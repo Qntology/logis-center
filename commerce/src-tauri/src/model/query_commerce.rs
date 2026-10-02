@@ -45,8 +45,11 @@ impl crate::model::LogisModel {
         let _ = app_handle.emit("extraction-progress", &payload);
         crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
-        // 🌟 [최적화] 파이프라인 중간에 모델을 교체하며 발생하는 Ping-Pong 로드를 방지하기 위해, 최초에 Qwen3와 Embedding 모델을 한 번에 모두 로드합니다.
-        self.ensure_qwen3().await?;
+        let route_lang = crate::utils::lang_utils::detect_document_language(&query);
+        let route_verdict = self.lang_route("search", "commerce_verify", &route_lang, &query).await;
+        emit_term(&format!("  {}", route_verdict.line));
+        let _query_route = crate::model::lang_llm::QueryRoute::open(route_verdict.code);
+        self.ensure_query_engine().await?;
         self.ensure_embedding().await?;
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
@@ -997,11 +1000,18 @@ impl crate::model::LogisModel {
                     if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
                         if let Ok(result) = serde_json::from_str::<Value>(&response) {
                             if let Some(suggested) = result.get("suggested_category").and_then(|v| v.as_str()) {
-                                if intersecting.contains(&suggested.to_string()) && best_cat != suggested {
+                                let valid = intersecting.contains(&suggested.to_string());
+                                crate::model::lang_llm::record_query_value(valid);
+                                if valid && best_cat != suggested {
                                     emit_term(&format!("      🔄 Category corrected/confirmed from [{}] to [{}] for '{}'", best_cat, suggested, final_text));
                                     best_cat = suggested.to_string();
-                                } else {
+                                } else if valid {
                                     emit_term(&format!("      ✅ Category [{}] confirmed for '{}'", best_cat, final_text));
+                                } else {
+                                    emit_term(&format!(
+                                        "      🚫 [LLM REJECT] '{}' 의 카테고리 제안 [{}] 은 후보 {:?} 밖이라 폐기하고 [{}] 를 유지합니다. ({})",
+                                        final_text, suggested, intersecting, best_cat, crate::model::lang_llm::query_engine_label()
+                                    ));
                                 }
                             }
                         }
@@ -2689,17 +2699,24 @@ impl crate::model::LogisModel {
                                     if c == owner_prop { picked = Some(c); break; }
                                     if allowed.iter().any(|(n, _)| n == &c) { picked = Some(c); break; }
                                     emit_term(&format!("      🚫 [LLM REJECT] '{}' 에 대한 제안 [{}] 은 형식 불일치이거나 다른 청크가 이미 선점한 속성이라 폐기합니다.", pm.chunk, c));
+                                    crate::model::lang_llm::record_query_value(false);
                                 }
                             }
                         }
 
+                        if picked.is_none() && owner_margin < 0.05 {
+                            emit_term(&format!(
+                                "      ⚖️ [UNCONFIRMED ASSIGN DROP] '{}' → [{}] | 검증 응답이 이 배정도 형식이 맞는 대안도 확인해 주지 못했고, 벡터 마진 {:+.4} 도 0.05 미만입니다. 근소한 배정을 확인 없이 하드 조건으로 걸면 회수한 문서 전부를 막을 수 있어 조건에서 빼고 FTS 검색어로 보존합니다.",
+                                pm.chunk, owner_prop, owner_margin
+                            ));
+                            crate::utils::score_dynamics::record_baseline("search.verify_unconfirmed_drop", 1.0);
+                            claimed_props.remove(&owner_prop);
+                            unassigned_chunks.push(pm.chunk.clone());
+                            continue;
+                        }
+
                         if let Some(new_prop) = picked {
                             if new_prop != owner_prop {
-                                // 🌟 [CORRECTION COSINE VERIFY] Qwen3 가 교정한 속성이
-                                //    원본 속성보다 청크와 실제로 더 관련 있는지 코사인으로 검증합니다.
-                                //    (로그: '남긴' → color → Qwen3 교정 → name. 그러나 name 도 '남긴' 과 무관)
-                                //    교정 후 코사인이 교정 전보다 낮으면 교정을 폐기하고 UNASSIGN 합니다.
-                                //    이 검사가 있어야 '남긴'→color→name 같은 연쇄 오배정이 차단됩니다.
                                 let chunk_emb_verify = self.get_embedding(pm.chunk.trim().to_string()).await.unwrap_or(vec![0.0; 384]);
                                 let old_pi = prop_keys.iter().position(|p| p == &owner_prop);
                                 let new_pi = prop_keys.iter().position(|p| p == &new_prop);
@@ -2714,11 +2731,13 @@ impl crate::model::LogisModel {
                                     _ => false,
                                 };
                                 if is_degraded {
-                                    emit_term(&format!("      🚫 [CORRECTION DEGRADED] '{}' 에 대한 Qwen3 교정 [{}] → [{}] 은 코사인 열화로 폐기합니다. UNASSIGN 처리.", pm.chunk, owner_prop, new_prop));
+                                    emit_term(&format!("      🚫 [CORRECTION DEGRADED] '{}' 에 대한 {} 교정 [{}] → [{}] 은 코사인 열화로 폐기합니다. UNASSIGN 처리.", pm.chunk, crate::model::lang_llm::query_engine_label(), owner_prop, new_prop));
+                                    crate::model::lang_llm::record_query_value(false);
                                     claimed_props.remove(&owner_prop);
                                     unassigned_chunks.push(pm.chunk.clone());
                                     continue;
                                 }
+                                crate::model::lang_llm::record_query_value(true);
                                 emit_term(&format!("      🔄 Property [{}] corrected as [{}] for '{}'", owner_prop, new_prop, pm.chunk));
                                 claimed_props.remove(&owner_prop);
                                 claimed_props.insert(new_prop.clone());
@@ -2729,6 +2748,7 @@ impl crate::model::LogisModel {
                                 allowed.retain(|(n, _)| n != &new_prop);
                                 owner_prop = new_prop;
                             } else {
+                                crate::model::lang_llm::record_query_value(true);
                                 emit_term(&format!("      ✅ Property [{}] confirmed for '{}'", owner_prop, pm.chunk));
                             }
                         }
@@ -2737,19 +2757,10 @@ impl crate::model::LogisModel {
                         alt_map.insert(owner_prop.clone(), allowed.iter().map(|(n, _)| n.clone()).collect());
                     }
 
-                    // 🌟 이제 한 속성 슬롯에는 정확히 한 청크만 담깁니다.
-                    //    Double Plinko 의 v.join(" | ") 와 deterministic_condition_value 가
-                    //    구조적으로 두 의미를 합칠 수 없게 되었습니다.
                     plinko_map = validated_map;
                     plinko_alternates = alt_map;
                 }
 
-                // 🌟 [SEASON / TIME EXACT MATCH — 확정 결과 재확인]
-                //    실제 감지는 Plinko 진입 전([FILTER TERM DROP])에서 이미 수행되었습니다.
-                //    여기서는 그 결과를 세그먼트 텍스트 기준으로 다시 확정하여
-                //    결정론 시간 가이드와 STAGE-3 메타데이터에 전달합니다.
-                //    Plinko 가 이 단어들을 아예 보지 못하므로
-                //    color / region_restrictions 로 흘러가는 경로가 물리적으로 존재하지 않습니다.
                 let mut exact_season_key = String::new();
                 let mut exact_time_key = String::new();
                 for w in current_text.split_whitespace() {
@@ -3254,7 +3265,7 @@ impl crate::model::LogisModel {
                 // Qwen3로 2차 매핑 검증
                 if !prop_to_op.is_empty() {
                      emit_term("    🧠 [QWEN3 VERIFICATION (2nd)] Verifying operators...");
-                     self.ensure_qwen3().await?;
+                     self.ensure_query_engine().await?;
                     
                      // 속성별 operator 검증
                      let mut validated_prop_to_op = prop_to_op.clone();
@@ -3549,9 +3560,8 @@ impl crate::model::LogisModel {
                     let combined_guide = format!("{}\n{}", fragments_text.trim(), llm_temporal_guide);
                     
                     let prompt_numeric = crate::parsing::extract_numeric_conditions(&current_text, &seg_type, metrics_json, &combined_guide, &time_context, language, &value_type_str);
-                    
-                    // 🌟 [CRITICAL FIX] Qwen3 모델을 사용하여 메모리 사용량을 줄이고 통일화합니다.
-                    self.ensure_qwen3().await?;
+
+                    self.ensure_query_engine().await?;
 
                     // call_qwen3_verification_model을 통해 순차적으로 LLM Normalization 수행
                     let res_numeric = self.call_qwen3_verification_model(&prompt_numeric, Some(cancel_token.clone())).await?;
@@ -3645,6 +3655,18 @@ impl crate::model::LogisModel {
                         
                         // 🌟 [CRITICAL FIX] LLM이 배열이 아닌 단일 객체로 반환했을 때 필터가 망가지는 현상을 막기 위해 파싱을 배열 폼으로 통일합니다.
                         let condition_json = final_numeric_json.get("condition");
+                        if condition_json.is_none() {
+                            let got_keys: Vec<String> = final_numeric_json
+                                .as_object()
+                                .map(|o| o.keys().cloned().collect())
+                                .unwrap_or_default();
+                            emit_term(&format!(
+                                "      🧾 [NUMERIC FORMAT MISS] {} 의 수치 조건 응답에 'condition' 키가 없습니다 (응답 키 {:?}). 형식을 지키지 못한 응답도 검증 실패로 세어야 엔진별 일관성 비교가 한쪽으로 기울지 않습니다.",
+                                crate::model::lang_llm::query_engine_label(),
+                                got_keys
+                            ));
+                            crate::model::lang_llm::record_query_value(false);
+                        }
                         let mut cond_items = Vec::new();
 
                         if let Some(arr) = condition_json.and_then(|v| v.as_array()) {
@@ -3702,11 +3724,15 @@ impl crate::model::LogisModel {
                                         continue;
                                     }
 
-                                    // 🌟 [CRITICAL FIX] 유효하지 않은 프로퍼티 이름(LLM 환각) 무시
                                     if !prop_to_op.contains_key(&k) {
-                                        emit_term(&format!("      ⚠️ [DISCARD] LLM hallucinated invalid property name: [{}]. Discarding.", k));
+                                        emit_term(&format!(
+                                            "      ⚠️ [DISCARD] 수치 조건 응답의 속성 [{}] 은 이번 질의의 벡터 가이드(확정된 청크 속성)에 없어 버립니다. 스키마에 있는 속성이어도 가이드 밖이면 이 단계의 답이 아니며, 같은 축은 추상 수식어 라우팅이 따로 물질화할 수 있습니다.",
+                                            k
+                                        ));
+                                        crate::model::lang_llm::record_query_value(false);
                                         continue;
                                     }
+                                    crate::model::lang_llm::record_query_value(true);
 
                                     let mut op = item_obj.get("operator").and_then(|v| v.as_str())
                                         .unwrap_or_else(|| prop_to_op.get(&k).map(|s| s.as_str()).unwrap_or("eq")).to_string();

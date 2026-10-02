@@ -1516,6 +1516,27 @@ impl Qwen3_5DecoderLayer {
 /// (scheduler.rs 의 max_tokens 는 128~512, qwen3_5 generate 기본값은 1024)
 pub const QWEN35_DECODE_HEADROOM_TOKENS: usize = 2048;
 
+pub const DECODE_RESIDENT_VRAM_MARGIN_BYTES: u64 = 640 * 1024 * 1024;
+
+fn decode_resident_gate(on_cuda: bool, weight_bytes: u64, kv_bytes: u64) -> (bool, Option<u64>) {
+    if !on_cuda {
+        return ((crate::utils::resources::free_ram_bytes() as u64) > 6_000_000_000, None);
+    }
+    let free = nvml_wrapper::Nvml::init().ok().and_then(|nvml| {
+        nvml.device_by_index(crate::utils::resources::primary_gpu_id() as u32)
+            .ok()
+            .and_then(|dev| dev.memory_info().ok())
+            .map(|m| m.free)
+    });
+    match free {
+        Some(f) => (
+            weight_bytes > 0 && f >= weight_bytes + kv_bytes + DECODE_RESIDENT_VRAM_MARGIN_BYTES,
+            Some(f),
+        ),
+        None => (false, None),
+    }
+}
+
 pub struct Qwen3_5TextModel {
     embed_tokens: Embedding,
     pub layers: Vec<Qwen3_5DecoderLayer>,
@@ -1533,8 +1554,8 @@ pub struct Qwen3_5TextModel {
     // 🌟 [DECODE-RESIDENT] 가중치 상주 여부도 같은 시점에 1회만 판정하여
     //    토큰마다 반복되던 sysinfo 호출을 제거합니다.
     pub keep_weights_resident: bool,
-    
-    // Mmap 핑퐁을 위한 메타데이터 필드
+    pub resident_prefix: usize,
+    pub release_streamed_pages: bool,
     pub mmap: Option<std::sync::Arc<memmap2::Mmap>>,
     pub ct: Option<std::sync::Arc<candle_core::quantized::gguf_file::Content>>,
     pub base_name: String,
@@ -1557,7 +1578,7 @@ impl Qwen3_5TextModel {
         Ok(Self {
             embed_tokens, layers, norm, rotary_emb, mrope_section: config.rope_parameters.mrope_section.clone(), dtype: vb.dtype(),
             registry, current_kv_len: 0, active_session_id: None, active_kv_name: None,
-            kv_plan: None, keep_weights_resident: false,
+            kv_plan: None, keep_weights_resident: false, resident_prefix: 0, release_streamed_pages: false,
             mmap: None, ct: None, base_name: "model".to_string(), 
         })
     }
@@ -1657,7 +1678,7 @@ impl Qwen3_5TextModel {
         Ok(Self {
             embed_tokens, layers, norm, rotary_emb, mrope_section, dtype,
             registry, current_kv_len: 0, active_session_id: None, active_kv_name: None,
-            kv_plan: None, keep_weights_resident: false,
+            kv_plan: None, keep_weights_resident: false, resident_prefix: 0, release_streamed_pages: false,
             mmap: mmap_handle, ct: ct_handle, base_name: "model".to_string(),
         })
     }
@@ -1698,16 +1719,12 @@ impl Qwen3_5TextModel {
 
         let total_layers = self.layers.len();
 
-        // 🌟 [KV RESIDENCY PLAN] 디코딩 루프 진입 직전(= 첫 디코딩 토큰)에 단 1회만 판정합니다.
-        //    KV Cache 는 단조 증가하므로 "앞으로 자랄 최대치"를 기준으로 판정해야
-        //    디코딩 도중 OOM 이 터지지 않습니다. 이후 토큰에서는 캐시된 계획을 그대로 씁니다.
-        //    프리필 구간에서는 계획을 무효화하여 기존 SSD 오프로딩 경로를 100% 유지합니다.
+        let mut resident_decided = false;
         let kv_residency = if is_decoding {
             if self.kv_plan.is_none() {
-                // full_attention 레이어만 KV 블록을 보유합니다. (linear_attention 은 고정 크기 SSM state)
                 let (full_attn_layers, kv_heads, kv_head_dim) = self.kv_plan_geometry();
                 let planned = seqlen_offset + seq_len + QWEN35_DECODE_HEADROOM_TOKENS;
-
+                let label = if crate::model::lang_llm::resident_variant().is_some() { "Qwen3.5-4B(alphaedge)" } else { "Qwen3.5(2B)" };
                 let plan = crate::utils::resources::plan_kv_residency(
                     &crate::utils::resources::KvPlanInput {
                         gpu_id: crate::utils::resources::primary_gpu_id(),
@@ -1715,20 +1732,77 @@ impl Qwen3_5TextModel {
                         num_kv_layers: full_attn_layers,
                         num_kv_heads: kv_heads,
                         head_dim: kv_head_dim,
-                        // Qwen3.5 는 KV 블록을 F8E4M3(1바이트)로 압축 보관합니다.
                         bytes_per_elem: 1,
                         planned_tokens: planned,
-                        label: "Qwen3.5(2B)",
+                        label,
                     },
                 );
-
-                // 가중치 상주 여부도 같은 시점에 1회만 결정합니다.
-                self.keep_weights_resident =
-                    crate::utils::resources::free_ram_bytes() > 6_000_000_000;
-
+                let weight_bytes = self.decode_resident_bytes();
+                let kv_bytes = (full_attn_layers * kv_heads * kv_head_dim * 2 * planned) as u64;
+                let (keep, vram_free) = decode_resident_gate(xs.device().is_cuda(), weight_bytes, kv_bytes);
+                let (prefix, prefix_bytes) = match vram_free {
+                    Some(free) if !keep => self.decode_resident_prefix(
+                        free.saturating_sub(kv_bytes + DECODE_RESIDENT_VRAM_MARGIN_BYTES + self.max_layer_bytes()),
+                    ),
+                    _ => (0, 0),
+                };
+                let streamed_bytes = if keep { 0 } else { weight_bytes.saturating_sub(prefix_bytes) };
+                let ram_free = crate::utils::resources::free_ram_bytes() as u64;
+                let release_streamed =
+                    streamed_bytes > 0 && ram_free < crate::model::RAM_PRESSURE_MARGIN_BYTES + streamed_bytes;
+                self.keep_weights_resident = keep;
+                self.resident_prefix = prefix;
+                self.release_streamed_pages = release_streamed;
+                resident_decided = keep || prefix > 0;
+                let variant = if label == "Qwen3.5(2B)" { "q35_2b" } else { "lang4b" };
+                crate::utils::score_dynamics::record_baseline(
+                    &format!("model.decode_resident_ratio.{}", variant),
+                    if keep { 1.0 } else { prefix as f32 / total_layers.max(1) as f32 },
+                );
+                crate::utils::score_dynamics::record_baseline(
+                    &format!("model.decode_entry_ram_free_mb.{}", variant),
+                    (ram_free / 1_000_000) as f32,
+                );
+                let page_mode = if release_streamed { "켬" } else { "끔" };
+                match vram_free {
+                    Some(free) => println!(
+                        "[DECODE-RESIDENT] {} | 층 가중치 {:.0} MB + KV {:.0} MB + margin {:.0} MB vs VRAM free {:.0} MB → {}",
+                        label,
+                        weight_bytes as f64 / 1e6,
+                        kv_bytes as f64 / 1e6,
+                        DECODE_RESIDENT_VRAM_MARGIN_BYTES as f64 / 1e6,
+                        free as f64 / 1e6,
+                        if keep {
+                            "Vram (디코딩 동안 층 가중치를 VRAM 에 두고 토큰마다 mmap 에서 다시 읽지 않습니다)".to_string()
+                        } else if prefix > 0 {
+                            format!(
+                                "Partial (층 {}/{}개 {:.0} MB 를 VRAM 에 두고 나머지 {}개 층 {:.0} MB 만 토큰마다 mmap 에서 읽습니다 · 읽은 층의 파일 페이지 반환 {} · RAM 여유 {:.0} MB)",
+                                prefix,
+                                total_layers,
+                                prefix_bytes as f64 / 1e6,
+                                total_layers - prefix,
+                                streamed_bytes as f64 / 1e6,
+                                page_mode,
+                                ram_free as f64 / 1e6
+                            )
+                        } else {
+                            format!(
+                                "Stream (토큰마다 mmap 에서 층을 다시 읽는 기존 경로 · 읽은 층의 파일 페이지 반환 {} · RAM 여유 {:.0} MB)",
+                                page_mode,
+                                ram_free as f64 / 1e6
+                            )
+                        }
+                    ),
+                    None => println!(
+                        "[DECODE-RESIDENT] {} | {} → {} (읽은 층의 파일 페이지 반환 {} · RAM 여유 {:.0} MB)",
+                        label,
+                        if xs.device().is_cuda() { "VRAM 조회 실패" } else { "CUDA 밖 장치는 기존 기준(여유 RAM 6GB 초과)" },
+                        if keep { "Resident" } else { "Stream" },
+                        page_mode,
+                        ram_free as f64 / 1e6
+                    ),
+                }
                 self.kv_plan = Some(plan);
-
-                // 전 레이어에 배치 계획을 전파합니다.
                 for layer in self.layers.iter_mut() {
                     layer.set_kv_residency(plan);
                 }
@@ -1737,28 +1811,52 @@ impl Qwen3_5TextModel {
         } else {
             self.kv_plan = None;
             self.keep_weights_resident = false;
+            self.resident_prefix = 0;
+            self.release_streamed_pages = (crate::utils::resources::free_ram_bytes() as u64)
+                < crate::model::RAM_PRESSURE_MARGIN_BYTES + self.decode_resident_bytes();
             for layer in self.layers.iter_mut() {
                 layer.set_kv_residency(crate::utils::resources::KvResidency::Ssd);
             }
             crate::utils::resources::KvResidency::Ssd
         };
 
-        // [DECODE-RESIDENT] 디코딩 시 매 토큰 mmap→heap 가중치 복사를 제거하기 위한 상주 플래그
-        let keep_resident = self.keep_weights_resident;
-
+        let mut keep_resident = self.keep_weights_resident;
+        let mut resident_prefix = self.resident_prefix;
+        let release_streamed = self.release_streamed_pages;
         for l_idx in 0..total_layers {
-            // 가중치가 비워져 있을 때만 Mmap 로드! 
             if self.layers[l_idx].is_cleared() {
-                self.reload_layer(l_idx, xs.device())?;
+                if let Err(e) = self.reload_layer(l_idx, xs.device()) {
+                    if !keep_resident && resident_prefix == 0 {
+                        return Err(e);
+                    }
+                    for j in 0..total_layers {
+                        if j != l_idx {
+                            self.layers[j].clear_weights();
+                        }
+                    }
+                    keep_resident = false;
+                    resident_prefix = 0;
+                    resident_decided = false;
+                    self.keep_weights_resident = false;
+                    self.resident_prefix = 0;
+                    println!(
+                        "[DECODE-RESIDENT] 층 {} 를 VRAM 에 상주시키다 실패했습니다 ({}). 이미 올린 층을 비우고 이번 생성의 남은 토큰은 토큰마다 mmap 에서 다시 읽는 기존 경로로 진행합니다.",
+                        l_idx, e
+                    );
+                    if xs.device().is_cuda() {
+                        let _ = xs.device().synchronize();
+                    }
+                    self.reload_layer(l_idx, xs.device())?;
+                }
+                if release_streamed || (is_decoding && (keep_resident || l_idx < resident_prefix)) {
+                    self.release_layer_pages(l_idx);
+                }
             }
-
             let layer = &mut self.layers[l_idx];
-
             if let AttnKind::SelfAttn(attn) = &mut layer.attn {
                 attn.active_session_id = session_id.clone();
                 attn.active_kv_name = kv_name.clone();
             }
-
             if layer.layer_type == "linear_attention" && seqlen_offset > 0 {
                 let (conv_opt, rec_opt) = layer.get_ssm_states();
                 if conv_opt.is_none() || rec_opt.is_none() {
@@ -1835,7 +1933,7 @@ impl Qwen3_5TextModel {
                 layer.set_ssm_dirty(is_dirty_backup); 
             }
             // [DECODE-RESIDENT] 디코딩 시 매 토큰 mmap→heap 가중치 복사(레이어 수 × 토큰 수)를 제거합니다.
-            if !keep_resident {
+            if !keep_resident && l_idx >= resident_prefix {
                 layer.clear_weights();
             }
 
@@ -1987,6 +2085,28 @@ impl Qwen3_5TextModel {
             }
         }
         
+        if resident_decided && keep_resident {
+            let free_prev = crate::utils::resources::free_ram_bytes() as u64;
+            crate::model::release_os_working_set();
+            let (free_now, total) = crate::model::ram_snapshot();
+            println!(
+                "[DECODE-RESIDENT] 첫 디코딩 토큰에서 층 {}개를 VRAM 에 올렸습니다. 남은 토큰은 mmap 을 읽지 않으므로 작업 집합을 반환합니다 | RAM 여유 {}MB → {}MB | {}",
+                total_layers,
+                free_prev / 1_000_000,
+                free_now / 1_000_000,
+                crate::model::ram_pressure_line(free_now, total)
+            );
+        } else if resident_decided && resident_prefix > 0 {
+            let (free_now, total) = crate::model::ram_snapshot();
+            println!(
+                "[DECODE-RESIDENT] 첫 디코딩 토큰에서 층 {}/{}개를 VRAM 에 올렸고 그 층의 파일 페이지는 바로 작업 집합에서 내려놓았습니다. 나머지 {}개 층은 토큰마다 mmap 에서 읽고 {} | {}",
+                resident_prefix,
+                total_layers,
+                total_layers - resident_prefix,
+                if release_streamed { "읽은 직후 그 층의 파일 페이지도 내려놓습니다" } else { "RAM 여유가 기준 위라 그 층의 파일 페이지는 작업 집합에 둡니다" },
+                crate::model::ram_pressure_line(free_now, total)
+            );
+        }
         tokio::task::yield_now().await;
         xs = self.norm.forward(&xs)?;
         self.current_kv_len = seqlen_offset + seq_len;
@@ -2011,13 +2131,98 @@ impl Qwen3_5TextModel {
     }
 
     pub fn clear_cache(&mut self) {
+        let was_resident = self.keep_weights_resident || self.resident_prefix > 0;
         for layer in self.layers.iter_mut() {
             layer.clear_cache();
+            if was_resident {
+                layer.clear_weights();
+            }
         }
         self.current_kv_len = 0;
-        // 🌟 [KV RESIDENCY] 세션이 바뀌면 배치 계획도 폐기하여 다음 디코딩에서 재판정합니다.
         self.kv_plan = None;
         self.keep_weights_resident = false;
+        self.resident_prefix = 0;
+        self.release_streamed_pages = false;
+    }
+
+    fn decode_resident_bytes(&self) -> u64 {
+        let ct = match self.ct.as_ref() {
+            Some(c) => c,
+            None => return 0,
+        };
+        ct.tensor_infos
+            .iter()
+            .filter(|(name, _)| name.starts_with("blk."))
+            .map(|(_, info)| {
+                let block = info.ggml_dtype.block_size().max(1);
+                (info.shape.elem_count() / block * info.ggml_dtype.type_size()) as u64
+            })
+            .sum()
+    }
+
+    fn layer_file_ranges(&self, layer_idx: usize) -> Vec<(usize, usize)> {
+        let ct = match self.ct.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let prefix = format!("blk.{}.", layer_idx);
+        ct.tensor_infos
+            .iter()
+            .filter(|(name, _)| name.starts_with(&prefix))
+            .map(|(_, info)| {
+                let block = info.ggml_dtype.block_size().max(1);
+                (
+                    (ct.tensor_data_offset + info.offset) as usize,
+                    info.shape.elem_count() / block * info.ggml_dtype.type_size(),
+                )
+            })
+            .collect()
+    }
+
+    fn layer_bytes(&self, layer_idx: usize) -> u64 {
+        self.layer_file_ranges(layer_idx).iter().map(|(_, len)| *len as u64).sum()
+    }
+
+    fn max_layer_bytes(&self) -> u64 {
+        (0..self.layers.len()).map(|i| self.layer_bytes(i)).max().unwrap_or(0)
+    }
+
+    fn decode_resident_prefix(&self, budget: u64) -> (usize, u64) {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for i in 0..self.layers.len() {
+            let b = self.layer_bytes(i);
+            if b == 0 || bytes + b > budget {
+                break;
+            }
+            bytes += b;
+            count += 1;
+        }
+        (count, bytes)
+    }
+
+    fn release_layer_pages(&self, layer_idx: usize) {
+        let mmap = match self.mmap.as_ref() {
+            Some(m) => m,
+            None => return,
+        };
+        for (start, len) in self.layer_file_ranges(layer_idx) {
+            if len == 0 || start >= mmap.len() {
+                continue;
+            }
+            let len = len.min(mmap.len() - start);
+            #[cfg(target_os = "windows")]
+            unsafe {
+                let _ = windows_sys::Win32::System::Memory::VirtualUnlock(
+                    mmap.as_ptr().add(start) as *const std::ffi::c_void,
+                    len,
+                );
+            }
+            #[cfg(unix)]
+            unsafe {
+                let _ = mmap.unchecked_advise_range(memmap2::UncheckedAdvice::DontNeed, start, len);
+            }
+        }
     }
 
     

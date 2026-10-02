@@ -47,6 +47,14 @@ pub fn lang_code_of(lang: &str) -> String {
     if code.chars().count() >= 2 { code } else { "en".to_string() }
 }
 
+pub fn lang_names_of(code: &str) -> Vec<&'static str> {
+    LANG_NAME_CODES
+        .iter()
+        .filter(|(name, c)| *c == code && name.is_ascii())
+        .map(|(name, _)| *name)
+        .collect()
+}
+
 pub const TRADE_DOC_TYPES: &[&str] = &[
     // ── 기존 27종 ──
     "BL", "AWB", "CI", "PI", "PL", "PO", "SC", "LC", "CO",

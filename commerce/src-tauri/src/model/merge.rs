@@ -1625,6 +1625,50 @@ pub fn label_exact_field(
     }
 }
 
+pub fn party_block_axis(
+    label: &str,
+    routed: &str,
+    exact: &LabelExactIndex,
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+    filled: &Map<String, Value>,
+) -> Option<(String, String)> {
+    let mut cands: Vec<String> = vec![routed.to_string()];
+    if let Some(ef) = label_exact_field(label, exact, banks) {
+        if !cands.contains(&ef) {
+            cands.push(ef);
+        }
+    }
+    let blank = |v: Option<&Value>| -> bool {
+        v.map_or(true, |x| x.is_null() || x.as_str().map_or(false, |s| s.trim().is_empty()))
+    };
+    for f in cands.iter() {
+        let base = match f.strip_suffix("_name") {
+            Some(b) if !b.is_empty() => b,
+            _ => continue,
+        };
+        let addr = format!("{}_address", base);
+        if !banks.iter().any(|(bf, b, _)| *bf == addr && !b.is_empty()) {
+            continue;
+        }
+        if crate::utils::ai_utils::detect_field_format(&addr) != crate::utils::ai_utils::FieldFormat::Address {
+            continue;
+        }
+        let cat = crate::logic::trade_field_category(f);
+        if cat.is_empty()
+            || cat != crate::logic::trade_field_category(&addr)
+            || crate::logic::is_trade_array_category(cat)
+        {
+            continue;
+        }
+        let empty_at = |k: &str| blank(filled.get(k)) && blank(filled.get(cat).and_then(|c| c.get(k)));
+        if !empty_at(f) || !empty_at(&addr) {
+            continue;
+        }
+        return Some((f.clone(), addr));
+    }
+    None
+}
+
 pub fn route_pairs_to_fields_detailed(
     pairs: &[(String, String)],
     pair_embs: &[Vec<f32>],

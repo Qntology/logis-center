@@ -1,5 +1,21 @@
 /// Converts a JSON Value into a human-readable natural language narrative.
 /// [STRICT ALIGNMENT] This logic perfectly synchronizes with every column in `parsing.rs`.
+fn strip_trailing_currency_mark(value: &str, currency: &str) -> String {
+    let t = value.trim();
+    let end = match t.char_indices().filter(|(_, c)| c.is_ascii_digit()).last() {
+        Some((i, c)) => i + c.len_utf8(),
+        None => return t.to_string(),
+    };
+    let tail = t[end..].trim();
+    let mark = !tail.is_empty()
+        && (tail.eq_ignore_ascii_case(currency.trim()) || ["원", "₩", "円", "元", "$", "€", "¥", "£"].contains(&tail));
+    if mark {
+        t[..end].trim_end().to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
     let mut sentences = Vec::new();
 
@@ -74,9 +90,16 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                         if ["sale_price", "supply_price", "price", "amount", "shipping_fee", "discount"].contains(&key.as_str()) {
                             let curr = map.get("currency").and_then(|c| c.as_str()).unwrap_or("");
                             let curr_str = if curr.is_empty() { String::new() } else { format!(" {}", curr) };
-                            sentences.push(format!("The {} is {}{}.", clean_key, val_str, curr_str));
+                            let shown = if curr.is_empty() { val_str.clone() } else { strip_trailing_currency_mark(&val_str, curr) };
+                            sentences.push(format!("The {} is {}{}.", clean_key, shown, curr_str));
                         } else if key == "status" {
-                            sentences.push(format!("It is currently in '{}' status.", val_str));
+                            let shown = match v {
+                                serde_json::Value::Number(n) => n.as_i64().and_then(crate::logic::status_name).map(|s| s.to_string()),
+                                _ => Some(val_str.clone()),
+                            };
+                            if let Some(s) = shown {
+                                sentences.push(format!("It is currently in '{}' status.", s));
+                            }
                         } else {
                             sentences.push(format!("Its {} is {}.", clean_key, val_str));
                         }
@@ -318,8 +341,9 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
     }
 
     for (chunk_text, property, confirmed) in &chunks {
-        if chunk_text.chars().count() > 150 {
-            // 콤마 기준으로 분할 시도
+        let synthesis = crate::utils::ai_utils::detect_field_format(property)
+            == crate::utils::ai_utils::FieldFormat::Synthesis;
+        if chunk_text.chars().count() > 150 && !synthesis {
             let parts: Vec<&str> = split_clause_commas(chunk_text)
                 .into_iter()
                 .map(|p| p.trim())
@@ -327,24 +351,13 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
                 .collect();
 
             if parts.len() > 1 {
-                // 🌟 [라벨 접두어 추출]
                 let label_prefix = extract_label_prefix(chunk_text);
-                let merge_fragments = crate::utils::ai_utils::detect_field_format(property)
-                    == crate::utils::ai_utils::FieldFormat::Synthesis;
 
                 for (pi, part) in parts.iter().enumerate() {
                     if pi == 0 {
                         expanded.push((part.to_string(), property.clone(), *confirmed));
                         continue;
                     }
-                    if merge_fragments && is_clause_fragment(part) {
-                        if let Some(last) = expanded.last_mut() {
-                            last.0.push_str(", ");
-                            last.0.push_str(part);
-                            continue;
-                        }
-                    }
-                    // 후속 조각에 라벨 접두어 복원
                     let restored = if let Some(prefix) = &label_prefix {
                         let clean_part = part
                             .trim_start_matches("and ")
@@ -354,7 +367,6 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
                     } else {
                         part.to_string()
                     };
-                    // 라벨 접두어가 복원되면 구조가 유지되므로 confirmed 유지
                     let sub_confirmed = *confirmed && label_prefix.is_some();
                     expanded.push((restored, property.clone(), sub_confirmed));
                 }
@@ -1085,11 +1097,6 @@ pub fn can_transliterate(
     }
 }
 
-/// [SYNONYM EXPANSION] 특수문자를 공백으로 치환하여 음차용 순수 텍스트를 생성합니다.
-/// (), {}, [], /, -, &, !, @, # 등 모든 비영숫자·비공백 문자를 공백으로 대체하고
-/// 연속 공백을 하나로 압축합니다. 다국어 문자(한글, 일본어, 중국어 등)는 유지합니다.
-/// 이 함수의 출력은 LLM 프롬프트 키와 sanitize 매칭 양쪽에 동일하게 사용되므로
-/// 키 불일치로 인한 맥락 끊김을 원천 차단합니다.
 pub fn strip_special_chars_for_transliteration(value: &str) -> String {
     value
         .chars()
@@ -1106,17 +1113,58 @@ pub fn strip_special_chars_for_transliteration(value: &str) -> String {
         .join(" ")
 }
 
-/// [LANGUAGE TRACK SPLIT] Source 단어를 표기 체계별로 분리합니다.
-/// 반환: (비라틴 단어 목록, 라틴 단어 목록)
-/// 판정 기준은 is_latin_dominant() — 각 단어의 알파벳 문자 중
-/// ASCII 알파벳 비율이 50% 이상이면 라틴, 그렇지 않으면 비라틴.
+pub fn reglue_native_alias(source: &str, native: &str) -> String {
+    let mut glue: Vec<bool> = Vec::new();
+    let mut runs = 0usize;
+    let mut in_run = false;
+    let mut gap_has_space = false;
+    for c in source.chars() {
+        if c.is_alphanumeric() {
+            if !in_run {
+                if runs > 0 {
+                    glue.push(!gap_has_space);
+                }
+                runs += 1;
+                in_run = true;
+            }
+        } else {
+            if in_run {
+                in_run = false;
+                gap_has_space = false;
+            }
+            if c.is_whitespace() {
+                gap_has_space = true;
+            }
+        }
+    }
+    let parts: Vec<&str> = native.split_whitespace().collect();
+    if runs < 2 || parts.len() != runs || !glue.iter().any(|g| *g) {
+        return native.to_string();
+    }
+    let latin = |s: &str| s.chars().any(|c| c.is_ascii_alphabetic());
+    let mut out = String::from(parts[0]);
+    for i in 1..parts.len() {
+        let glued = glue[i - 1] && !latin(parts[i - 1]) && !latin(parts[i]);
+        if !glued {
+            out.push(' ');
+        }
+        out.push_str(parts[i]);
+    }
+    out
+}
+
+pub fn is_digit_word(word: &str) -> bool {
+    word.chars().any(|c| c.is_ascii_digit())
+        && word.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+}
+
 pub fn split_words_by_script(source: &str) -> (Vec<String>, Vec<String>) {
     let cleaned = strip_special_chars_for_transliteration(source);
     let mut non_latin: Vec<String> = Vec::new();
     let mut latin: Vec<String> = Vec::new();
     for word in cleaned.split_whitespace() {
         if word.is_empty() { continue; }
-        if is_latin_dominant(word) {
+        if is_latin_dominant(word) && !is_digit_word(word) {
             latin.push(word.to_string());
         } else {
             non_latin.push(word.to_string());
@@ -1125,24 +1173,116 @@ pub fn split_words_by_script(source: &str) -> (Vec<String>, Vec<String>) {
     (non_latin, latin)
 }
 
-/// [LANGUAGE TRACK PROMPT] 특정 단어 목록만으로 음차 프롬프트를 생성합니다.
-/// build_transliteration_prompt 의 단어 제한 버전입니다.
-/// mixed-script 소스에서 트랙별로 분리 호출할 때 사용합니다.
+pub fn place_digit_words(source: &str, spoken: &str) -> Option<String> {
+    let cleaned = strip_special_chars_for_transliteration(source);
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if !words.iter().any(|w| is_digit_word(w)) {
+        return None;
+    }
+    let spoken_words: Vec<&str> = spoken.split_whitespace().collect();
+    if spoken_words.len() != words.iter().filter(|w| !is_digit_word(w)).count() {
+        return None;
+    }
+    let mut next = spoken_words.into_iter();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    for w in words.iter() {
+        if is_digit_word(w) {
+            out.push(w.to_string());
+        } else {
+            out.push(next.next()?.to_string());
+        }
+    }
+    Some(out.join(" "))
+}
+
 pub fn build_transliteration_prompt_for_words(words: &[String], target_language: &str) -> String {
     let full_lang = lang_code_to_full_name(target_language);
     let joined = words.join(" ");
     crate::prompts::transliteration_prompt(&joined, &full_lang)
 }
 
-/// [LANGUAGE TRACK SANITIZE] 특정 단어 목록에 대한 LLM 응답만 파싱합니다.
-/// sanitize_transliteration_dual 의 단어 제한 버전입니다.
-/// source_value 대신 명시적 words 목록을 사용하여 응답 매핑을 수행합니다.
+const TRANSLIT_SCHEMA_KEYS: [&str; 2] = ["transcription", "transliteration"];
+
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let sub = prev[j - 1] + if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = sub.min(prev[j] + 1).min(cur[j - 1] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+fn key_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.trim().to_lowercase().chars().collect();
+    let b: Vec<char> = b.trim().to_lowercase().chars().collect();
+    edit_distance(&a, &b)
+}
+
+fn schema_value<'a>(parsed: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    let map = parsed.as_object()?;
+    if let Some(v) = map.get(name) {
+        return Some(v);
+    }
+    let other = TRANSLIT_SCHEMA_KEYS.iter().copied().find(|k| *k != name).unwrap_or("");
+    let mut best: Option<(usize, &String, &serde_json::Value)> = None;
+    for (k, v) in map.iter() {
+        if TRANSLIT_SCHEMA_KEYS.contains(&k.as_str()) || k.trim().eq_ignore_ascii_case("language") {
+            continue;
+        }
+        let d = key_distance(k, name);
+        if d > 3 || d >= key_distance(k, other) {
+            continue;
+        }
+        if best.map_or(true, |(bd, _, _)| d < bd) {
+            best = Some((d, k, v));
+        }
+    }
+    let (d, k, v) = best?;
+    println!(
+        "    🩹 [TRANSLIT SCHEMA KEY] 응답 키 '{}' 를 '{}' 로 읽습니다 (철자 거리 {}). 키 철자만 틀리고 값은 정상인 응답을 '키 없음' 으로 버리면 그 값이 영구 음차 불가로 캐시됩니다.",
+        k, name, d
+    );
+    Some(v)
+}
+
+fn word_key_value<'a>(map: &'a serde_json::Map<String, serde_json::Value>, word: &str) -> Option<&'a str> {
+    let usable = |v: &'a serde_json::Value| v.as_str().filter(|s| !s.trim().is_empty());
+    if let Some(s) = map.get(word).and_then(usable) {
+        return Some(s);
+    }
+    let lw = word.trim().to_lowercase();
+    if let Some(s) = map.iter().find(|(k, _)| k.trim().to_lowercase() == lw).and_then(|(_, v)| usable(v)) {
+        return Some(s);
+    }
+    let n = word.trim().chars().count();
+    let tol = if n >= 8 { 2 } else if n >= 4 { 1 } else { 0 };
+    if tol == 0 {
+        return None;
+    }
+    let mut hits: Vec<(usize, &str)> = map
+        .iter()
+        .filter_map(|(k, v)| usable(v).map(|s| (key_distance(k, word), s)))
+        .filter(|(d, _)| *d <= tol)
+        .collect();
+    hits.sort_by_key(|(d, _)| *d);
+    match hits.as_slice() {
+        [(_, s)] => Some(*s),
+        [(d0, s0), (d1, _), ..] if d0 < d1 => Some(*s0),
+        _ => None,
+    }
+}
+
 fn transcription_fallback(
     parsed: &serde_json::Value,
     joined_src: &str,
     word_map: &dyn Fn(&serde_json::Value) -> String,
 ) -> String {
-    let tc = match parsed.get("transcription") {
+    let tc = match schema_value(parsed, "transcription") {
         Some(v) => v,
         None => return String::new(),
     };
@@ -1153,78 +1293,66 @@ fn transcription_fallback(
         Some(m) => m,
         None => return String::new(),
     };
-    let src_lower = joined_src.trim().to_lowercase();
-    for (k, v) in map.iter() {
-        if k.trim().to_lowercase() == src_lower {
-            if let Some(s) = v.as_str() {
-                return s.trim().to_string();
-            }
-        }
+    if let Some(s) = word_key_value(map, joined_src) {
+        return s.trim().to_string();
     }
     let mapped = word_map(tc);
     if !mapped.is_empty() && !mapped.eq_ignore_ascii_case(joined_src.trim()) {
         return mapped;
     }
     if map.len() == 1 && joined_src.split_whitespace().count() == 1 {
-        if let Some(s) = map.values().next().and_then(|v| v.as_str()) {
-            return s.trim().to_string();
+        if let Some((k, v)) = map.iter().next() {
+            if let Some(s) = v.as_str() {
+                let tol = (joined_src.trim().chars().count() / 4).max(1);
+                let d = key_distance(k, joined_src);
+                if d <= tol || !is_latin_dominant(k) {
+                    return s.trim().to_string();
+                }
+                crate::utils::score_dynamics::record_baseline("indexing.translit_key_mismatch", 1.0);
+                println!(
+                    "    🚫 [TRANSLIT KEY MISMATCH] 응답의 유일한 키 '{}' 가 원문 '{}' 와 철자 거리 {} (허용 {}) 인 다른 라틴 단어입니다. 다른 단어를 읽은 값 '{}' 은 이 원문의 별칭으로 쓰지 않습니다.",
+                    k,
+                    joined_src,
+                    d,
+                    tol,
+                    s.trim()
+                );
+            }
         }
     }
     String::new()
 }
 
+fn record_schema_adherence(parsed: &serde_json::Value) {
+    let both = TRANSLIT_SCHEMA_KEYS.iter().all(|k| parsed.get(*k).is_some());
+    crate::utils::score_dynamics::record_baseline("indexing.translit_schema_both_keys", if both { 1.0 } else { 0.0 });
+}
+
 pub fn sanitize_transliteration_dual_for_words(raw: &str, words: &[String]) -> (String, String) {
     let parsed = crate::parsing::parse_json_from_llm(raw);
+    record_schema_adherence(&parsed);
     let src_words: Vec<&str> = words.iter().map(|w| w.as_str()).collect();
     let extract_word_map = |obj: &serde_json::Value| -> String {
         let map = match obj.as_object() { Some(m) => m, None => return String::new() };
         let mut parts: Vec<String> = Vec::new();
         for w in &src_words {
-            if let Some(v) = map.get(*w).and_then(|v| v.as_str()) {
-                let val = v.trim();
-                if !val.is_empty() {
-                    let cleaned: String = val.chars()
-                        .filter(|c| !matches!(c, '-' | '_'))
-                        .collect();
-                    if !cleaned.is_empty() {
-                        parts.push(cleaned);
-                        continue;
-                    }
-                }
-            }
-            let w_lower = w.to_lowercase();
-            let mut found = false;
-            for (k, v) in map.iter() {
-                if k.to_lowercase() == w_lower {
-                    if let Some(s) = v.as_str() {
-                        let val = s.trim();
-                        if !val.is_empty() {
-                            let cleaned: String = val.chars()
-                                .filter(|c| !matches!(c, '-' | '_'))
-                                .collect();
-                            if !cleaned.is_empty() {
-                                parts.push(cleaned);
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if !found {
-                // 매칭 실패 시 원문 단어를 그대로 보존
+            let cleaned: String = word_key_value(map, w)
+                .map(|v| v.trim().chars().filter(|c| !matches!(c, '-' | '_')).collect())
+                .unwrap_or_default();
+            if cleaned.is_empty() {
                 parts.push(w.to_string());
+            } else {
+                parts.push(cleaned);
             }
         }
         parts.join(" ")
     };
-    // 🌟 [TRANSCRIPTION REMOVED] transcription 파싱을 완전히 제거합니다.
     let mut transliteration = String::new();
-    if let Some(tr_obj) = parsed.get("transliteration") {
+    if let Some(tr_obj) = schema_value(&parsed, "transliteration") {
         transliteration = extract_word_map(tr_obj);
     }
     if transliteration.is_empty() {
-        if let Some(val) = parsed.get("transliteration").and_then(|v| v.as_str()) {
+        if let Some(val) = schema_value(&parsed, "transliteration").and_then(|v| v.as_str()) {
             transliteration = val.trim().to_string();
         }
     }
@@ -1240,12 +1368,10 @@ pub fn sanitize_transliteration_dual_for_words(raw: &str, words: &[String]) -> (
         }
     }
     transliteration = transliteration.split_whitespace().collect::<Vec<_>>().join(" ");
-    // G1: 원문과 동일하면 폐기
     let src_joined = words.join(" ");
     if !transliteration.is_empty() && transliteration.eq_ignore_ascii_case(&src_joined) {
         transliteration = String::new();
     }
-    // G2: 표기 체계 반전 확인
     let src_non_latin_count: usize = words.iter()
         .filter(|w| !is_latin_dominant(w))
         .count();
@@ -1262,7 +1388,6 @@ pub fn sanitize_transliteration_dual_for_words(raw: &str, words: &[String]) -> (
             transliteration = String::new();
         }
     }
-    // 🌟 transcription 은 더 이상 존재하지 않으므로 빈 문자열 반환
     (String::new(), transliteration)
 }
 
@@ -1343,64 +1468,29 @@ pub fn sanitize_transliteration(raw: &str, source_value: &str) -> String {
 ///   - 둘 다 게이트 실패 시 둘 다 빈 문자열
 pub fn sanitize_transliteration_dual(raw: &str, source_value: &str) -> (String, String) {
     let parsed = crate::parsing::parse_json_from_llm(raw);
-    // 🌟 [SPECIAL CHAR STRIP] 프롬프트 키와 동일한 형태로 특수문자를 제거합니다.
+    record_schema_adherence(&parsed);
     let src_clean = strip_special_chars_for_transliteration(source_value);
     let src_clean_ref = src_clean.as_str();
     let src_words: Vec<&str> = src_clean_ref.split_whitespace().collect();
-    // ── 단어별 객체에서 값을 순서대로 조립 ──
-    //    🌟 [FULL SOURCE KEY SKIP] transliteration 객체의 첫 번째 키는 전체 SOURCE 입니다.
-    //    단어 단위 추출 시 전체 SOURCE 키는 건너뛰고 개별 단어만 매칭합니다.
     let extract_word_map = |obj: &serde_json::Value| -> String {
         let map = match obj.as_object() { Some(m) => m, None => return String::new() };
         let mut parts: Vec<String> = Vec::new();
         for w in &src_words {
-            // 1차: 완전일치
-            if let Some(v) = map.get(*w).and_then(|v| v.as_str()) {
-                let val = v.trim();
-                if !val.is_empty() {
-                    let cleaned: String = val.chars()
-                        .filter(|c| !matches!(c, '-' | '_'))
-                        .collect();
-                    if !cleaned.is_empty() {
-                        parts.push(cleaned);
-                    }
-                    continue;
+            if let Some(v) = word_key_value(map, w) {
+                let cleaned: String = v.trim().chars().filter(|c| !matches!(c, '-' | '_')).collect();
+                if !cleaned.is_empty() {
+                    parts.push(cleaned);
                 }
-            }
-            // 2차: 대소문자 무시 매칭
-            let w_lower = w.to_lowercase();
-            let mut found = false;
-            for (k, v) in map.iter() {
-                if k.to_lowercase() == w_lower {
-                    if let Some(s) = v.as_str() {
-                        let val = s.trim();
-                        if !val.is_empty() {
-                            let cleaned: String = val.chars()
-                                .filter(|c| !matches!(c, '-' | '_'))
-                                .collect();
-                            if !cleaned.is_empty() {
-                                parts.push(cleaned);
-                            }
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if !found {
-                // LLM 이 키를 누락한 경우 자리 보존 생략
             }
         }
         parts.join(" ")
     };
-    // 🌟 [TRANSCRIPTION REMOVED] transcription 파싱을 완전히 제거합니다.
-    //    transliteration 만 추출합니다.
     let mut transliteration = String::new();
-    if let Some(tr_obj) = parsed.get("transliteration") {
+    if let Some(tr_obj) = schema_value(&parsed, "transliteration") {
         transliteration = extract_word_map(tr_obj);
     }
     if transliteration.is_empty() {
-        if let Some(val) = parsed.get("transliteration").and_then(|v| v.as_str()) {
+        if let Some(val) = schema_value(&parsed, "transliteration").and_then(|v| v.as_str()) {
             transliteration = val.trim().to_string();
         }
     }
@@ -1415,7 +1505,6 @@ pub fn sanitize_transliteration_dual(raw: &str, source_value: &str) -> (String, 
         }
     }
     transliteration = transliteration.split_whitespace().collect::<Vec<_>>().join(" ");
-    // ── G1/G2/G3 게이트: transliteration 기준 ──
     let src_non_latin = src_clean_ref
         .chars()
         .filter(|c| c.is_alphabetic() && !c.is_ascii_alphabetic())
@@ -1437,7 +1526,6 @@ pub fn sanitize_transliteration_dual(raw: &str, source_value: &str) -> (String, 
             result_tr = String::new();
         }
     }
-    // 🌟 transcription 은 더 이상 존재하지 않으므로 빈 문자열 반환
     (String::new(), result_tr)
 }
 
@@ -1585,11 +1673,12 @@ fn romanize_for_phonetics(text: &str) -> String {
         .collect()
 }
 
+const LETTER_NAMES: [&str; 26] = [
+    "ei", "bi", "si", "di", "i", "ef", "ji", "eichi", "ai", "jei", "kei", "el", "em",
+    "en", "ou", "pi", "kyu", "ar", "es", "ti", "yu", "bi", "deobeulyu", "eks", "wai", "ji",
+];
+
 fn letter_name_reading(src: &str) -> Option<String> {
-    const NAMES: [&str; 26] = [
-        "ei", "bi", "si", "di", "i", "ef", "ji", "eichi", "ai", "jei", "kei", "el", "em",
-        "en", "ou", "pi", "kyu", "ar", "es", "ti", "yu", "bi", "dabeulyu", "eks", "wai", "ji",
-    ];
     let mut changed = false;
     let words: Vec<String> = src
         .split_whitespace()
@@ -1604,12 +1693,82 @@ fn letter_name_reading(src: &str) -> Option<String> {
             changed = true;
             letters
                 .iter()
-                .map(|c| NAMES[(*c as u8 - b'A') as usize])
+                .map(|c| LETTER_NAMES[(*c as u8 - b'A') as usize])
                 .collect::<Vec<_>>()
                 .join("")
         })
         .collect();
     if changed { Some(words.join(" ")) } else { None }
+}
+
+pub const SPELLED_OUT_MIN: f32 = 0.90;
+pub const TRANSLIT_GATE_REV: &str = "g4";
+
+fn letter_reading_key(romanized: &str) -> String {
+    let compact: String = romanized.split_whitespace().collect::<String>().replace("eu", "").replace("ou", "o");
+    let mut out = String::new();
+    for c in compact.chars() {
+        let c = match c {
+            'f' => 'p',
+            'r' => 'l',
+            'g' => 'k',
+            other => other,
+        };
+        if out.ends_with(c) && !"aeiou".contains(c) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn char_similarity(a: &str, b: &str) -> f32 {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let n = a.len().max(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    1.0 - edit_distance(&a, &b) as f32 / n as f32
+}
+
+pub fn spelled_out_similarity(latin_src: &str, native: &str) -> Option<f32> {
+    let src_words: Vec<&str> = latin_src.split_whitespace().collect();
+    let out_words: Vec<&str> = native.split_whitespace().collect();
+    if src_words.is_empty() || out_words.is_empty() {
+        return None;
+    }
+    let pairs: Vec<(&str, String)> = if src_words.len() == out_words.len() {
+        src_words.iter().zip(out_words.iter()).map(|(s, o)| (*s, o.to_string())).collect()
+    } else if src_words.len() == 1 {
+        vec![(src_words[0], out_words.concat())]
+    } else {
+        return None;
+    };
+    let mut best: Option<f32> = None;
+    for (word, heard_raw) in pairs {
+        let letters: Vec<char> = word.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        let acronym = letters.len() <= 5 && letters.iter().all(|c| c.is_ascii_uppercase());
+        if letters.len() < 3 || acronym || !letters.iter().any(|c| "aeiouyAEIOUY".contains(*c)) {
+            continue;
+        }
+        let heard = letter_reading_key(&romanize_for_phonetics(&heard_raw));
+        if heard.is_empty() {
+            continue;
+        }
+        let mut spelled = String::new();
+        for (k, c) in letters.iter().enumerate() {
+            spelled.push_str(LETTER_NAMES[(c.to_ascii_uppercase() as u8 - b'A') as usize]);
+            if k + 1 < 3 {
+                continue;
+            }
+            let sim = char_similarity(&heard, &letter_reading_key(&spelled));
+            if best.map_or(true, |b| sim > b) {
+                best = Some(sim);
+            }
+        }
+    }
+    best
 }
 
 pub fn phonetic_similarity(a: &str, b: &str) -> Option<f32> {
@@ -1648,6 +1807,30 @@ pub fn phonetic_gate(latin_src: &str, native: &str) -> (bool, Option<f32>) {
 pub fn gate_native_alias(latin_src: &str, native: String, tag: &str) -> String {
     if native.trim().is_empty() || is_latin_dominant(&native) {
         return native;
+    }
+    if let Some(mix) = foreign_script_mix(&native, latin_src) {
+        crate::utils::score_dynamics::record_baseline("indexing.translit_script_mix_reject", 1.0);
+        println!(
+            "    🚫 [{} SCRIPT MIX REJECT] '{}' → '{}' | 별칭에 서로 다른 비라틴 문자 체계가 섞였습니다 ({}). 한 언어로 옮긴 음차는 그 언어의 문자 체계 하나로 적힙니다(가나와 한자를 함께 쓰는 일본어는 예외). 다른 언어의 글자가 섞인 별칭은 소리 근거가 없어 쓰지 않습니다.",
+            tag, latin_src, native, mix
+        );
+        return String::new();
+    }
+    if let Some(sp) = spelled_out_similarity(latin_src, &native) {
+        let spelled = sp >= SPELLED_OUT_MIN;
+        crate::utils::score_dynamics::record_baseline("indexing.translit_spelled_out", if spelled { 1.0 } else { 0.0 });
+        if spelled {
+            crate::utils::score_dynamics::record_baseline("indexing.translit_phonetic_reject", 1.0);
+            println!(
+                "    🚫 [{} SPELLED-OUT REJECT] '{}' → '{}' | 원문 글자를 알파벳 이름으로 한 자씩 읽은 결과와 {:.2} 일치합니다 (기준 {:.2}). 발음할 수 있는 단어를 글자 이름으로 읽은 것은 음차가 아니라서 별칭으로 쓰지 않습니다. 대문자 5자 이하 약어(PC · BMW)는 글자 읽기가 정상 표기라 이 검사에서 뺍니다.",
+                tag,
+                latin_src,
+                native,
+                sp,
+                SPELLED_OUT_MIN
+            );
+            return String::new();
+        }
     }
     let (ok, sim) = phonetic_gate(latin_src, &native);
     if let Some(s) = sim {
@@ -1699,6 +1882,21 @@ pub fn cached_translit_recheck(
             None
         };
     }
+    if let Some(mix) = foreign_script_mix(&added.join(" "), src) {
+        return Some(format!(
+            "캐시 별칭 '{}' 에 서로 다른 비라틴 문자 체계가 섞였습니다 ({})",
+            added.join(" "),
+            mix
+        ));
+    }
+    if let Some(sp) = spelled_out_similarity(&latin.join(" "), &added.join(" ")).filter(|s| *s >= SPELLED_OUT_MIN) {
+        return Some(format!(
+            "캐시 별칭 '{}' 는 원문 글자를 알파벳 이름으로 한 자씩 읽은 것입니다 (일치 {:.2} ≥ {:.2})",
+            added.join(" "),
+            sp,
+            SPELLED_OUT_MIN
+        ));
+    }
     let (ok, sim) = phonetic_gate(&latin.join(" "), &added.join(" "));
     if ok {
         None
@@ -1710,6 +1908,98 @@ pub fn cached_translit_recheck(
             PHONETIC_PASS
         ))
     }
+}
+
+fn script_class(c: char) -> u8 {
+    match c as u32 {
+        0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x024F | 0x1E00..=0x1EFF => 1,
+        0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7AF => 2,
+        0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF66..=0xFF9F => 3,
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => 4,
+        0x0400..=0x04FF => 5,
+        0x0E00..=0x0E7F => 6,
+        0x0600..=0x06FF => 7,
+        _ if c.is_alphabetic() => 8,
+        _ => 0,
+    }
+}
+
+fn script_set(text: &str) -> std::collections::BTreeSet<u8> {
+    text.chars().map(script_class).filter(|s| *s != 0).collect()
+}
+
+fn foreign_script_mix(text: &str, source: &str) -> Option<String> {
+    let set: std::collections::BTreeSet<u8> = text
+        .chars()
+        .filter(|c| c.is_alphabetic() && !source.contains(*c))
+        .map(script_class)
+        .filter(|s| *s > 1)
+        .collect();
+    if set.len() <= 1 || set.iter().all(|s| *s == 3 || *s == 4) {
+        return None;
+    }
+    Some(
+        set.iter()
+            .map(|s| match s {
+                2 => "한글",
+                3 => "가나",
+                4 => "한자",
+                5 => "키릴 문자",
+                6 => "타이 문자",
+                7 => "아랍 문자",
+                _ => "기타 문자",
+            })
+            .collect::<Vec<_>>()
+            .join(" + "),
+    )
+}
+
+fn display_exonym(name: &str) -> String {
+    if name.chars().filter(|c| c.is_ascii_alphabetic()).count() <= 3 {
+        return name.to_uppercase();
+    }
+    name.split_whitespace()
+        .map(|w| {
+            let mut cs = w.chars();
+            match cs.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + cs.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn canonical_entity_alias(src: &str, doc_lang: &str) -> Option<(String, String, &'static str)> {
+    let code = crate::utils::ai_utils::country_code_exact(src)?;
+    let sample = native_script_sample(doc_lang, "", "");
+    if sample.trim().is_empty() || is_latin_dominant(&sample) {
+        return None;
+    }
+    let mut target = script_set(&sample);
+    if target.contains(&3) {
+        target.insert(4);
+    }
+    let (_, raw) = crate::utils::ai_utils::COUNTRY_NAMES_ML.iter().find(|(c, _)| *c == code)?;
+    let key_of = |t: &str| -> String { t.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase() };
+    let src_key = key_of(src);
+    let mut native: Vec<&str> = Vec::new();
+    let mut english: Option<&str> = None;
+    for name in raw.split(',').map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        let set = script_set(name);
+        if english.is_none() && name.is_ascii() && set.len() == 1 && set.contains(&1) {
+            english = Some(name);
+        }
+        if native.len() < 2 && !set.is_empty() && set.is_subset(&target) && key_of(name) != src_key && !native.contains(&name) {
+            native.push(name);
+        }
+    }
+    let roman = if is_latin_dominant(src) { String::new() } else { english.map(display_exonym).unwrap_or_default() };
+    let native = native.join(" ");
+    if native.is_empty() && roman.is_empty() {
+        return None;
+    }
+    Some((native, roman, code))
 }
 
 /// [PHASE B - 로그 헬퍼] 메타데이터 부여 + NMS + FORMAT GATE 전체 결과를 출력합니다.

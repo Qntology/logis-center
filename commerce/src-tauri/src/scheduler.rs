@@ -19,6 +19,7 @@ mod worker;
 mod entity;
 pub mod relay_ledger;
 pub mod trading;
+pub mod list_census;
 
 use crate::scheduler::translit::{generate_transliteration_aliases, transliterate_cross_language};
 use crate::scheduler::indexing::{upsert_alias_chunks, index_item_chunks, save_item};
@@ -48,9 +49,424 @@ fn best_thead_th_dbg(sel: &str, html: &str) -> usize {
     doc.select(&q).next().map(|e| e.select(&th).count()).unwrap_or(0)
 }
 
+fn derive_thead_selector(html: &str, target_selector: &str) -> Option<(String, String)> {
+    let doc = scraper::Html::parse_document(html);
+    let row_q = scraper::Selector::parse(target_selector).ok()?;
+    let row_el = doc.select(&row_q).next()?;
+    let mut table_el: Option<scraper::ElementRef> = None;
+    let mut cur = row_el.parent();
+    while let Some(node) = cur {
+        if let Some(e) = node.value().as_element() {
+            let n = e.name().to_lowercase();
+            if n == "table" {
+                table_el = scraper::ElementRef::wrap(node);
+                break;
+            }
+            if n == "body" || n == "html" {
+                break;
+            }
+        }
+        cur = node.parent();
+    }
+    let tbl = table_el?;
+    let tv = tbl.value();
+    let tsel = match tv.id() {
+        Some(id) => format!("table#{}", id),
+        None => {
+            let mut s = String::from("table");
+            for c in tv.classes().take(3) {
+                s.push('.');
+                s.push_str(c);
+            }
+            s
+        }
+    };
+    let th_q = scraper::Selector::parse("th").ok()?;
+    let td_q = scraper::Selector::parse("td").ok()?;
+    let own_head = scraper::Selector::parse("thead").ok().and_then(|q| tbl.select(&q).next());
+    let (cand, own) = match own_head {
+        Some(h) => (format!("{} thead", tsel), h),
+        None => {
+            let tr_q = scraper::Selector::parse("tr").ok()?;
+            (format!("{} tr", tsel), tbl.select(&tr_q).next()?)
+        }
+    };
+    let cand_q = scraper::Selector::parse(&cand).ok()?;
+    let first = doc.select(&cand_q).next()?;
+    if first.id() != own.id() {
+        return None;
+    }
+    let th = first.select(&th_q).count();
+    let td = first.select(&td_q).count();
+    if th >= 2 && th > td {
+        Some((cand, tsel))
+    } else {
+        None
+    }
+}
+
 /// 🌟 [PREJUDICE PAIR] 영어 편견 문장 벡터에 문서 언어 편견 문장 벡터를 더합니다.
 ///  두 벡터 중 최댓값(max_pool_sim)으로 재므로 단일 문장 코사인에 맞춰 둔 임계 눈금이 그대로 유지됩니다.
 ///  수십 구의 뱅크로 바꾸면 최댓값이 구조적으로 올라가 0.35 / 0.38 / 0.50 / 0.55 임계가 한꺼번에 어긋납니다.
+const SYNTHESIS_SKIP_DROP: f32 = 0.8;
+
+async fn run_synthesis_pass(
+    model: &LogisModel,
+    items: &mut Vec<Value>,
+    jobs: &[(usize, String, String)],
+    item_pos: &std::collections::HashMap<usize, usize>,
+    page_type: &str,
+    doc_lang: &str,
+    probe_text: &str,
+    skip_drop: f32,
+    cancel: &Arc<AtomicBool>,
+    emit_term: &(dyn Fn(&str) + Send + Sync),
+    step: &str,
+) -> Result<()> {
+    use crate::openai_types::{
+        ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    };
+    const STREAK_LIMIT: usize = 4;
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let pass_reason = format!("{} pass", step.replace('_', " "));
+    let verdict = model.lang_route("commerce", step, doc_lang, probe_text).await;
+    emit_term(&format!("  {}", verdict.line));
+    let mut lang: Option<crate::model::lang_llm::LangSession> = match verdict.code.as_deref() {
+        Some(code) => model.enter_lang_generation(code, &pass_reason).await,
+        None => None,
+    };
+    if lang.is_none() {
+        model
+            .enter_generation_phase(
+                crate::model::ModelSize::Qwen3,
+                None,
+                Some(cancel.clone()),
+                false,
+                Some("inference".to_string()),
+                &pass_reason,
+            )
+            .await?;
+    }
+    let sds_gate = |is_lang: bool| -> Option<(f32, u64)> {
+        crate::utils::score_dynamics::adaptive_recent(crate::model::lang_llm::synthesis_drop_axis(is_lang))
+            .filter(|(recent, _, _)| *recent >= skip_drop)
+            .map(|(recent, _, n)| (recent, n))
+    };
+    let total_items = items.len();
+    emit_term(&format!(
+        "  🧠 [SYNTHESIS PASS] 요약 {}건을 {} 로 만듭니다 | 값이 모두 확정된 아이템의 값표만 넘기고, 추출 단계의 디코딩 제약(확정된 다른 필드 값의 금지 목록 · 다른 필드 의미 편견)을 걸지 않습니다. 결과는 같은 원문 대조 게이트를 거치고, 연속 {}건이 게이트를 통과하지 못하면 다음 엔진으로 넘기거나 멈춥니다.",
+        jobs.len(),
+        lang.as_ref().map(|s| s.label()).unwrap_or_else(|| "Qwen3".to_string()),
+        STREAK_LIMIT
+    ));
+    let (ram_before, _) = crate::model::ram_snapshot();
+    crate::model::release_os_working_set();
+    let (ram_after, ram_total) = crate::model::ram_snapshot();
+    crate::utils::score_dynamics::record_baseline(
+        "commerce.synthesis_entry_trim_gain_mb",
+        (ram_after.saturating_sub(ram_before) / 1_000_000) as f32,
+    );
+    emit_term(&format!(
+        "  🧹 [SYNTHESIS PASS / RAM] 첫 요약 호출 전에 앞 단계(필드 추출 · 모델 적재)가 남긴 작업 집합을 반환합니다 | RAM 여유 {}MB → {}MB | {}",
+        ram_before / 1_000_000,
+        ram_after / 1_000_000,
+        crate::model::ram_pressure_line(ram_after, ram_total)
+    ));
+    let announce_gate = |g: Option<(f32, u64)>| {
+        if let Some((recent, n)) = g {
+            emit_term(&format!(
+                "    🔬 [SYNTHESIS PASS / SDS] 이 엔진의 최근 요약 문장 {:.0}% 가 원문 대조에서 폐기되었습니다 (관측 {}건, 기준 {:.0}%). 이번 목록은 첫 요약 하나만 관측용으로 만들고 나머지는 비워 둡니다.",
+                recent * 100.0,
+                n,
+                skip_drop * 100.0
+            ));
+        }
+    };
+    let mut gate = sds_gate(lang.is_some());
+    announce_gate(gate);
+    let mut observed = false;
+    let mut streak = 0usize;
+    let lang_label = lang.as_ref().map(|s| s.label());
+    let mut stats: [(usize, usize, u128); 2] = [(0, 0, 0); 2];
+    for (done, (item_idx, field_name, field_desc)) in jobs.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("Task cancelled"));
+        }
+        let pos = match item_pos.get(item_idx) {
+            Some(p) => *p,
+            None => continue,
+        };
+        if gate.is_some() && observed {
+            crate::utils::score_dynamics::record_baseline("commerce.synthesis_skip", 1.0);
+            continue;
+        }
+        let item = match items.get(pos) {
+            Some(v) => v.clone(),
+            None => continue,
+        };
+        let sheet = match crate::utils::ai_utils::synthesis_value_sheet(&item, page_type, doc_lang) {
+            Some(s) => s,
+            None => {
+                emit_term(&format!(
+                    "    ⏭️ [SYNTHESIS PASS] Item {}/{} · '{}' | 확정된 값이 2개 미만이라 요약 재료가 없습니다.",
+                    pos + 1,
+                    total_items,
+                    field_name
+                ));
+                continue;
+            }
+        };
+        crate::utils::score_dynamics::record_baseline("commerce.synthesis_sheet_fields", sheet.lines().count() as f32);
+        emit_term(&format!(
+            "    🧠 [SYNTHESIS PASS / VALUE SHEET] Item {}/{} · '{}' | 확정된 값 {}개를 요약 재료로 넘깁니다.",
+            pos + 1,
+            total_items,
+            field_name,
+            sheet.lines().count()
+        ));
+        let used_lang = lang.is_some();
+        let question = if used_lang {
+            parsing::extract_synthesis_field_prompt_native(page_type, field_name, field_desc, doc_lang, &sheet)
+        } else {
+            parsing::extract_synthesis_field_prompt(page_type, field_name, field_desc, doc_lang, &sheet)
+        };
+        let system_message = ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+            content: format!(
+                "[JSON CONTEXT]\n{}\n\n[SYNTHESIS FIELD NOTICE]\nThis field is NOT a value to copy. Read the WHOLE [JSON CONTEXT] above and write ONE short sentence that summarizes it. Never return a single cell value such as a bare number, a status word, a person name, or a branch name. If [JSON CONTEXT] is empty, return null.",
+                sheet
+            ),
+            name: None,
+        });
+        let user_msg = ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(question),
+            name: None,
+        });
+        let keys: Vec<String> = field_name.split(',').map(|s| s.trim().to_string()).collect();
+        let started = std::time::Instant::now();
+        let res = if let Some(sess) = lang.as_ref() {
+            model
+                .generate_lang_json(sess.code(), vec![system_message, user_msg], 512, 0.0, None, &keys, Some(cancel.clone()))
+                .await
+                .map(|(text, _)| text)
+        } else {
+            let q3_gen = model.qwen3_generator.clone();
+            let cancel_clone = cancel.clone();
+            let params = ChatCompletionParameters {
+                messages: vec![system_message, user_msg],
+                model: "qwen3".to_string(),
+                max_tokens: Some(512),
+                temperature: Some(0.0),
+                top_p: Some(0.95),
+                ..Default::default()
+            };
+            let r = tokio::task::spawn_blocking(move || {
+                let mut guard = q3_gen.blocking_lock();
+                match guard.as_mut() {
+                    Some(gen) => gen
+                        .generate(params, Some(cancel_clone), None, None)
+                        .map_err(|e| anyhow::anyhow!("Qwen 3 synthesis failed: {}", e)),
+                    None => Err(anyhow::anyhow!("Qwen 3 Generator not available")),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+            let q3_clear = model.qwen3_generator.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(gen) = q3_clear.blocking_lock().as_mut() {
+                    gen.clear_kv_cache();
+                }
+            })
+            .await;
+            if !model.is_cpu_mode {
+                let dev = model.device_config.device.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if dev.is_cuda() {
+                        let _ = dev.synchronize();
+                    }
+                })
+                .await;
+            }
+            r
+        };
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow::anyhow!("Task cancelled"));
+        }
+        let call_ms = started.elapsed().as_millis();
+        crate::utils::score_dynamics::record_baseline(
+            if used_lang { "commerce.synthesis_call_ms.lang4b" } else { "commerce.synthesis_call_ms.qwen3" },
+            call_ms as f32,
+        );
+        crate::utils::score_dynamics::record_baseline(
+            if used_lang { "commerce.synthesis_ram_free_mb.lang4b" } else { "commerce.synthesis_ram_free_mb.qwen3" },
+            (crate::utils::resources::free_ram_bytes() / 1_000_000) as f32,
+        );
+        observed = true;
+        let mut lang_failed = false;
+        let found: Option<(String, String)> = match res {
+            Ok(raw) => {
+                let mut parsed = parsing::parse_json_from_llm(&raw);
+                let parsed_val = if let Some(inner) = parsed.get_mut(page_type) { inner.take() } else { parsed };
+                let sheet_values: Vec<String> = sheet
+                    .lines()
+                    .filter_map(|l| l.split_once(": ").map(|(_, v)| v.trim().to_lowercase()))
+                    .collect();
+                let not_summary = |s: &str| -> bool {
+                    let t = s.trim().trim_matches(|c: char| c == '.' || c == '"' || c == '\'').trim().to_lowercase();
+                    !t.chars().any(|c| c.is_alphanumeric())
+                        || ["null", "string", "n/a", "none", "undefined"].contains(&t.as_str())
+                        || sheet_values.iter().any(|v| *v == t)
+                };
+                let hit = keys.iter().find_map(|k| {
+                    parsed_val
+                        .get(k.as_str())
+                        .and_then(|v| v.as_str())
+                        .map(|s| strip_markup_prefix(s.trim()))
+                        .filter(|s| !not_summary(s))
+                        .map(|s| (k.clone(), s))
+                });
+                if hit.is_none() {
+                    emit_term(&format!(
+                        "    ⏭️ [SYNTHESIS PASS] Item {}/{} · '{}' | 응답에 요약 문장이 없습니다 (빈 값 · 자리표시 · 값표의 값 하나를 그대로 돌려준 응답). 요약 필드의 답은 값 둘 이상을 잇는 문장이어야 합니다.",
+                        pos + 1,
+                        total_items,
+                        field_name
+                    ));
+                }
+                hit
+            }
+            Err(e) => {
+                emit_term(&format!(
+                    "    ⚠️ [SYNTHESIS PASS] Item {}/{} · '{}' | 생성에 실패했습니다: {}",
+                    pos + 1,
+                    total_items,
+                    field_name,
+                    e
+                ));
+                lang_failed = used_lang;
+                None
+            }
+        };
+        let pass = match found {
+            Some((key, text)) => {
+                let g = crate::utils::ai_utils::synthesis_fact_gate(&text, &sheet, doc_lang);
+                if g.total > 0 {
+                    crate::utils::score_dynamics::record_baseline(
+                        crate::model::lang_llm::synthesis_drop_axis(used_lang),
+                        g.dropped.len() as f32 / g.total as f32,
+                    );
+                }
+                if !g.dropped.is_empty() {
+                    emit_term(&format!(
+                        "    🧪 [SYNTHESIS GROUNDING] Item {}/{} · '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
+                        pos + 1,
+                        total_items,
+                        key,
+                        g.total,
+                        g.dropped.len(),
+                        g.dropped.iter().map(|(s, why)| format!("\"{}\" ← {}", s, why.join("·"))).collect::<Vec<_>>(),
+                        g.kept
+                    ));
+                }
+                let twin = if g.kept.is_empty() {
+                    None
+                } else {
+                    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let mine = norm(&g.kept);
+                    jobs.iter()
+                        .filter(|(ji, jf, _)| *ji == *item_idx && jf != field_name)
+                        .flat_map(|(_, jf, _)| jf.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+                        .find(|k| {
+                            items
+                                .get(pos)
+                                .and_then(|v| v.get(k.as_str()))
+                                .and_then(|v| v.as_str())
+                                .map_or(false, |s| norm(s) == mine)
+                        })
+                };
+                if let Some(other) = twin.as_ref() {
+                    crate::utils::score_dynamics::record_baseline("commerce.synthesis_duplicate", 1.0);
+                    emit_term(&format!(
+                        "    ♻️ [SYNTHESIS DUPLICATE] Item {}/{} · '{}' | 같은 아이템의 요약 필드 '{}' 와 문장이 같아 넣지 않습니다. 같은 문장이 두 필드로 색인되면 한 질의에 청크 두 개로 걸려 이 문서가 근거 없이 앞섭니다.",
+                        pos + 1,
+                        total_items,
+                        key,
+                        other
+                    ));
+                } else if !g.kept.is_empty() {
+                    if let Some(obj) = items.get_mut(pos).and_then(|v| v.as_object_mut()) {
+                        obj.insert(key.clone(), json!(g.kept.clone()));
+                    }
+                    emit_term(&format!("    ✅ [SYNTHESIS PASS] Item {}/{} · \"{}\": \"{}\"", pos + 1, total_items, key, g.kept));
+                }
+                g.dropped.is_empty() && !g.kept.is_empty()
+            }
+            None => false,
+        };
+        crate::model::lang_llm::record_engine_outcome("commerce", step, used_lang, pass);
+        let slot = &mut stats[usize::from(used_lang)];
+        slot.0 += 1;
+        slot.1 += usize::from(pass);
+        slot.2 += call_ms;
+        streak = if pass { 0 } else { streak + 1 };
+        if lang_failed || streak >= STREAK_LIMIT {
+            if used_lang {
+                emit_term(&format!(
+                    "    🔁 [SYNTHESIS ENGINE FALLBACK] {} 의 요약이 연속 {}건 원문 대조를 통과하지 못했거나 생성에 실패해, 남은 {}건은 Qwen3 로 만듭니다.",
+                    lang.as_ref().map(|s| s.label()).unwrap_or_default(),
+                    streak,
+                    jobs.len() - done - 1
+                ));
+                crate::utils::score_dynamics::record_baseline("commerce.synthesis_engine_fallback", 1.0);
+                lang = None;
+                model
+                    .enter_generation_phase(
+                        crate::model::ModelSize::Qwen3,
+                        None,
+                        Some(cancel.clone()),
+                        false,
+                        Some("inference".to_string()),
+                        &format!("{} (fallback)", pass_reason),
+                    )
+                    .await?;
+                streak = 0;
+                gate = sds_gate(false);
+                announce_gate(gate);
+                observed = false;
+            } else {
+                emit_term(&format!(
+                    "    ⛔ [SYNTHESIS PASS STOP] Qwen3 요약이 연속 {}건 원문 대조를 통과하지 못해 남은 {}건은 비워 둡니다. 확인되지 않은 요약을 색인하지 않는 쪽이 전처리 결과를 지킵니다.",
+                    streak,
+                    jobs.len() - done - 1
+                ));
+                crate::utils::score_dynamics::record_baseline("commerce.synthesis_pass_stop", 1.0);
+                for _ in (done + 1)..jobs.len() {
+                    crate::utils::score_dynamics::record_baseline("commerce.synthesis_skip", 1.0);
+                }
+                break;
+            }
+        }
+    }
+    let summary: Vec<String> = [(1usize, lang_label.unwrap_or_default()), (0usize, "Qwen3".to_string())]
+        .iter()
+        .filter(|(i, _)| stats[*i].0 > 0)
+        .map(|(i, label)| {
+            let (calls, passes, ms) = stats[*i];
+            format!("{} 호출 {}건 · 통과 {}건 · 호출당 평균 {:.1}초", label, calls, passes, ms as f64 / calls as f64 / 1000.0)
+        })
+        .collect();
+    if !summary.is_empty() {
+        emit_term(&format!(
+            "  📊 [SYNTHESIS PASS / SUMMARY] {} | 원문 대조를 통과한 문장만 아이템에 들어갑니다. 같은 목록에서 엔진별 통과율과 시간을 나란히 봅니다.",
+            summary.join(" | ")
+        ));
+    }
+    crate::utils::score_dynamics::flush();
+    Ok(())
+}
+
 async fn prejudice_pair(model: &LogisModel, en_text: &str, doc_lang: &str) -> Vec<Vec<f32>> {
     let mut out: Vec<Vec<f32>> = Vec::new();
     if let Ok(e) = model.get_embedding(en_text.to_string()).await {
@@ -332,8 +748,7 @@ pub async fn process_task(
     let mut raw_pug = parsing::convert_to_clean_pug(&clean_html_content, PugMode::NoAttributesMode, Some(&url));
     let mut light_pug = model.truncate_pug_context(&raw_pug, false, 2000, None).await;
 
-    let base_path = std::fs::canonicalize("src-tauri/models").or_else(|_| std::fs::canonicalize("models")).unwrap_or_default();
-    let tokenizer_path = base_path.join("Qwen3-0.6B-Instruct-gguf").to_string_lossy().to_string();
+    let tokenizer_path = model.qwen3_tokenizer_dir().to_string();
  
     let raw_system_prefix = format!("<|im_start|>system\n{}<|im_end|>\n", light_pug);
 
@@ -2546,10 +2961,19 @@ pub async fn process_task(
 
                         
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
+    let mut census_selector_used = false;
+    let list_census: Option<crate::scheduler::list_census::ListCensus> = if !is_detail && !skip_ai_analysis {
+        let mut census = crate::scheduler::list_census::run(&clean_html_content);
+        crate::scheduler::list_census::score_content(&mut census, &model, &page_type, &doc_lang).await;
+        for line in census.report_lines() {
+            emit_term(&line);
+        }
+        crate::utils::score_dynamics::record_baseline("commerce.census_data_groups", census.data_grade_count() as f32);
+        Some(census)
+    } else {
+        None
+    };
     model.deep_purge_resources().await;
-    // 🌟 [CROSSOVER] 직접 퍼지한 경로는 페이즈 상태를 되돌려야 합니다.
-    //    이 줄이 없으면 다음 enter_*_phase 가 '아직 상주 중' 으로 오판해
-    //    불필요한 스왑을 하거나, 반대로 로드를 생략해 버립니다.
     model.mark_crossover_idle();
  
     {
@@ -2597,122 +3021,176 @@ pub async fn process_task(
 
 
 
-                let mut titles = Vec::new();
-                {
-                    let params = ChatCompletionParameters {
-                        messages: vec![
-                            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                                content: system_content.clone(),
-                                name: None,
-                            }),
-                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                                name: None,
-                            })
-                        ],
-                        model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3".to_string() }, 
-                        max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
-                        ..Default::default()
-                    };
-
-                    let res = if base_model_size == crate::model::ModelSize::Qwen {
-                        // 🌟 [CROSSOVER] STEP A 에서 임베딩을 대량으로 썼으므로
-                        //    여기서 임베딩이 남아 있을 수 있습니다. 예산에 따라 정리합니다.
-                        model
-                            .enter_generation_phase(
-                                crate::model::ModelSize::Qwen,
-                                Some(&base_session_id),
-                                Some(cancellation_token.clone()),
-                                false,
-                                kv_name.clone(),
-                                "title extraction (Qwen 0.6B)",
-                            )
-                            .await?;
-                        if let Some(gen) = model.generator.lock().await.as_mut() {
-                            println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
-                            
-                            let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
-                            gen.generate(
-                                params, 
-                                Some(cancellation_token.clone()), 
-                                Some(snapshot_id.clone()), 
-                                kv_name.clone(),
-                                Some(&title_prej) 
-                            ).await?
+                let title_excerpt = if base_model_size == crate::model::ModelSize::Qwen {
+                    None
+                } else {
+                    list_census.as_ref().and_then(|c| c.title_excerpt(&clean_html_content))
+                };
+                crate::utils::score_dynamics::record_baseline(
+                    "commerce.title_excerpt_available",
+                    if title_excerpt.is_some() { 1.0 } else { 0.0 },
+                );
+                let (titles, titles_well_formed): (Vec<String>, bool) = {
+                    let mut contexts: Vec<(String, bool)> = Vec::new();
+                    if let Some(ex) = title_excerpt.as_ref() {
+                        contexts.push((format!("[PUG CONTENT]\n{}", ex.text), true));
+                    }
+                    contexts.push((system_content.clone(), false));
+                    let mut q35_ready = false;
+                    let mut outcome: (Vec<String>, bool) = (Vec::new(), false);
+                    for (context, from_excerpt) in contexts.into_iter() {
+                        let call_session = if from_excerpt { format!("{}_excerpt", snapshot_id) } else { snapshot_id.clone() };
+                        let params = ChatCompletionParameters {
+                            messages: vec![
+                                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                                    content: context.clone(),
+                                    name: None,
+                                }),
+                                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                                    name: None,
+                                })
+                            ],
+                            model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3.5".to_string() },
+                            max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+                            ..Default::default()
+                        };
+                        let res = if base_model_size == crate::model::ModelSize::Qwen {
+                            model
+                                .enter_generation_phase(
+                                    crate::model::ModelSize::Qwen,
+                                    Some(&base_session_id),
+                                    Some(cancellation_token.clone()),
+                                    false,
+                                    kv_name.clone(),
+                                    "title extraction (Qwen 0.6B)",
+                                )
+                                .await?;
+                            if let Some(gen) = model.generator.lock().await.as_mut() {
+                                println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
+                                let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
+                                gen.generate(
+                                    params,
+                                    Some(cancellation_token.clone()),
+                                    Some(call_session.clone()),
+                                    kv_name.clone(),
+                                    Some(&title_prej)
+                                ).await?
+                            } else {
+                                return Err(anyhow::anyhow!("Qwen generator missing"));
+                            }
                         } else {
-                            return Err(anyhow::anyhow!("Qwen generator missing"));
-                        }
-                    } else {
-                        model
-                            .switch_to_generation(
-                                crate::model::ModelSize::Qwen3,
-                                Some(cancellation_token.clone()),
-                                None,
-                                "title extraction (Qwen3)",
-                            )
-                            .await?;
-                        let q3_gen_arc = model.qwen3_generator.clone();
-                        let cancel_clone = cancellation_token.clone();
-                        let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
-                        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-                            let mut gen_guard = q3_gen_arc.blocking_lock();
-                            if let Some(gen) = gen_guard.as_mut() {
-                                println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3)...");
-                                gen.generate(params, Some(cancel_clone), None, Some(&title_prej)).map_err(|e| anyhow::anyhow!("Qwen3 failed: {}", e)) 
-                            } else {
-                                Err(anyhow::anyhow!("Qwen3 generator missing"))
+                            if !q35_ready {
+                                model
+                                    .switch_to_generation(
+                                        crate::model::ModelSize::Qwen3_5,
+                                        Some(cancellation_token.clone()),
+                                        kv_name.clone(),
+                                        "title extraction (Qwen3.5-2B)",
+                                    )
+                                    .await?;
+                                q35_ready = true;
                             }
-                        }).await??
-                    };
-                    
-                    println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
-
-
-                    let title_info = parsing::parse_json_from_llm(&res);
-                        
-                    if title_info.as_object().map_or(true, |obj| obj.is_empty()) {
-                        return Err(anyhow::anyhow!("LLM returned invalid or unparseable JSON response during title extraction."));
-                    }
-
-                    let items_opt = title_info.get("order")
-                        .or(title_info.get("goods"))
-                        .or(title_info.get("title"))
-                        .or(title_info.get("titles"))
-                        .or(title_info.get("product"))
-                        .and_then(|v| v.as_array());
-
-                    if let Some(items) = items_opt {
-                        for item in items {
-                            let t_val = if let Some(t) = item.as_str() {
-                                Some(t)
-                            } else if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
-                                Some(t)
+                            let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
+                            if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                                println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3.5-2B)...");
+                                gen.generate(
+                                    params,
+                                    Some(cancellation_token.clone()),
+                                    Some(call_session.clone()),
+                                    kv_name.clone(),
+                                    None,
+                                    Some(&title_prej),
+                                ).await?
                             } else {
-                                None
-                            };
-                            
-                            if let Some(t) = t_val {
-                                
-                                let clean_t = t.replace(",", "").replace(".", "").trim().to_string();
-                                let is_only_numbers = !clean_t.is_empty() && clean_t.chars().all(|c| c.is_ascii_digit());
-                                
-                                if !is_only_numbers {
-                                    titles.push(t.to_string());
-                                }
+                                return Err(anyhow::anyhow!("Qwen3.5 generator missing"));
+                            }
+                        };
+                        println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
+                        let title_info = parsing::parse_json_from_llm(&res);
+                        let well_formed = title_info.as_object().map_or(false, |obj| !obj.is_empty());
+                        let harvested = crate::scheduler::list_census::harvest_titles(&title_info, &res);
+                        println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", harvested);
+                        if from_excerpt {
+                            crate::utils::score_dynamics::record_baseline(
+                                "commerce.title_excerpt_hit",
+                                if harvested.is_empty() { 0.0 } else { 1.0 },
+                            );
+                            if harvested.is_empty() {
+                                emit_term("  ✂️ [TITLE EXCERPT / EMPTY] 반복 구조 발췌에서 제목을 찾지 못했습니다. 기존과 같은 전체 PUG 로 한 번 더 묻습니다.");
+                                continue;
+                            }
+                            if let Some(ex) = title_excerpt.as_ref() {
+                                let ratio = context.chars().count() as f32 / system_content.chars().count().max(1) as f32;
+                                crate::utils::score_dynamics::record_baseline("commerce.title_excerpt_ratio", ratio);
+                                emit_term(&format!(
+                                    "  ✂️ [TITLE EXCERPT] 전수 조사 1위 '{}' 가 나머지 후보보다 구조점수 {:.1}배 우세해, 2B 에 전체 PUG 대신 이 반복 구조의 첫 {}행(전체 {}행)과 머리행 {}칸만 보냈습니다 | 문맥 {}자 / 전체 PUG {}자 ({:.1}%) | 제목 {}개. 제목으로 반복 구조를 찾는 Boa 판정은 그대로이며, 이 경우 아래 CENSUS SHADOW 는 같은 후보에서 나온 제목이라 독립 관측이 아닙니다.",
+                                    ex.selector,
+                                    ex.dominance,
+                                    ex.rows,
+                                    ex.members,
+                                    ex.header_cells,
+                                    context.chars().count(),
+                                    system_content.chars().count(),
+                                    ratio * 100.0,
+                                    harvested.len()
+                                ));
                             }
                         }
+                        crate::utils::score_dynamics::record_baseline("commerce.title_llm_count", harvested.len() as f32);
+                        outcome = (harvested, well_formed);
+                        break;
                     }
-                    println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", titles);
+                    outcome
+                };
+                if base_model_size == crate::model::ModelSize::Qwen {
+                    model.deep_purge_resources().await;
                 }
-
-                model.deep_purge_resources().await;
-
+                let mut census_selector: Option<serde_json::Value> = None;
                 if titles.is_empty() {
-                    
-                    return Err(anyhow::anyhow!("[JS-BRIDGE] No titles extracted from LLM. Aborting task to prevent invalid DOM fallback."));
+                    let census = list_census.as_ref();
+                    if let Some(empty) = census.filter(|_| titles_well_formed).and_then(|c| c.empty_verdict()) {
+                        emit_term(&format!(
+                            "  📭 [EMPTY LIST VERDICT] LLM 이 정상 JSON 으로 빈 제목 목록을 돌려주었고 DOM 전수 조사도 같은 결론입니다: 표 '{}' 는 머리행 {}칸 · 본문 {}행이며 본문에 데이터 행이 없습니다 (\"{}\"). 폼·랜드마크 밖에서 여러 칸짜리 반복 구조도 0개입니다. 서로 독립인 두 근거가 일치하므로 오류로 중단하지 않고 '0건 목록' 으로 완료합니다. 셀렉터는 캐시하지 않으므로 행이 생긴 뒤 같은 페이지를 넣으면 처음부터 분석합니다.",
+                            empty.selector, empty.header_cells, empty.body_rows, empty.notice
+                        ));
+                        crate::utils::score_dynamics::record_baseline("commerce.census_empty_verdict", 1.0);
+                        let payload = json!({
+                            "task_id": task.id,
+                            "category": "Done",
+                            "summary": "Extraction complete. The list has no rows (0 items).",
+                            "spinner": "✅",
+                            "data": null
+                        });
+                        let _ = app_handle.emit("extraction-progress", &payload);
+                        log_task_progress(app_handle, &task.id, &payload);
+                        emit_term(&format!("[PROCESS] {}", crate::utils::score_dynamics::report()));
+                        crate::utils::score_dynamics::flush();
+                        crate::utils::score_dynamics::leave_scope();
+                        return Ok(());
+                    }
+                    match census.and_then(|c| c.decisive_fallback()) {
+                        Some(g) => {
+                            emit_term(&format!(
+                                "  🧮 [CENSUS FALLBACK / NO TITLES] LLM 제목이 비어 Boa 가 기준으로 삼을 텍스트가 없지만, DOM 전수 조사가 결정적인 목록 1개를 찾았습니다: '{}' | 행 {} · 칸 평균 {:.1} · 내용마진 {:+.4} · 2위 대비 구조점수 2배 이상. 이 셀렉터로 이어 가되 페이지 캐시에는 남기지 않습니다.",
+                                g.item_selector, g.members, g.avg_cells, g.content_margin.unwrap_or(0.0)
+                            ));
+                            crate::utils::score_dynamics::record_baseline("commerce.census_fallback", 1.0);
+                            census_selector = Some(g.selector_json());
+                        }
+                        None if !titles_well_formed => {
+                            return Err(anyhow::anyhow!("LLM returned invalid or unparseable JSON response during title extraction."));
+                        }
+                        None => {
+                            return Err(anyhow::anyhow!("[JS-BRIDGE] No titles extracted from LLM. Aborting task to prevent invalid DOM fallback."));
+                        }
+                    }
                 }
 
-                {
+                if let Some(sel) = census_selector.take() {
+                    selector_info = sel;
+                    census_selector_used = true;
+                } else {
                     println!("[JS-BRIDGE] 2. Starting boa-engine for DOM analysis...");
                     let mut context = Context::default();
                     
@@ -2764,13 +3242,44 @@ pub async fn process_task(
 
                     match context.eval(Source::from_bytes(js_code.as_bytes())) {
                         Ok(val) => {
-                            let res_str = val.as_string().unwrap().to_std_string_escaped();
+                            let res_str = val.as_string().map(|s| s.to_std_string_escaped()).unwrap_or_default();
                             println!("[JS-BRIDGE] Boa Final Result: {}", res_str);
 
                             selector_info = serde_json::from_str(&res_str).unwrap_or(json!({}));
                         },
                         Err(e) => {
                             println!("[JS-BRIDGE] Error executing JS: {:?}", e);
+                        }
+                    }
+                    let boa_count = selector_info.get("matchCount").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let boa_items = selector_info.get("itemSelector").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if boa_count == 0 {
+                        match list_census.as_ref().and_then(|c| c.anchor_titles(&titles).or_else(|| c.decisive_fallback())) {
+                            Some(g) => {
+                                emit_term(&format!(
+                                    "  🧮 [CENSUS FALLBACK / BOA MISS] Boa 가 제목 {:?} 로 반복 구조를 찾지 못했습니다 (matchCount 0 이면 기본값 'body div' 가 페이지의 모든 div 를 아이템으로 만듭니다). DOM 전수 조사에서 제목을 품은 반복 구조 '{}' (행 {} · 칸 평균 {:.1}) 로 대신하고, 페이지 캐시에는 남기지 않습니다.",
+                                    titles, g.item_selector, g.members, g.avg_cells
+                                ));
+                                crate::utils::score_dynamics::record_baseline("commerce.census_fallback", 1.0);
+                                selector_info = g.selector_json();
+                                census_selector_used = true;
+                            }
+                            None => {
+                                return Err(anyhow::anyhow!("[JS-BRIDGE] Boa found no repeated structure for titles {:?} and the DOM census has no candidate that contains them. Aborting task to prevent invalid DOM fallback ('body div').", titles));
+                            }
+                        }
+                    } else if let Some(census) = list_census.as_ref() {
+                        match census.shadow_agreement(&clean_html_content, &boa_items) {
+                            Some((jac, g, rows, records)) => {
+                                crate::utils::score_dynamics::record_baseline("commerce.census_shadow_record_jaccard", jac);
+                                emit_term(&format!(
+                                    "  🧮 [CENSUS SHADOW] Boa '{}' 행 {}개 → 레코드 {}개 ↔ 전수 조사 1위 '{}' {}개 | 레코드 겹침(Jaccard) {:.2} — 관측만 합니다. rowspan 으로 이어진 행은 목록 분해(split_doc_to_pug_list_advanced)와 같은 규칙으로 한 레코드로 셉니다. 이 분포가 쌓이면 둘이 어긋난 문서에서 어느 쪽이 맞았는지를 숫자로 보고 승격 여부를 정합니다.",
+                                    boa_items, rows, records, g.item_selector, g.members, jac
+                                ));
+                            }
+                            None => {
+                                emit_term("  🧮 [CENSUS SHADOW] 전수 조사에 여러 칸짜리 반복 구조가 없어 Boa 결과와 비교하지 않습니다.");
+                            }
                         }
                     }
                 }
@@ -2815,6 +3324,28 @@ pub async fn process_task(
             }
         } 
         
+
+        if final_thead_selector.is_empty() {
+            match derive_thead_selector(&clean_html_content, &target_selector) {
+                Some((head, table)) => {
+                    emit_term(&format!(
+                        "  🧭 [DETERMINISTIC THEAD / DOM FIRST] 목록 첫 행 '{}' 의 조상 표 '{}' 에서 머리행 '{}' (th {}개) 을 LLM 없이 확정했습니다. LLM 셀렉터 수확도 같은 DOM 검증(th 2개 이상 · th 가 td 보다 많음)을 통과해야 채택되므로, DOM 이 먼저 답을 가지면 2B 프리필을 쓰지 않습니다.",
+                        target_selector,
+                        table,
+                        head,
+                        best_thead_th_dbg(&head, &clean_html_content)
+                    ));
+                    crate::utils::score_dynamics::record_baseline("commerce.thead_dom_first", 1.0);
+                    selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(head.clone()));
+                    selector_info.as_object_mut().unwrap().insert("wrapper".to_string(), json!(table));
+                    final_thead_selector = head;
+                    cache_updated = true;
+                }
+                None => {
+                    crate::utils::score_dynamics::record_baseline("commerce.thead_dom_first", 0.0);
+                }
+            }
+        }
 
         if final_thead_selector.is_empty() {
 
@@ -2963,92 +3494,10 @@ pub async fn process_task(
                 }
             }
         }
-
-        
-        
-        
-        
-        
-        
-        
-        
-        //
-        
-        
-        
-        
-        
-        
-        
-        
         
         if final_thead_selector.is_empty() || final_thead_selector == "..." {
-            let derived = {
-                let doc = scraper::Html::parse_document(&clean_html_content);
-                let mut out = String::new();
-                if let Ok(row_q) = scraper::Selector::parse(&target_selector) {
-                    if let Some(row_el) = doc.select(&row_q).next() {
-                        
-                        let mut table_el: Option<scraper::ElementRef> = None;
-                        let mut cur = row_el.parent();
-                        while let Some(node) = cur {
-                            if let Some(e) = node.value().as_element() {
-                                let n = e.name().to_lowercase();
-                                if n == "table" {
-                                    table_el = scraper::ElementRef::wrap(node);
-                                    break;
-                                }
-                                if n == "body" || n == "html" { break; }
-                            }
-                            cur = node.parent();
-                        }
-                        if let Some(tbl) = table_el {
-                            
-                            let tv = tbl.value();
-                            let mut tsel = String::from("table");
-                            if let Some(id) = tv.id() {
-                                tsel = format!("table#{}", id);
-                            } else {
-                                let classes: Vec<&str> = tv.classes().collect();
-                                for c in classes.iter().take(3) {
-                                    tsel.push('.');
-                                    tsel.push_str(c);
-                                }
-                            }
-                            
-                            let has_thead = scraper::Selector::parse("thead").ok()
-                                .map(|q| tbl.select(&q).next().is_some())
-                                .unwrap_or(false);
-                            let cand = if has_thead {
-                                format!("{} thead", tsel)
-                            } else {
-                                format!("{} tr", tsel)
-                            };
-                            
-                            let ok = scraper::Selector::parse(&cand).ok().and_then(|q| {
-                                doc.select(&q).next().map(|e| {
-                                    let th = scraper::Selector::parse("th").ok()
-                                        .map(|tq| e.select(&tq).count()).unwrap_or(0);
-                                    th >= 2
-                                })
-                            }).unwrap_or(false);
-                            if ok { out = cand; }
-                        }
-                    }
-                }
-                out
-            };
-            if !derived.is_empty() {
-                final_thead_selector = derived.clone();
-                selector_info.as_object_mut().unwrap().insert("head".to_string(), json!(derived.clone()));
-                cache_updated = true;
-                emit_term(&format!(
-                    "  🧭 [DETERMINISTIC THEAD] LLM 응답에서 헤더를 얻지 못해 DOM 구조로 직접 유도했습니다: '{}'",
-                    derived
-                ));
-            } else {
-                emit_term("  ⚠️ [DETERMINISTIC THEAD] target_selector 조상에서 헤더 행(th 2개 이상)을 찾지 못했습니다. 헤더 없이 진행합니다.");
-            }
+            final_thead_selector.clear();
+            emit_term("  ⚠️ [DETERMINISTIC THEAD] 목록 첫 행의 조상 표에서도, LLM 셀렉터 수확에서도 헤더 행(th 2개 이상 · th 가 td 보다 많음)을 찾지 못했습니다. 헤더 없이 진행합니다.");
         }
         model.deep_purge_resources().await;
         
@@ -3155,7 +3604,9 @@ pub async fn process_task(
             let ref_for_page = if !task.r#ref.is_empty() { &task.r#ref } else { raw_path };
 
             
-            if !is_detail {
+            if census_selector_used {
+                emit_term("  🧮 [CENSUS SELECTOR / NO CACHE] 이번 목록 셀렉터는 'LLM 제목 → Boa 검증' 이 아니라 DOM 전수 조사에서 왔습니다. 페이지 캐시에 저장하지 않으므로, 다음 실행은 처음부터 다시 분석해 Boa 가 확인한 셀렉터만 캐시에 남습니다.");
+            } else if !is_detail {
                 let mut page_data: serde_json::Value = selector_info.clone();
                 if let Some(obj) = page_data.as_object_mut() {
                     obj.insert("origin".to_string(), json!(format!("{}://{}", url_obj.scheme(), url_obj.host_str().unwrap_or(""))));
@@ -3931,22 +4382,25 @@ pub async fn process_task(
             //    · 여유가 없으면 임베딩만 반환시킨 뒤 Qwen3 를 올립니다.
             //  Qwen3 는 0.6B 라 임베딩과 함께 있어도 대부분 여유가 남습니다.
             //  이 판정이 하드코딩이 아니라 실측이므로 GPU 가 바뀌어도 유효합니다.
-            model
-                .enter_generation_phase(
-                    crate::model::ModelSize::Qwen3,
-                    None,
-                    Some(cancellation_token.clone()),
-                    false,
-                    Some("inference".to_string()),
-                    "list item extraction loop",
-                )
-                .await?;
-            emit_term(&format!("  {}", model.crossover_report()));
+            let mut qwen3_ready = false;
+            let list_route: Option<String> = {
+                let verdict = model.lang_route("commerce", "list_field", &doc_lang, &lang_probe_text).await;
+                emit_term(&format!("  {}", verdict.line));
+                verdict.code
+            };
+            let mut field_lang: Option<crate::model::lang_llm::LangSession> = None;
+            let synthesis_gate_for = |lang: bool| -> Option<(f32, u64)> {
+                crate::utils::score_dynamics::adaptive_recent(crate::model::lang_llm::synthesis_drop_axis(lang))
+                    .filter(|(recent, _, _)| *recent >= SYNTHESIS_SKIP_DROP)
+                    .map(|(recent, _, n)| (recent, n))
+            };
+            let synthesis_gate_lang = synthesis_gate_for(true);
+            let synthesis_gate_base = synthesis_gate_for(false);
+            let mut synthesis_probe_item: Option<usize> = None;
+            let mut synthesis_jobs: Vec<(usize, String, String)> = Vec::new();
+            let mut synthesis_item_pos: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            emit_term("  💤 [LAZY GENERATOR] 목록 루프의 Qwen3 는 LLM 이 실제로 필요한 첫 필드에서 올립니다. 모든 필드가 헤더 코사인 · Enum · 상태 어휘로 확정되면 이 태스크는 Qwen3 를 올리지 않습니다.");
 
-            // 🌟 [PEAK SAMPLER] 아이템 루프 전 구간의 순간 점유를 추적합니다.
-            //    KV-PLAN 의 free 값은 generate '전' 스냅샷이라 연산 도중의
-            //    전이를 잡지 못합니다. 50ms 폴링이 그 사각지대를 메웁니다.
-            //    루프가 끝나면 Drop 이 자동으로 결과를 출력합니다.
             let vram_probe = model.spawn_vram_sampler("list item extraction loop");
 
             for (idx, item_pug) in pug_list.iter().enumerate() {
@@ -5052,6 +5506,39 @@ pub async fn process_task(
                     }
                     let _ = best_thead_idx;
 
+                    if field_is_analytic[f_idx] {
+                        synthesis_jobs.push((idx, field_name.clone(), field_desc.clone()));
+                        emit_term(&format!(
+                            "    ⏳ [SYNTHESIS DEFERRED] Field: '{}' | 요약 필드는 이 목록의 추출이 끝난 뒤 요약 패스에서 만듭니다. 값이 모두 확정된 아이템의 값표를 쓰고, 추출용 디코딩 제약 없이 요약에 맞는 엔진으로 생성합니다.",
+                            field_name
+                        ));
+                        continue;
+                    }
+
+                    let active_synthesis_gate = if qwen3_ready {
+                        if field_lang.is_some() { synthesis_gate_lang } else { synthesis_gate_base }
+                    } else if list_route.is_some() {
+                        synthesis_gate_lang
+                    } else {
+                        synthesis_gate_base
+                    };
+                    if field_is_analytic[f_idx] && active_synthesis_gate.is_some() {
+                        let last_chance = idx + 1 == total_items && synthesis_probe_item.is_none();
+                        if synthesis_probe_item.map_or(qwen3_ready || last_chance, |p| p == idx) {
+                            synthesis_probe_item = Some(idx);
+                            emit_term(&format!(
+                                "    🔬 [SYNTHESIS PROBE] Field: '{}' | 게이트가 닫힌 스코프에서도 목록마다 아이템 하나(Qwen3 가 이미 올라온 첫 아이템, 없으면 마지막 아이템)에서는 관측용으로 요약을 만듭니다. 결과는 같은 원문 대조 게이트를 거쳐 SDS 에 쌓이므로, 요약 품질이 좋아지면 이 게이트는 스스로 다시 열립니다.",
+                                field_name
+                            ));
+                        } else {
+                            emit_term(&format!(
+                                "    ⏭️ [SYNTHESIS SKIP / SDS] Field: '{}' | 이 스코프에서 원문에 없는 사실로 폐기되는 비율이 기준을 넘은 요약 축이라 LLM 을 부르지 않고 비워 둡니다.",
+                                field_name
+                            ));
+                            crate::utils::score_dynamics::record_baseline("commerce.synthesis_skip", 1.0);
+                            continue;
+                        }
+                    }
                     let synthesis_sheet: Option<String> = if field_is_analytic[f_idx] {
                         crate::utils::ai_utils::synthesis_value_sheet(&item_val, &page_type, &doc_lang)
                     } else {
@@ -5171,90 +5658,147 @@ pub async fn process_task(
                     let metadata_str = metadata_str.trim();
                     let target_data_str = target_data_str.trim();
 
-                    let task_question = if field_name.contains("status") {
+                    if !qwen3_ready {
+                        vram_probe.phase(format!("item {}/{} · generator load", idx + 1, total_items));
+                        if let Some(code) = list_route.as_deref() {
+                            field_lang = model.enter_lang_generation(code, "list item extraction loop (first LLM field)").await;
+                        }
+                        if field_lang.is_none() {
+                            model
+                                .enter_generation_phase(
+                                    crate::model::ModelSize::Qwen3,
+                                    None,
+                                    Some(cancellation_token.clone()),
+                                    false,
+                                    Some("inference".to_string()),
+                                    "list item extraction loop (first LLM field)",
+                                )
+                                .await?;
+                        }
+                        let engine_label = field_lang.as_ref().map(|s| s.label()).unwrap_or_else(|| "Qwen3".to_string());
+                        emit_term(&format!(
+                            "  💡 [LAZY GENERATOR] Item {}/{} · Field '{}' 에서 처음으로 LLM 이 필요해 {} 를 올렸습니다. {}",
+                            idx + 1, total_items, field_name, engine_label, model.crossover_report()
+                        ));
+                        qwen3_ready = true;
+                    }
+                    let mut task_question = if field_name.contains("status") {
                         parsing::extract_status_intent_legacy_prompt(&targeted_pug, &page_type, &bias_target)
                     } else if field_is_analytic[f_idx] {
-                        
-                        parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                        if field_lang.is_some() {
+                            parsing::extract_synthesis_field_prompt_native(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                        } else {
+                            parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                        }
                     } else {
                         parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
                     };
-                    
+                    let field_keys: Vec<String> = field_name.split(',').map(|s| s.trim().to_string()).collect();
+
                     let mut ignore_list: Vec<String> = global_ignore_list.clone();
                     let mut miss_counter = 0;
-                    // 🌟 [PEAK SAMPLER] 최저점이 어느 필드에서 나왔는지 귀속시킵니다.
                     vram_probe.phase(format!("item {}/{} · field '{}'", idx + 1, total_items, field_name));
                     
                     loop {
                         if cancellation_token.load(Ordering::Relaxed) { break; }
 
-                        let q3_gen = model.qwen3_generator.clone();
-                        let cancel_clone = cancellation_token.clone();
-                        let sys_msg = system_message.clone();
-                        
                         let field_name_clone = field_name.clone();
-                        let bias_target_for_closure = bias_target.clone();
-                        
+                        let used_lang = field_lang.is_some();
+                        let res = if let Some(sess) = field_lang.as_ref() {
+                            let user_msg = ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                                name: None,
+                            });
+                            model
+                                .generate_lang_json(
+                                    sess.code(),
+                                    vec![system_message.clone(), user_msg],
+                                    512,
+                                    0.0,
+                                    Some(ignore_list.as_slice()),
+                                    &field_keys,
+                                    Some(cancellation_token.clone()),
+                                )
+                                .await
+                                .map(|(text, fixed)| {
+                                    if !fixed.is_empty() {
+                                        crate::utils::score_dynamics::record_baseline("commerce.lang4b_key_repair", fixed.len() as f32);
+                                        emit_term(&format!("    🩹 [LANG4B KEY REPAIR] {:?} — 어휘 16,384 개인 4B 가 영문 스키마 키를 한두 글자 틀리게 옮긴 것을 철자 거리로 되돌립니다. 값은 아래 검증을 그대로 거칩니다.", fixed));
+                                    }
+                                    text
+                                })
+                        } else {
+                            let q3_gen = model.qwen3_generator.clone();
+                            let cancel_clone = cancellation_token.clone();
+                            let sys_msg = system_message.clone();
+                            let prejudice_target_for_closure = dynamic_prej_str.clone();
+                            let task_q = task_question.clone();
+                            let ignore_list_clone = ignore_list.clone();
+                            let res = tokio::task::spawn_blocking(move || {
+                                let mut gen_guard = q3_gen.blocking_lock();
+                                if let Some(gen) = gen_guard.as_mut() {
+                                    let params = ChatCompletionParameters {
+                                        messages: vec![
+                                            sys_msg,
+                                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                                content: ChatCompletionRequestUserMessageContent::Text(task_q),
+                                                name: None,
+                                            })
+                                        ],
+                                        model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
+                                        ..Default::default()
+                                    };
 
-                        let prejudice_target_for_closure = dynamic_prej_str.clone();
-                        
-                        let task_q = task_question.clone();
-                        let ignore_list_clone = ignore_list.clone();
-                        
-                        let res = tokio::task::spawn_blocking(move || {
-                            let mut gen_guard = q3_gen.blocking_lock();
-                            if let Some(gen) = gen_guard.as_mut() {
-                                let params = ChatCompletionParameters {
-                                    messages: vec![
-                                        sys_msg,
-                                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                            content: ChatCompletionRequestUserMessageContent::Text(task_q),
-                                            name: None,
-                                        })
-                                    ],
-                                    model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
-                                    ..Default::default()
-                                };
-                                
-                                let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
-                                
-                                gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                                    let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
+
+                                    gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                                } else {
+                                    Err(anyhow::anyhow!("Qwen 3 Generator not available"))
+                                }
+                            }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+                            let q3_clear_arc = model.qwen3_generator.clone();
+                            let dev_for_sync = if model.is_cpu_mode {
+                                None
                             } else {
-                                Err(anyhow::anyhow!("Qwen 3 Generator not available"))
-                            }
-                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
-                        // 🌟 [PEAK SAMPLER] 재시도 회차를 라벨에 반영합니다.
-                        //    'color' 처럼 3회 재시도하는 필드가 피크의 주범인지
-                        //    이 라벨 하나로 판별됩니다.
+                                Some(model.device_config.device.clone())
+                            };
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                                    gen.clear_kv_cache();
+                                }
+                                if let Some(dev) = dev_for_sync {
+                                    if dev.is_cuda() { let _ = dev.synchronize(); }
+                                }
+                            }).await;
+                            res
+                        };
                         if miss_counter > 0 {
                             vram_probe.phase(format!(
                                 "item {}/{} · field '{}' · retry {}",
                                 idx + 1, total_items, field_name, miss_counter
                             ));
                         }
-                        // 🌟 [MERGED CLEANUP] clear_kv_cache 와 synchronize 를 한 번의
-                        //    spawn_blocking 으로 합칩니다.
-                        //
-                        //  ── 왜 합치는가 ──
-                        //   기존에는 필드마다 스레드 홉이 2회 발생했습니다.
-                        //   13아이템 × 10필드 × 2 = 260회입니다.
-                        //   더 중요한 것은 '해제와 동기화 사이의 창' 이 사라진다는 점입니다.
-                        //   그 사이에 다른 태스크가 끼어들면 동기화가 해제분을
-                        //   반영하지 못한 채 지나갑니다.
-                        let q3_clear_arc = model.qwen3_generator.clone();
-                        let dev_for_sync = if model.is_cpu_mode {
-                            None
-                        } else {
-                            Some(model.device_config.device.clone())
-                        };
-                        let _ = tokio::task::spawn_blocking(move || {
-                            if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                                gen.clear_kv_cache();
+                        if used_lang {
+                            if let Err(e) = &res {
+                                emit_term(&format!("    ⚠️ [LANG4B FALLBACK] Field '{}' | 4B 생성이 실패해 이 태스크의 남은 필드는 Qwen3 로 진행합니다: {}", field_name, e));
+                                crate::model::lang_llm::record_route_outcome("commerce", "list_field", false);
+                                field_lang = None;
+                                if field_is_analytic[f_idx] && !field_name.contains("status") {
+                                    task_question = parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str);
+                                }
+                                model
+                                    .enter_generation_phase(
+                                        crate::model::ModelSize::Qwen3,
+                                        None,
+                                        Some(cancellation_token.clone()),
+                                        false,
+                                        Some("inference".to_string()),
+                                        "list item extraction loop (4B fallback)",
+                                    )
+                                    .await?;
+                                continue;
                             }
-                            if let Some(dev) = dev_for_sync {
-                                if dev.is_cuda() { let _ = dev.synchronize(); }
-                            }
-                        }).await;
+                        }
 
                         match res {
                             Ok(res_text) => {
@@ -5322,9 +5866,10 @@ pub async fn process_task(
                                             if is_synthesis_field && !extracted_str.is_empty() {
                                                 let gate = crate::utils::ai_utils::synthesis_fact_gate(&extracted_str, &targeted_pug, &doc_lang);
                                                 crate::utils::score_dynamics::record_baseline(
-                                                    "commerce.synthesis_sentence_drop",
+                                                    crate::model::lang_llm::synthesis_drop_axis(used_lang),
                                                     if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
                                                 );
+                                                crate::model::lang_llm::record_engine_outcome("commerce", "list_field", used_lang, gate.dropped.is_empty());
                                                 if !gate.dropped.is_empty() {
                                                     emit_term(&format!(
                                                         "    🧪 [SYNTHESIS GROUNDING] '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
@@ -5496,6 +6041,9 @@ pub async fn process_task(
                                 if !found_valid_value {
                                     requires_retry = true;
                                 }
+                                if !is_synthesis_field || requires_retry {
+                                    crate::model::lang_llm::record_engine_outcome("commerce", "list_field", used_lang, !requires_retry);
+                                }
 
                                 if requires_retry {
                                     miss_counter += 1;
@@ -5641,6 +6189,7 @@ pub async fn process_task(
                     }
                     
                     emit_term(&format!("  ✅ Successfully Merged Extracted Item {}/{}: {}", idx + 1, total_items, serde_json::to_string(&item_val).unwrap_or_default()));
+                    synthesis_item_pos.insert(idx, all_extracted_items.len());
                     all_extracted_items.push(item_val);
                     
                     all_item_raw_lines.push(item_lines.clone());
@@ -5680,7 +6229,23 @@ pub async fn process_task(
                 //   dirty 가 아니거나 최소 간격(5초) 미만이면 실제 쓰기는 생략됩니다.
                 crate::utils::score_dynamics::flush();
             }
-            
+
+            drop(field_lang);
+            run_synthesis_pass(
+                &model,
+                &mut all_extracted_items,
+                &synthesis_jobs,
+                &synthesis_item_pos,
+                &page_type,
+                &doc_lang,
+                &lang_probe_text,
+                SYNTHESIS_SKIP_DROP,
+                cancellation_token,
+                &emit_term,
+                "list_synthesis",
+            )
+            .await?;
+
             {
                 let total_extracted_items = all_extracted_items.len();
                 let mut retry_count = 0usize;
@@ -6025,6 +6590,12 @@ pub async fn process_task(
 
             let fields = parsing::get_detail_schema_fields(&page_type, &url, &doc_lang);
             let total_fields = fields.len();
+            let detail_route: Option<String> = {
+                let verdict = model.lang_route("commerce", "detail_field", &doc_lang, &lang_probe_text).await;
+                emit_term(&format!("  {}", verdict.line));
+                verdict.code
+            };
+            let mut field_lang: Option<crate::model::lang_llm::LangSession> = None;
 
             let payload = json!({ "task_id": task.id, "category": "AI Inference", "summary": format!("Extracting {} detail fields sequentially...", total_fields), "spinner": "⠋" });
             let _ = app_handle.emit("extraction-progress", &payload);
@@ -6041,6 +6612,25 @@ pub async fn process_task(
                 let refs: Vec<&str> = pug_lines.iter().map(|s| s.as_str()).collect();
                 collect_detail_label_value_pairs(&refs)
             };
+            let (form_labeled, form_controls) = {
+                let refs: Vec<&str> = pug_lines.iter().map(|s| s.as_str()).collect();
+                detail_form_profile(&refs)
+            };
+            let form_page = form_controls >= 8 && form_controls * 10 >= form_labeled * 7;
+            if form_labeled > 0 {
+                crate::utils::score_dynamics::record_baseline(
+                    "commerce.detail_form_control_ratio",
+                    form_controls as f32 / form_labeled as f32,
+                );
+            }
+            if form_page {
+                emit_term(&format!(
+                    "  📋 [DETAIL FORM PAGE] 라벨 칸 {}개 중 {}개가 입력 컨트롤 칸입니다 ({:.0}%). 이 상세는 레코드를 입력 폼으로 보여 주므로, 라벨 칸에서 값을 얻지 못한 글자(Text) 필드는 폼 밖의 메뉴 · 도움말 · 다른 칸 글자에서 LLM 으로 찾지 않습니다.",
+                    form_labeled,
+                    form_controls,
+                    form_controls as f32 * 100.0 / form_labeled.max(1) as f32
+                ));
+            }
 
             
             
@@ -6382,7 +6972,19 @@ pub async fn process_task(
 
             
             
-            let line_is_non_value: Vec<bool> = line_parts.iter().map(|p| is_non_value_role_tag(&p.1)).collect();
+            let control_noise = detail_control_noise_lines(&pug_lines_ref);
+            if !control_noise.is_empty() {
+                crate::utils::score_dynamics::record_baseline("commerce.detail_control_noise", control_noise.len() as f32);
+                emit_term(&format!(
+                    "  🎛️ [DETAIL CONTROL CELL] 입력 컨트롤이 값을 쥔 셀 안의 다른 라인 {}개(선택 안 된 옵션 · 체크 안 된 항목 · 버튼 · 도움말)를 값 후보에서 뺍니다. 이런 셀의 값은 컨트롤이 쥔 값(입력값 · 선택된 옵션 · 체크된 항목의 이름)뿐입니다.",
+                    control_noise.len()
+                ));
+            }
+            let line_is_non_value: Vec<bool> = line_parts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| is_non_value_role_tag(&p.1) || control_noise.contains(&i))
+                .collect();
             
             let line_is_selected_option: Vec<bool> = line_parts.iter()
                 .map(|p| p.1 == "option" && pug_attr_flag(&p.2, "selected"))
@@ -6415,10 +7017,19 @@ pub async fn process_task(
             emit_term(&format!("  🔑 [ID/LINK COSINE BANK] 라벨 구 {}개 | 편견 구 {}개 준비 완료.", idlink_label_embs.len(), idlink_prej_embs.len()));
 
             let mut det_id_link: Option<(String, String)> = None;
-
-            
-            
-            {
+            if let Some((tok, role, ev)) = url_typed_self_token(&url, &page_type) {
+                let page_link = match url::Url::parse(&url) {
+                    Ok(u) => format!("{}{}", u.path(), u.query().map(|q| format!("?{}", q)).unwrap_or_default()).to_lowercase(),
+                    Err(_) => url.clone(),
+                };
+                crate::utils::score_dynamics::record_baseline("commerce.detail_url_type_identity", 1.0);
+                emit_term(&format!(
+                    "  🔑 [PAGE-URL ID / TYPE EVIDENCE] 추출 주소의 '{}' (역할 '{}' · 타입 근거 {}) 를 이 상세 문서의 식별자로 먼저 확정합니다 → link '{}' | 주소 매개변수 이름이 이 문서 타입의 별칭이라 저장 단계의 URL 자기 식별자와 같은 근거입니다. 라벨 코사인이나 본문 링크(이미지 · 미리보기 버튼)로 정하면 목록 행의 link 를 덮고 식별자 문장도 어긋납니다.",
+                    tok, role, ev, page_link
+                ));
+                det_id_link = Some((tok, page_link));
+            }
+            if det_id_link.is_none() {
                 let url_cands = collect_id_link_candidates_from_url(&url);
                 if !url_cands.is_empty() && !idlink_label_embs.is_empty() {
                     let role_texts: Vec<String> = url_cands.iter().map(|c| c.role_phrase.clone()).collect();
@@ -6512,20 +7123,19 @@ pub async fn process_task(
 
             let mut det_consumed_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
             if let Some((det_id, _)) = &det_id_link {
+                let whole_only = det_id.chars().count() < 4;
                 for (l, v) in line_values.iter().enumerate() {
                     if v.is_empty() { continue; }
-                    let matched = v.split(|c: char| !c.is_alphanumeric())
-                        .any(|tok| !tok.is_empty() && tok.eq_ignore_ascii_case(det_id.as_str()));
+                    let matched = if whole_only {
+                        v.trim().eq_ignore_ascii_case(det_id.as_str())
+                    } else {
+                        v.split(|c: char| !c.is_alphanumeric())
+                            .any(|tok| !tok.is_empty() && tok.eq_ignore_ascii_case(det_id.as_str()))
+                    };
                     if matched { det_consumed_lines.insert(l); }
                 }
             }
 
-            
-            
-            
-            
-            
-            
             let mut header_forced_assign: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             let mut pair_owned_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
             
@@ -6714,17 +7324,43 @@ pub async fn process_task(
                         sec_raw[f][h] = weighted_max_pool_sim(&section_embs[h], &d_label_embs[f], &d_label_weights[f]);
                     }
                 }
-
-                
-                
-                
-                
-                
-                
-                
-                
-                
-                
+                let label_key = |s: &str| -> String {
+                    s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase()
+                };
+                let bank_keys: Vec<Vec<String>> = d_field_names
+                    .iter()
+                    .map(|n| {
+                        label_phrase_bank(&doc_lang, &page_type, n)
+                            .0
+                            .iter()
+                            .map(|p| label_key(p.as_str()))
+                            .collect()
+                    })
+                    .collect();
+                for h in 0..unique_phrases.len() {
+                    let leaf = label_key(unique_leaf[h].as_str());
+                    if leaf.chars().count() < 2 { continue; }
+                    let owners: Vec<usize> = (0..d_field_names.len())
+                        .filter(|&f| bank_keys[f].iter().any(|k| *k == leaf))
+                        .collect();
+                    if owners.len() != 1 { continue; }
+                    let o = owners[0];
+                    if leaf_raw[o][h] >= 0.0 { continue; }
+                    let mut blocked: Vec<String> = Vec::new();
+                    for f in 0..d_field_names.len() {
+                        if f == o || leaf_raw[f][h] < 0.0 { continue; }
+                        leaf_raw[f][h] = -1.0;
+                        sec_raw[f][h] = -1.0;
+                        blocked.push(d_field_names[f].clone());
+                    }
+                    if !blocked.is_empty() {
+                        crate::utils::score_dynamics::record_baseline("commerce.detail_pair_owner_hold", blocked.len() as f32);
+                        emit_term(&format!(
+                            "    🔒 [DETAIL PAIR OWNER HOLD] Label '{}' | 인쇄 라벨이 '{}' 라벨 뱅크의 구와 글자가 같은데 그 필드가 이 칸의 값을 형식 게이트에서 받지 못했습니다. 이 칸은 '{}' 의 칸이므로 다른 필드 {:?} 에 배정하지 않습니다.",
+                            unique_phrases[h], d_field_names[o], d_field_names[o], blocked
+                        ));
+                    }
+                }
                 const SECTION_WEIGHT: f32 = 0.5f32;
                 let mut d_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
                 for h in 0..unique_phrases.len() {
@@ -6794,7 +7430,56 @@ pub async fn process_task(
                     ));
                     crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
                 }
-                
+                let mut d_assign = d_assign;
+                for f in 0..d_assign.len() {
+                    let (h, own, margin) = match d_assign[f] {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if margin > 1e-6 { continue; }
+                    let twin = (0..d_field_names.len()).find(|&g| {
+                        g != f && d_assign[g].is_none() && (d_matrix[g][h] - own).abs() <= 1e-6
+                    });
+                    if let Some(g) = twin {
+                        d_assign[f] = None;
+                        crate::utils::score_dynamics::record_baseline("commerce.detail_pair_dead_heat", 1.0);
+                        emit_term(&format!(
+                            "    ⚖️ [DETAIL PAIR DEAD HEAT] Label '{}' | '{}' 와 '{}' 의 점수가 {:.4} 로 같아 필드 순서로 한쪽을 고르지 않고 둘 다 보류합니다. 두 필드의 라벨 뱅크가 같은 구를 갖고 있어 이 라벨만으로는 어느 필드의 칸인지 정할 수 없습니다.",
+                            unique_phrases[h], d_field_names[f], d_field_names[g], own
+                        ));
+                    }
+                }
+                let residual_eligible: Vec<bool> = (0..d_field_names.len())
+                    .map(|f| {
+                        let name = d_field_names[f].as_str();
+                        !is_id_link_field(name)
+                            && !d_diags.iter().any(|d| d.field == f && !d.accepted)
+                            && matches!(
+                                detect_field_format(name),
+                                FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric
+                                    | FieldFormat::Phone | FieldFormat::Address
+                            )
+                    })
+                    .collect();
+                let residual = crate::utils::ai_utils::residual_assign_blocked(&d_matrix, &mut d_assign, &residual_eligible, 0.0);
+                for (f, h, blocker, margin) in residual.iter() {
+                    crate::utils::score_dynamics::record_baseline("commerce.detail_pair_residual", *margin);
+                    emit_term(&format!(
+                        "    🧩 [DETAIL PAIR RESIDUAL] Label '{}' → Field '{}' | 이 라벨의 1위 필드 '{}' 는 다른 라벨로 이미 확정되어 이 칸이 비어 있었습니다. 남은 필드 가운데 1위(2위와의 차 {:+.4} · 2위가 없으면 자기 점수)이고 이 필드에게도 남은 칸 중 최선이라 배정합니다. 값 형식으로 검증되는 필드(날짜 · 수치 · 전화 · 주소 · 운송장)에만 적용합니다.",
+                        unique_phrases[*h], d_field_names[*f], d_field_names[*blocker], margin
+                    ));
+                }
+                let mut contested_floor: Option<f32> = None;
+                for (f, a) in d_assign.iter().enumerate() {
+                    let (h, s, m) = match a { Some(v) => *v, None => continue };
+                    if m + 1e-4 >= s || is_id_link_field(&d_field_names[f]) {
+                        continue;
+                    }
+                    if form_page && detect_field_format(&d_field_names[f]) == FieldFormat::Text && leaf_raw[f][h] < sec_raw[f][h] {
+                        continue;
+                    }
+                    contested_floor = Some(contested_floor.map_or(s, |c: f32| c.min(s)));
+                }
                 for (f, a) in d_assign.iter().enumerate() {
                     let (h, score, margin) = match a { Some(v) => *v, None => continue };
                     let owner = d_field_names[f].clone();
@@ -6807,7 +7492,26 @@ pub async fn process_task(
 
                     let owner_fmt = detect_field_format(&owner);
                     let multi = is_multi_value_field(&owner);
-
+                    if form_page && owner_fmt == FieldFormat::Text && leaf_raw[f][h] < sec_raw[f][h] {
+                        crate::utils::score_dynamics::record_baseline("commerce.detail_pair_section_led", 1.0);
+                        emit_term(&format!(
+                            "    🔒 [DETAIL PAIR SECTION-LED] Label '{}' → Field '{}' | 라벨 점수 {:.4} 가 섹션 점수 {:.4} 보다 낮습니다. 입력 폼에서 라벨이 아니라 섹션 제목이 끌어온 글자 필드 배정은 값으로 받지 않습니다.",
+                            unique_phrases[h], owner, leaf_raw[f][h], sec_raw[f][h]
+                        ));
+                        continue;
+                    }
+                    if form_page && owner_fmt == FieldFormat::Text && margin + 1e-4 >= score {
+                        if let Some(floor) = contested_floor {
+                            if score < floor {
+                                crate::utils::score_dynamics::record_baseline("commerce.detail_pair_uncontested_weak", score);
+                                emit_term(&format!(
+                                    "    🔒 [DETAIL PAIR UNCONTESTED WEAK] Label '{}' → Field '{}' | 점수 {:.4} 에 겨룬 상대 필드가 없습니다(마진 = 점수). 이 문서에서 상대와 겨뤄 이긴 배정 가운데 가장 낮은 점수 {:.4} 에도 못 미치므로, 값 형식으로 검증할 수 없는 글자 필드에는 이 칸의 값을 넣지 않습니다.",
+                                    unique_phrases[h], owner, score, floor
+                                ));
+                                continue;
+                            }
+                        }
+                    }
                     let mut merged = String::new();
                     let mut primary = detail_pairs[targets[0]].primary_line;
                     for pi in &targets {
@@ -6950,7 +7654,19 @@ pub async fn process_task(
                     }
 
                     
+                    let pair_status_line = header_forced_assign.get("status").copied();
                     if chosen.is_none() {
+                        if let Some(pl) = pair_status_line {
+                            crate::utils::score_dynamics::record_baseline("commerce.enum_select_llm_skip", 1.0);
+                            emit_term(&format!(
+                                "  ⏭️ [ENUM SELECT LLM SKIP] 'status' 는 이미 라벨↔값 쌍 Line {} (\"{}\") 로 확정되어 있습니다. 코사인이 상태 컨트롤을 고르지 못했다는 이유로 2B 를 올려 <select> {}개 전체를 묻지 않습니다 (2B 적재 · 프리필 · Qwen3 재적재가 생기지 않습니다).",
+                                pl + 1,
+                                line_values.get(pl).map(|s| s.as_str()).unwrap_or(""),
+                                select_groups.len()
+                            ));
+                        }
+                    }
+                    if chosen.is_none() && pair_status_line.is_none() {
                         let catalogue: Vec<serde_json::Value> = select_groups.iter().map(|g| json!({
                             "selector": g.selector,
                             "role": g.role_phrase,
@@ -6991,16 +7707,16 @@ pub async fn process_task(
                         }
                         model.deep_purge_resources().await;
                         model.mark_crossover_idle();
-                        // 🌟 이 뒤로는 다시 임베딩(vector_assignment 재료)이 아니라
-                        //    필드 추출 루프로 이어지므로 생성 페이즈를 유지합니다.
-                        model
-                            .switch_to_generation(
-                                crate::model::ModelSize::Qwen3,
-                                Some(cancellation_token.clone()),
-                                Some("inference".to_string()),
-                                "detail field extraction (after enum fallback)",
-                            )
-                            .await?;
+                        if detail_route.is_none() {
+                            model
+                                .switch_to_generation(
+                                    crate::model::ModelSize::Qwen3,
+                                    Some(cancellation_token.clone()),
+                                    Some("inference".to_string()),
+                                    "detail field extraction (after enum fallback)",
+                                )
+                                .await?;
+                        }
 
                         if !picked.is_empty() && picked != "null" {
                             if let Some(pos) = select_groups.iter().position(|g| g.selector == picked) {
@@ -7013,7 +7729,30 @@ pub async fn process_task(
                     }
 
                     
-                    if let Some(gi) = chosen {
+                    let pair_conflict = match (chosen, pair_status_line) {
+                        (Some(gi), Some(pl)) => {
+                            let key = |s: &str| -> String {
+                                s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase()
+                            };
+                            let sel = key(&select_groups[gi].selected);
+                            let line = key(line_values.get(pl).map(|s| s.as_str()).unwrap_or(""));
+                            !sel.is_empty() && !line.contains(&sel) && !sel.contains(&line)
+                        }
+                        _ => false,
+                    };
+                    if pair_conflict {
+                        if let (Some(gi), Some(pl)) = (chosen, pair_status_line) {
+                            crate::utils::score_dynamics::record_baseline("commerce.enum_select_pair_conflict", 1.0);
+                            emit_term(&format!(
+                                "  🔒 [ENUM SELECT PAIR CONFLICT] '{}' 의 선택값 \"{}\" 이 라벨↔값 쌍으로 확정된 Line {} (\"{}\") 와 다릅니다. 같은 상태를 두 근거가 다르게 말하므로 컨트롤 쪽으로 덮지 않고 라벨 쌍 배정을 유지합니다.",
+                                select_groups[gi].selector,
+                                select_groups[gi].selected,
+                                pl + 1,
+                                line_values.get(pl).map(|s| s.as_str()).unwrap_or("")
+                            ));
+                        }
+                    }
+                    if let Some(gi) = chosen.filter(|_| !pair_conflict) {
                         let g = &select_groups[gi];
                         let sel_emb = model.get_embedding(g.selected.clone()).await.unwrap_or(vec![0.0; 384]);
                         let key_scores = status_key_scores(&sel_emb, &key_banks);
@@ -7133,7 +7872,27 @@ pub async fn process_task(
             
             
             
-            {
+            let mut family_shared: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            if form_page {
+                let held: Vec<String> = (0..vector_assignment.len())
+                    .filter(|&f| {
+                        vector_assignment[f].is_none()
+                            && !field_is_analytic[f]
+                            && !is_id_link_field(&fields[f].0)
+                            && !pair_line_map.contains_key(&fields[f].0)
+                            && matches!(field_formats[f], FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric)
+                    })
+                    .map(|f| fields[f].0.clone())
+                    .collect();
+                if !held.is_empty() {
+                    crate::utils::score_dynamics::record_baseline("commerce.form_family_share_skip", held.len() as f32);
+                    emit_term(&format!(
+                        "  ⛔ [FORMAT FAMILY SHARE / FORM] 입력 폼 상세라 같은 형식 필드의 줄을 빌려 쓰지 않습니다. 자기 라벨 칸도 벡터 배정도 없는 필드: {:?} | 폼에서는 칸마다 자기 라벨이 있으므로, 자기 라벨 칸이 없는 필드가 다른 필드(등록일시 · 포인트 등)의 줄을 가져가면 그 값은 이 필드의 사실이 아닙니다. 라벨 쌍이 있는 필드는 지금처럼 자기 칸의 값을 씁니다.",
+                        held
+                    ));
+                }
+            }
+            if !form_page {
                 let mut shared = 0usize;
                 for f in 0..vector_assignment.len() {
                     if vector_assignment[f].is_some() { continue; }
@@ -7170,6 +7929,7 @@ pub async fn process_task(
                     if let Some(l) = best_line {
                         vector_assignment[f] = Some((l, best_raw, 0.0));
                         shared += 1;
+                        family_shared.insert(f);
                         emit_term(&format!("  ♻️ [FORMAT FAMILY SHARE] '{}' ({:?}) ← Line {} | RawSim: {:.4} | 같은 형식 필드가 확정한 라인을 공유합니다.",
                             fields[f].0, fmt, l + 1, best_raw));
                     }
@@ -7245,18 +8005,27 @@ pub async fn process_task(
             //    ENUM SELECT 폴백이 발동한 경우 이미 생성 페이즈이므로
             //    enter_generation_phase 는 no-op 에 가깝고,
             //    발동하지 않은 경우에만 실제 전환이 일어납니다.
-            model
-                .enter_generation_phase(
-                    crate::model::ModelSize::Qwen3,
-                    None,
-                    Some(cancellation_token.clone()),
-                    false,
-                    Some("inference".to_string()),
-                    "detail field extraction loop",
-                )
-                .await?;
-            emit_term(&format!("  {}", model.crossover_report()));
-
+            if let Some(code) = detail_route.as_deref() {
+                field_lang = model.enter_lang_generation(code, "detail field extraction loop").await;
+            }
+            if field_lang.is_none() {
+                model
+                    .enter_generation_phase(
+                        crate::model::ModelSize::Qwen3,
+                        None,
+                        Some(cancellation_token.clone()),
+                        false,
+                        Some("inference".to_string()),
+                        "detail field extraction loop",
+                    )
+                    .await?;
+            }
+            emit_term(&format!(
+                "  {} | 필드 생성 엔진: {}",
+                model.crossover_report(),
+                field_lang.as_ref().map(|s| s.label()).unwrap_or_else(|| "Qwen3".to_string())
+            ));
+            let mut detail_synthesis_jobs: Vec<(usize, String, String)> = Vec::new();
             for (idx, (field_name, field_desc, bias_target, prejudice_target)) in fields.into_iter().enumerate() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -7335,7 +8104,7 @@ pub async fn process_task(
                     if let Some((det_id, det_link)) = det_id_link.clone() {
                         extracted_data.as_object_mut().unwrap().insert("id".to_string(), json!(det_id.clone()));
                         extracted_data.as_object_mut().unwrap().insert("link".to_string(), json!(det_link.clone()));
-                        if !global_ignore_list.contains(&det_id) {
+                        if det_id.chars().count() >= 5 && !global_ignore_list.contains(&det_id) {
                             global_ignore_list.push(det_id.clone());
                             global_ignore_list.push(format!(" {}", det_id));
                             global_ignore_list.push(det_id.to_lowercase());
@@ -7344,7 +8113,14 @@ pub async fn process_task(
                         continue;
                     }
                 }
-
+                if form_page && field_format == FieldFormat::Text && !field_is_analytic[idx] {
+                    crate::utils::score_dynamics::record_baseline("commerce.form_absent_skip", 1.0);
+                    emit_term(&format!(
+                        "  ⛔ [FORM ABSENT] Field: '{}' (Text) | 입력 폼 상세(라벨 칸 {}개 중 입력 컨트롤 {}개)에서 이 필드에 대응하는 라벨 칸 값이 없습니다. 메뉴 · 도움말 · 다른 칸의 글자를 LLM 으로 고르지 않고 비워 둡니다. 빈 값은 목록 문서의 기존 값을 덮지 않습니다.",
+                        field_name, form_labeled, form_controls
+                    ));
+                    continue;
+                }
                 let (_bias_emb, _prej_emb, dynamic_prej_str) = &field_embeddings[idx];
 
                 
@@ -7408,6 +8184,34 @@ pub async fn process_task(
                         field_format,
                         FieldFormat::Phone | FieldFormat::Address | FieldFormat::TrackingCode | FieldFormat::Numeric
                     );
+                    let shared_line = family_shared.contains(&idx);
+                    let multi_number = field_format == FieldFormat::Numeric && numeric_run_count(&line_values[best_idx]) > 1;
+                    let foreign_label = detail_pairs
+                        .iter()
+                        .find(|p| p.primary_line == best_idx)
+                        .map(|p| p.label.clone());
+                    if copyable && (shared_line || multi_number || foreign_label.is_some()) {
+                        crate::utils::score_dynamics::record_baseline("commerce.value_copy_refused", 1.0);
+                        let why = if shared_line {
+                            "같은 형식의 다른 필드가 확정한 라인을 공유받은 배정이라".to_string()
+                        } else if multi_number {
+                            "라인에 수치가 여럿 있어 이 필드의 값을 하나로 정할 수 없어".to_string()
+                        } else {
+                            format!(
+                                "이 라인은 라벨 '{}' 칸의 값이고 라벨 대조가 그 라벨을 이 필드에 배정하지 않았으므로",
+                                foreign_label.clone().unwrap_or_default()
+                            )
+                        };
+                        emit_term(&format!(
+                            "  ⛔ [VALUE COPY REFUSED] Field: '{}' ({:?}) | Line {} \"{}\" | {} 값을 비워 둡니다. 다른 필드의 라인을 그대로 옮기거나 여러 수치를 한 값으로 붙이면 틀린 값이 확정되고 저장 단계가 그 값을 숫자로 굳힙니다. 빈 값은 목록 문서의 기존 값을 덮지 않습니다.",
+                            field_name,
+                            field_format,
+                            best_idx + 1,
+                            line_values[best_idx].trim(),
+                            why
+                        ));
+                        continue;
+                    }
                     if copyable {
                         let raw_val = line_values[best_idx].trim().to_string();
                         if !raw_val.is_empty() && value_matches_format(field_format, &raw_val) {
@@ -7431,6 +8235,14 @@ pub async fn process_task(
                     }
                 }
 
+                if field_is_analytic[idx] {
+                    detail_synthesis_jobs.push((0usize, field_name.clone(), field_desc.clone()));
+                    emit_term(&format!(
+                        "    ⏳ [SYNTHESIS DEFERRED] Field: '{}' | 상세 요약 필드는 이 문서의 추출이 끝난 뒤 요약 패스(commerce.detail_synthesis)에서 만듭니다. 문서 전체 대신 확정된 값의 값표를 쓰고, 엔진은 그 단계에서 따로 판정합니다.",
+                        field_name
+                    ));
+                    continue;
+                }
                 let targeted_pug = if field_is_analytic[idx] {
                     emit_term(&format!("  🧠 [SYNTHESIS FIELD] Field: '{}' | 단일 라인 환원 불가 → 전체 컨텍스트 요약 모드", field_name));
                     content_pug.clone()
@@ -7511,71 +8323,117 @@ pub async fn process_task(
                 let metadata_str = metadata_str.trim();
                 let target_data_str = target_data_str.trim();
 
-                let task_question = if field_name.contains("status") {
+                let mut task_question = if field_name.contains("status") {
                     parsing::extract_status_intent_legacy_prompt(&targeted_pug, &page_type, &bias_target)
                 } else if field_is_analytic[idx] {
-                    parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                    if field_lang.is_some() {
+                        parsing::extract_synthesis_field_prompt_native(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                    } else {
+                        parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str)
+                    }
                 } else {
                     parsing::extract_single_field_prompt(&page_type, &field_name, &field_desc, language, metadata_str, target_data_str)
                 };
-                
+                let field_keys: Vec<String> = field_name.split(',').map(|s| s.trim().to_string()).collect();
 
-                let mut ignore_list: Vec<String> = global_ignore_list.clone();
+
+                let mut ignore_list: Vec<String> = if field_is_analytic[idx] { Vec::new() } else { global_ignore_list.clone() };
                 let mut miss_counter = 0;
                 
                 loop {
                     if cancellation_token.load(Ordering::Relaxed) { break; }
 
-                    let q3_gen = model.qwen3_generator.clone();
-                    let cancel_clone = cancellation_token.clone();
-                    let sys_msg = system_message.clone();
-                    
                     let field_name_clone = field_name.clone();
-                    let bias_target_for_closure = bias_target.clone(); 
-                    let prejudice_target_for_closure = dynamic_prej_str.clone();
-                    
-                    let task_q = task_question.clone();
-                    let ignore_list_clone = ignore_list.clone();
-                    
-                    let res = tokio::task::spawn_blocking(move || {
-                        let mut gen_guard = q3_gen.blocking_lock();
-                        if let Some(gen) = gen_guard.as_mut() {
-                            let params = ChatCompletionParameters {
-                                messages: vec![
-                                    sys_msg,
-                                    ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                        content: ChatCompletionRequestUserMessageContent::Text(task_q),
-                                        name: None,
-                                    })
-                                ],
-                                model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
-                                ..Default::default()
-                            };
-                            
+                    let used_lang = field_lang.is_some();
+                    let res = if let Some(sess) = field_lang.as_ref() {
+                        let user_msg = ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                            content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                            name: None,
+                        });
+                        model
+                            .generate_lang_json(
+                                sess.code(),
+                                vec![system_message.clone(), user_msg],
+                                512,
+                                0.0,
+                                Some(ignore_list.as_slice()),
+                                &field_keys,
+                                Some(cancellation_token.clone()),
+                            )
+                            .await
+                            .map(|(text, fixed)| {
+                                if !fixed.is_empty() {
+                                    crate::utils::score_dynamics::record_baseline("commerce.lang4b_key_repair", fixed.len() as f32);
+                                    emit_term(&format!("  🩹 [LANG4B KEY REPAIR] {:?} — 어휘 16,384 개인 4B 가 영문 스키마 키를 한두 글자 틀리게 옮긴 것을 철자 거리로 되돌립니다. 값은 아래 검증을 그대로 거칩니다.", fixed));
+                                }
+                                text
+                            })
+                    } else {
+                        let q3_gen = model.qwen3_generator.clone();
+                        let cancel_clone = cancellation_token.clone();
+                        let sys_msg = system_message.clone();
+                        let prejudice_target_for_closure = if field_is_analytic[idx] { String::new() } else { dynamic_prej_str.clone() };
+                        let task_q = task_question.clone();
+                        let ignore_list_clone = ignore_list.clone();
+                        let res = tokio::task::spawn_blocking(move || {
+                            let mut gen_guard = q3_gen.blocking_lock();
+                            if let Some(gen) = gen_guard.as_mut() {
+                                let params = ChatCompletionParameters {
+                                    messages: vec![
+                                        sys_msg,
+                                        ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                            content: ChatCompletionRequestUserMessageContent::Text(task_q),
+                                            name: None,
+                                        })
+                                    ],
+                                    model: "qwen3".to_string(), max_tokens: Some(512), temperature: Some(0.0), top_p: Some(0.95),
+                                    ..Default::default()
+                                };
 
-                            let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
 
-                            
-                            gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
-                        } else {
-                            Err(anyhow::anyhow!("Qwen 3 Generator not available"))
-                        }
-                    }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+                                let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
 
 
-
-                    let q3_clear_arc = model.qwen3_generator.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                            gen.clear_kv_cache();
-                        }
-                    }).await;
-
-                    if !model.is_cpu_mode {
-                        let dev = model.device_config.device.clone();
+                                gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                            } else {
+                                Err(anyhow::anyhow!("Qwen 3 Generator not available"))
+                            }
+                        }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join failed: {}", e)));
+                        let q3_clear_arc = model.qwen3_generator.clone();
                         let _ = tokio::task::spawn_blocking(move || {
-                            if dev.is_cuda() { let _ = dev.synchronize(); }
+                            if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
+                                gen.clear_kv_cache();
+                            }
                         }).await;
+
+                        if !model.is_cpu_mode {
+                            let dev = model.device_config.device.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if dev.is_cuda() { let _ = dev.synchronize(); }
+                            }).await;
+                        }
+                        res
+                    };
+                    if used_lang {
+                        if let Err(e) = &res {
+                            emit_term(&format!("  ⚠️ [LANG4B FALLBACK] Field '{}' | 4B 생성이 실패해 이 문서의 남은 필드는 Qwen3 로 진행합니다: {}", field_name, e));
+                            crate::model::lang_llm::record_route_outcome("commerce", "detail_field", false);
+                            field_lang = None;
+                            if field_is_analytic[idx] && !field_name.contains("status") {
+                                task_question = parsing::extract_synthesis_field_prompt(&page_type, &field_name, &field_desc, &doc_lang, target_data_str);
+                            }
+                            model
+                                .enter_generation_phase(
+                                    crate::model::ModelSize::Qwen3,
+                                    None,
+                                    Some(cancellation_token.clone()),
+                                    false,
+                                    Some("inference".to_string()),
+                                    "detail field extraction loop (4B fallback)",
+                                )
+                                .await?;
+                            continue;
+                        }
                     }
 
                     match res {
@@ -7633,11 +8491,28 @@ pub async fn process_task(
                                         };
 
                                         if is_synthesis_field && !extracted_str.is_empty() {
+                                            let answer_key = extracted_str.trim().trim_matches(|c: char| c == '.' || c == '"' || c == '\'').trim().to_lowercase();
+                                            let bare_value = !answer_key.chars().any(|c| c.is_alphanumeric())
+                                                || extracted_data.as_object().map_or(false, |o| {
+                                                    o.iter().any(|(ok, ov)| ok.as_str() != *k && ov.as_str().map_or(false, |s| s.trim().to_lowercase() == answer_key))
+                                                })
+                                                || targeted_pug.lines().any(|l| l.split_once('|').map_or(false, |(_, v)| v.trim().to_lowercase() == answer_key));
+                                            if bare_value {
+                                                emit_term(&format!(
+                                                    "  ⏭️ [SYNTHESIS NOT A SUMMARY] '{}' | 응답 \"{}\" 은 문서의 값 하나를 그대로 옮겼거나 글자가 없는 응답이라 요약으로 받지 않고 다시 묻습니다. 다시 물을 때는 다른 필드 값 전체가 아니라 이 응답만 금지 목록에 넣습니다.",
+                                                    k,
+                                                    extracted_str
+                                                ));
+                                                requires_retry = true;
+                                                extracted_values_for_retry.push(extracted_str.clone());
+                                                continue;
+                                            }
                                             let gate = crate::utils::ai_utils::synthesis_fact_gate(&extracted_str, &targeted_pug, &doc_lang);
                                             crate::utils::score_dynamics::record_baseline(
-                                                "commerce.synthesis_sentence_drop",
+                                                crate::model::lang_llm::synthesis_drop_axis(used_lang),
                                                 if gate.total == 0 { 0.0 } else { gate.dropped.len() as f32 / gate.total as f32 },
                                             );
+                                            crate::model::lang_llm::record_engine_outcome("commerce", "detail_synthesis", used_lang, gate.dropped.is_empty());
                                             if !gate.dropped.is_empty() {
                                                 emit_term(&format!(
                                                     "  🧪 [SYNTHESIS GROUNDING] '{}' | 문장 {}개 중 {}개를 뺍니다: {:?} | 남은 문장: \"{}\" — 요약 문장의 연도·날짜·금액·통화는 아이템 원문에 그대로 있어야 합니다. 원문에 없는 사실이 text·masked_text 로 들어가면 FTS 와 청크 코사인이 그 사실로 이 문서를 회수합니다.",
@@ -7760,6 +8635,14 @@ pub async fn process_task(
                             if !found_valid_value {
                                 requires_retry = true;
                             }
+                            if !is_synthesis_field || requires_retry {
+                                crate::model::lang_llm::record_engine_outcome(
+                                    "commerce",
+                                    if is_synthesis_field { "detail_synthesis" } else { "detail_field" },
+                                    used_lang,
+                                    !requires_retry,
+                                );
+                            }
 
                             if requires_retry {
                                 miss_counter += 1;
@@ -7834,6 +8717,86 @@ pub async fn process_task(
                         }
                     }
                 }
+            }
+            drop(field_lang);
+            if !detail_synthesis_jobs.is_empty() {
+                let mut detail_items: Vec<Value> = vec![extracted_data.clone()];
+                let detail_pos: std::collections::HashMap<usize, usize> = std::collections::HashMap::from([(0usize, 0usize)]);
+                run_synthesis_pass(
+                    &model,
+                    &mut detail_items,
+                    &detail_synthesis_jobs,
+                    &detail_pos,
+                    &page_type,
+                    &doc_lang,
+                    &lang_probe_text,
+                    SYNTHESIS_SKIP_DROP,
+                    cancellation_token,
+                    &emit_term,
+                    "detail_synthesis",
+                )
+                .await?;
+                if let Some(done) = detail_items.pop() {
+                    extracted_data = done;
+                }
+            }
+            let own_family = crate::utils::canonical::relay_type_family(&page_type);
+            let related_types = crate::logic::related(&page_type);
+            let relay_foreign: Vec<&str> = ["goods", "order", "tracking"]
+                .iter()
+                .copied()
+                .filter(|t| *t != own_family.as_str() && related_types.iter().any(|r| r == t))
+                .collect();
+            if !relay_foreign.is_empty() {
+                let self_token = extracted_data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let cands = collect_id_link_candidates_capped(&pug_lines_ref, usize::MAX);
+                let mut relay_bound = 0usize;
+                for (ftype, token, role) in collect_typed_relay_refs(&cands, &self_token, &relay_foreign) {
+                    let aliases = crate::logic::relay_type_aliases(&ftype);
+                    let keyed = cands
+                        .iter()
+                        .any(|c| same_id_token(&c.token, &token) && candidate_type_evidence(c, aliases) >= 2);
+                    if !keyed {
+                        continue;
+                    }
+                    let key = match crate::utils::canonical::relay_key_for_type(&ftype) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    let f_index = entity_key_index(&ftype, &team_id, &task.cc, &token);
+                    let obj = match extracted_data.as_object_mut() {
+                        Some(o) => o,
+                        None => break,
+                    };
+                    match obj.get(key) {
+                        Some(Value::Array(_)) | Some(Value::Object(_)) => continue,
+                        Some(v) if crate::utils::canonical::relay_ref_index(Some(v)).is_some() => continue,
+                        _ => {}
+                    }
+                    let companion = format!("{}_title", key);
+                    let text_val = obj
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| crate::utils::canonical::relay_text_is_content(s));
+                    let companion_empty = obj
+                        .get(&companion)
+                        .and_then(|v| v.as_str())
+                        .map_or(true, |s| s.trim().is_empty());
+                    if let Some(t) = text_val {
+                        if companion_empty {
+                            obj.insert(companion.clone(), json!(t));
+                        }
+                    }
+                    obj.insert(key.to_string(), json!(f_index));
+                    relay_ledger::mark_relay_bound(&mut extracted_data, key);
+                    relay_bound += 1;
+                    emit_term(&format!(
+                        "  🔗 [DETAIL RELAY REF BIND] {} ← {} '{}' (역할 '{}' · 주소 매개변수 이름이 {} 별칭) → {} = {} | 상세 페이지에 인쇄된 상대 문서 링크의 식별자로 목록과 같은 식의 상대 index 를 만들고, 글자 값은 {}_title 로 옮깁니다. 목록 문서 없이 상세만 들어와도 저장 직전 정리 단계가 이 연결을 0 으로 지우지 않습니다.",
+                        page_type, ftype, token, role, ftype, key, f_index, key
+                    ));
+                }
+                crate::utils::score_dynamics::record_baseline("commerce.detail_relay_ref_bound", relay_bound as f32);
             }
         }
     }
@@ -8108,16 +9071,28 @@ pub async fn process_task(
 
     {
         println!("[Scheduler] PHASE 3: Handover - Unloading, Preparing for Embedding...");
-        
+
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model...", "spinner": "⠋" }));
-        
-        model.deep_purge_resources().await;
-        // 🌟 [CROSSOVER] 퍼지 사실을 페이즈 원장에 반영합니다.
-        model.mark_crossover_idle();
-        
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        
-        crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
+
+        let kept_lang = if crate::model::lang_llm::translit_demand(&extracted_data) > 0 {
+            model.deep_purge_keep_lang(&doc_lang).await
+        } else {
+            model.deep_purge_resources().await;
+            None
+        };
+        match kept_lang.as_deref() {
+            Some(code) => emit_term(&format!(
+                "[Scheduler] 🔁 [HANDOVER KEEP] 필드 추출에 쓴 Qwen3.5-4B-{} 를 음차 단계까지 둡니다. 음차가 같은 언어 모델을 쓰므로 내렸다가 다시 올리는 적재 한 번을 줄입니다. 임베딩 적재가 동시 상주를 허용하지 않으면 그 자리에서 기존 교차 규칙대로 내립니다.",
+                code
+            )),
+            None => {
+                model.mark_crossover_idle();
+
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+                crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;
+            }
+        }
         emit_term(&format!("[Scheduler] {}", model.crossover_report()));
     }
 
@@ -8138,11 +9113,19 @@ pub async fn process_task(
 
         let free_mb = model.get_free_vram_mb();
         let embed_need = model.embedding_budget_mb();
+        let gen_resident = translit_engine.code().is_some()
+            && crate::model::lang_llm::resident_variant().as_deref() == translit_engine.code()
+            && model.qwen3_5_generator.lock().await.is_some();
         let gen_need = match translit_engine.code() {
+            Some(_) if gen_resident => 0,
             Some(code) => crate::model::lang_llm::resident_estimate_mb(code),
             None => model.generation_budget_mb(crate::model::ModelSize::Qwen3_5),
         };
-        let gen_label = translit_engine.label();
+        let gen_label = if gen_resident {
+            format!("{} (이미 상주)", translit_engine.label())
+        } else {
+            translit_engine.label()
+        };
         if free_mb >= embed_need + gen_need {
             emit_term(&format!(
                 "[Scheduler] 🤝 [CROSSOVER/COEXIST 예상] 자유 {}MB >= 임베딩 {}MB + {} {}MB. 스왑 없이 진행할 수 있습니다.",
@@ -8165,22 +9148,7 @@ pub async fn process_task(
         .and_then(|v| if v.is_number() { Some(v.to_string()) } else { v.as_str().map(|s| s.to_string()) })
         .unwrap_or_default();
     let url_self_token: Option<(String, String, u8)> = if is_detail {
-        let self_aliases = crate::logic::relay_type_aliases(&page_type);
-        let mut typed: Vec<(String, String, u8)> = collect_id_link_candidates_from_url(&url)
-            .into_iter()
-            .map(|c| {
-                let ev = candidate_type_evidence(&c, self_aliases);
-                (c.token, c.role_phrase, ev)
-            })
-            .filter(|(_, _, ev)| *ev >= 1)
-            .collect();
-        typed.sort_by(|a, b| b.2.cmp(&a.2));
-        match typed.first() {
-            Some((tok, role, ev)) if !typed.iter().skip(1).any(|(t2, _, e2)| e2 == ev && !same_id_token(t2, tok)) => {
-                Some((tok.clone(), role.clone(), *ev))
-            }
-            _ => None,
-        }
+        url_typed_self_token(&url, &page_type)
     } else {
         None
     };
@@ -8347,7 +9315,24 @@ pub async fn process_task(
                 existing_json_found = Some(json_val);
             }
         }
-
+        if let Some(prior) = existing_json_found.as_ref() {
+            let relay_kept = crate::utils::canonical::keep_relay_index(prior, &mut extracted_data, &page_type);
+            if !relay_kept.is_empty() {
+                crate::utils::score_dynamics::record_baseline("commerce.detail_relay_kept", relay_kept.len() as f32);
+                emit_term(&format!(
+                    "  ⚓ [DETAIL MERGE / RELAY KEEP] {} '{}' | 목록이 확정한 연결 index {:?} 를 상세 병합 뒤에도 유지합니다. 상세 페이지가 같은 키에 글자 값(상품명 등)을 가져와 index 를 덮으면, 저장 직전 정리 단계가 그 글자를 {{키}}_title 로 옮기면서 연결이 0 으로 사라져 기간 연결 검색이 이 문서를 찾지 못합니다. 상세의 글자 값은 {{키}}_title 이 비어 있을 때만 그 자리에 둡니다.",
+                    page_type, target_id, relay_kept
+                ));
+            }
+            let shape_kept = crate::utils::canonical::keep_value_shapes(prior, &mut extracted_data);
+            if !shape_kept.is_empty() {
+                crate::utils::score_dynamics::record_baseline("commerce.detail_shape_kept", shape_kept.len() as f32);
+                emit_term(&format!(
+                    "  ⚓ [DETAIL MERGE / SHAPE KEEP] {} '{}' | 필드 {:?} 는 기존 값의 모양(주소 · 코드 · 수치·날짜)과 상세 값의 모양이 달라 기존 값을 유지합니다. 상세 폼의 버튼 글자('미리보기')나 라디오 코드('0')가 상품코드 · 대표 이미지 주소를 덮지 않게 합니다. 글자 값끼리의 교체는 막지 않습니다.",
+                    page_type, target_id, shape_kept
+                ));
+            }
+        }
         let self_prior = crate::utils::canonical::ledger_prior(existing_json_found.as_ref());
         let origin_ok = relay_ledger::placeholder_origin_establishes(&page_type, existing_json_found.as_ref());
 

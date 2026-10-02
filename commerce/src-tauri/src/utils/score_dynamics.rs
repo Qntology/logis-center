@@ -1346,6 +1346,14 @@ pub fn adaptive_baseline_n(axis: &str) -> Option<(f32, f32, u64)> {
     })
 }
 
+pub fn adaptive_recent(axis: &str) -> Option<(f32, f32, u64)> {
+    resolve(|st| {
+        st.baseline
+            .get(axis)
+            .map(|w| ((w.recent_mean() as f32, w.mean as f32, w.n), w.n))
+    })
+}
+
 /// 축 신뢰도. 역분산 융합의 가중치로 씁니다(Phase 1).
 /// 분산이 작을수록(변별력 없음) 낮은 값을 돌려줍니다.
 pub fn axis_confidence(axis: &str) -> Option<f32> {

@@ -928,6 +928,7 @@ pub async fn relay_join(
         let mut date_fields: Vec<String> = Vec::new();
         let mut in_period_ids: Vec<String> = Vec::new();
         let mut out_period_ids: Vec<String> = Vec::new();
+        let mut void_partner_ids: Vec<String> = Vec::new();
         for (pid, pdoc) in partners.iter() {
             let (field, iso) = match date_axis(pdoc) {
                 Some(x) => x,
@@ -966,6 +967,7 @@ pub async fn relay_join(
                 in_period_ids.push(pid.clone());
                 if voided {
                     void_partners += 1;
+                    void_partner_ids.push(pid.clone());
                 }
             }
         }
@@ -999,12 +1001,22 @@ pub async fn relay_join(
 
         if hits.is_empty() {
             crate::utils::score_dynamics::record_baseline("search.relay_period_empty", 1.0);
+            let pre_void = results.len();
+            if !void_only.is_empty() {
+                results.retain(|r| {
+                    let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    !void_only.iter().any(|x| x == id)
+                });
+            }
+            let void_dropped = pre_void - results.len();
+            rep.dropped += void_dropped;
+            crate::utils::score_dynamics::record_baseline("search.relay_void_only_dropped", void_dropped as f32);
             emit(&format!(
-                "[AI-SEARCH] ⚪ [RELAY PERIOD / EMPTY] '{}' 의 기간 {:?} ~ {:?} 을 연결 타입 {:?} 의 날짜 축으로 옮겨 보았지만 기간 안에서 '{}' 를 가리키는 문서가 없습니다. 결과를 줄이지 않고 표시만 합니다.",
-                primary, start, end, partner_types, key
+                "[AI-SEARCH] ⚪ [RELAY PERIOD / EMPTY] '{}' 의 기간 {:?} ~ {:?} 을 연결 타입 {:?} 의 날짜 축으로 옮겨 보았지만 기간 안에서 '{}' 를 가리키는 성립 문서가 없습니다. 기간으로는 결과를 줄이지 않고, 취소·환불·반품 문서로만 가리켜진 {}건만 결과에서 뺐습니다. 연결이 없다는 것은 연결 축이 비어 있을 수 있다는 뜻이라 좁히지 않지만, 취소 건만 있다는 것은 그 기간에 팔리지 않았다는 직접 근거입니다.",
+                primary, start, end, partner_types, key, void_dropped
             ));
             if let Some(o) = plan.as_object_mut() {
-                o.insert("relay".to_string(), json!({ "period": period, "key": key, "partner_types": partner_types, "applied": false }));
+                o.insert("relay".to_string(), json!({ "period": period, "key": key, "partner_types": partner_types, "void_only": void_only, "applied": false, "void_only_applied": void_dropped > 0 }));
             }
             crate::utils::score_dynamics::leave_scope();
             continue;
@@ -1041,6 +1053,12 @@ pub async fn relay_join(
         rep.rescued += rescued_ids.len();
 
         let pre_drop = results.len();
+        let void_shown: Vec<String> = results
+            .iter()
+            .filter_map(|r| r.get("id").and_then(|v| v.as_str()))
+            .filter(|id| void_partner_ids.iter().any(|x| x == id))
+            .map(|s| s.to_string())
+            .collect();
         results.retain(|r| {
             let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let t = r
@@ -1053,8 +1071,16 @@ pub async fn relay_join(
             if fam == primary_family {
                 return hits.contains_key(id);
             }
-            !out_period_ids.iter().any(|x| x == id)
+            !out_period_ids.iter().any(|x| x == id) && !void_partner_ids.iter().any(|x| x == id)
         });
+        if !void_shown.is_empty() {
+            crate::utils::score_dynamics::record_baseline("search.relay_void_partner_dropped", void_shown.len() as f32);
+            emit(&format!(
+                "[AI-SEARCH] 🚫 [RELAY PERIOD / VOID PARTNER] 기간 안의 취소·환불·반품 상대 문서 {}건을 결과 목록에서 뺍니다: {:?}. 판매 수량 합에서는 이미 빠져 있었고, 이 질의는 판매·거래 관계로 기간을 옮긴 질의라 이 문서들은 '팔린 기록' 이 아닙니다. 연결 문서 목록(plan.relay.partner_ids)에는 그대로 남습니다.",
+                void_shown.len(),
+                void_shown.iter().take(8).collect::<Vec<_>>()
+            ));
+        }
         let dropped = pre_drop - results.len();
         rep.dropped += dropped;
         for r in results.iter_mut() {

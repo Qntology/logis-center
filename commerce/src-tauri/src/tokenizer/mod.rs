@@ -12,17 +12,14 @@ impl TokenizerModel {
     }
 
     pub fn init(path: &str) -> Result<Self> {
-        let path = path.to_string();
-        assert!(
-            std::path::Path::new(&path).exists(),
-            "model path file not exists"
-        );
-        let tokenizer_file = std::path::Path::new(&path).join("tokenizer.json");
-        assert!(
-            tokenizer_file.exists(),
-            "tokenizer.json not exists in model path: {:?}",
-            tokenizer_file
-        );
+        let dir = std::path::Path::new(path);
+        if !dir.exists() {
+            return Err(anyhow!("model path not found: {}", path));
+        }
+        let tokenizer_file = dir.join("tokenizer.json");
+        if !tokenizer_file.exists() {
+            return Err(anyhow!("tokenizer.json not found in model path: {:?}", tokenizer_file));
+        }
         let tokenizer = Tokenizer::from_file(tokenizer_file)
             .map_err(|e| anyhow!(format!("tokenizer from file error{}", e)))?;
         Ok(Self { tokenizer })

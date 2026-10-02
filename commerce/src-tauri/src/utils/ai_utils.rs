@@ -2973,6 +2973,79 @@ where
     }
     (result, diags)
 }
+
+pub fn residual_assign_blocked(
+    matrix: &Vec<Vec<f32>>,
+    assign: &mut Vec<Option<(usize, f32, f32)>>,
+    eligible: &[bool],
+    abs_threshold: f32,
+) -> Vec<(usize, usize, usize, f32)> {
+    let field_count = matrix.len().min(assign.len());
+    let mut line_count = 0usize;
+    for row in matrix.iter() {
+        if row.len() > line_count { line_count = row.len(); }
+    }
+    let mut rescued: Vec<(usize, usize, usize, f32)> = Vec::new();
+    if field_count == 0 || line_count == 0 { return rescued; }
+    let get = |f: usize, l: usize| -> f32 {
+        matrix.get(f).and_then(|row| row.get(l)).copied().unwrap_or(-1.0)
+    };
+    let mut claimed = vec![false; line_count];
+    for a in assign.iter() {
+        if let Some((l, _, _)) = a {
+            if *l < line_count { claimed[*l] = true; }
+        }
+    }
+    loop {
+        let mut pick: Option<(usize, usize, f32, f32, usize)> = None;
+        for l in 0..line_count {
+            if claimed[l] { continue; }
+            let mut top: Option<(usize, f32)> = None;
+            for f in 0..field_count {
+                let s = get(f, l);
+                if s < abs_threshold { continue; }
+                if top.map_or(true, |(_, v)| s > v) { top = Some((f, s)); }
+            }
+            let blocker = match top {
+                Some((f, _)) if assign[f].is_some() => f,
+                _ => continue,
+            };
+            let mut cands: Vec<(usize, f32)> = (0..field_count)
+                .filter(|f| assign[*f].is_none())
+                .map(|f| (f, get(f, l)))
+                .filter(|(_, s)| *s >= abs_threshold)
+                .collect();
+            if cands.is_empty() { continue; }
+            cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let (f, s) = cands[0];
+            if !eligible.get(f).copied().unwrap_or(false) { continue; }
+            let margin = match cands.get(1) {
+                Some((_, s2)) => s - *s2,
+                None => s - abs_threshold,
+            };
+            if margin <= 1e-6 { continue; }
+            if cands.len() >= 3 {
+                let tail: Vec<f32> = cands[1..].iter().map(|(_, v)| *v).collect();
+                let n = tail.len() as f32;
+                let mean = tail.iter().sum::<f32>() / n;
+                let noise = (tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).max(0.0).sqrt();
+                if margin < noise { continue; }
+            }
+            if (0..line_count).any(|l2| l2 != l && !claimed[l2] && get(f, l2) > s) { continue; }
+            if pick.map_or(true, |p| s > p.2) { pick = Some((f, l, s, margin, blocker)); }
+        }
+        match pick {
+            Some((f, l, s, margin, blocker)) => {
+                assign[f] = Some((l, s, margin));
+                claimed[l] = true;
+                rescued.push((f, l, blocker, margin));
+            }
+            None => break,
+        }
+    }
+    rescued
+}
+
 pub fn self_poisoned_prejudice_mask(
     own_label_embs: &Vec<Vec<f32>>,
     prej_embs: &Vec<Vec<f32>>,
@@ -5191,11 +5264,262 @@ struct SynSource {
     month_days: std::collections::HashSet<(u32, u32)>,
     months: std::collections::HashSet<u32>,
     currencies: std::collections::HashSet<&'static str>,
+    times: std::collections::HashSet<(u32, u32)>,
+    text_key: String,
+    roman_key: String,
+    anchors: Vec<(String, Vec<String>)>,
+    bindings: Vec<(String, Vec<SynLit>)>,
+    values: Vec<String>,
+    names: Vec<(String, Vec<char>)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SynLit {
+    Num(String),
+    Date(Option<u32>, u32, u32),
+}
+
+fn syn_glued_tail(tail: &str) -> bool {
+    let rest = tail.trim_start_matches(|c: char| c == '\'' || c == '\u{2019}');
+    let apostrophe = rest.len() != tail.len();
+    !rest.is_empty() && rest.chars().all(|c| c.is_alphabetic() && (apostrophe || !c.is_ascii()))
+}
+
+const SYN_SCALE_CHARS: [char; 14] = ['십', '백', '천', '만', '억', '조', '十', '百', '千', '万', '萬', '億', '亿', '兆'];
+
+fn syn_numeric_head(core: &str) -> Option<&str> {
+    let cut = core
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_digit() || matches!(c, ',' | '.' | '-' | '/')))
+        .map(|(i, _)| i)?;
+    let head = core[..cut].trim_end_matches(|c: char| matches!(c, ',' | '.' | '-' | '/'));
+    let tail = &core[cut..];
+    if head.is_empty()
+        || !head.chars().any(|c| c.is_ascii_digit())
+        || tail.starts_with(|c: char| SYN_SCALE_CHARS.contains(&c))
+        || !syn_glued_tail(tail)
+    {
+        return None;
+    }
+    Some(head)
+}
+
+const SYN_RANGE_WORDS: [&str; 33] = [
+    "미만", "이하", "이상", "초과", "정도", "가량", "쯤", "내외", "안팎", "넘", "남짓", "수준", "대",
+    "未満", "以下", "以上", "超", "程度", "前後", "左右", "以内",
+    "under", "over", "below", "above", "less", "more", "about", "around", "approximately", "nearly", "roughly", "almost",
+];
+
+fn syn_scale_unit(c: char) -> Option<(f64, bool)> {
+    match c {
+        '십' | '十' => Some((10.0, false)),
+        '백' | '百' => Some((100.0, false)),
+        '천' | '千' => Some((1_000.0, false)),
+        '만' | '万' | '萬' => Some((10_000.0, true)),
+        '억' | '億' | '亿' => Some((100_000_000.0, true)),
+        '조' | '兆' => Some((1_000_000_000_000.0, true)),
+        _ => None,
+    }
+}
+
+fn syn_scaled_part(core: &str) -> Option<(f64, usize, f64)> {
+    if !core.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut total = 0.0f64;
+    let mut section = 0.0f64;
+    let mut num: Option<f64> = None;
+    let mut buf = String::new();
+    let mut end = 0usize;
+    let mut last_big = 0.0f64;
+    let mut saw_scale = false;
+    for (i, c) in core.char_indices() {
+        if c.is_ascii_digit() || c == ',' || c == '.' {
+            buf.push(c);
+            end = i + c.len_utf8();
+            continue;
+        }
+        if !buf.is_empty() {
+            num = Some(buf.replace(',', "").parse::<f64>().ok()?);
+            buf.clear();
+        }
+        match syn_scale_unit(c) {
+            Some((m, false)) => {
+                section += num.take().unwrap_or(1.0) * m;
+                saw_scale = true;
+                last_big = 0.0;
+                end = i + c.len_utf8();
+            }
+            Some((m, true)) => {
+                section += num.take().unwrap_or(0.0);
+                let base = if section == 0.0 { 1.0 } else { section };
+                total += base * m;
+                section = 0.0;
+                saw_scale = true;
+                last_big = m;
+                end = i + c.len_utf8();
+            }
+            None => break,
+        }
+    }
+    if !buf.is_empty() {
+        num = Some(buf.replace(',', "").parse::<f64>().ok()?);
+    }
+    if !saw_scale {
+        return None;
+    }
+    if let Some(n) = num {
+        section += n;
+        last_big = 0.0;
+    }
+    total += section;
+    Some((total, end, last_big))
+}
+
+fn syn_plain_head(tok: &str) -> Option<(f64, usize)> {
+    let end = tok
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_digit() || *c == ','))
+        .map(|(i, _)| i)
+        .unwrap_or(tok.len());
+    if end == 0 || tok[end..].starts_with(|c: char| syn_scale_unit(c).is_some()) {
+        return None;
+    }
+    let n = tok[..end].replace(',', "").parse::<f64>().ok()?;
+    Some((n, end))
+}
+
+fn syn_scaled_span(toks: &[&str], e: usize) -> Option<(f64, usize, String)> {
+    let core = syn_core(toks[e]);
+    let (mut value, end, mut last_big) = syn_scaled_part(core)?;
+    let mut last = e;
+    let mut rest = core[end..].to_string();
+    while last_big > 0.0 && rest.is_empty() {
+        let next = match toks.get(last + 1) {
+            Some(t) => syn_core(t),
+            None => break,
+        };
+        if let Some((v, nend, nbig)) = syn_scaled_part(next).filter(|(v, _, _)| *v < last_big) {
+            value += v;
+            last_big = nbig;
+            rest = next[nend..].to_string();
+        } else if let Some((v, nend)) = syn_plain_head(next).filter(|(v, _)| *v < last_big) {
+            value += v;
+            last_big = 0.0;
+            rest = next[nend..].to_string();
+        } else {
+            break;
+        }
+        last += 1;
+    }
+    Some((value, last, rest))
+}
+
+fn syn_scaled_literal(toks: &[&str], e: usize) -> Option<SynLit> {
+    let (value, last, rest) = syn_scaled_span(toks, e)?;
+    let rest = rest.to_lowercase();
+    let next_word = toks.get(last + 1).map(|t| syn_core(t).to_lowercase()).unwrap_or_default();
+    if SYN_RANGE_WORDS.iter().any(|w| rest.contains(w) || next_word.starts_with(w)) {
+        return None;
+    }
+    syn_number_key(&format!("{}", value.round() as u128)).map(SynLit::Num)
+}
+
+fn syn_label_word(token: &str, word: &str) -> bool {
+    match token.strip_prefix(word) {
+        Some(tail) => tail.is_empty() || syn_glued_tail(tail),
+        None => false,
+    }
+}
+
+fn syn_literal(value: &str) -> Option<SynLit> {
+    let first = value.split_whitespace().next()?;
+    let core = syn_core(first);
+    let date_part = match core.split_once('T') {
+        Some((d, _)) if syn_date_literal(d).is_some() => d,
+        _ => core,
+    };
+    if let Some((y, m, d)) = syn_date_literal(date_part) {
+        return Some(SynLit::Date(y, m, d));
+    }
+    if !core.is_empty() && core.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
+        return syn_number_key(core).map(SynLit::Num);
+    }
+    None
+}
+
+fn syn_lit_matches(bound: &SynLit, got: &SynLit) -> bool {
+    match (bound, got) {
+        (SynLit::Num(a), SynLit::Num(b)) => a == b,
+        (SynLit::Date(ya, ma, da), SynLit::Date(yb, mb, db)) => {
+            ma == mb && da == db && (ya.is_none() || yb.is_none() || ya == yb)
+        }
+        _ => false,
+    }
+}
+
+fn syn_lit_text(lit: &SynLit) -> String {
+    match lit {
+        SynLit::Num(n) => n.clone(),
+        SynLit::Date(Some(y), m, d) => format!("{}-{:02}-{:02}", y, m, d),
+        SynLit::Date(None, m, d) => format!("{:02}-{:02}", m, d),
+    }
+}
+
+fn syn_clock(core: &str) -> Option<(u32, u32)> {
+    let lower = core.to_lowercase();
+    let body = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '.');
+    let parts: Vec<&str> = body.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    if !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    if parts[0].len() > 2 || parts[1].len() != 2 {
+        return None;
+    }
+    let h: u32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some((h, m))
+}
+
+fn syn_text_key(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+fn syn_quoted_spans(sentence: &str) -> Vec<String> {
+    const PAIRS: [(char, char); 6] = [('"', '"'), ('\'', '\''), ('“', '”'), ('‘', '’'), ('「', '」'), ('『', '』')];
+    let chars: Vec<char> = sentence.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let open_ok = i == 0 || !chars[i - 1].is_alphanumeric();
+        let close = PAIRS.iter().find(|(o, _)| *o == chars[i]).map(|(_, c)| *c);
+        if let (Some(close), true) = (close, open_ok) {
+            let end = (i + 1..chars.len()).find(|&j| chars[j] == close && (j + 1 >= chars.len() || !chars[j + 1].is_alphanumeric()));
+            if let Some(j) = end {
+                let span: String = chars[i + 1..j].iter().collect();
+                if span.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+                    out.push(span.trim().to_string());
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 fn syn_source(source: &str, doc_lang: &str) -> SynSource {
     let mut s = SynSource::default();
     s.currencies.insert(default_currency_for_lang(doc_lang));
+    s.text_key = syn_text_key(source);
+    s.roman_key = syn_text_key(&any_ascii::any_ascii(source));
     let toks: Vec<&str> = source
         .split(|c: char| c.is_whitespace() || c == '|' || c == '"' || c == '\'' || c == '(' || c == ')' || c == '[' || c == ']' || c == '=')
         .filter(|t| !t.is_empty())
@@ -5205,7 +5529,14 @@ fn syn_source(source: &str, doc_lang: &str) -> SynSource {
             s.currencies.insert(c);
         }
         let core = syn_core(raw);
-        if let Some((y, m, d)) = syn_date_literal(core) {
+        let (date_core, clock_core) = match core.split_once('T') {
+            Some((d, t)) if syn_date_literal(d).is_some() => (d, t),
+            _ => (core, core),
+        };
+        if let Some(t) = syn_clock(clock_core) {
+            s.times.insert(t);
+        }
+        if let Some((y, m, d)) = syn_date_literal(date_core) {
             if let Some(y) = y {
                 s.years.insert(y);
             }
@@ -5252,7 +5583,164 @@ fn syn_source(source: &str, doc_lang: &str) -> SynSource {
             }
         }
     }
+    for line in source.lines() {
+        let value = match line.rfind('|') {
+            Some(p) => &line[p + 1..],
+            None => match line.find(": ") {
+                Some(p) => &line[p + 2..],
+                None => line,
+            },
+        };
+        let words: Vec<&str> = value.split_whitespace().map(syn_core).filter(|w| !w.is_empty()).collect();
+        let companions: Vec<String> = words
+            .iter()
+            .filter(|w| w.chars().any(|c| c.is_alphabetic() && !c.is_ascii()))
+            .map(|w| w.to_lowercase())
+            .collect();
+        if companions.is_empty() {
+            continue;
+        }
+        for w in words.iter() {
+            let code_like = w.chars().count() >= 3
+                && w.chars().any(|c| c.is_ascii_alphabetic())
+                && w.chars().any(|c| c.is_ascii_digit())
+                && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if code_like && !s.anchors.iter().any(|(c, _)| c.eq_ignore_ascii_case(w)) {
+                s.anchors.push((w.to_string(), companions.clone()));
+            }
+        }
+    }
+    for line in source.lines() {
+        let (label, value) = match line.rfind('|') {
+            Some(p) => (&line[..p], &line[p + 1..]),
+            None => match line.find(": ") {
+                Some(p) => (&line[..p], &line[p + 2..]),
+                None => continue,
+            },
+        };
+        let label = label.rsplit('>').next().unwrap_or("").trim().to_lowercase();
+        if label.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
+            continue;
+        }
+        let lit = match syn_literal(value) {
+            Some(l) => l,
+            None => continue,
+        };
+        match s.bindings.iter().position(|(l, _)| *l == label) {
+            Some(p) => {
+                if !s.bindings[p].1.contains(&lit) {
+                    s.bindings[p].1.push(lit);
+                }
+            }
+            None => s.bindings.push((label, vec![lit])),
+        }
+    }
+    let mut seen_values: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in source.lines() {
+        let value = match line.rfind('|') {
+            Some(p) => &line[p + 1..],
+            None => match line.find(": ") {
+                Some(p) => &line[p + 2..],
+                None => continue,
+            },
+        };
+        let key = syn_text_key(value);
+        if key.chars().count() < 2 || !seen_values.insert(key.clone()) {
+            continue;
+        }
+        let chars: Vec<char> = key.chars().collect();
+        if chars.len() >= SYN_NAME_MIN_CHARS && chars.iter().filter(|c| c.is_alphabetic()).count() * 2 >= chars.len() {
+            s.names.push((value.trim().to_string(), chars));
+        }
+        s.values.push(key);
+    }
     s
+}
+
+const SYN_NAME_MIN_CHARS: usize = 10;
+
+fn syn_find_all(hay: &[char], needle: &[char]) -> Vec<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return Vec::new();
+    }
+    (0..=hay.len() - needle.len()).filter(|&i| hay[i..i + needle.len()] == *needle).collect()
+}
+
+fn syn_bigram_dice(a: &[char], b: &[char]) -> f32 {
+    if a.len() < 2 || b.len() < 2 {
+        return 0.0;
+    }
+    let mut pool: Vec<(char, char)> = b.windows(2).map(|w| (w[0], w[1])).collect();
+    let mut common = 0usize;
+    for w in a.windows(2) {
+        if let Some(p) = pool.iter().position(|x| *x == (w[0], w[1])) {
+            pool.swap_remove(p);
+            common += 1;
+        }
+    }
+    2.0 * common as f32 / (a.len() + b.len() - 2) as f32
+}
+
+fn syn_name_mutations(sentence: &str, src: &SynSource) -> Vec<String> {
+    let skey: Vec<char> = syn_text_key(sentence).chars().collect();
+    let mut bad: Vec<String> = Vec::new();
+    for (shown, name) in src.names.iter() {
+        let n = name.len();
+        if !syn_find_all(&skey, name).is_empty() {
+            continue;
+        }
+        let starts = syn_find_all(&skey, &name[..2]);
+        let ends = syn_find_all(&skey, &name[n - 2..]);
+        let mutated = starts.iter().any(|&i| {
+            ends.iter().any(|&j| {
+                let stop = j + 2;
+                j > i
+                    && (stop - i) * 4 >= n * 3
+                    && (stop - i) * 3 <= n * 4
+                    && syn_bigram_dice(&skey[i..stop], name) >= 0.6
+            })
+        });
+        if mutated {
+            bad.push(format!("이름 변형 '{}'", shown));
+        }
+    }
+    bad
+}
+
+fn syn_anchor_hits(sentence: &str, src: &SynSource) -> Vec<String> {
+    let skey = syn_text_key(sentence);
+    let mut hits: Vec<String> = src.values.iter().filter(|v| skey.contains(v.as_str())).cloned().collect();
+    let toks: Vec<&str> = sentence.split_whitespace().collect();
+    for (i, raw) in toks.iter().enumerate() {
+        let core = syn_core(raw);
+        let head = syn_numeric_head(core).unwrap_or(core);
+        let day = if let Some((_, m, d)) = syn_date_literal(head) {
+            Some((m, d))
+        } else if let Some(m) = syn_month(core) {
+            toks.get(i + 1)
+                .and_then(|t| syn_day(t))
+                .or_else(|| if i > 0 { syn_day(toks[i - 1]) } else { None })
+                .map(|d| (m, d))
+        } else {
+            let kd: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
+            match kd.parse::<u32>() {
+                Ok(m) if kd.len() <= 2 && core[kd.len()..].starts_with('월') => toks.get(i + 1).and_then(|t| {
+                    let c = syn_core(t);
+                    let dd: String = c.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+                    if !dd.is_empty() && c[dd.len()..].starts_with('일') { dd.parse::<u32>().ok().map(|d| (m, d)) } else { None }
+                }),
+                _ => None,
+            }
+        };
+        if let Some((m, d)) = day.filter(|md| src.month_days.contains(md)) {
+            hits.push(format!("{:02}-{:02}", m, d));
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    let all = hits.clone();
+    hits.retain(|h| !all.iter().any(|o| o != h && o.contains(h.as_str())));
+    hits
 }
 
 fn syn_sentences(text: &str) -> Vec<String> {
@@ -5290,10 +5778,11 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
             used[i] = true;
             continue;
         }
-        if let Some((y, m, d)) = syn_date_literal(core) {
+        let date_core = syn_numeric_head(core).unwrap_or(core);
+        if let Some((y, m, d)) = syn_date_literal(date_core) {
             used[i] = true;
             if !src.month_days.contains(&(m, d)) {
-                bad.push(format!("날짜 {}", core));
+                bad.push(format!("날짜 {}", date_core));
             } else if let Some(y) = y {
                 if !src.years.contains(&y) {
                     bad.push(format!("연도 {}", y));
@@ -5365,6 +5854,13 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
             }
         }
     }
+    for i in 0..toks.len() {
+        if let Some((_, last, _)) = syn_scaled_span(&toks, i) {
+            for j in (i + 1)..=last {
+                used[j] = true;
+            }
+        }
+    }
     for (i, raw) in toks.iter().enumerate() {
         let iso_ok = raw.chars().any(|c| c.is_ascii_digit())
             || (i > 0 && syn_amount_like(toks[i - 1]))
@@ -5376,12 +5872,19 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
                 .trim_end_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | ')' | '\'' | '"'));
             bad.push(format!("통화 {}", shown));
         }
+        if let Some((h, m)) = syn_clock(syn_core(raw)) {
+            if !src.times.iter().any(|(sh, sm)| *sm == m && sh % 12 == h % 12) {
+                bad.push(format!("시각 {:02}:{:02}", h, m));
+            }
+            continue;
+        }
         if used[i] || raw.contains(':') {
             continue;
         }
         let core = syn_core(raw);
         let letters = core.chars().filter(|c| c.is_alphabetic()).count();
         let currency_letters = !cur.is_empty();
+        let mut num_core = core;
         if letters > 0 && !currency_letters {
             let kd: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
             let rest = &core[kd.len()..];
@@ -5391,10 +5894,14 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
                         bad.push(format!("연도 {}", y));
                     }
                 }
+                continue;
             }
-            continue;
+            match syn_numeric_head(core) {
+                Some(head) => num_core = head,
+                None => continue,
+            }
         }
-        let digit_part: String = core
+        let digit_part: String = num_core
             .chars()
             .skip_while(|c| !c.is_ascii_digit())
             .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
@@ -5421,6 +5928,83 @@ fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
             bad.push(format!("수치 {}", digit_part.trim_end_matches(|c: char| c == ',' || c == '.')));
         }
     }
+    for span in syn_quoted_spans(sentence) {
+        let k = syn_text_key(&span);
+        if k.chars().count() < 2 {
+            continue;
+        }
+        if !src.text_key.contains(&k) && !src.roman_key.contains(&k) {
+            bad.push(format!("인용 '{}'", span));
+        }
+    }
+    if !src.anchors.is_empty() {
+        let lower = sentence.to_lowercase();
+        let cores: Vec<String> = toks.iter().map(|t| syn_core(t).to_lowercase()).collect();
+        for (code, companions) in src.anchors.iter() {
+            let code_lower = code.to_lowercase();
+            if !cores.iter().any(|t| *t == code_lower) {
+                continue;
+            }
+            let found = companions.iter().filter(|w| lower.contains(w.as_str())).count();
+            if found * 2 < companions.len() {
+                bad.push(format!("번역된 이름 {} (원문 표기 {}개 중 {}개)", code, companions.len(), found));
+            }
+        }
+    }
+    if !src.bindings.is_empty() {
+        let lowers: Vec<String> = toks.iter().map(|t| syn_core(t).to_lowercase()).collect();
+        let mut spans: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for (bi, (label, _)) in src.bindings.iter().enumerate() {
+            let words: Vec<&str> = label.split_whitespace().collect();
+            let n = words.len();
+            if n == 0 {
+                continue;
+            }
+            let mut i = 0usize;
+            while i + n <= lowers.len() {
+                let hit = (0..n).all(|w| {
+                    if w + 1 == n {
+                        syn_label_word(&lowers[i + w], words[w])
+                    } else {
+                        lowers[i + w] == words[w]
+                    }
+                });
+                if hit {
+                    spans.push((i, i + n, bi, label.chars().count()));
+                    i += n;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for &(s, e, bi, len) in spans.iter() {
+            let outranked = spans
+                .iter()
+                .any(|&(s2, e2, _, len2)| s2 < e && s < e2 && (e2 - s2, len2) > (e - s, len));
+            if outranked || e >= toks.len() {
+                continue;
+            }
+            let core = syn_core(toks[e]);
+            let head = syn_numeric_head(core).unwrap_or(core);
+            let full_date = syn_date_literal(head).map(|(y, m, d)| SynLit::Date(y, m, d));
+            if full_date.is_none() && (used[e] || core[head.len()..].starts_with('년')) {
+                continue;
+            }
+            let lit = match full_date.or_else(|| syn_literal(head)).or_else(|| syn_scaled_literal(&toks, e)) {
+                Some(l) => l,
+                None => continue,
+            };
+            let (label, lits) = &src.bindings[bi];
+            if !lits.iter().any(|b| syn_lit_matches(b, &lit)) {
+                bad.push(format!(
+                    "바인딩 {} {} ≠ {}",
+                    label,
+                    head,
+                    lits.iter().map(syn_lit_text).collect::<Vec<_>>().join("/")
+                ));
+            }
+        }
+    }
     bad
 }
 
@@ -5429,12 +6013,30 @@ pub fn synthesis_fact_gate(text: &str, source: &str, doc_lang: &str) -> Synthesi
     let sentences = syn_sentences(text);
     let mut kept: Vec<String> = Vec::new();
     let mut dropped: Vec<(String, Vec<String>)> = Vec::new();
+    let mut joined: Vec<String> = Vec::new();
     for s in sentences.iter() {
-        let bad = syn_ungrounded(s, &src);
+        let mut bad = syn_ungrounded(s, &src);
+        bad.extend(syn_name_mutations(s, &src));
+        let anchors = syn_anchor_hits(s, &src);
+        if bad.is_empty() && anchors.is_empty() {
+            bad.push("원문 값 0개 (값표의 사실을 하나도 담지 않은 문장)".to_string());
+        }
         if bad.is_empty() {
+            for a in anchors {
+                if !joined.contains(&a) {
+                    joined.push(a);
+                }
+            }
             kept.push(s.clone());
         } else {
             dropped.push((s.clone(), bad));
+        }
+    }
+    let need = src.values.len().min(2);
+    if !kept.is_empty() && joined.len() < need {
+        let why = format!("원문 값 {}개만 이음 (요약은 값 {}개 이상을 이어야 합니다)", joined.len(), need);
+        for s in kept.drain(..) {
+            dropped.push((s, vec![why.clone()]));
         }
     }
     SynthesisGate {
@@ -6157,11 +6759,14 @@ fn push_candidates_from_href(
 }
 
 pub fn collect_id_link_candidates(lines: &[&str]) -> Vec<IdLinkCandidate> {
+    collect_id_link_candidates_capped(lines, 24)
+}
+
+pub fn collect_id_link_candidates_capped(lines: &[&str], limit: usize) -> Vec<IdLinkCandidate> {
     let href_re = match regex::Regex::new(r#"href=["']([^"']+)["']"#) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-
     let mut hrefs: Vec<String> = Vec::new();
     for line in lines {
         for cap in href_re.captures_iter(line) {
@@ -6176,15 +6781,12 @@ pub fn collect_id_link_candidates(lines: &[&str]) -> Vec<IdLinkCandidate> {
         }
     }
     if hrefs.is_empty() { return Vec::new(); }
-
     let mut out: Vec<IdLinkCandidate> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
     for href in &hrefs {
         push_candidates_from_href(href, &mut out, &mut seen);
     }
-
-    if out.len() > 24 { out.truncate(24); }
+    if out.len() > limit { out.truncate(limit); }
     out
 }
 
@@ -6254,6 +6856,32 @@ pub fn candidate_type_evidence(cand: &IdLinkCandidate, aliases: &[&str]) -> u8 {
         .collect();
     words.extend(cand.role_phrase.split_whitespace().map(|s| s.to_string()));
     if words.iter().any(|w| alias_hit(w)) { 1 } else { 0 }
+}
+
+pub fn url_typed_self_token(page_url: &str, page_type: &str) -> Option<(String, String, u8)> {
+    let self_aliases = crate::logic::relay_type_aliases(page_type);
+    let mut typed: Vec<(String, String, u8)> = collect_id_link_candidates_from_url(page_url)
+        .into_iter()
+        .map(|c| {
+            let ev = candidate_type_evidence(&c, self_aliases);
+            (c.token, c.role_phrase, ev)
+        })
+        .filter(|(_, _, ev)| *ev >= 1)
+        .collect();
+    typed.sort_by(|a, b| b.2.cmp(&a.2));
+    match typed.first() {
+        Some((tok, role, ev)) if !typed.iter().skip(1).any(|(t2, _, e2)| e2 == ev && !same_id_token(t2, tok)) => {
+            Some((tok.clone(), role.clone(), *ev))
+        }
+        _ => None,
+    }
+}
+
+pub fn numeric_run_count(value: &str) -> usize {
+    value
+        .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == ','))
+        .filter(|r| r.chars().any(|c| c.is_ascii_digit()))
+        .count()
 }
 
 pub fn id_resource_affinity(page_url: &str, cand: &IdLinkCandidate, self_aliases: &[&str]) -> f32 {
@@ -6588,18 +7216,42 @@ pub fn enum_cell_plain(field_name: &str, raw: &str) -> Option<String> {
     Some(v)
 }
 
+pub fn status_display_label(canon: &str, doc_lang: &str) -> Option<String> {
+    let native = crate::model::lang_llm::native_scripts(doc_lang);
+    if native.is_empty() || native.contains(&crate::model::lang_llm::ScriptKind::Latin) {
+        return None;
+    }
+    crate::parsing::BIAS_DICT
+        .get("status_filters")?
+        .get(canon.trim().to_lowercase().as_str())?
+        .get("exact_match")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .find(|s| {
+            let m = crate::model::lang_llm::script_mix(s, &native);
+            m.letters > 0 && m.native == m.letters
+        })
+        .map(|s| s.to_string())
+}
+
 pub fn synthesis_value_sheet(item: &serde_json::Value, page_type: &str, doc_lang: &str) -> Option<String> {
     let obj = item.as_object()?;
     let skip = |k: &str| -> bool {
         let l = k.to_lowercase();
         l == "id" || l == "link" || l == "index" || l == "type" || l == "detail" || l == "digest"
             || l == "text" || l == "masked_text" || l == "mode" || l == "updated_at" || l == "created_at"
+            || l == "has_header" || l == "has_footer" || l == "language"
+            || l.contains("phone") || l.contains("email") || l.contains("address") || l.contains("zip")
             || l.starts_with("rel_") || l.starts_with("reference_") || l.starts_with('_')
             || l.contains("insight") || l.contains("summary") || l.contains("analysis")
     };
     let mut lines: Vec<String> = Vec::new();
     for (k, v) in obj.iter() {
         if skip(k) { continue; }
+        if crate::utils::canonical::is_relay_index_key(k) && !crate::utils::canonical::relay_value_is_content(v) {
+            continue;
+        }
         let text = match v {
             serde_json::Value::String(s) => s.trim().to_string(),
             serde_json::Value::Number(n) => n.to_string(),
@@ -6622,6 +7274,11 @@ pub fn synthesis_value_sheet(item: &serde_json::Value, page_type: &str, doc_lang
             _ => String::new(),
         };
         if text.is_empty() || text == "null" { continue; }
+        let text = if k.eq_ignore_ascii_case("status") {
+            status_display_label(&text, doc_lang).unwrap_or(text)
+        } else {
+            text
+        };
         let label = indexing_leaf_label(doc_lang, page_type, k);
         let label = if label.trim().is_empty() { humanize_url_token(k) } else { label };
         lines.push(format!("{}: {}", label.trim(), text));
@@ -6693,6 +7350,17 @@ pub fn country_code_of(value: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+pub fn country_code_exact(value: &str) -> Option<&'static str> {
+    let joined = country_norm(value);
+    if joined.is_empty() {
+        return None;
+    }
+    COUNTRY_NAMES_ML
+        .iter()
+        .find(|(_, raw)| raw.split(',').any(|name| country_norm(name) == joined))
+        .map(|(code, _)| *code)
 }
 
 pub fn is_multi_value_field(field_name: &str) -> bool {
@@ -6810,13 +7478,117 @@ fn detail_cell_label_text(
     String::new()
 }
 
+fn detail_control_kind(tag: &str, attrs: &str) -> Option<u8> {
+    match tag {
+        "select" => Some(2),
+        "textarea" => Some(0),
+        "input" => match pug_attr_string(attrs, "type").unwrap_or_default().to_lowercase().as_str() {
+            "hidden" | "submit" | "button" | "reset" | "image" | "file" => None,
+            "radio" => Some(1),
+            "checkbox" => Some(3),
+            _ => Some(0),
+        },
+        _ => None,
+    }
+}
+
+fn detail_choice_label(
+    lines: &[&str],
+    parts: &[(usize, String, String, String)],
+    at: usize,
+    end: usize,
+) -> Option<usize> {
+    for k in (at + 1)..=end {
+        if lines[k].trim().is_empty() { continue; }
+        let tag = parts[k].1.as_str();
+        if detail_control_kind(tag, &parts[k].2).is_some() { return None; }
+        if matches!(tag, "" | "label" | "span") && !parts[k].3.trim().is_empty() { return Some(k); }
+    }
+    None
+}
+
+fn detail_cell_controls(
+    lines: &[&str],
+    parts: &[(usize, String, String, String)],
+    start: usize,
+    end: usize,
+) -> Option<(Vec<(String, usize)>, std::collections::HashSet<usize>)> {
+    let mut ctrl_indent = usize::MAX;
+    let mut text_indent = usize::MAX;
+    let mut vals: Vec<(u8, std::cmp::Reverse<usize>, usize, String)> = Vec::new();
+    let mut j = start;
+    while j <= end {
+        if lines[j].trim().is_empty() { j += 1; continue; }
+        let (indent, tag, attrs, text) = &parts[j];
+        if j > start && matches!(tag.as_str(), "table" | "tr" | "td" | "th") { return None; }
+        let kind = detail_control_kind(tag, attrs);
+        let checked = pug_attr_flag(attrs, "checked");
+        let rank = if pug_attr_flag(attrs, "disabled") { 2 } else { 0 };
+        match kind {
+            Some(0) => {
+                ctrl_indent = ctrl_indent.min(*indent);
+                if !text.trim().is_empty() {
+                    vals.push((rank, std::cmp::Reverse(text.trim().chars().count()), j, text.trim().to_string()));
+                }
+            }
+            Some(1) | Some(3) => {
+                if kind == Some(1) || checked { ctrl_indent = ctrl_indent.min(*indent); }
+                if checked {
+                    if let Some(k) = detail_choice_label(lines, parts, j, end) {
+                        vals.push((rank.max(1), std::cmp::Reverse(0), k, parts[k].3.trim().to_string()));
+                    }
+                }
+            }
+            Some(_) => {
+                ctrl_indent = ctrl_indent.min(*indent);
+                let sel_end = detail_block_end(lines, parts, j).min(end);
+                for k in (j + 1)..=sel_end {
+                    if parts[k].1 == "option" && pug_attr_flag(&parts[k].2, "selected") && !parts[k].3.trim().is_empty() {
+                        vals.push((rank.max(1), std::cmp::Reverse(0), k, parts[k].3.trim().to_string()));
+                    }
+                }
+                j = sel_end + 1;
+                continue;
+            }
+            None => {
+                let plain = !text.trim().is_empty()
+                    && !matches!(tag.as_str(), "label" | "button" | "legend" | "caption" | "option" | "input")
+                    && !(tag == "th" && j != start);
+                if plain { text_indent = text_indent.min(*indent); }
+            }
+        }
+        j += 1;
+    }
+    if ctrl_indent == usize::MAX || text_indent < ctrl_indent { return None; }
+    vals.sort();
+    let mut keep: std::collections::HashSet<usize> = vals.iter().filter(|v| v.0 < 2).map(|v| v.2).collect();
+    if keep.is_empty() {
+        if let Some(v) = vals.first() { keep.insert(v.2); }
+    }
+    Some((vals.into_iter().map(|(_, _, l, v)| (v, l)).collect(), keep))
+}
+
 fn detail_cell_value_text(
     lines: &[&str],
     parts: &[(usize, String, String, String)],
     start: usize,
     end: usize,
 ) -> (String, String, usize) {
-    // 1차 : 값이 될 자격이 있는 라인만 추려 '최소 깊이'를 확정합니다.
+    if let Some((vals, _)) = detail_cell_controls(lines, parts, start, end) {
+        let mut in_order: Vec<&(String, usize)> = vals.iter().collect();
+        in_order.sort_by_key(|(_, l)| *l);
+        let mut joined: Vec<String> = Vec::new();
+        for (v, _) in in_order {
+            if !joined.contains(v) { joined.push(v.clone()); }
+        }
+        return match vals.first() {
+            Some((v, l)) => (v.clone(), joined.join(" "), *l),
+            None => (String::new(), String::new(), start),
+        };
+    }
+    if ((start + 1)..=end).any(|j| !lines[j].trim().is_empty() && parts[j].1 == "table") {
+        return (String::new(), String::new(), start);
+    }
     let mut candidates: Vec<usize> = Vec::new();
     let mut min_indent = usize::MAX;
     for j in start..=end {
@@ -6867,6 +7639,57 @@ fn detail_cell_value_text(
     }
 
     (best_text, joined.join(" "), best_line)
+}
+
+pub fn detail_control_noise_lines(lines: &[&str]) -> std::collections::HashSet<usize> {
+    let parts: Vec<(usize, String, String, String)> = lines.iter().map(|l| pug_line_parts(l)).collect();
+    let mut noise: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for i in 0..lines.len() {
+        if lines[i].trim().is_empty() || parts[i].1 != "td" { continue; }
+        let end = detail_block_end(lines, &parts, i).max(i);
+        if let Some((_, keep)) = detail_cell_controls(lines, &parts, i, end) {
+            for l in i..=end {
+                if !lines[l].trim().is_empty() && !keep.contains(&l) { noise.insert(l); }
+            }
+        }
+    }
+    noise
+}
+
+pub fn detail_form_profile(lines: &[&str]) -> (usize, usize) {
+    let parts: Vec<(usize, String, String, String)> = lines.iter().map(|l| pug_line_parts(l)).collect();
+    let mut labeled = 0usize;
+    let mut controlled = 0usize;
+    for i in 0..lines.len() {
+        if lines[i].trim().is_empty() || parts[i].1 != "tr" { continue; }
+        let tr_end = detail_block_end(lines, &parts, i);
+        if tr_end <= i { continue; }
+        let child_indent = match ((i + 1)..=tr_end).find(|&j| !lines[j].trim().is_empty() && parts[j].0 > parts[i].0) {
+            Some(j) => parts[j].0,
+            None => continue,
+        };
+        let mut pending_label = false;
+        for j in (i + 1)..=tr_end {
+            if lines[j].trim().is_empty() || parts[j].0 != child_indent { continue; }
+            let cell_end = detail_block_end(lines, &parts, j).max(j);
+            match parts[j].1.as_str() {
+                "th" => {
+                    pending_label = !detail_cell_label_text(lines, &parts, j, cell_end).is_empty();
+                }
+                "td" => {
+                    if pending_label {
+                        labeled += 1;
+                        if detail_cell_controls(lines, &parts, j, cell_end).is_some() {
+                            controlled += 1;
+                        }
+                    }
+                    pending_label = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    (labeled, controlled)
 }
 
 pub fn collect_detail_label_value_pairs(lines: &[&str]) -> Vec<DetailPair> {

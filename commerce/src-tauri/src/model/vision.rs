@@ -696,19 +696,64 @@ impl crate::model::LogisModel {
                             } else {
                                 Vec::new()
                             };
-                            if region_read && unread_axes.is_empty() {
-                                emit_term(&format!(
-                                    "    ♻️ [REGION ALREADY READ] '{}' 크롭 px({},{})-({},{}) 의 판독 가능 패치 {}칸이 앞선 스칼라 크롭들이 이미 쌍으로 읽은 지면 안에 전부 들어 있고, 이 범주의 축 가운데 라벨 봉우리가 이 크롭 안에 있으면서 비어 있는 축도 없습니다. 이 크롭의 호출을 건너뜁니다.",
-                                    plan.category, plan.bbox.0, plan.bbox.1, plan.bbox.2, plan.bbox.3, mine.len()
-                                ));
+                            let centre_of = |patch: usize| -> (f32, f32) {
+                                (((patch % peak_cols) as f32 + 0.5) * peak_cw, ((patch / peak_cols) as f32 + 0.5) * peak_ch)
+                            };
+                            let in_box = |pt: (f32, f32), b: (u32, u32, u32, u32)| -> bool {
+                                pt.0 >= b.0 as f32 && pt.0 <= b.2 as f32 && pt.1 >= b.1 as f32 && pt.1 <= b.3 as f32
+                            };
+                            let has_value = |f: &str| -> bool {
+                                let cell = |v: &Value| !(v.is_null() || v.as_str().map_or(false, |s| s.trim().is_empty()));
+                                if final_data_map.get(f).map_or(false, |v| !v.is_array() && cell(v)) {
+                                    return true;
+                                }
+                                let cat = crate::logic::trade_field_category(f);
+                                crate::logic::is_trade_array_category(cat)
+                                    && final_data_map
+                                        .get(cat)
+                                        .and_then(|v| v.as_array())
+                                        .map_or(false, |rows| rows.iter().any(|r| r.get(f).map_or(false, |v| cell(v))))
+                            };
+                            let (reread_axes, dead_axes): (Vec<String>, Vec<String>) = unread_axes.iter().cloned().partition(|f| {
+                                heatmaps.iter().any(|hm| {
+                                    hm.field_peaks.iter().any(|(pf, patch, _)| {
+                                        pf == f
+                                            && in_box(centre_of(*patch), plan.bbox)
+                                            && legibility.verdict.get(*patch).copied()
+                                                == Some(crate::models::siglip2::legibility::PatchLegibility::Legible)
+                                            && !heatmaps.iter().any(|h2| {
+                                                h2.field_peaks.iter().any(|(of, op, _)| {
+                                                    op == patch
+                                                        && of != f
+                                                        && has_value(of)
+                                                        && grounding_claims.iter().any(|g| g.field == *of && in_box(centre_of(*op), g.bbox))
+                                                })
+                                            })
+                                    })
+                                })
+                            });
+                            if region_read && reread_axes.is_empty() {
+                                if dead_axes.is_empty() {
+                                    emit_term(&format!(
+                                        "    ♻️ [REGION ALREADY READ] '{}' 크롭 px({},{})-({},{}) 의 판독 가능 패치 {}칸이 앞선 스칼라 크롭들이 이미 쌍으로 읽은 지면 안에 전부 들어 있고, 이 범주의 축 가운데 라벨 봉우리가 이 크롭 안에 있으면서 비어 있는 축도 없습니다. 이 크롭의 호출을 건너뜁니다.",
+                                        plan.category, plan.bbox.0, plan.bbox.1, plan.bbox.2, plan.bbox.3, mine.len()
+                                    ));
+                                } else {
+                                    emit_term(&format!(
+                                        "    ♻️ [REGION ALREADY READ / DEAD PEAKS] '{}' 크롭 px({},{})-({},{}) 의 지면은 앞선 크롭이 읽었고, 비어 있는 축 {:?} 는 라벨 봉우리가 이 크롭 안에 있지만 그 칸이 판독 불가이거나 이미 채워진 다른 축의 출처 칸입니다. 같은 지면을 이 범주 정의로 다시 읽어도 이미 확정된 쌍만 되돌아오므로 호출을 건너뜁니다. 이 축들은 FIELD RECOVERY 가 같은 규칙(판독 가능한 봉우리 · 출처 칸 가지치기)으로 다시 판정합니다.",
+                                        plan.category, plan.bbox.0, plan.bbox.1, plan.bbox.2, plan.bbox.3, dead_axes
+                                    ));
+                                    crate::utils::score_dynamics::record_baseline("vision.region_reread_dead", 1.0);
+                                }
                                 crate::utils::score_dynamics::record_baseline("vision.region_already_read", 1.0);
                                 continue;
                             }
                             if region_read {
                                 crate::utils::score_dynamics::record_baseline("vision.region_reread", 1.0);
                                 emit_term(&format!(
-                                    "    🔁 [REGION RE-READ] '{}' 크롭 px({},{})-({},{}) 의 지면은 앞선 크롭이 읽었지만, 이 범주의 축 {:?} 는 라벨 봉우리가 이 크롭 안에 있는데 아직 어떤 쌍도 이 축으로 라우팅되지 않았습니다. 앞선 크롭은 다른 범주의 정의로 물었으므로 이름·주소가 여러 줄로 쌓인 당사자 상자 같은 블록은 쌍으로 옮겨지지 않았을 수 있습니다. 같은 지면이라도 이 범주 정의로 다시 읽습니다.",
-                                    plan.category, plan.bbox.0, plan.bbox.1, plan.bbox.2, plan.bbox.3, unread_axes
+                                    "    🔁 [REGION RE-READ] '{}' 크롭 px({},{})-({},{}) 의 지면은 앞선 크롭이 읽었지만, 이 범주의 축 {:?} 는 판독 가능한 라벨 봉우리가 이 크롭 안에 있고 그 칸이 다른 축의 출처도 아닌데 아직 어떤 쌍도 이 축으로 라우팅되지 않았습니다. 앞선 크롭은 다른 범주의 정의로 물었으므로 이름·주소가 여러 줄로 쌓인 당사자 상자 같은 블록은 쌍으로 옮겨지지 않았을 수 있습니다. 같은 지면이라도 이 범주 정의로 다시 읽습니다.{}",
+                                    plan.category, plan.bbox.0, plan.bbox.1, plan.bbox.2, plan.bbox.3, reread_axes,
+                                    if dead_axes.is_empty() { String::new() } else { format!(" (봉우리가 판독 불가이거나 출처 칸이라 이번 재판독에서 뺀 축: {:?})", dead_axes) }
                                 ));
                             } else {
                                 crate::utils::score_dynamics::record_baseline("vision.region_already_read", 0.0);
@@ -1440,16 +1485,37 @@ impl crate::model::LogisModel {
                                             continue;
                                         }
                                         let multiline = value.lines().filter(|l| !l.trim().is_empty()).count() >= 2;
-                                        if multiline
+                                        let (field, value, rcat) = if multiline
                                             && crate::utils::ai_utils::detect_field_format(&field)
                                                 != crate::utils::ai_utils::FieldFormat::Address
                                         {
-                                            emit_term(&format!(
-                                                "      🚫 [PAIR MULTILINE] \"{}\" → {} | 줄바꿈으로 나뉜 블록은 주소 축에만 들어갈 수 있습니다. 이 축의 형식은 주소가 아니므로 배정하지 않고, 같은 크롭의 잔여 스키마 패스와 복구 창에 맡깁니다.",
-                                                label, field
-                                            ));
-                                            continue;
-                                        }
+                                            match crate::model::merge::party_block_axis(&label, &field, &label_exact, &gate_banks, &final_data_map) {
+                                                Some((name_axis, addr_axis)) => {
+                                                    let block = value
+                                                        .lines()
+                                                        .map(|l| l.trim())
+                                                        .filter(|l| !l.is_empty())
+                                                        .collect::<Vec<_>>()
+                                                        .join(" / ");
+                                                    crate::utils::score_dynamics::record_baseline("vision.pair_party_block", 1.0);
+                                                    emit_term(&format!(
+                                                        "      🧱 [PAIR PARTY BLOCK] \"{}\" → {} | 줄바꿈 블록이 당사자 상자(이름 줄 + 주소 줄)입니다. 라우팅 축 '{}' 대신 이름 축에 줄을 ' / ' 로 이어 넣고, 저장 전 정규화가 텍스트 경로와 같은 규칙으로 첫 줄은 '{}', 나머지 줄은 '{}' 로 나눕니다.",
+                                                        label, name_axis, field, name_axis, addr_axis
+                                                    ));
+                                                    let cat = crate::logic::trade_field_category(&name_axis).to_string();
+                                                    (name_axis, block, cat)
+                                                }
+                                                None => {
+                                                    emit_term(&format!(
+                                                        "      🚫 [PAIR MULTILINE] \"{}\" → {} | 줄바꿈으로 나뉜 블록은 주소 축에만 들어갈 수 있습니다. 이 축의 형식은 주소가 아니므로 배정하지 않고, 같은 크롭의 잔여 스키마 패스와 복구 창에 맡깁니다.",
+                                                        label, field
+                                                    ));
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            (field, value, rcat)
+                                        };
                                         if crate::logic::is_trade_array_category(&rcat) && rcat != plan.category {
                                             let rows = final_data_map
                                                 .get(&rcat)
@@ -3916,6 +3982,40 @@ impl crate::model::LogisModel {
                     );
                 }
             }
+            if !is_trade_doc {
+                let lang_code = crate::utils::bias_schema::lang_code_of(&language);
+                crate::scheduler::trading::normalize_trading_data(&mut extracted_data, &lang_code);
+                let raw_status = extracted_data
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let status_note = if raw_status.is_empty() {
+                    "상태 값 없음".to_string()
+                } else if crate::logic::parse_status(&raw_status) != 0 {
+                    format!("상태 '{}' 는 이미 캐노니컬 키", raw_status)
+                } else {
+                    let lower = raw_status.to_lowercase();
+                    let canon = if crate::logic::parse_status(&lower) != 0 {
+                        Some((lower, "소문자 일치".to_string()))
+                    } else {
+                        crate::utils::ai_utils::status_canonical_exact(&raw_status, "goods", None)
+                    };
+                    match canon {
+                        Some((key, route)) => {
+                            if let Some(o) = extracted_data.as_object_mut() {
+                                o.insert("status".to_string(), json!(key.clone()));
+                            }
+                            format!("상태 '{}' → '{}' ({})", raw_status, key, route)
+                        }
+                        None => format!("상태 '{}' 는 닫힌 상태 어휘와 정확히 맞지 않아 원문을 둡니다", raw_status),
+                    }
+                };
+                emit_term(&format!(
+                    "  🧾 [COMMERCE NORMALIZE / IMAGE] 텍스트 경로와 같은 저장 형식으로 맞춥니다: 날짜 축은 ISO, 금액·수량 축은 수치, 통화는 문서 언어 '{}' 기준 코드 | {} | 질의의 기간·수치·상태 조건이 이미지 문서와도 같은 비교로 만납니다.",
+                    lang_code, status_note
+                ));
+            }
             let nl = crate::parsing::json_to_natural_language(&extracted_data);
             let doc_type_owned: String = if is_trade_doc {
                 let raw = extracted_data.get("header")
@@ -4230,7 +4330,7 @@ impl crate::model::LogisModel {
                     Some(&item_digest)
                 ).await;
 
-                if is_trade_doc {
+                {
                     let chunk_cancel = cancel_token
                         .clone()
                         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
@@ -4256,7 +4356,7 @@ impl crate::model::LogisModel {
                         &hashed_cc,
                         &chunk_bcc,
                         &ref_val,
-                        "shipping",
+                        if is_trade_doc { "shipping" } else { "commerce" },
                         "",
                         &chunk_cancel,
                         app_handle,

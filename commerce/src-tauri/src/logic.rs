@@ -61,6 +61,17 @@ pub fn parse_status(status: &str) -> i32 {
     }
 }
 
+const STATUS_NAMES: [&str; 12] = [
+    "progress", "stop", "cancel", "refund", "return", "error", "expire", "exchange", "complete", "draft", "show", "hide",
+];
+
+pub fn status_name(code: i64) -> Option<&'static str> {
+    if code == 0 {
+        return None;
+    }
+    STATUS_NAMES.iter().copied().find(|n| parse_status(n) as i64 == code)
+}
+
 
 
 pub fn related(item_type: &str) -> Vec<&str> {
