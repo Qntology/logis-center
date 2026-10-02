@@ -1140,7 +1140,7 @@ impl LogisModel {
                 step,
                 Some(&code),
                 &format!(
-                    "디코딩 동안 층 가중치를 상주시키는 조건(여유 RAM 6GB 초과, Qwen3.5 모델 코드의 keep_weights_resident 기준)이 안 됩니다 (여유 RAM {:.1}GB). 이 상태의 4B 는 토큰마다 층 가중치 약 {}MB 를 다시 올려 호출당 시간이 Qwen3 0.6B 보다 여러 배 깁니다. 원문 값을 글자 그대로 옮기는 필드 추출은 다국어 Qwen3 로 둡니다. {}",
+                    "아이템마다 반복되는 필드 추출은 여유 RAM 6GB 초과일 때만 4B 로 보냅니다 (여유 RAM {:.1}GB). 디코딩 층 상주는 CUDA 에서 VRAM 기준으로 판정하도록 바뀌었지만([DECODE-RESIDENT] 줄), 이 라우팅은 그 판정이 Vram 으로 나오는 비율과 요약 호출 시간(commerce.synthesis_call_ms.lang4b)을 다음 실행에서 본 뒤에 옮깁니다. 4B 가 상주하지 못하면 토큰마다 층 가중치 약 {}MB 를 다시 읽어 호출당 시간이 Qwen3 0.6B 보다 여러 배 깁니다. 원문 값을 글자 그대로 옮기는 필드 추출은 다국어 Qwen3 로 둡니다. {}",
                     crate::utils::resources::free_ram_bytes() as f64 / 1_000_000_000.0,
                     lang_llm::resident_estimate_mb(&code),
                     synthesis_note

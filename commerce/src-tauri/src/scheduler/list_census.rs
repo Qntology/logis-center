@@ -18,6 +18,10 @@ const MAX_KEPT: usize = 12;
 const EMPTY_MAX_BODY_ROWS: usize = 2;
 const SAMPLE_CHARS: usize = 160;
 const MATCH_CHARS: usize = 600;
+const EXCERPT_ROWS: usize = 6;
+const EXCERPT_ROW_LINES: usize = 40;
+const EXCERPT_LINE_CHARS: usize = 120;
+const EXCERPT_HEADER_CELLS: usize = 40;
 
 #[derive(Debug, Clone)]
 pub struct CensusGroup {
@@ -319,6 +323,25 @@ fn anchor_parent<'a>(p: &ElementRef<'a>) -> ElementRef<'a> {
 
 fn text_key(s: &str) -> String {
     s.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[derive(Debug, Clone)]
+pub struct TitleExcerpt {
+    pub text: String,
+    pub selector: String,
+    pub rows: usize,
+    pub members: usize,
+    pub header_cells: usize,
+    pub dominance: f32,
+}
+
+fn own_text(el: &ElementRef) -> String {
+    let joined = el
+        .children()
+        .filter_map(|c| c.value().as_text().map(|t| t.to_string()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn run(html: &str) -> ListCensus {
@@ -663,6 +686,102 @@ impl ListCensus {
         let inter = boa.intersection(&mine).count();
         let uni = boa.union(&mine).count().max(1);
         Some((inter as f32 / uni as f32, top, rows, boa.len()))
+    }
+
+    pub fn title_excerpt(&self, html: &str) -> Option<TitleExcerpt> {
+        let top_idx = self.groups.iter().position(|g| g.structural_grade())?;
+        let top = &self.groups[top_idx];
+        if top.members < FALLBACK_MIN_ROWS || top.avg_cells < FALLBACK_MIN_CELLS {
+            return None;
+        }
+        let rival = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != top_idx)
+            .map(|(_, g)| g.score)
+            .fold(0.0f32, f32::max);
+        if top.score < FALLBACK_DOMINANCE * rival {
+            return None;
+        }
+        let doc = Html::parse_document(html);
+        let wanted: HashSet<usize> = top.member_order.iter().take(EXCERPT_ROWS).copied().collect();
+        let mut order = HashMap::new();
+        let mut rows: Vec<ElementRef> = Vec::new();
+        for (i, n) in doc.tree.root().descendants().enumerate() {
+            order.insert(n.id(), i);
+            if wanted.contains(&i) {
+                if let Some(e) = ElementRef::wrap(n) {
+                    rows.push(e);
+                }
+            }
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        let mut header: Vec<String> = Vec::new();
+        if top.tag == "tr" {
+            if let (Some(table), Ok(th_q)) = (owning_table(&rows[0]), Selector::parse("th")) {
+                let first = order.get(&rows[0].id()).copied().unwrap_or(usize::MAX);
+                for th in table.select(&th_q) {
+                    if header.len() >= EXCERPT_HEADER_CELLS {
+                        break;
+                    }
+                    if owning_table(&th).map_or(true, |t| t.id() != table.id()) {
+                        continue;
+                    }
+                    if order.get(&th.id()).copied().unwrap_or(usize::MAX) > first {
+                        continue;
+                    }
+                    let t = norm_text(&th, EXCERPT_LINE_CHARS);
+                    if !t.is_empty() && !header.contains(&t) {
+                        header.push(t);
+                    }
+                }
+            }
+        }
+        let mut text = format!(
+            "[LIST ROWS] {} | rows {} (first {} shown) | each line under [ROW n] is the text of one cell, copied verbatim\n",
+            top.item_selector,
+            top.members,
+            rows.len()
+        );
+        if !header.is_empty() {
+            text.push_str(&format!("[HEADER] {}\n", header.join(" | ")));
+        }
+        for (k, row) in rows.iter().enumerate() {
+            text.push_str(&format!("[ROW {}]\n", k + 1));
+            let mut lines = 0usize;
+            let mut last = String::new();
+            for n in row.descendants() {
+                let e = match ElementRef::wrap(n) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if NON_ITEM_TAGS.contains(&e.value().name()) {
+                    continue;
+                }
+                let t: String = own_text(&e).chars().take(EXCERPT_LINE_CHARS).collect();
+                if t.is_empty() || !t.chars().any(|c| c.is_alphanumeric()) || t == last {
+                    continue;
+                }
+                text.push_str(&t);
+                text.push('\n');
+                last = t;
+                lines += 1;
+                if lines >= EXCERPT_ROW_LINES {
+                    break;
+                }
+            }
+        }
+        Some(TitleExcerpt {
+            text,
+            selector: top.item_selector.clone(),
+            rows: rows.len(),
+            members: top.members,
+            header_cells: header.len(),
+            dominance: if rival > 0.0 { top.score / rival } else { f32::INFINITY },
+        })
     }
 
     pub fn report_lines(&self) -> Vec<String> {

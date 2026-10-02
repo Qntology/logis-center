@@ -1,5 +1,21 @@
 /// Converts a JSON Value into a human-readable natural language narrative.
 /// [STRICT ALIGNMENT] This logic perfectly synchronizes with every column in `parsing.rs`.
+fn strip_trailing_currency_mark(value: &str, currency: &str) -> String {
+    let t = value.trim();
+    let end = match t.char_indices().filter(|(_, c)| c.is_ascii_digit()).last() {
+        Some((i, c)) => i + c.len_utf8(),
+        None => return t.to_string(),
+    };
+    let tail = t[end..].trim();
+    let mark = !tail.is_empty()
+        && (tail.eq_ignore_ascii_case(currency.trim()) || ["원", "₩", "円", "元", "$", "€", "¥", "£"].contains(&tail));
+    if mark {
+        t[..end].trim_end().to_string()
+    } else {
+        t.to_string()
+    }
+}
+
 pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
     let mut sentences = Vec::new();
 
@@ -74,7 +90,8 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                         if ["sale_price", "supply_price", "price", "amount", "shipping_fee", "discount"].contains(&key.as_str()) {
                             let curr = map.get("currency").and_then(|c| c.as_str()).unwrap_or("");
                             let curr_str = if curr.is_empty() { String::new() } else { format!(" {}", curr) };
-                            sentences.push(format!("The {} is {}{}.", clean_key, val_str, curr_str));
+                            let shown = if curr.is_empty() { val_str.clone() } else { strip_trailing_currency_mark(&val_str, curr) };
+                            sentences.push(format!("The {} is {}{}.", clean_key, shown, curr_str));
                         } else if key == "status" {
                             let shown = match v {
                                 serde_json::Value::Number(n) => n.as_i64().and_then(crate::logic::status_name).map(|s| s.to_string()),
@@ -1284,8 +1301,23 @@ fn transcription_fallback(
         return mapped;
     }
     if map.len() == 1 && joined_src.split_whitespace().count() == 1 {
-        if let Some(s) = map.values().next().and_then(|v| v.as_str()) {
-            return s.trim().to_string();
+        if let Some((k, v)) = map.iter().next() {
+            if let Some(s) = v.as_str() {
+                let tol = (joined_src.trim().chars().count() / 4).max(1);
+                let d = key_distance(k, joined_src);
+                if d <= tol || !is_latin_dominant(k) {
+                    return s.trim().to_string();
+                }
+                crate::utils::score_dynamics::record_baseline("indexing.translit_key_mismatch", 1.0);
+                println!(
+                    "    🚫 [TRANSLIT KEY MISMATCH] 응답의 유일한 키 '{}' 가 원문 '{}' 와 철자 거리 {} (허용 {}) 인 다른 라틴 단어입니다. 다른 단어를 읽은 값 '{}' 은 이 원문의 별칭으로 쓰지 않습니다.",
+                    k,
+                    joined_src,
+                    d,
+                    tol,
+                    s.trim()
+                );
+            }
         }
     }
     String::new()

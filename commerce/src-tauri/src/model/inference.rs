@@ -389,6 +389,39 @@ impl crate::model::LogisModel {
         }
     }
 
+    fn embed_ram_watch(&self, texts: usize) {
+        static LAST_PRESSURE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (avail, total) = crate::model::ram_snapshot();
+        crate::utils::score_dynamics::record_baseline("model.ram_free_mb.embed", (avail / 1_000_000) as f32);
+        crate::utils::score_dynamics::record_baseline("model.ram_used_pct.embed", crate::model::ram_used_pct(avail, total));
+        if avail >= crate::model::RAM_PRESSURE_MARGIN_BYTES {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last_ms = LAST_PRESSURE_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if last_ms > 0 && now_ms.saturating_sub(last_ms) < 2_000 {
+            return;
+        }
+        LAST_PRESSURE_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        crate::model::release_os_working_set();
+        let (free_now, _) = crate::model::ram_snapshot();
+        crate::utils::score_dynamics::record_baseline(
+            "model.ram_trim_gain_mb.embed",
+            (free_now.saturating_sub(avail) / 1_000_000) as f32,
+        );
+        println!(
+            "[MODEL] 🧠 [RAM WATCH / EMBED] 실연산 {}건 직전 {} → 작업 집합 반환 후 여유 {}MB | 임베딩 장치 {} · 임베딩 캐시 상한 {}MB | 반환과 이 줄은 2초에 한 번까지 (SDS 는 매번 기록)",
+            texts,
+            crate::model::ram_pressure_line(avail, total),
+            free_now / 1_000_000,
+            if self.is_cpu_mode { "CPU(가중치가 RAM 에 있음)" } else { "GPU(가중치가 VRAM 에 있음)" },
+            Self::EMBED_CACHE_RAM_BUDGET_BYTES / (1024 * 1024)
+        );
+    }
+
     pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
         // 🌟 1. 메모리 캐시부터 확인합니다 (중복된 텍스트면 GPU 연산 원천 차단)
         {
@@ -494,21 +527,7 @@ impl crate::model::LogisModel {
         }
 
         self.ensure_embedding().await?;
-
-        // ── ③ 실연산 규모 로깅 ──
-        //
-        //  🌟 [CROSSOVER / 정정] embedding.rs 대조 결과 embed_batch 는
-        //     이름과 달리 배치 연산이 아니라 self.embed(text) 1건씩 순회입니다.
-        //     시퀀스 길이도 embed() 내부에서 512 로 고정되어 있습니다.
-        //     따라서 '한 번에 몇 건을 넘기는가' 는 activation 에 영향이 없고,
-        //     실제 축은 embed_batch 내부의 '동시 순전파 스레드 수' 입니다.
-        //     그 조절은 embedding.rs 의 adaptive_thread_count 가 담당하며,
-        //     여기서는 청킹으로 activation 을 줄이려 하지 않습니다.
-        //
-        //  ── 그래도 청킹을 남기는 이유 ──
-        //     한 번에 수천 건을 넘기면 embed_batch 가 결과 Vec 전체를
-        //     RAM 에 한꺼번에 들고 있게 됩니다. 그것은 VRAM 이 아니라 RAM 축이며,
-        //     아래 상한은 그 목적만 갖습니다. VRAM 판정과 무관합니다.
+        self.embed_ram_watch(miss_texts.len());
         const RAM_CHUNK: usize = 512;
         if hit_count > 0 || dup_folded > 0 {
             println!(

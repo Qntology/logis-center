@@ -3008,89 +3008,131 @@ pub async fn process_task(
 
 
 
-                let (titles, titles_well_formed): (Vec<String>, bool) = {
-                    let params = ChatCompletionParameters {
-                        messages: vec![
-                            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                                content: system_content.clone(),
-                                name: None,
-                            }),
-                            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage { 
-                                content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
-                                name: None,
-                            })
-                        ],
-                        model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3.5".to_string() }, 
-                        max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
-                        ..Default::default()
-                    };
-
-                    let res = if base_model_size == crate::model::ModelSize::Qwen {
-                        // 🌟 [CROSSOVER] STEP A 에서 임베딩을 대량으로 썼으므로
-                        //    여기서 임베딩이 남아 있을 수 있습니다. 예산에 따라 정리합니다.
-                        model
-                            .enter_generation_phase(
-                                crate::model::ModelSize::Qwen,
-                                Some(&base_session_id),
-                                Some(cancellation_token.clone()),
-                                false,
-                                kv_name.clone(),
-                                "title extraction (Qwen 0.6B)",
-                            )
-                            .await?;
-                        if let Some(gen) = model.generator.lock().await.as_mut() {
-                            println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
-                            
-                            let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
-                            gen.generate(
-                                params, 
-                                Some(cancellation_token.clone()), 
-                                Some(snapshot_id.clone()), 
-                                kv_name.clone(),
-                                Some(&title_prej) 
-                            ).await?
-                        } else {
-                            return Err(anyhow::anyhow!("Qwen generator missing"));
-                        }
-                    } else {
-                        model
-                            .switch_to_generation(
-                                crate::model::ModelSize::Qwen3_5,
-                                Some(cancellation_token.clone()),
-                                kv_name.clone(),
-                                "title extraction (Qwen3.5-2B)",
-                            )
-                            .await?;
-                        let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
-                        if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                            println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3.5-2B)...");
-                            gen.generate(
-                                params,
-                                Some(cancellation_token.clone()),
-                                Some(snapshot_id.clone()),
-                                kv_name.clone(),
-                                None,
-                                Some(&title_prej),
-                            ).await?
-                        } else {
-                            return Err(anyhow::anyhow!("Qwen3.5 generator missing"));
-                        }
-                    };
-                    
-                    println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
-
-                    let title_info = parsing::parse_json_from_llm(&res);
-                    let well_formed = title_info.as_object().map_or(false, |obj| !obj.is_empty());
-                    let harvested = crate::scheduler::list_census::harvest_titles(&title_info, &res);
-                    crate::utils::score_dynamics::record_baseline("commerce.title_llm_count", harvested.len() as f32);
-                    println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", harvested);
-                    (harvested, well_formed)
+                let title_excerpt = if base_model_size == crate::model::ModelSize::Qwen {
+                    None
+                } else {
+                    list_census.as_ref().and_then(|c| c.title_excerpt(&clean_html_content))
                 };
-
+                crate::utils::score_dynamics::record_baseline(
+                    "commerce.title_excerpt_available",
+                    if title_excerpt.is_some() { 1.0 } else { 0.0 },
+                );
+                let (titles, titles_well_formed): (Vec<String>, bool) = {
+                    let mut contexts: Vec<(String, bool)> = Vec::new();
+                    if let Some(ex) = title_excerpt.as_ref() {
+                        contexts.push((format!("[PUG CONTENT]\n{}", ex.text), true));
+                    }
+                    contexts.push((system_content.clone(), false));
+                    let mut q35_ready = false;
+                    let mut outcome: (Vec<String>, bool) = (Vec::new(), false);
+                    for (context, from_excerpt) in contexts.into_iter() {
+                        let call_session = if from_excerpt { format!("{}_excerpt", snapshot_id) } else { snapshot_id.clone() };
+                        let params = ChatCompletionParameters {
+                            messages: vec![
+                                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                                    content: context.clone(),
+                                    name: None,
+                                }),
+                                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                                    content: ChatCompletionRequestUserMessageContent::Text(task_question.clone()),
+                                    name: None,
+                                })
+                            ],
+                            model: if base_model_size == crate::model::ModelSize::Qwen { "qwen".to_string() } else { "qwen3.5".to_string() },
+                            max_tokens: Some(128), temperature: Some(0.0), top_p: Some(0.95),
+                            ..Default::default()
+                        };
+                        let res = if base_model_size == crate::model::ModelSize::Qwen {
+                            model
+                                .enter_generation_phase(
+                                    crate::model::ModelSize::Qwen,
+                                    Some(&base_session_id),
+                                    Some(cancellation_token.clone()),
+                                    false,
+                                    kv_name.clone(),
+                                    "title extraction (Qwen 0.6B)",
+                                )
+                                .await?;
+                            if let Some(gen) = model.generator.lock().await.as_mut() {
+                                println!("[JS-BRIDGE] 1. Requesting titles from LLM (0.6B)...");
+                                let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
+                                gen.generate(
+                                    params,
+                                    Some(cancellation_token.clone()),
+                                    Some(call_session.clone()),
+                                    kv_name.clone(),
+                                    Some(&title_prej)
+                                ).await?
+                            } else {
+                                return Err(anyhow::anyhow!("Qwen generator missing"));
+                            }
+                        } else {
+                            if !q35_ready {
+                                model
+                                    .switch_to_generation(
+                                        crate::model::ModelSize::Qwen3_5,
+                                        Some(cancellation_token.clone()),
+                                        kv_name.clone(),
+                                        "title extraction (Qwen3.5-2B)",
+                                    )
+                                    .await?;
+                                q35_ready = true;
+                            }
+                            let (_title_bias, title_prej) = crate::parsing::get_title_bias(&page_type, &doc_lang);
+                            if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
+                                println!("[JS-BRIDGE] 1. Requesting titles from LLM (Qwen3.5-2B)...");
+                                gen.generate(
+                                    params,
+                                    Some(cancellation_token.clone()),
+                                    Some(call_session.clone()),
+                                    kv_name.clone(),
+                                    None,
+                                    Some(&title_prej),
+                                ).await?
+                            } else {
+                                return Err(anyhow::anyhow!("Qwen3.5 generator missing"));
+                            }
+                        };
+                        println!("[JS-BRIDGE] LLM Raw Response: '{}'", res);
+                        let title_info = parsing::parse_json_from_llm(&res);
+                        let well_formed = title_info.as_object().map_or(false, |obj| !obj.is_empty());
+                        let harvested = crate::scheduler::list_census::harvest_titles(&title_info, &res);
+                        println!("[JS-BRIDGE] Titles extracted (Robust): {:?}", harvested);
+                        if from_excerpt {
+                            crate::utils::score_dynamics::record_baseline(
+                                "commerce.title_excerpt_hit",
+                                if harvested.is_empty() { 0.0 } else { 1.0 },
+                            );
+                            if harvested.is_empty() {
+                                emit_term("  ✂️ [TITLE EXCERPT / EMPTY] 반복 구조 발췌에서 제목을 찾지 못했습니다. 기존과 같은 전체 PUG 로 한 번 더 묻습니다.");
+                                continue;
+                            }
+                            if let Some(ex) = title_excerpt.as_ref() {
+                                let ratio = context.chars().count() as f32 / system_content.chars().count().max(1) as f32;
+                                crate::utils::score_dynamics::record_baseline("commerce.title_excerpt_ratio", ratio);
+                                emit_term(&format!(
+                                    "  ✂️ [TITLE EXCERPT] 전수 조사 1위 '{}' 가 나머지 후보보다 구조점수 {:.1}배 우세해, 2B 에 전체 PUG 대신 이 반복 구조의 첫 {}행(전체 {}행)과 머리행 {}칸만 보냈습니다 | 문맥 {}자 / 전체 PUG {}자 ({:.1}%) | 제목 {}개. 제목으로 반복 구조를 찾는 Boa 판정은 그대로이며, 이 경우 아래 CENSUS SHADOW 는 같은 후보에서 나온 제목이라 독립 관측이 아닙니다.",
+                                    ex.selector,
+                                    ex.dominance,
+                                    ex.rows,
+                                    ex.members,
+                                    ex.header_cells,
+                                    context.chars().count(),
+                                    system_content.chars().count(),
+                                    ratio * 100.0,
+                                    harvested.len()
+                                ));
+                            }
+                        }
+                        crate::utils::score_dynamics::record_baseline("commerce.title_llm_count", harvested.len() as f32);
+                        outcome = (harvested, well_formed);
+                        break;
+                    }
+                    outcome
+                };
                 if base_model_size == crate::model::ModelSize::Qwen {
                     model.deep_purge_resources().await;
                 }
-
                 let mut census_selector: Option<serde_json::Value> = None;
                 if titles.is_empty() {
                     let census = list_census.as_ref();
@@ -7414,6 +7456,17 @@ pub async fn process_task(
                         unique_phrases[*h], d_field_names[*f], d_field_names[*blocker], margin
                     ));
                 }
+                let mut contested_floor: Option<f32> = None;
+                for (f, a) in d_assign.iter().enumerate() {
+                    let (h, s, m) = match a { Some(v) => *v, None => continue };
+                    if m + 1e-4 >= s || is_id_link_field(&d_field_names[f]) {
+                        continue;
+                    }
+                    if form_page && detect_field_format(&d_field_names[f]) == FieldFormat::Text && leaf_raw[f][h] < sec_raw[f][h] {
+                        continue;
+                    }
+                    contested_floor = Some(contested_floor.map_or(s, |c: f32| c.min(s)));
+                }
                 for (f, a) in d_assign.iter().enumerate() {
                     let (h, score, margin) = match a { Some(v) => *v, None => continue };
                     let owner = d_field_names[f].clone();
@@ -7434,7 +7487,18 @@ pub async fn process_task(
                         ));
                         continue;
                     }
-
+                    if form_page && owner_fmt == FieldFormat::Text && margin + 1e-4 >= score {
+                        if let Some(floor) = contested_floor {
+                            if score < floor {
+                                crate::utils::score_dynamics::record_baseline("commerce.detail_pair_uncontested_weak", score);
+                                emit_term(&format!(
+                                    "    🔒 [DETAIL PAIR UNCONTESTED WEAK] Label '{}' → Field '{}' | 점수 {:.4} 에 겨룬 상대 필드가 없습니다(마진 = 점수). 이 문서에서 상대와 겨뤄 이긴 배정 가운데 가장 낮은 점수 {:.4} 에도 못 미치므로, 값 형식으로 검증할 수 없는 글자 필드에는 이 칸의 값을 넣지 않습니다.",
+                                    unique_phrases[h], owner, score, floor
+                                ));
+                                continue;
+                            }
+                        }
+                    }
                     let mut merged = String::new();
                     let mut primary = detail_pairs[targets[0]].primary_line;
                     for pi in &targets {
@@ -7577,7 +7641,19 @@ pub async fn process_task(
                     }
 
                     
+                    let pair_status_line = header_forced_assign.get("status").copied();
                     if chosen.is_none() {
+                        if let Some(pl) = pair_status_line {
+                            crate::utils::score_dynamics::record_baseline("commerce.enum_select_llm_skip", 1.0);
+                            emit_term(&format!(
+                                "  ⏭️ [ENUM SELECT LLM SKIP] 'status' 는 이미 라벨↔값 쌍 Line {} (\"{}\") 로 확정되어 있습니다. 코사인이 상태 컨트롤을 고르지 못했다는 이유로 2B 를 올려 <select> {}개 전체를 묻지 않습니다 (2B 적재 · 프리필 · Qwen3 재적재가 생기지 않습니다).",
+                                pl + 1,
+                                line_values.get(pl).map(|s| s.as_str()).unwrap_or(""),
+                                select_groups.len()
+                            ));
+                        }
+                    }
+                    if chosen.is_none() && pair_status_line.is_none() {
                         let catalogue: Vec<serde_json::Value> = select_groups.iter().map(|g| json!({
                             "selector": g.selector,
                             "role": g.role_phrase,
@@ -7640,7 +7716,30 @@ pub async fn process_task(
                     }
 
                     
-                    if let Some(gi) = chosen {
+                    let pair_conflict = match (chosen, pair_status_line) {
+                        (Some(gi), Some(pl)) => {
+                            let key = |s: &str| -> String {
+                                s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase()
+                            };
+                            let sel = key(&select_groups[gi].selected);
+                            let line = key(line_values.get(pl).map(|s| s.as_str()).unwrap_or(""));
+                            !sel.is_empty() && !line.contains(&sel) && !sel.contains(&line)
+                        }
+                        _ => false,
+                    };
+                    if pair_conflict {
+                        if let (Some(gi), Some(pl)) = (chosen, pair_status_line) {
+                            crate::utils::score_dynamics::record_baseline("commerce.enum_select_pair_conflict", 1.0);
+                            emit_term(&format!(
+                                "  🔒 [ENUM SELECT PAIR CONFLICT] '{}' 의 선택값 \"{}\" 이 라벨↔값 쌍으로 확정된 Line {} (\"{}\") 와 다릅니다. 같은 상태를 두 근거가 다르게 말하므로 컨트롤 쪽으로 덮지 않고 라벨 쌍 배정을 유지합니다.",
+                                select_groups[gi].selector,
+                                select_groups[gi].selected,
+                                pl + 1,
+                                line_values.get(pl).map(|s| s.as_str()).unwrap_or("")
+                            ));
+                        }
+                    }
+                    if let Some(gi) = chosen.filter(|_| !pair_conflict) {
                         let g = &select_groups[gi];
                         let sel_emb = model.get_embedding(g.selected.clone()).await.unwrap_or(vec![0.0; 384]);
                         let key_scores = status_key_scores(&sel_emb, &key_banks);
@@ -7761,7 +7860,26 @@ pub async fn process_task(
             
             
             let mut family_shared: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            {
+            if form_page {
+                let held: Vec<String> = (0..vector_assignment.len())
+                    .filter(|&f| {
+                        vector_assignment[f].is_none()
+                            && !field_is_analytic[f]
+                            && !is_id_link_field(&fields[f].0)
+                            && !pair_line_map.contains_key(&fields[f].0)
+                            && matches!(field_formats[f], FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric)
+                    })
+                    .map(|f| fields[f].0.clone())
+                    .collect();
+                if !held.is_empty() {
+                    crate::utils::score_dynamics::record_baseline("commerce.form_family_share_skip", held.len() as f32);
+                    emit_term(&format!(
+                        "  ⛔ [FORMAT FAMILY SHARE / FORM] 입력 폼 상세라 같은 형식 필드의 줄을 빌려 쓰지 않습니다. 자기 라벨 칸도 벡터 배정도 없는 필드: {:?} | 폼에서는 칸마다 자기 라벨이 있으므로, 자기 라벨 칸이 없는 필드가 다른 필드(등록일시 · 포인트 등)의 줄을 가져가면 그 값은 이 필드의 사실이 아닙니다. 라벨 쌍이 있는 필드는 지금처럼 자기 칸의 값을 씁니다.",
+                        held
+                    ));
+                }
+            }
+            if !form_page {
                 let mut shared = 0usize;
                 for f in 0..vector_assignment.len() {
                     if vector_assignment[f].is_some() { continue; }

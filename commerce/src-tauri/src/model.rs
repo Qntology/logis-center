@@ -185,6 +185,68 @@ static LAST_SWAP_MS: AtomicU64 = AtomicU64::new(0);
 /// 관측된 activation 여유(MB). 로드 직후 free 와 연산 중 free 의 차이입니다.
 static ACTIVATION_HEADROOM_MB: AtomicU64 = AtomicU64::new(0);
 
+pub const RAM_PRESSURE_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+pub fn ram_snapshot() -> (u64, u64) {
+    let avail = crate::utils::resources::free_ram_bytes() as u64;
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    (avail, sys.total_memory())
+}
+
+pub fn ram_used_pct(avail: u64, total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    (total.saturating_sub(avail) as f64 * 100.0 / total as f64) as f32
+}
+
+pub fn process_rss_bytes() -> Option<u64> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    let sys = sysinfo::System::new_all();
+    sys.process(pid).map(|p| p.memory())
+}
+
+pub fn ram_pressure_line(avail: u64, total: u64) -> String {
+    let limit_pct = if total > 0 {
+        (100.0 - RAM_PRESSURE_MARGIN_BYTES as f64 * 100.0 / total as f64).max(0.0)
+    } else {
+        0.0
+    };
+    format!(
+        "RAM 사용 {:.1}% (여유 {}MB / 총 {}MB · 이 프로세스 작업 집합 {}) | 압박 기준: 여유 {}MB 미만 = 이 PC 에서 사용 {:.1}% 이상 (KV-PLAN 의 RAM margin 과 같은 값)",
+        ram_used_pct(avail, total),
+        avail / 1_000_000,
+        total / 1_000_000,
+        process_rss_bytes().map_or("-".to_string(), |b| format!("{}MB", b / 1_000_000)),
+        RAM_PRESSURE_MARGIN_BYTES / 1_000_000,
+        limit_pct
+    )
+}
+
+pub fn release_os_working_set() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        malloc_trim(0);
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
+}
+
 impl LogisModel {
     // ── 상주 비용 추정 ──────────────────────────────────────────────
     /// 가중치 파일들의 총 바이트를 MB 로 환산합니다.
