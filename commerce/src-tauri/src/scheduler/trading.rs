@@ -3964,7 +3964,14 @@ pub async fn process_trading_task(
         doc_type, merged_page_count
     ));
 
-    let mut extracted_data = Value::Object(merged_map);    
+    let mut extracted_data = Value::Object(merged_map);
+    if let Some(map) = extracted_data.as_object_mut() {
+        crate::model::merge::drop_row_echo_columns(map, &emit_term);
+        crate::model::merge::reconcile_monetary_axes(map, &emit_term);
+        crate::model::merge::reconcile_package_axes(map, &emit_term);
+        crate::model::merge::reconcile_weight_basis(map, &emit_term);
+        crate::model::merge::reroute_closed_vocab_values(map, &doc_type, &emit_term);
+    }    
     {
         // 🌟 other_parties / settlement 추가. 비전 경로는 이미 party_name 을 루트에 올리고
         //    있어 두 경로의 루트 축이 어긋나 있었습니다.

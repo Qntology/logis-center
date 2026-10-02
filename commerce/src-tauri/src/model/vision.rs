@@ -3982,6 +3982,40 @@ impl crate::model::LogisModel {
                     );
                 }
             }
+            if !is_trade_doc {
+                let lang_code = crate::utils::bias_schema::lang_code_of(&language);
+                crate::scheduler::trading::normalize_trading_data(&mut extracted_data, &lang_code);
+                let raw_status = extracted_data
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let status_note = if raw_status.is_empty() {
+                    "상태 값 없음".to_string()
+                } else if crate::logic::parse_status(&raw_status) != 0 {
+                    format!("상태 '{}' 는 이미 캐노니컬 키", raw_status)
+                } else {
+                    let lower = raw_status.to_lowercase();
+                    let canon = if crate::logic::parse_status(&lower) != 0 {
+                        Some((lower, "소문자 일치".to_string()))
+                    } else {
+                        crate::utils::ai_utils::status_canonical_exact(&raw_status, "goods", None)
+                    };
+                    match canon {
+                        Some((key, route)) => {
+                            if let Some(o) = extracted_data.as_object_mut() {
+                                o.insert("status".to_string(), json!(key.clone()));
+                            }
+                            format!("상태 '{}' → '{}' ({})", raw_status, key, route)
+                        }
+                        None => format!("상태 '{}' 는 닫힌 상태 어휘와 정확히 맞지 않아 원문을 둡니다", raw_status),
+                    }
+                };
+                emit_term(&format!(
+                    "  🧾 [COMMERCE NORMALIZE / IMAGE] 텍스트 경로와 같은 저장 형식으로 맞춥니다: 날짜 축은 ISO, 금액·수량 축은 수치, 통화는 문서 언어 '{}' 기준 코드 | {} | 질의의 기간·수치·상태 조건이 이미지 문서와도 같은 비교로 만납니다.",
+                    lang_code, status_note
+                ));
+            }
             let nl = crate::parsing::json_to_natural_language(&extracted_data);
             let doc_type_owned: String = if is_trade_doc {
                 let raw = extracted_data.get("header")
@@ -4296,7 +4330,7 @@ impl crate::model::LogisModel {
                     Some(&item_digest)
                 ).await;
 
-                if is_trade_doc {
+                {
                     let chunk_cancel = cancel_token
                         .clone()
                         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
@@ -4322,7 +4356,7 @@ impl crate::model::LogisModel {
                         &hashed_cc,
                         &chunk_bcc,
                         &ref_val,
-                        "shipping",
+                        if is_trade_doc { "shipping" } else { "commerce" },
                         "",
                         &chunk_cancel,
                         app_handle,

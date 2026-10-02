@@ -894,7 +894,14 @@ pub async fn generate_transliteration_aliases(
             && !crate::nl_convert::is_latin_dominant(&gated)
             && crate::nl_convert::find_mixed_script_words(&gated).is_empty()
         {
-            let native = if non_latin.is_empty() { gated.clone() } else { format!("{} {}", non_latin.join(" "), gated) };
+            let native = if non_latin.is_empty() {
+                gated.clone()
+            } else if non_latin.iter().all(|w| crate::nl_convert::is_digit_word(w)) {
+                crate::nl_convert::place_digit_words(src, &gated)
+                    .unwrap_or_else(|| format!("{} {}", non_latin.join(" "), gated))
+            } else {
+                format!("{} {}", non_latin.join(" "), gated)
+            };
             let native = crate::nl_convert::reglue_native_alias(src, &native);
             if pair.1.is_empty() {
                 let roman = crate::nl_convert::try_any_ascii_transliteration(&native).unwrap_or_default();

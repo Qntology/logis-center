@@ -162,6 +162,19 @@ async fn run_synthesis_pass(
         lang.as_ref().map(|s| s.label()).unwrap_or_else(|| "Qwen3".to_string()),
         STREAK_LIMIT
     ));
+    let (ram_before, _) = crate::model::ram_snapshot();
+    crate::model::release_os_working_set();
+    let (ram_after, ram_total) = crate::model::ram_snapshot();
+    crate::utils::score_dynamics::record_baseline(
+        "commerce.synthesis_entry_trim_gain_mb",
+        (ram_after.saturating_sub(ram_before) / 1_000_000) as f32,
+    );
+    emit_term(&format!(
+        "  🧹 [SYNTHESIS PASS / RAM] 첫 요약 호출 전에 앞 단계(필드 추출 · 모델 적재)가 남긴 작업 집합을 반환합니다 | RAM 여유 {}MB → {}MB | {}",
+        ram_before / 1_000_000,
+        ram_after / 1_000_000,
+        crate::model::ram_pressure_line(ram_after, ram_total)
+    ));
     let announce_gate = |g: Option<(f32, u64)>| {
         if let Some((recent, n)) = g {
             emit_term(&format!(

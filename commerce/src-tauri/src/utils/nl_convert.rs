@@ -1808,6 +1808,14 @@ pub fn gate_native_alias(latin_src: &str, native: String, tag: &str) -> String {
     if native.trim().is_empty() || is_latin_dominant(&native) {
         return native;
     }
+    if let Some(mix) = foreign_script_mix(&native, latin_src) {
+        crate::utils::score_dynamics::record_baseline("indexing.translit_script_mix_reject", 1.0);
+        println!(
+            "    🚫 [{} SCRIPT MIX REJECT] '{}' → '{}' | 별칭에 서로 다른 비라틴 문자 체계가 섞였습니다 ({}). 한 언어로 옮긴 음차는 그 언어의 문자 체계 하나로 적힙니다(가나와 한자를 함께 쓰는 일본어는 예외). 다른 언어의 글자가 섞인 별칭은 소리 근거가 없어 쓰지 않습니다.",
+            tag, latin_src, native, mix
+        );
+        return String::new();
+    }
     if let Some(sp) = spelled_out_similarity(latin_src, &native) {
         let spelled = sp >= SPELLED_OUT_MIN;
         crate::utils::score_dynamics::record_baseline("indexing.translit_spelled_out", if spelled { 1.0 } else { 0.0 });
@@ -1874,6 +1882,13 @@ pub fn cached_translit_recheck(
             None
         };
     }
+    if let Some(mix) = foreign_script_mix(&added.join(" "), src) {
+        return Some(format!(
+            "캐시 별칭 '{}' 에 서로 다른 비라틴 문자 체계가 섞였습니다 ({})",
+            added.join(" "),
+            mix
+        ));
+    }
     if let Some(sp) = spelled_out_similarity(&latin.join(" "), &added.join(" ")).filter(|s| *s >= SPELLED_OUT_MIN) {
         return Some(format!(
             "캐시 별칭 '{}' 는 원문 글자를 알파벳 이름으로 한 자씩 읽은 것입니다 (일치 {:.2} ≥ {:.2})",
@@ -1911,6 +1926,32 @@ fn script_class(c: char) -> u8 {
 
 fn script_set(text: &str) -> std::collections::BTreeSet<u8> {
     text.chars().map(script_class).filter(|s| *s != 0).collect()
+}
+
+fn foreign_script_mix(text: &str, source: &str) -> Option<String> {
+    let set: std::collections::BTreeSet<u8> = text
+        .chars()
+        .filter(|c| c.is_alphabetic() && !source.contains(*c))
+        .map(script_class)
+        .filter(|s| *s > 1)
+        .collect();
+    if set.len() <= 1 || set.iter().all(|s| *s == 3 || *s == 4) {
+        return None;
+    }
+    Some(
+        set.iter()
+            .map(|s| match s {
+                2 => "한글",
+                3 => "가나",
+                4 => "한자",
+                5 => "키릴 문자",
+                6 => "타이 문자",
+                7 => "아랍 문자",
+                _ => "기타 문자",
+            })
+            .collect::<Vec<_>>()
+            .join(" + "),
+    )
 }
 
 fn display_exonym(name: &str) -> String {

@@ -917,7 +917,7 @@ impl VectorStore {
                         Some(Value::String(s)) => {
                             let t = s.trim();
                             if t.is_empty() { continue; }
-                            t == "1" || t.eq_ignore_ascii_case("true")
+                            t == "1" || t.eq_ignore_ascii_case("true") || crate::utils::canonical::truthy_word(t)
                         },
                         Some(Value::Array(_)) | Some(Value::Object(_)) => continue,
                         None | Some(Value::Null) => continue,

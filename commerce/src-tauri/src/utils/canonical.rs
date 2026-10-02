@@ -49,6 +49,21 @@ const BOOL_PREFIX: &[&str] = &["is_", "has_", "allow_", "use_"];
 
 const BOOL_SUFFIX: &[&str] = &["_only", "_included", "_allowed", "_match"];
 
+const TRUTHY_WORDS: &[&str] = &[
+    "yes", "y", "on", "o", "allowed", "permitted", "included", "taxable", "applicable", "available", "enabled",
+    "예", "네", "있음", "허용", "가능", "포함", "적용", "과세", "사용",
+    "はい", "あり", "有", "許可", "可", "課税", "含む",
+    "是", "允许", "可以", "包含", "含税",
+];
+
+pub fn truthy_word(raw: &str) -> bool {
+    let t: String = raw
+        .trim()
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    !t.is_empty() && TRUTHY_WORDS.iter().any(|w| *w == t)
+}
+
 /// 🌟 필드 이름만으로 저장 타입을 판정합니다.
 ///    새 필드는 대부분 접미사 규칙에 자동으로 걸리므로 Rust 수정이 불필요합니다.
 pub fn kind_of(key: &str) -> CanonKind {
