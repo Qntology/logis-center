@@ -167,13 +167,16 @@ pub const PHASE_GENERATION: u8 = 2;
 pub const PHASE_BOTH: u8 = 3;
 
 static CROSSOVER_PHASE: AtomicU8 = AtomicU8::new(PHASE_IDLE);
-/// 임베딩 실측 상주 비용(MB). 0 이면 아직 미관측 → 디스크 크기로 대체합니다.
 static EMBED_RESIDENT_MB: AtomicU64 = AtomicU64::new(0);
-/// 마지막으로 올린 생성 모델의 실측 상주 비용(MB).
 static GEN_RESIDENT_MB: AtomicU64 = AtomicU64::new(0);
-/// 관측된 최대 동시 점유(MB). 진단 전용.
+static GEN_COST_BY_KIND: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+pub const GEN_KIND_LANG4B: usize = 3;
 static PEAK_RESIDENT_MB: AtomicU64 = AtomicU64::new(0);
-/// 스왑(한쪽을 내리고 다른 쪽을 올린) 횟수.
 static SWAP_COUNT: AtomicU64 = AtomicU64::new(0);
 /// 동시 상주로 스왑을 회피한 횟수.
 static COEXIST_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -245,10 +248,39 @@ impl LogisModel {
             ModelSize::Qwen3_5 => self.qwen3_5_model_path.clone(),
         };
         let disk = Self::path_footprint_mb(std::path::Path::new(&dir));
-        let observed = GEN_RESIDENT_MB.load(XOrder::SeqCst);
-        // 실측은 '마지막에 올린 모델' 기준이라 크기가 다른 모델에는 부정확합니다.
-        // 두 값 중 큰 쪽을 택해 보수적으로 판정합니다.
+        let own = Self::measured_generation_mb(Self::gen_kind(size));
+        let observed = if own > 0 { own } else { GEN_RESIDENT_MB.load(XOrder::SeqCst) };
         disk.max(observed).max(1) + ACTIVATION_HEADROOM_MB.load(XOrder::SeqCst)
+    }
+
+    pub fn gen_kind(size: ModelSize) -> usize {
+        match size {
+            ModelSize::Qwen => 0,
+            ModelSize::Qwen3 => 1,
+            ModelSize::Qwen3_5 => 2,
+        }
+    }
+
+    pub fn measured_generation_mb(kind: usize) -> u64 {
+        GEN_COST_BY_KIND.get(kind).map(|c| c.load(XOrder::SeqCst)).unwrap_or(0)
+    }
+
+    pub async fn resident_generation_cost_mb(&self) -> u64 {
+        let qwen = self.generator.lock().await.is_some();
+        let qwen3 = self.qwen3_generator.lock().await.is_some();
+        let qwen3_5 = self.qwen3_5_generator.lock().await.is_some();
+        let mut total = 0u64;
+        if qwen {
+            total += Self::measured_generation_mb(0);
+        }
+        if qwen3 {
+            total += Self::measured_generation_mb(1);
+        }
+        if qwen3_5 {
+            let kind = if crate::model::lang_llm::resident_variant().is_some() { GEN_KIND_LANG4B } else { 2 };
+            total += Self::measured_generation_mb(kind);
+        }
+        total
     }
 
     // ── 페이즈 상태 ────────────────────────────────────────────────
@@ -402,14 +434,19 @@ impl LogisModel {
     ///   예산이 과소평가되면 곧바로 OOM 방향의 오판이 되므로 허용할 수 없습니다.
     ///   측정이 깨끗하지 않으면 기록하지 않고 디스크 추정치를 유지합니다.
     ///   (디스크 추정치는 과대평가 방향이라 안전합니다)
-    fn observe_generation_cost_strict(&self, free_before: u64, pre_empty: bool) {
-        if self.is_cpu_mode { return; }
+    fn observe_generation_cost(&self, kind: usize, free_before: u64, clean: bool) -> bool {
+        if self.is_cpu_mode { return false; }
         let after = self.get_free_vram_mb();
-        if pre_empty && free_before > after {
+        let measured = clean && free_before > after;
+        if measured {
             let cost = free_before - after;
-            if cost > 0 { GEN_RESIDENT_MB.store(cost, XOrder::SeqCst); }
+            if let Some(slot) = GEN_COST_BY_KIND.get(kind) {
+                slot.store(cost, XOrder::SeqCst);
+            }
+            GEN_RESIDENT_MB.store(cost, XOrder::SeqCst);
         }
         self.observe_peak(after);
+        measured
     }
 
     /// 지금까지 관측된 '가장 적게 남았던 순간' 을 피크로 환산해 기록합니다.
@@ -546,8 +583,9 @@ impl LogisModel {
 
         // 🌟 [CLEAN BASELINE] 지금 슬롯이 전부 비어 있으면 free_before 가
         //    오염되지 않은 기준선이므로 생성 비용을 실측으로 확정할 수 있습니다.
-        let pre_empty = !self.generation_resident().await
-            && !self.embedding_resident().await;
+        let gen_empty_before = !self.generation_resident().await;
+        let embed_held = self.embedding_resident().await;
+        let vision_held = self.siglip2_model.lock().await.is_some();
         let before = self.get_free_vram_mb();
 
         if coexist_ok {
@@ -566,14 +604,18 @@ impl LogisModel {
             self.secure_vram_relay(size, session_id, cancel, prefill, kv_name).await?;
         }
 
-        self.observe_generation_cost_strict(before, pre_empty);
+        let embed_after = self.embedding_resident().await;
+        let vision_after = self.siglip2_model.lock().await.is_some();
+        let clean = gen_empty_before && embed_after == embed_held && vision_after == vision_held;
+        let measured = self.observe_generation_cost(Self::gen_kind(size), before, clean);
         let phase = self.sync_crossover_phase().await;
         println!(
-            "[CROSSOVER] 🧠 [GENERATION PHASE] {} | {:?} 상주 확정 (phase={} | 생성 실측 {}MB | 자유 {}MB)",
+            "[CROSSOVER] 🧠 [GENERATION PHASE] {} | {:?} 상주 확정 (phase={} | 생성 실측 {}MB{} | 자유 {}MB)",
             reason,
             size,
             phase,
-            GEN_RESIDENT_MB.load(XOrder::SeqCst),
+            Self::measured_generation_mb(Self::gen_kind(size)),
+            if measured && embed_held { " · 임베딩 상주 상태에서 이번 적재로 실측" } else { "" },
             self.get_free_vram_mb()
         );
         Ok(())

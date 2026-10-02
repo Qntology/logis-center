@@ -1136,19 +1136,46 @@ pub fn reglue_native_alias(source: &str, native: &str) -> String {
     out
 }
 
+pub fn is_digit_word(word: &str) -> bool {
+    word.chars().any(|c| c.is_ascii_digit())
+        && word.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+}
+
 pub fn split_words_by_script(source: &str) -> (Vec<String>, Vec<String>) {
     let cleaned = strip_special_chars_for_transliteration(source);
     let mut non_latin: Vec<String> = Vec::new();
     let mut latin: Vec<String> = Vec::new();
     for word in cleaned.split_whitespace() {
         if word.is_empty() { continue; }
-        if is_latin_dominant(word) {
+        if is_latin_dominant(word) && !is_digit_word(word) {
             latin.push(word.to_string());
         } else {
             non_latin.push(word.to_string());
         }
     }
     (non_latin, latin)
+}
+
+pub fn place_digit_words(source: &str, spoken: &str) -> Option<String> {
+    let cleaned = strip_special_chars_for_transliteration(source);
+    let words: Vec<&str> = cleaned.split_whitespace().collect();
+    if !words.iter().any(|w| is_digit_word(w)) {
+        return None;
+    }
+    let spoken_words: Vec<&str> = spoken.split_whitespace().collect();
+    if spoken_words.len() != words.iter().filter(|w| !is_digit_word(w)).count() {
+        return None;
+    }
+    let mut next = spoken_words.into_iter();
+    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    for w in words.iter() {
+        if is_digit_word(w) {
+            out.push(w.to_string());
+        } else {
+            out.push(next.next()?.to_string());
+        }
+    }
+    Some(out.join(" "))
 }
 
 pub fn build_transliteration_prompt_for_words(words: &[String], target_language: &str) -> String {
@@ -1643,8 +1670,7 @@ fn letter_name_reading(src: &str) -> Option<String> {
 }
 
 pub const SPELLED_OUT_MIN: f32 = 0.90;
-
-pub const TRANSLIT_GATE_REV: &str = "g3";
+pub const TRANSLIT_GATE_REV: &str = "g4";
 
 fn letter_reading_key(romanized: &str) -> String {
     let compact: String = romanized.split_whitespace().collect::<String>().replace("eu", "").replace("ou", "o");

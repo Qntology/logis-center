@@ -962,7 +962,7 @@ impl LogisModel {
         let gen_resident = self.generation_resident().await;
         let embed_resident = self.embedding_resident().await;
         if !self.is_cpu_mode {
-            let reclaimable = if gen_resident { super::GEN_RESIDENT_MB.load(std::sync::atomic::Ordering::SeqCst) } else { 0 }
+            let reclaimable = self.resident_generation_cost_mb().await
                 + if embed_resident { super::EMBED_RESIDENT_MB.load(std::sync::atomic::Ordering::SeqCst) } else { 0 };
             let ceiling = self.get_free_vram_mb() + reclaimable;
             if ceiling < need {
@@ -1000,7 +1000,9 @@ impl LogisModel {
             }
         }
 
-        let pre_empty = !self.generation_resident().await && !self.embedding_resident().await;
+        let gen_empty_before = !self.generation_resident().await;
+        let embed_held = self.embedding_resident().await;
+        let vision_held = self.siglip2_model.lock().await.is_some();
         let before = self.get_free_vram_mb();
         {
             *self.current_size.lock().await = Some(ModelSize::Qwen3_5);
@@ -1040,7 +1042,10 @@ impl LogisModel {
             *self.qwen3_5_generator.lock().await = Some(gen);
         }
         lang_llm::set_resident_variant(Some(code.to_string()));
-        self.observe_generation_cost_strict(before, pre_empty);
+        let embed_after = self.embedding_resident().await;
+        let vision_after = self.siglip2_model.lock().await.is_some();
+        let clean = gen_empty_before && embed_after == embed_held && vision_after == vision_held;
+        self.observe_generation_cost(super::GEN_KIND_LANG4B, before, clean);
         let load_ms = started.elapsed().as_millis() as f32;
         crate::utils::score_dynamics::record_baseline("model.lang4b_load_ms", load_ms);
         println!(
@@ -1143,22 +1148,26 @@ impl LogisModel {
             );
         }
         let embed_resident = self.embedding_resident().await;
-        let gen_resident = self.generation_resident().await;
+        let swap_ok = step.ends_with("_synthesis");
         let need = lang_llm::resident_estimate_mb(&code)
             + super::ACTIVATION_HEADROOM_MB.load(std::sync::atomic::Ordering::SeqCst)
-            + if embed_resident { 0 } else { self.embedding_budget_mb() };
-        let available = self.get_free_vram_mb()
-            + if gen_resident { super::GEN_RESIDENT_MB.load(std::sync::atomic::Ordering::SeqCst) } else { 0 };
+            + if embed_resident || swap_ok { 0 } else { self.embedding_budget_mb() };
+        let reclaim = self.resident_generation_cost_mb().await
+            + if swap_ok && embed_resident { super::EMBED_RESIDENT_MB.load(std::sync::atomic::Ordering::SeqCst) } else { 0 };
+        let available = self.get_free_vram_mb() + reclaim;
         if available < need {
-            return lang_llm::closed_verdict(
-                track,
-                step,
-                Some(&code),
-                &format!(
-                    "임베딩과 4B 를 함께 둘 VRAM 이 없습니다 (확보 가능 {}MB < 필요 {}MB). 이 단계는 아이템마다 임베딩과 생성을 오가므로 동시 상주가 안 되면 아이템 수만큼 교체가 일어납니다",
-                    available, need
-                ),
-            );
+            let why = if swap_ok {
+                format!(
+                    "요약 패스 동안 생성 모델과 임베딩을 모두 내려도 4B 를 둘 VRAM 이 없습니다 (확보 가능 {}MB = 자유 {}MB + 내릴 수 있는 실측 {}MB < 필요 {}MB)",
+                    available, available - reclaim, reclaim, need
+                )
+            } else {
+                format!(
+                    "임베딩과 4B 를 함께 둘 VRAM 이 없습니다 (확보 가능 {}MB = 자유 {}MB + 내릴 생성 모델 실측 {}MB < 필요 {}MB). 이 단계는 아이템마다 임베딩과 생성을 오가므로 동시 상주가 안 되면 아이템 수만큼 교체가 일어납니다",
+                    available, available - reclaim, reclaim, need
+                )
+            };
+            return lang_llm::closed_verdict(track, step, Some(&code), &why);
         }
         crate::utils::score_dynamics::record_baseline(&format!("{}.lang4b_route.{}", track, step), 1.0);
         verdict

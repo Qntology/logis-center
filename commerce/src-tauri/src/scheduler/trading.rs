@@ -1256,12 +1256,12 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
     }
     walk(item);
 
-    if let Some(obj) = item.as_object_mut() {
+    fn split_party_blocks(map: &mut serde_json::Map<String, Value>, scope: &str) {
         for (name_key, addr_key) in [
             ("sender_name", "sender_address"),
             ("recipient_name", "recipient_address"),
         ] {
-            let raw = obj.get(name_key).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+            let raw = map.get(name_key).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
             if !raw.contains(" / ") { continue; }
             let parts: Vec<String> = raw
                 .split(" / ")
@@ -1269,17 +1269,23 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
                 .filter(|p| !p.is_empty())
                 .collect();
             if parts.len() < 2 { continue; }
-            let addr_empty = obj
+            let addr_empty = map
                 .get(addr_key)
                 .map_or(true, |v| v.is_null() || v.as_str().map_or(false, |s| s.trim().is_empty()));
-            obj.insert(name_key.to_string(), json!(parts[0].clone()));
+            map.insert(name_key.to_string(), json!(parts[0].clone()));
             if addr_empty {
-                obj.insert(addr_key.to_string(), json!(parts[1..].join(", ")));
+                map.insert(addr_key.to_string(), json!(parts[1..].join(", ")));
             }
             println!(
-                "  🧱 [PARTY BLOCK SPLIT] {} 에 여러 줄 블록이 들어와 첫 줄 '{}' 을 이름으로, 나머지 {}줄을 {} 로 나눕니다.",
-                name_key, parts[0], parts.len() - 1, if addr_empty { addr_key } else { "(이미 채워진 주소는 유지)" }
+                "  🧱 [PARTY BLOCK SPLIT] {}{} 에 여러 줄 블록이 들어와 첫 줄 '{}' 을 이름으로, 나머지 {}줄을 {} 로 나눕니다.",
+                scope, name_key, parts[0], parts.len() - 1, if addr_empty { addr_key } else { "(이미 채워진 주소는 유지)" }
             );
+        }
+    }
+    if let Some(obj) = item.as_object_mut() {
+        split_party_blocks(obj, "");
+        if let Some(parties) = obj.get_mut("parties").and_then(|v| v.as_object_mut()) {
+            split_party_blocks(parties, "parties.");
         }
         let cur = obj.get("currency").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if crate::model::merge::is_schema_echo(&cur) {

@@ -1485,16 +1485,37 @@ impl crate::model::LogisModel {
                                             continue;
                                         }
                                         let multiline = value.lines().filter(|l| !l.trim().is_empty()).count() >= 2;
-                                        if multiline
+                                        let (field, value, rcat) = if multiline
                                             && crate::utils::ai_utils::detect_field_format(&field)
                                                 != crate::utils::ai_utils::FieldFormat::Address
                                         {
-                                            emit_term(&format!(
-                                                "      🚫 [PAIR MULTILINE] \"{}\" → {} | 줄바꿈으로 나뉜 블록은 주소 축에만 들어갈 수 있습니다. 이 축의 형식은 주소가 아니므로 배정하지 않고, 같은 크롭의 잔여 스키마 패스와 복구 창에 맡깁니다.",
-                                                label, field
-                                            ));
-                                            continue;
-                                        }
+                                            match crate::model::merge::party_block_axis(&label, &field, &label_exact, &gate_banks, &final_data_map) {
+                                                Some((name_axis, addr_axis)) => {
+                                                    let block = value
+                                                        .lines()
+                                                        .map(|l| l.trim())
+                                                        .filter(|l| !l.is_empty())
+                                                        .collect::<Vec<_>>()
+                                                        .join(" / ");
+                                                    crate::utils::score_dynamics::record_baseline("vision.pair_party_block", 1.0);
+                                                    emit_term(&format!(
+                                                        "      🧱 [PAIR PARTY BLOCK] \"{}\" → {} | 줄바꿈 블록이 당사자 상자(이름 줄 + 주소 줄)입니다. 라우팅 축 '{}' 대신 이름 축에 줄을 ' / ' 로 이어 넣고, 저장 전 정규화가 텍스트 경로와 같은 규칙으로 첫 줄은 '{}', 나머지 줄은 '{}' 로 나눕니다.",
+                                                        label, name_axis, field, name_axis, addr_axis
+                                                    ));
+                                                    let cat = crate::logic::trade_field_category(&name_axis).to_string();
+                                                    (name_axis, block, cat)
+                                                }
+                                                None => {
+                                                    emit_term(&format!(
+                                                        "      🚫 [PAIR MULTILINE] \"{}\" → {} | 줄바꿈으로 나뉜 블록은 주소 축에만 들어갈 수 있습니다. 이 축의 형식은 주소가 아니므로 배정하지 않고, 같은 크롭의 잔여 스키마 패스와 복구 창에 맡깁니다.",
+                                                        label, field
+                                                    ));
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            (field, value, rcat)
+                                        };
                                         if crate::logic::is_trade_array_category(&rcat) && rcat != plan.category {
                                             let rows = final_data_map
                                                 .get(&rcat)

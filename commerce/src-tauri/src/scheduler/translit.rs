@@ -599,6 +599,8 @@ pub async fn generate_transliteration_aliases(
                     phonetic_dropped += 1;
                 }
             }
+            let digits_only = !non_latin_words.is_empty()
+                && non_latin_words.iter().all(|w| crate::nl_convert::is_digit_word(w));
             let mut korean_unified_parts: Vec<String> = Vec::new();
             for w in &non_latin_words {
                 korean_unified_parts.push(w.clone());
@@ -608,10 +610,12 @@ pub async fn generate_transliteration_aliases(
             }
             let korean_unified = if !latin_words.is_empty() && track_b_transliteration.is_empty() {
                 String::new()
+            } else if digits_only {
+                crate::nl_convert::place_digit_words(&src, &track_b_transliteration)
+                    .unwrap_or_else(|| korean_unified_parts.join(" "))
             } else {
                 korean_unified_parts.join(" ")
             };
-
             let mut english_unified_parts: Vec<String> = Vec::new();
             if !track_a_transliteration.is_empty() {
                 english_unified_parts.push(track_a_transliteration.clone());
@@ -619,14 +623,16 @@ pub async fn generate_transliteration_aliases(
             for w in &latin_words {
                 english_unified_parts.push(w.clone());
             }
-            let english_unified = english_unified_parts.join(" ");
-
+            let english_unified = if digits_only {
+                crate::nl_convert::strip_special_chars_for_transliteration(&src)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                english_unified_parts.join(" ")
+            };
             println!("    [LANG-UNIFIED] native(ko) = '{}'", korean_unified);
             println!("    [LANG-UNIFIED] roman(en) = '{}'", english_unified);
-
-            // 🌟 혼용 모드에서는 언어 통일 문자열 2개를 직접 반환합니다.
-            //    이후 PASS-2 를 건너뛰고 assign_transliterations 에 바로 전달합니다.
-            //    반환 형식: "native|||roman" 구분자로 임시 인코딩
             format!("{}|||{}", korean_unified, english_unified)
         } else {
             // 단일 스크립트: 기존 로직 그대로

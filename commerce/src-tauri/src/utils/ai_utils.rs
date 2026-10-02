@@ -2973,6 +2973,79 @@ where
     }
     (result, diags)
 }
+
+pub fn residual_assign_blocked(
+    matrix: &Vec<Vec<f32>>,
+    assign: &mut Vec<Option<(usize, f32, f32)>>,
+    eligible: &[bool],
+    abs_threshold: f32,
+) -> Vec<(usize, usize, usize, f32)> {
+    let field_count = matrix.len().min(assign.len());
+    let mut line_count = 0usize;
+    for row in matrix.iter() {
+        if row.len() > line_count { line_count = row.len(); }
+    }
+    let mut rescued: Vec<(usize, usize, usize, f32)> = Vec::new();
+    if field_count == 0 || line_count == 0 { return rescued; }
+    let get = |f: usize, l: usize| -> f32 {
+        matrix.get(f).and_then(|row| row.get(l)).copied().unwrap_or(-1.0)
+    };
+    let mut claimed = vec![false; line_count];
+    for a in assign.iter() {
+        if let Some((l, _, _)) = a {
+            if *l < line_count { claimed[*l] = true; }
+        }
+    }
+    loop {
+        let mut pick: Option<(usize, usize, f32, f32, usize)> = None;
+        for l in 0..line_count {
+            if claimed[l] { continue; }
+            let mut top: Option<(usize, f32)> = None;
+            for f in 0..field_count {
+                let s = get(f, l);
+                if s < abs_threshold { continue; }
+                if top.map_or(true, |(_, v)| s > v) { top = Some((f, s)); }
+            }
+            let blocker = match top {
+                Some((f, _)) if assign[f].is_some() => f,
+                _ => continue,
+            };
+            let mut cands: Vec<(usize, f32)> = (0..field_count)
+                .filter(|f| assign[*f].is_none())
+                .map(|f| (f, get(f, l)))
+                .filter(|(_, s)| *s >= abs_threshold)
+                .collect();
+            if cands.is_empty() { continue; }
+            cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let (f, s) = cands[0];
+            if !eligible.get(f).copied().unwrap_or(false) { continue; }
+            let margin = match cands.get(1) {
+                Some((_, s2)) => s - *s2,
+                None => s - abs_threshold,
+            };
+            if margin <= 1e-6 { continue; }
+            if cands.len() >= 3 {
+                let tail: Vec<f32> = cands[1..].iter().map(|(_, v)| *v).collect();
+                let n = tail.len() as f32;
+                let mean = tail.iter().sum::<f32>() / n;
+                let noise = (tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).max(0.0).sqrt();
+                if margin < noise { continue; }
+            }
+            if (0..line_count).any(|l2| l2 != l && !claimed[l2] && get(f, l2) > s) { continue; }
+            if pick.map_or(true, |p| s > p.2) { pick = Some((f, l, s, margin, blocker)); }
+        }
+        match pick {
+            Some((f, l, s, margin, blocker)) => {
+                assign[f] = Some((l, s, margin));
+                claimed[l] = true;
+                rescued.push((f, l, blocker, margin));
+            }
+            None => break,
+        }
+    }
+    rescued
+}
+
 pub fn self_poisoned_prejudice_mask(
     own_label_embs: &Vec<Vec<f32>>,
     prej_embs: &Vec<Vec<f32>>,
@@ -6686,11 +6759,14 @@ fn push_candidates_from_href(
 }
 
 pub fn collect_id_link_candidates(lines: &[&str]) -> Vec<IdLinkCandidate> {
+    collect_id_link_candidates_capped(lines, 24)
+}
+
+pub fn collect_id_link_candidates_capped(lines: &[&str], limit: usize) -> Vec<IdLinkCandidate> {
     let href_re = match regex::Regex::new(r#"href=["']([^"']+)["']"#) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
-
     let mut hrefs: Vec<String> = Vec::new();
     for line in lines {
         for cap in href_re.captures_iter(line) {
@@ -6705,15 +6781,12 @@ pub fn collect_id_link_candidates(lines: &[&str]) -> Vec<IdLinkCandidate> {
         }
     }
     if hrefs.is_empty() { return Vec::new(); }
-
     let mut out: Vec<IdLinkCandidate> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
     for href in &hrefs {
         push_candidates_from_href(href, &mut out, &mut seen);
     }
-
-    if out.len() > 24 { out.truncate(24); }
+    if out.len() > limit { out.truncate(limit); }
     out
 }
 
@@ -7513,6 +7586,9 @@ fn detail_cell_value_text(
             None => (String::new(), String::new(), start),
         };
     }
+    if ((start + 1)..=end).any(|j| !lines[j].trim().is_empty() && parts[j].1 == "table") {
+        return (String::new(), String::new(), start);
+    }
     let mut candidates: Vec<usize> = Vec::new();
     let mut min_indent = usize::MAX;
     for j in start..=end {
@@ -7578,6 +7654,42 @@ pub fn detail_control_noise_lines(lines: &[&str]) -> std::collections::HashSet<u
         }
     }
     noise
+}
+
+pub fn detail_form_profile(lines: &[&str]) -> (usize, usize) {
+    let parts: Vec<(usize, String, String, String)> = lines.iter().map(|l| pug_line_parts(l)).collect();
+    let mut labeled = 0usize;
+    let mut controlled = 0usize;
+    for i in 0..lines.len() {
+        if lines[i].trim().is_empty() || parts[i].1 != "tr" { continue; }
+        let tr_end = detail_block_end(lines, &parts, i);
+        if tr_end <= i { continue; }
+        let child_indent = match ((i + 1)..=tr_end).find(|&j| !lines[j].trim().is_empty() && parts[j].0 > parts[i].0) {
+            Some(j) => parts[j].0,
+            None => continue,
+        };
+        let mut pending_label = false;
+        for j in (i + 1)..=tr_end {
+            if lines[j].trim().is_empty() || parts[j].0 != child_indent { continue; }
+            let cell_end = detail_block_end(lines, &parts, j).max(j);
+            match parts[j].1.as_str() {
+                "th" => {
+                    pending_label = !detail_cell_label_text(lines, &parts, j, cell_end).is_empty();
+                }
+                "td" => {
+                    if pending_label {
+                        labeled += 1;
+                        if detail_cell_controls(lines, &parts, j, cell_end).is_some() {
+                            controlled += 1;
+                        }
+                    }
+                    pending_label = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    (labeled, controlled)
 }
 
 pub fn collect_detail_label_value_pairs(lines: &[&str]) -> Vec<DetailPair> {

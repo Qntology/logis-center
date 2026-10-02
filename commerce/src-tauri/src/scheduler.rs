@@ -286,6 +286,10 @@ async fn run_synthesis_pass(
             if used_lang { "commerce.synthesis_call_ms.lang4b" } else { "commerce.synthesis_call_ms.qwen3" },
             call_ms as f32,
         );
+        crate::utils::score_dynamics::record_baseline(
+            if used_lang { "commerce.synthesis_ram_free_mb.lang4b" } else { "commerce.synthesis_ram_free_mb.qwen3" },
+            (crate::utils::resources::free_ram_bytes() / 1_000_000) as f32,
+        );
         observed = true;
         let mut lang_failed = false;
         let found: Option<(String, String)> = match res {
@@ -349,11 +353,36 @@ async fn run_synthesis_pass(
                         key,
                         g.total,
                         g.dropped.len(),
-                        g.dropped.iter().map(|(_, why)| why.join("·")).collect::<Vec<_>>(),
+                        g.dropped.iter().map(|(s, why)| format!("\"{}\" ← {}", s, why.join("·"))).collect::<Vec<_>>(),
                         g.kept
                     ));
                 }
-                if !g.kept.is_empty() {
+                let twin = if g.kept.is_empty() {
+                    None
+                } else {
+                    let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let mine = norm(&g.kept);
+                    jobs.iter()
+                        .filter(|(ji, jf, _)| *ji == *item_idx && jf != field_name)
+                        .flat_map(|(_, jf, _)| jf.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+                        .find(|k| {
+                            items
+                                .get(pos)
+                                .and_then(|v| v.get(k.as_str()))
+                                .and_then(|v| v.as_str())
+                                .map_or(false, |s| norm(s) == mine)
+                        })
+                };
+                if let Some(other) = twin.as_ref() {
+                    crate::utils::score_dynamics::record_baseline("commerce.synthesis_duplicate", 1.0);
+                    emit_term(&format!(
+                        "    ♻️ [SYNTHESIS DUPLICATE] Item {}/{} · '{}' | 같은 아이템의 요약 필드 '{}' 와 문장이 같아 넣지 않습니다. 같은 문장이 두 필드로 색인되면 한 질의에 청크 두 개로 걸려 이 문서가 근거 없이 앞섭니다.",
+                        pos + 1,
+                        total_items,
+                        key,
+                        other
+                    ));
+                } else if !g.kept.is_empty() {
                     if let Some(obj) = items.get_mut(pos).and_then(|v| v.as_object_mut()) {
                         obj.insert(key.clone(), json!(g.kept.clone()));
                     }
@@ -6528,6 +6557,25 @@ pub async fn process_task(
                 let refs: Vec<&str> = pug_lines.iter().map(|s| s.as_str()).collect();
                 collect_detail_label_value_pairs(&refs)
             };
+            let (form_labeled, form_controls) = {
+                let refs: Vec<&str> = pug_lines.iter().map(|s| s.as_str()).collect();
+                detail_form_profile(&refs)
+            };
+            let form_page = form_controls >= 8 && form_controls * 10 >= form_labeled * 7;
+            if form_labeled > 0 {
+                crate::utils::score_dynamics::record_baseline(
+                    "commerce.detail_form_control_ratio",
+                    form_controls as f32 / form_labeled as f32,
+                );
+            }
+            if form_page {
+                emit_term(&format!(
+                    "  📋 [DETAIL FORM PAGE] 라벨 칸 {}개 중 {}개가 입력 컨트롤 칸입니다 ({:.0}%). 이 상세는 레코드를 입력 폼으로 보여 주므로, 라벨 칸에서 값을 얻지 못한 글자(Text) 필드는 폼 밖의 메뉴 · 도움말 · 다른 칸 글자에서 LLM 으로 찾지 않습니다.",
+                    form_labeled,
+                    form_controls,
+                    form_controls as f32 * 100.0 / form_labeled.max(1) as f32
+                ));
+            }
 
             
             
@@ -7221,17 +7269,43 @@ pub async fn process_task(
                         sec_raw[f][h] = weighted_max_pool_sim(&section_embs[h], &d_label_embs[f], &d_label_weights[f]);
                     }
                 }
-
-                
-                
-                
-                
-                
-                
-                
-                
-                
-                
+                let label_key = |s: &str| -> String {
+                    s.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_lowercase()
+                };
+                let bank_keys: Vec<Vec<String>> = d_field_names
+                    .iter()
+                    .map(|n| {
+                        label_phrase_bank(&doc_lang, &page_type, n)
+                            .0
+                            .iter()
+                            .map(|p| label_key(p.as_str()))
+                            .collect()
+                    })
+                    .collect();
+                for h in 0..unique_phrases.len() {
+                    let leaf = label_key(unique_leaf[h].as_str());
+                    if leaf.chars().count() < 2 { continue; }
+                    let owners: Vec<usize> = (0..d_field_names.len())
+                        .filter(|&f| bank_keys[f].iter().any(|k| *k == leaf))
+                        .collect();
+                    if owners.len() != 1 { continue; }
+                    let o = owners[0];
+                    if leaf_raw[o][h] >= 0.0 { continue; }
+                    let mut blocked: Vec<String> = Vec::new();
+                    for f in 0..d_field_names.len() {
+                        if f == o || leaf_raw[f][h] < 0.0 { continue; }
+                        leaf_raw[f][h] = -1.0;
+                        sec_raw[f][h] = -1.0;
+                        blocked.push(d_field_names[f].clone());
+                    }
+                    if !blocked.is_empty() {
+                        crate::utils::score_dynamics::record_baseline("commerce.detail_pair_owner_hold", blocked.len() as f32);
+                        emit_term(&format!(
+                            "    🔒 [DETAIL PAIR OWNER HOLD] Label '{}' | 인쇄 라벨이 '{}' 라벨 뱅크의 구와 글자가 같은데 그 필드가 이 칸의 값을 형식 게이트에서 받지 못했습니다. 이 칸은 '{}' 의 칸이므로 다른 필드 {:?} 에 배정하지 않습니다.",
+                            unique_phrases[h], d_field_names[o], d_field_names[o], blocked
+                        ));
+                    }
+                }
                 const SECTION_WEIGHT: f32 = 0.5f32;
                 let mut d_matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
                 for h in 0..unique_phrases.len() {
@@ -7301,7 +7375,45 @@ pub async fn process_task(
                     ));
                     crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
                 }
-                
+                let mut d_assign = d_assign;
+                for f in 0..d_assign.len() {
+                    let (h, own, margin) = match d_assign[f] {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    if margin > 1e-6 { continue; }
+                    let twin = (0..d_field_names.len()).find(|&g| {
+                        g != f && d_assign[g].is_none() && (d_matrix[g][h] - own).abs() <= 1e-6
+                    });
+                    if let Some(g) = twin {
+                        d_assign[f] = None;
+                        crate::utils::score_dynamics::record_baseline("commerce.detail_pair_dead_heat", 1.0);
+                        emit_term(&format!(
+                            "    ⚖️ [DETAIL PAIR DEAD HEAT] Label '{}' | '{}' 와 '{}' 의 점수가 {:.4} 로 같아 필드 순서로 한쪽을 고르지 않고 둘 다 보류합니다. 두 필드의 라벨 뱅크가 같은 구를 갖고 있어 이 라벨만으로는 어느 필드의 칸인지 정할 수 없습니다.",
+                            unique_phrases[h], d_field_names[f], d_field_names[g], own
+                        ));
+                    }
+                }
+                let residual_eligible: Vec<bool> = (0..d_field_names.len())
+                    .map(|f| {
+                        let name = d_field_names[f].as_str();
+                        !is_id_link_field(name)
+                            && !d_diags.iter().any(|d| d.field == f && !d.accepted)
+                            && matches!(
+                                detect_field_format(name),
+                                FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric
+                                    | FieldFormat::Phone | FieldFormat::Address
+                            )
+                    })
+                    .collect();
+                let residual = crate::utils::ai_utils::residual_assign_blocked(&d_matrix, &mut d_assign, &residual_eligible, 0.0);
+                for (f, h, blocker, margin) in residual.iter() {
+                    crate::utils::score_dynamics::record_baseline("commerce.detail_pair_residual", *margin);
+                    emit_term(&format!(
+                        "    🧩 [DETAIL PAIR RESIDUAL] Label '{}' → Field '{}' | 이 라벨의 1위 필드 '{}' 는 다른 라벨로 이미 확정되어 이 칸이 비어 있었습니다. 남은 필드 가운데 1위(2위와의 차 {:+.4} · 2위가 없으면 자기 점수)이고 이 필드에게도 남은 칸 중 최선이라 배정합니다. 값 형식으로 검증되는 필드(날짜 · 수치 · 전화 · 주소 · 운송장)에만 적용합니다.",
+                        unique_phrases[*h], d_field_names[*f], d_field_names[*blocker], margin
+                    ));
+                }
                 for (f, a) in d_assign.iter().enumerate() {
                     let (h, score, margin) = match a { Some(v) => *v, None => continue };
                     let owner = d_field_names[f].clone();
@@ -7314,6 +7426,14 @@ pub async fn process_task(
 
                     let owner_fmt = detect_field_format(&owner);
                     let multi = is_multi_value_field(&owner);
+                    if form_page && owner_fmt == FieldFormat::Text && leaf_raw[f][h] < sec_raw[f][h] {
+                        crate::utils::score_dynamics::record_baseline("commerce.detail_pair_section_led", 1.0);
+                        emit_term(&format!(
+                            "    🔒 [DETAIL PAIR SECTION-LED] Label '{}' → Field '{}' | 라벨 점수 {:.4} 가 섹션 점수 {:.4} 보다 낮습니다. 입력 폼에서 라벨이 아니라 섹션 제목이 끌어온 글자 필드 배정은 값으로 받지 않습니다.",
+                            unique_phrases[h], owner, leaf_raw[f][h], sec_raw[f][h]
+                        ));
+                        continue;
+                    }
 
                     let mut merged = String::new();
                     let mut primary = detail_pairs[targets[0]].primary_line;
@@ -7862,7 +7982,14 @@ pub async fn process_task(
                         continue;
                     }
                 }
-
+                if form_page && field_format == FieldFormat::Text && !field_is_analytic[idx] {
+                    crate::utils::score_dynamics::record_baseline("commerce.form_absent_skip", 1.0);
+                    emit_term(&format!(
+                        "  ⛔ [FORM ABSENT] Field: '{}' (Text) | 입력 폼 상세(라벨 칸 {}개 중 입력 컨트롤 {}개)에서 이 필드에 대응하는 라벨 칸 값이 없습니다. 메뉴 · 도움말 · 다른 칸의 글자를 LLM 으로 고르지 않고 비워 둡니다. 빈 값은 목록 문서의 기존 값을 덮지 않습니다.",
+                        field_name, form_labeled, form_controls
+                    ));
+                    continue;
+                }
                 let (_bias_emb, _prej_emb, dynamic_prej_str) = &field_embeddings[idx];
 
                 
@@ -7928,15 +8055,29 @@ pub async fn process_task(
                     );
                     let shared_line = family_shared.contains(&idx);
                     let multi_number = field_format == FieldFormat::Numeric && numeric_run_count(&line_values[best_idx]) > 1;
-                    if copyable && (shared_line || multi_number) {
+                    let foreign_label = detail_pairs
+                        .iter()
+                        .find(|p| p.primary_line == best_idx)
+                        .map(|p| p.label.clone());
+                    if copyable && (shared_line || multi_number || foreign_label.is_some()) {
                         crate::utils::score_dynamics::record_baseline("commerce.value_copy_refused", 1.0);
+                        let why = if shared_line {
+                            "같은 형식의 다른 필드가 확정한 라인을 공유받은 배정이라".to_string()
+                        } else if multi_number {
+                            "라인에 수치가 여럿 있어 이 필드의 값을 하나로 정할 수 없어".to_string()
+                        } else {
+                            format!(
+                                "이 라인은 라벨 '{}' 칸의 값이고 라벨 대조가 그 라벨을 이 필드에 배정하지 않았으므로",
+                                foreign_label.clone().unwrap_or_default()
+                            )
+                        };
                         emit_term(&format!(
                             "  ⛔ [VALUE COPY REFUSED] Field: '{}' ({:?}) | Line {} \"{}\" | {} 값을 비워 둡니다. 다른 필드의 라인을 그대로 옮기거나 여러 수치를 한 값으로 붙이면 틀린 값이 확정되고 저장 단계가 그 값을 숫자로 굳힙니다. 빈 값은 목록 문서의 기존 값을 덮지 않습니다.",
                             field_name,
                             field_format,
                             best_idx + 1,
                             line_values[best_idx].trim(),
-                            if shared_line { "같은 형식의 다른 필드가 확정한 라인을 공유받은 배정이라" } else { "라인에 수치가 여럿 있어 이 필드의 값을 하나로 정할 수 없어" }
+                            why
                         ));
                         continue;
                     }
@@ -8467,6 +8608,64 @@ pub async fn process_task(
                 if let Some(done) = detail_items.pop() {
                     extracted_data = done;
                 }
+            }
+            let own_family = crate::utils::canonical::relay_type_family(&page_type);
+            let related_types = crate::logic::related(&page_type);
+            let relay_foreign: Vec<&str> = ["goods", "order", "tracking"]
+                .iter()
+                .copied()
+                .filter(|t| *t != own_family.as_str() && related_types.iter().any(|r| r == t))
+                .collect();
+            if !relay_foreign.is_empty() {
+                let self_token = extracted_data.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let cands = collect_id_link_candidates_capped(&pug_lines_ref, usize::MAX);
+                let mut relay_bound = 0usize;
+                for (ftype, token, role) in collect_typed_relay_refs(&cands, &self_token, &relay_foreign) {
+                    let aliases = crate::logic::relay_type_aliases(&ftype);
+                    let keyed = cands
+                        .iter()
+                        .any(|c| same_id_token(&c.token, &token) && candidate_type_evidence(c, aliases) >= 2);
+                    if !keyed {
+                        continue;
+                    }
+                    let key = match crate::utils::canonical::relay_key_for_type(&ftype) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    let f_index = entity_key_index(&ftype, &team_id, &task.cc, &token);
+                    let obj = match extracted_data.as_object_mut() {
+                        Some(o) => o,
+                        None => break,
+                    };
+                    match obj.get(key) {
+                        Some(Value::Array(_)) | Some(Value::Object(_)) => continue,
+                        Some(v) if crate::utils::canonical::relay_ref_index(Some(v)).is_some() => continue,
+                        _ => {}
+                    }
+                    let companion = format!("{}_title", key);
+                    let text_val = obj
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| crate::utils::canonical::relay_text_is_content(s));
+                    let companion_empty = obj
+                        .get(&companion)
+                        .and_then(|v| v.as_str())
+                        .map_or(true, |s| s.trim().is_empty());
+                    if let Some(t) = text_val {
+                        if companion_empty {
+                            obj.insert(companion.clone(), json!(t));
+                        }
+                    }
+                    obj.insert(key.to_string(), json!(f_index));
+                    relay_ledger::mark_relay_bound(&mut extracted_data, key);
+                    relay_bound += 1;
+                    emit_term(&format!(
+                        "  🔗 [DETAIL RELAY REF BIND] {} ← {} '{}' (역할 '{}' · 주소 매개변수 이름이 {} 별칭) → {} = {} | 상세 페이지에 인쇄된 상대 문서 링크의 식별자로 목록과 같은 식의 상대 index 를 만들고, 글자 값은 {}_title 로 옮깁니다. 목록 문서 없이 상세만 들어와도 저장 직전 정리 단계가 이 연결을 0 으로 지우지 않습니다.",
+                        page_type, ftype, token, role, ftype, key, f_index, key
+                    ));
+                }
+                crate::utils::score_dynamics::record_baseline("commerce.detail_relay_ref_bound", relay_bound as f32);
             }
         }
     }
