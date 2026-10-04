@@ -1094,27 +1094,10 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
         lower.ends_with("_date") || lower.starts_with("date_") || lower.ends_with("_at")
     }
 
-    fn to_number(v: &Value) -> Option<f64> {
+    fn to_number(v: &Value, decimal_comma: bool) -> Option<f64> {
         match v {
             Value::Number(n) => n.as_f64(),
-            Value::String(s) => {
-                let mut buf = String::new();
-                let mut seen_digit = false;
-                for c in s.chars() {
-                    if c.is_ascii_digit() {
-                        buf.push(c);
-                        seen_digit = true;
-                    } else if c == ',' && seen_digit {
-                        continue;
-                    } else if c == '.' && seen_digit && !buf.contains('.') {
-                        buf.push(c);
-                    } else if seen_digit {
-                        break;
-                    }
-                }
-                if !seen_digit { return None; }
-                buf.trim_end_matches('.').parse::<f64>().ok()
-            },
+            Value::String(s) => crate::utils::canonical::parse_number_run(s, decimal_comma),
             _ => None,
         }
     }
@@ -1148,7 +1131,7 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
         Some(n)
     }
 
-    fn to_iso_date(v: &Value) -> Option<String> {
+    fn to_iso_date(v: &Value, doc_lang: &str) -> Option<String> {
         let s = match v {
             Value::String(s) => s.trim().to_string(),
             Value::Number(n) => n.to_string(),
@@ -1201,41 +1184,23 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
             }
         }
 
-        let re = regex::Regex::new(r"\d+").ok()?;
-        let nums: Vec<u32> = re.find_iter(&s).filter_map(|m| m.as_str().parse().ok()).collect();
-        if nums.len() < 3 { return None; }
-        let (mut year, mut month, mut day) = (nums[0], nums[1], nums[2]);
-        
-        if day > 31 && year <= 31 {
-            year = nums[2];
-            day = nums[1];
-            month = nums[0];
-        }
-        if year < 100 { year += if year > 50 { 1900 } else { 2000 }; }
-        
-        if month > 12 && day <= 12 { std::mem::swap(&mut month, &mut day); }
-        month = month.clamp(1, 12);
-        day = day.clamp(1, 31);
-        let hour   = if nums.len() > 3 { nums[3].clamp(0, 23) } else { 0 };
-        let minute = if nums.len() > 4 { nums[4].clamp(0, 59) } else { 0 };
-        let second = if nums.len() > 5 { nums[5].clamp(0, 59) } else { 0 };
-        Some(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", year, month, day, hour, minute, second))
+        crate::utils::canonical::numeric_date_to_iso(&s, doc_lang)
     }
 
-    fn walk(v: &mut Value) {
+    fn walk(v: &mut Value, doc_lang: &str, decimal_comma: bool) {
         match v {
             Value::Object(map) => {
                 let keys: Vec<String> = map.keys().cloned().collect();
                 for k in keys {
                     if is_date_key(&k) {
-                        let converted = map.get(&k).and_then(to_iso_date);
+                        let converted = map.get(&k).and_then(|x| to_iso_date(x, doc_lang));
                         if let Some(iso) = converted {
                             map.insert(k.clone(), json!(iso));
                         }
                         continue;
                     }
                     if is_numeric_key(&k) {
-                        let converted = map.get(&k).and_then(to_number);
+                        let converted = map.get(&k).and_then(|x| to_number(x, decimal_comma));
                         if let Some(num) = converted {
                             map.insert(k.clone(), json!(num));
                         }
@@ -1243,18 +1208,34 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
                     }
                     if let Some(child) = map.get_mut(&k) {
                         if child.is_object() || child.is_array() {
-                            walk(child);
+                            walk(child, doc_lang, decimal_comma);
                         }
                     }
                 }
             },
             Value::Array(arr) => {
-                for it in arr.iter_mut() { walk(it); }
+                for it in arr.iter_mut() { walk(it, doc_lang, decimal_comma); }
             },
             _ => {}
         }
     }
-    walk(item);
+    let currency_hint = item
+        .get("currency")
+        .or_else(|| item.get("financials").and_then(|f| f.get("currency")))
+        .and_then(|v| v.as_str())
+        .map(|s| crate::utils::ai_utils::normalize_currency_value(s, doc_lang))
+        .unwrap_or_default();
+    let decimal_comma = crate::utils::canonical::decimal_comma_lang(doc_lang)
+        && !crate::utils::canonical::point_decimal_currency(&currency_hint);
+    let dropped = crate::utils::canonical::drop_placeholder_values(item);
+    if !dropped.is_empty() {
+        crate::utils::score_dynamics::record_baseline("vision.placeholder_drop", dropped.len() as f32);
+        println!(
+            "  🧽 [PLACEHOLDER DROP] 값 자리에 다른 곳을 가리키는 안내문·미확정 표지가 들어온 축 {:?} 를 비웁니다. 비워 두면 복구·검색이 '값 없음' 으로 다루고, 남겨 두면 그 글자가 값처럼 색인됩니다.",
+            dropped
+        );
+    }
+    walk(item, doc_lang, decimal_comma);
 
     fn split_party_blocks(map: &mut serde_json::Map<String, Value>, scope: &str) {
         for (name_key, addr_key) in [
@@ -1565,7 +1546,7 @@ async fn extract_continuation_page(
             "    ⚖️ [ARRAY TIE HOLD] '{}' vs '{}' | 마진 {:+.4} < 잡음 마진 {:.4} ({:?}) → 보류. 수치 축이 몰린 행에서는 결정론으로 가릴 근거가 없습니다.",
             fname, rname, d.margin, d.noise_margin, d.tie
         ));
-        crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+        crate::utils::score_dynamics::record_confusion_tie(&fname, &rname, d.margin);
     }
     use crate::logic::trade_field_category;
     let mut assigned = 0usize;
@@ -3356,7 +3337,11 @@ pub async fn process_trading_task(
                 }
             }
             if d.tie != crate::utils::ai_utils::TieKind::Decisive {
-                crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+                if d.tie == crate::utils::ai_utils::TieKind::PairConfusion && !d.accepted && d.margin > f32::EPSILON {
+                    crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+                } else if !d.accepted {
+                    crate::utils::score_dynamics::record_confusion_tie(&fname, &rname, d.margin);
+                }
                 crate::utils::score_dynamics::record_baseline("plinko.noise_margin", d.noise_margin);
             }
         }

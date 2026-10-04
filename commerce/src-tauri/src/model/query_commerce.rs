@@ -4764,6 +4764,38 @@ impl crate::model::LogisModel {
 
                 *ctx_arr = final_contexts;
 
+                if crate::utils::canonical::has_superlative_marker(&query)
+                    && !query.contains('%')
+                    && !query.contains('％')
+                {
+                    let mut tagged: Vec<String> = Vec::new();
+                    for c in ctx_arr.iter_mut() {
+                        let cond_obj = match c.get_mut("condition").and_then(|v| v.as_object_mut()) {
+                            Some(o) => o,
+                            None => continue,
+                        };
+                        for (k, v) in cond_obj.iter_mut() {
+                            let o = match v.as_object_mut() {
+                                Some(o) => o,
+                                None => continue,
+                            };
+                            let op = o.get("operator").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            if op != "top" && op != "bottom" {
+                                continue;
+                            }
+                            o.insert("extreme".to_string(), json!(true));
+                            tagged.push(format!("{} {}", k, op));
+                        }
+                    }
+                    if !tagged.is_empty() {
+                        crate::utils::score_dynamics::record_baseline("search.superlative_extreme", tagged.len() as f32);
+                        emit_term(&format!(
+                            "  🏁 [SUPERLATIVE EXTREME] 질의에 최상급 표지가 있어 순위 조건 {:?} 를 백분위 구간 대신 극값(동률 포함)으로 좁힙니다. '가장 저렴한 제품' 은 하위 20% 가 아니라 최저가 상품입니다.",
+                            tagged
+                        ));
+                    }
+                }
+
                 let query_count = ctx_arr.iter().filter(|c| c.get("type").and_then(|v| v.as_str()).unwrap_or("") != "ignore").count();
                 let total_types: usize = ctx_arr.iter()
                     .filter_map(|c| c.get("types").and_then(|v| v.as_array()).map(|a| a.len()))

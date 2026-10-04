@@ -7428,7 +7428,11 @@ pub async fn process_task(
                         fname, rname, d.margin, d.noise_margin, d.tie,
                         if d.accepted { "혼동 사전 승자로 확정" } else { "보류 (LLM 패스로 이관)" }
                     ));
-                    crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+                    if d.tie == crate::utils::ai_utils::TieKind::PairConfusion && !d.accepted && d.margin > f32::EPSILON {
+                        crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+                    } else if !d.accepted {
+                        crate::utils::score_dynamics::record_confusion_tie(&fname, &rname, d.margin);
+                    }
                 }
                 let mut d_assign = d_assign;
                 for f in 0..d_assign.len() {
@@ -8815,6 +8819,14 @@ pub async fn process_task(
         .trim()
         .to_string();
     let normalize_data = |item: &mut serde_json::Value| {
+        let dropped = crate::utils::canonical::drop_placeholder_values(item);
+        if !dropped.is_empty() {
+            crate::utils::score_dynamics::record_baseline("commerce.placeholder_drop", dropped.len() as f32);
+            println!(
+                "[Scheduler] 🧽 [PLACEHOLDER DROP] 값이 아니라 다른 곳을 가리키는 안내문·미확정 표지 {:?} 를 저장·색인 전에 비웁니다. 이 글자가 값으로 남으면 '상품'·'페이지' 같은 일반어 질의와 FTS·코사인으로 엮여 엉뚱한 문서를 끌어옵니다.",
+                dropped
+            );
+        }
         if let Some(obj) = item.as_object_mut() {
             if obj.get("type").is_none() { obj.insert("type".to_string(), json!(page_type.clone())); }
             
@@ -8830,7 +8842,28 @@ pub async fn process_task(
                 println!("[Scheduler] 💱 [CURRENCY AMOUNT FALLBACK] currency='{}' 는 글자·통화기호 없는 금액 모양이라 통화가 될 수 없어 문서 언어 기본 통화 '{}' 로 대체합니다.", currency_val, currency_norm);
             }
             obj.insert("currency".to_string(), json!(currency_norm));
-            
+
+            let decimal_comma = crate::utils::canonical::decimal_comma_lang(&doc_lang_str)
+                && !crate::utils::canonical::point_decimal_currency(&currency_norm);
+            if decimal_comma {
+                let keys: Vec<String> = obj.keys().cloned().collect();
+                for k in keys {
+                    let lk = k.to_lowercase();
+                    if lk.ends_with("_at") || lk.ends_with("_date") || crate::utils::canonical::is_structural_key(&lk) {
+                        continue;
+                    }
+                    if crate::utils::canonical::kind_of(&lk) != crate::utils::canonical::CanonKind::Numeric {
+                        continue;
+                    }
+                    let fixed = obj
+                        .get(&k)
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| crate::utils::canonical::normalize_number_lexeme(s, true));
+                    if let Some(f) = fixed {
+                        obj.insert(k, json!(f));
+                    }
+                }
+            }
 
             if let Some(q) = obj.get("quantity").cloned() {
                 let q_val: Option<i64> = if q.is_number() {
@@ -8861,68 +8894,42 @@ pub async fn process_task(
             
             
             let date_keys = [
-                "registration_date", "order_date", "payment_date", "shipping_date", 
+                "registration_date", "order_date", "payment_date", "shipping_date",
                 "manufacture_date", "expiration_date", "release_date", "started_at", "expired_at"
             ];
-            if let Ok(re_date) = regex::Regex::new(r"\d+") {
-                for key in date_keys.iter() {
-                    if let Some(date_val) = obj.get(*key).and_then(|v| v.as_str()) {
-                        let s = date_val.trim();
-                        if !s.is_empty() && s != "null" {
-
-                            if s.chars().all(char::is_numeric) && (s.len() == 10 || s.len() == 13) {
-                                if let Ok(ts) = s.parse::<i64>() {
-                                    let ts_ms = if s.len() == 10 { ts * 1000 } else { ts };
-                                    if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts_ms).map(|dt| dt.naive_utc()) {
-                                        let iso_date = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
-                                        obj.insert(key.to_string(), json!(iso_date));
-                                        continue;
-                                    }
+            for key in date_keys.iter() {
+                if let Some(date_val) = obj.get(*key).and_then(|v| v.as_str()) {
+                    let s = date_val.trim();
+                    if !s.is_empty() && s != "null" {
+                        if s.chars().all(char::is_numeric) && (s.len() == 10 || s.len() == 13) {
+                            if let Ok(ts) = s.parse::<i64>() {
+                                let ts_ms = if s.len() == 10 { ts * 1000 } else { ts };
+                                if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts_ms).map(|dt| dt.naive_utc()) {
+                                    let iso_date = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+                                    obj.insert(key.to_string(), json!(iso_date));
+                                    continue;
                                 }
                             }
-
-
-                            if s.contains('T') && s.len() >= 19 {
-                                continue;
-                            }
-
-
-                            let nums: Vec<u32> = re_date.find_iter(s).filter_map(|m| m.as_str().parse().ok()).collect();
-                            if nums.len() >= 3 {
-                                let mut year = nums[0];
-                                let mut month = nums[1];
-                                let mut day = nums[2];
-
-
-                                if day > 31 && year <= 31 {
-                                    year = nums[2];
-                                    day = nums[1];
-                                    month = nums[0];
-                                }
-
-
-                                if year < 100 {
-                                    year += if year > 50 { 1900 } else { 2000 };
-                                }
-                                
-                                month = month.clamp(1, 12);
-                                day = day.clamp(1, 31);
-                                
-                                let hour = if nums.len() > 3 { nums[3].clamp(0, 23) } else { 0 };
-                                let minute = if nums.len() > 4 { nums[4].clamp(0, 59) } else { 0 };
-                                let second = if nums.len() > 5 { nums[5].clamp(0, 59) } else { 0 };
-                                
-                                let iso_date = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", year, month, day, hour, minute, second);
+                        }
+                        if s.contains('T') && s.len() >= 19 {
+                            continue;
+                        }
+                        match crate::utils::canonical::numeric_date_to_iso(s, &doc_lang_str) {
+                            Some(iso_date) => {
                                 obj.insert(key.to_string(), json!(iso_date));
                             }
+                            None => {
+                                if crate::utils::canonical::is_missing_marker(s) {
+                                    obj.remove(*key);
+                                }
+                            }
                         }
-                    } else if let Some(date_num) = obj.get(*key).and_then(|v| v.as_i64()) {
-
-                        let ts_ms = if date_num < 10_000_000_000 { date_num * 1000 } else { date_num };
-                        if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts_ms).map(|dt| dt.naive_utc()) {
-                            let iso_date = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
-                            obj.insert(key.to_string(), json!(iso_date));
-                        }
+                    }
+                } else if let Some(date_num) = obj.get(*key).and_then(|v| v.as_i64()) {
+                    let ts_ms = if date_num < 10_000_000_000 { date_num * 1000 } else { date_num };
+                    if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts_ms).map(|dt| dt.naive_utc()) {
+                        let iso_date = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+                        obj.insert(key.to_string(), json!(iso_date));
                     }
                 }
             }
@@ -9332,6 +9339,21 @@ pub async fn process_task(
                     page_type, target_id, shape_kept
                 ));
             }
+            let info_kept = crate::utils::canonical::keep_informative_values(prior, &mut extracted_data);
+            if !info_kept.is_empty() {
+                crate::utils::score_dynamics::record_baseline("commerce.detail_info_kept", info_kept.len() as f32);
+                emit_term(&format!(
+                    "  ⚓ [DETAIL MERGE / INFO KEEP] {} '{}' | 필드 {:?} 는 기존 값이 구체적인데 상세 값이 '기타' · '상품페이지 참고' · 미확정 표지처럼 정보가 없는 값이라 기존 값을 유지합니다. 정보 없는 값이 구체값을 덮으면 그 축의 청크 문장과 검색 조건이 함께 무너집니다.",
+                    page_type, target_id, info_kept
+                ));
+            }
+            if !shape_kept.is_empty() || !info_kept.is_empty() {
+                let merged_text = parsing::json_to_natural_language(&extracted_data);
+                if let Some(obj) = extracted_data.as_object_mut() {
+                    obj.insert("text".to_string(), json!(merged_text.clone()));
+                    obj.insert("masked_text".to_string(), json!(merged_text));
+                }
+            }
         }
         let self_prior = crate::utils::canonical::ledger_prior(existing_json_found.as_ref());
         let origin_ok = relay_ledger::placeholder_origin_establishes(&page_type, existing_json_found.as_ref());
@@ -9670,6 +9692,14 @@ pub async fn process_task(
                 let origin_ok = relay_ledger::placeholder_origin_establishes(&page_type, existing_json.as_ref());
                 if let Some(ej) = existing_json.as_ref() {
                     single_item = merge_node(ej, &single_item);
+                    let info_kept = crate::utils::canonical::keep_informative_values(ej, &mut single_item);
+                    if !info_kept.is_empty() {
+                        crate::utils::score_dynamics::record_baseline("commerce.list_info_kept", info_kept.len() as f32);
+                        emit_term(&format!(
+                            "  ⚓ [LIST MERGE / INFO KEEP] {} '{}' | 필드 {:?} 는 저장된 값이 구체적인데 이번 목록 값이 정보가 없는 값이라 저장된 값을 유지합니다.",
+                            page_type, hashed_item_id, info_kept
+                        ));
+                    }
                     if let Some(obj) = single_item.as_object_mut() {
                         obj.insert("id".to_string(), json!(hashed_item_id.clone()));
                         obj.insert("index".to_string(), json!(index_val));

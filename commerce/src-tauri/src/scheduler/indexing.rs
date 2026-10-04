@@ -58,10 +58,15 @@ pub async fn upsert_alias_chunks(
     //   그 사이사이에 생성 모델이 올라와 있으면 왕복마다 피크가 재현됩니다.
     //   텍스트를 먼저 모아 '한 번' 만 호출하면 왕복이 1회로 줄고,
     //   호출 시점도 한 곳으로 모여 페이즈 판정이 가능해집니다.
-    let mut pending_alias: Vec<(&str, String, String)> = Vec::new(); // (suffix, alias, localized)
+    let origin_is_latin = crate::utils::canonical::is_latin_script_text(&origin_value);
+    let mut pending_alias: Vec<(&str, String, String)> = Vec::new();
     for (suffix, alias) in variants.iter() {
         let a = alias.trim();
         if a.is_empty() { continue; }
+        if *suffix == "tr" && origin_is_latin {
+            crate::utils::score_dynamics::record_baseline("indexing.translit_latin_roman_skip", 1.0);
+            continue;
+        }
 
         // 🌟 [VALUE-DOMINANT LOCALIZED] "{짧은 문서언어 라벨} {별칭} {원본값}"
         //    leaf 는 indexing_leaf_label() 이 뽑은 단일 라벨(예: '상품명')이므로

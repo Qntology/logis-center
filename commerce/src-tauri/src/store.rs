@@ -890,15 +890,12 @@ impl VectorStore {
                                 crate::logic::parse_status(t) as f64
                             } else if let Some(ms) = iso_to_epoch_ms(t) {
                                 ms as f64
-                            } else if crate::utils::ai_utils::numeric_run_count(t) > 1 {
+                            } else if crate::utils::ai_utils::numeric_run_count(&crate::utils::canonical::number_text(t)) > 1 {
                                 continue;
                             } else {
-                                let cleaned: String = t.chars()
-                                    .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-                                    .collect();
-                                match cleaned.parse::<f64>() {
-                                    Ok(v) => v,
-                                    Err(_) => continue,
+                                match crate::utils::canonical::parse_number_run(t, false) {
+                                    Some(v) => v,
+                                    None => continue,
                                 }
                             }
                         },

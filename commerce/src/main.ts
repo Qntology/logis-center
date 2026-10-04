@@ -611,10 +611,11 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
 
 interface DexieCondition {
     path: string;
-    op: string;              // eq | neq | gt | gte | lt | lte | contains | not_contains | top | bottom
+    op: string;
     value?: any;
     percent?: number;
-    kind?: string;           // number | string | rank
+    kind?: string;
+    extreme?: boolean;
 }
 
 interface DexiePlan {
@@ -834,8 +835,14 @@ async function executeDexiePlan(
             const bv = Number(readPath(b, rc.path));
             return rc.op === 'top' ? bv - av : av - bv;
         });
-        rows = sorted.slice(0, take);
-        console.log(`[DEXIE-PLAN] ${rc.op} ${pct}% on ${rc.path} → ${rows.length}건 (값 결손 ${skipped}건 제외)`);
+        if (rc.extreme) {
+            const edge = Number(readPath(sorted[0], rc.path));
+            rows = sorted.filter(r => Number(readPath(r, rc.path)) === edge);
+            console.log(`[DEXIE-PLAN] ${rc.op} extreme on ${rc.path} = ${edge} → ${rows.length}건 (동률 포함, 값 결손 ${skipped}건 제외)`);
+        } else {
+            rows = sorted.slice(0, take);
+            console.log(`[DEXIE-PLAN] ${rc.op} ${pct}% on ${rc.path} → ${rows.length}건 (값 결손 ${skipped}건 제외)`);
+        }
     }
     if (plan.keywords && plan.keywords.length > 0) {
         for (const r of rows) {

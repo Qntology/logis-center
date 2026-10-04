@@ -1002,28 +1002,16 @@ pub fn try_any_ascii_transliteration_words(words: &[String]) -> Option<String> {
     Some(results.join(" "))
 }
 
-/// [SYNONYM EXPANSION] 값의 주 표기 체계가 라틴(ASCII 알파벳)인지 판정합니다.
-/// 문자 클래스 카운트만 사용하므로 언어 사전이 전혀 필요 없습니다.
 pub fn is_latin_dominant(value: &str) -> bool {
     let mut latin = 0usize;
     let mut other = 0usize;
     for c in value.chars() {
         if !c.is_alphabetic() { continue; }
-        if c.is_ascii_alphabetic() { latin += 1; } else { other += 1; }
+        if crate::utils::canonical::is_latin_letter(c) { latin += 1; } else { other += 1; }
     }
     latin >= other
 }
 
-/// [SYNONYM EXPANSION] 이 청크가 음차 별칭 생성 대상인지 판정합니다.
-///
-/// 판정 규칙 (전부 결정론, 어휘 하드코딩 없음):
-///   T1: property_format 이 '자유 서술 값'을 담는 형식이어야 합니다. (Text / Address)
-///       Numeric / Date / Identifier / Link / Phone / TrackingCode / Enum 은
-///       값이 숫자·코드·캐노니컬 키라 음차가 물리적으로 무의미합니다.
-///       Synthesis 는 합성 문장이라 별칭 벡터가 노이즈만 늘리므로 제외합니다.
-///   T2: 값에 '문자'가 하나라도 있어야 소리를 옮길 수 있습니다.
-///   T3: 숫자 비율이 절반 이상이면 코드성 값이므로 제외합니다.
-///   T4: 길이 상한은 R2 의 150자를 그대로 재사용합니다. (새 상수 도입 아님)
 pub fn needs_transliteration(chunk: &ChunkMetadata) -> bool {
     match chunk.property_format.as_str() {
         "Text" | "Address" => {},
@@ -1045,11 +1033,6 @@ pub fn needs_transliteration(chunk: &ChunkMetadata) -> bool {
     true
 }
 
-/// [SYNONYM EXPANSION] 문서 언어의 '실제 문자 샘플'을 bias.json 에서 동적으로 확보합니다.
-/// detect_document_language() 결과(doc_lang)를 그대로 받아
-///   get_localized_page_type()  → 그 언어로 쓰인 도메인 명사
-///   indexing_leaf_label()      → 그 언어로 쓰인 이 속성의 라벨
-/// 두 조각을 이어붙입니다. 코드에는 어떤 언어 이름도 등장하지 않습니다.
 pub fn native_script_sample(doc_lang: &str, page_type: &str, property: &str) -> String {
     let localized_type = crate::parsing::get_localized_page_type(page_type, doc_lang);
     let leaf = crate::utils::ai_utils::indexing_leaf_label(doc_lang, page_type, property);

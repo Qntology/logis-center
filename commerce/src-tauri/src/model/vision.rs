@@ -1107,11 +1107,15 @@ impl crate::model::LogisModel {
                                     .map(|f| (f.clone(), crate::parsing::trade_field_definition(&language, f)))
                                     .collect();
                                 let pair_prompt = crate::parsing::get_trade_pair_read_prompt(&detected_type, &defs);
-                                let pair_cap = ((lg_cnt as usize) * 16).clamp(384, 1024);
+                                let truncated_rate = crate::utils::score_dynamics::adaptive_baseline("vision.pair_read_truncated")
+                                    .map(|(m, _)| m.clamp(0.0, 1.0))
+                                    .unwrap_or(0.0);
+                                let per_patch = (16.0 * (1.0 + truncated_rate)).ceil() as usize;
+                                let pair_cap = ((lg_cnt as usize) * per_patch).clamp(384, 1024);
                                 crate::utils::score_dynamics::record_baseline("vision.pair_read_cap", pair_cap as f32);
                                 emit_term(&format!(
-                                    "    🏷️ [PAIR READ / CROP] [{}] 축 {}개를 스키마로 묻는 대신 이 크롭에 인쇄된 라벨↔값 쌍을 전부 옮겨 적게 합니다. 라벨→축 배정은 라벨 코사인 게이트가 스키마 {}축 전체를 상대로 수행합니다. 생성 상한 {} 토큰 (판독 가능 패치 {} × 16, 384~1024) — 쌍 하나가 약 30 토큰이고 판독 가능 패치 한 칸에 인쇄 쌍이 평균 0.4~0.5개 들어 있어, 고정 384 토큰은 표 머리글과 첫 행만으로 소진되어 둘째 행부터 잘립니다.",
-                                    plan.category, cat_fields.len(), gate_banks.len(), pair_cap, lg_cnt
+                                    "    🏷️ [PAIR READ / CROP] [{}] 축 {}개를 스키마로 묻는 대신 이 크롭에 인쇄된 라벨↔값 쌍을 전부 옮겨 적게 합니다. 라벨→축 배정은 라벨 코사인 게이트가 스키마 {}축 전체를 상대로 수행합니다. 생성 상한 {} 토큰 (판독 가능 패치 {} × {}, 384~1024, SDS 절단율 {:.3} 반영) — 쌍 하나가 약 30 토큰이고 판독 가능 패치 한 칸에 인쇄 쌍이 평균 0.4~0.5개 들어 있어, 고정 384 토큰은 표 머리글과 첫 행만으로 소진되어 둘째 행부터 잘립니다.",
+                                    plan.category, cat_fields.len(), gate_banks.len(), pair_cap, lg_cnt, per_patch, truncated_rate
                                 ));
                                 let pair_res = self.chat_with_qwen3_5_image_spinner(
                                     "You are a highly precise document data extraction assistant.",
@@ -2381,8 +2385,8 @@ impl crate::model::LogisModel {
                             deferred_pairs.len(), cell_echo, row_label, keep.len(), scalar_fields.len()
                         ));
                         if !keep.is_empty() && !scalar_banks.is_empty() {
-                            let (routed, logs) = crate::model::merge::route_pairs_to_fields(
-                                &keep, &keep_embs, &scalar_fields, &scalar_banks,
+                            let (routed, logs, _) = crate::model::merge::route_pairs_to_fields_exact(
+                                &keep, &keep_embs, &scalar_fields, &scalar_banks, &label_exact,
                             );
                             for line in logs.iter() { emit_term(line); }
                             let mut adopted = 0usize;
