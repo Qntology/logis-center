@@ -82,7 +82,7 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                     } else {
                         let val_str = match v {
                             serde_json::Value::String(s) => s.clone(),
-                            serde_json::Value::Number(n) => n.to_string(),
+                            serde_json::Value::Number(n) => crate::utils::canonical::epoch_field_text(key, n).unwrap_or_else(|| n.to_string()),
                             serde_json::Value::Bool(b) => b.to_string(),
                             _ => String::new(),
                         };
@@ -1864,6 +1864,23 @@ pub fn cached_translit_recheck(
         } else {
             None
         };
+    }
+    let src_seq: Vec<String> = strip_special_chars_for_transliteration(src)
+        .split_whitespace()
+        .map(|w| w.to_string())
+        .collect();
+    let digit_seq: Vec<&String> = src_seq.iter().filter(|w| is_digit_word(w)).collect();
+    if !digit_seq.is_empty() {
+        let n = digit_seq.len();
+        let cached_head: Vec<&str> = cached_native.split_whitespace().take(n).collect();
+        let cached_gathered = cached_head.len() == n && cached_head.iter().zip(digit_seq.iter()).all(|(a, b)| *a == b.as_str());
+        let src_gathered = src_seq.iter().take(n).zip(digit_seq.iter()).all(|(a, b)| a == *b);
+        if cached_gathered && !src_gathered {
+            return Some(format!(
+                "캐시 별칭 '{}' 은 숫자 {:?} 를 원문 자리와 다르게 앞으로 모은 표기입니다",
+                cached_native, digit_seq
+            ));
+        }
     }
     if let Some(mix) = foreign_script_mix(&added.join(" "), src) {
         return Some(format!(

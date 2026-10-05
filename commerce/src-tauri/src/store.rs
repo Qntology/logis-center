@@ -1341,6 +1341,8 @@ impl VectorStore {
                 "[STORE] 🧾 [PRESENCE SKIP] id='{}' type='{}' 은 릴레이가 만든 빈 초안입니다. 저장 사전에 넣지 않습니다. 초안은 '이 서식이 그 축을 보통 갖는가' 라는 관측에 기여할 수 없는데, 문서 1건을 추출할 때마다 10건 이상 생기므로 그대로 두면 껍데기가 다수를 이뤄 실제 문서의 축 보유율을 0 에 가깝게 끌어내립니다.",
                 presence_id, type_
             );
+        } else if !is_domain_item {
+            crate::utils::score_dynamics::presence_forget(&presence_id);
         } else {
             let mut present_fields: Vec<String> = Vec::new();
             Self::collect_filled_fields(&final_data, 1, &mut present_fields);

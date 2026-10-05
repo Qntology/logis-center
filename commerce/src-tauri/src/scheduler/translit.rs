@@ -611,8 +611,22 @@ pub async fn generate_transliteration_aliases(
             let korean_unified = if !latin_words.is_empty() && track_b_transliteration.is_empty() {
                 String::new()
             } else if digits_only {
-                crate::nl_convert::place_digit_words(&src, &track_b_transliteration)
-                    .unwrap_or_else(|| korean_unified_parts.join(" "))
+                match crate::nl_convert::place_digit_words(&src, &track_b_transliteration) {
+                    Some(placed) => {
+                        crate::utils::score_dynamics::record_baseline("indexing.translit_digit_align_miss", 0.0);
+                        placed
+                    }
+                    None => {
+                        crate::utils::score_dynamics::record_baseline("indexing.translit_digit_align_miss", 1.0);
+                        println!(
+                            "    ⚪ [DIGIT ALIGN MISS] '{}' | 문서 언어 표기 {}단어가 원문 라틴 단어 {}개와 한 단어씩 맞지 않아 숫자를 제자리에 둘 수 없습니다. 숫자를 앞으로 모아 붙이면 번지·우편번호처럼 자리가 곧 의미인 숫자의 순서가 바뀐 별칭이 캐시에 영구히 남으므로, 이 값의 문서 언어 별칭은 만들지 않습니다.",
+                            src,
+                            track_b_transliteration.split_whitespace().count(),
+                            latin_words.len()
+                        );
+                        String::new()
+                    }
+                }
             } else {
                 korean_unified_parts.join(" ")
             };
@@ -890,19 +904,23 @@ pub async fn generate_transliteration_aliases(
             crate::nl_convert::sanitize_transliteration_dual_for_words(&raw, &latin)
         };
         let gated = crate::nl_convert::gate_native_alias(&latin_src, tr, "SECOND-READ");
+        let digit_words = !non_latin.is_empty() && non_latin.iter().all(|w| crate::nl_convert::is_digit_word(w));
+        let placed = if non_latin.is_empty() {
+            gated.clone()
+        } else if digit_words {
+            crate::nl_convert::place_digit_words(src, &gated).unwrap_or_default()
+        } else {
+            format!("{} {}", non_latin.join(" "), gated)
+        };
+        if digit_words && !gated.trim().is_empty() {
+            crate::utils::score_dynamics::record_baseline("indexing.translit_digit_align_miss", if placed.is_empty() { 1.0 } else { 0.0 });
+        }
         if !gated.trim().is_empty()
+            && !placed.trim().is_empty()
             && !crate::nl_convert::is_latin_dominant(&gated)
             && crate::nl_convert::find_mixed_script_words(&gated).is_empty()
         {
-            let native = if non_latin.is_empty() {
-                gated.clone()
-            } else if non_latin.iter().all(|w| crate::nl_convert::is_digit_word(w)) {
-                crate::nl_convert::place_digit_words(src, &gated)
-                    .unwrap_or_else(|| format!("{} {}", non_latin.join(" "), gated))
-            } else {
-                format!("{} {}", non_latin.join(" "), gated)
-            };
-            let native = crate::nl_convert::reglue_native_alias(src, &native);
+            let native = crate::nl_convert::reglue_native_alias(src, &placed);
             if pair.1.is_empty() {
                 let roman = crate::nl_convert::try_any_ascii_transliteration(&native).unwrap_or_default();
                 pair = crate::nl_convert::assign_transliterations(src, &native, &roman);

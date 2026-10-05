@@ -575,6 +575,11 @@ pub async fn bridge_relays(
 
     crate::utils::score_dynamics::record_baseline("commerce.relay_ledger_linked", out.linked as f32);
     crate::utils::score_dynamics::record_baseline("commerce.relay_establishing_out", out.establishing_out as f32);
+    crate::utils::score_dynamics::record_baseline("commerce.relay_referrers", out.referrers as f32);
+    crate::utils::score_dynamics::record_baseline(
+        "commerce.relay_connected",
+        if out.establishing_out > 0 || out.referenced { 1.0 } else { 0.0 },
+    );
     env.emit(&format!(
         "  🔗 [RELAY LEDGER] {} '{}' (index={}) | 정방향 연결 {}건 (성립 관계 {}건) · 자리 초안 생성 {}건 · 상대 draft→count {}건 · 미인증 {}건 | 역방향 성립 참조 {}건",
         page_type, self_id, self_index, out.linked, out.establishing_out, out.drafted, out.confirmed_foreign, out.uncertified, out.referrers
@@ -1131,6 +1136,7 @@ pub async fn relay_join(
                 "void_units": void_units_map,
                 "units_exact": units_exact,
                 "partner_ids": in_period_ids,
+                "void_partner_ids": void_partner_ids,
                 "applied": true
             }));
         }

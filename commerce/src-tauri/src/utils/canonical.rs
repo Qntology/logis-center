@@ -779,6 +779,106 @@ pub fn keep_informative_values(prior: &serde_json::Value, merged: &mut serde_jso
     kept
 }
 
+fn timestamp_grain(s: &str) -> Option<(String, u8)> {
+    use chrono::Timelike;
+    let t = s.trim();
+    let date = t.get(..10)?;
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let rest = t.get(10..)?.trim_start_matches(|c: char| c == 'T' || c == ' ');
+    if rest.is_empty() {
+        return Some((date.to_string(), 0));
+    }
+    let hms = rest.get(..8)?;
+    let tail = rest.get(8..)?.trim();
+    if !(tail.is_empty() || tail == "Z") {
+        return None;
+    }
+    let tm = chrono::NaiveTime::parse_from_str(hms, "%H:%M:%S").ok()?;
+    if tm.hour() == 0 && tm.minute() == 0 && tm.second() == 0 {
+        Some((date.to_string(), 0))
+    } else if tm.second() == 0 {
+        Some((format!("{}T{}", date, hms.get(..5)?), 1))
+    } else {
+        Some((format!("{}T{}", date, hms), 2))
+    }
+}
+
+fn grain_start_ms(prefix: &str, grain: u8) -> Option<i64> {
+    let dt = match grain {
+        0 => chrono::NaiveDate::parse_from_str(prefix, "%Y-%m-%d").ok()?.and_hms_opt(0, 0, 0)?,
+        1 => chrono::NaiveDateTime::parse_from_str(&format!("{}:00", prefix), "%Y-%m-%dT%H:%M:%S").ok()?,
+        _ => return None,
+    };
+    Some(dt.and_utc().timestamp_millis())
+}
+
+pub fn is_coarser_timestamp(incoming: &str, prior: &str) -> bool {
+    match (timestamp_grain(incoming), timestamp_grain(prior)) {
+        (Some((ip, ig)), Some((pp, pg))) => ig < pg && pp.starts_with(&ip),
+        _ => false,
+    }
+}
+
+fn finer_epoch_value(incoming: &str, prior_ms: i64) -> Option<serde_json::Value> {
+    let (prefix, grain) = timestamp_grain(incoming)?;
+    let start = grain_start_ms(&prefix, grain)?;
+    let span: i64 = if grain == 0 { 86_400_000 } else { 60_000 };
+    if prior_ms <= start || prior_ms >= start + span {
+        return None;
+    }
+    if prior_ms % 1000 != 0 {
+        return Some(serde_json::Value::from(prior_ms));
+    }
+    let dt = chrono::DateTime::from_timestamp_millis(prior_ms)?.naive_utc();
+    Some(serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S").to_string()))
+}
+
+pub fn epoch_field_text(key: &str, n: &serde_json::Number) -> Option<String> {
+    let k = key.trim().to_lowercase();
+    if !k.ends_with("_at") || kind_of(&k) != CanonKind::Numeric {
+        return None;
+    }
+    let ms = n.as_i64()?;
+    if !(946_684_800_000..4_102_444_800_000).contains(&ms) {
+        return None;
+    }
+    let dt = chrono::DateTime::from_timestamp_millis(ms)?.naive_utc();
+    Some(dt.format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
+pub fn keep_finer_timestamps(prior: &serde_json::Value, merged: &mut serde_json::Value) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let (p, m) = match (prior.as_object(), merged.as_object_mut()) {
+        (Some(p), Some(m)) => (p, m),
+        _ => return kept,
+    };
+    for (k, pv) in p.iter() {
+        let incoming = match m.get(k).and_then(|mv| mv.as_str()) {
+            Some(s) => s.trim().to_string(),
+            None => continue,
+        };
+        let keep = match pv {
+            serde_json::Value::String(ps) => {
+                let ps = ps.trim();
+                if ps != incoming && is_coarser_timestamp(&incoming, ps) {
+                    Some(pv.clone())
+                } else {
+                    None
+                }
+            }
+            serde_json::Value::Number(n) if kind_of(k) == CanonKind::Numeric && k != "created_at" && k != "updated_at" => {
+                n.as_i64().and_then(|ms| finer_epoch_value(&incoming, ms))
+            }
+            _ => None,
+        };
+        if let Some(v) = keep {
+            m.insert(k.clone(), v);
+            kept.push(k.clone());
+        }
+    }
+    kept
+}
+
 pub fn number_text(s: &str) -> String {
     let src: Vec<char> = crate::utils::ai_utils::normalize_digits_ascii(s)
         .chars()

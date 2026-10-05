@@ -8845,23 +8845,21 @@ pub async fn process_task(
 
             let decimal_comma = crate::utils::canonical::decimal_comma_lang(&doc_lang_str)
                 && !crate::utils::canonical::point_decimal_currency(&currency_norm);
-            if decimal_comma {
-                let keys: Vec<String> = obj.keys().cloned().collect();
-                for k in keys {
-                    let lk = k.to_lowercase();
-                    if lk.ends_with("_at") || lk.ends_with("_date") || crate::utils::canonical::is_structural_key(&lk) {
-                        continue;
-                    }
-                    if crate::utils::canonical::kind_of(&lk) != crate::utils::canonical::CanonKind::Numeric {
-                        continue;
-                    }
-                    let fixed = obj
-                        .get(&k)
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| crate::utils::canonical::normalize_number_lexeme(s, true));
-                    if let Some(f) = fixed {
-                        obj.insert(k, json!(f));
-                    }
+            let numeric_keys: Vec<String> = obj.keys().cloned().collect();
+            for k in numeric_keys {
+                let lk = k.to_lowercase();
+                if lk.ends_with("_at") || lk.ends_with("_date") || crate::utils::canonical::is_structural_key(&lk) {
+                    continue;
+                }
+                if crate::utils::canonical::kind_of(&lk) != crate::utils::canonical::CanonKind::Numeric {
+                    continue;
+                }
+                let fixed = obj
+                    .get(&k)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| crate::utils::canonical::normalize_number_lexeme(s, decimal_comma));
+                if let Some(f) = fixed {
+                    obj.insert(k, json!(f));
                 }
             }
 
@@ -9277,19 +9275,17 @@ pub async fn process_task(
     if is_detail {
         
 
-        let text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&extracted_data));
-        let item_digest = crate::utils::hash::digest(&text_to_embed);
+        let mut text_to_embed = extracted_data.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(|| parsing::json_to_natural_language(&extracted_data));
+        let mut item_digest = crate::utils::hash::digest(&text_to_embed);
         let mut target_id = generated_id.clone();
 
-        let mut existing_vector = None;
+        let mut existing_vector: Option<Vec<f32>> = None;
+        let mut prior_vector: Option<Vec<f32>> = None;
         let mut existing_json_found: Option<serde_json::Value> = None;
 
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
             if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
-                let old_digest = existing_json.get("digest").and_then(|d| d.as_str()).unwrap_or("");
-                if old_digest == item_digest {
-                    existing_vector = Some(existing_item.vector);
-                }
+                prior_vector = Some(existing_item.vector);
                 extracted_data = merge_node(&existing_json, &extracted_data);
                 existing_json_found = Some(existing_json);
             }
@@ -9304,12 +9300,7 @@ pub async fn process_task(
                 target_id = found_id.clone();
 
                 if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-                    if let Ok(ej) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
-                        let old_digest = ej.get("digest").and_then(|d| d.as_str()).unwrap_or("");
-                        if old_digest == item_digest {
-                            existing_vector = Some(existing_item.vector);
-                        }
-                    }
+                    prior_vector = Some(existing_item.vector);
                 }
 
                 extracted_data = merge_node(&json_val, &extracted_data);
@@ -9347,13 +9338,41 @@ pub async fn process_task(
                     page_type, target_id, info_kept
                 ));
             }
-            if !shape_kept.is_empty() || !info_kept.is_empty() {
-                let merged_text = parsing::json_to_natural_language(&extracted_data);
-                if let Some(obj) = extracted_data.as_object_mut() {
-                    obj.insert("text".to_string(), json!(merged_text.clone()));
-                    obj.insert("masked_text".to_string(), json!(merged_text));
+            let finer_kept = crate::utils::canonical::keep_finer_timestamps(prior, &mut extracted_data);
+            if !finer_kept.is_empty() {
+                crate::utils::score_dynamics::record_baseline("commerce.detail_finer_kept", finer_kept.len() as f32);
+                emit_term(&format!(
+                    "  ⚓ [DETAIL MERGE / FINER KEEP] {} '{}' | 필드 {:?} 는 기존 값이 같은 시각을 더 정밀하게 담고 있어 기존 값을 유지합니다. 이번 값은 그 시각의 초·분·시각을 0 으로 채운 거친 표기라 새 정보 없이 기간 경계 판정의 해상도만 떨어뜨립니다.",
+                    page_type, target_id, finer_kept
+                ));
+            }
+            let mut text_view = extracted_data.clone();
+            if let Some(o) = text_view.as_object_mut() {
+                if url_self_token.is_none() && extracted_id_raw.trim().is_empty() {
+                    o.remove("id");
+                } else {
+                    o.insert("id".to_string(), json!(id_val_raw.clone()));
                 }
             }
+            let merged_text = parsing::json_to_natural_language(&text_view);
+            let remerged = merged_text != text_to_embed;
+            crate::utils::score_dynamics::record_baseline("commerce.detail_text_remerged", if remerged { 1.0 } else { 0.0 });
+            if remerged {
+                emit_term(&format!(
+                    "  🧾 [DETAIL MERGE / TEXT] {} '{}' | 문서 문장·digest·벡터를 병합 결과 하나에서 만듭니다 (상세 단독 {}자 → 병합 {}자). 상세 페이지 문장만으로 벡터를 만들면 목록에서 온 값과 위에서 되살린 값이 FTS 문장·청크에는 있고 문서 벡터에는 없어, 같은 문서의 세 검색 경로가 서로 다른 사실을 봅니다. 병합 문장의 digest 가 저장된 digest 와 같으면 벡터는 다시 만들지 않습니다.",
+                    page_type, target_id, text_to_embed.chars().count(), merged_text.chars().count()
+                ));
+            }
+            if let Some(obj) = extracted_data.as_object_mut() {
+                obj.insert("text".to_string(), json!(merged_text.clone()));
+                obj.insert("masked_text".to_string(), json!(merged_text.clone()));
+            }
+            item_digest = crate::utils::hash::digest(&merged_text);
+            text_to_embed = merged_text;
+            if prior.get("digest").and_then(|d| d.as_str()) == Some(item_digest.as_str()) {
+                existing_vector = prior_vector.take();
+            }
+            crate::utils::score_dynamics::record_baseline("commerce.detail_vector_reused", if existing_vector.is_some() { 1.0 } else { 0.0 });
         }
         let self_prior = crate::utils::canonical::ledger_prior(existing_json_found.as_ref());
         let origin_ok = relay_ledger::placeholder_origin_establishes(&page_type, existing_json_found.as_ref());
@@ -9393,6 +9412,7 @@ pub async fn process_task(
         if let Some(obj) = extracted_data.as_object_mut() {
             obj.insert("updated_at".to_string(), json!(self_ts));
             obj.insert(crate::utils::canonical::LEDGER_KEY.to_string(), json!(self_state));
+            obj.insert("detail".to_string(), json!(true));
         }
         emit_term(&format!(
             "  📒 [RELAY LEDGER / SELF] {} '{}' 상세 문서 | 이전 상태 {:?} | 성립 관계 정방향 {}건 · 역방향 {}건 · 자리 초안 출처 성립 {} | {} | 원장 변화 {:?}",
@@ -9698,6 +9718,14 @@ pub async fn process_task(
                         emit_term(&format!(
                             "  ⚓ [LIST MERGE / INFO KEEP] {} '{}' | 필드 {:?} 는 저장된 값이 구체적인데 이번 목록 값이 정보가 없는 값이라 저장된 값을 유지합니다.",
                             page_type, hashed_item_id, info_kept
+                        ));
+                    }
+                    let finer_kept = crate::utils::canonical::keep_finer_timestamps(ej, &mut single_item);
+                    if !finer_kept.is_empty() {
+                        crate::utils::score_dynamics::record_baseline("commerce.list_finer_kept", finer_kept.len() as f32);
+                        emit_term(&format!(
+                            "  ⚓ [LIST MERGE / FINER KEEP] {} '{}' | 필드 {:?} 는 저장된 값(상세에서 온 초 단위 시각 등)이 이번 목록 값과 같은 시각을 더 정밀하게 담고 있어 저장된 값을 유지합니다. 목록을 다시 수집할 때마다 상세의 시각이 분·날짜 단위로 깎이지 않게 합니다.",
+                            page_type, hashed_item_id, finer_kept
                         ));
                     }
                     if let Some(obj) = single_item.as_object_mut() {
