@@ -145,6 +145,57 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
     unique_sentences.join(" ").replace("  ", " ").trim().to_string()
 }
 
+fn generated_sentence_starts_at(rest: &str) -> bool {
+    const FIXED: [&str; 4] = [
+        "The unique identifier is ",
+        "It can be accessed at ",
+        "Regarding ",
+        "It is currently in '",
+    ];
+    if FIXED.iter().any(|p| rest.starts_with(p)) {
+        return true;
+    }
+    if let Some(body) = rest.strip_prefix("This ") {
+        return body
+            .find(" is titled '")
+            .map_or(false, |p| body[..p].split_whitespace().count() <= 3);
+    }
+    for lead in ["Its ", "The "] {
+        let body = match rest.strip_prefix(lead) {
+            Some(b) => b,
+            None => continue,
+        };
+        let cut = [" is ", " includes: "].iter().filter_map(|m| body.find(m)).min();
+        if let Some(p) = cut {
+            let key = &body[..p];
+            let words = key.split_whitespace().count();
+            if (1..=6).contains(&words)
+                && key.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '_' || c == '-')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn split_generated_sentences(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(". ") {
+        let dot = from + rel;
+        let next = dot + 2;
+        if generated_sentence_starts_at(&text[next..]) {
+            out.push(&text[start..dot]);
+            start = next;
+        }
+        from = next;
+    }
+    out.push(&text[start..]);
+    out
+}
+
 /// [PHASE A] json_to_natural_language() 출력을 문장/속성 단위 청크로 분할합니다.
 ///
 /// 분할 규칙:
@@ -166,8 +217,8 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
     // ". " (마침표 + 공백) 기준으로 1차 분할합니다.
     // json_to_natural_language() 의 출력은 이미 문장 단위로 구분되어 있으므로
     // 이 분할이 1:1 문장 대응이 됩니다.
-    let raw_sentences: Vec<&str> = text
-        .split(". ")
+    let raw_sentences: Vec<&str> = split_generated_sentences(text)
+        .into_iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();

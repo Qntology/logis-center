@@ -1117,7 +1117,7 @@ impl crate::model::LogisModel {
                                     "    🏷️ [PAIR READ / CROP] [{}] 축 {}개를 스키마로 묻는 대신 이 크롭에 인쇄된 라벨↔값 쌍을 전부 옮겨 적게 합니다. 라벨→축 배정은 라벨 코사인 게이트가 스키마 {}축 전체를 상대로 수행합니다. 생성 상한 {} 토큰 (판독 가능 패치 {} × {}, 384~1024, SDS 절단율 {:.3} 반영) — 쌍 하나가 약 30 토큰이고 판독 가능 패치 한 칸에 인쇄 쌍이 평균 0.4~0.5개 들어 있어, 고정 384 토큰은 표 머리글과 첫 행만으로 소진되어 둘째 행부터 잘립니다.",
                                     plan.category, cat_fields.len(), gate_banks.len(), pair_cap, lg_cnt, per_patch, truncated_rate
                                 ));
-                                let pair_res = self.chat_with_qwen3_5_image_spinner(
+                                let mut pair_res = self.chat_with_qwen3_5_image_spinner(
                                     "You are a highly precise document data extraction assistant.",
                                     &pair_prompt,
                                     Some(verify_crop.clone()),
@@ -1132,17 +1132,53 @@ impl crate::model::LogisModel {
                                     Some(task_id.clone()),
                                     None
                                 ).await?;
-                                let pair_open = pair_res.matches('{').count();
-                                let pair_close = pair_res.matches('}').count();
-                                let pair_truncated = pair_open > pair_close;
+                                let mut pair_open = pair_res.matches('{').count();
+                                let mut pair_close = pair_res.matches('}').count();
+                                let mut used_cap = pair_cap;
                                 crate::utils::score_dynamics::record_baseline(
                                     "vision.pair_read_truncated",
-                                    if pair_truncated { 1.0 } else { 0.0 },
+                                    if pair_open > pair_close { 1.0 } else { 0.0 },
                                 );
+                                if pair_open > pair_close && pair_cap < 1024 {
+                                    let retry_cap = (pair_cap * 2).min(1024);
+                                    emit_term(&format!(
+                                        "    🔁 [PAIR READ RETRY] [{}] 쌍 읽기 응답이 생성 상한 {} 토큰에서 끊겼습니다 (여는 괄호 {} > 닫는 괄호 {}). 같은 크롭 · 같은 프롬프트로 상한 {} 토큰에서 한 번 더 읽습니다. 끊긴 뒤의 쌍은 JSON 복구가 버리므로 다시 읽지 않으면 이 크롭 뒷부분의 라벨은 한 번도 읽히지 않습니다.",
+                                        plan.category, pair_cap, pair_open, pair_close, retry_cap
+                                    ));
+                                    let retry_res = self.chat_with_qwen3_5_image_spinner(
+                                        "You are a highly precise document data extraction assistant.",
+                                        &pair_prompt,
+                                        Some(verify_crop.clone()),
+                                        app_handle,
+                                        "extraction-progress",
+                                        json!({
+                                            "category": format!("Vision (Pairs Retry {}/{}{})", idx + 1, plans.len(), tile_tag),
+                                            "summary": format!("Re-transcribing {} pairs...", plan.category)
+                                        }),
+                                        retry_cap,
+                                        cancel_token.clone(),
+                                        Some(task_id.clone()),
+                                        None
+                                    ).await?;
+                                    let retry_open = retry_res.matches('{').count();
+                                    let retry_close = retry_res.matches('}').count();
+                                    let recovered = retry_open <= retry_close;
+                                    crate::utils::score_dynamics::record_baseline(
+                                        "vision.pair_read_retry_recovered",
+                                        if recovered { 1.0 } else { 0.0 },
+                                    );
+                                    if recovered || retry_res.len() > pair_res.len() {
+                                        pair_res = retry_res;
+                                        pair_open = retry_open;
+                                        pair_close = retry_close;
+                                        used_cap = retry_cap;
+                                    }
+                                }
+                                let pair_truncated = pair_open > pair_close;
                                 if pair_truncated {
                                     emit_term(&format!(
                                         "    ✂️ [PAIR READ TRUNCATED] [{}] 쌍 읽기 응답이 생성 상한 {} 토큰에서 끊겼습니다 (여는 괄호 {} > 닫는 괄호 {}). 끊긴 뒤의 쌍은 JSON 복구가 버리므로 이 크롭의 뒷부분 라벨은 읽히지 않은 것입니다. SDS 의 vision.pair_read_truncated 평균이 0 보다 크면 패치당 토큰 계수를 올려야 합니다.",
-                                        plan.category, pair_cap, pair_open, pair_close
+                                        plan.category, used_cap, pair_open, pair_close
                                     ));
                                 }
                                 let raw_pairs = crate::parsing::parse_json_from_llm(&pair_res);

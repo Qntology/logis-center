@@ -7140,6 +7140,7 @@ pub async fn process_task(
             let mut pair_owned_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
             
             let mut pair_line_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut pair_absent_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             if !detail_pairs.is_empty() {
                 
@@ -7259,6 +7260,8 @@ pub async fn process_task(
                 let pair_abs_floor = 0.50f32;
                 let mut leaf_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
                 let mut sec_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
+                let mut pair_own: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
+                let mut value_failed_own: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_phrases.len()]; d_field_names.len()];
 
                 for f in 0..d_field_names.len() {
                     let f_fmt = detect_field_format(&d_field_names[f]);
@@ -7273,6 +7276,7 @@ pub async fn process_task(
                     for h in 0..unique_phrases.len() {
                         if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
                         let own = weighted_max_pool_sim(&leaf_embs[h], &d_label_embs[f], &d_label_weights[f]);
+                        pair_own[f][h] = own;
                         crate::utils::score_dynamics::record_field_seen(&d_field_names[f]);
                         if own < pair_abs_floor {
                             crate::utils::score_dynamics::record_near_miss(&d_field_names[f]);
@@ -7294,6 +7298,7 @@ pub async fn process_task(
                         let pair_val = if f_multi { &phrase_multi_value[h] } else { &phrase_single_value[h] };
                         if f_strict {
                             if pair_val.trim().is_empty() || !value_matches_format(f_fmt, pair_val) {
+                                value_failed_own[f][h] = own;
                                 crate::utils::score_dynamics::record_field_reject(
                                     &d_field_names[f],
                                     crate::utils::score_dynamics::GateKind::Format,
@@ -7308,6 +7313,7 @@ pub async fn process_task(
                         
                         let enum_reject = if f_fmt == FieldFormat::Enum { enum_value_reject(&d_field_names[f], pair_val) } else { None };
                         if let Some(why) = enum_reject {
+                            value_failed_own[f][h] = own;
                             crate::utils::score_dynamics::record_field_reject(
                                 &d_field_names[f],
                                 crate::utils::score_dynamics::GateKind::Enum,
@@ -7549,8 +7555,30 @@ pub async fn process_task(
                         continue;
                     }
 
+                    if owner_fmt == FieldFormat::Link && !value_matches_format(owner_fmt, &merged) {
+                        let tokens: Vec<&str> = merged.split_whitespace().collect();
+                        let resolved: Vec<String> = tokens
+                            .iter()
+                            .filter_map(|t| {
+                                if value_matches_format(FieldFormat::Link, t) {
+                                    Some(t.to_string())
+                                } else {
+                                    resolve_page_asset_link(t, &pug_lines_ref)
+                                }
+                            })
+                            .collect();
+                        if !tokens.is_empty() && resolved.len() == tokens.len() {
+                            let joined = resolved.join(" ");
+                            crate::utils::score_dynamics::record_baseline("commerce.detail_pair_link_resolved", tokens.len() as f32);
+                            emit_term(&format!(
+                                "    🔗 [DETAIL PAIR LINK RESOLVE] '{}' | 라벨 '{}' 의 값 \"{}\" 은 파일 이름뿐이라 링크가 아닙니다. 같은 페이지의 href/src 가운데 이 파일 이름으로 끝나는 주소가 하나뿐이므로 그 주소로 바꿉니다: {}",
+                                owner, unique_phrases[h], merged, joined
+                            ));
+                            merged = joined;
+                        }
+                    }
                     let fmt_ok = match owner_fmt {
-                        FieldFormat::Identifier | FieldFormat::Link => true,
+                        FieldFormat::Identifier => true,
                         _ => value_matches_format(owner_fmt, &merged),
                     };
                     if !fmt_ok {
@@ -7573,6 +7601,50 @@ pub async fn process_task(
                         leaf_raw[f][h].max(0.0),
                         sec_raw[f][h].max(0.0),
                         score, margin, primary + 1, merged));
+                }
+                for h in 0..unique_phrases.len() {
+                    let claimants: Vec<usize> = (0..d_field_names.len())
+                        .filter(|&f| leaf_raw[f][h] >= 0.0 || value_failed_own[f][h] >= 0.0)
+                        .collect();
+                    if claimants.len() != 1 {
+                        continue;
+                    }
+                    let f = claimants[0];
+                    let name = &d_field_names[f];
+                    if leaf_raw[f][h] >= 0.0
+                        || pair_line_map.contains_key(name)
+                        || header_forced_assign.contains_key(name)
+                        || detect_field_format(name) == FieldFormat::Enum
+                    {
+                        continue;
+                    }
+                    let row: Vec<f32> = (0..d_field_names.len())
+                        .map(|g| pair_own[g][h])
+                        .filter(|v| *v > -1.0)
+                        .collect();
+                    if row.len() < 3 {
+                        continue;
+                    }
+                    let n = row.len() as f32;
+                    let mean = row.iter().sum::<f32>() / n;
+                    let sd = (row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n).sqrt().max(1e-6);
+                    let z = (value_failed_own[f][h] - mean) / sd - gumbel_expected_z(row.len());
+                    let shown = if is_multi_value_field(name) { &phrase_multi_value[h] } else { &phrase_single_value[h] };
+                    if z <= 0.0 {
+                        crate::utils::score_dynamics::record_baseline("commerce.detail_pair_absent_weak", z);
+                        emit_term(&format!(
+                            "    ⚪ [DETAIL PAIR ABSENT / WEAK] Label '{}' → '{}' | 이 라벨을 받아들인 필드는 하나뿐이지만 점수 {:.4} 가 라벨 행 {}개 필드 분포에서 z {:+.3} 로 무작위 최댓값을 넘지 못해, 값 \"{}\" 을 이 필드의 빈칸 근거로 쓰지 않습니다.",
+                            unique_phrases[h], name, value_failed_own[f][h], row.len(), z, shown
+                        ));
+                        continue;
+                    }
+                    if pair_absent_fields.insert(name.clone()) {
+                        crate::utils::score_dynamics::record_baseline("commerce.detail_pair_absent", z);
+                        emit_term(&format!(
+                            "    🕳️ [DETAIL PAIR ABSENT] Label '{}' → '{}' | 이 라벨을 받아들인 필드가 '{}' 하나뿐이고 점수 {:.4} 가 라벨 행 {}개 필드 분포에서 z {:+.3} 로 두드러지는데, 값 \"{}\" 이 형식을 통과하지 못했습니다. 이 문서는 '{}' 의 칸을 갖고 있고 그 칸이 비어 있으므로, 같은 형식 필드의 줄을 빌리거나 약한 벡터 배정으로 이 필드를 채우지 않습니다.",
+                            unique_phrases[h], name, name, value_failed_own[f][h], row.len(), z, shown, name
+                        ));
+                    }
                 }
             }
 
@@ -7791,7 +7863,7 @@ pub async fn process_task(
 
             
             
-            let (mut vector_assignment, vector_raw_matrix): (Vec<Option<(usize, f32, f32)>>, Vec<Vec<f32>>) = {
+            let (mut vector_assignment, vector_raw_matrix, vector_tie_held): (Vec<Option<(usize, f32, f32)>>, Vec<Vec<f32>>, std::collections::HashSet<usize>) = {
                 let line_count = pug_lines_ref.len();
                 let field_count = field_phrase_embs.len();
                 let mut raw = vec![vec![-1.0f32; line_count]; field_count];
@@ -7843,13 +7915,79 @@ pub async fn process_task(
                 let centered = double_center_matrix(&raw);
                 let mut assign = exclusive_assign(&centered, 0.0, 0.005);
 
+                let mut tie_held: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                let mut held_lines: Vec<usize> = Vec::new();
+                for f in 0..field_count {
+                    let l = match assign[f] {
+                        Some((l, _, _)) => l,
+                        None => continue,
+                    };
+                    if !matches!(
+                        field_formats[f],
+                        FieldFormat::Date | FieldFormat::Numeric | FieldFormat::TrackingCode | FieldFormat::Phone | FieldFormat::Address
+                    ) {
+                        continue;
+                    }
+                    if pair_line_map.contains_key(&fields[f].0) || header_forced_assign.contains_key(&fields[f].0) {
+                        continue;
+                    }
+                    let mut rivals: Vec<(usize, f32)> = (0..field_count)
+                        .filter(|&g| g != f && raw[g][l] > -1.0)
+                        .map(|g| (g, raw[g][l]))
+                        .collect();
+                    if rivals.len() < 2 {
+                        continue;
+                    }
+                    rivals.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let rn = rivals.len() as f32;
+                    let rmean = rivals.iter().map(|(_, s)| *s).sum::<f32>() / rn;
+                    let spread = (rivals.iter().map(|(_, s)| (s - rmean) * (s - rmean)).sum::<f32>() / rn).sqrt();
+                    let line_margin = raw[f][l] - rivals[0].1;
+                    if line_margin >= spread {
+                        continue;
+                    }
+                    let cands: Vec<f32> = raw[f].iter().copied().filter(|v| *v > -1.0).collect();
+                    let field_z = if cands.len() >= 3 {
+                        let n = cands.len() as f32;
+                        let mean = cands.iter().sum::<f32>() / n;
+                        let sd = (cands.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n).sqrt().max(1e-6);
+                        Some((raw[f][l] - mean) / sd - gumbel_expected_z(cands.len()))
+                    } else {
+                        None
+                    };
+                    if field_z.map_or(false, |z| z >= 0.0) {
+                        continue;
+                    }
+                    assign[f] = None;
+                    tie_held.insert(f);
+                    held_lines.push(l);
+                    crate::utils::score_dynamics::record_baseline("commerce.detail_vector_tie_hold", line_margin);
+                    emit_term(&format!(
+                        "  ⚖️ [VECTOR TIE HOLD] '{}' ← Line {} | 1위 경쟁 '{}' 와의 라인 마진 {:+.4} 가 같은 줄 경쟁 필드 점수의 흩어짐 {:.4} ({}개) 보다 작고, {} | 같은 형식의 필드끼리 잡음 수준으로 다투는 줄이라 LLM 없이 값으로 확정하지 않습니다.",
+                        fields[f].0,
+                        l + 1,
+                        fields[rivals[0].0].0,
+                        line_margin,
+                        spread,
+                        rivals.len(),
+                        match field_z {
+                            Some(z) => format!("이 필드의 후보 줄 {}개 분포에서도 z {:+.3} 로 두드러지지 않습니다", cands.len(), z),
+                            None => format!("이 필드의 후보 줄이 {}개뿐이라 필드 쪽 근거를 세울 수 없습니다", cands.len()),
+                        }
+                    ));
+                }
+
                 let mut claimed = vec![false; line_count];
                 for a in assign.iter() {
                     if let Some((l, _, _)) = a { claimed[*l] = true; }
                 }
+                for l in held_lines.iter() {
+                    claimed[*l] = true;
+                }
                 for f in 0..field_count {
                     if assign[f].is_some() { continue; }
                     if field_is_analytic[f] { continue; }
+                    if tie_held.contains(&f) { continue; }
                     let cands: Vec<usize> = (0..line_count)
                         .filter(|&l| raw[f][l] >= 0.0 && !claimed[l])
                         .collect();
@@ -7860,7 +7998,7 @@ pub async fn process_task(
                     }
                 }
 
-                (assign, raw)
+                (assign, raw, tie_held)
             };
 
             
@@ -7870,6 +8008,21 @@ pub async fn process_task(
                     vector_assignment[f_i] = Some((*l, raw, 0.0));
                     emit_term(&format!("  🧷 [PAIR OVERRIDE] '{}' 의 벡터 배정을 구조적 페어 확정 라인(Line {})으로 교체했습니다.", fname, *l + 1));
                 }
+            }
+            let mut absent_dropped: Vec<String> = Vec::new();
+            for (f_i, (fname, _, _, _)) in fields.iter().enumerate() {
+                if vector_assignment[f_i].is_none() { continue; }
+                if !pair_absent_fields.contains(fname) { continue; }
+                if header_forced_assign.contains_key(fname) { continue; }
+                vector_assignment[f_i] = None;
+                absent_dropped.push(fname.clone());
+            }
+            if !absent_dropped.is_empty() {
+                crate::utils::score_dynamics::record_baseline("commerce.detail_vector_absent_hold", absent_dropped.len() as f32);
+                emit_term(&format!(
+                    "  🕳️ [VECTOR ABSENT HOLD] {:?} | 자기 라벨 칸이 있으나 값이 비었거나 형식에 맞지 않는 필드(DETAIL PAIR ABSENT)의 벡터 배정을 내려놓습니다. 같은 문서가 이 필드를 비어 있다고 말하므로 다른 줄의 값을 이 필드로 확정하지 않습니다.",
+                    absent_dropped
+                ));
             }
 
             
@@ -7898,14 +8051,30 @@ pub async fn process_task(
             }
             if !form_page {
                 let mut shared = 0usize;
+                let mut absent_held: Vec<String> = Vec::new();
+                let family_affinity = |a: usize, b: usize| -> f32 {
+                    let mut sum = 0.0f32;
+                    let mut n = 0usize;
+                    for e in field_phrase_embs[a].iter() {
+                        if e.iter().all(|&v| v == 0.0) { continue; }
+                        sum += max_pool_sim(e, &field_phrase_embs[b]);
+                        n += 1;
+                    }
+                    if n == 0 { 0.0 } else { sum / n as f32 }
+                };
                 for f in 0..vector_assignment.len() {
                     if vector_assignment[f].is_some() { continue; }
                     if field_is_analytic[f] { continue; }
                     if is_id_link_field(&fields[f].0) { continue; }
                     let fmt = field_formats[f];
                     if !matches!(fmt, FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric) { continue; }
+                    if vector_tie_held.contains(&f) || pair_absent_fields.contains(&fields[f].0) {
+                        absent_held.push(fields[f].0.clone());
+                        continue;
+                    }
                     let mut best_line: Option<usize> = None;
                     let mut best_raw = f32::MIN;
+                    let mut best_affinity = f32::MIN;
                     for other in 0..vector_assignment.len() {
                         if other == f { continue; }
                         if field_formats[other] != fmt { continue; }
@@ -7927,19 +8096,32 @@ pub async fn process_task(
                                 continue;
                             }
                             let raw = vector_raw_matrix[f].get(l).copied().unwrap_or(0.0);
-                            if raw > best_raw { best_raw = raw; best_line = Some(l); }
+                            let affinity = family_affinity(f, other);
+                            if affinity > best_affinity || (affinity == best_affinity && raw > best_raw) {
+                                best_affinity = affinity;
+                                best_raw = raw;
+                                best_line = Some(l);
+                            }
                         }
                     }
                     if let Some(l) = best_line {
                         vector_assignment[f] = Some((l, best_raw, 0.0));
                         shared += 1;
                         family_shared.insert(f);
-                        emit_term(&format!("  ♻️ [FORMAT FAMILY SHARE] '{}' ({:?}) ← Line {} | RawSim: {:.4} | 같은 형식 필드가 확정한 라인을 공유합니다.",
-                            fields[f].0, fmt, l + 1, best_raw));
+                        crate::utils::score_dynamics::record_baseline("commerce.family_share_affinity", best_affinity);
+                        emit_term(&format!("  ♻️ [FORMAT FAMILY SHARE] '{}' ({:?}) ← Line {} | RawSim: {:.4} | 라벨 뱅크 친화도 {:.4} | 같은 형식 필드 가운데 뜻이 가장 가까운 필드가 확정한 라인을 공유합니다.",
+                            fields[f].0, fmt, l + 1, best_raw, best_affinity));
                     }
                 }
                 if shared > 0 {
                     emit_term(&format!("  ♻️ [FORMAT FAMILY SHARE] 총 {}개 필드가 동일 형식 라인을 공유했습니다.", shared));
+                }
+                if !absent_held.is_empty() {
+                    crate::utils::score_dynamics::record_baseline("commerce.family_share_absent_skip", absent_held.len() as f32);
+                    emit_term(&format!(
+                        "  ⛔ [FORMAT FAMILY SHARE / ABSENT] {:?} | 자기 라벨 칸이 비어 있다고 확인된 필드(DETAIL PAIR ABSENT)와, 같은 형식 필드끼리 잡음 수준으로 다퉈 보류된 필드(VECTOR TIE HOLD)는 다른 필드의 줄을 빌려 쓰지 않습니다. 빈 값은 목록 문서의 기존 값을 덮지 않습니다.",
+                        absent_held
+                    ));
                 }
             }
 
@@ -8117,6 +8299,14 @@ pub async fn process_task(
                         continue;
                     }
                 }
+                if pair_absent_fields.contains(&field_name) {
+                    crate::utils::score_dynamics::record_baseline("commerce.pair_absent_skip", 1.0);
+                    emit_term(&format!(
+                        "  ⛔ [PAIR ABSENT SKIP] Field: '{}' ({:?}) | 이 문서에는 이 필드의 라벨 칸이 있고 그 값이 비었거나 형식에 맞지 않습니다(DETAIL PAIR ABSENT). LLM 으로 다른 칸의 값을 고르지 않고 비워 둡니다. 빈 값은 목록 문서의 기존 값을 덮지 않습니다.",
+                        field_name, field_format
+                    ));
+                    continue;
+                }
                 if form_page && field_format == FieldFormat::Text && !field_is_analytic[idx] {
                     crate::utils::score_dynamics::record_baseline("commerce.form_absent_skip", 1.0);
                     emit_term(&format!(
@@ -8159,6 +8349,22 @@ pub async fn process_task(
                 
                 
                 if !field_is_analytic[idx] && field_format == FieldFormat::Date && has_vector_match {
+                    let cell_label = if family_shared.contains(&idx) {
+                        None
+                    } else {
+                        detail_pairs
+                            .iter()
+                            .find(|p| p.cell_start <= best_idx && best_idx <= p.cell_end)
+                            .map(|p| p.label.clone())
+                    };
+                    if let Some(label) = cell_label {
+                        crate::utils::score_dynamics::record_baseline("commerce.date_bypass_cell_refused", 1.0);
+                        emit_term(&format!(
+                            "  ⛔ [DATE BYPASS REFUSED] Field: '{}' (Date) | Line {} \"{}\" 은 라벨 '{}' 칸 안의 값이고, 라벨 쌍 경로가 이 칸을 이 필드의 값으로 확정하지 않았습니다. 벡터 배정만으로 날짜를 확정하지 않고 비워 둡니다. 빈 값은 목록 문서의 기존 값을 덮지 않습니다.",
+                            field_name, best_idx + 1, line_values[best_idx].trim(), label
+                        ));
+                        continue;
+                    }
                     if let Some(date_literal) = extract_date_literal(&line_values[best_idx]) {
                         let keys: Vec<&str> = field_name.split(',').map(|s| s.trim()).collect();
                         let mut done = Vec::new();
@@ -8192,7 +8398,7 @@ pub async fn process_task(
                     let multi_number = field_format == FieldFormat::Numeric && numeric_run_count(&line_values[best_idx]) > 1;
                     let foreign_label = detail_pairs
                         .iter()
-                        .find(|p| p.primary_line == best_idx)
+                        .find(|p| p.primary_line == best_idx || (p.cell_start <= best_idx && best_idx <= p.cell_end))
                         .map(|p| p.label.clone());
                     if copyable && (shared_line || multi_number || foreign_label.is_some()) {
                         crate::utils::score_dynamics::record_baseline("commerce.value_copy_refused", 1.0);
