@@ -2,7 +2,6 @@ use sysinfo::{System, RefreshKind, CpuRefreshKind, MemoryRefreshKind};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use once_cell::sync::Lazy;
-use nvml_wrapper::Nvml;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -11,11 +10,10 @@ use anyhow::Result;
 
 
 pub async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>, target_gpu_id: u32) -> Result<()> {
-    use nvml_wrapper::Nvml;
     use sysinfo::System;
-    
+
     let mut sys = System::new_all();
-    let nvml = Nvml::init().ok();
+    let gpu_probe = crate::utils::GpuMemProbe::new();
     
     let target_vram_bytes = target_vram_mb * 1024 * 1024;
     let target_ram_bytes = target_ram_mb * 1024 * 1024;
@@ -39,13 +37,9 @@ pub async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64,
         let mut current_vram = 0;
         let mut has_gpu = false;
 
-        if let Some(ref nvml_inst) = nvml {
-            if let Ok(dev) = nvml_inst.device_by_index(target_gpu_id) {
-                if let Ok(mem) = dev.memory_info() {
-                    current_vram = mem.free;
-                    has_gpu = true;
-                }
-            }
+        if let Some(free) = gpu_probe.free_bytes(target_gpu_id as usize) {
+            current_vram = free;
+            has_gpu = true;
         }
 
         let meets_vram = !has_gpu || current_vram >= target_vram_bytes;
@@ -132,24 +126,18 @@ pub struct KvPlanInput<'a> {
 /// device_utils::get_best_device_info 와 동일한 정책이지만 Device 객체를 생성하지 않아
 /// 디코딩 경로에서 호출해도 CUDA 컨텍스트를 건드리지 않습니다.
 static PRIMARY_GPU_ID: Lazy<u32> = Lazy::new(|| {
-    if let Ok(nvml) = Nvml::init() {
-        if let Ok(count) = nvml.device_count() {
-            let mut best_id = 0u32;
-            let mut max_free = 0u64;
-            for i in 0..count {
-                if let Ok(dev) = nvml.device_by_index(i) {
-                    if let Ok(mem) = dev.memory_info() {
-                        if mem.free > max_free {
-                            max_free = mem.free;
-                            best_id = i;
-                        }
-                    }
-                }
+    let probe = crate::utils::GpuMemProbe::new();
+    let mut best_id = 0u32;
+    let mut max_free = 0u64;
+    for i in 0..probe.device_count() {
+        if let Some(free) = probe.free_bytes(i) {
+            if free > max_free {
+                max_free = free;
+                best_id = i as u32;
             }
-            return best_id;
         }
     }
-    0
+    best_id
 });
 
 pub fn primary_gpu_id() -> u32 {
@@ -167,14 +155,9 @@ pub fn kv_bytes_per_token(input: &KvPlanInput) -> u64 {
 
 /// 현재 여유 VRAM(bytes). GPU 가 없거나 NVML 실패 시 0 을 반환합니다.
 pub fn free_vram_bytes(gpu_id: u32) -> u64 {
-    if let Ok(nvml) = Nvml::init() {
-        if let Ok(dev) = nvml.device_by_index(gpu_id) {
-            if let Ok(mem) = dev.memory_info() {
-                return mem.free;
-            }
-        }
-    }
-    0
+    crate::utils::gpu_mem_info(gpu_id as usize)
+        .map(|(free, _)| free)
+        .unwrap_or(0)
 }
 
 /// 현재 여유 RAM(bytes).
@@ -284,8 +267,7 @@ pub fn get_optimal_thread_config(is_cpu_mode: bool) -> ThreadConfig {
     let physical_cores = sys.physical_core_count().unwrap_or(4);
     
     // 3. Check GPU status
-    let nvml = Nvml::init().ok();
-    let has_gpu = nvml.is_some() && !is_cpu_mode; // If forced CPU, treat as if no GPU for logging
+    let has_gpu = crate::utils::gpu_count() > 0 && !is_cpu_mode; // If forced CPU, treat as if no GPU for logging
     
     // --- ORGANIC DECISION LOGIC ---
     let (threads, mode) = if has_gpu {
@@ -319,15 +301,10 @@ pub fn get_memory_usage() -> (u64, u64) {
     let ram_used = sys.used_memory(); 
     
     let mut vram_used = 0;
-    if let Ok(nvml) = Nvml::init() {
-        if let Ok(count) = nvml.device_count() {
-            for i in 0..count {
-                 if let Ok(dev) = nvml.device_by_index(i) {
-                     if let Ok(mem) = dev.memory_info() {
-                         vram_used += mem.used;
-                     }
-                 }
-            }
+    let probe = crate::utils::GpuMemProbe::new();
+    for i in 0..probe.device_count() {
+        if let Some((free, total)) = probe.mem_info(i) {
+            vram_used += total.saturating_sub(free);
         }
     }
     (ram_used, vram_used)

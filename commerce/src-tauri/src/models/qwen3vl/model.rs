@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Shape, Tensor};
 use candle_core::quantized::{QMatMul, gguf_file};
+use crate::utils::GpuDeviceExt;
 use candle_nn::{
     Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, embedding, linear,
     linear_no_bias, rms_norm,
@@ -975,7 +976,7 @@ impl Qwen3VLVisionModel {
         }
         self.is_weights_loaded = false;
 
-        if self.device.is_cuda() {
+        if self.device.is_cuda_or_rocm() {
             let _ = self.device.synchronize();
         }
         Self::force_memory_release();
@@ -1286,7 +1287,7 @@ impl Qwen3VLVisionModel {
             if streaming {
                 // 계산이 끝난 블록은 즉시 반환합니다. 다음 블록이 그 자리를 씁니다.
                 self.blocks[layer_num].clear_weights();
-                if self.device.is_cuda() {
+                if self.device.is_cuda_or_rocm() {
                     let _ = self.device.synchronize();
                 }
             }
@@ -1942,7 +1943,7 @@ impl Qwen3VLModel {
                 }
 
                 // 🌟 [VRAM/RAM 최적화]
-                if inputs_embeds.device().is_cuda() {
+                if inputs_embeds.device().is_cuda_or_rocm() {
                     let _ = inputs_embeds.device().synchronize();
                 }
 

@@ -1,6 +1,7 @@
 use crate::models::qwen::quantized_model::{KVLocation, KVBlock, KVRegistry, BitKVMetadata, QuantizedQwenVLModel, MemorySlot};
 use anyhow::{Result, anyhow};
 use candle_core::{quantized::gguf_file, DType, Device, Tensor};
+use crate::utils::GpuDeviceExt;
 use candle_nn::{VarBuilder, Module}; // 🌟 [CRITICAL FIX] Module 트레이트를 추가하여 embed_tokens.forward()를 활성화합니다.
 use std::io::Write;
 
@@ -589,7 +590,7 @@ impl QwenVLGenerateModel {
         self.qwen.set_vision_active(active)?;
 
         if !active {
-            if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+            if self.text_device.is_cuda_or_rocm() { let _ = self.text_device.synchronize(); }
             #[cfg(target_os = "windows")]
             unsafe {
                 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -671,7 +672,7 @@ impl QwenVLGenerateModel {
         }
 
         // 🌟 [종료 직후 메모리 즉각 강제 반환]
-        if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+        if self.text_device.is_cuda_or_rocm() { let _ = self.text_device.synchronize(); }
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -995,7 +996,7 @@ impl QwenVLGenerateModel {
         // 🌟 [종료 직후 메모리 즉각 강제 반환] 
         // 80% -> 65% 로 브라우저를 켤 때만 메모리가 OS로 반환되는 지연(Lazy Free) 현상을 타파합니다.
         // 생성이 종료된 직후에 GPU 동기화 및 OS 메모리 반환을 찔러 넣어 사용자가 즉각 65%를 볼 수 있게 합니다.
-        if self.text_device.is_cuda() { let _ = self.text_device.synchronize(); }
+        if self.text_device.is_cuda_or_rocm() { let _ = self.text_device.synchronize(); }
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::GetCurrentProcess;

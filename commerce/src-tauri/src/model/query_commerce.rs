@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use serde_json::{json, Value};
+use crate::utils::GpuDeviceExt;
 
 impl crate::model::LogisModel {
 
@@ -4174,7 +4175,7 @@ impl crate::model::LogisModel {
                 if !self.is_cpu_mode {
                     let dev = self.device_config.device.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        if dev.is_cuda() { let _ = dev.synchronize(); }
+                        if dev.is_cuda_or_rocm() { let _ = dev.synchronize(); }
                     }).await;
                 }
 
@@ -4821,11 +4822,11 @@ impl crate::model::LogisModel {
 
         // 🌟 [강화된 VRAM 초기화] CUDA 메모리 캐시 강제 비우기 (컴파일 에러 해결 적용)
         if !self.is_cpu_mode {
-            if self.device_config.device.is_cuda() {
+            if self.device_config.device.is_cuda_or_rocm() {
                 let _ = self.device_config.device.synchronize();
             }
             // 새 컨텍스트를 할당하여 기존 메모리 풀을 OS로 반환시킵니다.
-            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+            crate::utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
         }
 
         // 🌟 [CRITICAL FIX] scheduler.rs의 함수 대신 model.rs에 내장된 강력한 VRAM 스마트 폴링 모니터(self.wait_for_vram_settle)를 호출합니다.

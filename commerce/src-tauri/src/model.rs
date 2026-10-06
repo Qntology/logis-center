@@ -453,17 +453,15 @@ impl LogisModel {
             let p = phase.clone();
             let w = worst_phase.clone();
             tokio::spawn(async move {
-                use nvml_wrapper::Nvml;
-                let nvml = match Nvml::init() { Ok(n) => n, Err(_) => return };
+                let probe = crate::utils::GpuMemProbe::new();
+                if probe.free_bytes(gpu as usize).is_none() { return; }
                 while !s.load(XOrder::SeqCst) {
-                    if let Ok(dev) = nvml.device_by_index(gpu) {
-                        if let Ok(mem) = dev.memory_info() {
-                            let f = mem.free / (1024 * 1024);
-                            if f < m.load(XOrder::SeqCst) {
-                                m.store(f, XOrder::SeqCst);
-                                if let (Ok(cur), Ok(mut dst)) = (p.lock(), w.lock()) {
-                                    *dst = cur.clone();
-                                }
+                    if let Some(free) = probe.free_bytes(gpu as usize) {
+                        let f = free / (1024 * 1024);
+                        if f < m.load(XOrder::SeqCst) {
+                            m.store(f, XOrder::SeqCst);
+                            if let (Ok(cur), Ok(mut dst)) = (p.lock(), w.lock()) {
+                                *dst = cur.clone();
                             }
                         }
                     }

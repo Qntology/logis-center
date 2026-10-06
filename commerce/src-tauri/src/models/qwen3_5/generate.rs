@@ -1,6 +1,7 @@
 use crate::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart};
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor, quantized::gguf_file};
+use crate::utils::GpuDeviceExt;
 use candle_nn::VarBuilder;
 use std::io::Write;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -67,7 +68,7 @@ impl Qwen3_5GenerateModel {
 
         // 비전을 뗀 직후 OS 레벨 메모리 반환을 즉시 트리거합니다.
         if !active {
-            if self.device.is_cuda() { let _ = self.device.synchronize(); }
+            if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
             #[cfg(target_os = "windows")]
             unsafe {
                 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -432,8 +433,8 @@ impl Qwen3_5GenerateModel {
                 if !prej.device().same_device(logits.device()) {
                     println!(
                         "[SEMANTIC-PREJUDICE] 편견 벡터를 logits 와 같은 장치로 옮깁니다 ({} → {}). forward 는 logits 를 CPU 로 돌려주므로, 장치를 맞추지 않으면 첫 토큰에서 device mismatch 로 태스크가 중단됩니다.",
-                        if prej.device().is_cuda() { "GPU" } else { "CPU" },
-                        if logits.device().is_cuda() { "GPU" } else { "CPU" }
+                        if prej.device().is_cpu() { "CPU" } else { "GPU" },
+                        if logits.device().is_cpu() { "CPU" } else { "GPU" }
                     );
                     *prej = prej.to_device(logits.device())?;
                 }
@@ -653,7 +654,7 @@ impl Qwen3_5GenerateModel {
 
         // 🌟 [종료 직후 메모리 즉각 강제 반환] 
         // 80% -> 65% 지연 반환 현상 해결! OS 레벨 메모리를 즉시 강제 회수하여 65% 상태를 유지시킵니다.
-        if self.device.is_cuda() { let _ = self.device.synchronize(); }
+        if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -870,8 +871,8 @@ impl Qwen3_5GenerateModel {
                 if !prej.device().same_device(logits.device()) {
                     println!(
                         "[SEMANTIC-PREJUDICE] 편견 벡터를 logits 와 같은 장치로 옮깁니다 ({} → {}). forward 는 logits 를 CPU 로 돌려주므로, 장치를 맞추지 않으면 첫 토큰에서 device mismatch 로 태스크가 중단됩니다.",
-                        if prej.device().is_cuda() { "GPU" } else { "CPU" },
-                        if logits.device().is_cuda() { "GPU" } else { "CPU" }
+                        if prej.device().is_cpu() { "CPU" } else { "GPU" },
+                        if logits.device().is_cpu() { "CPU" } else { "GPU" }
                     );
                     *prej = prej.to_device(logits.device())?;
                 }
@@ -1092,7 +1093,7 @@ impl Qwen3_5GenerateModel {
         }
 
         // 🌟 [종료 직후 메모리 즉각 강제 반환] 
-        if self.device.is_cuda() { let _ = self.device.synchronize(); }
+        if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1181,7 +1182,7 @@ impl Qwen3_5GenerateModel {
         }
 
         // 🌟 [종료 직후 메모리 즉각 강제 반환]
-        if self.device.is_cuda() { let _ = self.device.synchronize(); }
+        if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::GetCurrentProcess;

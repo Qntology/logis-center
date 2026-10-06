@@ -450,6 +450,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ash"
+version = "0.38.0+1.3.281"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+dependencies = [
+ "libloading 0.8.9",
+]
+
+[[package]]
 name = "asn1-rs"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -993,7 +1002,7 @@ dependencies = [
  "boa_string",
  "indexmap 2.14.0",
  "num-bigint",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "strum 0.28.0",
 ]
 
@@ -1035,7 +1044,7 @@ dependencies = [
  "portable-atomic",
  "rand 0.10.2",
  "regress",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "ryu-js",
  "serde",
  "serde_json",
@@ -1072,7 +1081,7 @@ dependencies = [
  "indexmap 2.14.0",
  "once_cell",
  "phf 0.13.1",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "static_assertions",
 ]
 
@@ -1101,7 +1110,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "regress",
- "rustc-hash",
+ "rustc-hash 2.1.3",
 ]
 
 [[package]]
@@ -1111,7 +1120,7 @@ dependencies = [
  "fast-float2",
  "itoa",
  "paste",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "ryu-js",
  "static_assertions",
 ]
@@ -1328,9 +1337,9 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ecb245093b0f791b89d3420c3df9c6d49c60ab63ba54db896bf8a3baf486706"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan.git#3b651dbfa232a49dda0f4d5a3e7bc1f451c46d02"
 dependencies = [
+ "ash",
  "byteorder",
  "candle-kernels",
  "candle-metal-kernels",
@@ -1339,9 +1348,12 @@ dependencies = [
  "float8",
  "gemm 0.19.0",
  "half",
+ "hip-runtime",
+ "hip-sys",
  "libc",
  "libm",
  "memmap2",
+ "naga",
  "num-traits",
  "num_cpus",
  "objc2-foundation",
@@ -1397,8 +1409,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eaa10b6ccc365b33210ce404fbf45e60d3e0bdac1004463cf1052e6ee1c1739a"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan.git#3b651dbfa232a49dda0f4d5a3e7bc1f451c46d02"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -1410,6 +1421,14 @@ dependencies = [
  "safetensors 0.8.0",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "candle-rocm"
+version = "0.2.0"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan.git#3b651dbfa232a49dda0f4d5a3e7bc1f451c46d02"
+dependencies = [
+ "candle-core",
 ]
 
 [[package]]
@@ -1764,6 +1783,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48f68d061bc2828ae826206326e61251aca94c1e4a5305cf52d9138639c918b4"
 dependencies = [
  "encoding_rs",
+]
+
+[[package]]
+name = "codespan-reporting"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe6d2e5af09e8c8ad56c969f2157a3d4238cebc7c55f0a517728c38f7b200f81"
+dependencies = [
+ "unicode-width",
 ]
 
 [[package]]
@@ -4996,6 +5024,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hip-runtime"
+version = "0.2.0"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan.git#3b651dbfa232a49dda0f4d5a3e7bc1f451c46d02"
+dependencies = [
+ "hip-sys",
+]
+
+[[package]]
+name = "hip-sys"
+version = "0.2.0"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan.git#3b651dbfa232a49dda0f4d5a3e7bc1f451c46d02"
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5785,7 +5826,7 @@ dependencies = [
  "jieba-macros",
  "phf 0.13.1",
  "regex",
- "rustc-hash",
+ "rustc-hash 2.1.3",
 ]
 
 [[package]]
@@ -6056,7 +6097,7 @@ dependencies = [
  "rand 0.9.5",
  "rayon",
  "roaring",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "semver 1.0.28",
  "serde",
  "serde_json",
@@ -6922,6 +6963,7 @@ dependencies = [
  "candle-core",
  "candle-flash-attn",
  "candle-nn",
+ "candle-rocm",
  "candle-transformers",
  "chromiumoxide",
  "chrono",
@@ -7397,6 +7439,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "naga"
+version = "27.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "066cf25f0e8b11ee0df221219010f213ad429855f57c494f995590c861a9a7d8"
+dependencies = [
+ "arrayvec",
+ "bit-set",
+ "bitflags 2.13.0",
+ "cfg-if",
+ "cfg_aliases",
+ "codespan-reporting",
+ "half",
+ "hashbrown 0.16.1",
+ "indexmap 2.14.0",
+ "libm",
+ "log",
+ "num-traits",
+ "once_cell",
+ "pp-rs",
+ "rustc-hash 1.1.0",
+ "spirv",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -8668,6 +8735,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
+name = "pp-rs"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb458bb7f6e250e6eb79d5026badc10a3ebb8f9a15d1fff0f13d17c71f4d6dee"
+dependencies = [
+ "unicode-xid",
+]
+
+[[package]]
 name = "ppmd-rust"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8998,7 +9074,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "rustls 0.23.42",
  "socket2 0.6.5",
  "thiserror 2.0.18",
@@ -9019,7 +9095,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_pcg",
  "ring 0.17.14",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "rustls 0.23.42",
  "rustls-pki-types",
  "slab",
@@ -9687,6 +9763,12 @@ checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
 
 [[package]]
 name = "rustc-hash"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
+name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
@@ -10075,7 +10157,7 @@ dependencies = [
  "phf 0.13.1",
  "phf_codegen",
  "precomputed-hash",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "servo_arc",
  "smallvec",
 ]
@@ -10094,7 +10176,7 @@ dependencies = [
  "phf 0.13.1",
  "phf_codegen",
  "precomputed-hash",
- "rustc-hash",
+ "rustc-hash 2.1.3",
  "servo_arc",
  "smallvec",
 ]
@@ -10627,6 +10709,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 dependencies = [
  "lock_api",
+]
+
+[[package]]
+name = "spirv"
+version = "0.3.0+sdk-1.3.268.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eda41003dc44290527a59b13432d4a0379379fa074b70174882adfbdfd917844"
+dependencies = [
+ "bitflags 2.13.0",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
 use super::{LogisModel, ModelSize};
 use crate::utils;
+use crate::utils::GpuDeviceExt;
 use anyhow::anyhow;
 use crate::models::qwen::generate::QwenVLGenerateModel;
 use crate::models::qwen3_5::generate::Qwen3_5GenerateModel;
@@ -32,10 +33,10 @@ impl LogisModel {
             println!("[MODEL] Embedding Memory Cache cleared to free RAM.");
         }
         if !self.is_cpu_mode {
-            if self.device_config.device.is_cuda() {
+            if self.device_config.device.is_cuda_or_rocm() {
                 let _ = self.device_config.device.synchronize();
             }
-            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+            utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
             println!("[MODEL] CUDA Context synchronized and memory pool flushed.");
         }
         self.sync_crossover_phase().await;
@@ -92,7 +93,7 @@ impl LogisModel {
             let sync = tokio::time::timeout(
                 Duration::from_secs(5),
                 tokio::task::spawn_blocking(move || {
-                    if dev.is_cuda() {
+                    if dev.is_cuda_or_rocm() {
                         let _ = dev.synchronize();
                     }
                 }),
@@ -103,7 +104,7 @@ impl LogisModel {
                 Err(_) => println!("[CROSSOVER] ⚠️ CUDA sync 5s 상한 도달. 동기화 없이 진행합니다."),
             }
             // caching allocator 가 붙들고 있는 풀을 OS 로 밀어냅니다.
-            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+            utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
         }
 
         self.sync_crossover_phase().await;
@@ -180,7 +181,7 @@ impl LogisModel {
         if !self.is_cpu_mode {
             let dev = self.device_config.device.clone();
             let sync_res = tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || {
-                if dev.is_cuda() { 
+                if dev.is_cuda_or_rocm() { 
                     println!("[DIAG-PURGE] Executing dev.synchronize()...");
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         dev.synchronize()
@@ -197,7 +198,7 @@ impl LogisModel {
             }
 
             // 🌟 [추가] 기존에 할당된 CUDA 메모리 풀을 OS에 즉시 반환시키기 위한 컨텍스트 덮어쓰기
-            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+            utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
         }
 
         println!("[DIAG-PURGE] Step 4: Flushing OS Memory...");
@@ -251,15 +252,9 @@ impl LogisModel {
             }
 
             // 2. Measure VRAM
-            let mut current_free = 0;
-            use nvml_wrapper::Nvml;
-            if let Ok(nvml) = Nvml::init() {
-                if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
-                    if let Ok(mem) = dev.memory_info() {
-                        current_free = mem.free;
-                    }
-                }
-            }
+            let current_free = utils::gpu_mem_info(self.device_config.gpu_id as usize)
+                .map(|(free, _)| free)
+                .unwrap_or(0);
 
             // [FAST-PATH] Immediate Success
             if current_free >= target_bytes {
@@ -317,21 +312,11 @@ impl LogisModel {
         Ok(())
     }
 
-    // --- [NEW] VRAM 자유 메모리 조회 헬퍼 ---
-    /// 현재 디바이스의 자유 VRAM을 MB 단위로 반환합니다.
-    /// CPU 모드면 항상 충분하다는 의미로 u64::MAX를 돌려줍니다.
-    /// nvml 초기화 실패 시 보수적으로 0을 반환합니다.
     pub fn get_free_vram_mb(&self) -> u64 {
         if self.is_cpu_mode { return u64::MAX; }
-        use nvml_wrapper::Nvml;
-        if let Ok(nvml) = Nvml::init() {
-            if let Ok(dev) = nvml.device_by_index(self.device_config.gpu_id as u32) {
-                if let Ok(mem) = dev.memory_info() {
-                    return mem.free / (1024 * 1024);
-                }
-            }
-        }
-        0
+        utils::gpu_mem_info(self.device_config.gpu_id as usize)
+            .map(|(free, _)| free / (1024 * 1024))
+            .unwrap_or(0)
     }
 
     // --- [NEW] SSD Bridge Operations ---    
@@ -665,7 +650,7 @@ impl LogisModel {
             
             let path = self.qwen3_model_path.clone();
             let dev = self.device_config.device.clone();
-            let dtype = if self.is_cpu_mode { Some(candle_core::DType::F32) } else { Some(candle_core::DType::BF16) };
+            let dtype = if self.is_cpu_mode || dev.is_vulkan() { Some(candle_core::DType::F32) } else { Some(candle_core::DType::BF16) };
             
             // 🌟 방금 만든 init_from_gguf 를 호출합니다!
             let gen_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Qwen3GenerateModel> {
@@ -724,7 +709,7 @@ impl LogisModel {
         let target_device = self.device_config.device.clone();
         let is_disk_swap = self.is_disk_swap;
         let dev_id = self.device_config.gpu_id;
-        let dtype = if target_device.is_cpu() { Some(candle_core::DType::F32) } else { Some(candle_core::DType::BF16) };
+        let dtype = if target_device.is_cpu() || target_device.is_vulkan() { Some(candle_core::DType::F32) } else { Some(candle_core::DType::BF16) };
         let limit = self.max_tokens_limit;
         let path_clone = path.to_string();
         let handle_clone = self.app_handle.clone();
@@ -1238,7 +1223,7 @@ impl LogisModel {
         if !self.is_cpu_mode {
             let dev = self.device_config.device.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                if dev.is_cuda() {
+                if dev.is_cuda_or_rocm() {
                     let _ = dev.synchronize();
                 }
             })
@@ -1548,7 +1533,7 @@ impl LogisModel {
         // ── ② 신규 로드 ──
         let path = self.siglip2_model_path.clone();
         let dev = self.device_config.device.clone();
-        let dtype = if self.is_cpu_mode {
+        let dtype = if self.is_cpu_mode || dev.is_vulkan() {
             candle_core::DType::F32
         } else {
             candle_core::DType::BF16
@@ -1625,7 +1610,7 @@ impl LogisModel {
             let sync_res = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 tokio::task::spawn_blocking(move || {
-                    if dev.is_cuda() {
+                    if dev.is_cuda_or_rocm() {
                         let _ = dev.synchronize();
                     }
                 }),
@@ -1636,7 +1621,7 @@ impl LogisModel {
                 Ok(Err(e)) => println!("[VRAM] CUDA synchronize join error: {:?}", e),
                 Err(_) => println!("[VRAM] ⚠️ CUDA synchronize 5s timeout — 드라이버 스톨 감지, 동기화 없이 진행합니다."),
             }
-            let _ = candle_core::Device::new_cuda(self.device_config.gpu_id as usize);
+            utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
             println!("[VRAM] CUDA context refresh done. Proceeding to STAGE-5.");
             if let Some(token) = None::<Arc<AtomicBool>> {
                 let _ = token;
@@ -1726,7 +1711,7 @@ impl LogisModel {
                 gpu_id: 0,
             };
         } else {
-            let fresh_dev = candle_core::Device::new_cuda(config.gpu_id as usize).unwrap_or(candle_core::Device::Cpu);
+            let fresh_dev = utils::new_gpu_device(config.gpu_id as usize).unwrap_or(candle_core::Device::Cpu);
             config.device = fresh_dev;
             println!("🚀 [MODEL] Running in default mode ({}) with Fresh CUDA Context", config.name);
         }

@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, Tensor, Module};
+use crate::utils::GpuDeviceExt;
 use candle_nn::{VarBuilder, linear_no_bias as linear};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -52,7 +53,7 @@ struct RotaryEmbedding {
 
 impl RotaryEmbedding {
     fn new(dim: usize, max_seq_len: usize, theta: f64, device: &Device) -> candle_core::Result<Self> {
-        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let dtype = if device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         let inv_freq: Vec<_> = (0..dim)
             .step_by(2)
             .map(|i| 1f32 / (theta.powf(i as f64 / dim as f64) as f32))
@@ -262,7 +263,7 @@ impl EmbeddingModel {
         let config: Config = serde_json::from_str(&config_str)?;
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
 
-        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let dtype = if device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
 
         let model = if weights_path.exists() {
              println!("[EmbeddingModel] Loading Safetensors model from {:?}", weights_path);
@@ -355,15 +356,9 @@ impl EmbeddingModel {
 
     fn free_vram_mb(&self) -> u64 {
         if self.device.is_cpu() { return u64::MAX; }
-        use nvml_wrapper::Nvml;
-        if let Ok(nvml) = Nvml::init() {
-            if let Ok(dev) = nvml.device_by_index(0) {
-                if let Ok(mem) = dev.memory_info() {
-                    return mem.free / (1024 * 1024);
-                }
-            }
-        }
-        0
+        crate::utils::gpu_mem_info(0)
+            .map(|(free, _)| free / (1024 * 1024))
+            .unwrap_or(0)
     }
 
     /// 지금 띄워도 되는 동시 순전파 스레드 수. 상한은 기존과 같은 3 입니다.

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use candle_core::{D, IndexOp, Tensor};
+use crate::utils::GpuDeviceExt;
 use candle_nn::{
     Activation, BatchNorm, BatchNormConfig, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
     ConvTranspose1d, ConvTranspose1dConfig, Embedding, LayerNorm, LayerNormConfig, Linear, Module,
@@ -773,21 +774,12 @@ pub fn vision_query_tile_size(num_heads: usize, kv_len: usize, dtype_bytes: usiz
         return 0;
     }
 
-    let nvml = match nvml_wrapper::Nvml::init() {
-        Ok(n) => n,
-        // NVML 이 없으면(CPU 모드 등) 보수적으로 고정 타일을 씁니다.
-        Err(_) => return TILE_MAX.min(kv_len),
-    };
-    let dev = match nvml.device_by_index(0) {
-        Ok(d) => d,
-        Err(_) => return TILE_MAX.min(kv_len),
-    };
-    let mem = match dev.memory_info() {
-        Ok(m) => m,
-        Err(_) => return TILE_MAX.min(kv_len),
+    let free_vram = match crate::utils::gpu_mem_info(0) {
+        Some((free, _)) => free,
+        None => return TILE_MAX.min(kv_len),
     };
 
-    let usable = mem.free.saturating_sub(RESERVE);
+    let usable = free_vram.saturating_sub(RESERVE);
     let budget = usable / BUDGET_SHARE;
     if budget == 0 {
         return TILE_MIN;
@@ -810,7 +802,7 @@ pub fn eager_attention_forward(
     let orig_dtype = query_states.dtype();
     
     // 🌟 [VRAM 최적화] F32 연산은 VRAM을 2배로 폭식하므로, Attention 연산 직전에만 BF16으로 다운캐스팅하여 OOM을 원천 차단합니다.
-    let target_dtype = if dev.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+    let target_dtype = if dev.is_cuda_or_rocm() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
 
     #[cfg(feature = "flash-attn")]
     {

@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, Tensor};
+use crate::utils::GpuDeviceExt;
 use candle_nn::{Embedding, Module, VarBuilder}; 
 use candle_core::quantized::{gguf_file, QMatMul};
 use std::path::Path;
@@ -39,7 +40,7 @@ impl RmsNorm {
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         
         self.weight = self.weight.to_dtype(target_dtype)?.to_device(device)?;
         Ok(())
@@ -122,7 +123,7 @@ impl QLinear {
         let is_cpu_qtensor = device.is_cpu() && matches!(self.inner, QMatMul::QTensor(_));
 
         if !self.device.same_device(device) || is_cpu_qtensor {
-            let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+            let target_dtype = if device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
             
             self.inner = match &self.inner {
                 QMatMul::QTensor(q) => {
@@ -151,13 +152,13 @@ impl QLinear {
         if self.is_cleared() {
             return Err(anyhow!("Linear weight is cleared. Reload required."));
         }
-        if device.is_cuda() {
+        if device.is_cuda_or_rocm() {
             // GPU로 갈 때는 프레임워크 한계상 압축을 풀어야 함
             self.to_device(device)?;
         } else {
             // CPU일 때는 압축 상태(QTensor)를 유지하여 RAM 피크(OOM) 완벽 방지!
             if let Some(b) = &self.bias {
-                let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+                let target_dtype = if device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
                 self.bias = Some(b.to_device(device)?.to_dtype(target_dtype)?);
             }
             self.device = device.clone();
@@ -669,7 +670,7 @@ impl QuantizedQwenVLTextAttention {
         self.active_kv_name = kv_name;
         
         let dev = self.q_proj.device();
-        let target_dtype = if dev.is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if dev.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
 
         // 1. [ALIGNMENT] Input & Rotary
         let xs = if !xs.device().same_device(dev) { xs.to_device(dev)? } else { xs.clone() };
@@ -724,8 +725,8 @@ impl QuantizedQwenVLTextAttention {
                         let cat_k = Tensor::cat(&[&pk_f, &k_piece], 2)?.contiguous()?;
                         let cat_v = Tensor::cat(&[&pv_f, &v_piece], 2)?.contiguous()?;
                         
-                        inner.k_cache = Some(if dev.is_cuda() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
-                        inner.v_cache = Some(if dev.is_cuda() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
+                        inner.k_cache = Some(if dev.is_cuda_or_rocm() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
+                        inner.v_cache = Some(if dev.is_cuda_or_rocm() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
                         
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
@@ -751,8 +752,8 @@ impl QuantizedQwenVLTextAttention {
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
-                    inner.k_cache = Some(if dev.is_cuda() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece });
-                    inner.v_cache = Some(if dev.is_cuda() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
+                    inner.k_cache = Some(if dev.is_cuda_or_rocm() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece });
+                    inner.v_cache = Some(if dev.is_cuda_or_rocm() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
                 }
                 
                 let mut reg = self.registry.entries.write().unwrap();
@@ -907,7 +908,7 @@ impl QuantizedQwenVLTextAttention {
                     // 🌟 [KV RESIDENCY] VRAM 상주가 확정된 경우, 읽어온 블록을 FP8 로 VRAM 에 눌러앉힙니다.
                     //    이후 토큰에서는 이 블록이 KVLocation::VRAM 으로 잡혀
                     //    SafeTensors 역직렬화 + PCIe 업로드가 통째로 사라집니다.
-                    if self.kv_residency == crate::utils::resources::KvResidency::Vram && dev.is_cuda() {
+                    if self.kv_residency == crate::utils::resources::KvResidency::Vram && dev.is_cuda_or_rocm() {
                         let k_res = k_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_gpu.clone());
                         let v_res = v_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_gpu.clone());
                         inner.k_cache = Some(k_res);
@@ -1041,7 +1042,7 @@ impl QuantizedQwenVLTextAttention {
         let original_shape = t.shape().dims().to_vec();
         
         // 🌟 [동적 타입 분기] SSD 저장소 맵으로 넘기기 직전에도 F32/FP8 원본 정밀도를 절대 파괴하지 않고 보존합니다.
-        let target_dtype = if t.device().is_cuda() || t.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
+        let target_dtype = if t.device().is_cuda_or_rocm() || t.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
         let t_compressed = t.to_dtype(target_dtype).unwrap_or_else(|_| t.clone()).to_device(&Device::Cpu)?.contiguous()?;
         Ok((t_compressed, original_shape))
     }
@@ -1281,12 +1282,12 @@ impl QuantizedQwenVLTextAttention {
                                 
                                 
                                 let target_device = self.q_proj.device();
-                                let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+                                let target_dtype = if target_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
                                 
                                 let k_gpu = k_raw.to_device(target_device)?;
                                 let v_gpu = v_raw.to_device(target_device)?;
-                                inner.k_cache = Some(if target_device.is_cuda() { k_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_gpu.clone()) } else { k_gpu.to_dtype(target_dtype)? });
-                                inner.v_cache = Some(if target_device.is_cuda() { v_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_gpu.clone()) } else { v_gpu.to_dtype(target_dtype)? });
+                                inner.k_cache = Some(if target_device.is_cuda_or_rocm() { k_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_gpu.clone()) } else { k_gpu.to_dtype(target_dtype)? });
+                                inner.v_cache = Some(if target_device.is_cuda_or_rocm() { v_gpu.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_gpu.clone()) } else { v_gpu.to_dtype(target_dtype)? });
                                 
                                 inner.location = KVLocation::VRAM; // RAM을 건너뛰고 VRAM 상주 확정!
                                 reg[b_idx].location[self.layer_idx] = KVLocation::VRAM;
@@ -1319,7 +1320,7 @@ impl QuantizedQwenVLTextAttention {
         if let (Some(mk), Some(mv)) = (&self.vram_merged_k, &self.vram_merged_v) {
             
             // 🌟 [동적 타입 분기] 공용 모듈 사용을 고려하여 텐서 고유의 DType(FP8, BF16, F32)을 감지하여 보존합니다.
-            let target_dtype = if mk.device().is_cuda() || mk.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
+            let target_dtype = if mk.device().is_cuda_or_rocm() || mk.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
             let mk_cpu = mk.contiguous()?.to_dtype(target_dtype).unwrap_or_else(|_| mk.clone()).to_device(dev)?;
             let mv_cpu = mv.contiguous()?.to_dtype(target_dtype).unwrap_or_else(|_| mv.clone()).to_device(dev)?;
             
@@ -1365,7 +1366,7 @@ impl QuantizedQwenVLTextAttention {
             let merged_v = Tensor::cat(&v_list, 2)?.contiguous()?;
             
             // 🌟 [동적 타입 분기]
-            let target_dtype = if merged_k.device().is_cuda() || merged_k.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
+            let target_dtype = if merged_k.device().is_cuda_or_rocm() || merged_k.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
             let merged_k_cpu = merged_k.to_dtype(target_dtype).unwrap_or_else(|_| merged_k.clone()).to_device(dev)?;
             let merged_v_cpu = merged_v.to_dtype(target_dtype).unwrap_or_else(|_| merged_v.clone()).to_device(dev)?;
             
@@ -1392,7 +1393,7 @@ impl QuantizedQwenVLTextAttention {
 
     pub fn inject_live_kv(&mut self, k_i8: &Tensor, v_i8: &Tensor, k_scale: f32, v_scale: f32) -> Result<()> {
         let target_device = self.q_proj.device(); 
-        let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if target_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         let k_gpu_i8 = k_i8.to_device(target_device)?;
         let v_gpu_i8 = v_i8.to_device(target_device)?;
         let k_small = (k_gpu_i8.to_dtype(DType::F32)? * k_scale as f64)?.to_dtype(target_dtype)?;
@@ -1969,7 +1970,7 @@ impl QuantizedQwenVLTextModel {
             is_forced_cpu, 
             active_session_id: None, 
             active_kv_name: None, 
-            pinned_layer_count: if current_device.is_cuda() { num_layers_to_load } else { 0 }, 
+            pinned_layer_count: if current_device.is_cuda_or_rocm() { num_layers_to_load } else { 0 }, 
             current_kv_len: 0,
             kv_plan: None,
             keep_weights_resident: false,
@@ -2033,7 +2034,7 @@ impl QuantizedQwenVLTextModel {
 
         let mut layers = vec![];
         for layer_idx in 0..num_layers_to_load {
-            if device.is_cuda() { pinned_layer_count += 1; }
+            if device.is_cuda_or_rocm() { pinned_layer_count += 1; }
             let gguf_blk = format!("blk.{layer_idx}");
             let prefix = if ct.tensor_infos.contains_key(&format!("{}.attn_norm.weight", gguf_blk)) { gguf_blk } else { format!("{base_name}.layers.{layer_idx}") };
             let mut layer = QuantizedQwenVLTextDecoderLayer::new(config, &ct, reader, &prefix, device, effective_dtype, layer_idx, baking_only, registry.clone())?;
@@ -2243,7 +2244,7 @@ impl QuantizedQwenVLTextModel {
                 // 디코딩(1토큰)에서는 회수할 과거 블록이 없는데도 스톨만 발생하므로 건너뜁니다.
                 if !is_decoding {
                     let dev = self.layers[layer_idx].device();
-                    if dev.is_cuda() {
+                    if dev.is_cuda_or_rocm() {
                         let _ = dev.synchronize();
                     }
                 }
@@ -2422,7 +2423,7 @@ impl QuantizedQwenVLTextModel {
 
         // [NO-PER-LAYER-STALL] 레이어마다 GPU 하드 동기화를 걸면 토큰당 28회 파이프라인이 멈춥니다.
         // 프리필에서만 유지하고 디코딩에서는 제거합니다.
-        if target_device.is_cuda() && !is_decoding { let _ = target_device.synchronize(); }
+        if target_device.is_cuda_or_rocm() && !is_decoding { let _ = target_device.synchronize(); }
 
         if let Some(sid) = session_id {
             
@@ -2483,7 +2484,7 @@ impl QuantizedQwenVLTextModel {
                             let k = inner.k_cache.take();
                             let v = inner.v_cache.take();
                             if let (Some(k_t), Some(v_t)) = (k, v) {
-                                let target_dtype = if k_t.device().is_cuda() || k_t.dtype() == candle_core::DType::F8E4M3 {
+                                let target_dtype = if k_t.device().is_cuda_or_rocm() || k_t.dtype() == candle_core::DType::F8E4M3 {
                                     candle_core::DType::F8E4M3
                                 } else {
                                     candle_core::DType::F32
@@ -2581,7 +2582,7 @@ impl QuantizedQwenVLTextModel {
 
                 // 🌟 [FP8 Compression] 전체 활성 블록을 디스크로 보낼 때 VRAM 안에서 먼저 FP8로 캐스팅해 RAM으로 보냅니다.
                 // SSD 저장 로직(LayerKVDump) 내부에서 백그라운드 스레드가 이를 다시 원래의 BF16으로 무손실 복구해 저장하게 됩니다.
-                let target_dtype = if merged_k_gpu.device().is_cuda() || merged_k_gpu.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
+                let target_dtype = if merged_k_gpu.device().is_cuda_or_rocm() || merged_k_gpu.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
                 let merged_k_cpu = merged_k_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
                 let merged_v_cpu = merged_v_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
@@ -2713,7 +2714,7 @@ impl QuantizedQwenVLTextModel {
             let merged_v_gpu = candle_core::Tensor::cat(&gpu_v_list, 2).unwrap_or_else(|_| gpu_v_list[0].clone());
 
             // 🌟 [FP8 Compression] 디코딩 롤백 시 단일 레이어 VRAM 완전 철수 과정에서도 GPU 코어로 초고속 FP8 압축합니다.
-            let target_dtype = if merged_k_gpu.device().is_cuda() || merged_k_gpu.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
+            let target_dtype = if merged_k_gpu.device().is_cuda_or_rocm() || merged_k_gpu.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
             let merged_k_cpu = merged_k_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
             let merged_v_cpu = merged_v_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
@@ -2873,7 +2874,7 @@ impl QuantizedQwenVLTextModel {
         }
 
         let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
-        let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if target_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?;
 
         let position_ids = match position_ids_in {
@@ -2947,7 +2948,7 @@ impl QuantizedQwenVLTextModel {
             }
         }
 
-        if target_device.is_cuda() { let _ = target_device.synchronize(); }
+        if target_device.is_cuda_or_rocm() { let _ = target_device.synchronize(); }
 
         self.current_kv_len = seqlen_offset + seq_len;
         let norm_dev = self.norm.weight().device();
@@ -3032,7 +3033,7 @@ impl QuantizedQwenVLTextModel {
 
     pub fn inject_live_kv_bitkv(&mut self, k_data: &[Tensor], v_data: &[Tensor], original_shape: &[usize]) -> Result<()> {
         let target_device = self.layers[0].device().clone();
-        let target_dtype = if target_device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if target_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         
         for (i, layer) in self.layers.iter_mut().enumerate() {
             if i < k_data.len() {
@@ -3135,26 +3136,17 @@ impl QuantizedQwenVLTextModel {
 
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> {
         if self.is_forced_cpu { return Ok(()); } 
-        
-        use nvml_wrapper::Nvml;
-        
-        let nvml = Nvml::init().ok();
-        let mut free_vram = 0;
-        
-        if let Some(nvml_inst) = &nvml {
-            if let Ok(dev) = nvml_inst.device_by_index(device_id as u32) {
-                if let Ok(mem) = dev.memory_info() {
-                    free_vram = mem.free;
-                }
-            }
-        }
+
+        let free_vram = crate::utils::gpu_mem_info(device_id)
+            .map(|(free, _)| free)
+            .unwrap_or(0);
 
         let danger_zone = 500_000_000; 
         let safe_zone = 1_000_000_000; 
 
         if free_vram > 0 && free_vram < danger_zone {
             for layer in self.layers.iter_mut().rev() {
-                if layer.device().is_cuda() {
+                if layer.device().is_cuda_or_rocm() {
                     println!("[REBALANCE] (Offset: {}/{}) Low VRAM ({:.2} MB). Offloading Layer {} to CPU.", offset, total_len, free_vram as f64 / 1e6, layer.self_attn.layer_idx);
                     layer.to_device(&Device::Cpu)?;
                     break; 
@@ -3203,7 +3195,7 @@ impl QuantizedQwenVLModel {
         baking_only: bool, 
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
-        let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { DType::F16 };
+        let vision_dtype = if vision_device.is_cpu() || vision_device.is_vulkan() { DType::F32 } else { DType::F16 };
         
         
         let visual = if baking_only {
@@ -3266,7 +3258,7 @@ impl QuantizedQwenVLModel {
         baking_only: bool, 
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
-        let vision_dtype = if vision_device.is_cpu() { DType::F32 } else { DType::F16 };
+        let vision_dtype = if vision_device.is_cpu() || vision_device.is_vulkan() { DType::F32 } else { DType::F16 };
         
         let visual = if baking_only {
             None
@@ -3333,7 +3325,7 @@ impl QuantizedQwenVLModel {
         }
         self.visual = None;
 
-        if self.vision_device.is_cuda() {
+        if self.vision_device.is_cuda_or_rocm() {
             let _ = self.vision_device.synchronize();
         }
         Self::force_memory_release();
@@ -3391,7 +3383,7 @@ impl QuantizedQwenVLModel {
         let image_grid_thw = if !image_grid_thw.device().same_device(&self.vision_device) { image_grid_thw.to_device(&self.vision_device)? } else { image_grid_thw.clone() };
         let (image_embeds, deepstack_image_embeds) = visual_model.forward(&pixel_values, &image_grid_thw)?;
         
-        let target_dtype = if self.text_device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if self.text_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         
         let image_embeds = image_embeds.to_dtype(target_dtype)?.to_device(&self.text_device)?;
         let deepstack_image_embeds: Result<Vec<Tensor>> = deepstack_image_embeds.into_iter().map(|t| Ok(t.to_dtype(target_dtype)?.to_device(&self.text_device)?)).collect();
@@ -3479,7 +3471,7 @@ impl QuantizedQwenVLModel {
 
         let position_ids = Tensor::from_vec(flat_pos_ids, (3, b_sz, seq_len), input_ids.device())?;
         
-        let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if input_ids.device().is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         let deltas = Tensor::from_vec(mrope_position_deltas.clone(), (b_sz, 1), input_ids.device())?.to_dtype(target_dtype)?; 
         Ok((position_ids, deltas, mrope_position_deltas))
     }
@@ -3512,7 +3504,7 @@ impl QuantizedQwenVLModel {
         }
         
         let mut inputs_embeds = self.language_model.embed_tokens.forward(&input_ids)?;
-        let target_dtype = if self.text_device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if self.text_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         inputs_embeds = inputs_embeds.to_dtype(target_dtype)?;
         
         if let Some(pv) = pixel_values { 
@@ -3564,7 +3556,7 @@ impl QuantizedQwenVLModel {
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
         
         let head_dev = self.lm_head.device();
-        let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
+        let head_dtype = if head_dev.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         
         let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
         let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
@@ -3674,7 +3666,7 @@ impl QuantizedQwenTextModel {
         let flat_input = input_ids.flatten_all()?;
         let inputs_embeds_flat = self.language_model.embed_tokens.forward(&flat_input)?;
         
-        let target_dtype = if self.text_device.is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if self.text_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         let inputs_embeds = inputs_embeds_flat.reshape((b_sz, seq_len, ()))?.to_dtype(target_dtype)?;
         
         let start = seqlen_offset as u32;
@@ -3761,7 +3753,7 @@ impl QuantizedQwenTextModel {
         let hidden_state = final_hidden_state.unwrap();
         
         let head_dev = self.lm_head.as_ref().map(|h| h.device()).unwrap_or(&self.text_device);
-        let head_dtype = if head_dev.is_cuda() { DType::BF16 } else { DType::F32 };
+        let head_dtype = if head_dev.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         
         let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
         let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };

@@ -4994,20 +4994,17 @@ async fn check_gpu_availability() -> serde_json::Value {
     let mut vendor = "none";
 
     if !config.is_cpu {
-        vendor = "amd"; // 기본적으로 CPU가 아니면 AMD(ROCm)로 가정
-
-        // NVIDIA GPU 여부 판별 (nvml-wrapper 사용)
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            if nvml_wrapper::Nvml::init().is_ok() {
-                vendor = "nvidia";
-            }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            vendor = "apple";
-        }
+        vendor = if config.device.is_cuda() {
+            "nvidia"
+        } else if config.device.is_rocm() {
+            "amd"
+        } else if config.device.is_vulkan() {
+            "vulkan"
+        } else if config.device.is_metal() {
+            "apple"
+        } else {
+            "none"
+        };
     }
 
     serde_json::json!({

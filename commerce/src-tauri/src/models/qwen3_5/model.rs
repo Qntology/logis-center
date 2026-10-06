@@ -2,6 +2,7 @@ use std::io::{Read, Seek};
 
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor, quantized::QMatMul};
+use crate::utils::GpuDeviceExt;
 use candle_nn::{
     Conv1d, Embedding, Linear, Module, VarBuilder, embedding, linear_b, linear_no_bias,
     ops::sigmoid,
@@ -849,8 +850,8 @@ impl Qwen3_5Attention {
                         let cat_k = Tensor::cat(&[&pk_f, &k_piece], 2)?.contiguous()?;
                         let cat_v = Tensor::cat(&[&pv_f, &v_piece], 2)?.contiguous()?;
 
-                        inner.k_cache = Some(if dev.is_cuda() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
-                        inner.v_cache = Some(if dev.is_cuda() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
+                        inner.k_cache = Some(if dev.is_cuda_or_rocm() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
+                        inner.v_cache = Some(if dev.is_cuda_or_rocm() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
                         
@@ -874,8 +875,8 @@ impl Qwen3_5Attention {
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
-                    inner.k_cache = Some(if dev.is_cuda() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece }); 
-                    inner.v_cache = Some(if dev.is_cuda() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
+                    inner.k_cache = Some(if dev.is_cuda_or_rocm() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece }); 
+                    inner.v_cache = Some(if dev.is_cuda_or_rocm() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
                 }
                 
                 let mut reg = self.registry.entries.write().unwrap();
@@ -1522,12 +1523,8 @@ fn decode_resident_gate(on_cuda: bool, weight_bytes: u64, kv_bytes: u64) -> (boo
     if !on_cuda {
         return ((crate::utils::resources::free_ram_bytes() as u64) > 6_000_000_000, None);
     }
-    let free = nvml_wrapper::Nvml::init().ok().and_then(|nvml| {
-        nvml.device_by_index(crate::utils::resources::primary_gpu_id() as u32)
-            .ok()
-            .and_then(|dev| dev.memory_info().ok())
-            .map(|m| m.free)
-    });
+    let free = crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize)
+        .map(|(free, _)| free);
     match free {
         Some(f) => (
             weight_bytes > 0 && f >= weight_bytes + kv_bytes + DECODE_RESIDENT_VRAM_MARGIN_BYTES,
@@ -1625,7 +1622,7 @@ impl Qwen3_5TextModel {
             drop(embed_tensor);
             w
         };
-        if device.is_cuda() {
+        if device.is_cuda_or_rocm() {
             // 방금 떨어뜨린 양자화 원본을 할당자가 실제로 반환하도록 경계를 만듭니다.
             let _ = device.synchronize();
         }
@@ -1739,7 +1736,7 @@ impl Qwen3_5TextModel {
                 );
                 let weight_bytes = self.decode_resident_bytes();
                 let kv_bytes = (full_attn_layers * kv_heads * kv_head_dim * 2 * planned) as u64;
-                let (keep, vram_free) = decode_resident_gate(xs.device().is_cuda(), weight_bytes, kv_bytes);
+                let (keep, vram_free) = decode_resident_gate(xs.device().is_cuda_or_rocm(), weight_bytes, kv_bytes);
                 let (prefix, prefix_bytes) = match vram_free {
                     Some(free) if !keep => self.decode_resident_prefix(
                         free.saturating_sub(kv_bytes + DECODE_RESIDENT_VRAM_MARGIN_BYTES + self.max_layer_bytes()),
@@ -1796,7 +1793,7 @@ impl Qwen3_5TextModel {
                     None => println!(
                         "[DECODE-RESIDENT] {} | {} → {} (읽은 층의 파일 페이지 반환 {} · RAM 여유 {:.0} MB)",
                         label,
-                        if xs.device().is_cuda() { "VRAM 조회 실패" } else { "CUDA 밖 장치는 기존 기준(여유 RAM 6GB 초과)" },
+                        if xs.device().is_cuda_or_rocm() { "VRAM 조회 실패" } else { "CUDA 밖 장치는 기존 기준(여유 RAM 6GB 초과)" },
                         if keep { "Resident" } else { "Stream" },
                         page_mode,
                         ram_free as f64 / 1e6
@@ -1843,7 +1840,7 @@ impl Qwen3_5TextModel {
                         "[DECODE-RESIDENT] 층 {} 를 VRAM 에 상주시키다 실패했습니다 ({}). 이미 올린 층을 비우고 이번 생성의 남은 토큰은 토큰마다 mmap 에서 다시 읽는 기존 경로로 진행합니다.",
                         l_idx, e
                     );
-                    if xs.device().is_cuda() {
+                    if xs.device().is_cuda_or_rocm() {
                         let _ = xs.device().synchronize();
                     }
                     self.reload_layer(l_idx, xs.device())?;
@@ -1965,7 +1962,7 @@ impl Qwen3_5TextModel {
                             let k = inner.k_cache.take();
                             let v = inner.v_cache.take();
                             if let (Some(k_t), Some(v_t)) = (k, v) {
-                                let target_dtype = if k_t.device().is_cuda() || k_t.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
+                                let target_dtype = if k_t.device().is_cuda_or_rocm() || k_t.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
                                 inner.k_cache = Some(k_t.to_dtype(target_dtype).unwrap_or_else(|_| k_t.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_t.clone()));
                                 inner.v_cache = Some(v_t.to_dtype(target_dtype).unwrap_or_else(|_| v_t.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_t.clone()));
                                 inner.location = KVLocation::RAM;
@@ -2340,7 +2337,7 @@ impl Qwen3_5TextModel {
                     // 🌟 [FP8 Compression] Qwen3.5 0.8B 모델 역시 디스크 백업 준비 단계에서 GPU 상에서 즉시 FP8 압축을 마친 뒤 RAM으로 내립니다.
                     // Qwen 계열(qwen, qwen3, qwen3_5) 모두 Attention forward 시에 to_device와 to_dtype 코어가 존재하여
                     // VRAM 재진입 시 자동으로 원래의 BF16/F32 정밀도로 복구됩니다.
-                    let target_dtype = if merged_k_gpu.device().is_cuda() || merged_k_gpu.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
+                    let target_dtype = if merged_k_gpu.device().is_cuda_or_rocm() || merged_k_gpu.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
                     let merged_k_cpu = merged_k_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
                     let merged_v_cpu = merged_v_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
@@ -2752,7 +2749,7 @@ impl Qwen3_5Model {
             .to_dtype(DType::F32)?
             .to_device(input_ids.device())?;
             
-        let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if input_ids.device().is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         let deltas = Tensor::from_vec(mrope_position_deltas.clone(), (b_sz, 1), &Device::Cpu)?
             .to_dtype(DType::F32)? 
             .to_device(input_ids.device())? 
@@ -2831,7 +2828,7 @@ impl Qwen3_5Model {
         }
         
         let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
-        let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if input_ids.device().is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         inputs_embeds = inputs_embeds.to_dtype(target_dtype)?;
         
         if let Some(pixel_values) = pixel_values {

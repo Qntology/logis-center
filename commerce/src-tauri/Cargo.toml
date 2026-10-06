@@ -47,6 +47,7 @@ ahash = "0.8.11"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
 candle-flash-attn = { version = "0.11.0", optional = true }
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", optional = true }
 tokenizers = "0.22.1"
 num = "0.4.3"
 minijinja = "2.12.0"
@@ -93,8 +94,14 @@ metal = "0.33.0"
 [features]
 default = ["cuda"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+rocm = ["dep:candle-rocm", "candle-core/rocm", "candle-nn/rocm"]
+vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 flash-attn = []
+
+[patch.crates-io]
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan.git" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan.git" }
 
 
 [profile.dev]

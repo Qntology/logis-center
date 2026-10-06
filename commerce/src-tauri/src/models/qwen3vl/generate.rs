@@ -1,6 +1,7 @@
 use crate::openai_types::ChatCompletionParameters;
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
+use crate::utils::GpuDeviceExt;
 use candle_nn::VarBuilder;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
@@ -272,7 +273,7 @@ impl Qwen3VLGenerateModel {
 
             // 🌟 [VRAM/RAM 최적화] 15토큰마다 OS 시스템 RAM 스파이크 억제 및 반환
             if generate.len() % 15 == 0 {
-                if self.device.is_cuda() { let _ = self.device.synchronize(); }
+                if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
                 #[cfg(target_os = "windows")]
                 unsafe {

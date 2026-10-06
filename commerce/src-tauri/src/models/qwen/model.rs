@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Shape, Tensor};
+use crate::utils::GpuDeviceExt;
 use candle_nn::{
     Activation, Embedding, Init, LayerNorm, Linear, Module, RmsNorm, VarBuilder, embedding, linear,
     linear_no_bias, rms_norm,
@@ -676,7 +677,7 @@ impl QwenVLTextAttention {
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
-                let target_dtype = if xs.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+                let target_dtype = if xs.device().is_cuda_or_rocm() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
                 let prev_k_res = prev_k.to_dtype(target_dtype).unwrap_or_else(|_| prev_k.clone());
                 let prev_v_res = prev_v.to_dtype(target_dtype).unwrap_or_else(|_| prev_v.clone());
                 let key_states = Tensor::cat(&[&prev_k_res, &key_states], 2)?;

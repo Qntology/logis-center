@@ -4,6 +4,7 @@ use tokio::time::{sleep, Duration};
 use crate::store::{VectorStore, Task};
 use crate::logic;
 use crate::utils;
+use crate::utils::GpuDeviceExt;
 use crate::utils::parsing::{self, PugMode};
 use crate::model::LogisModel;
 use serde_json::{Value, json};
@@ -283,7 +284,7 @@ async fn run_synthesis_pass(
             if !model.is_cpu_mode {
                 let dev = model.device_config.device.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    if dev.is_cuda() {
+                    if dev.is_cuda_or_rocm() {
                         let _ = dev.synchronize();
                     }
                 })
@@ -2994,7 +2995,7 @@ pub async fn process_task(
         if !model.is_cpu_mode {
             let dev = model.device_config.device.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                if dev.is_cuda() { let _ = dev.synchronize(); }
+                if dev.is_cuda_or_rocm() { let _ = dev.synchronize(); }
             }).await;
         }
     }
@@ -5767,7 +5768,7 @@ pub async fn process_task(
                                     gen.clear_kv_cache();
                                 }
                                 if let Some(dev) = dev_for_sync {
-                                    if dev.is_cuda() { let _ = dev.synchronize(); }
+                                    if dev.is_cuda_or_rocm() { let _ = dev.synchronize(); }
                                 }
                             }).await;
                             res
@@ -8619,7 +8620,7 @@ pub async fn process_task(
                         if !model.is_cpu_mode {
                             let dev = model.device_config.device.clone();
                             let _ = tokio::task::spawn_blocking(move || {
-                                if dev.is_cuda() { let _ = dev.synchronize(); }
+                                if dev.is_cuda_or_rocm() { let _ = dev.synchronize(); }
                             }).await;
                         }
                         res

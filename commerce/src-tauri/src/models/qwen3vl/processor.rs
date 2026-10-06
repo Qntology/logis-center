@@ -6,6 +6,7 @@ use crate::openai_types::{
 };
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Shape, Tensor};
+use crate::utils::GpuDeviceExt;
 #[cfg(feature = "ffmpeg")]
 use ffmpeg_next as ffmpeg;
 use image::DynamicImage;
@@ -101,20 +102,10 @@ impl Qwen3VLProcessor {
         let patch_area = (self.img_process_cfg.patch_size * self.img_process_cfg.patch_size) as u64;
         if patch_area == 0 { return config_max; }
 
-        let nvml = match nvml_wrapper::Nvml::init() {
-            Ok(n) => n,
-            Err(_) => return config_max,
+        let free_vram = match crate::utils::gpu_mem_info(0) {
+            Some((free, _)) => free,
+            None => return config_max,
         };
-        let dev = match nvml.device_by_index(0) {
-            Ok(d) => d,
-            Err(_) => return config_max,
-        };
-        let mem = match dev.memory_info() {
-            Ok(m) => m,
-            Err(_) => return config_max,
-        };
-
-        let free_vram = mem.free;
         let usable = free_vram.saturating_sub(VISION_VRAM_RESERVE);
         let max_patches = vision_max_patches_from_vram(usable);
         if max_patches == 0 {
@@ -416,7 +407,7 @@ impl Qwen3VLProcessor {
             vision_grid_thws_vec.push(grid_thw);
 
             // 이미지 1장 처리가 끝날 때마다 GPU 큐를 비워 중간 버퍼가 실제로 반환되게 합니다.
-            if self.device.is_cuda() {
+            if self.device.is_cuda_or_rocm() {
                 let _ = self.device.synchronize();
             }
         }
@@ -427,7 +418,7 @@ impl Qwen3VLProcessor {
         // 🌟 [VRAM] 개별 조각들은 합쳐진 이후 불필요합니다.
         drop(pixel_values_vec);
         drop(vision_grid_thws_vec);
-        if self.device.is_cuda() {
+        if self.device.is_cuda_or_rocm() {
             let _ = self.device.synchronize();
         }
 

@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use candle_core::Tensor;
+use crate::utils::GpuDeviceExt;
 use candle_nn::{
     Embedding, Linear, Module, RmsNorm, VarBuilder, embedding, linear_b, linear_no_bias, rms_norm,
 };
@@ -92,7 +93,7 @@ impl Qwen3DecoderLayer {
         if self.self_attn.kv_cache.is_none() {
             if let Some(cache) = self.fp8_cache.take() {
                 let dev = xs.device();
-                let target_dtype = if dev.is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+                let target_dtype = if dev.is_cuda_or_rocm() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
 
                 // 🌟 [KV RESIDENCY] RAM 에 대피해 있던 캐시라면 연산 직전에만 GPU 로 올립니다.
                 //    PCIe 4.0 x16 기준 28레이어 × 28KB/token ≈ 784KB → 0.03ms 로 무시 가능한 비용입니다.
@@ -166,12 +167,12 @@ impl Qwen3DecoderLayer {
     pub fn compress_kv_in_vram(&mut self) -> Result<()> {
         if let Some((k, v)) = self.self_attn.kv_cache.take() {
             let dev = k.device();
-            let k_fp8 = if dev.is_cuda() {
+            let k_fp8 = if dev.is_cuda_or_rocm() {
                 k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k.clone())
             } else {
                 k.clone()
             };
-            let v_fp8 = if dev.is_cuda() {
+            let v_fp8 = if dev.is_cuda_or_rocm() {
                 v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v.clone())
             } else {
                 v.clone()
@@ -285,7 +286,7 @@ impl Qwen3Model {
         };
 
         // 🌟 [VRAM 최적화] CUDA 환경일 때 입력 임베딩을 BF16으로 강제 캐스팅하여 전체 파이프라인의 VRAM 2배 폭식을 방어합니다.
-        let target_dtype = if inputs_embeds.device().is_cuda() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+        let target_dtype = if inputs_embeds.device().is_cuda_or_rocm() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
         let inputs_embeds = if inputs_embeds.dtype() != target_dtype { inputs_embeds.to_dtype(target_dtype)? } else { inputs_embeds };
 
         let (bs, seq_len, _) = inputs_embeds.dims3()?;
