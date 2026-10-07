@@ -1030,6 +1030,7 @@ impl crate::model::LogisModel {
                 let e = &span_embs[si];
                 if e.iter().all(|&v| v == 0.0) { continue; }
                 let mut feasible = 0usize;
+                let mut unbound: Option<(usize, f32)> = None;
                 for fi in 0..f_names.len() {
                     let probe = ship_make_assignment(
                         &f_names[fi], cat, &span_surface(*wi),
@@ -1037,21 +1038,51 @@ impl crate::model::LogisModel {
                         enum_code_for(&f_names[fi], winners[*wi].start, winners[*wi].end).as_deref(),
                         winners[*wi].score >= d1_gate,
                     );
-                    if probe.is_none() { continue; }
                     let own = crate::utils::ai_utils::weighted_max_pool_sim(e, &f_banks[fi], &f_weights[fi]);
                     if !f_prejs[fi].is_empty() {
                         let prej = crate::utils::ai_utils::max_pool_sim(e, &f_prejs[fi]);
                         let coh = crate::utils::ai_utils::bank_internal_cohesion(&f_banks[fi]);
                         if crate::utils::ai_utils::prejudice_dominates(own, prej, coh) {
-                            emit_term(&format!(
-                                "      🚫 [D2 PREJUDICE] \"{}\" → {} | Own: {:.4} | Prej: {:.4} | Cohesion: {:.4}",
-                                winners[*wi].text, f_names[fi], own, prej, coh
-                            ));
+                            if probe.is_some() {
+                                emit_term(&format!(
+                                    "      🚫 [D2 PREJUDICE] \"{}\" → {} | Own: {:.4} | Prej: {:.4} | Cohesion: {:.4}",
+                                    winners[*wi].text, f_names[fi], own, prej, coh
+                                ));
+                            }
                             continue;
                         }
                     }
+                    if probe.is_none() {
+                        let value_bound = matches!(
+                            crate::utils::ai_utils::query_value_format(&f_names[fi]),
+                            crate::utils::ai_utils::FieldFormat::Numeric
+                                | crate::utils::ai_utils::FieldFormat::Identifier
+                                | crate::utils::ai_utils::FieldFormat::TrackingCode
+                                | crate::utils::ai_utils::FieldFormat::Enum
+                        );
+                        if value_bound && unbound.map_or(true, |(_, b)| own > b) {
+                            unbound = Some((fi, own));
+                        }
+                        continue;
+                    }
                     matrix[fi][si] = own;
                     feasible += 1;
+                }
+                if let Some((nf, nown)) = unbound {
+                    let best_open = (0..f_names.len())
+                        .map(|k| matrix[k][si])
+                        .fold(f32::MIN, f32::max);
+                    if feasible > 0 && nown > best_open {
+                        for k in 0..f_names.len() {
+                            matrix[k][si] = -1.0;
+                        }
+                        crate::utils::score_dynamics::record_baseline("search.d2_unbound_label", 1.0);
+                        emit_term(&format!(
+                            "   📏 [D2 UNBOUND LABEL] \"{}\" 는 값이 결속되어야 열리는 축 '{}' 의 라벨입니다 (라벨 뱅크 {:.4} > 열려 있는 축 최고 {:.4}). 결속된 수치 · 식별자 · 열거값이 없으므로 이 스팬은 조건 값이 아니라 무엇을 볼지 지목한 것입니다. 열려 있는 자유서술 축의 힌트로 바꾸지 않습니다.",
+                            winners[*wi].text, f_names[nf], nown, best_open
+                        ));
+                        continue;
+                    }
                 }
                 if feasible == 0 {
                     let significant = winners[*wi].score >= d1_gate;
@@ -3267,6 +3298,42 @@ impl crate::model::LogisModel {
                     } else {
                         (s, e)
                     };
+                    let mention = cores[ms..me].join(" ");
+                    let head_final = mention.chars().any(|c| {
+                        matches!(
+                            c as u32,
+                            0x1100..=0x11FF | 0x3040..=0x30FF | 0x3130..=0x318F | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF
+                        )
+                    });
+                    if head_final {
+                        let mut keys: Vec<String> = vec![crate::utils::ai_utils::lower_alnum(&mention)];
+                        for (stem, _) in crate::utils::ai_utils::closed_tail_stems(&mention) {
+                            let k = crate::utils::ai_utils::lower_alnum(&stem);
+                            if !keys.contains(&k) {
+                                keys.push(k);
+                            }
+                        }
+                        keys.retain(|k| !k.is_empty());
+                        let title_keys: Vec<String> = titles
+                            .iter()
+                            .map(|(t, _)| crate::utils::ai_utils::lower_alnum(t))
+                            .collect();
+                        let inside = keys
+                            .iter()
+                            .any(|k| title_keys.iter().any(|t| t.contains(k.as_str())));
+                        let as_head = keys
+                            .iter()
+                            .any(|k| title_keys.iter().any(|t| t.ends_with(k.as_str())));
+                        if inside && !as_head {
+                            crate::utils::score_dynamics::record_baseline("search.title.modifier_fragment", 1.0);
+                            logs.push(format!(
+                                "   ✂️ [DOC TYPE / MODIFIER FRAGMENT] \"{}\" | 서식 cos {:.4} (최고 '{}') 가 게이트를 넘었지만, 이 표현은 서식 이름 안에서 앞쪽 수식어로만 쓰이고 어떤 서식 이름의 끝(중심어)에도 오지 않습니다. 한국어·일본어·중국어 복합 명사는 끝 요소가 종류를 정하므로, 수식어 조각은 서식 지목이 아니라 내용어로 둡니다.",
+                                mention, top, titles[top_i].0
+                            ));
+                            s += 1;
+                            continue;
+                        }
+                    }
                     for k in ms..me { roles[k] = ShipTokenRole::DocType; }
                     logs.push(format!(
                         "   📄 [DOC TYPE / COSINE] \"{}\" → {:?} | 최고 '{}' cos {:.4} | z {:+.3} > √(2lnN) + 최댓값 표준편차 {:.3} | 라벨 cos {:.4}",
@@ -4345,6 +4412,31 @@ impl crate::model::LogisModel {
                 if q.iter().all(|&v| v == 0.0) { continue; }
                 let lab = max_pool_sim(q, foreign);
                 if let Some((code, cos, gap)) = ship_enum_resolve(q, &cores[i], rows, fun, opb, lab) {
+                    let stem = raw_variants.get(i).and_then(|vs| {
+                        vs.iter()
+                            .filter(|v| v.chars().count() < cores[i].chars().count())
+                            .min_by_key(|v| v.chars().count())
+                            .cloned()
+                    });
+                    if let Some(st) = stem {
+                        let qs = table.get(&st);
+                        let agrees = if qs.iter().all(|&v| v == 0.0) {
+                            false
+                        } else {
+                            let fs = max_pool_sim(qs, &func_bank);
+                            let os = max_pool_sim(qs, &op_all_bank);
+                            let ls = max_pool_sim(qs, foreign);
+                            ship_enum_resolve(qs, &st, rows, fs, os, ls).map_or(false, |(c, _, _)| c == code)
+                        };
+                        if !agrees {
+                            crate::utils::score_dynamics::record_baseline("search.enum_stem_disagree", 1.0);
+                            logs.push(format!(
+                                "   ⚪ [ENUM VALUE / STEM DISAGREE] \"{}\" → {} = {} (cos {:.4}) 로 읽혔지만 어간 \"{}\" 은 같은 값으로 읽히지 않습니다. 조사 · 접미어가 붙은 표면형만 열거값 구와 닮은 경우이므로, 하드 조건이 될 수 있는 열거값으로 쓰지 않습니다.",
+                                cores[i], field, code, cos, st
+                            ));
+                            continue;
+                        }
+                    }
                     logs.push(format!(
                         "   🏷️ [ENUM VALUE / COSINE] \"{}\" → {} = {} | cos {:.4} | 1·2위 격차 {:+.4}",
                         cores[i], field, code, cos, gap

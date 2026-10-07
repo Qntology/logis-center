@@ -136,10 +136,30 @@ pub fn morphological_variants(word: &str, lemma: &str) -> Vec<String> {
     }
 
     let chars: Vec<char> = surface.chars().collect();
-    if chars.len() >= 3 {
+    let code_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '/' | '.' | '_');
+    {
+        let run = chars.iter().take_while(|c| code_char(**c)).count();
+        if run >= 2
+            && run < chars.len()
+            && chars[..run].iter().any(|c| c.is_ascii_alphabetic())
+            && chars[run].is_alphabetic()
+        {
+            let stem: String = chars[..run].iter().collect();
+            push(
+                &mut out,
+                surface,
+                stem.trim_end_matches(|c: char| !c.is_ascii_alphanumeric()).to_string(),
+            );
+        }
+    }
+    let tails: Vec<String> = crate::utils::ai_utils::closed_tail_stems(surface)
+        .into_iter()
+        .map(|(stem, _)| stem)
+        .collect();
+    if tails.is_empty() && chars.len() >= 3 {
         let hi = (chars.len() - 1).min(4);
         for n in 2..=hi {
-            if chars[n - 1].is_ascii_digit() && chars[n].is_ascii_digit() {
+            if code_char(chars[n - 1]) && code_char(chars[n]) {
                 continue;
             }
             push(&mut out, surface, chars[..n].iter().collect::<String>());
@@ -149,7 +169,7 @@ pub fn morphological_variants(word: &str, lemma: &str) -> Vec<String> {
     if out.len() > 3 {
         out.truncate(3);
     }
-    for (stem, _) in crate::utils::ai_utils::closed_tail_stems(surface) {
+    for stem in tails {
         push(&mut out, surface, stem);
     }
     out

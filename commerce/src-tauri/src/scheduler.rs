@@ -7142,6 +7142,8 @@ pub async fn process_task(
             
             let mut pair_line_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             let mut pair_absent_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut pair_line_takers: std::collections::HashMap<usize, (String, std::collections::HashMap<String, f32>)> = std::collections::HashMap::new();
+            let mut pair_judged_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             if !detail_pairs.is_empty() {
                 
@@ -7647,6 +7649,28 @@ pub async fn process_task(
                         ));
                     }
                 }
+                for name in d_field_names.iter() {
+                    pair_judged_fields.insert(name.clone());
+                }
+                for (pi, ph) in pair_phrases.iter().enumerate() {
+                    let h = match unique_phrases.iter().position(|u| u == ph) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let entry = pair_line_takers
+                        .entry(detail_pairs[pi].primary_line)
+                        .or_insert_with(|| (ph.clone(), std::collections::HashMap::new()));
+                    for f in 0..d_field_names.len() {
+                        if leaf_raw[f][h] < 0.0 && value_failed_own[f][h] < 0.0 {
+                            continue;
+                        }
+                        let s = pair_own[f][h];
+                        let slot = entry.1.entry(d_field_names[f].clone()).or_insert(s);
+                        if s > *slot {
+                            *slot = s;
+                        }
+                    }
+                }
             }
 
             
@@ -8067,6 +8091,7 @@ pub async fn process_task(
                     if vector_assignment[f].is_some() { continue; }
                     if field_is_analytic[f] { continue; }
                     if is_id_link_field(&fields[f].0) { continue; }
+                    if pair_line_map.contains_key(&fields[f].0) { continue; }
                     let fmt = field_formats[f];
                     if !matches!(fmt, FieldFormat::Date | FieldFormat::TrackingCode | FieldFormat::Numeric) { continue; }
                     if vector_tie_held.contains(&f) || pair_absent_fields.contains(&fields[f].0) {
@@ -8076,6 +8101,8 @@ pub async fn process_task(
                     let mut best_line: Option<usize> = None;
                     let mut best_raw = f32::MIN;
                     let mut best_affinity = f32::MIN;
+                    let mut best_label = f32::MIN;
+                    let mut refused: Vec<String> = Vec::new();
                     for other in 0..vector_assignment.len() {
                         if other == f { continue; }
                         if field_formats[other] != fmt { continue; }
@@ -8096,22 +8123,54 @@ pub async fn process_task(
                             if l < line_values.len() && !value_matches_format(fmt, &line_values[l]) {
                                 continue;
                             }
+                            let label_score = match pair_line_takers.get(&l) {
+                                Some((label, takers)) if pair_judged_fields.contains(&fields[f].0) => {
+                                    match takers.get(&fields[f].0) {
+                                        Some(&s) => s,
+                                        None => {
+                                            let tag = format!("Line {} '{}'", l + 1, label);
+                                            if !refused.contains(&tag) {
+                                                refused.push(tag);
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+                                _ => -1.0,
+                            };
                             let raw = vector_raw_matrix[f].get(l).copied().unwrap_or(0.0);
                             let affinity = family_affinity(f, other);
-                            if affinity > best_affinity || (affinity == best_affinity && raw > best_raw) {
+                            let better = label_score > best_label
+                                || (label_score == best_label
+                                    && (affinity > best_affinity
+                                        || (affinity == best_affinity && raw > best_raw)));
+                            if better {
+                                best_label = label_score;
                                 best_affinity = affinity;
                                 best_raw = raw;
                                 best_line = Some(l);
                             }
                         }
                     }
+                    if !refused.is_empty() {
+                        crate::utils::score_dynamics::record_baseline("commerce.family_share_label_refused", refused.len() as f32);
+                        emit_term(&format!(
+                            "  ⛔ [FORMAT FAMILY SHARE / LABEL REFUSED] '{}' ({:?}) | {:?} | 이 줄은 라벨이 붙은 칸의 값인데, 라벨 대조에서 그 라벨이 '{}' 를 받아들이지 않았습니다(편견 게이트 · 하한 탈락). 라벨이 이 필드를 가리키지 않는 칸의 값은 이 필드의 사실이 아니므로 빌려 쓰지 않습니다.",
+                            fields[f].0, fmt, refused, fields[f].0
+                        ));
+                    }
                     if let Some(l) = best_line {
                         vector_assignment[f] = Some((l, best_raw, 0.0));
                         shared += 1;
                         family_shared.insert(f);
                         crate::utils::score_dynamics::record_baseline("commerce.family_share_affinity", best_affinity);
-                        emit_term(&format!("  ♻️ [FORMAT FAMILY SHARE] '{}' ({:?}) ← Line {} | RawSim: {:.4} | 라벨 뱅크 친화도 {:.4} | 같은 형식 필드 가운데 뜻이 가장 가까운 필드가 확정한 라인을 공유합니다.",
-                            fields[f].0, fmt, l + 1, best_raw, best_affinity));
+                        if best_label >= 0.0 {
+                            crate::utils::score_dynamics::record_baseline("commerce.family_share_label", best_label);
+                        }
+                        emit_term(&format!("  ♻️ [FORMAT FAMILY SHARE] '{}' ({:?}) ← Line {} | RawSim: {:.4} | 라벨 수용 {} | 라벨 뱅크 친화도 {:.4} | 같은 형식 필드가 확정한 줄 가운데, 그 칸의 라벨이 이 필드를 받아들인 줄을 먼저 고르고, 그다음 뜻이 가장 가까운 필드의 줄을 고릅니다.",
+                            fields[f].0, fmt, l + 1, best_raw,
+                            if best_label >= 0.0 { format!("{:.4}", best_label) } else { "라벨 없는 줄".to_string() },
+                            best_affinity));
                     }
                 }
                 if shared > 0 {
@@ -9871,6 +9930,9 @@ pub async fn process_task(
                 ref_val: &ref_val,
                 search_mode: &search_mode,
             };
+            let mut translit_memo: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+            let mut translit_pending: Vec<(String, (String, String))> = Vec::new();
+            let mut translit_slots: Vec<(String, String, crate::nl_convert::ChunkMetadata, String)> = Vec::new();
             for item_val in items.iter() {
                 if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
@@ -10115,7 +10177,7 @@ pub async fn process_task(
                                 
                                 let metas: Vec<&crate::nl_convert::ChunkMetadata> =
                                     indexable_chunks.iter().map(|(_, c)| *c).collect();
-                                let alias_pairs = generate_transliteration_aliases(
+                                let (alias_pairs, pending_here) = crate::scheduler::translit::generate_transliteration_aliases_deferred(
                                     &model,
                                     &metas,
                                     &doc_lang,
@@ -10123,7 +10185,13 @@ pub async fn process_task(
                                     cancellation_token,
                                     app_handle,
                                     &task.id,
+                                    &mut translit_memo,
                                 ).await;
+                                for (src, pair) in pending_here.iter() {
+                                    if !translit_pending.iter().any(|(s, _)| s == src) {
+                                        translit_pending.push((src.clone(), pair.clone()));
+                                    }
+                                }
 
                                 
                                 let _ = store.delete_chunks_by_item(&hashed_item_id).await;
@@ -10205,6 +10273,15 @@ pub async fn process_task(
                                         &ref_val,
                                         &search_mode,
                                     ).await;
+                                    let pending_src = chunk_meta.value_part.trim();
+                                    if pending_here.iter().any(|(s, _)| s.as_str() == pending_src) {
+                                        translit_slots.push((
+                                            hashed_item_id.clone(),
+                                            chunk_id.clone(),
+                                            (**chunk_meta).clone(),
+                                            pending_src.to_string(),
+                                        ));
+                                    }
                                 }
 
                                 emit_term(&format!(
@@ -10215,6 +10292,64 @@ pub async fn process_task(
                         }
                     }
                 }
+            }
+            if !translit_pending.is_empty() && !cancellation_token.load(Ordering::Relaxed) {
+                let read = crate::scheduler::translit::run_deferred_second_reads(
+                    &model,
+                    &translit_pending,
+                    &doc_lang,
+                    cancellation_token,
+                    app_handle,
+                    &task.id,
+                )
+                .await;
+                let mut late_saved = 0usize;
+                let mut late_items: Vec<String> = Vec::new();
+                for (item_id, chunk_id, meta, src) in translit_slots.iter() {
+                    let pair = match read.get(src) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let first_pass = translit_pending
+                        .iter()
+                        .find(|(s, _)| s == src)
+                        .map(|(_, p)| p.clone())
+                        .unwrap_or_default();
+                    let delta = (
+                        if pair.0 != first_pass.0 { pair.0.clone() } else { String::new() },
+                        if pair.1 != first_pass.1 { pair.1.clone() } else { String::new() },
+                    );
+                    if delta.0.is_empty() && delta.1.is_empty() {
+                        continue;
+                    }
+                    let n = upsert_alias_chunks(
+                        &store,
+                        &model,
+                        item_id,
+                        chunk_id,
+                        &page_type,
+                        &doc_lang,
+                        meta,
+                        &delta,
+                        &task.cc,
+                        &bcc,
+                        &ref_val,
+                        &search_mode,
+                    )
+                    .await;
+                    if n > 0 && !late_items.contains(item_id) {
+                        late_items.push(item_id.clone());
+                    }
+                    late_saved += n;
+                }
+                crate::utils::score_dynamics::record_baseline("indexing.translit_deferred_alias", late_saved as f32);
+                emit_term(&format!(
+                    "  🧩 [TRANSLIT SECOND READ / LATE ALIAS] 대기열 값 {}건 · 대상 청크 {}개 → 별칭 {}개를 아이템 {}개에 더 저장했습니다. 원본 청크와 1차 별칭은 아이템마다 이미 저장되어 있고, 여기서는 Qwen3.5-2B 가 읽은 문서 언어 표기만 더합니다.",
+                    translit_pending.len(),
+                    translit_slots.len(),
+                    late_saved,
+                    late_items.len()
+                ));
             }
         }
     }

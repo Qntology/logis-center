@@ -797,7 +797,7 @@ pub const TRADE_CONDITION_CATEGORIES_ML: [(&str, &str); 11] = [
       الشاحن, المصدر, البائع, المورد, المرسل إليه, المستورد, المشتري, الجهة المخطرة, المستفيد, مقدم الطلب, اسم الشركة, \
       荷送人, 輸出者, 売主, 供給者, 荷受人, 輸入者, 買主, 着荷通知先, 受益者, 発行依頼人, 会社名, \
       发货人, 出口商, 卖方, 供应商, 收货人, 进口商, 买方, 通知方, 受益人, 申请人, 公司名称, \
-      송하인, 수출자, 매도인, 공급자, 수하인, 수입자, 매수인, 통지처, 수익자, 개설의뢰인, 회사명"),
+      송하인, 수출자, 매도인, 공급자, 수하인, 수입자, 매수인, 통지처, 수익자, 개설의뢰인, 회사명, 송화인, 수화인, 화주, 발송인, 보내는 사람, 수취인, 수령인, 받는 사람"),
     ("terms",
      "Lieferbedingungen, Preisbedingungen, Zahlungsbedingungen, Akkreditiv, Fracht vorausbezahlt, Fracht unfrei, Währung, Gesamtbetrag, Rechnungswert, Frachtkosten, Versicherungskosten, \
       conditions de livraison, conditions de prix, conditions de paiement, lettre de crédit, fret prépayé, fret dû, devise, montant total, valeur de la facture, frais de fret, frais d'assurance, \

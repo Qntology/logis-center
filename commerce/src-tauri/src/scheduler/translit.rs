@@ -288,6 +288,33 @@ pub async fn generate_transliteration_aliases(
     app_handle: &tauri::AppHandle,
     task_id: &str,
 ) -> Vec<(String, String)> {
+    let mut memo: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    let (mut out, pending) = generate_transliteration_aliases_deferred(
+        model, chunks, doc_lang, page_type, cancel, app_handle, task_id, &mut memo,
+    )
+    .await;
+    if pending.is_empty() {
+        return out;
+    }
+    let read = run_deferred_second_reads(model, &pending, doc_lang, cancel, app_handle, task_id).await;
+    for (j, cm) in chunks.iter().enumerate() {
+        if let Some(pair) = read.get(cm.value_part.trim()) {
+            out[j] = pair.clone();
+        }
+    }
+    out
+}
+
+pub async fn generate_transliteration_aliases_deferred(
+    model: &LogisModel,
+    chunks: &[&crate::nl_convert::ChunkMetadata],
+    doc_lang: &str,
+    page_type: &str,
+    cancel: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    task_id: &str,
+    memo: &mut std::collections::HashMap<String, (String, String)>,
+) -> (Vec<(String, String)>, Vec<(String, (String, String))>) {
     let emit = |msg: &str| {
         println!("{}", msg);
         let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}
@@ -302,7 +329,7 @@ pub async fn generate_transliteration_aliases(
         "question", "answer", "team", "user", "member",
     ];
     if TRANSLIT_EXCLUDE_TYPES.iter().any(|t| page_type == *t) {
-        return vec![(String::new(), String::new()); chunks.len()];
+        return (vec![(String::new(), String::new()); chunks.len()], Vec::new());
     }
 
     let mut out: Vec<(String, String)> = vec![(String::new(), String::new()); chunks.len()];
@@ -366,6 +393,15 @@ pub async fn generate_transliteration_aliases(
         // 🌟 [CACHE LOOKUP] ① 아이템 로컬 → ② 프로세스 전역 메모리 → ③ Dexie 영구
         if let Some(hit) = cache.get(&src) {
             out[i] = hit.clone();
+            reused += 1;
+            continue;
+        }
+        if let Some(hit) = memo.get(&src).cloned() {
+            cache.insert(src.clone(), hit.clone());
+            out[i] = hit;
+            if !second_read.contains(&src) {
+                second_read.push(src.clone());
+            }
             reused += 1;
             continue;
         }
@@ -858,52 +894,123 @@ pub async fn generate_transliteration_aliases(
         let latin_left = !crate::nl_convert::split_words_by_script(&src).1.is_empty();
         if lang_engine_used && final_pair.0.is_empty() && latin_left && !second_read.contains(&src) {
             second_read.push(src.clone());
+            memo.insert(src.clone(), final_pair.clone());
         } else {
             save_translit_cache(app_handle, &src, doc_lang, &final_pair.0, &final_pair.1);
         }
         out[i] = final_pair;
     }
 
-    if !second_read.is_empty() {
+    if made > 0 || reused > 0 || phonetic_dropped > 0 || canonical_made > 0 || mixed_dropped > 0 {
         emit(&format!(
-            "  🔁 [TRANSLIT SECOND READ] {} 가 원문 라틴 단어를 게이트를 통과하는 문서 언어 표기로 옮기지 못한 값 {}건을 Qwen3.5-2B(다국어 어휘)로 한 번 더 읽습니다: {:?} | 단일 언어 모델이 외국어 단어 읽기에 실패한 자리만 다국어 모델로 넘기고, 이 결과까지 게이트를 통과하지 못해야 음차 불가로 저장합니다.",
-            engine_label,
-            second_read.len(),
-            second_read
+            "  🔤 [SYNONYM EXPANSION / {}] 별칭 생성 {}건 | 국가명 정규 별칭 {}건 | 캐시 재사용 {}건 | 대상 외 {}건 | 발음·글자읽기 게이트 폐기 {}건 | 혼용 조각 폐기 {}건",
+            if generation_ready { engine_label.as_str() } else { "캐시" },
+            made, canonical_made, reused, skipped, phonetic_dropped, mixed_dropped
         ));
     }
-    for src in second_read.iter() {
+
+    if generation_ready {
+        emit(&format!(
+            "  🔁 [CROSSOVER] 음차 구간에서 {} 를 1회 올려 {}건을 처리했습니다. {}",
+            engine_label,
+            made,
+            model.crossover_report()
+        ));
+    } else {
+        emit("  ⚡ [CROSSOVER] 음차가 전부 캐시로 해결되어 Qwen3.5 를 올리지 않았습니다. (전환 0회)");
+    }
+
+    let pending: Vec<(String, (String, String))> = second_read
+        .iter()
+        .filter_map(|s| memo.get(s).map(|p| (s.clone(), p.clone())))
+        .collect();
+    if !pending.is_empty() {
+        emit(&format!(
+            "  ⏳ [TRANSLIT SECOND READ / QUEUED] {} 이(가) 원문 라틴 단어를 게이트를 통과하는 문서 언어 표기로 옮기지 못한 값 {}건을 Qwen3.5-2B(다국어 어휘) 읽기 대기열에 넣습니다: {:?}",
+            if generation_ready { engine_label.clone() } else { "앞선 아이템의 문서 언어 모델".to_string() },
+            pending.len(),
+            pending.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>()
+        ));
+    }
+    (out, pending)
+}
+
+pub async fn run_deferred_second_reads(
+    model: &LogisModel,
+    pending: &[(String, (String, String))],
+    doc_lang: &str,
+    cancel: &Arc<AtomicBool>,
+    app_handle: &tauri::AppHandle,
+    task_id: &str,
+) -> std::collections::HashMap<String, (String, String)> {
+    let emit = |msg: &str| {
+        println!("{}", msg);
+        let _ = app_handle.emit(
+            "task-console-log",
+            json!({"task_id": task_id, "text": format!("{}\n", msg)}),
+        );
+    };
+    let mut done: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    let mut order: Vec<(String, (String, String))> = Vec::new();
+    for (src, pair) in pending.iter() {
+        if order.iter().any(|(s, _)| s == src) {
+            continue;
+        }
+        order.push((src.clone(), pair.clone()));
+    }
+    if order.is_empty() {
+        return done;
+    }
+    emit(&format!(
+        "  🔁 [TRANSLIT SECOND READ / BATCH] 문서 언어 전용 모델이 게이트를 통과하는 표기로 옮기지 못한 값 {}건을 Qwen3.5-2B(다국어 어휘)로 한 번에 읽습니다: {:?} | 값마다 모델을 바꾸면 2B 적재와 문서 언어 모델 재적재가 값 수만큼 반복되므로, 문서 언어 모델 작업을 먼저 끝내고 다국어 작업을 모아 2B 를 한 번만 올립니다.",
+        order.len(),
+        order.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>()
+    ));
+    let started = std::time::Instant::now();
+    let mut first_call_ms: Option<f32> = None;
+    let mut calls = 0usize;
+    let mut readings: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (src, base) in order.iter() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let slots: Vec<usize> = chunks
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.value_part.trim() == src.as_str())
-            .map(|(j, _)| j)
-            .collect();
-        let mut pair = match slots.first() {
-            Some(&j) => out[j].clone(),
-            None => continue,
-        };
+        let mut pair = base.clone();
         let (non_latin, latin) = crate::nl_convert::split_words_by_script(src);
         let latin_src = latin.join(" ");
-        let prompt = if non_latin.is_empty() {
-            crate::nl_convert::build_transliteration_prompt(src, doc_lang)
-        } else {
-            crate::nl_convert::build_transliteration_prompt_for_words(&latin, doc_lang)
+        let reading_key = format!("{}\u{1}{}", non_latin.is_empty(), latin_src);
+        let gated = match readings.get(&reading_key) {
+            Some(g) => g.clone(),
+            None => {
+                let prompt = if non_latin.is_empty() {
+                    crate::nl_convert::build_transliteration_prompt(src, doc_lang)
+                } else {
+                    crate::nl_convert::build_transliteration_prompt_for_words(&latin, doc_lang)
+                };
+                let t0 = std::time::Instant::now();
+                let raw = model
+                    .call_base_transliteration(&prompt, Some(cancel.clone()))
+                    .await
+                    .unwrap_or_default();
+                calls += 1;
+                if first_call_ms.is_none() {
+                    first_call_ms = Some(t0.elapsed().as_millis() as f32);
+                }
+                println!("    SECOND-READ RAW (Qwen3.5-2B) = '{}'", raw.trim());
+                let (_t, tr) = if non_latin.is_empty() {
+                    crate::nl_convert::sanitize_transliteration_dual(&raw, src)
+                } else {
+                    crate::nl_convert::sanitize_transliteration_dual_for_words(&raw, &latin)
+                };
+                let g = crate::nl_convert::gate_native_alias(&latin_src, tr, "SECOND-READ");
+                if !g.trim().is_empty() {
+                    if let Some(sim) = crate::nl_convert::phonetic_similarity(&latin_src, &g) {
+                        crate::utils::score_dynamics::record_baseline("indexing.translit_second_read_sim", sim);
+                    }
+                }
+                readings.insert(reading_key.clone(), g.clone());
+                g
+            }
         };
-        let raw = model
-            .call_base_transliteration(&prompt, Some(cancel.clone()))
-            .await
-            .unwrap_or_default();
-        println!("    SECOND-READ RAW (Qwen3.5-2B) = '{}'", raw.trim());
-        let (_t, tr) = if non_latin.is_empty() {
-            crate::nl_convert::sanitize_transliteration_dual(&raw, src)
-        } else {
-            crate::nl_convert::sanitize_transliteration_dual_for_words(&raw, &latin)
-        };
-        let gated = crate::nl_convert::gate_native_alias(&latin_src, tr, "SECOND-READ");
         let digit_words = !non_latin.is_empty() && non_latin.iter().all(|w| crate::nl_convert::is_digit_word(w));
         let placed = if non_latin.is_empty() {
             gated.clone()
@@ -927,7 +1034,6 @@ pub async fn generate_transliteration_aliases(
             } else {
                 pair.0 = native;
             }
-            made += 1;
             crate::utils::score_dynamics::record_baseline("indexing.translit_second_read", 1.0);
             emit(&format!(
                 "      🔤 [SYNONYM EXPANSION / SECOND READ] '{}' → native='{}' | roman='{}' | Qwen3.5-2B 가 읽은 표기가 발음·글자읽기 게이트를 통과했습니다.",
@@ -941,28 +1047,18 @@ pub async fn generate_transliteration_aliases(
             ));
         }
         save_translit_cache(app_handle, src, doc_lang, &pair.0, &pair.1);
-        for j in slots {
-            out[j] = pair.clone();
-        }
+        done.insert(src.clone(), pair);
     }
-    if made > 0 || reused > 0 || phonetic_dropped > 0 || canonical_made > 0 || mixed_dropped > 0 {
-        emit(&format!(
-            "  🔤 [SYNONYM EXPANSION / {}] 별칭 생성 {}건 | 국가명 정규 별칭 {}건 | 캐시 재사용 {}건 | 대상 외 {}건 | 발음·글자읽기 게이트 폐기 {}건 | 혼용 조각 폐기 {}건",
-            if generation_ready { engine_label.as_str() } else { "캐시" },
-            made, canonical_made, reused, skipped, phonetic_dropped, mixed_dropped
-        ));
+    if let Some(ms) = first_call_ms {
+        crate::utils::score_dynamics::record_baseline("indexing.translit_second_read_first_ms", ms);
     }
-
-    if generation_ready {
-        emit(&format!(
-            "  🔁 [CROSSOVER] 음차 구간에서 {} 를 1회 올려 {}건을 처리했습니다. {}",
-            engine_label,
-            made,
-            model.crossover_report()
-        ));
-    } else {
-        emit("  ⚡ [CROSSOVER] 음차가 전부 캐시로 해결되어 Qwen3.5 를 올리지 않았습니다. (전환 0회)");
-    }
-
-    out
+    crate::utils::score_dynamics::record_baseline("indexing.translit_second_read_batch", done.len() as f32);
+    emit(&format!(
+        "  🔁 [TRANSLIT SECOND READ / BATCH DONE] {}건 처리 · 2B 호출 {}회 (같은 라틴 단어 묶음은 한 번만 읽습니다) · 첫 호출 {:.0}ms (2B 적재 포함) · 전체 {}ms",
+        done.len(),
+        calls,
+        first_call_ms.unwrap_or(0.0),
+        started.elapsed().as_millis()
+    ));
+    done
 }
