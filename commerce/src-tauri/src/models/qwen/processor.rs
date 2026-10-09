@@ -12,6 +12,7 @@ use crate::{
 };
 use anyhow::Result;
 use candle_core::{DType, Device, Shape, Tensor};
+use crate::utils::GpuDeviceExt;
 use image::DynamicImage;
 use sysinfo::System;
 
@@ -102,20 +103,10 @@ impl QwenVLProcessor {
         let patch_area = (self.img_process_cfg.patch_size * self.img_process_cfg.patch_size) as u64;
         if patch_area == 0 { return config_max; }
 
-        let nvml = match nvml_wrapper::Nvml::init() {
-            Ok(n) => n,
-            Err(_) => return config_max,
+        let free_vram = match crate::utils::gpu_mem_info(0) {
+            Some((free, _)) => free,
+            None => return config_max,
         };
-        let dev = match nvml.device_by_index(0) {
-            Ok(d) => d,
-            Err(_) => return config_max,
-        };
-        let mem = match dev.memory_info() {
-            Ok(m) => m,
-            Err(_) => return config_max,
-        };
-
-        let free_vram = mem.free;
         let usable = free_vram.saturating_sub(RESERVE);
         if usable == 0 {
             let floor_px = 1_048_576u32;
@@ -290,7 +281,7 @@ impl QwenVLProcessor {
             pixel_values_vec.push(patched);
             vision_grid_thws_vec.push(grid_thw);
 
-            if self.device.is_cuda() {
+            if self.device.is_cuda_or_rocm() {
                 let _ = self.device.synchronize();
             }
         }
@@ -300,7 +291,7 @@ impl QwenVLProcessor {
 
         drop(pixel_values_vec);
         drop(vision_grid_thws_vec);
-        if self.device.is_cuda() {
+        if self.device.is_cuda_or_rocm() {
             let _ = self.device.synchronize();
         }
 

@@ -865,6 +865,604 @@ fn is_row_index_section(section: &str) -> bool {
     }
     false
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PartyRole {
+    Main(usize),
+    Other,
+    Undecided,
+}
+
+struct PartySectionEvidence {
+    main_roles: Vec<(&'static str, &'static str, Option<&'static str>)>,
+    sections: Vec<String>,
+    verdicts: Vec<PartyRole>,
+    kinds: Vec<Option<&'static str>>,
+}
+
+fn party_section_evidence(
+    detail_pairs: &[crate::utils::ai_utils::DetailPair],
+    unique_section: &[String],
+    leaf_embs: &[Vec<f32>],
+    section_embs: &[Vec<f32>],
+    pair_phrases: &[String],
+    unique_labels: &[String],
+    t_field_names: &[String],
+    t_label_texts: &[Vec<String>],
+    t_label_embs: &[Vec<Vec<f32>>],
+    t_label_weights: &[Vec<f32>],
+    t_prej_raw: &[Vec<Vec<f32>>],
+    role_embs: &Vec<Vec<f32>>,
+    main_embs: &Vec<Vec<f32>>,
+    emit_term: &(dyn Fn(&str) + Send + Sync),
+) -> Option<PartySectionEvidence> {
+    use crate::utils::ai_utils::{max_pool_sim, value_matches_format, weighted_max_pool_sim, FieldFormat};
+
+    if role_embs.is_empty() || main_embs.is_empty() {
+        return None;
+    }
+    let fidx = |name: &str| t_field_names.iter().position(|n| n == name);
+    let composite = |e: &[f32], f: usize| -> f32 {
+        let (bank, weights) = match (t_label_embs.get(f), t_label_weights.get(f)) {
+            (Some(b), Some(w)) => (b, w),
+            _ => return 0.0,
+        };
+        if e.iter().all(|&v| v == 0.0) {
+            return 0.0;
+        }
+        let own = weighted_max_pool_sim(e, bank, weights);
+        let prej = match t_prej_raw.get(f) {
+            Some(p) if !p.is_empty() => max_pool_sim(e, p),
+            _ => 0.0,
+        };
+        own - prej
+    };
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_lowercase())
+            .collect()
+    };
+    let ngrams = |s: &str| -> std::collections::HashSet<String> {
+        let w = words(s);
+        let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for i in 0..w.len() {
+            for j in (i + 1)..=w.len() {
+                out.insert(w[i..j].join(" "));
+            }
+        }
+        out
+    };
+    let lex_bank = |f: usize| -> std::collections::HashSet<String> {
+        t_label_texts
+            .get(f)
+            .map(|ps| {
+                ps.iter()
+                    .map(|p| words(p).join(" "))
+                    .filter(|k| !k.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let main_roles: Vec<(&'static str, &'static str, Option<&'static str>, usize)> = [
+        ("sender", "sender_name", Some("sender_address")),
+        ("recipient", "recipient_name", Some("recipient_address")),
+        ("notify", "notify_party_name", None),
+    ]
+    .iter()
+    .filter_map(|&(r, n, a)| fidx(n).map(|i| (r, n, a, i)))
+    .collect();
+    let kind_fields: Vec<(&'static str, usize)> = [
+        "party_name",
+        "party_address",
+        "party_contact",
+        "signatory_name",
+        "sender_tax_number",
+        "recipient_tax_number",
+    ]
+    .iter()
+    .filter_map(|&k| fidx(k).map(|i| (k, i)))
+    .collect();
+    if main_roles.is_empty() || !kind_fields.iter().any(|(k, _)| *k == "party_name") {
+        return None;
+    }
+    let main_lex: Vec<std::collections::HashSet<String>> =
+        main_roles.iter().map(|&(_, _, _, f)| lex_bank(f)).collect();
+    let role_lex: std::collections::HashSet<String> =
+        fidx("party_role").map(|f| lex_bank(f)).unwrap_or_default();
+
+    let mut kinds: Vec<Option<&'static str>> = vec![None; detail_pairs.len()];
+    for (pi, p) in detail_pairs.iter().enumerate() {
+        let s = p.section.trim();
+        if s.is_empty() || is_row_index_section(s) {
+            continue;
+        }
+        let v = p.value.trim();
+        if v.is_empty() {
+            continue;
+        }
+        let h = match pair_phrases
+            .get(pi)
+            .and_then(|ph| unique_labels.iter().position(|u| u == ph))
+        {
+            Some(h) => h,
+            None => continue,
+        };
+        let e = match leaf_embs.get(h) {
+            Some(e) => e,
+            None => continue,
+        };
+        let mut best: Option<(&'static str, f32)> = None;
+        for &(k, f) in kind_fields.iter() {
+            let c = composite(e, f);
+            if best.map_or(true, |(_, bc)| c > bc) {
+                best = Some((k, c));
+            }
+        }
+        let contact_shaped = (value_matches_format(FieldFormat::Phone, v)
+            && !value_matches_format(FieldFormat::Text, v))
+            || (v.contains('@') && !v.chars().any(|c| c.is_whitespace()));
+        let kind = match best {
+            Some((k, _)) if contact_shaped => {
+                if k == "party_contact" { Some(k) } else { None }
+            }
+            Some((k, c)) if c > 0.0 => Some(k),
+            _ => None,
+        };
+        let fits = match kind {
+            Some("party_name") => value_matches_format(FieldFormat::Text, v),
+            Some("party_address") => {
+                let a = if p.value_all.trim().is_empty() { v } else { p.value_all.trim() };
+                value_matches_format(FieldFormat::Address, a)
+            }
+            Some("party_contact") => true,
+            _ => false,
+        };
+        if fits {
+            kinds[pi] = kind;
+        }
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+    let mut sec_emb: Vec<usize> = Vec::new();
+    for p in detail_pairs.iter() {
+        let s = p.section.trim();
+        if s.is_empty() || is_row_index_section(s) || sections.iter().any(|x| x == s) {
+            continue;
+        }
+        if let Some(h) = unique_section.iter().position(|u| u == s) {
+            sections.push(s.to_string());
+            sec_emb.push(h);
+        }
+    }
+
+    let zero: Vec<f32> = vec![0.0; 384];
+    let mut verdicts: Vec<PartyRole> = Vec::with_capacity(sections.len());
+    for (k, s) in sections.iter().enumerate() {
+        let e = section_embs.get(sec_emb[k]).unwrap_or(&zero);
+        if e.iter().all(|&v| v == 0.0) {
+            verdicts.push(PartyRole::Undecided);
+            continue;
+        }
+        let role_sim = max_pool_sim(e, role_embs);
+        let main_sim = max_pool_sim(e, main_embs);
+        let comps: Vec<f32> = main_roles.iter().map(|&(_, _, _, f)| composite(e, f)).collect();
+        let row: Vec<f32> = (0..t_field_names.len()).map(|f| composite(e, f)).collect();
+        let spread = {
+            let n = row.len().max(1) as f32;
+            let mu = row.iter().sum::<f32>() / n;
+            (row.iter().map(|x| (x - mu) * (x - mu)).sum::<f32>() / n).max(0.0).sqrt()
+        };
+        let grams = ngrams(s);
+        let main_hits: Vec<usize> = (0..main_lex.len())
+            .filter(|&m| main_lex[m].iter().any(|p| grams.contains(p)))
+            .collect();
+        let role_hit = role_lex.iter().any(|p| grams.contains(p));
+        let max_main = comps.iter().copied().fold(f32::MIN, f32::max);
+        let positives: Vec<usize> = (0..comps.len()).filter(|&m| comps[m] > 0.0).collect();
+        let verdict = if role_sim > main_sim {
+            let lexical = role_hit && main_hits.is_empty();
+            if lexical || (max_main <= 0.0 && -max_main >= spread) {
+                PartyRole::Other
+            } else {
+                PartyRole::Undecided
+            }
+        } else if positives.len() == 1 {
+            let x = positives[0];
+            let lexical = !role_hit && main_hits.len() == 1 && main_hits[0] == x;
+            let rival = (0..comps.len())
+                .filter(|&m| m != x)
+                .map(|m| comps[m])
+                .fold(f32::MIN, f32::max);
+            let separated = rival != f32::MIN && comps[x] - rival >= spread;
+            if lexical || separated {
+                PartyRole::Main(x)
+            } else {
+                PartyRole::Undecided
+            }
+        } else {
+            PartyRole::Undecided
+        };
+        verdicts.push(verdict);
+        let carries_name = detail_pairs
+            .iter()
+            .enumerate()
+            .any(|(pi, p)| p.section.trim() == s.as_str() && kinds[pi] == Some("party_name"));
+        if verdict == PartyRole::Undecided && !carries_name {
+            continue;
+        }
+        crate::utils::score_dynamics::record_baseline("trading.party_section_role_gap", role_sim - main_sim);
+        let mut hit_names: Vec<&str> = main_hits.iter().map(|&m| main_roles[m].1).collect();
+        if role_hit {
+            hit_names.push("party_role");
+        }
+        emit_term(&format!(
+            "  🧭 [PARTY SECTION ROLE] 섹션 '{}' | 역할 당사자 축 {:.4} vs 주요 당사자 축 {:.4} | 이름 축(라벨 - 편견) [{}] | 분산 {:.4} | 라벨 구 일치: {} → {}",
+            s,
+            role_sim,
+            main_sim,
+            main_roles
+                .iter()
+                .zip(comps.iter())
+                .map(|(r, c)| format!("{} {:+.4}", r.1, c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            spread,
+            if hit_names.is_empty() { "없음".to_string() } else { hit_names.join(", ") },
+            match verdict {
+                PartyRole::Main(m) => format!("주요 당사자 '{}'", main_roles[m].1),
+                PartyRole::Other => "역할 당사자 (other_parties)".to_string(),
+                PartyRole::Undecided => "판정 보류 (축이 서로 다른 답을 내거나 근거가 분산 안쪽)".to_string(),
+            }
+        ));
+    }
+
+    Some(PartySectionEvidence {
+        main_roles: main_roles.iter().map(|&(r, n, a, _)| (r, n, a)).collect(),
+        sections,
+        verdicts,
+        kinds,
+    })
+}
+
+fn reconcile_party_sections(
+    detail_pairs: &[crate::utils::ai_utils::DetailPair],
+    evidence: Option<&PartySectionEvidence>,
+    t_field_names: &[String],
+    assigned_fields: &std::collections::HashMap<String, String>,
+    final_data_map: &mut serde_json::Map<String, Value>,
+    emit_term: &(dyn Fn(&str) + Send + Sync),
+) {
+    use crate::utils::ai_utils::lower_alnum;
+
+    let ev = match evidence {
+        Some(e) => e,
+        None => return,
+    };
+    let has = |f: &str| t_field_names.iter().any(|n| n == f);
+
+    let mut party_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    {
+        let mut take = |v: &Value| {
+            if let Some(s) = v.as_str() {
+                let k = lower_alnum(s);
+                if !k.is_empty() {
+                    party_keys.insert(k);
+                }
+            }
+        };
+        if let Some(o) = final_data_map.get("parties").and_then(|v| v.as_object()) {
+            for v in o.values() {
+                take(v);
+            }
+        }
+        if let Some(arr) = final_data_map.get("other_parties").and_then(|v| v.as_array()) {
+            for row in arr.iter() {
+                if let Some(o) = row.as_object() {
+                    for v in o.values() {
+                        take(v);
+                    }
+                }
+            }
+        }
+    }
+    if party_keys.is_empty() {
+        return;
+    }
+    let printed_in = |p: &crate::utils::ai_utils::DetailPair, key: &str| -> bool {
+        !key.is_empty() && (lower_alnum(&p.value) == key || lower_alnum(&p.value_all) == key)
+    };
+    let sec_of = |p: &crate::utils::ai_utils::DetailPair| -> Option<usize> {
+        let s = p.section.trim();
+        ev.sections.iter().position(|x| x.as_str() == s)
+    };
+    let cand: Vec<bool> = (0..ev.sections.len())
+        .map(|k| {
+            detail_pairs.iter().enumerate().any(|(pi, p)| {
+                sec_of(p) == Some(k)
+                    && ev.kinds.get(pi).copied().flatten() == Some("party_name")
+                    && party_keys.contains(&lower_alnum(&p.value))
+            })
+        })
+        .collect();
+    if !cand.iter().any(|&c| c) {
+        return;
+    }
+
+    let n = ev.sections.len();
+    let mut names: Vec<Vec<String>> = vec![Vec::new(); n];
+    let mut addrs: Vec<Vec<String>> = vec![Vec::new(); n];
+    let mut contacts: Vec<Vec<String>> = vec![Vec::new(); n];
+    let push_unique = |list: &mut Vec<String>, v: &str| {
+        let k = lower_alnum(v);
+        if !k.is_empty() && !list.iter().any(|x| lower_alnum(x) == k) {
+            list.push(v.to_string());
+        }
+    };
+    for (pi, p) in detail_pairs.iter().enumerate() {
+        let k = match sec_of(p) {
+            Some(k) => k,
+            None => continue,
+        };
+        if !cand[k] || ev.verdicts[k] == PartyRole::Undecided {
+            continue;
+        }
+        let v = p.value.trim();
+        match ev.kinds.get(pi).copied().flatten() {
+            Some("party_name") => push_unique(&mut names[k], v),
+            Some("party_address") => {
+                let a = if p.value_all.trim().is_empty() { v } else { p.value_all.trim() };
+                push_unique(&mut addrs[k], a);
+            }
+            Some("party_contact") => push_unique(&mut contacts[k], v),
+            _ => {}
+        }
+    }
+
+    let mut fixes: Vec<String> = Vec::new();
+    let mut confirmed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (m, &(_, name_f, addr_f)) in ev.main_roles.iter().enumerate() {
+        let secs: Vec<usize> = (0..n)
+            .filter(|&k| cand[k] && ev.verdicts[k] == PartyRole::Main(m))
+            .collect();
+        if secs.len() > 1 {
+            emit_term(&format!(
+                "    ⚪ [PARTY SECTION ROLE] '{}' 로 판정된 섹션이 {}개 {:?} 라 어느 블록의 값인지 정할 수 없습니다. 이 축은 그대로 둡니다.",
+                name_f,
+                secs.len(),
+                secs.iter().map(|&k| ev.sections[k].as_str()).collect::<Vec<_>>()
+            ));
+        }
+        if secs.len() != 1 {
+            continue;
+        }
+        let k = secs[0];
+        let mut wants: Vec<(&str, String)> = Vec::new();
+        if names[k].len() == 1 {
+            wants.push((name_f, names[k][0].clone()));
+        }
+        if let Some(af) = addr_f {
+            if has(af) && addrs[k].len() == 1 {
+                wants.push((af, addrs[k][0].clone()));
+            }
+        }
+        for (field, val) in wants {
+            confirmed.insert(field);
+            if assigned_fields.contains_key(field) {
+                continue;
+            }
+            let slot = final_data_map
+                .entry("parties".to_string())
+                .or_insert_with(|| json!({}));
+            if !slot.is_object() {
+                *slot = json!({});
+            }
+            if let Some(obj) = slot.as_object_mut() {
+                let cur = obj
+                    .get(field)
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if lower_alnum(&cur) == lower_alnum(&val) {
+                    continue;
+                }
+                if cur.is_empty() {
+                    fixes.push(format!(
+                        "parties.{} ← \"{}\" (섹션 '{}' 의 인쇄값)",
+                        field, val, ev.sections[k]
+                    ));
+                } else {
+                    fixes.push(format!(
+                        "parties.{} \"{}\" → \"{}\" (섹션 '{}' 의 인쇄값)",
+                        field, cur, val, ev.sections[k]
+                    ));
+                }
+                obj.insert(field.to_string(), json!(val));
+            }
+        }
+    }
+
+    for &(field, role) in [
+        ("sender_name", "sender"),
+        ("sender_address", "sender"),
+        ("recipient_name", "recipient"),
+        ("recipient_address", "recipient"),
+        ("notify_party_name", "notify"),
+    ]
+    .iter()
+    {
+        if confirmed.contains(field) || assigned_fields.contains_key(field) {
+            continue;
+        }
+        let cur = match final_data_map
+            .get("parties")
+            .and_then(|v| v.get(field))
+            .and_then(|v| v.as_str())
+        {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => continue,
+        };
+        let key = lower_alnum(&cur);
+        if key.is_empty() {
+            continue;
+        }
+        let mut seen = 0usize;
+        let mut all_foreign = true;
+        let mut foreign_secs: Vec<String> = Vec::new();
+        for p in detail_pairs.iter() {
+            if !printed_in(p, &key) {
+                continue;
+            }
+            seen += 1;
+            let v = sec_of(p)
+                .and_then(|k| ev.verdicts.get(k).copied())
+                .unwrap_or(PartyRole::Undecided);
+            let differs = match v {
+                PartyRole::Other => true,
+                PartyRole::Main(m) => ev.main_roles[m].0 != role,
+                PartyRole::Undecided => false,
+            };
+            if !differs {
+                all_foreign = false;
+                break;
+            }
+            let s = p.section.trim().to_string();
+            if !foreign_secs.contains(&s) {
+                foreign_secs.push(s);
+            }
+        }
+        if seen == 0 || !all_foreign {
+            continue;
+        }
+        let guarded: Vec<&str> = (0..n)
+            .filter(|&k| {
+                !cand[k] && matches!(ev.verdicts[k], PartyRole::Main(m) if ev.main_roles[m].0 == role)
+            })
+            .map(|k| ev.sections[k].as_str())
+            .collect();
+        if !guarded.is_empty() {
+            emit_term(&format!(
+                "    ⚪ [PARTY SECTION KEEP] parties.{} \"{}\" 는 지우지 않습니다. 이 문서에는 같은 역할로 판정된 섹션 {:?} 이 따로 있고, 그 섹션에 인쇄된 값은 지금 저장값과 다릅니다('SAME AS CONSIGNEE' 처럼 다른 칸을 가리키는 표기일 수 있습니다). 앞 단계가 그 표기를 해석해 넣은 값일 수 있습니다.",
+                field, cur, guarded
+            ));
+            continue;
+        }
+        if let Some(obj) = final_data_map.get_mut("parties").and_then(|v| v.as_object_mut()) {
+            obj.remove(field);
+        }
+        fixes.push(format!(
+            "parties.{} \"{}\" 제거 (이 값이 인쇄된 곳은 다른 역할로 판정된 섹션 {:?} 뿐입니다)",
+            field, cur, foreign_secs
+        ));
+    }
+
+    for k in 0..n {
+        let verdict = ev.verdicts[k];
+        if !cand[k] || verdict == PartyRole::Undecided || names[k].len() != 1 {
+            continue;
+        }
+        let name = names[k][0].clone();
+        let nkey = lower_alnum(&name);
+        let addr = if addrs[k].len() == 1 { Some(addrs[k][0].clone()) } else { None };
+        let contact = if contacts[k].is_empty() { None } else { Some(contacts[k].join(", ")) };
+        let skey = lower_alnum(&ev.sections[k]);
+        let slot = final_data_map
+            .entry("other_parties".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if !slot.is_array() {
+            *slot = Value::Array(Vec::new());
+        }
+        let rows = match slot.as_array_mut() {
+            Some(r) => r,
+            None => continue,
+        };
+        let found = rows.iter().position(|r| {
+            r.get("party_name")
+                .and_then(|x| x.as_str())
+                .map_or(false, |s| lower_alnum(s) == nkey)
+        });
+        match found {
+            Some(ri) => {
+                if let Some(o) = rows[ri].as_object_mut() {
+                    let mut updates: Vec<(&str, String)> = Vec::new();
+                    if has("party_role") {
+                        let ck = lower_alnum(o.get("party_role").and_then(|x| x.as_str()).unwrap_or(""));
+                        if ck != skey && (ck.is_empty() || ck.contains(&skey)) {
+                            updates.push(("party_role", ev.sections[k].clone()));
+                        }
+                    }
+                    for (f, want) in [("party_address", addr.clone()), ("party_contact", contact.clone())] {
+                        let want = match want {
+                            Some(w) => w,
+                            None => continue,
+                        };
+                        if !has(f) {
+                            continue;
+                        }
+                        let ck = lower_alnum(o.get(f).and_then(|x| x.as_str()).unwrap_or(""));
+                        if ck != lower_alnum(&want) {
+                            updates.push((f, want));
+                        }
+                    }
+                    for (f, want) in updates {
+                        let cur = o
+                            .get(f)
+                            .and_then(|x| x.as_str())
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default();
+                        if cur.is_empty() {
+                            fixes.push(format!(
+                                "other_parties['{}'].{} ← \"{}\" (섹션 '{}')",
+                                name, f, want, ev.sections[k]
+                            ));
+                        } else {
+                            fixes.push(format!(
+                                "other_parties['{}'].{} \"{}\" → \"{}\" (섹션 '{}')",
+                                name, f, cur, want, ev.sections[k]
+                            ));
+                        }
+                        o.insert(f.to_string(), json!(want));
+                    }
+                }
+            }
+            None => {
+                if verdict != PartyRole::Other && contact.is_none() {
+                    continue;
+                }
+                let mut row = serde_json::Map::new();
+                if has("party_role") {
+                    row.insert("party_role".to_string(), json!(ev.sections[k].clone()));
+                }
+                row.insert("party_name".to_string(), json!(name.clone()));
+                if let (true, Some(a)) = (has("party_address"), addr.clone()) {
+                    row.insert("party_address".to_string(), json!(a));
+                }
+                if let (true, Some(c)) = (has("party_contact"), contact.clone()) {
+                    row.insert("party_contact".to_string(), json!(c));
+                }
+                fixes.push(format!(
+                    "other_parties 행 추가 {} (섹션 '{}' 의 인쇄 블록)",
+                    Value::Object(row.clone()),
+                    ev.sections[k]
+                ));
+                rows.push(Value::Object(row));
+            }
+        }
+    }
+
+    if fixes.is_empty() {
+        return;
+    }
+    crate::utils::score_dynamics::record_baseline("trading.party_section_fix", fixes.len() as f32);
+    emit_term(&format!(
+        "  🧭 [PARTY SECTION FIX] 인쇄된 당사자 블록(섹션 제목 아래의 이름 · 주소 · 연락처 칸)을 기준으로 {}건을 바로잡았습니다. 섹션의 역할은 역할/주요 당사자 앵커, 이름 축의 라벨-편견 부호, 라벨 구 일치 또는 분산 밖 격차가 같은 답을 낼 때만 확정합니다.",
+        fixes.len()
+    ));
+    for f in fixes.iter() {
+        emit_term(&format!("    ✏️ [PARTY SECTION FIX] {}", f));
+    }
+}
+
 fn recover_pair_sections(anchors: &[(usize, usize)], pug_lines: &[String]) -> Vec<String> {
     let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (label_line, primary_line) in anchors.iter() {
@@ -1094,27 +1692,10 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
         lower.ends_with("_date") || lower.starts_with("date_") || lower.ends_with("_at")
     }
 
-    fn to_number(v: &Value) -> Option<f64> {
+    fn to_number(v: &Value, decimal_comma: bool) -> Option<f64> {
         match v {
             Value::Number(n) => n.as_f64(),
-            Value::String(s) => {
-                let mut buf = String::new();
-                let mut seen_digit = false;
-                for c in s.chars() {
-                    if c.is_ascii_digit() {
-                        buf.push(c);
-                        seen_digit = true;
-                    } else if c == ',' && seen_digit {
-                        continue;
-                    } else if c == '.' && seen_digit && !buf.contains('.') {
-                        buf.push(c);
-                    } else if seen_digit {
-                        break;
-                    }
-                }
-                if !seen_digit { return None; }
-                buf.trim_end_matches('.').parse::<f64>().ok()
-            },
+            Value::String(s) => crate::utils::canonical::parse_number_run(s, decimal_comma),
             _ => None,
         }
     }
@@ -1148,7 +1729,7 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
         Some(n)
     }
 
-    fn to_iso_date(v: &Value) -> Option<String> {
+    fn to_iso_date(v: &Value, doc_lang: &str) -> Option<String> {
         let s = match v {
             Value::String(s) => s.trim().to_string(),
             Value::Number(n) => n.to_string(),
@@ -1201,41 +1782,23 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
             }
         }
 
-        let re = regex::Regex::new(r"\d+").ok()?;
-        let nums: Vec<u32> = re.find_iter(&s).filter_map(|m| m.as_str().parse().ok()).collect();
-        if nums.len() < 3 { return None; }
-        let (mut year, mut month, mut day) = (nums[0], nums[1], nums[2]);
-        
-        if day > 31 && year <= 31 {
-            year = nums[2];
-            day = nums[1];
-            month = nums[0];
-        }
-        if year < 100 { year += if year > 50 { 1900 } else { 2000 }; }
-        
-        if month > 12 && day <= 12 { std::mem::swap(&mut month, &mut day); }
-        month = month.clamp(1, 12);
-        day = day.clamp(1, 31);
-        let hour   = if nums.len() > 3 { nums[3].clamp(0, 23) } else { 0 };
-        let minute = if nums.len() > 4 { nums[4].clamp(0, 59) } else { 0 };
-        let second = if nums.len() > 5 { nums[5].clamp(0, 59) } else { 0 };
-        Some(format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", year, month, day, hour, minute, second))
+        crate::utils::canonical::numeric_date_to_iso(&s, doc_lang)
     }
 
-    fn walk(v: &mut Value) {
+    fn walk(v: &mut Value, doc_lang: &str, decimal_comma: bool) {
         match v {
             Value::Object(map) => {
                 let keys: Vec<String> = map.keys().cloned().collect();
                 for k in keys {
                     if is_date_key(&k) {
-                        let converted = map.get(&k).and_then(to_iso_date);
+                        let converted = map.get(&k).and_then(|x| to_iso_date(x, doc_lang));
                         if let Some(iso) = converted {
                             map.insert(k.clone(), json!(iso));
                         }
                         continue;
                     }
                     if is_numeric_key(&k) {
-                        let converted = map.get(&k).and_then(to_number);
+                        let converted = map.get(&k).and_then(|x| to_number(x, decimal_comma));
                         if let Some(num) = converted {
                             map.insert(k.clone(), json!(num));
                         }
@@ -1243,18 +1806,34 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
                     }
                     if let Some(child) = map.get_mut(&k) {
                         if child.is_object() || child.is_array() {
-                            walk(child);
+                            walk(child, doc_lang, decimal_comma);
                         }
                     }
                 }
             },
             Value::Array(arr) => {
-                for it in arr.iter_mut() { walk(it); }
+                for it in arr.iter_mut() { walk(it, doc_lang, decimal_comma); }
             },
             _ => {}
         }
     }
-    walk(item);
+    let currency_hint = item
+        .get("currency")
+        .or_else(|| item.get("financials").and_then(|f| f.get("currency")))
+        .and_then(|v| v.as_str())
+        .map(|s| crate::utils::ai_utils::normalize_currency_value(s, doc_lang))
+        .unwrap_or_default();
+    let decimal_comma = crate::utils::canonical::decimal_comma_lang(doc_lang)
+        && !crate::utils::canonical::point_decimal_currency(&currency_hint);
+    let dropped = crate::utils::canonical::drop_placeholder_values(item);
+    if !dropped.is_empty() {
+        crate::utils::score_dynamics::record_baseline("vision.placeholder_drop", dropped.len() as f32);
+        println!(
+            "  🧽 [PLACEHOLDER DROP] 값 자리에 다른 곳을 가리키는 안내문·미확정 표지가 들어온 축 {:?} 를 비웁니다. 비워 두면 복구·검색이 '값 없음' 으로 다루고, 남겨 두면 그 글자가 값처럼 색인됩니다.",
+            dropped
+        );
+    }
+    walk(item, doc_lang, decimal_comma);
 
     fn split_party_blocks(map: &mut serde_json::Map<String, Value>, scope: &str) {
         for (name_key, addr_key) in [
@@ -1565,7 +2144,7 @@ async fn extract_continuation_page(
             "    ⚖️ [ARRAY TIE HOLD] '{}' vs '{}' | 마진 {:+.4} < 잡음 마진 {:.4} ({:?}) → 보류. 수치 축이 몰린 행에서는 결정론으로 가릴 근거가 없습니다.",
             fname, rname, d.margin, d.noise_margin, d.tie
         ));
-        crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+        crate::utils::score_dynamics::record_confusion_tie(&fname, &rname, d.margin);
     }
     use crate::logic::trade_field_category;
     let mut assigned = 0usize;
@@ -1993,12 +2572,54 @@ pub async fn process_trading_task(
         let mut self_id_top = f32::MIN;
         {
             let pairs_all: Vec<&str> = light_pug.lines().collect();
+            let lines_owned: Vec<String> = pairs_all.iter().map(|s| s.to_string()).collect();
             let dp = crate::utils::ai_utils::collect_detail_label_value_pairs(&pairs_all);
+            let anchors: Vec<(usize, usize)> = dp.iter().map(|p| (p.label_line, p.primary_line)).collect();
+            let recovered = recover_pair_sections(&anchors, &lines_owned);
+            let sections: Vec<String> = dp
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if p.section.trim().is_empty() {
+                        recovered.get(i).cloned().unwrap_or_default()
+                    } else {
+                        p.section.clone()
+                    }
+                })
+                .collect();
+            let first_row_line: Option<usize> = dp
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| is_row_index_section(&sections[*i]))
+                .map(|(_, p)| p.label_line)
+                .min();
             let mut labels: Vec<String> = Vec::new();
-            for p in dp.iter() {
+            let mut skipped: Vec<String> = Vec::new();
+            for (i, p) in dp.iter().enumerate() {
                 if p.label.trim().is_empty() { continue; }
+                let in_row = is_row_index_section(&sections[i]);
+                let below_rows = first_row_line.map_or(false, |r| p.label_line > r);
+                let id_shaped = crate::utils::ai_utils::value_matches_format(
+                    crate::utils::ai_utils::FieldFormat::Identifier,
+                    &p.value,
+                );
+                if in_row || below_rows || !id_shaped {
+                    skipped.push(format!("{}='{}'", p.label, p.value));
+                    continue;
+                }
                 let t = humanize_c(&p.label);
                 if !labels.iter().any(|e| e == &t) { labels.push(t); }
+            }
+            if !skipped.is_empty() {
+                crate::utils::score_dynamics::record_baseline(
+                    "trading.continuation_selfid_skipped",
+                    skipped.len() as f32,
+                );
+                emit_term(&format!(
+                    "     🧾 [PAGE CONTINUITY / SELF-ID SCOPE] 자기 문서번호 후보에서 뺀 라벨 {}개: {:?} | 문서번호는 품목 행보다 위의 머리 영역에 식별자 모양 값으로 인쇄됩니다. 행 번호 구역('[ Item N ]' 등) 안이나 첫 행 구역보다 아래에 있는 라벨, 식별자 모양이 아닌 값(수량 · 중량 등)은 이 페이지가 새 문서라는 근거가 되지 않습니다. 본문 추출의 SELF-ID ANCHOR 도 식별자 모양 값만 문서번호로 받으므로 같은 기준입니다.",
+                    skipped.len(),
+                    skipped.iter().take(8).collect::<Vec<_>>()
+                ));
             }
             if !labels.is_empty() {
                 let sid = trade_anchor_banks(
@@ -2850,6 +3471,7 @@ pub async fn process_trading_task(
     }
 
     let mut assigned_fields: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut party_evidence: Option<PartySectionEvidence> = None;
 
     if !unique_labels.is_empty() && !t_field_names.is_empty() {
         let leaf_embs = model.get_embedding_batch(unique_leaf.clone()).await
@@ -3007,9 +3629,20 @@ pub async fn process_trading_task(
             } else {
                 // 접두어 규약을 따르지 않는 서식(순수 숫자 번호 등)은 코사인으로 폴백합니다.
                 let mut cands: Vec<usize> = Vec::new();
+                let first_row_line: Option<usize> = (0..unique_labels.len())
+                    .filter(|&h| is_row_index_section(&unique_section[h]) && !phrase_single[h].trim().is_empty())
+                    .map(|h| phrase_line[h])
+                    .min();
+                let mut row_scoped: Vec<String> = Vec::new();
                 for h in 0..unique_labels.len() {
                     if label_self_cos[h] == f32::MIN { continue; }
                     if label_self_cos[h] <= label_ref_cos[h] { continue; }
+                    if is_row_index_section(&unique_section[h])
+                        || first_row_line.map_or(false, |r| phrase_line[h] > r)
+                    {
+                        row_scoped.push(unique_labels[h].clone());
+                        continue;
+                    }
                     let v = phrase_single[h].trim();
                     if v.is_empty() { continue; }
                     if !crate::utils::ai_utils::value_matches_format(
@@ -3021,6 +3654,13 @@ pub async fn process_trading_task(
                         if !code.eq_ignore_ascii_case(doc_type.as_str()) { continue; }
                     }
                     cands.push(h);
+                }
+                if !row_scoped.is_empty() {
+                    crate::utils::score_dynamics::record_baseline("trading.selfid_row_scoped", row_scoped.len() as f32);
+                    emit_term(&format!(
+                        "  🧾 [SELF-ID ANCHOR / ROW SCOPE] 자기선언 축이 타문서참조 축보다 높지만 품목 행 구역 안이나 첫 행 구역 아래에 인쇄된 라벨 {:?} 는 문서번호 후보에서 뺍니다. 품목 코드(SKU 등)와 합계 행은 문서 머리의 자기 번호가 아닙니다.",
+                        row_scoped
+                    ));
                 }
                 match pick_by_gap(&cands) {
                     Some(h) => {
@@ -3137,6 +3777,24 @@ pub async fn process_trading_task(
             ));
             (re, me, ready)
         };
+        if role_party_anchor_ready {
+            party_evidence = party_section_evidence(
+                &detail_pairs,
+                &unique_section,
+                &leaf_embs,
+                &section_embs,
+                &pair_phrases,
+                &unique_labels,
+                &t_field_names,
+                &t_label_texts,
+                &t_label_embs,
+                &t_label_weights,
+                &t_prej_raw,
+                &role_party_embs,
+                &main_party_embs,
+                &emit_term,
+            );
+        }
 
         let pair_abs_floor = 0.50f32;
         let mut leaf_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; unique_labels.len()]; t_field_names.len()];
@@ -3356,7 +4014,11 @@ pub async fn process_trading_task(
                 }
             }
             if d.tie != crate::utils::ai_utils::TieKind::Decisive {
-                crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+                if d.tie == crate::utils::ai_utils::TieKind::PairConfusion && !d.accepted && d.margin > f32::EPSILON {
+                    crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+                } else if !d.accepted {
+                    crate::utils::score_dynamics::record_confusion_tie(&fname, &rname, d.margin);
+                }
                 crate::utils::score_dynamics::record_baseline("plinko.noise_margin", d.noise_margin);
             }
         }
@@ -3517,6 +4179,43 @@ pub async fn process_trading_task(
             assigned_fields.insert(fname.clone(), val.clone());
             emit_term(&format!("    ✨ [TRADING PLINKO ASSIGN] Label '{}' → Field '{}' (cat: {}) | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
                 unique_labels[h], fname, if cat.is_empty() { "-" } else { cat }, score, margin, phrase_line[h] + 1, val));
+            if let Some((comp_f, comp_v, _)) = split_pair.take() {
+                let comp_cat = trade_field_category(&comp_f);
+                let comp_in_schema = t_field_names.iter().any(|n| n == &comp_f);
+                if comp_in_schema
+                    && !comp_cat.is_empty()
+                    && !comp_v.trim().is_empty()
+                    && !assigned_fields.contains_key(&comp_f)
+                {
+                    let mut written = false;
+                    if let Some(slot) = final_data_map.get_mut(comp_cat).and_then(|v| v.as_object_mut()) {
+                        slot.insert(comp_f.clone(), json!(comp_v.clone()));
+                        written = true;
+                    } else if crate::logic::is_trade_array_category(comp_cat) {
+                        let ak = if comp_cat == "items" { "line_items" } else { comp_cat };
+                        let slot = final_data_map
+                            .entry(ak.to_string())
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                        if let Some(arr) = slot.as_array_mut() {
+                            if arr.is_empty() {
+                                arr.push(Value::Object(serde_json::Map::new()));
+                            }
+                            if let Some(row) = arr[0].as_object_mut() {
+                                row.insert(comp_f.clone(), json!(comp_v.clone()));
+                                written = true;
+                            }
+                        }
+                    }
+                    if written {
+                        assigned_fields.insert(comp_f.clone(), comp_v.clone());
+                        crate::utils::score_dynamics::record_baseline("trading.count_unit_companion", 1.0);
+                        emit_term(&format!(
+                            "    ✨ [COUNT-UNIT COMPANION] '{}' 를 분해한 짝 '{}' = \"{}\" 도 같은 라벨 칸의 값으로 확정합니다 (Line {}). 분해만 하고 기록하지 않으면 이 축은 LLM 이 다시 읽어야 하고, LLM 이 null 을 돌려주면 인쇄된 수량·단위가 저장되지 않습니다.",
+                            fname, comp_f, comp_v, phrase_line[h] + 1
+                        ));
+                    }
+                }
+            }
 
             // 🌟 [SDS 계측] 확정 마진과 그 라벨의 전체 감쇠 곡선을 남깁니다.
             //
@@ -3811,7 +4510,9 @@ pub async fn process_trading_task(
         let claimed_ctx = if assigned_fields.is_empty() {
             String::new()
         } else {
-            let list: Vec<serde_json::Value> = assigned_fields.iter()
+            let mut claimed: Vec<(&String, &String)> = assigned_fields.iter().collect();
+            claimed.sort();
+            let list: Vec<serde_json::Value> = claimed.into_iter()
                 .map(|(k, v)| json!({ "target_column": k, "extracted_value": v }))
                 .collect();
             format!("\n\n[ALREADY CLAIMED VALUES]\nThese values are already assigned to OTHER fields by the deterministic engine. You MUST NOT return any of them:\n{}",
@@ -3908,6 +4609,14 @@ pub async fn process_trading_task(
     }
 
     
+    reconcile_party_sections(
+        &detail_pairs,
+        party_evidence.as_ref(),
+        &t_field_names,
+        &assigned_fields,
+        &mut final_data_map,
+        &emit_term,
+    );
     emit_term(&format!(
         "[TRADING PAGE {}/{}] ✅ 페이지 추출 완료 (doc_type='{}', lang='{}')",
         page_idx + 1, total_pages, doc_type, doc_lang

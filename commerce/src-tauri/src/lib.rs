@@ -1304,7 +1304,7 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
         if let Some(s) = v.as_str() {
             match kind_of(leaf) {
                 CanonKind::Numeric | CanonKind::Boolean => {
-                    if s.chars().any(|c| c.is_ascii_digit()) { return "number"; }
+                    if crate::utils::canonical::parse_number_run(s, false).is_some() { return "number"; }
                 },
                 _ => {}
             }
@@ -1338,7 +1338,10 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
         }
     }
 
-    // ── condition : 전량 통과 ──
+    let decimal_comma = ctx
+        .get("text")
+        .and_then(|v| v.as_str())
+        .map_or(false, |t| crate::utils::canonical::decimal_comma_lang(&crate::utils::lang_utils::detect_document_language(t)));
     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
         for (key, val_obj) in cond {
             // created_at / updated_at 은 build_scope_filter 가 이미 SQL 로 처리했으므로 중복 제외
@@ -1364,9 +1367,9 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
                     let final_val = if kind == "number" {
                         let n = match &raw {
                             Value::Number(n) => n.as_f64().unwrap_or(0.0),
-                            Value::String(s) => {
-                                let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
-                                cleaned.parse::<f64>().unwrap_or(0.0)
+                            Value::String(s) => match crate::utils::canonical::parse_number_run(s, decimal_comma) {
+                                Some(v) => v,
+                                None => continue,
                             },
                             _ => 0.0,
                         };
@@ -1394,16 +1397,17 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
                 else if op_clean.starts_with("neq") { "neq" }
                 else { "eq" };
 
-            // ── top / bottom : 백분위 랭킹. Dexie 가 정렬 후 슬라이스합니다 ──
             if op == "top" || op == "bottom" {
                 let pct = val_obj.get("percent_total")
                     .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
                     .unwrap_or(20.0);
+                let extreme = val_obj.get("extreme").and_then(|v| v.as_bool()).unwrap_or(false);
                 conditions.push(json!({
                     "path": path,
                     "op": op,
                     "percent": pct,
-                    "kind": "rank"
+                    "kind": "rank",
+                    "extreme": extreme
                 }));
                 continue;
             }
@@ -1424,9 +1428,9 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
             let final_val = if kind == "number" {
                 let n = match &raw_val {
                     Value::Number(n) => n.as_f64().unwrap_or(0.0),
-                    Value::String(s) => {
-                        let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-').collect();
-                        cleaned.parse::<f64>().unwrap_or(0.0)
+                    Value::String(s) => match crate::utils::canonical::parse_number_run(s, decimal_comma) {
+                        Some(v) => v,
+                        None => continue,
                     },
                     _ => 0.0,
                 };
@@ -4990,20 +4994,17 @@ async fn check_gpu_availability() -> serde_json::Value {
     let mut vendor = "none";
 
     if !config.is_cpu {
-        vendor = "amd"; // 기본적으로 CPU가 아니면 AMD(ROCm)로 가정
-
-        // NVIDIA GPU 여부 판별 (nvml-wrapper 사용)
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            if nvml_wrapper::Nvml::init().is_ok() {
-                vendor = "nvidia";
-            }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            vendor = "apple";
-        }
+        vendor = if config.device.is_cuda() {
+            "nvidia"
+        } else if config.device.is_rocm() {
+            "amd"
+        } else if config.device.is_vulkan() {
+            "vulkan"
+        } else if config.device.is_metal() {
+            "apple"
+        } else {
+            "none"
+        };
     }
 
     serde_json::json!({

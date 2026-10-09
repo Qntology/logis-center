@@ -890,15 +890,12 @@ impl VectorStore {
                                 crate::logic::parse_status(t) as f64
                             } else if let Some(ms) = iso_to_epoch_ms(t) {
                                 ms as f64
-                            } else if crate::utils::ai_utils::numeric_run_count(t) > 1 {
+                            } else if crate::utils::ai_utils::numeric_run_count(&crate::utils::canonical::number_text(t)) > 1 {
                                 continue;
                             } else {
-                                let cleaned: String = t.chars()
-                                    .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-                                    .collect();
-                                match cleaned.parse::<f64>() {
-                                    Ok(v) => v,
-                                    Err(_) => continue,
+                                match crate::utils::canonical::parse_number_run(t, false) {
+                                    Some(v) => v,
+                                    None => continue,
                                 }
                             }
                         },
@@ -1344,6 +1341,8 @@ impl VectorStore {
                 "[STORE] 🧾 [PRESENCE SKIP] id='{}' type='{}' 은 릴레이가 만든 빈 초안입니다. 저장 사전에 넣지 않습니다. 초안은 '이 서식이 그 축을 보통 갖는가' 라는 관측에 기여할 수 없는데, 문서 1건을 추출할 때마다 10건 이상 생기므로 그대로 두면 껍데기가 다수를 이뤄 실제 문서의 축 보유율을 0 에 가깝게 끌어내립니다.",
                 presence_id, type_
             );
+        } else if !is_domain_item {
+            crate::utils::score_dynamics::presence_forget(&presence_id);
         } else {
             let mut present_fields: Vec<String> = Vec::new();
             Self::collect_filled_fields(&final_data, 1, &mut present_fields);

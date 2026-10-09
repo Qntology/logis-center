@@ -611,10 +611,11 @@ const DEXIE_INDEXED_PATHS = new Set<string>([
 
 interface DexieCondition {
     path: string;
-    op: string;              // eq | neq | gt | gte | lt | lte | contains | not_contains | top | bottom
+    op: string;
     value?: any;
     percent?: number;
-    kind?: string;           // number | string | rank
+    kind?: string;
+    extreme?: boolean;
 }
 
 interface DexiePlan {
@@ -627,6 +628,17 @@ interface DexiePlan {
     alternates?: Record<string, string[]>;
     substantial?: string;
     find?: string;
+    relay?: RelayPlanInfo;
+}
+
+interface RelayPlanInfo {
+    applied?: boolean;
+    key?: string;
+    partner_types?: string[];
+    target_ids?: string[];
+    void_only?: string[];
+    partner_ids?: string[];
+    void_partner_ids?: string[];
 }
 
 // 🌟 중첩 경로('data.sale_price')를 안전하게 읽습니다.
@@ -639,6 +651,22 @@ function readPath(row: any, path: string): any {
         cur = cur[seg];
     }
     return cur;
+}
+function relayFamily(t: string): string {
+    const k = String(t || "").trim().toLowerCase();
+    if (k === "receiving" || k === "shipping" || k === "tracking") return "tracking";
+    if (k === "sales" || k === "order") return "order";
+    if (k === "coupon" || k === "event") return "event";
+    return k;
+}
+function relayPeriodBadge(res: any): string {
+    if (!res || res.relay_period_hits === undefined || res.relay_period_hits === null) return "";
+    const net = Number(res.relay_period_units_net ?? res.relay_period_units ?? res.relay_period_hits);
+    const voidUnits = Number(res.relay_period_void_units ?? 0);
+    const exact = res.relay_period_units_exact !== false;
+    const shown = isNaN(net) ? String(res.relay_period_hits) : String(net);
+    const head = `🔗 기간 내 판매·거래 ${shown}개${exact ? "" : " (수량 없는 연결은 1개로 셈)"}`;
+    return voidUnits > 0 ? `${head} · 취소·환불·반품 ${voidUnits}개 제외` : head;
 }
 function matchCondition(row: any, cond: DexieCondition): boolean {
     // top / bottom 은 개별 행으로 판정 불가. 정렬 단계에서 처리합니다.
@@ -834,8 +862,14 @@ async function executeDexiePlan(
             const bv = Number(readPath(b, rc.path));
             return rc.op === 'top' ? bv - av : av - bv;
         });
-        rows = sorted.slice(0, take);
-        console.log(`[DEXIE-PLAN] ${rc.op} ${pct}% on ${rc.path} → ${rows.length}건 (값 결손 ${skipped}건 제외)`);
+        if (rc.extreme) {
+            const edge = Number(readPath(sorted[0], rc.path));
+            rows = sorted.filter(r => Number(readPath(r, rc.path)) === edge);
+            console.log(`[DEXIE-PLAN] ${rc.op} extreme on ${rc.path} = ${edge} → ${rows.length}건 (동률 포함, 값 결손 ${skipped}건 제외)`);
+        } else {
+            rows = sorted.slice(0, take);
+            console.log(`[DEXIE-PLAN] ${rc.op} ${pct}% on ${rc.path} → ${rows.length}건 (값 결손 ${skipped}건 제외)`);
+        }
     }
     if (plan.keywords && plan.keywords.length > 0) {
         for (const r of rows) {
@@ -3513,10 +3547,15 @@ listen("extraction-progress", async (event: any) => {
 
                 for (const plan of response.dexie_plans) {
                     const condCount = plan.conditions ? plan.conditions.length : 0;
+                    const relay: RelayPlanInfo | undefined = plan.relay;
+                    const relayLocked = !!relay && relay.applied === true;
+                    const relayTargets: string[] = (relayLocked && relay && Array.isArray(relay.target_ids)) ? relay.target_ids : [];
+                    const relayVoid = new Set<string>((relay && Array.isArray(relay.void_only)) ? relay.void_only : []);
 
-                    // 조건이 하나도 없는 플랜은 후보를 그대로 통과시킵니다. (리콜 우선)
                     if (condCount === 0) {
-                        for (const id of candidateIds) accepted.add(id);
+                        for (const id of candidateIds) {
+                            if (!relayVoid.has(id)) accepted.add(id);
+                        }
                         console.log(`[DEXIE-PLAN] type='${plan.type}' 조건 0개 → 후보 전량 통과`);
                         continue;
                     }
@@ -3524,8 +3563,8 @@ listen("extraction-progress", async (event: any) => {
                     try {
                         const passed = await executeDexiePlan(plan, { candidateIds, limit: 500 });
                         for (const p of passed) {
+                            if (relayVoid.has(p.id)) continue;
                             accepted.add(p.id);
-                            // 어떤 조건으로 통과했는지 배지로 남깁니다.
                             const first = plan.conditions[0];
                             if (first) {
                                 planBadges.set(p.id, `🎯 ${first.path.replace('data.', '')} ${first.op}`);
@@ -3534,22 +3573,27 @@ listen("extraction-progress", async (event: any) => {
                         console.log(`[DEXIE-PLAN] type='${plan.type}' 조건 ${condCount}개 → ${passed.length}건 통과`);
 
                         {
-                            const rescued = await executeDexiePlan(plan, { limit: 200 });
+                            const rescued = relayLocked
+                                ? (relayTargets.length > 0 ? await executeDexiePlan(plan, { candidateIds: relayTargets, limit: 200 }) : [])
+                                : await executeDexiePlan(plan, { limit: 200 });
                             let added = 0;
                             for (const p of rescued) {
-                                if (accepted.has(p.id)) continue;
+                                if (accepted.has(p.id) || relayVoid.has(p.id)) continue;
                                 accepted.add(p.id);
                                 planBadges.set(p.id, `🛟 recall`);
                                 added++;
                             }
-                            if (added > 0) {
+                            if (relayLocked) {
+                                console.log(`[DEXIE-PLAN] 🔗 기간 연결이 확정한 대상 ${relayTargets.length}건 안에서만 조건 리콜을 수행했습니다 (추가 ${added}건). 기간 밖·미연결·취소 전용 문서는 전체 테이블 리콜로 되살리지 않습니다.`);
+                            } else if (added > 0) {
                                 console.log(`[DEXIE-PLAN] 🛟 후보 밖에서 ${added}건 추가 확보 (전송 상한과 무관한 조건 리콜)`);
                             }
                         }
                     } catch (e) {
                         console.error(`[DEXIE-PLAN] 실행 실패 (type='${plan.type}'):`, e);
-                        // 실패 시 조건을 포기하고 후보를 통과시킵니다. 0건보다 낫습니다.
-                        for (const id of candidateIds) accepted.add(id);
+                        for (const id of candidateIds) {
+                            if (!relayVoid.has(id)) accepted.add(id);
+                        }
                     }
                 }
 
@@ -3588,7 +3632,7 @@ listen("extraction-progress", async (event: any) => {
                         if (fullDoc.data) {
                             fullDoc.data.search_score = res.score;
                             fullDoc.data.search_context = res.context_type;
-                            const badge = planBadges.get(res.id);
+                            const badge = [planBadges.get(res.id), relayPeriodBadge(res)].filter(Boolean).join(' · ');
                             if (badge) fullDoc.data.search_badge = badge;
                         }
 
@@ -3656,9 +3700,28 @@ listen("extraction-progress", async (event: any) => {
                         return await coll.toArray();
                     };
 
+                    const periodFamilies = new Set<string>();
+                    const periodPartners = new Set<string>();
+                    const periodVoid = new Set<string>();
+                    for (const p of (response.dexie_plans || [])) {
+                        const r: RelayPlanInfo | undefined = p && p.relay;
+                        if (!r || r.applied !== true) continue;
+                        for (const t of (r.partner_types || [])) periodFamilies.add(relayFamily(t));
+                        for (const id of (r.partner_ids || [])) periodPartners.add(id);
+                        for (const id of (r.void_partner_ids || [])) periodVoid.add(id);
+                        for (const id of (r.void_only || [])) periodVoid.add(id);
+                    }
+                    const periodAdmits = (match: any): boolean => {
+                        if (periodFamilies.size === 0) return true;
+                        if (periodVoid.has(match.id)) return false;
+                        if (!periodFamilies.has(relayFamily(match.type || match.data?.type || ""))) return true;
+                        return periodPartners.has(match.id);
+                    };
+
                     const absorb = (match: any, relation: string) => {
                         if (!match || !match.id) return false;
                         if (existingIds.has(match.id) || relayDocs.has(match.id)) return false;
+                        if (!periodAdmits(match)) return false;
                         const dData = { ...(match.data || {}) };
                         dData.search_context = match.type;
                         dData.relation = relation;

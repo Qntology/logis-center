@@ -1260,6 +1260,20 @@ pub fn record_confusion(winner: &str, loser: &str, margin: f32) {
     });
 }
 
+pub fn record_confusion_tie(a: &str, b: &str, margin: f32) {
+    if a.is_empty() || b.is_empty() || a == b {
+        return;
+    }
+    let key = if a <= b { format!("{}|{}", a, b) } else { format!("{}|{}", b, a) };
+    with_scope_mut(|s, ring| {
+        let e = s.confusion.entry(key).or_insert_with(ConfusionStat::default);
+        e.ties += 1;
+        if margin.is_finite() {
+            e.margin.push(margin as f64, ring);
+        }
+    });
+}
+
 /// 카테고리 실현 최댓값. CATEGORY-NEUTRAL 의 N_eff 캘리브레이션(Phase 2) 입력.
 pub fn record_category_max(category: &str, n_fields: usize, realized_max: f32) {
     if !realized_max.is_finite() { return; }

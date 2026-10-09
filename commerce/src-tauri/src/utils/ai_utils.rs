@@ -6362,21 +6362,75 @@ pub fn is_document_number_shaped(value: &str) -> bool {
     false
 }
 
+pub fn is_ip_address_literal(value: &str) -> bool {
+    let parts: Vec<&str> = value.trim().split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 3
+                && p.chars().all(|c| c.is_ascii_digit())
+                && (p.len() == 1 || !p.starts_with('0'))
+                && p.parse::<u16>().map_or(false, |n| n <= 255)
+        })
+}
+
+pub fn resolve_page_asset_link(value: &str, page_lines: &[&str]) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.contains('/') || !v.contains('.') || v.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    let tail = format!("/{}", v.to_lowercase());
+    let mut found: Vec<String> = Vec::new();
+    for line in page_lines.iter() {
+        for attr in ["href=", "src="] {
+            let mut rest: &str = line;
+            while let Some(pos) = rest.find(attr) {
+                let after = &rest[pos + attr.len()..];
+                let quote = match after.chars().next() {
+                    Some(q) if q == '"' || q == '\'' => q,
+                    _ => {
+                        rest = after;
+                        continue;
+                    }
+                };
+                let body = &after[1..];
+                let end = match body.find(quote) {
+                    Some(e) => e,
+                    None => break,
+                };
+                let url = body[..end].trim();
+                let path = url.split(|c| c == '?' || c == '#').next().unwrap_or("");
+                if path.to_lowercase().ends_with(&tail) && !found.iter().any(|u| u == url) {
+                    found.push(url.to_string());
+                }
+                rest = &body[end + 1..];
+            }
+        }
+    }
+    if found.len() == 1 { found.pop() } else { None }
+}
+
+pub fn is_grouped_digit_literal(value: &str) -> bool {
+    let t = value.trim();
+    let body = t.strip_prefix('+').unwrap_or(t);
+    let groups: Vec<&str> = body.split('-').collect();
+    groups.len() >= 3
+        && groups
+            .iter()
+            .all(|g| !g.is_empty() && g.chars().all(|c| c.is_ascii_digit()))
+}
+
 pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
     let v = value.trim();
     if v.is_empty() { return false; }
-    // 어떤 형식이든 구조 태그 잔재는 데이터가 아닙니다.
     if is_bare_markup_token(v) { return false; }
+    if matches!(fmt, FieldFormat::Phone | FieldFormat::Numeric) && is_ip_address_literal(v) { return false; }
     match fmt {
         FieldFormat::Synthesis => true,
         FieldFormat::Enum => !has_date_shape(v),
         FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()) && v.chars().count() >= 2,
         FieldFormat::Numeric => {
-            // 🌟 has_date_literal 이 아니라 has_date_shape 를 봅니다.
-            //    "Apr-19-2022" 는 부호·점 필터를 통과하면 "-19-2022" 가 남아
-            //    '숫자가 있다' 는 이유로 수치 축이 날짜를 가져갈 수 있습니다.
-            //    날짜 축의 게이트를 여는 순간 수치 축의 게이트는 같은 문자열에 대해 닫아야 합니다.
-            if has_date_shape(v) {
+            if has_date_shape(v) || is_grouped_digit_literal(v) {
                 return false;
             }
 
@@ -6387,13 +6441,11 @@ pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
             if core.is_empty() {
                 return false;
             }
-            // 통화 기호와 부호는 허용합니다. (₩ 12,500 / -350.00 / $78,500)
             let stripped: String = core
                 .chars()
                 .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
                 .collect();
             let symbols = core.chars().count().saturating_sub(stripped.chars().count());
-            // 기호가 숫자보다 많으면 수치가 아닙니다. (예: "FOB Busan")
             if symbols * 2 > core.chars().count() {
                 return false;
             }
@@ -6402,7 +6454,10 @@ pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
         FieldFormat::Date => {
             has_date_shape(v)
         },
-        FieldFormat::Link => v.contains('/') || v.to_lowercase().starts_with("http"),
+        FieldFormat::Link => {
+            let lower = v.to_lowercase();
+            v.contains('/') || lower.starts_with("http") || lower.starts_with("www.")
+        },
         FieldFormat::TrackingCode => !has_date_shape(v) && longest_code_token_len(v) >= 8,
         FieldFormat::Identifier => !has_date_shape(v) && longest_code_token_len(v) >= 4,
         FieldFormat::Phone => {
@@ -7448,6 +7503,8 @@ pub struct DetailPair {
     pub value_all: String,    // 셀 전체 병합값 (주소 등 다중 값 필드용)
     pub primary_line: usize,  // 대표값이 위치한 라인 인덱스
     pub label_line: usize,
+    pub cell_start: usize,
+    pub cell_end: usize,
 }
 
 fn detail_block_end(lines: &[&str], parts: &[(usize, String, String, String)], start: usize) -> usize {
@@ -7798,6 +7855,8 @@ pub fn collect_detail_label_value_pairs(lines: &[&str]) -> Vec<DetailPair> {
                 value_all: all_v,
                 primary_line: prim,
                 label_line,
+                cell_start: *line_idx,
+                cell_end: *cell_end,
             });
         }
     }
@@ -7820,6 +7879,8 @@ pub fn collect_detail_label_value_pairs(lines: &[&str]) -> Vec<DetailPair> {
             value_all: v,
             primary_line: i,
             label_line: i,
+            cell_start: i,
+            cell_end: i,
         });
     }
 

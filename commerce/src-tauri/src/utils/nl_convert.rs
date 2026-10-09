@@ -82,7 +82,7 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                     } else {
                         let val_str = match v {
                             serde_json::Value::String(s) => s.clone(),
-                            serde_json::Value::Number(n) => n.to_string(),
+                            serde_json::Value::Number(n) => crate::utils::canonical::epoch_field_text(key, n).unwrap_or_else(|| n.to_string()),
                             serde_json::Value::Bool(b) => b.to_string(),
                             _ => String::new(),
                         };
@@ -145,6 +145,57 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
     unique_sentences.join(" ").replace("  ", " ").trim().to_string()
 }
 
+fn generated_sentence_starts_at(rest: &str) -> bool {
+    const FIXED: [&str; 4] = [
+        "The unique identifier is ",
+        "It can be accessed at ",
+        "Regarding ",
+        "It is currently in '",
+    ];
+    if FIXED.iter().any(|p| rest.starts_with(p)) {
+        return true;
+    }
+    if let Some(body) = rest.strip_prefix("This ") {
+        return body
+            .find(" is titled '")
+            .map_or(false, |p| body[..p].split_whitespace().count() <= 3);
+    }
+    for lead in ["Its ", "The "] {
+        let body = match rest.strip_prefix(lead) {
+            Some(b) => b,
+            None => continue,
+        };
+        let cut = [" is ", " includes: "].iter().filter_map(|m| body.find(m)).min();
+        if let Some(p) = cut {
+            let key = &body[..p];
+            let words = key.split_whitespace().count();
+            if (1..=6).contains(&words)
+                && key.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '_' || c == '-')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn split_generated_sentences(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut from = 0usize;
+    while let Some(rel) = text[from..].find(". ") {
+        let dot = from + rel;
+        let next = dot + 2;
+        if generated_sentence_starts_at(&text[next..]) {
+            out.push(&text[start..dot]);
+            start = next;
+        }
+        from = next;
+    }
+    out.push(&text[start..]);
+    out
+}
+
 /// [PHASE A] json_to_natural_language() 출력을 문장/속성 단위 청크로 분할합니다.
 ///
 /// 분할 규칙:
@@ -166,8 +217,8 @@ pub fn split_natural_language_to_chunks(text: &str) -> Vec<(String, String, bool
     // ". " (마침표 + 공백) 기준으로 1차 분할합니다.
     // json_to_natural_language() 의 출력은 이미 문장 단위로 구분되어 있으므로
     // 이 분할이 1:1 문장 대응이 됩니다.
-    let raw_sentences: Vec<&str> = text
-        .split(". ")
+    let raw_sentences: Vec<&str> = split_generated_sentences(text)
+        .into_iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
@@ -1002,28 +1053,16 @@ pub fn try_any_ascii_transliteration_words(words: &[String]) -> Option<String> {
     Some(results.join(" "))
 }
 
-/// [SYNONYM EXPANSION] 값의 주 표기 체계가 라틴(ASCII 알파벳)인지 판정합니다.
-/// 문자 클래스 카운트만 사용하므로 언어 사전이 전혀 필요 없습니다.
 pub fn is_latin_dominant(value: &str) -> bool {
     let mut latin = 0usize;
     let mut other = 0usize;
     for c in value.chars() {
         if !c.is_alphabetic() { continue; }
-        if c.is_ascii_alphabetic() { latin += 1; } else { other += 1; }
+        if crate::utils::canonical::is_latin_letter(c) { latin += 1; } else { other += 1; }
     }
     latin >= other
 }
 
-/// [SYNONYM EXPANSION] 이 청크가 음차 별칭 생성 대상인지 판정합니다.
-///
-/// 판정 규칙 (전부 결정론, 어휘 하드코딩 없음):
-///   T1: property_format 이 '자유 서술 값'을 담는 형식이어야 합니다. (Text / Address)
-///       Numeric / Date / Identifier / Link / Phone / TrackingCode / Enum 은
-///       값이 숫자·코드·캐노니컬 키라 음차가 물리적으로 무의미합니다.
-///       Synthesis 는 합성 문장이라 별칭 벡터가 노이즈만 늘리므로 제외합니다.
-///   T2: 값에 '문자'가 하나라도 있어야 소리를 옮길 수 있습니다.
-///   T3: 숫자 비율이 절반 이상이면 코드성 값이므로 제외합니다.
-///   T4: 길이 상한은 R2 의 150자를 그대로 재사용합니다. (새 상수 도입 아님)
 pub fn needs_transliteration(chunk: &ChunkMetadata) -> bool {
     match chunk.property_format.as_str() {
         "Text" | "Address" => {},
@@ -1045,11 +1084,6 @@ pub fn needs_transliteration(chunk: &ChunkMetadata) -> bool {
     true
 }
 
-/// [SYNONYM EXPANSION] 문서 언어의 '실제 문자 샘플'을 bias.json 에서 동적으로 확보합니다.
-/// detect_document_language() 결과(doc_lang)를 그대로 받아
-///   get_localized_page_type()  → 그 언어로 쓰인 도메인 명사
-///   indexing_leaf_label()      → 그 언어로 쓰인 이 속성의 라벨
-/// 두 조각을 이어붙입니다. 코드에는 어떤 언어 이름도 등장하지 않습니다.
 pub fn native_script_sample(doc_lang: &str, page_type: &str, property: &str) -> String {
     let localized_type = crate::parsing::get_localized_page_type(page_type, doc_lang);
     let leaf = crate::utils::ai_utils::indexing_leaf_label(doc_lang, page_type, property);
@@ -1881,6 +1915,23 @@ pub fn cached_translit_recheck(
         } else {
             None
         };
+    }
+    let src_seq: Vec<String> = strip_special_chars_for_transliteration(src)
+        .split_whitespace()
+        .map(|w| w.to_string())
+        .collect();
+    let digit_seq: Vec<&String> = src_seq.iter().filter(|w| is_digit_word(w)).collect();
+    if !digit_seq.is_empty() {
+        let n = digit_seq.len();
+        let cached_head: Vec<&str> = cached_native.split_whitespace().take(n).collect();
+        let cached_gathered = cached_head.len() == n && cached_head.iter().zip(digit_seq.iter()).all(|(a, b)| *a == b.as_str());
+        let src_gathered = src_seq.iter().take(n).zip(digit_seq.iter()).all(|(a, b)| a == *b);
+        if cached_gathered && !src_gathered {
+            return Some(format!(
+                "캐시 별칭 '{}' 은 숫자 {:?} 를 원문 자리와 다르게 앞으로 모은 표기입니다",
+                cached_native, digit_seq
+            ));
+        }
     }
     if let Some(mix) = foreign_script_mix(&added.join(" "), src) {
         return Some(format!(

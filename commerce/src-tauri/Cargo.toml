@@ -47,6 +47,7 @@ ahash = "0.8.11"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
 candle-flash-attn = { version = "0.11.0", optional = true }
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", optional = true }
 tokenizers = "0.22.1"
 num = "0.4.3"
 minijinja = "2.12.0"
@@ -93,13 +94,44 @@ metal = "0.33.0"
 [features]
 default = ["cuda"]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+rocm = ["dep:candle-rocm", "candle-core/rocm", "candle-nn/rocm"]
+vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 flash-attn = []
+
+[patch.crates-io]
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan.git" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan.git" }
 
 
 [profile.dev]
 opt-level = 0      # 기본값 0(최적화 없음)을 2로 올려서 실행 속도를 개선합니다.
 incremental = true # 변경된 부분만 빌드해서 시간을 아낍니다.
+
+[profile.dev.package.candle-core]
+opt-level = 3
+[profile.dev.package.candle-nn]
+opt-level = 3
+[profile.dev.package.candle-transformers]
+opt-level = 3
+[profile.dev.package.gemm]
+opt-level = 3
+[profile.dev.package.gemm-common]
+opt-level = 3
+[profile.dev.package.gemm-f16]
+opt-level = 3
+[profile.dev.package.gemm-f32]
+opt-level = 3
+[profile.dev.package.gemm-f64]
+opt-level = 3
+[profile.dev.package.half]
+opt-level = 3
+[profile.dev.package.naga]
+opt-level = 3
+[profile.dev.package.rayon]
+opt-level = 3
+[profile.dev.package.rayon-core]
+opt-level = 3
 
 [profile.release]
 opt-level = 3   # 실행 속도 최대

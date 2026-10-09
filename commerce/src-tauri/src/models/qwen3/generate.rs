@@ -1,6 +1,7 @@
 use crate::openai_types::ChatCompletionParameters;
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
+use crate::utils::GpuDeviceExt;
 use candle_nn::VarBuilder;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -312,7 +313,7 @@ impl Qwen3GenerateModel {
             let _ = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
             
             // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU를 동기화하고 시스템 메모리(RAM)를 강제로 반환시킵니다.
-            if self.device.is_cuda() { let _ = self.device.synchronize(); }
+            if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
             #[cfg(target_os = "windows")]
             unsafe {
@@ -419,7 +420,7 @@ impl Qwen3GenerateModel {
             let logits = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
             
             // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU를 동기화하고 시스템 메모리(RAM)를 강제로 반환시킵니다.
-            if self.device.is_cuda() { let _ = self.device.synchronize(); }
+            if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
             #[cfg(target_os = "windows")]
             unsafe {
@@ -637,7 +638,7 @@ impl Qwen3GenerateModel {
             // 🌟 메모리 최적화 (15토큰마다 OS 시스템 RAM 스파이크 억제 및 반환, 주기를 짧게 압박)
             if i > 0 && i % 15 == 0 {
                 // 🌟 [VRAM 최적화 3] 디코딩 중 발생하는 KV Cache 병합(Cat) 찌꺼기 텐서들을 즉시 날려버립니다.
-                if self.device.is_cuda() { let _ = self.device.synchronize(); }
+                if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
                 #[cfg(target_os = "windows")]
                 unsafe {
@@ -724,7 +725,7 @@ impl Qwen3GenerateModel {
             let logits = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
             
             // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU 동기화 및 시스템 메모리 강제 반환을 수행합니다.
-            if self.device.is_cuda() { let _ = self.device.synchronize(); }
+            if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
             #[cfg(target_os = "windows")]
             unsafe {
@@ -941,7 +942,7 @@ impl Qwen3GenerateModel {
             // 🌟 메모리 최적화 (15토큰마다 OS 시스템 RAM 스파이크 억제 및 반환, 잦은 주기로 압박)
             if i > 0 && i % 15 == 0 {
                 // 🌟 [VRAM 최적화 3] 디코딩 중 발생하는 KV Cache 병합(Cat) 찌꺼기 텐서들을 즉시 날려버립니다.
-                if self.device.is_cuda() { let _ = self.device.synchronize(); }
+                if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
                 #[cfg(target_os = "windows")]
                 unsafe {

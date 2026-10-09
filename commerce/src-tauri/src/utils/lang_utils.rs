@@ -65,6 +65,7 @@ pub fn detect_document_language(text: &str) -> String {
                 whatlang::Lang::Ita => "it",
                 whatlang::Lang::Por => "pt",
                 whatlang::Lang::Nld => "nl",
+                whatlang::Lang::Ces => "cs",
                 _ => "en",
             }.to_string(),
             None => "en".to_string(),

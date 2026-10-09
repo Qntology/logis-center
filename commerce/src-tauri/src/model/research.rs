@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use serde_json::json;
+use crate::utils::GpuDeviceExt;
 
 impl crate::model::LogisModel {
 
@@ -39,7 +40,7 @@ impl crate::model::LogisModel {
             if !self.is_cpu_mode {
                 let dev = self.device_config.device.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    if dev.is_cuda() { let _ = dev.synchronize(); }
+                    if dev.is_cuda_or_rocm() { let _ = dev.synchronize(); }
                 }).await;
             }
             

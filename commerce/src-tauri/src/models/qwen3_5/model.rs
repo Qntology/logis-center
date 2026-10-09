@@ -2,12 +2,77 @@ use std::io::{Read, Seek};
 
 use anyhow::{Result, anyhow};
 use candle_core::{D, DType, Device, IndexOp, Tensor, quantized::QMatMul};
+use crate::utils::GpuDeviceExt;
 use candle_nn::{
     Conv1d, Embedding, Linear, Module, VarBuilder, embedding, linear_b, linear_no_bias,
     ops::sigmoid,
 };
 
 use crate::models::qwen::quantized_model::{KVBlock, KVLocation, KVRegistry};
+
+#[derive(Clone)]
+pub enum EmbedTable {
+    Dense(Embedding),
+    Quant {
+        q: std::sync::Arc<candle_core::quantized::QTensor>,
+        hidden: usize,
+    },
+}
+
+impl EmbedTable {
+    pub fn forward(&self, ids: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(e) => e.forward(ids),
+            Self::Quant { q, .. } => q.embedding(ids),
+        }
+    }
+
+    pub fn vocab(&self) -> candle_core::Result<usize> {
+        match self {
+            Self::Dense(e) => e.embeddings().dim(0),
+            Self::Quant { q, .. } => Ok(q.shape().dims()[0]),
+        }
+    }
+
+    pub fn rows_f32(&self, off: usize, take: usize) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(e) => e.embeddings().narrow(0, off, take)?.to_dtype(DType::F32),
+            Self::Quant { q, .. } => {
+                let ids = Tensor::arange(off as u32, (off + take) as u32, &q.device())?;
+                q.embedding(&ids)
+            }
+        }
+    }
+
+    pub fn dense(&self) -> Option<&Tensor> {
+        match self {
+            Self::Dense(e) => Some(e.embeddings()),
+            Self::Quant { .. } => None,
+        }
+    }
+
+    pub fn hidden(&self) -> usize {
+        match self {
+            Self::Dense(e) => e.embeddings().dim(1).unwrap_or(0),
+            Self::Quant { hidden, .. } => *hidden,
+        }
+    }
+}
+
+fn embed_q8_env() -> Option<bool> {
+    std::env::var("LOGIS_EMBED_Q8").ok().map(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+    })
+}
+
+fn use_quant_embed(device: &Device) -> bool {
+    embed_q8_env().unwrap_or_else(|| device.is_vulkan())
+}
+
+fn quant_embed_ok(dtype: candle_core::quantized::GgmlDType) -> bool {
+    embed_q8_env() == Some(true) || dtype == candle_core::quantized::GgmlDType::Q8_0
+}
 
 use crate::{
     models::{
@@ -334,17 +399,21 @@ impl Qwen3_5GatedDeltaNet {
             .broadcast_as(decay_mask.shape())?;
         
         attn = mask.where_cond(&on_false, &attn)?;
-        let (d0, d1, d2, _, _) = attn.dims5()?;
-        for i in 1..chunk_size {
-            let row = attn.i((.., .., .., i, ..i))?.contiguous()?;
-            let sub = attn.i((.., .., .., ..i, ..i))?.contiguous()?;
-            let attn_i = row
-                .unsqueeze(D::Minus1)?
-                .broadcast_mul(&sub)?
-                .sum(D::Minus2)?
-                .add(&row)?
-                .unsqueeze(D::Minus2)?;
-            attn = attn.slice_assign(&[(0..d0), (0..d1), (0..d2), (i..i + 1), (0..i)], &attn_i)?;
+        if attn.device().is_vulkan() {
+            attn = candle_core::delta_rule::chunk_tril_recurrence(&attn)?;
+        } else {
+            let (d0, d1, d2, _, _) = attn.dims5()?;
+            for i in 1..chunk_size {
+                let row = attn.i((.., .., .., i, ..i))?.contiguous()?;
+                let sub = attn.i((.., .., .., ..i, ..i))?.contiguous()?;
+                let attn_i = row
+                    .unsqueeze(D::Minus1)?
+                    .broadcast_mul(&sub)?
+                    .sum(D::Minus2)?
+                    .add(&row)?
+                    .unsqueeze(D::Minus2)?;
+                attn = attn.slice_assign(&[(0..d0), (0..d1), (0..d2), (i..i + 1), (0..i)], &attn_i)?;
+            }
         }
         let attn = attn
             .broadcast_add(&Tensor::eye(chunk_size, attn.dtype(), attn.device())?)?
@@ -377,6 +446,8 @@ impl Qwen3_5GatedDeltaNet {
             .broadcast_as((batch_size, num_heads, chunk_size, chunk_size))?;
         let on_false = tril_mask.zeros_like()?.to_dtype(candle_core::DType::F32)?;
         let last_dim = core_attn_out.dim(D::Minus1)?;
+        let vk_cat = value.device().is_vulkan();
+        let mut out_chunks: Vec<Tensor> = Vec::new();
         for i in 0..total_sequence_length / chunk_size {
             let q_i = query.i((.., .., i))?.contiguous()?;
             let k_i = key.i((.., .., i))?.contiguous()?;
@@ -392,16 +463,20 @@ impl Qwen3_5GatedDeltaNet {
                 .broadcast_mul(&g_i.unsqueeze(D::Minus1)?.exp()?)?
                 .matmul(&last_recurrent_state)?;
             let out_i = attn_inter.add(&attn.matmul(&v_new)?)?.unsqueeze(2)?;
-            core_attn_out = core_attn_out.slice_assign(
-                &[
-                    (0..batch_size),
-                    (0..num_heads),
-                    (i..i + 1),
-                    (0..chunk_size),
-                    (0..last_dim),
-                ],
-                &out_i,
-            )?;
+            if vk_cat {
+                out_chunks.push(out_i);
+            } else {
+                core_attn_out = core_attn_out.slice_assign(
+                    &[
+                        (0..batch_size),
+                        (0..num_heads),
+                        (i..i + 1),
+                        (0..chunk_size),
+                        (0..last_dim),
+                    ],
+                    &out_i,
+                )?;
+            }
             let g_i_last_dim = g_i.dim(D::Minus1)?;
             last_recurrent_state = last_recurrent_state
                 .broadcast_mul(
@@ -423,6 +498,9 @@ impl Qwen3_5GatedDeltaNet {
                 )?;
         }
         self.recurrent_state_cache = Some(last_recurrent_state);
+        if vk_cat && !out_chunks.is_empty() {
+            core_attn_out = Tensor::cat(&out_chunks, 2)?;
+        }
         core_attn_out =
             core_attn_out.reshape((batch_size, num_heads, (), core_attn_out.dim(D::Minus1)?))?;
         core_attn_out = core_attn_out.narrow(2, 0, sequence_length)?;
@@ -473,12 +551,21 @@ impl Qwen3_5GatedDeltaNet {
             // println!("[DEBUG-CONTIG] SSM Fast-Path Q: {}, K: {}, V: {}", q_i.is_contiguous(), k_i.is_contiguous(), v_i.is_contiguous());
 
             last_recurrent_state = last_recurrent_state.broadcast_mul(&g_i)?;
-            let kv_mem = last_recurrent_state.broadcast_mul(&k_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum(D::Minus2)?;
+            let vk_mm = last_recurrent_state.device().is_vulkan();
+            let kv_mem = if vk_mm {
+                k_i.unsqueeze(D::Minus2)?.contiguous()?.matmul(&last_recurrent_state)?.squeeze(D::Minus2)?
+            } else {
+                last_recurrent_state.broadcast_mul(&k_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum(D::Minus2)?
+            };
             let delta = v_i.broadcast_sub(&kv_mem)?.broadcast_mul(&beta_i)?;
             last_recurrent_state = last_recurrent_state.broadcast_add(
                 &k_i.unsqueeze(D::Minus1)?.contiguous()?.broadcast_mul(&delta.unsqueeze(D::Minus2)?.contiguous()?)?,
             )?;
-            let out_i = last_recurrent_state.broadcast_mul(&q_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum_keepdim(D::Minus2)?;
+            let out_i = if vk_mm {
+                q_i.unsqueeze(D::Minus2)?.contiguous()?.matmul(&last_recurrent_state)?
+            } else {
+                last_recurrent_state.broadcast_mul(&q_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum_keepdim(D::Minus2)?
+            };
             
             self.recurrent_state_cache = Some(last_recurrent_state);
             
@@ -849,8 +936,8 @@ impl Qwen3_5Attention {
                         let cat_k = Tensor::cat(&[&pk_f, &k_piece], 2)?.contiguous()?;
                         let cat_v = Tensor::cat(&[&pv_f, &v_piece], 2)?.contiguous()?;
 
-                        inner.k_cache = Some(if dev.is_cuda() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
-                        inner.v_cache = Some(if dev.is_cuda() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
+                        inner.k_cache = Some(if dev.is_cuda_or_rocm() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
+                        inner.v_cache = Some(if dev.is_cuda_or_rocm() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
                         
@@ -874,8 +961,8 @@ impl Qwen3_5Attention {
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
-                    inner.k_cache = Some(if dev.is_cuda() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece }); 
-                    inner.v_cache = Some(if dev.is_cuda() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
+                    inner.k_cache = Some(if dev.is_cuda_or_rocm() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece }); 
+                    inner.v_cache = Some(if dev.is_cuda_or_rocm() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
                 }
                 
                 let mut reg = self.registry.entries.write().unwrap();
@@ -1522,12 +1609,8 @@ fn decode_resident_gate(on_cuda: bool, weight_bytes: u64, kv_bytes: u64) -> (boo
     if !on_cuda {
         return ((crate::utils::resources::free_ram_bytes() as u64) > 6_000_000_000, None);
     }
-    let free = nvml_wrapper::Nvml::init().ok().and_then(|nvml| {
-        nvml.device_by_index(crate::utils::resources::primary_gpu_id() as u32)
-            .ok()
-            .and_then(|dev| dev.memory_info().ok())
-            .map(|m| m.free)
-    });
+    let free = crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize)
+        .map(|(free, _)| free);
     match free {
         Some(f) => (
             weight_bytes > 0 && f >= weight_bytes + kv_bytes + DECODE_RESIDENT_VRAM_MARGIN_BYTES,
@@ -1538,7 +1621,7 @@ fn decode_resident_gate(on_cuda: bool, weight_bytes: u64, kv_bytes: u64) -> (boo
 }
 
 pub struct Qwen3_5TextModel {
-    embed_tokens: Embedding,
+    embed_tokens: EmbedTable,
     pub layers: Vec<Qwen3_5DecoderLayer>,
     norm: Qwen3_5RMSNorm,
     rotary_emb: Qwen3VLTextRotaryEmbedding,
@@ -1563,7 +1646,7 @@ pub struct Qwen3_5TextModel {
 
 impl Qwen3_5TextModel {
     pub fn new_from_vb(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
-        let embed_tokens = embedding(config.vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
+        let embed_tokens = EmbedTable::Dense(embedding(config.vocab_size, config.hidden_size, vb.pp("embed_tokens"))?);
         let registry = KVRegistry::new(); // 장부 초기화
         let mut layers = vec![];
         let vb_layers = vb.pp("layers");
@@ -1593,6 +1676,13 @@ impl Qwen3_5TextModel {
             Ok(v) => match v.to_u32() as Result<u32, candle_core::Error> { Ok(0) => DType::F32, Ok(1) => DType::F16, _ => DType::F16 },
             Err(_) => DType::F16,
         };
+        let dtype = if device.is_vulkan()
+            && std::env::var("LOGIS_VK_DTYPE").map(|v| !v.trim().eq_ignore_ascii_case("f16")).unwrap_or(true)
+        {
+            DType::F32
+        } else {
+            dtype
+        };
         let num_layers = gguf.get_matedata("qwen35.block_count")?.to_u32()? as usize;
         let full_attention_interval = gguf.get_matedata("qwen35.full_attention_interval")?.to_u32()? as usize;
         let rope_freq_base = gguf.get_matedata("qwen35.rope.freq_base")?.to_f32()?;
@@ -1615,27 +1705,41 @@ impl Qwen3_5TextModel {
         //     이 환경의 실측 free RAM 은 592MB~1.3GB 입니다(로그 KV-PLAN 참조).
         //     CPU 경로는 호스트에 540MB + 1,017MB 를 동시에 요구하므로
         //     VRAM 을 아끼려다 시스템 RAM 을 터뜨립니다. GPU 역양자화가 옳습니다.
-        let embed_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
-        let embed_weight = {
-            let embed_tensor = gguf.tensor("token_embd.weight")?;
-            let w = embed_tensor
-                .dequantize_f16(device)
-                .or_else(|_| embed_tensor.dequantize(device))?
-                .to_dtype(embed_dtype)?;
-            drop(embed_tensor);
-            w
+        let quant_embed = if use_quant_embed(device) {
+            let q = gguf.tensor("token_embd.weight")?;
+            if quant_embed_ok(q.dtype()) {
+                Some(q)
+            } else {
+                None
+            }
+        } else {
+            None
         };
-        if device.is_cuda() {
-            // 방금 떨어뜨린 양자화 원본을 할당자가 실제로 반환하도록 경계를 만듭니다.
-            let _ = device.synchronize();
-        }
-        println!(
-            "[MODEL] embed_tokens materialized: {:?} {:?} ({:.0}MB). Quantized source released.",
-            embed_weight.shape().dims(),
-            embed_weight.dtype(),
-            (embed_weight.elem_count() as f64) * 2.0 / 1e6
-        );
-        let embed_tokens = Embedding::new(embed_weight, hidden_size);
+        let embed_tokens = if let Some(q) = quant_embed {
+            EmbedTable::Quant { q: std::sync::Arc::new(q), hidden: hidden_size }
+        } else {
+            let embed_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
+            let embed_weight = {
+                let embed_tensor = gguf.tensor("token_embd.weight")?;
+                let w = embed_tensor
+                    .dequantize_f16(device)
+                    .or_else(|_| embed_tensor.dequantize(device))?
+                    .to_dtype(embed_dtype)?;
+                drop(embed_tensor);
+                w
+            };
+            if device.is_cuda_or_rocm() {
+                // 방금 떨어뜨린 양자화 원본을 할당자가 실제로 반환하도록 경계를 만듭니다.
+                let _ = device.synchronize();
+            }
+            println!(
+                "[MODEL] embed_tokens materialized: {:?} {:?} ({:.0}MB). Quantized source released.",
+                embed_weight.shape().dims(),
+                embed_weight.dtype(),
+                (embed_weight.elem_count() as f64) * 2.0 / 1e6
+            );
+            EmbedTable::Dense(Embedding::new(embed_weight, hidden_size))
+        };
         
         
         #[cfg(target_os = "windows")]
@@ -1739,7 +1843,7 @@ impl Qwen3_5TextModel {
                 );
                 let weight_bytes = self.decode_resident_bytes();
                 let kv_bytes = (full_attn_layers * kv_heads * kv_head_dim * 2 * planned) as u64;
-                let (keep, vram_free) = decode_resident_gate(xs.device().is_cuda(), weight_bytes, kv_bytes);
+                let (keep, vram_free) = decode_resident_gate(xs.device().is_cuda_or_rocm(), weight_bytes, kv_bytes);
                 let (prefix, prefix_bytes) = match vram_free {
                     Some(free) if !keep => self.decode_resident_prefix(
                         free.saturating_sub(kv_bytes + DECODE_RESIDENT_VRAM_MARGIN_BYTES + self.max_layer_bytes()),
@@ -1796,7 +1900,7 @@ impl Qwen3_5TextModel {
                     None => println!(
                         "[DECODE-RESIDENT] {} | {} → {} (읽은 층의 파일 페이지 반환 {} · RAM 여유 {:.0} MB)",
                         label,
-                        if xs.device().is_cuda() { "VRAM 조회 실패" } else { "CUDA 밖 장치는 기존 기준(여유 RAM 6GB 초과)" },
+                        if xs.device().is_cuda_or_rocm() { "VRAM 조회 실패" } else { "CUDA 밖 장치는 기존 기준(여유 RAM 6GB 초과)" },
                         if keep { "Resident" } else { "Stream" },
                         page_mode,
                         ram_free as f64 / 1e6
@@ -1843,7 +1947,7 @@ impl Qwen3_5TextModel {
                         "[DECODE-RESIDENT] 층 {} 를 VRAM 에 상주시키다 실패했습니다 ({}). 이미 올린 층을 비우고 이번 생성의 남은 토큰은 토큰마다 mmap 에서 다시 읽는 기존 경로로 진행합니다.",
                         l_idx, e
                     );
-                    if xs.device().is_cuda() {
+                    if xs.device().is_cuda_or_rocm() {
                         let _ = xs.device().synchronize();
                     }
                     self.reload_layer(l_idx, xs.device())?;
@@ -1965,7 +2069,7 @@ impl Qwen3_5TextModel {
                             let k = inner.k_cache.take();
                             let v = inner.v_cache.take();
                             if let (Some(k_t), Some(v_t)) = (k, v) {
-                                let target_dtype = if k_t.device().is_cuda() || k_t.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
+                                let target_dtype = if k_t.device().is_cuda_or_rocm() || k_t.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
                                 inner.k_cache = Some(k_t.to_dtype(target_dtype).unwrap_or_else(|_| k_t.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_t.clone()));
                                 inner.v_cache = Some(v_t.to_dtype(target_dtype).unwrap_or_else(|_| v_t.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_t.clone()));
                                 inner.location = KVLocation::RAM;
@@ -2340,7 +2444,7 @@ impl Qwen3_5TextModel {
                     // 🌟 [FP8 Compression] Qwen3.5 0.8B 모델 역시 디스크 백업 준비 단계에서 GPU 상에서 즉시 FP8 압축을 마친 뒤 RAM으로 내립니다.
                     // Qwen 계열(qwen, qwen3, qwen3_5) 모두 Attention forward 시에 to_device와 to_dtype 코어가 존재하여
                     // VRAM 재진입 시 자동으로 원래의 BF16/F32 정밀도로 복구됩니다.
-                    let target_dtype = if merged_k_gpu.device().is_cuda() || merged_k_gpu.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
+                    let target_dtype = if merged_k_gpu.device().is_cuda_or_rocm() || merged_k_gpu.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
                     let merged_k_cpu = merged_k_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_k_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_k_gpu.clone());
                     let merged_v_cpu = merged_v_gpu.to_dtype(target_dtype).unwrap_or_else(|_| merged_v_gpu.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| merged_v_gpu.clone());
 
@@ -2486,7 +2590,14 @@ impl Qwen3_5Model {
         let language_model =
             Qwen3_5TextModel::new_from_vb(vb_m.pp("language_model"), &config.text_config)?;
         let lm_head = if config.tie_word_embeddings {
-            Linear::new(language_model.embed_tokens.embeddings().clone(), None)
+            Linear::new(
+                language_model
+                    .embed_tokens
+                    .dense()
+                    .expect("safetensors path always builds a dense embedding table")
+                    .clone(),
+                None,
+            )
         } else {
             linear_no_bias(
                 config.text_config.hidden_size,
@@ -2545,19 +2656,24 @@ impl Qwen3_5Model {
                 println!("[MODEL] lm_head: dedicated 'output.weight' loaded (untied).");
                 ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(tensor)?, None))
             }
-            Err(_) => {
-                let shared = language_model.embed_tokens.embeddings().clone();
-                let qm = if shared.dtype() == DType::F16 {
-                    QMatMul::TensorF16(shared)
-                } else {
-                    QMatMul::Tensor(shared)
-                };
-                println!(
-                    "[MODEL] lm_head: 'output.weight' absent → tied to embed_tokens. Duplicate {:.0}MB avoided.",
-                    (language_model.embed_tokens.embeddings().elem_count() as f64) * 2.0 / 1e6
-                );
-                ProjKind::QuantizedProj(QuantizedLinear::new(qm, None))
-            }
+            Err(_) => match &language_model.embed_tokens {
+                EmbedTable::Quant { q, .. } => {
+                    ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_arc(q.clone())?, None))
+                }
+                EmbedTable::Dense(e) => {
+                    let shared = e.embeddings().clone();
+                    let qm = if shared.dtype() == DType::F16 {
+                        QMatMul::TensorF16(shared)
+                    } else {
+                        QMatMul::Tensor(shared)
+                    };
+                    println!(
+                        "[MODEL] lm_head: 'output.weight' absent → tied to embed_tokens. Duplicate {:.0}MB avoided.",
+                        (e.embeddings().elem_count() as f64) * 2.0 / 1e6
+                    );
+                    ProjKind::QuantizedProj(QuantizedLinear::new(qm, None))
+                }
+            },
         };
 
         // 🌟 [VISION-SKELETON] 여기서는 비전을 만들지 않습니다.
@@ -2668,9 +2784,12 @@ impl Qwen3_5Model {
         Ok(())
     }
 
-    // 🌟 [추가] Semantic Bias 연산을 위해 전체 단어장의 벡터(Weight)를 그대로 반환합니다.
-    pub fn get_embed_tokens(&self) -> Tensor {
-        self.language_model.embed_tokens.embeddings().clone()
+    pub fn embed_vocab(&self) -> candle_core::Result<usize> {
+        self.language_model.embed_tokens.vocab()
+    }
+
+    pub fn embed_rows_f32(&self, off: usize, take: usize) -> candle_core::Result<Tensor> {
+        self.language_model.embed_tokens.rows_f32(off, take)
     }
 
     pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -2752,7 +2871,7 @@ impl Qwen3_5Model {
             .to_dtype(DType::F32)?
             .to_device(input_ids.device())?;
             
-        let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if input_ids.device().is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         let deltas = Tensor::from_vec(mrope_position_deltas.clone(), (b_sz, 1), &Device::Cpu)?
             .to_dtype(DType::F32)? 
             .to_device(input_ids.device())? 
@@ -2831,7 +2950,7 @@ impl Qwen3_5Model {
         }
         
         let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
-        let target_dtype = if input_ids.device().is_cuda() { DType::BF16 } else { DType::F32 };
+        let target_dtype = if input_ids.device().is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         inputs_embeds = inputs_embeds.to_dtype(target_dtype)?;
         
         if let Some(pixel_values) = pixel_values {

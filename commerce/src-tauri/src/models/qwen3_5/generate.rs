@@ -1,6 +1,7 @@
 use crate::openai_types::{ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestUserMessageContent, ChatCompletionRequestMessageContentPart};
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor, quantized::gguf_file};
+use crate::utils::GpuDeviceExt;
 use candle_nn::VarBuilder;
 use std::io::Write;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -67,7 +68,7 @@ impl Qwen3_5GenerateModel {
 
         // 비전을 뗀 직후 OS 레벨 메모리 반환을 즉시 트리거합니다.
         if !active {
-            if self.device.is_cuda() { let _ = self.device.synchronize(); }
+            if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
             #[cfg(target_os = "windows")]
             unsafe {
                 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -372,18 +373,17 @@ impl Qwen3_5GenerateModel {
                         //   행을 블록으로 잘라 각각 정규화·내적한 뒤 이어 붙이면
                         //   전량 계산과 비트 단위로 동일한 벡터가 나옵니다.
                         //   블록 16,384행 기준 전이 버퍼는 16,384 × 2,048 × 4B = 134MB 입니다.
-                        let all_embs = self.qwen3_5.get_embed_tokens(); // Arc 참조 복사, 새 할당 없음
                         let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
                         let target_normalized = target_vec.broadcast_div(&target_norm)?;
                         let target_col = target_normalized.unsqueeze(1)?.contiguous()?;
 
                         const VOCAB_CHUNK: usize = 16_384;
-                        let vocab = all_embs.dim(0)?;
+                        let vocab = self.qwen3_5.embed_vocab()?;
                         let mut sim_parts: Vec<Tensor> = Vec::with_capacity(vocab / VOCAB_CHUNK + 1);
                         let mut off = 0usize;
                         while off < vocab {
                             let take = (vocab - off).min(VOCAB_CHUNK);
-                            let blk = all_embs.narrow(0, off, take)?.to_dtype(DType::F32)?;
+                            let blk = self.qwen3_5.embed_rows_f32(off, take)?;
                             let blk_norm = blk.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
                             let blk_normalized = blk.broadcast_div(&blk_norm)?;
                             sim_parts.push(blk_normalized.matmul(&target_col)?.squeeze(1)?);
@@ -412,6 +412,9 @@ impl Qwen3_5GenerateModel {
         }
 
         for i in 0..sample_len {
+            if i == 1 {
+                crate::utils::trim_idle_gpu_pool(&self.device);
+            }
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
 
             let logits = self.qwen3_5.forward(
@@ -432,8 +435,8 @@ impl Qwen3_5GenerateModel {
                 if !prej.device().same_device(logits.device()) {
                     println!(
                         "[SEMANTIC-PREJUDICE] 편견 벡터를 logits 와 같은 장치로 옮깁니다 ({} → {}). forward 는 logits 를 CPU 로 돌려주므로, 장치를 맞추지 않으면 첫 토큰에서 device mismatch 로 태스크가 중단됩니다.",
-                        if prej.device().is_cuda() { "GPU" } else { "CPU" },
-                        if logits.device().is_cuda() { "GPU" } else { "CPU" }
+                        if prej.device().is_cpu() { "CPU" } else { "GPU" },
+                        if logits.device().is_cpu() { "CPU" } else { "GPU" }
                     );
                     *prej = prej.to_device(logits.device())?;
                 }
@@ -641,6 +644,7 @@ impl Qwen3_5GenerateModel {
             cur_pixel_values_video = None;
         }
         println!(); 
+        crate::utils::trim_idle_gpu_pool(&self.device);
 
         let res = self.tokenizer.token_decode(generate)?;
         
@@ -653,7 +657,7 @@ impl Qwen3_5GenerateModel {
 
         // 🌟 [종료 직후 메모리 즉각 강제 반환] 
         // 80% -> 65% 지연 반환 현상 해결! OS 레벨 메모리를 즉시 강제 회수하여 65% 상태를 유지시킵니다.
-        if self.device.is_cuda() { let _ = self.device.synchronize(); }
+        if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -804,18 +808,17 @@ impl Qwen3_5GenerateModel {
                         //   행을 블록으로 잘라 각각 정규화·내적한 뒤 이어 붙이면
                         //   전량 계산과 비트 단위로 동일한 벡터가 나옵니다.
                         //   블록 16,384행 기준 전이 버퍼는 16,384 × 2,048 × 4B = 134MB 입니다.
-                        let all_embs = self.qwen3_5.get_embed_tokens(); // Arc 참조 복사, 새 할당 없음
                         let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
                         let target_normalized = target_vec.broadcast_div(&target_norm)?;
                         let target_col = target_normalized.unsqueeze(1)?.contiguous()?;
 
                         const VOCAB_CHUNK: usize = 16_384;
-                        let vocab = all_embs.dim(0)?;
+                        let vocab = self.qwen3_5.embed_vocab()?;
                         let mut sim_parts: Vec<Tensor> = Vec::with_capacity(vocab / VOCAB_CHUNK + 1);
                         let mut off = 0usize;
                         while off < vocab {
                             let take = (vocab - off).min(VOCAB_CHUNK);
-                            let blk = all_embs.narrow(0, off, take)?.to_dtype(DType::F32)?;
+                            let blk = self.qwen3_5.embed_rows_f32(off, take)?;
                             let blk_norm = blk.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
                             let blk_normalized = blk.broadcast_div(&blk_norm)?;
                             sim_parts.push(blk_normalized.matmul(&target_col)?.squeeze(1)?);
@@ -844,6 +847,9 @@ impl Qwen3_5GenerateModel {
         }
 
         for i in 0..sample_len {
+            if i == 1 {
+                crate::utils::trim_idle_gpu_pool(&self.device);
+            }
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) {
                     break;
@@ -870,8 +876,8 @@ impl Qwen3_5GenerateModel {
                 if !prej.device().same_device(logits.device()) {
                     println!(
                         "[SEMANTIC-PREJUDICE] 편견 벡터를 logits 와 같은 장치로 옮깁니다 ({} → {}). forward 는 logits 를 CPU 로 돌려주므로, 장치를 맞추지 않으면 첫 토큰에서 device mismatch 로 태스크가 중단됩니다.",
-                        if prej.device().is_cuda() { "GPU" } else { "CPU" },
-                        if logits.device().is_cuda() { "GPU" } else { "CPU" }
+                        if prej.device().is_cpu() { "CPU" } else { "GPU" },
+                        if logits.device().is_cpu() { "CPU" } else { "GPU" }
                     );
                     *prej = prej.to_device(logits.device())?;
                 }
@@ -1084,6 +1090,7 @@ impl Qwen3_5GenerateModel {
             cur_video_thw = None;
         }
         println!(); 
+        crate::utils::trim_idle_gpu_pool(&self.device);
 
         let res_text = self.tokenizer.token_decode(generate)?;
         
@@ -1092,7 +1099,7 @@ impl Qwen3_5GenerateModel {
         }
 
         // 🌟 [종료 직후 메모리 즉각 강제 반환] 
-        if self.device.is_cuda() { let _ = self.device.synchronize(); }
+        if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1181,7 +1188,7 @@ impl Qwen3_5GenerateModel {
         }
 
         // 🌟 [종료 직후 메모리 즉각 강제 반환]
-        if self.device.is_cuda() { let _ = self.device.synchronize(); }
+        if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
         #[cfg(target_os = "windows")]
         unsafe {
             use windows_sys::Win32::System::Threading::GetCurrentProcess;
