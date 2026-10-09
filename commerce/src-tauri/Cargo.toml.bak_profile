@@ -108,35 +108,6 @@ candle-nn = { path = "../../../candle-rocm-vulkan/candle-nn" }
 opt-level = 0      # 기본값 0(최적화 없음)을 2로 올려서 실행 속도를 개선합니다.
 incremental = true # 변경된 부분만 빌드해서 시간을 아낍니다.
 
-# 🌟 [DEV-PERF] 앱 코드는 디버그(빠른 증분 빌드) 그대로 두고, 연산 라이브러리만 최적화합니다.
-#   opt-level 0 의 candle CPU 연산은 릴리스 대비 수십 배 느려서, CPU 로 떨어지는 연산이 많은
-#   Vulkan(그리고 CPU 모드)에서 dev 실행이 사실상 멈춘 것처럼 보였습니다.
-#   이 크레이트들은 거의 수정하지 않으므로 처음 한 번만 다시 빌드됩니다.
-[profile.dev.package.candle-core]
-opt-level = 3
-[profile.dev.package.candle-nn]
-opt-level = 3
-[profile.dev.package.candle-transformers]
-opt-level = 3
-[profile.dev.package.gemm]
-opt-level = 3
-[profile.dev.package.gemm-common]
-opt-level = 3
-[profile.dev.package.gemm-f16]
-opt-level = 3
-[profile.dev.package.gemm-f32]
-opt-level = 3
-[profile.dev.package.gemm-f64]
-opt-level = 3
-[profile.dev.package.half]
-opt-level = 3
-[profile.dev.package.naga]
-opt-level = 3
-[profile.dev.package.rayon]
-opt-level = 3
-[profile.dev.package.rayon-core]
-opt-level = 3
-
 [profile.release]
 opt-level = 3   # 실행 속도 최대
 strip = true      # 모든 심볼 제거 (함수 이름 등 삭제)

@@ -10,6 +10,87 @@ use candle_nn::{
 
 use crate::models::qwen::quantized_model::{KVBlock, KVLocation, KVRegistry};
 
+/// 🌟 [EMBED TABLE] 토큰 임베딩 표.
+///
+///  · Dense: F16 역양자화본 한 벌을 임베딩 조회와 tied lm_head 가 공유합니다 (CPU/CUDA/ROCm 기본).
+///  · Quant: GGUF 의 양자화 원본(Q8_0)을 장치 메모리에 그대로 두고 조회(gather)와
+///    lm_head(양자화 GEMV)를 모두 그 한 벌로 처리합니다.
+///
+///  ── Vulkan 에서 Quant 를 쓰는 이유 (실측) ──
+///   Vulkan 백엔드는 일반 텐서를 호스트(공유) 메모리에 두고, 행렬곱의 큰 우변만 VRAM 에
+///   사본(미러)을 만듭니다. F16 역양자화본(248,320 × 2,048 × 2B = 1,017MB)은 그래서
+///   호스트 RAM 에 한 벌 + lm_head 용 VRAM 에 한 벌, 같은 표가 두 번 존재했습니다.
+///   Q8_0 원본 한 벌(약 576MB, VRAM)이면 조회도 lm_head 도 GPU 에서 끝납니다.
+///   `LOGIS_EMBED_Q8=1|0` 으로 다른 장치에서도 켜거나 Vulkan 에서 끌 수 있습니다.
+#[derive(Clone)]
+pub enum EmbedTable {
+    Dense(Embedding),
+    Quant {
+        q: std::sync::Arc<candle_core::quantized::QTensor>,
+        hidden: usize,
+    },
+}
+
+impl EmbedTable {
+    pub fn forward(&self, ids: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(e) => e.forward(ids),
+            Self::Quant { q, .. } => q.embedding(ids),
+        }
+    }
+
+    pub fn vocab(&self) -> candle_core::Result<usize> {
+        match self {
+            Self::Dense(e) => e.embeddings().dim(0),
+            Self::Quant { q, .. } => Ok(q.shape().dims()[0]),
+        }
+    }
+
+    /// 어휘 행 [off, off + take) 를 F32 로 돌려줍니다 (Quant 는 GPU gather).
+    pub fn rows_f32(&self, off: usize, take: usize) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(e) => e.embeddings().narrow(0, off, take)?.to_dtype(DType::F32),
+            Self::Quant { q, .. } => {
+                let ids = Tensor::arange(off as u32, (off + take) as u32, &q.device())?;
+                q.embedding(&ids)
+            }
+        }
+    }
+
+    pub fn dense(&self) -> Option<&Tensor> {
+        match self {
+            Self::Dense(e) => Some(e.embeddings()),
+            Self::Quant { .. } => None,
+        }
+    }
+
+    pub fn hidden(&self) -> usize {
+        match self {
+            Self::Dense(e) => e.embeddings().dim(1).unwrap_or(0),
+            Self::Quant { hidden, .. } => *hidden,
+        }
+    }
+}
+
+/// `LOGIS_EMBED_Q8` 명시값 (없으면 None).
+fn embed_q8_env() -> Option<bool> {
+    std::env::var("LOGIS_EMBED_Q8").ok().map(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+    })
+}
+
+/// Q8 원본 임베딩 표를 쓸지: Vulkan 은 기본 사용, 그 외 장치는 `LOGIS_EMBED_Q8=1` 일 때.
+fn use_quant_embed(device: &Device) -> bool {
+    embed_q8_env().unwrap_or_else(|| device.is_vulkan())
+}
+
+/// 기본값(환경변수 없음)에서는 GPU gather/GEMV 커널이 있는 Q8_0 표만 양자화 상태로 둡니다.
+/// 다른 형식(Q4_K 등)은 Vulkan 에서 CPU 로 떨어지므로 기존 F16 표가 더 빠릅니다.
+fn quant_embed_ok(dtype: candle_core::quantized::GgmlDType) -> bool {
+    embed_q8_env() == Some(true) || dtype == candle_core::quantized::GgmlDType::Q8_0
+}
+
 use crate::{
     models::{
         common::{
@@ -1535,7 +1616,7 @@ fn decode_resident_gate(on_cuda: bool, weight_bytes: u64, kv_bytes: u64) -> (boo
 }
 
 pub struct Qwen3_5TextModel {
-    embed_tokens: Embedding,
+    embed_tokens: EmbedTable,
     pub layers: Vec<Qwen3_5DecoderLayer>,
     norm: Qwen3_5RMSNorm,
     rotary_emb: Qwen3VLTextRotaryEmbedding,
@@ -1560,7 +1641,7 @@ pub struct Qwen3_5TextModel {
 
 impl Qwen3_5TextModel {
     pub fn new_from_vb(vb: VarBuilder, config: &Qwen3_5TextConfig) -> Result<Self> {
-        let embed_tokens = embedding(config.vocab_size, config.hidden_size, vb.pp("embed_tokens"))?;
+        let embed_tokens = EmbedTable::Dense(embedding(config.vocab_size, config.hidden_size, vb.pp("embed_tokens"))?);
         let registry = KVRegistry::new(); // 장부 초기화
         let mut layers = vec![];
         let vb_layers = vb.pp("layers");
@@ -1612,27 +1693,53 @@ impl Qwen3_5TextModel {
         //     이 환경의 실측 free RAM 은 592MB~1.3GB 입니다(로그 KV-PLAN 참조).
         //     CPU 경로는 호스트에 540MB + 1,017MB 를 동시에 요구하므로
         //     VRAM 을 아끼려다 시스템 RAM 을 터뜨립니다. GPU 역양자화가 옳습니다.
-        let embed_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
-        let embed_weight = {
-            let embed_tensor = gguf.tensor("token_embd.weight")?;
-            let w = embed_tensor
-                .dequantize_f16(device)
-                .or_else(|_| embed_tensor.dequantize(device))?
-                .to_dtype(embed_dtype)?;
-            drop(embed_tensor);
-            w
+        let quant_embed = if use_quant_embed(device) {
+            let q = gguf.tensor("token_embd.weight")?;
+            if quant_embed_ok(q.dtype()) {
+                Some(q)
+            } else {
+                println!(
+                    "[MODEL] embed_tokens: {:?} table has no GPU gather/GEMV path → F16 table kept (set LOGIS_EMBED_Q8=1 to force).",
+                    q.dtype()
+                );
+                None
+            }
+        } else {
+            None
         };
-        if device.is_cuda_or_rocm() {
-            // 방금 떨어뜨린 양자화 원본을 할당자가 실제로 반환하도록 경계를 만듭니다.
-            let _ = device.synchronize();
-        }
-        println!(
-            "[MODEL] embed_tokens materialized: {:?} {:?} ({:.0}MB). Quantized source released.",
-            embed_weight.shape().dims(),
-            embed_weight.dtype(),
-            (embed_weight.elem_count() as f64) * 2.0 / 1e6
-        );
-        let embed_tokens = Embedding::new(embed_weight, hidden_size);
+        let embed_tokens = if let Some(q) = quant_embed {
+            // 🌟 [EMBED TABLE / Quant] 역양자화본을 만들지 않고 양자화 원본 한 벌만 장치에 둡니다.
+            println!(
+                "[MODEL] embed_tokens kept quantized on {:?}: {:?} {:?} ({:.0}MB). F16 copy skipped (lookup + tied lm_head share this one table).",
+                device,
+                q.shape().dims(),
+                q.dtype(),
+                q.storage_size_in_bytes() as f64 / 1e6
+            );
+            EmbedTable::Quant { q: std::sync::Arc::new(q), hidden: hidden_size }
+        } else {
+            let embed_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
+            let embed_weight = {
+                let embed_tensor = gguf.tensor("token_embd.weight")?;
+                let w = embed_tensor
+                    .dequantize_f16(device)
+                    .or_else(|_| embed_tensor.dequantize(device))?
+                    .to_dtype(embed_dtype)?;
+                drop(embed_tensor);
+                w
+            };
+            if device.is_cuda_or_rocm() {
+                // 방금 떨어뜨린 양자화 원본을 할당자가 실제로 반환하도록 경계를 만듭니다.
+                let _ = device.synchronize();
+            }
+            println!(
+                "[MODEL] embed_tokens materialized: {:?} {:?} ({:.0}MB). Quantized source released.",
+                embed_weight.shape().dims(),
+                embed_weight.dtype(),
+                (embed_weight.elem_count() as f64) * 2.0 / 1e6
+            );
+            EmbedTable::Dense(Embedding::new(embed_weight, hidden_size))
+        };
         
         
         #[cfg(target_os = "windows")]
@@ -2483,7 +2590,14 @@ impl Qwen3_5Model {
         let language_model =
             Qwen3_5TextModel::new_from_vb(vb_m.pp("language_model"), &config.text_config)?;
         let lm_head = if config.tie_word_embeddings {
-            Linear::new(language_model.embed_tokens.embeddings().clone(), None)
+            Linear::new(
+                language_model
+                    .embed_tokens
+                    .dense()
+                    .expect("safetensors path always builds a dense embedding table")
+                    .clone(),
+                None,
+            )
         } else {
             linear_no_bias(
                 config.text_config.hidden_size,
@@ -2542,19 +2656,28 @@ impl Qwen3_5Model {
                 println!("[MODEL] lm_head: dedicated 'output.weight' loaded (untied).");
                 ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(tensor)?, None))
             }
-            Err(_) => {
-                let shared = language_model.embed_tokens.embeddings().clone();
-                let qm = if shared.dtype() == DType::F16 {
-                    QMatMul::TensorF16(shared)
-                } else {
-                    QMatMul::Tensor(shared)
-                };
-                println!(
-                    "[MODEL] lm_head: 'output.weight' absent → tied to embed_tokens. Duplicate {:.0}MB avoided.",
-                    (language_model.embed_tokens.embeddings().elem_count() as f64) * 2.0 / 1e6
-                );
-                ProjKind::QuantizedProj(QuantizedLinear::new(qm, None))
-            }
+            Err(_) => match &language_model.embed_tokens {
+                EmbedTable::Quant { q, .. } => {
+                    println!(
+                        "[MODEL] lm_head: 'output.weight' absent → tied to the quantized embed table ({:.0}MB, no extra copy).",
+                        q.storage_size_in_bytes() as f64 / 1e6
+                    );
+                    ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_arc(q.clone())?, None))
+                }
+                EmbedTable::Dense(e) => {
+                    let shared = e.embeddings().clone();
+                    let qm = if shared.dtype() == DType::F16 {
+                        QMatMul::TensorF16(shared)
+                    } else {
+                        QMatMul::Tensor(shared)
+                    };
+                    println!(
+                        "[MODEL] lm_head: 'output.weight' absent → tied to embed_tokens. Duplicate {:.0}MB avoided.",
+                        (e.embeddings().elem_count() as f64) * 2.0 / 1e6
+                    );
+                    ProjKind::QuantizedProj(QuantizedLinear::new(qm, None))
+                }
+            },
         };
 
         // 🌟 [VISION-SKELETON] 여기서는 비전을 만들지 않습니다.
@@ -2665,9 +2788,14 @@ impl Qwen3_5Model {
         Ok(())
     }
 
-    // 🌟 [추가] Semantic Bias 연산을 위해 전체 단어장의 벡터(Weight)를 그대로 반환합니다.
-    pub fn get_embed_tokens(&self) -> Tensor {
-        self.language_model.embed_tokens.embeddings().clone()
+    // 🌟 [추가] Semantic Bias 연산용: 어휘 크기와 어휘 행 블록(F32).
+    //   표가 양자화 원본(EmbedTable::Quant)이어도 같은 값을 블록 단위로 돌려줍니다.
+    pub fn embed_vocab(&self) -> candle_core::Result<usize> {
+        self.language_model.embed_tokens.vocab()
+    }
+
+    pub fn embed_rows_f32(&self, off: usize, take: usize) -> candle_core::Result<Tensor> {
+        self.language_model.embed_tokens.rows_f32(off, take)
     }
 
     pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {

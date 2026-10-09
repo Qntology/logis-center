@@ -1,8 +1,8 @@
 @echo off
 chcp 65001 > nul
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-set "PYTHONIOENCODING=utf-8"
+call "%~dp0_env_vulkan.bat"
+if errorlevel 1 exit /b 1
 
-cd src-tauri
+cd /d "%~dp0src-tauri"
 
 cargo check --no-default-features --features vulkan

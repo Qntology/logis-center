@@ -373,18 +373,18 @@ impl Qwen3_5GenerateModel {
                         //   행을 블록으로 잘라 각각 정규화·내적한 뒤 이어 붙이면
                         //   전량 계산과 비트 단위로 동일한 벡터가 나옵니다.
                         //   블록 16,384행 기준 전이 버퍼는 16,384 × 2,048 × 4B = 134MB 입니다.
-                        let all_embs = self.qwen3_5.get_embed_tokens(); // Arc 참조 복사, 새 할당 없음
+                        // 어휘 행은 블록 단위로 꺼냅니다 (양자화 표면 GPU gather, 새 상주 할당 없음)
                         let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
                         let target_normalized = target_vec.broadcast_div(&target_norm)?;
                         let target_col = target_normalized.unsqueeze(1)?.contiguous()?;
 
                         const VOCAB_CHUNK: usize = 16_384;
-                        let vocab = all_embs.dim(0)?;
+                        let vocab = self.qwen3_5.embed_vocab()?;
                         let mut sim_parts: Vec<Tensor> = Vec::with_capacity(vocab / VOCAB_CHUNK + 1);
                         let mut off = 0usize;
                         while off < vocab {
                             let take = (vocab - off).min(VOCAB_CHUNK);
-                            let blk = all_embs.narrow(0, off, take)?.to_dtype(DType::F32)?;
+                            let blk = self.qwen3_5.embed_rows_f32(off, take)?;
                             let blk_norm = blk.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
                             let blk_normalized = blk.broadcast_div(&blk_norm)?;
                             sim_parts.push(blk_normalized.matmul(&target_col)?.squeeze(1)?);
@@ -412,7 +412,14 @@ impl Qwen3_5GenerateModel {
             }
         }
 
+        let gen_t0 = std::time::Instant::now();
+        let mut gen_first_ms: Option<f64> = None;
+        let mut gen_steps = 0usize;
         for i in 0..sample_len {
+            if i == 1 && gen_first_ms.is_none() {
+                gen_first_ms = Some(gen_t0.elapsed().as_secs_f64() * 1e3);
+            }
+            gen_steps = i as usize + 1;
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
 
             let logits = self.qwen3_5.forward(
@@ -642,6 +649,22 @@ impl Qwen3_5GenerateModel {
             cur_pixel_values_video = None;
         }
         println!(); 
+        {
+            // 🌟 [GEN-STAT] 생성 1회의 속도와, 생성 직후(가중치·KV 상주) 메모리 상태
+            let total_ms = gen_t0.elapsed().as_secs_f64() * 1e3;
+            let first_ms = gen_first_ms.unwrap_or(total_ms);
+            let dec_tok = gen_steps.saturating_sub(1);
+            let dec_ms = (total_ms - first_ms).max(0.0);
+            println!(
+                "[GEN-STAT] 프리필+첫 토큰 {:.0} ms | 디코드 {} 토큰 {:.0} ms ({:.1} ms/토큰, {:.1} 토큰/s)",
+                first_ms,
+                dec_tok,
+                dec_ms,
+                if dec_tok > 0 { dec_ms / dec_tok as f64 } else { 0.0 },
+                if dec_ms > 0.0 { dec_tok as f64 * 1000.0 / dec_ms } else { 0.0 }
+            );
+            crate::utils::log_vram_report_for(&self.device, "gen-end (생성 직후)");
+        }
 
         let res = self.tokenizer.token_decode(generate)?;
         
@@ -805,18 +828,18 @@ impl Qwen3_5GenerateModel {
                         //   행을 블록으로 잘라 각각 정규화·내적한 뒤 이어 붙이면
                         //   전량 계산과 비트 단위로 동일한 벡터가 나옵니다.
                         //   블록 16,384행 기준 전이 버퍼는 16,384 × 2,048 × 4B = 134MB 입니다.
-                        let all_embs = self.qwen3_5.get_embed_tokens(); // Arc 참조 복사, 새 할당 없음
+                        // 어휘 행은 블록 단위로 꺼냅니다 (양자화 표면 GPU gather, 새 상주 할당 없음)
                         let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
                         let target_normalized = target_vec.broadcast_div(&target_norm)?;
                         let target_col = target_normalized.unsqueeze(1)?.contiguous()?;
 
                         const VOCAB_CHUNK: usize = 16_384;
-                        let vocab = all_embs.dim(0)?;
+                        let vocab = self.qwen3_5.embed_vocab()?;
                         let mut sim_parts: Vec<Tensor> = Vec::with_capacity(vocab / VOCAB_CHUNK + 1);
                         let mut off = 0usize;
                         while off < vocab {
                             let take = (vocab - off).min(VOCAB_CHUNK);
-                            let blk = all_embs.narrow(0, off, take)?.to_dtype(DType::F32)?;
+                            let blk = self.qwen3_5.embed_rows_f32(off, take)?;
                             let blk_norm = blk.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
                             let blk_normalized = blk.broadcast_div(&blk_norm)?;
                             sim_parts.push(blk_normalized.matmul(&target_col)?.squeeze(1)?);
@@ -844,7 +867,14 @@ impl Qwen3_5GenerateModel {
             }
         }
 
+        let gen_t0 = std::time::Instant::now();
+        let mut gen_first_ms: Option<f64> = None;
+        let mut gen_steps = 0usize;
         for i in 0..sample_len {
+            if i == 1 && gen_first_ms.is_none() {
+                gen_first_ms = Some(gen_t0.elapsed().as_secs_f64() * 1e3);
+            }
+            gen_steps = i as usize + 1;
             if let Some(flag) = &cancel_flag {
                 if flag.load(Ordering::Relaxed) {
                     break;
@@ -1085,6 +1115,22 @@ impl Qwen3_5GenerateModel {
             cur_video_thw = None;
         }
         println!(); 
+        {
+            // 🌟 [GEN-STAT] 생성 1회의 속도와, 생성 직후(가중치·KV 상주) 메모리 상태
+            let total_ms = gen_t0.elapsed().as_secs_f64() * 1e3;
+            let first_ms = gen_first_ms.unwrap_or(total_ms);
+            let dec_tok = gen_steps.saturating_sub(1);
+            let dec_ms = (total_ms - first_ms).max(0.0);
+            println!(
+                "[GEN-STAT] 프리필+첫 토큰 {:.0} ms | 디코드 {} 토큰 {:.0} ms ({:.1} ms/토큰, {:.1} 토큰/s)",
+                first_ms,
+                dec_tok,
+                dec_ms,
+                if dec_tok > 0 { dec_ms / dec_tok as f64 } else { 0.0 },
+                if dec_ms > 0.0 { dec_tok as f64 * 1000.0 / dec_ms } else { 0.0 }
+            );
+            crate::utils::log_vram_report_for(&self.device, "gen-end (생성 직후)");
+        }
 
         let res_text = self.tokenizer.token_decode(generate)?;
         
