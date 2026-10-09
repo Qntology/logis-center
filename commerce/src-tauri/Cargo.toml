@@ -83,7 +83,7 @@ any_ascii = "0.3.3"
 
 [target.'cfg(windows)'.dependencies]
 direct-storage = { path = "../crates/direct-storage" }
-windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Security", "Win32_System_IO"] }
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Graphics_Direct3D12", "Win32_Security", "Win32_System_IO"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.13"
@@ -108,10 +108,6 @@ candle-nn = { path = "../../../candle-rocm-vulkan/candle-nn" }
 opt-level = 0      # 기본값 0(최적화 없음)을 2로 올려서 실행 속도를 개선합니다.
 incremental = true # 변경된 부분만 빌드해서 시간을 아낍니다.
 
-# 🌟 [DEV-PERF] 앱 코드는 디버그(빠른 증분 빌드) 그대로 두고, 연산 라이브러리만 최적화합니다.
-#   opt-level 0 의 candle CPU 연산은 릴리스 대비 수십 배 느려서, CPU 로 떨어지는 연산이 많은
-#   Vulkan(그리고 CPU 모드)에서 dev 실행이 사실상 멈춘 것처럼 보였습니다.
-#   이 크레이트들은 거의 수정하지 않으므로 처음 한 번만 다시 빌드됩니다.
 [profile.dev.package.candle-core]
 opt-level = 3
 [profile.dev.package.candle-nn]

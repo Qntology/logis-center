@@ -13,8 +13,6 @@ pub mod logger;
 pub mod pug_utils;
 pub mod lang_utils;
 pub mod device_utils;
-// 🌟 [VRAM-REPORT] Windows 가 이 프로세스에 실제로 매긴 GPU 메모리(작업 관리자 기준)
-pub mod os_vram;
 pub mod misc_utils;
 pub mod metrics;
 pub mod sync_utils;

@@ -1,6 +1,5 @@
 @echo off
 chcp 65001 > nul
-rem Downloads Microsoft.Direct3D.DirectStorage 1.3.0 (official NuGet package) and unpacks it into src-tauri
 set "DEST=%~dp0src-tauri\microsoft.direct3d.directstorage.1.3.0"
 set "LOG=%~dp0setup_directstorage.log"
 echo start > "%LOG%"

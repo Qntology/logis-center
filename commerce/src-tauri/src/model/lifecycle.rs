@@ -114,9 +114,6 @@ impl LogisModel {
     /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
     pub async fn deep_purge_resources(&self) {
         let _purge_hold = self.hold_generation();
-        if !self.is_cpu_mode {
-            utils::log_vram_report(self.device_config.gpu_id as usize, "purge-start (모델 해제 전)");
-        }
         println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
         crate::models::qwen::generate::wait_for_global_io().await; // [cite: 254]
         println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
@@ -227,14 +224,6 @@ impl LogisModel {
         }
 
         println!("[DIAG-PURGE] Aggressive Purge Complete.");
-        if !self.is_cpu_mode {
-            // 해제가 비동기로 늦게 반영되는지 보려고 3초 뒤에 한 번 더 남깁니다.
-            let gpu = self.device_config.gpu_id as usize;
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                utils::log_vram_report(gpu, "purge+3s");
-            });
-        }
         // 🌟 [CROSSOVER] 퍼지 후 모든 슬롯이 비었으므로 원장을 사실에 맞춥니다.
         //    이 한 줄 덕분에 호출부마다 mark_crossover_idle 을 흩뿌릴 필요가 없습니다.
         //    (이미 호출부에 남아 있는 mark_crossover_idle 은 멱등이라 무해합니다)

@@ -1,6 +1,5 @@
 @echo off
 chcp 65001 > nul
-rem Installs the Windows 11 SDK (kernel32.lib etc.) into VS 2022 Community. Needs admin (UAC prompt).
 net session >nul 2>&1
 if errorlevel 1 (
     echo Requesting administrator rights...

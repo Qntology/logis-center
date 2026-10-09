@@ -10,18 +10,6 @@ use candle_nn::{
 
 use crate::models::qwen::quantized_model::{KVBlock, KVLocation, KVRegistry};
 
-/// 🌟 [EMBED TABLE] 토큰 임베딩 표.
-///
-///  · Dense: F16 역양자화본 한 벌을 임베딩 조회와 tied lm_head 가 공유합니다 (CPU/CUDA/ROCm 기본).
-///  · Quant: GGUF 의 양자화 원본(Q8_0)을 장치 메모리에 그대로 두고 조회(gather)와
-///    lm_head(양자화 GEMV)를 모두 그 한 벌로 처리합니다.
-///
-///  ── Vulkan 에서 Quant 를 쓰는 이유 (실측) ──
-///   Vulkan 백엔드는 일반 텐서를 호스트(공유) 메모리에 두고, 행렬곱의 큰 우변만 VRAM 에
-///   사본(미러)을 만듭니다. F16 역양자화본(248,320 × 2,048 × 2B = 1,017MB)은 그래서
-///   호스트 RAM 에 한 벌 + lm_head 용 VRAM 에 한 벌, 같은 표가 두 번 존재했습니다.
-///   Q8_0 원본 한 벌(약 576MB, VRAM)이면 조회도 lm_head 도 GPU 에서 끝납니다.
-///   `LOGIS_EMBED_Q8=1|0` 으로 다른 장치에서도 켜거나 Vulkan 에서 끌 수 있습니다.
 #[derive(Clone)]
 pub enum EmbedTable {
     Dense(Embedding),
@@ -46,7 +34,6 @@ impl EmbedTable {
         }
     }
 
-    /// 어휘 행 [off, off + take) 를 F32 로 돌려줍니다 (Quant 는 GPU gather).
     pub fn rows_f32(&self, off: usize, take: usize) -> candle_core::Result<Tensor> {
         match self {
             Self::Dense(e) => e.embeddings().narrow(0, off, take)?.to_dtype(DType::F32),
@@ -72,7 +59,6 @@ impl EmbedTable {
     }
 }
 
-/// `LOGIS_EMBED_Q8` 명시값 (없으면 None).
 fn embed_q8_env() -> Option<bool> {
     std::env::var("LOGIS_EMBED_Q8").ok().map(|v| {
         let v = v.trim().to_ascii_lowercase();
@@ -80,13 +66,10 @@ fn embed_q8_env() -> Option<bool> {
     })
 }
 
-/// Q8 원본 임베딩 표를 쓸지: Vulkan 은 기본 사용, 그 외 장치는 `LOGIS_EMBED_Q8=1` 일 때.
 fn use_quant_embed(device: &Device) -> bool {
     embed_q8_env().unwrap_or_else(|| device.is_vulkan())
 }
 
-/// 기본값(환경변수 없음)에서는 GPU gather/GEMV 커널이 있는 Q8_0 표만 양자화 상태로 둡니다.
-/// 다른 형식(Q4_K 등)은 Vulkan 에서 CPU 로 떨어지므로 기존 F16 표가 더 빠릅니다.
 fn quant_embed_ok(dtype: candle_core::quantized::GgmlDType) -> bool {
     embed_q8_env() == Some(true) || dtype == candle_core::quantized::GgmlDType::Q8_0
 }
@@ -417,10 +400,6 @@ impl Qwen3_5GatedDeltaNet {
         
         attn = mask.where_cond(&on_false, &attn)?;
         if attn.device().is_vulkan() {
-            // 🌟 [VK-TRIL] Vulkan 에서는 이 루프의 연산이 전부 CPU 에서 돌고, slice_assign 이
-            //    매 행마다 attn 전체(층당 수 MB)를 where_cond 로 다시 만듭니다 (실측: 프리필
-            //    2,347토큰에서 where_cond·복사·sum 으로 약 15초). 같은 행 단위 점화식을
-            //    호스트에서 제자리 계산합니다 (candle_core::delta_rule, 결과 동일).
             attn = candle_core::delta_rule::chunk_tril_recurrence(&attn)?;
         } else {
             let (d0, d1, d2, _, _) = attn.dims5()?;
@@ -467,8 +446,6 @@ impl Qwen3_5GatedDeltaNet {
             .broadcast_as((batch_size, num_heads, chunk_size, chunk_size))?;
         let on_false = tril_mask.zeros_like()?.to_dtype(candle_core::DType::F32)?;
         let last_dim = core_attn_out.dim(D::Minus1)?;
-        // 🌟 [VK-CAT] Vulkan: 청크 출력을 모아 마지막에 한 번 이어 붙입니다. slice_assign 은 청크마다
-        //    출력 전체(층당 ~19MB)를 where_cond 로 다시 쓰므로 CPU 에서 청크 수의 제곱으로 늘어납니다.
         let vk_cat = value.device().is_vulkan();
         let mut out_chunks: Vec<Tensor> = Vec::new();
         for i in 0..total_sequence_length / chunk_size {
@@ -574,10 +551,6 @@ impl Qwen3_5GatedDeltaNet {
             // println!("[DEBUG-CONTIG] SSM Fast-Path Q: {}, K: {}, V: {}", q_i.is_contiguous(), k_i.is_contiguous(), v_i.is_contiguous());
 
             last_recurrent_state = last_recurrent_state.broadcast_mul(&g_i)?;
-            // 🌟 [VK-DELTA] Vulkan 에서는 아래 원소 연산이 CPU 에서 돕니다(실측: 상태 1MB 를
-            //    곱하고 축 -2 로 합하는 reduce 가 디코드 토큰당 약 28ms).
-            //    (S ⊙ k).sum(-2) 와 (S ⊙ q).sum(-2) 는 수학적으로 kᵀ·S, qᵀ·S 이므로
-            //    헤드별 (1×K)·(K×V) 작은 행렬곱으로 계산합니다. CUDA/ROCm 은 기존 경로 그대로입니다.
             let vk_mm = last_recurrent_state.device().is_vulkan();
             let kv_mem = if vk_mm {
                 k_i.unsqueeze(D::Minus2)?.contiguous()?.matmul(&last_recurrent_state)?.squeeze(D::Minus2)?
@@ -1703,11 +1676,6 @@ impl Qwen3_5TextModel {
             Ok(v) => match v.to_u32() as Result<u32, candle_core::Error> { Ok(0) => DType::F32, Ok(1) => DType::F16, _ => DType::F16 },
             Err(_) => DType::F16,
         };
-        // 🌟 [VK-F32] Vulkan 계산 dtype: 기본 f32. Vulkan 은 행렬곱만 GPU(Q8 커널, f32 입출력)이고
-        //    나머지 원소 연산은 CPU 에서 돕니다. f16 이면 CPU 가 원소마다 변환하고 Q8 커널 앞뒤로
-        //    f16↔f32 변환이 붙습니다. 실측(같은 문서, 프롬프트 고정): f16 과 f32 의 추출 결과가
-        //    7개 카테고리 모두 동일했고 f32 가 문서당 약 16% 빠름(138.6초 vs 164.1초).
-        //    `LOGIS_VK_DTYPE=f16` 이면 모델 dtype(f16) 그대로 계산합니다.
         let dtype = if device.is_vulkan()
             && std::env::var("LOGIS_VK_DTYPE").map(|v| !v.trim().eq_ignore_ascii_case("f16")).unwrap_or(true)
         {
@@ -1742,24 +1710,12 @@ impl Qwen3_5TextModel {
             if quant_embed_ok(q.dtype()) {
                 Some(q)
             } else {
-                println!(
-                    "[MODEL] embed_tokens: {:?} table has no GPU gather/GEMV path → F16 table kept (set LOGIS_EMBED_Q8=1 to force).",
-                    q.dtype()
-                );
                 None
             }
         } else {
             None
         };
         let embed_tokens = if let Some(q) = quant_embed {
-            // 🌟 [EMBED TABLE / Quant] 역양자화본을 만들지 않고 양자화 원본 한 벌만 장치에 둡니다.
-            println!(
-                "[MODEL] embed_tokens kept quantized on {:?}: {:?} {:?} ({:.0}MB). F16 copy skipped (lookup + tied lm_head share this one table).",
-                device,
-                q.shape().dims(),
-                q.dtype(),
-                q.storage_size_in_bytes() as f64 / 1e6
-            );
             EmbedTable::Quant { q: std::sync::Arc::new(q), hidden: hidden_size }
         } else {
             let embed_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
@@ -2702,10 +2658,6 @@ impl Qwen3_5Model {
             }
             Err(_) => match &language_model.embed_tokens {
                 EmbedTable::Quant { q, .. } => {
-                    println!(
-                        "[MODEL] lm_head: 'output.weight' absent → tied to the quantized embed table ({:.0}MB, no extra copy).",
-                        q.storage_size_in_bytes() as f64 / 1e6
-                    );
                     ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_arc(q.clone())?, None))
                 }
                 EmbedTable::Dense(e) => {
@@ -2832,8 +2784,6 @@ impl Qwen3_5Model {
         Ok(())
     }
 
-    // 🌟 [추가] Semantic Bias 연산용: 어휘 크기와 어휘 행 블록(F32).
-    //   표가 양자화 원본(EmbedTable::Quant)이어도 같은 값을 블록 단위로 돌려줍니다.
     pub fn embed_vocab(&self) -> candle_core::Result<usize> {
         self.language_model.embed_tokens.vocab()
     }
