@@ -415,9 +415,13 @@ impl Qwen3_5GenerateModel {
         let gen_t0 = std::time::Instant::now();
         let mut gen_first_ms: Option<f64> = None;
         let mut gen_steps = 0usize;
+        crate::utils::reset_gpu_profile(&self.device);
         for i in 0..sample_len {
             if i == 1 && gen_first_ms.is_none() {
                 gen_first_ms = Some(gen_t0.elapsed().as_secs_f64() * 1e3);
+                // 프리필 구간 연산표 → 프리필용 큰 임시 버퍼 반환 (디코드는 재사용하지 않음)
+                crate::utils::log_gpu_profile(&self.device, "prefill+first token");
+                crate::utils::trim_idle_gpu_pool(&self.device, "prefill→decode");
             }
             gen_steps = i as usize + 1;
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
@@ -664,6 +668,8 @@ impl Qwen3_5GenerateModel {
                 if dec_ms > 0.0 { dec_tok as f64 * 1000.0 / dec_ms } else { 0.0 }
             );
             crate::utils::log_vram_report_for(&self.device, "gen-end (생성 직후)");
+            crate::utils::log_gpu_profile(&self.device, "decode");
+            crate::utils::trim_idle_gpu_pool(&self.device, "gen-end");
         }
 
         let res = self.tokenizer.token_decode(generate)?;
@@ -870,9 +876,13 @@ impl Qwen3_5GenerateModel {
         let gen_t0 = std::time::Instant::now();
         let mut gen_first_ms: Option<f64> = None;
         let mut gen_steps = 0usize;
+        crate::utils::reset_gpu_profile(&self.device);
         for i in 0..sample_len {
             if i == 1 && gen_first_ms.is_none() {
                 gen_first_ms = Some(gen_t0.elapsed().as_secs_f64() * 1e3);
+                // 프리필 구간 연산표 → 프리필용 큰 임시 버퍼 반환 (디코드는 재사용하지 않음)
+                crate::utils::log_gpu_profile(&self.device, "prefill+first token");
+                crate::utils::trim_idle_gpu_pool(&self.device, "prefill→decode");
             }
             gen_steps = i as usize + 1;
             if let Some(flag) = &cancel_flag {
@@ -1130,6 +1140,8 @@ impl Qwen3_5GenerateModel {
                 if dec_ms > 0.0 { dec_tok as f64 * 1000.0 / dec_ms } else { 0.0 }
             );
             crate::utils::log_vram_report_for(&self.device, "gen-end (생성 직후)");
+            crate::utils::log_gpu_profile(&self.device, "decode");
+            crate::utils::trim_idle_gpu_pool(&self.device, "gen-end");
         }
 
         let res_text = self.tokenizer.token_decode(generate)?;

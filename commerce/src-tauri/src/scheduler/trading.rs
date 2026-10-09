@@ -4510,7 +4510,12 @@ pub async fn process_trading_task(
         let claimed_ctx = if assigned_fields.is_empty() {
             String::new()
         } else {
-            let list: Vec<serde_json::Value> = assigned_fields.iter()
+            // 🌟 [DETERMINISTIC PROMPT] assigned_fields 는 HashMap 이라 순회 순서가 실행마다
+            //    무작위(RandomState)입니다. 같은 문서인데도 이 목록의 순서가 바뀌어 프롬프트가
+            //    달라지고(토큰 수는 같음) 탐욕 디코딩 결과까지 달라졌습니다. 키 순으로 고정합니다.
+            let mut claimed: Vec<(&String, &String)> = assigned_fields.iter().collect();
+            claimed.sort();
+            let list: Vec<serde_json::Value> = claimed.into_iter()
                 .map(|(k, v)| json!({ "target_column": k, "extracted_value": v }))
                 .collect();
             format!("\n\n[ALREADY CLAIMED VALUES]\nThese values are already assigned to OTHER fields by the deterministic engine. You MUST NOT return any of them:\n{}",

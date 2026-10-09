@@ -416,17 +416,25 @@ impl Qwen3_5GatedDeltaNet {
             .broadcast_as(decay_mask.shape())?;
         
         attn = mask.where_cond(&on_false, &attn)?;
-        let (d0, d1, d2, _, _) = attn.dims5()?;
-        for i in 1..chunk_size {
-            let row = attn.i((.., .., .., i, ..i))?.contiguous()?;
-            let sub = attn.i((.., .., .., ..i, ..i))?.contiguous()?;
-            let attn_i = row
-                .unsqueeze(D::Minus1)?
-                .broadcast_mul(&sub)?
-                .sum(D::Minus2)?
-                .add(&row)?
-                .unsqueeze(D::Minus2)?;
-            attn = attn.slice_assign(&[(0..d0), (0..d1), (0..d2), (i..i + 1), (0..i)], &attn_i)?;
+        if attn.device().is_vulkan() {
+            // 🌟 [VK-TRIL] Vulkan 에서는 이 루프의 연산이 전부 CPU 에서 돌고, slice_assign 이
+            //    매 행마다 attn 전체(층당 수 MB)를 where_cond 로 다시 만듭니다 (실측: 프리필
+            //    2,347토큰에서 where_cond·복사·sum 으로 약 15초). 같은 행 단위 점화식을
+            //    호스트에서 제자리 계산합니다 (candle_core::delta_rule, 결과 동일).
+            attn = candle_core::delta_rule::chunk_tril_recurrence(&attn)?;
+        } else {
+            let (d0, d1, d2, _, _) = attn.dims5()?;
+            for i in 1..chunk_size {
+                let row = attn.i((.., .., .., i, ..i))?.contiguous()?;
+                let sub = attn.i((.., .., .., ..i, ..i))?.contiguous()?;
+                let attn_i = row
+                    .unsqueeze(D::Minus1)?
+                    .broadcast_mul(&sub)?
+                    .sum(D::Minus2)?
+                    .add(&row)?
+                    .unsqueeze(D::Minus2)?;
+                attn = attn.slice_assign(&[(0..d0), (0..d1), (0..d2), (i..i + 1), (0..i)], &attn_i)?;
+            }
         }
         let attn = attn
             .broadcast_add(&Tensor::eye(chunk_size, attn.dtype(), attn.device())?)?
@@ -459,6 +467,10 @@ impl Qwen3_5GatedDeltaNet {
             .broadcast_as((batch_size, num_heads, chunk_size, chunk_size))?;
         let on_false = tril_mask.zeros_like()?.to_dtype(candle_core::DType::F32)?;
         let last_dim = core_attn_out.dim(D::Minus1)?;
+        // 🌟 [VK-CAT] Vulkan: 청크 출력을 모아 마지막에 한 번 이어 붙입니다. slice_assign 은 청크마다
+        //    출력 전체(층당 ~19MB)를 where_cond 로 다시 쓰므로 CPU 에서 청크 수의 제곱으로 늘어납니다.
+        let vk_cat = value.device().is_vulkan();
+        let mut out_chunks: Vec<Tensor> = Vec::new();
         for i in 0..total_sequence_length / chunk_size {
             let q_i = query.i((.., .., i))?.contiguous()?;
             let k_i = key.i((.., .., i))?.contiguous()?;
@@ -474,16 +486,20 @@ impl Qwen3_5GatedDeltaNet {
                 .broadcast_mul(&g_i.unsqueeze(D::Minus1)?.exp()?)?
                 .matmul(&last_recurrent_state)?;
             let out_i = attn_inter.add(&attn.matmul(&v_new)?)?.unsqueeze(2)?;
-            core_attn_out = core_attn_out.slice_assign(
-                &[
-                    (0..batch_size),
-                    (0..num_heads),
-                    (i..i + 1),
-                    (0..chunk_size),
-                    (0..last_dim),
-                ],
-                &out_i,
-            )?;
+            if vk_cat {
+                out_chunks.push(out_i);
+            } else {
+                core_attn_out = core_attn_out.slice_assign(
+                    &[
+                        (0..batch_size),
+                        (0..num_heads),
+                        (i..i + 1),
+                        (0..chunk_size),
+                        (0..last_dim),
+                    ],
+                    &out_i,
+                )?;
+            }
             let g_i_last_dim = g_i.dim(D::Minus1)?;
             last_recurrent_state = last_recurrent_state
                 .broadcast_mul(
@@ -505,6 +521,9 @@ impl Qwen3_5GatedDeltaNet {
                 )?;
         }
         self.recurrent_state_cache = Some(last_recurrent_state);
+        if vk_cat && !out_chunks.is_empty() {
+            core_attn_out = Tensor::cat(&out_chunks, 2)?;
+        }
         core_attn_out =
             core_attn_out.reshape((batch_size, num_heads, (), core_attn_out.dim(D::Minus1)?))?;
         core_attn_out = core_attn_out.narrow(2, 0, sequence_length)?;
@@ -555,12 +574,25 @@ impl Qwen3_5GatedDeltaNet {
             // println!("[DEBUG-CONTIG] SSM Fast-Path Q: {}, K: {}, V: {}", q_i.is_contiguous(), k_i.is_contiguous(), v_i.is_contiguous());
 
             last_recurrent_state = last_recurrent_state.broadcast_mul(&g_i)?;
-            let kv_mem = last_recurrent_state.broadcast_mul(&k_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum(D::Minus2)?;
+            // 🌟 [VK-DELTA] Vulkan 에서는 아래 원소 연산이 CPU 에서 돕니다(실측: 상태 1MB 를
+            //    곱하고 축 -2 로 합하는 reduce 가 디코드 토큰당 약 28ms).
+            //    (S ⊙ k).sum(-2) 와 (S ⊙ q).sum(-2) 는 수학적으로 kᵀ·S, qᵀ·S 이므로
+            //    헤드별 (1×K)·(K×V) 작은 행렬곱으로 계산합니다. CUDA/ROCm 은 기존 경로 그대로입니다.
+            let vk_mm = last_recurrent_state.device().is_vulkan();
+            let kv_mem = if vk_mm {
+                k_i.unsqueeze(D::Minus2)?.contiguous()?.matmul(&last_recurrent_state)?.squeeze(D::Minus2)?
+            } else {
+                last_recurrent_state.broadcast_mul(&k_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum(D::Minus2)?
+            };
             let delta = v_i.broadcast_sub(&kv_mem)?.broadcast_mul(&beta_i)?;
             last_recurrent_state = last_recurrent_state.broadcast_add(
                 &k_i.unsqueeze(D::Minus1)?.contiguous()?.broadcast_mul(&delta.unsqueeze(D::Minus2)?.contiguous()?)?,
             )?;
-            let out_i = last_recurrent_state.broadcast_mul(&q_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum_keepdim(D::Minus2)?;
+            let out_i = if vk_mm {
+                q_i.unsqueeze(D::Minus2)?.contiguous()?.matmul(&last_recurrent_state)?
+            } else {
+                last_recurrent_state.broadcast_mul(&q_i.unsqueeze(D::Minus1)?.contiguous()?)?.sum_keepdim(D::Minus2)?
+            };
             
             self.recurrent_state_cache = Some(last_recurrent_state);
             
@@ -1670,6 +1702,18 @@ impl Qwen3_5TextModel {
         let dtype = match gguf.get_matedata("general.dtype") {
             Ok(v) => match v.to_u32() as Result<u32, candle_core::Error> { Ok(0) => DType::F32, Ok(1) => DType::F16, _ => DType::F16 },
             Err(_) => DType::F16,
+        };
+        // 🌟 [VK-F32] Vulkan 계산 dtype: 기본 f32. Vulkan 은 행렬곱만 GPU(Q8 커널, f32 입출력)이고
+        //    나머지 원소 연산은 CPU 에서 돕니다. f16 이면 CPU 가 원소마다 변환하고 Q8 커널 앞뒤로
+        //    f16↔f32 변환이 붙습니다. 실측(같은 문서, 프롬프트 고정): f16 과 f32 의 추출 결과가
+        //    7개 카테고리 모두 동일했고 f32 가 문서당 약 16% 빠름(138.6초 vs 164.1초).
+        //    `LOGIS_VK_DTYPE=f16` 이면 모델 dtype(f16) 그대로 계산합니다.
+        let dtype = if device.is_vulkan()
+            && std::env::var("LOGIS_VK_DTYPE").map(|v| !v.trim().eq_ignore_ascii_case("f16")).unwrap_or(true)
+        {
+            DType::F32
+        } else {
+            dtype
         };
         let num_layers = gguf.get_matedata("qwen35.block_count")?.to_u32()? as usize;
         let full_attention_interval = gguf.get_matedata("qwen35.full_attention_interval")?.to_u32()? as usize;
