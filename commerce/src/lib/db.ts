@@ -24,7 +24,7 @@ export const Delete: Record<string, (query: any) => Promise<any>> = {};
 const getAppDb = () => (window as any).appDb;
 
 // Helper: Parse tags into SQL filter string for LanceDB
-async function parseQueryToFilter(queryStr: string): Promise<string | null> {
+export async function parseQueryToFilter(queryStr: string): Promise<string | null> {
     if (!queryStr) return null;
     
     const filters: string[] = [];
@@ -63,7 +63,7 @@ function toDexiePath(key: string): string {
 // 🌟 [ROW → DOC] Dexie 봉투 행을 렌더러가 기대하는 형태로 펼칩니다.
 //  render.ts 의 Tpl 은 item[key] 와 item.data[key] 를 모두 시도하므로
 //  data 를 그대로 두고 봉투 필드만 루트에 남겨 두면 됩니다.
-function envelopeToDoc(row: any): any {
+export function envelopeToDoc(row: any): any {
     if (!row) return row;
     const parsed = (row.data && typeof row.data === 'object')
         ? row.data
@@ -383,4 +383,4 @@ const handleDelete = async (q: DbQuery = {}) => {
 
 Delete["items"] = handleDelete;
 Delete["pages"] = handleDelete;
-Delete["users"] = handleDelete;
+Delete["users"] = handleDelete;

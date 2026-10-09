@@ -1,5 +1,6 @@
-mod model;
-mod store;
+// 통합 테스트(tests/it)에서 앱 계층(모델 수명주기·저장소·업무규칙·스케줄러)을 검증할 수 있도록 pub 으로 노출합니다.
+pub mod model;
+pub mod store;
 mod automation;
 pub use utils::parsing;
 pub use utils::bias_schema;
@@ -10,8 +11,8 @@ pub use utils::time_guide;
 //    bias.json 이 정적 사전이라면 이것은 동적 사전입니다.
 //    Phase 0 에서는 계측과 영속화만 수행하고 판정에는 개입하지 않습니다.
 pub use utils::score_dynamics;
-mod logic;
-mod scheduler;
+pub mod logic;
+pub mod scheduler;
 pub mod analytic;
 pub mod stanza;
 pub mod js_templates;
@@ -5619,4 +5620,4 @@ pub fn run() {
                 println!("[APP] Browser shutdown complete.");
             }
         });
-}
+}

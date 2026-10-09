@@ -31,7 +31,7 @@ export function normalizeOAuthHost(raw: any): string {
     }
 }
 
-function extractBalancedJson(text: string, fromIndex: number): string {
+export function extractBalancedJson(text: string, fromIndex: number): string {
     const start = text.indexOf("{", fromIndex);
     if (start === -1) return "";
     let depth = 0;
@@ -56,7 +56,7 @@ function extractBalancedJson(text: string, fromIndex: number): string {
 }
 
 /** api/index.js 의 HTML 응답에서 JSON 페이로드를 추출합니다. */
-function parseOAuthApiResponse(raw: any): { rows: any[]; cookies: any; count: number; query: any } {
+export function parseOAuthApiResponse(raw: any): { rows: any[]; cookies: any; count: number; query: any } {
     let text = "";
     if (typeof raw === "string") {
         text = raw;
@@ -669,4 +669,4 @@ export function renderOAuthRegistrationForm() {
             setTimeout(() => { metaTextarea.style.border = "1px solid #ddd"; }, 3000);
         }
     });
-}
+}

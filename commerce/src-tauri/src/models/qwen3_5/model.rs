@@ -1055,8 +1055,9 @@ impl Qwen3_5Attention {
                                 if block_file.exists() {
                                     if let Ok(raw_content) = crate::utils::direct_loader::load_kv_block(&block_file) {
                                         // [CRYPTO-COMPAT] 저장측(spawn_slot_worker)은 평문 safetensors로 기록합니다.
-                                        // 복호화가 성공하면 복호문을, 실패하면 원본을 그대로 사용해 폴백(zeros)을 없앱니다.
-                                        let content = crate::utils::crypto::decrypt_data(&raw_content).unwrap_or(raw_content);
+                                        // decrypt_data 는 평문에도 Ok(쓰레기)를 돌려주므로(무결성 검증 없음),
+                                        // 평문으로 파싱되는지 먼저 확인하고 암호문일 때만 복호화합니다. (zeros 폴백 방지)
+                                        let content = crate::utils::crypto::kv_block_plaintext(raw_content);
                                         {
                                             if let Ok(st) = safetensors::SafeTensors::deserialize(&content) {
                                                 let prefix = format!("b{}_l{}_", b_off, self.layer_idx);
@@ -3169,4 +3170,4 @@ impl Qwen3_5Model {
     pub fn clear_cache(&mut self) {
         self.language_model.clear_cache();
     }
-}
+}
