@@ -111,3 +111,19 @@ pub fn decrypt_data(data: &[u8]) -> Result<Vec<u8>> {
 
     Ok(payload)
 }
+
+/// SSD 에서 읽은 KV 블록 바이트를 safetensors 평문으로 돌려줍니다.
+///
+/// `decrypt_data` 는 무결성 검증이 없는 XOR 스트림이라 평문을 넣어도 `Ok(쓰레기)` 를 돌려줍니다.
+/// 그래서 `decrypt_data(&raw).unwrap_or(raw)` 패턴은 평문 블록(spawn_slot_worker 가 기록)을
+/// 항상 망가뜨리고, 파싱 실패 → zeros 폴백으로 이어집니다.
+/// 여기서는 평문 safetensors 로 파싱되면 그대로 쓰고, 아니면 복호화 결과가 파싱될 때만 채택합니다.
+pub fn kv_block_plaintext(raw: Vec<u8>) -> Vec<u8> {
+    if safetensors::SafeTensors::deserialize(&raw).is_ok() {
+        return raw;
+    }
+    match decrypt_data(&raw) {
+        Ok(plain) if safetensors::SafeTensors::deserialize(&plain).is_ok() => plain,
+        _ => raw,
+    }
+}

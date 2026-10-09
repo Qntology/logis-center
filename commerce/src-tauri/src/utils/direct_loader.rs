@@ -24,6 +24,8 @@ mod windows_impl {
     unsafe impl Send for WinContext {}
     unsafe impl Sync for WinContext {}
 
+    pub fn is_available() -> bool { CONTEXT.is_ok() }
+
     static CONTEXT: Lazy<Result<Arc<WinContext>>> = Lazy::new(|| {
         unsafe {
             let factory: IDStorageFactory = DStorageGetFactory().map_err(|e| {
@@ -137,7 +139,13 @@ mod linux_impl {
     use io_uring::{opcode, types, IoUring};
     use std::fs::File;
     use std::os::unix::io::AsRawFd;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex;
+
+    /// 한 번의 SQE 로 요청할 최대 바이트 수.
+    /// 리눅스 read/write 는 한 번에 최대 0x7ffff000 바이트만 처리하고 opcode 길이는 u32 이므로
+    /// 1 GiB 단위로 쪼개 오프셋 루프를 돈다 (부분 완료도 같은 루프로 이어서 처리).
+    const MAX_CHUNK: usize = 1 << 30;
 
     struct LinuxContext { ring: Mutex<IoUring> }
     unsafe impl Send for LinuxContext {}
@@ -152,48 +160,157 @@ mod linux_impl {
         Ok(Arc::new(LinuxContext { ring: Mutex::new(ring) }))
     });
 
-    pub fn load_block(path: &Path) -> Result<Vec<u8>> {
-        let ctx = CONTEXT.as_ref().map_err(|e| anyhow!(e))?;
-        let file = File::open(path)?;
+    /// 복구 불가능한 링 오류 이후에는 링을 다시 쓰지 않는다 (남은 SQE/CQE 오염 방지).
+    static RING_BROKEN: AtomicBool = AtomicBool::new(false);
+    /// 요청마다 고유한 user_data — 이전 호출의 잔여 CQE 를 내 것으로 오인하지 않기 위함.
+    static NEXT_TAG: AtomicU64 = AtomicU64::new(1);
+
+    /// io_uring 링을 사용할 수 있는지 (커널/seccomp 차단 또는 링 고장 시 false → fs 폴백)
+    pub fn is_available() -> bool {
+        CONTEXT.is_ok() && !RING_BROKEN.load(Ordering::Acquire)
+    }
+
+    enum OpError {
+        /// 커널이 버퍼를 더 이상 참조하지 않음 → 일반 오류로 처리해도 안전
+        Done(anyhow::Error),
+        /// 요청이 아직 in-flight 일 수 있음 → 버퍼를 해제하면 안 됨
+        InFlight(anyhow::Error),
+    }
+
+    /// SQE 하나를 제출하고 대응하는 CQE 의 res 를 돌려준다.
+    /// EINTR/EBUSY/EAGAIN 은 재시도하며, 요청이 끝나기 전에는 Ok 로 반환하지 않는다.
+    fn submit_one(ring: &mut IoUring, entry: io_uring::squeue::Entry) -> std::result::Result<i32, OpError> {
+        let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
+        let entry = entry.user_data(tag);
+        // push 실패(SQ full)는 아직 커널에 넘어가지 않았으므로 안전한 실패
+        if unsafe { ring.submission().push(&entry) }.is_err() {
+            return Err(OpError::Done(anyhow!("io_uring submission queue full")));
+        }
+        let mut transient_retries = 0u32;
+        loop {
+            // 이미 도착한 완료부터 확인 (다른 tag 의 잔여 CQE 는 버린다)
+            let done = {
+                let mut cq = ring.completion();
+                let mut r = None;
+                while let Some(cqe) = cq.next() {
+                    if cqe.user_data() == tag {
+                        r = Some(cqe.result());
+                        break;
+                    }
+                }
+                r
+            };
+            if let Some(res) = done {
+                return Ok(res);
+            }
+            match ring.submit_and_wait(1) {
+                Ok(_) => {}
+                // 시그널 인터럽트: 제출은 이미 끝났을 수 있으므로 그대로 다시 기다린다
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+                // CQ overflow / 일시적 자원 부족: CQ 를 비운 뒤 재시도
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EBUSY) | Some(libc::EAGAIN)) => {
+                    transient_retries += 1;
+                    if transient_retries > 10_000 {
+                        return Err(OpError::InFlight(anyhow!("io_uring wait kept failing: {}", e)));
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+                Err(e) => return Err(OpError::InFlight(anyhow!("io_uring wait failed: {}", e))),
+            }
+        }
+    }
+
+    fn uring_read(ctx: &LinuxContext, file: &File, path: &Path) -> Result<Vec<u8>> {
         let size = file.metadata()?.len() as usize;
         let mut buffer = vec![0u8; size];
-        let read_e = opcode::Read::new(types::Fd(file.as_raw_fd()), buffer.as_mut_ptr(), size as u32).build();
-        let mut ring = ctx.ring.lock().unwrap();
-        unsafe { ring.submission().push(&read_e).map_err(|e| anyhow!(e))?; }
-        ring.submit_and_wait(1)?;
-        if let Some(cqe) = ring.completion().next() {
-            let result = cqe.result();
-            if result < 0 {
-                return Err(anyhow::anyhow!("io_uring read failed for {:?}: error code {}", path, result));
-            }
-            let bytes_read = result as usize;
-            if bytes_read < size {
-                println!("[DirectLoader] io_uring partial read for {:?}: got {} of {} bytes.", path, bytes_read, size);
-                buffer.truncate(bytes_read);
+        let fd = types::Fd(file.as_raw_fd());
+        let mut ring = ctx.ring.lock().unwrap_or_else(|p| p.into_inner());
+        let mut off = 0usize;
+        while off < size {
+            let len = (size - off).min(MAX_CHUNK) as u32;
+            let e = opcode::Read::new(fd, unsafe { buffer.as_mut_ptr().add(off) }, len)
+                .offset(off as u64)
+                .build();
+            match submit_one(&mut ring, e) {
+                Ok(res) if res == -libc::EINTR || res == -libc::EAGAIN => continue,
+                Ok(res) if res < 0 => {
+                    return Err(anyhow!(
+                        "io_uring read failed for {:?}: {}",
+                        path,
+                        std::io::Error::from_raw_os_error(-res)
+                    ))
+                }
+                Ok(0) => {
+                    // 읽는 도중 파일이 줄어든 경우 (정상적인 EOF)
+                    println!("[DirectLoader] io_uring early EOF for {:?}: got {} of {} bytes.", path, off, size);
+                    buffer.truncate(off);
+                    break;
+                }
+                Ok(res) => off += res as usize,
+                Err(OpError::Done(e)) => return Err(e),
+                Err(OpError::InFlight(e)) => {
+                    RING_BROKEN.store(true, Ordering::Release);
+                    // 커널이 아직 이 버퍼에 쓸 수 있으므로 해제하지 않는다 (use-after-free 방지)
+                    std::mem::forget(buffer);
+                    return Err(e);
+                }
             }
         }
         Ok(buffer)
     }
 
-    pub fn save_block(path: &Path, data: &[u8]) -> Result<()> {
-        let ctx = CONTEXT.as_ref().map_err(|e| anyhow!(e))?;
-        let file = File::create(path)?;
-        let write_e = opcode::Write::new(types::Fd(file.as_raw_fd()), data.as_ptr(), data.len() as u32).build();
-        let mut ring = ctx.ring.lock().unwrap();
-        unsafe { ring.submission().push(&write_e).map_err(|e| anyhow!(e))?; }
-        ring.submit_and_wait(1)?;
-        if let Some(cqe) = ring.completion().next() {
-            let result = cqe.result();
-            if result < 0 {
-                return Err(anyhow::anyhow!("io_uring write failed for {:?}: error code {}", path, result));
-            }
-            let bytes_written = result as usize;
-            if bytes_written < data.len() {
-                println!("[DirectLoader] io_uring partial write for {:?}: wrote {} of {} bytes.", path, bytes_written, data.len());
-                return Err(anyhow::anyhow!("io_uring partial write for {:?}: wrote {} of {} bytes", path, bytes_written, data.len()));
+    fn uring_write(ctx: &LinuxContext, file: &File, path: &Path, data: &[u8]) -> Result<()> {
+        let fd = types::Fd(file.as_raw_fd());
+        let mut ring = ctx.ring.lock().unwrap_or_else(|p| p.into_inner());
+        let mut off = 0usize;
+        while off < data.len() {
+            let len = (data.len() - off).min(MAX_CHUNK) as u32;
+            let e = opcode::Write::new(fd, unsafe { data.as_ptr().add(off) }, len)
+                .offset(off as u64)
+                .build();
+            match submit_one(&mut ring, e) {
+                Ok(res) if res == -libc::EINTR || res == -libc::EAGAIN => continue,
+                Ok(res) if res <= 0 => {
+                    return Err(anyhow!(
+                        "io_uring write failed for {:?} at offset {}: {}",
+                        path,
+                        off,
+                        std::io::Error::from_raw_os_error(-res)
+                    ))
+                }
+                Ok(res) => off += res as usize,
+                Err(OpError::Done(e)) => return Err(e),
+                Err(OpError::InFlight(e)) => {
+                    RING_BROKEN.store(true, Ordering::Release);
+                    return Err(e);
+                }
             }
         }
         Ok(())
+    }
+
+    pub fn load_block(path: &Path) -> Result<Vec<u8>> {
+        // 열기 실패(파일 없음 등)는 폴백해도 똑같이 실패하므로 바로 반환
+        let file = File::open(path).map_err(|e| anyhow!("open failed for {:?}: {}", path, e))?;
+        if let (Ok(ctx), true) = (CONTEXT.as_ref(), is_available()) {
+            match uring_read(ctx, &file, path) {
+                Ok(buf) => return Ok(buf),
+                Err(e) => println!("[DirectLoader] {}. Falling back to fs::read.", e),
+            }
+        }
+        fs::read(path).map_err(|e| anyhow!("Fallback read failed: {}", e))
+    }
+
+    pub fn save_block(path: &Path, data: &[u8]) -> Result<()> {
+        let file = File::create(path).map_err(|e| anyhow!("create failed for {:?}: {}", path, e))?;
+        if let (Ok(ctx), true) = (CONTEXT.as_ref(), is_available()) {
+            match uring_write(ctx, &file, path, data) {
+                Ok(()) => return Ok(()),
+                Err(e) => println!("[DirectLoader] {}. Falling back to fs::write.", e),
+            }
+        }
+        drop(file);
+        fs::write(path, data).map_err(|e| anyhow!("Fallback write failed: {}", e))
     }
 }
 
@@ -205,6 +322,7 @@ mod macos_impl {
     struct MacContext { queue: IOCommandQueue }
     unsafe impl Send for MacContext {}
     unsafe impl Sync for MacContext {}
+    pub fn is_available() -> bool { CONTEXT.is_ok() }
     static CONTEXT: Lazy<Result<Arc<MacContext>>> = Lazy::new(|| {
         let device = Device::system_default().ok_or_else(|| {
             println!("[DirectLoader] No Metal device found. Falling back to fs::read/fs::write.");
@@ -251,4 +369,14 @@ pub fn save_kv_block(path: &Path, data: &[u8]) -> Result<()> {
     #[cfg(target_os = "linux")] { linux_impl::save_block(path, data) }
     #[cfg(target_os = "macos")] { macos_impl::save_block(path, data) }
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))] { default_impl::save_block(path, data) }
+}
+
+/// 현재 플랫폼에서 KV 블록 I/O 가 실제로 어떤 경로를 타는지 돌려줍니다.
+/// ("directstorage" | "io_uring" | "metal-io" | "fs-fallback")
+/// 진단 로그와 테스트(링 초기화 실패 → 조용한 폴백 감지)에 사용합니다.
+pub fn io_backend() -> &'static str {
+    #[cfg(windows)] { if windows_impl::is_available() { "directstorage" } else { "fs-fallback" } }
+    #[cfg(target_os = "linux")] { if linux_impl::is_available() { "io_uring" } else { "fs-fallback" } }
+    #[cfg(target_os = "macos")] { if macos_impl::is_available() { "metal-io" } else { "fs-fallback" } }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))] { "fs-fallback" }
 }

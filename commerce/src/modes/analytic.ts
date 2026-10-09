@@ -165,7 +165,7 @@ async function resolveAnalyticsOrigins(): Promise<string[]> {
     return Array.from(origins);
 }
 
-function extractAnalyticText(parsed: any): string {
+export function extractAnalyticText(parsed: any): string {
     const pick = (v: any): string => (typeof v === "string" ? v.trim() : "");
     return pick(parsed?.action)
         || pick(parsed?.summary)
@@ -384,4 +384,4 @@ export async function syncAnalyticsInBackground() {
     const throttleMs = Math.max(30_000, getSyncIntervalMs());
     if (Date.now() - lastAnalyticsSyncAt < throttleMs) return;
     await syncAnalyticsData();
-}
+}
