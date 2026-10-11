@@ -10,6 +10,7 @@
 - [Key Features](#key-features)
 - [Project Structure](#project-structure)
 - [AI Model Architecture](#ai-model-architecture)
+- [Language-Specialized Engine (AlphaEdge Qwen3.5-4B)](#language-specialized-engine-alphaedge-qwen35-4b)
 - [Memory Management (RAM / SSD Offloading)](#memory-management-ram--ssd-offloading)
 - [Build & Run](#build--run)
 - [License](#license)
@@ -24,7 +25,7 @@
 | **Trade & Logistics** | Extracts 55 types of trade forms (B/L, C/I, P/L, L/C, etc.) using SigLIP2 Vision + Qwen3.5 2B and builds a reference graph between documents. |
 | **Website Analytics** | Collects user click, hover, and input events to summarize behavioral flows, preferences, and conversion funnels into natural language reports. |
 
-All inference, embedding, and storage are performed **locally on the client**, with no external API calls.
+All inference, embedding, and storage are performed **locally on the client**, with no external API calls. For non-Latin document languages, a **language-specialized Qwen3.5-4B engine from [alphaedge-ai](https://huggingface.co/alphaedge-ai)** is downloaded on demand, converted to a local Q4_K_M GGUF once, and routed into transliteration, synthesis, and field extraction steps when it is a better fit than the base models.
 
 ---
 
@@ -35,7 +36,8 @@ All inference, embedding, and storage are performed **locally on the client**, w
 - **List Extraction** — Boa engine DOM traversal → LLM field matching → mutually exclusive assignment (1:1) for column-value mapping.
 - **Detail Extraction** — Structural label-value pairs + field-by-field extraction using Qwen3 0.6B.
 - **Chunk Indexing** — Natural language segmentation → attribute tagging (PLINKO) → 384-dimensional tri-synthetic vectors → LanceDB `item_chunks`.
-- **Transliteration Aliases** — Additionally stores bidirectional transliteration vectors for multilingual cross-lingual search.
+- **Transliteration Aliases** — Additionally stores bidirectional transliteration vectors for multilingual cross-lingual search. Uses the AlphaEdge Qwen3.5-4B model of the document language when ready, otherwise Qwen3.5 2B + pronunciation gate.
+- **Language Routing** — Per-step router (`list_field / detail_field / list_synthesis / detail_synthesis`) decides between Qwen3 0.6B and the AlphaEdge 4B engine using script ratio, tokenizer fit, VRAM/RAM headroom, and observed pass rates.
 
 ### Trade & Logistics Pipeline
 - **Document Classification** — SigLIP2 patches × text anchor cosine → 2-depth judgment for groups (7 types) → codes (55 types).
@@ -57,40 +59,54 @@ All inference, embedding, and storage are performed **locally on the client**, w
 ```
 
 cron-logis-center/
-├── commerce/
+├── commerce/                           # Desktop client (Tauri v2 + Vite/TS)
+│   ├── src/                            # Frontend (TypeScript)
+│   ├── mobile/                         # Mobile companion app (Tauri)
+│   ├── landing/                        # Landing page
+│   ├── build_cargo*.bat / dev_cargo*.bat / test_cargo*.bat  # CUDA / ROCm / Vulkan scripts
+│   ├── test_linux.sh                   # Linux integration tests (vulkan|cuda|rocm)
+│   ├── crates/
+│   │   ├── boa-engine/                 # Boa JS engine (local build)
+│   │   ├── onnxruntime/                # ONNX Runtime bindings (local build)
+│   │   ├── onnxruntime-sys/            # ONNX Runtime FFI
+│   │   └── direct-storage/             # DirectStorage (Windows)
 │   └── src-tauri/
-│       ├── Cargo.toml                  # Rust dependencies & build settings
+│       ├── Cargo.toml                  # Rust dependencies & feature flags (cuda/rocm/vulkan/metal)
+│       ├── tests/it/                   # Integration tests (cargo test --test it)
 │       └── src/
-│           ├── lib.rs                  # Tauri entry, IPC command registration
+│           ├── lib.rs                  # Tauri entry, IPC command registration, model downloads
 │           ├── scheduler.rs            # Background task scheduler (main pipeline)
+│           ├── scheduler/
+│           │   ├── worker.rs           # Task worker loop
+│           │   ├── trading.rs          # Trade & logistics pipeline
+│           │   ├── translit.rs         # Transliteration alias generation
+│           │   ├── indexing.rs         # Chunk indexing
+│           │   ├── entity.rs           # Entity key normalization (commerce/trade)
+│           │   ├── list_census.rs      # List page census
+│           │   └── relay_ledger.rs     # Document relay ledger
+│           ├── model.rs                # Model manager (ModelSize, residency budgets)
+│           ├── model/
+│           │   ├── lifecycle.rs        # Load/unload, VRAM crossover, lang_route()
+│           │   ├── lang_llm.rs         # AlphaEdge Qwen3.5-4B: language codes, download, routing
+│           │   ├── lang_gguf.rs        # safetensors → Q4_K_M GGUF runtime conversion
+│           │   ├── inference.rs        # Generation entry points
+│           │   ├── vision.rs           # Vision inference
+│           │   ├── merge.rs            # Result merging
+│           │   ├── research.rs         # Research flow
+│           │   └── query_{commerce,shipping,analytic}.rs  # Domain search queries
 │           ├── logic.rs                # Business logic (relay, state, trade rules)
 │           ├── store.rs                # LanceDB vector store (envelope schema)
 │           ├── automation.rs           # Chromium browser automation
 │           ├── analytic.rs             # Website analytics tasks
 │           ├── stanza.rs               # Stanza NLP (tokenization/POS/lemma/syntax)
+│           ├── prompts.rs              # Prompt templates
 │           ├── models/
 │           │   ├── mod.rs
-│           │   ├── common/             # Common layer (GateUpDownMLP, Attention, etc.)
-│           │   ├── qwen/               # Qwen VL 0.6B (Vision + Language)
-│           │   │   ├── config.rs       # Model configuration parsing
-│           │   │   ├── generate.rs     # Inference loop, KV cache management
-│           │   │   ├── model.rs        # Model structure definition
-│           │   │   ├── processor.rs    # Image preprocessing (resize/patch)
-│           │   │   ├── quantized_model.rs  # GGUF quantized model + KV offloading
-│           │   │   └── rope.rs         # RoPE positional encoding
+│           │   ├── common/             # Common layer (GateUpDownMLP, Attention, GGUF)
+│           │   ├── qwen/               # Qwen VL (Vision + Language), KV offloading
 │           │   ├── qwen3/              # Qwen3 0.6B (Text only)
-│           │   │   ├── config.rs
-│           │   │   ├── generate.rs
-│           │   │   └── model.rs
-│           │   ├── qwen3_5/            # Qwen3.5 2B (Transliteration/Precision extraction)
-│           │   │   ├── config.rs
-│           │   │   ├── generate.rs
-│           │   │   └── model.rs
+│           │   ├── qwen3_5/            # Qwen3.5 2B / AlphaEdge 4B (shared runtime)
 │           │   ├── qwen3vl/            # Qwen3 VL (Next-gen Vision)
-│           │   │   ├── config.rs
-│           │   │   ├── generate.rs
-│           │   │   ├── model.rs
-│           │   │   └── processor.rs
 │           │   ├── siglip2/            # SigLIP2 Vision Encoder
 │           │   │   ├── mod.rs          # Model load (Text/Vision separated)
 │           │   │   ├── vision.rs       # Vision Transformer
@@ -98,36 +114,48 @@ cron-logis-center/
 │           │   │   ├── preprocessor.rs # NaFlex preprocessing
 │           │   │   ├── vision_encoder.rs # Heatmap/Classification pipeline
 │           │   │   ├── vision_crop.rs  # NMS crop + Tile splitting
+│           │   │   ├── nms_arena.rs    # NMS arena allocator
+│           │   │   ├── layout_cache.rs # Layout heatmap cache
+│           │   │   ├── phrase_cache.rs # Text anchor embedding cache
 │           │   │   ├── legibility.rs   # Legibility map (blur/margin detection)
 │           │   │   ├── value_grounding.rs # Value grounding validation
 │           │   │   └── tokenizer.rs    # SigLIP2 tokenizer
-│           │   ├── embedding/          # granite-embedding-97m (384d)
-│           │   ├── vision_cache/       # ViT output disk cache
-│           │   └── granite/            # Granite MoE model
+│           │   ├── granite/            # Granite MoE model
+│           │   ├── embedding.rs        # granite-embedding-97m (384d)
+│           │   └── vision_cache.rs     # ViT output disk cache
 │           ├── utils/
 │           │   ├── parsing.rs          # HTML→PUG conversion, schema management
 │           │   ├── bias_schema.rs      # bias.json access layer
-│           │   ├── bias.json           # Multilingual field anchor/bias dictionary
+│           │   ├── bias.json / full_bias.json # Multilingual field anchor/bias dictionary
 │           │   ├── ai_utils.rs         # Cosine, exclusive assignment, format gating
+│           │   ├── score_dynamics.rs   # Adaptive baselines (SDS pass rates for routing)
 │           │   ├── json_parse.rs       # LLM JSON parsing/recovery
 │           │   ├── nl_convert.rs       # JSON→Natural language, chunk segmentation
+│           │   ├── direct_loader.rs    # DirectStorage / io_uring KV block I/O
+│           │   ├── device_utils.rs     # Device/backend detection
+│           │   ├── resources.rs        # RAM/VRAM resource probes
+│           │   ├── tensor_utils.rs     # Tensor helpers
+│           │   ├── compression.rs      # Compression helpers
+│           │   ├── crypto.rs           # Data / KV block encryption
 │           │   ├── img_utils.rs        # Image resize/patch
 │           │   ├── json_utils.rs       # JSON merge
 │           │   ├── pug_utils.rs        # PUG grid parser
 │           │   ├── hash.rs             # ID hashing, CRC32
 │           │   ├── canonical.rs        # Type normalization rules
 │           │   ├── time_guide.rs       # Time intent parsing
-│           │   └── lang_utils.rs       # Language detection
+│           │   ├── lang_utils.rs       # Language detection
+│           │   └── paths.rs / logger.rs / metrics.rs / network.rs / url_utils.rs / ...
 │           ├── parsers/
-│           │   └── mod.rs              # PDF/Excel/Word/HWP text extraction
-│           ├── chat_template.rs        # ChatML template
-│           ├── tokenizer.rs            # GGUF tokenizer wrapper
+│           │   └── mod.rs              # PDF/Excel/Word/HWP/CSV text extraction
+│           ├── chat_template/          # ChatML template
+│           ├── tokenizer/              # GGUF tokenizer wrapper
+│           ├── position_embed/         # RoPE / sinusoidal positional encoding
 │           ├── openai_types.rs         # OpenAI compatible type definitions
 │           └── js_templates.rs         # Boa engine JS templates
-├── crates/
-│   ├── boa-engine/                     # Boa JS engine (local build)
-│   ├── onnxruntime/                    # ONNX Runtime (local build)
-│   └── direct-storage/                 # DirectStorage (Windows)
+├── apac/                               # Cloudflare Worker + D1 backend
+├── proxy/                              # Cloudflare Worker + D1 backend (proxy)
+├── SyntheticData/trading/              # Synthetic trade documents (YAML → PDF generators)
+├── logic.md                            # Pipeline logic notes
 └── readme.md
 
 ```
@@ -161,6 +189,14 @@ cron-logis-center/
 │   └── tokenizer.json
 ├── granite-4.0-h-350m/             # Granite MoE (Optional)
 │   └── model.safetensors
+├── Qwen3.5-4B-{code}-16384/        # AlphaEdge language model (on demand, e.g. kor / jpn / zho / rus)
+│   ├── model.safetensors           # Original weights (~7.9GB, kept as-is)
+│   ├── config.json
+│   ├── tokenizer.json              # 16,384-token language-specific vocab
+│   ├── tokenizer_config.json / chat_template.jinja / merges.txt / vocab.json
+│   └── runtime-q4km/               # Generated locally on first use
+│       ├── model-q4km.gguf         # Q4_K_M runtime weights
+│       └── READY                   # Conversion recipe key (re-converts if it changes)
 └── stanza/                          # NLP Pipeline
 ├── ko/
 │   ├── vocab.json
@@ -183,7 +219,8 @@ cron-logis-center/
 | Model | Size | Role | Inference Timing |
 |------|------|------|-----------|
 | **Qwen3 0.6B** | ~600MB (Q8) | List/detail field extraction, page classification, behavior structuring | Every task |
-| **Qwen3.5 2B** | ~2.1GB (Q8) | Precision extraction, transliteration generation, document classification tie-breaks | As needed |
+| **Qwen3.5 2B** | ~2.1GB (Q8) | Precision extraction, transliteration fallback, document classification tie-breaks | As needed |
+| **AlphaEdge Qwen3.5-4B-{code}** | ~7.9GB download → Q4_K_M runtime | Language-specialized transliteration, list/detail synthesis and field extraction for non-Latin documents | On demand (routed) |
 | **granite-embedding-97m** | ~380MB | 384-dimensional multilingual embeddings (vector search) | Indexing/Search |
 | **SigLIP2** | ~2.2GB | Vision patch × text anchor cosine (Heatmap) | Trade documents |
 | **Stanza** | ~50MB/lang | Tokenization, POS, Lemma, Dependency syntax | Transliteration preprocessing |
@@ -194,7 +231,8 @@ cron-logis-center/
 ```
 
 [Task Queue] → [Scheduler]
-├── Commerce: PUG conversion → Page classification → Field extraction → Chunk indexing
+├── Commerce: PUG conversion → Page classification → Field extraction → Synthesis → Translit → Chunk indexing
+│             (each LLM step: lang_route() → AlphaEdge 4B or Qwen3 0.6B / Qwen3.5 2B)
 ├── Trading:  PDF split → Document classification → Heatmap → Crop → Precision extraction → Grounding validation
 └── Analytic: Event collection → Structuring → Report synthesis → Vector indexing
 
@@ -222,6 +260,47 @@ cron-logis-center/
 └─────────────┴───────────────────────────────────────────┘
 
 ```
+
+---
+
+## Language-Specialized Engine (AlphaEdge Qwen3.5-4B)
+
+Base models (Qwen3 0.6B / Qwen3.5 2B) share a large multilingual vocabulary, so non-Latin text (Korean, Japanese, Thai, Cyrillic, Devanagari, …) is split into many tokens and transliteration quality drops. The project therefore uses **per-language Qwen3.5-4B models published by [alphaedge-ai](https://huggingface.co/alphaedge-ai)**, each with a compact **16,384-token vocabulary** tuned for one language.
+
+| Item | Value | Code |
+|------|-------|------|
+| Repository | `alphaedge-ai/Qwen3.5-4B-{code}-16384` | `lang_llm::repo_id()` |
+| Language codes | 83 ISO 639-3 codes (`kor`, `jpn`, `zho`, `rus`, `tha`, `hin`, …); ISO 639-1 / locale tags are mapped automatically (`ko` → `kor`, `zh-hans` → `zho`) | `lang_llm::alphaedge_code()` |
+| Runtime format | safetensors → **Q4_K_M GGUF** (`runtime-q4km/model-q4km.gguf`), converted once in-process (no Python) | `lang_gguf::prepare()` |
+| Inference | Text-only, shares the Qwen3.5 runtime (`Qwen3_5GenerateModel::init_from_gguf`) with a no-think ChatML template | `lang_gguf::load_from()` |
+| Labels in logs | `[LANG-LLM]`, `[TRANSLIT ENGINE]`, `[LANG ROUTE]`, `[CROSSOVER]` | |
+
+### Lifecycle
+
+```
+Document language detected
+  └─ prefetch(doc_lang)                 # only for non-Latin languages
+       └─ background download (resumable, 4 attempts/file, 10-min cooldown on failure)
+            └─ Q4_K_M GGUF conversion   # once; READY file stores the recipe key
+                 └─ is_ready(code) ✔ → engine becomes routable from the next cache miss
+```
+
+While the model is downloading or converting, every step keeps running on **Qwen3.5 2B + pronunciation gate** — tasks never block on the 4B engine.
+
+### Routing (`ModelManager::lang_route` → `lang_llm::route_verdict`)
+
+A step is sent to the 4B engine only if every gate passes; otherwise it falls back to the base model and the reason is logged.
+
+| Gate | Rule |
+|------|------|
+| Step contract | `search.commerce_verify` stays on Qwen3 (must copy English identifiers verbatim) |
+| Script | Document language must be non-Latin; ≥ 8 letters, native script ≥ 60 %, third scripts ≤ 2 % |
+| Tokenizer fit | 0 characters lost on round-trip; token count ≤ 1.5 × the reference tokenizer |
+| Resources | GPU only (CPU mode skips per-item steps); `list_field` / `detail_field` need > 6 GB free RAM; VRAM must hold the 4B runtime (synthesis steps may swap out the embedding model) |
+| Quality (SDS) | Recent 4B pass rate must stay ≥ Qwen3 pass rate − 0.10 (or ≥ 0.55 with no baseline); closed routes are re-probed every 10th call |
+| Session | One 4B language resident at a time; runtime failures disable it until restart, VRAM shortages cool down for 120 s |
+
+Outcomes are recorded per step (`{track}.lang4b_pass.{step}` vs `{track}.qwen3_pass.{step}`) in `score_dynamics`, so routing adapts to observed quality.
 
 ---
 
@@ -424,9 +503,16 @@ model.load_kv_cache(path, device, expected_len, refill_len, kv_name).await?;
 ### Prerequisites
 
 * **Rust** ≥ 1.75 (nightly)
-* **CUDA Toolkit** ≥ 12.0 (Optional, for GPU acceleration)
 * **Node.js** ≥ 18 (Frontend build)
 * **Tauri CLI** v2
+* GPU backend (choose one, selected by Cargo feature):
+
+| Feature | Backend | Requirement |
+| --- | --- | --- |
+| `cuda` (default) | NVIDIA CUDA | CUDA Toolkit ≥ 12.0 |
+| `rocm` | AMD ROCm / HIP | ROCm SDK (via `candle-rocm-vulkan` fork) |
+| `vulkan` | Vulkan | Vulkan SDK |
+| `metal` | Apple Metal | macOS |
 
 ### Build
 
@@ -434,10 +520,11 @@ model.load_kv_cache(path, device, expected_len, refill_len, kv_name).await?;
 # Frontend build
 cd commerce && npm install && npm run build
 
-# Rust Backend build
+# Rust Backend build (CUDA default)
 cd src-tauri
 cargo build --release
-
+# Other backends
+cargo build --release --no-default-features --features rocm     # or vulkan / metal
 ```
 
 ### Run
@@ -445,17 +532,32 @@ cargo build --release
 ```bash
 cargo tauri dev      # Development mode
 or
-.\dev_cargo.bat
+.\dev_cargo.bat      # .\dev_cargo_rocm.bat / .\dev_cargo_vulkan.bat
 
 cargo tauri build    # Production build
 or
-.\build_cargo.bat
+.\build_cargo.bat    # .\build_cargo_rocm.bat / .\build_cargo_vulkan.bat
+```
+
+### Test
+
+```bash
+# Windows
+.\test_cargo.bat     # .\test_cargo_rocm.bat / .\test_cargo_vulkan.bat
+
+# Linux (vulkan | cuda | rocm)
+./test_linux.sh vulkan
+
+# Frontend
+npm test
 ```
 
 ### Model Download
 
-Model downloading is triggered from the Settings tab upon first launch.
-For manual downloads, place them in the [Model File Paths](https://www.google.com/search?q=%23model-file-paths) directory specified above.
+Base models are downloaded from the Settings tab upon first launch.
+For manual downloads, place them in the [Model File Paths](#model-file-paths) directory specified above.
+
+AlphaEdge Qwen3.5-4B language models are **not** part of the initial download. They are fetched automatically in the background the first time a non-Latin document language needs them (about 7.9GB per language), then converted to `runtime-q4km/model-q4km.gguf`. To pre-install manually, download `alphaedge-ai/Qwen3.5-4B-{code}-16384` into `{AppData}/logis-center/models/Qwen3.5-4B-{code}-16384/`; the GGUF conversion runs on first use.
 
 ---
 
@@ -469,6 +571,7 @@ Apache License 2.0
 | --- | --- | --- |
 | [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) | Multimodal | Apache-2.0 |
 | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Language Model | Apache-2.0 |
+| [alphaedge-ai/Qwen3.5-4B-{code}-16384](https://huggingface.co/alphaedge-ai) | Language-specialized Model (Qwen3.5-4B based) | See each model card (base model: Apache-2.0) |
 | [ibm-granite/granite-4.0-h-350m](https://huggingface.co/ibm-granite/granite-4.0-h-350m) | Language Model | Apache-2.0 |
 | [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) | Embedding | Apache-2.0 |
 | [google/siglip2-so400m-patch16-naflex](https://huggingface.co/google/siglip2-so400m-patch16-naflex) | Vision Encoder | Apache-2.0 |
@@ -478,15 +581,24 @@ Apache License 2.0
 
 ### Open Source Libraries
 
+#### Rust (`commerce/src-tauri`)
+
 | Library | License |
 | --- | --- |
 | ahash | MIT OR Apache-2.0 |
+| any_ascii | ISC |
 | anyhow | MIT OR Apache-2.0 |
 | arrow-array / arrow-schema | Apache-2.0 |
 | base64 | MIT OR Apache-2.0 |
-| candle-core / candle-nn / candle-transformers | MIT OR Apache-2.0 |
+| boa_engine (local build) | MIT OR Unlicense |
+| calamine | MIT |
+| candle-core / candle-nn / candle-transformers / candle-flash-attn | MIT OR Apache-2.0 |
+| candle-rocm-vulkan (Qntology fork, `rocm` feature) | MIT OR Apache-2.0 |
 | chrono | MIT OR Apache-2.0 |
 | chromiumoxide | MIT OR Apache-2.0 |
+| csv | Unlicense OR MIT |
+| dirs | MIT OR Apache-2.0 |
+| drag | MIT OR Apache-2.0 |
 | ego-tree | ISC OR MIT |
 | encoding_rs | MIT OR Apache-2.0 |
 | ethers-core / ethers-signers | MIT OR Apache-2.0 |
@@ -495,16 +607,20 @@ Apache License 2.0
 | futures | MIT OR Apache-2.0 |
 | half | MIT OR Apache-2.0 |
 | image | MIT OR Apache-2.0 |
+| io-uring (Linux) | MIT OR Apache-2.0 |
 | lancedb | Apache-2.0 |
 | libc | MIT OR Apache-2.0 |
 | memmap2 | MIT OR Apache-2.0 |
+| metal (macOS) | MIT OR Apache-2.0 |
 | mimalloc | MIT |
 | minijinja | Apache-2.0 |
 | ndarray | MIT OR Apache-2.0 |
 | num | MIT OR Apache-2.0 |
 | nvml-wrapper | MIT OR Apache-2.0 |
 | once_cell | MIT OR Apache-2.0 |
-| onnxruntime | MIT OR Apache-2.0 |
+| onnxruntime (local build) | MIT OR Apache-2.0 |
+| pdf-extract | MIT |
+| quick-xml | MIT |
 | rand / rand_chacha | MIT OR Apache-2.0 |
 | rayon | MIT OR Apache-2.0 |
 | rcgen | MIT OR Apache-2.0 |
@@ -513,9 +629,9 @@ Apache License 2.0
 | safetensors | Apache-2.0 |
 | scraper | ISC |
 | serde / serde_json | MIT OR Apache-2.0 |
-| pdf-extract | MIT |
 | sysinfo | MIT |
-| tauri | MIT OR Apache-2.0 |
+| tauri / tauri-build | MIT OR Apache-2.0 |
+| tauri-plugin-opener / -dialog / -fs / -shell | MIT OR Apache-2.0 |
 | tokenizers | Apache-2.0 |
 | tokio | MIT |
 | url | MIT OR Apache-2.0 |
@@ -524,6 +640,21 @@ Apache License 2.0
 | whatlang | MIT |
 | which | MIT |
 | windows / windows-sys | MIT OR Apache-2.0 |
+| zip | MIT |
+
+#### JavaScript / TypeScript (`commerce`, `commerce/mobile`, `apac`, `proxy`)
+
+| Library | License |
+| --- | --- |
+| @tauri-apps/api / @tauri-apps/cli / @tauri-apps/plugin-* | MIT OR Apache-2.0 |
+| vite | MIT |
+| vitest | MIT |
+| happy-dom | MIT |
+| typescript | Apache-2.0 |
+| wrangler | MIT OR Apache-2.0 |
+| ethers | MIT |
+| linkedom | ISC |
+| pako | MIT AND Zlib |
 
 ### GPU Notices
 
@@ -539,6 +670,11 @@ This application utilizes components from the AMD ROCm Platform.
 Portions of this software are copyrighted by Advanced Micro Devices, Inc.
 Licensed under the MIT License and/or Apache License 2.0.
 [ROCm License](https://rocm.docs.amd.com/en/latest/about/license.html)
+
+#### Microsoft DirectStorage
+
+This application uses Microsoft DirectStorage 1.3.0 on Windows for fast KV cache block I/O.
+See `commerce/src-tauri/dstorage.license.txt` for license terms.
 
 ---
 
