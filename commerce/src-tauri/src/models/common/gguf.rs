@@ -16,6 +16,51 @@ use tokenizers::{self, AddedToken, Tokenizer, models::bpe::BPE};
 
 use crate::tokenizer::TokenizerModel;
 
+/// 🌟 [MMAP-LOAD] GGUF 텐서를 파일 전체 바이트(메모리 맵 `&mmap[..]`)에서 바로 읽습니다.
+///
+/// `Content::tensor` 는 텐서마다 힙 버퍼를 새로 잡아 맵의 페이지를 한 번 복사한 뒤 장치로 올립니다.
+/// 층 가중치를 레이어마다 다시 읽는 스트리밍 경로에서는 그 복사가 층 크기만큼 매번 반복되고
+/// 힙도 그때마다 크게 출렁입니다. 여기서는 맵의 바이트를 그대로 넘겨 GPU 업로드가 맵 페이지를 직접 읽습니다.
+/// (CPU 장치는 어차피 자기 저장소로 복사합니다. 결과 텐서는 `Content::tensor` 와 비트 단위로 같습니다)
+pub fn qtensor_from_bytes(
+    ct: &gguf_file::Content,
+    file: &[u8],
+    name: &str,
+    device: &Device,
+) -> candle_core::Result<QTensor> {
+    let info = ct
+        .tensor_infos
+        .get(name)
+        .ok_or_else(|| candle_core::Error::Msg(format!("cannot find tensor info for {name}")))?;
+    let elems = info.shape.elem_count();
+    let block = info.ggml_dtype.block_size();
+    if block == 0 || elems % block != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "{name}: {elems} elements are not a multiple of the block size {block}"
+        )));
+    }
+    let size = elems / block * info.ggml_dtype.type_size();
+    let start = usize::try_from(ct.tensor_data_offset.saturating_add(info.offset))
+        .map_err(|_| candle_core::Error::Msg(format!("{name}: offset does not fit in memory")))?;
+    if start.checked_add(size).map_or(true, |end| end > file.len()) {
+        return Err(candle_core::Error::Msg(format!(
+            "{name}: needs {size} bytes at offset {start}, the file has {}",
+            file.len()
+        )));
+    }
+    let raw = &file[start..start + size];
+    // GGML 블록(f16/f32 필드)으로 다시 해석되므로 정렬이 맞지 않으면(정상 GGUF·맵에서는 생기지 않음) 복사 경로로 읽습니다.
+    if (raw.as_ptr() as usize) % 4 != 0 {
+        return info.read(&mut std::io::Cursor::new(file), ct.tensor_data_offset, device);
+    }
+    candle_core::quantized::ggml_file::qtensor_from_ggml(
+        info.ggml_dtype,
+        raw,
+        info.shape.dims().to_vec(),
+        device,
+    )
+}
+
 pub struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
@@ -285,14 +330,15 @@ impl GateUpDownMLPGguf {
         self.down_proj = dummy;
     }
 
-    pub fn load_weights_inplace<R: Read + Seek>(&mut self, ct: &gguf_file::Content, reader: &mut R, prefix: &str, device: &Device) -> Result<()> {
-        let gate_w = ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
+    /// `data`: GGUF 파일 전체 바이트(메모리 맵). [`qtensor_from_bytes`] 로 힙 복사 없이 읽습니다.
+    pub fn load_weights_inplace(&mut self, ct: &gguf_file::Content, data: &[u8], prefix: &str, device: &Device) -> Result<()> {
+        let gate_w = qtensor_from_bytes(ct, data, &format!("{prefix}.ffn_gate.weight"), device)?;
         self.gate_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(gate_w)?, None));
         
-        let up_w = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
+        let up_w = qtensor_from_bytes(ct, data, &format!("{prefix}.ffn_up.weight"), device)?;
         self.up_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(up_w)?, None));
         
-        let down_w = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
+        let down_w = qtensor_from_bytes(ct, data, &format!("{prefix}.ffn_down.weight"), device)?;
         self.down_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(down_w)?, None));
         
         Ok(())

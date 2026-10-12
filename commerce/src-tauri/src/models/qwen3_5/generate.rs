@@ -191,6 +191,9 @@ impl Qwen3_5GenerateModel {
             Some(mmap_arc.clone()),
             Some(ct_arc)
         )?;
+        // 🌟 [WEIGHT-RESIDENT] 텍스트 전용 생성기(4B 등)는 호출이 끝나도 VRAM 여유가 있으면 층 가중치를 남겨
+        //    다음 호출에서 다시 읽지 않습니다. 비전 타워를 붙였다 떼는 생성기(2B + mmproj)는 예전처럼 매번 내려놓습니다.
+        qwen3_5.language_model.keep_warm = target_mmproj.is_none();
 
         // 🌟 [VISION-SKELETON] 가중치 0바이트로 비전 구조만 붙입니다.
         //    실패하면 순수 텍스트 모드로 안전하게 강등됩니다.

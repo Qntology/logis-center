@@ -47,7 +47,10 @@ ahash = "0.8.11"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
 candle-flash-attn = { version = "0.11.0", optional = true, default-features = false }
-candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca", optional = true }
+# 🌟 [OFFLOAD-ATTN] 앱이 쓰는 포크 수정분(candle_nn::turbo_quant::attention_packed)이 원격에 올라가기 전까지는 로컬 포크 경로를 씁니다.
+#    원격 반영 후에는 아래 주석의 git 줄로 되돌리고 rev 를 새 커밋으로 바꾸세요. (아래 [patch.crates-io] 3줄도 함께)
+# candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca", optional = true }
+candle-rocm = { path = "../../../candle-rocm/candle-backend", optional = true }
 tokenizers = "0.22.1"
 num = "0.4.3"
 minijinja = "2.12.0"
@@ -106,10 +109,15 @@ turbo-quant = ["candle-core/turbo-quant", "candle-nn/turbo-quant"]
 # candle-rocm-vulkan 포크는 아래 rev(커밋)에 고정합니다. rev 를 바꾸면 cargo 가 자동으로 새 커밋을 받아옵니다.
 # 02d1800 = FlashAttention v1/v2/v3 + TurboQuant 가 들어간 master (PR #5).
 # 위 candle-rocm 의존성과 아래 3개 패치는 반드시 같은 rev 여야 candle-core 가 하나로 합쳐집니다.
+# 🌟 [OFFLOAD-ATTN] 지금은 02d1800 위에 오프로딩 최적화(attention_packed 등)를 얹은 로컬 포크(../../../candle-rocm)를 씁니다.
+#    포크 변경을 원격에 올린 뒤에는 path 3줄을 지우고 git 3줄의 주석을 풀어 rev 를 새 커밋으로 바꾸면 됩니다.
 [patch.crates-io]
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca" }
-candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca" }
+# candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca" }
+# candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca" }
+# candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca" }
+candle-core = { path = "../../../candle-rocm/candle-core" }
+candle-nn = { path = "../../../candle-rocm/candle-nn" }
+candle-flash-attn = { path = "../../../candle-rocm/candle-flash-attn" }
 
 
 [profile.dev]

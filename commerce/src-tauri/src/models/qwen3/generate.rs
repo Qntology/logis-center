@@ -236,6 +236,31 @@ impl Qwen3GenerateModel {
         Ok(prejudice)
     }
 
+    /// 🌟 [KV-PRECISION] 이번 생성의 KV 를 원본 정밀도(BF16)로 둘지, TurboQuant 로 압축할지 정해 모델에 설정합니다.
+    /// 캐시가 빈 상태(새 생성)에서 프리필 전에 호출합니다. 판정 기준은 kv_turbo::exact_kv_affordable 을 보세요.
+    fn plan_kv_precision(&mut self, planned_tokens: usize) {
+        let (layers, heads, head_dim) = self.qwen3.kv_geometry();
+        let elem = if self.device.is_cuda_or_rocm() { 2 } else { 4 };
+        let exact_bytes = (layers * heads * head_dim * 2 * elem * planned_tokens) as u64;
+        let (exact, free) =
+            crate::models::common::kv_turbo::exact_kv_affordable(&self.device, exact_bytes, 0);
+        self.qwen3.set_kv_exact(exact);
+        if self.device.is_cuda_or_rocm() || self.device.is_vulkan() {
+            println!(
+                "[KV-PRECISION] Qwen3(0.6B) | 토큰 {} · 원본 KV {:.0} MB + 여유 {:.0} MB vs VRAM free {} → {}",
+                planned_tokens,
+                exact_bytes as f64 / 1e6,
+                crate::utils::resources::KV_VRAM_SAFETY_MARGIN_BYTES as f64 / 1e6,
+                free.map(|f| format!("{:.0} MB", f as f64 / 1e6)).unwrap_or_else(|| "?".to_string()),
+                if exact {
+                    "원본 KV (압축하지 않음 · 정확도 우선)"
+                } else {
+                    "TurboQuant 압축 KV (메모리 우선)"
+                }
+            );
+        }
+    }
+
     pub fn get_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.qwen3.get_kv_cache()
     }
@@ -403,6 +428,14 @@ impl Qwen3GenerateModel {
                 Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
             }
         }
+        // 🌟 [KV-PRECISION] 새로 시작하는 생성이면 VRAM 여유에 따라 KV 정밀도를 정합니다.
+        //    (저장된 세션을 이어 쓸 때는 기존 압축 경로가 스냅샷을 흡수하므로 그대로 둡니다)
+        if is_prefill {
+            self.plan_kv_precision(start_len + prompt_seq_len + sample_len as usize);
+        } else {
+            self.qwen3.set_kv_exact(false);
+        }
+
         // 🌟 [Phase 1: Chunked Prefill] VRAM 폭발과 RAM 널뛰기를 막기 위해 256 토큰 단위로 강하게 압박합니다.
         let chunk_size = 256;
         let mut next_token = 0;
@@ -709,6 +742,9 @@ impl Qwen3GenerateModel {
                 Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
             }
         }
+        // 🌟 [KV-PRECISION] VRAM 여유가 충분하면 이번 생성의 KV 를 압축하지 않습니다.
+        self.plan_kv_precision(prompt_seq_len + sample_len as usize);
+
         // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 256 토큰 단위로 강하게 잘라 VRAM 및 RAM 널뛰기를 막습니다.
         let chunk_size = 256;
         let mut next_token = 0;

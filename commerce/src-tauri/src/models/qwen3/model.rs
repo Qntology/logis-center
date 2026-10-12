@@ -32,6 +32,9 @@ pub struct Qwen3DecoderLayer {
     // 🌟 [KV RESIDENCY] 디코딩 진입 시 1회 결정된 목표 배치 위치.
     //    기본값은 기존 동작과 100% 동일한 Vram 입니다.
     pub kv_residency: crate::utils::resources::KvResidency,
+    // 🌟 [KV-PRECISION] true 면 VRAM 에 있는 동안 KV 를 압축(TurboQuant·FP8)하지 않고 원본 dtype 으로 둡니다.
+    //    생성 시작 시 VRAM 여유로 정합니다(kv_turbo::exact_kv_affordable). RAM 으로 내릴 때는 기존처럼 압축합니다.
+    pub kv_exact: bool,
 }
 
 impl Qwen3DecoderLayer {
@@ -78,6 +81,7 @@ impl Qwen3DecoderLayer {
             post_attention_layernorm,
             fp8_cache: None,
             kv_residency: crate::utils::resources::KvResidency::Vram,
+            kv_exact: false,
         })
     }
 
@@ -144,7 +148,7 @@ impl Qwen3DecoderLayer {
         // 🌟 [TURBO-KV] TurboQuant 압축 캐시는 VRAM 상주 전용입니다.
         //    RAM/SSD 대피가 결정되면 압축 캐시를 풀어 기존 FP8 + RAM 경로로 넘기고,
         //    다시 VRAM 상주가 결정되면 다음 forward 에서 FP8 캐시를 압축 캐시로 흡수합니다.
-        let turbo_ok = residency == crate::utils::resources::KvResidency::Vram;
+        let turbo_ok = residency == crate::utils::resources::KvResidency::Vram && !self.kv_exact;
         self.self_attn.set_turbo_kv_allowed(turbo_ok);
         if !turbo_ok {
             match self.self_attn.take_turbo_kv() {
@@ -188,6 +192,10 @@ impl Qwen3DecoderLayer {
     }
 
     pub fn compress_kv_in_vram(&mut self) -> Result<()> {
+        // 🌟 [KV-PRECISION] 원본 KV 모드에서 VRAM 에 둘 때는 FP8 로 바꾸지 않고 그대로 둡니다.
+        if self.kv_exact && self.kv_residency == crate::utils::resources::KvResidency::Vram {
+            return Ok(());
+        }
         if let Some((k, v)) = self.self_attn.kv_cache.take() {
             let dev = k.device();
             let k_fp8 = if dev.is_cuda_or_rocm() {
@@ -400,6 +408,16 @@ impl Qwen3Model {
             layer.compress_kv_in_vram()?;
         }
         Ok(())
+    }
+
+    /// 🌟 [KV-PRECISION] 이번 생성의 KV 를 원본 정밀도로 둘지(true) 압축할지(false) 전 레이어에 설정합니다.
+    /// 생성 시작(캐시가 빈 상태)에 호출합니다.
+    pub fn set_kv_exact(&mut self, exact: bool) {
+        for layer in self.layers.iter_mut() {
+            layer.kv_exact = exact;
+            let turbo_ok = layer.kv_residency == crate::utils::resources::KvResidency::Vram && !exact;
+            layer.self_attn.set_turbo_kv_allowed(turbo_ok);
+        }
     }
 
     pub fn get_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {

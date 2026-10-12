@@ -263,6 +263,37 @@ impl TqBlockCodec {
         Ok(self.unrotate(&self.unpack(packed, false, DType::F32)?)?.to_dtype(dt)?)
     }
 
+    /// 🌟 [OFFLOAD-ATTN] 압축된 K/V 행 `(b, kv_heads, t, words)` 위에서 바로 어텐션을 계산합니다.
+    /// `q`: `(b, q_heads, q_len, d)` (스케일 전, 원래 좌표계), 출력은 `q` 와 같은 dtype·모양입니다.
+    /// GPU 에서는 포크의 fused TurboQuant 커널이 압축 행을 직접 읽고(복원본을 만들지 않음),
+    /// 커널을 쓸 수 없으면(CPU, 자가 검증 실패, 지원 밖 형태) 포크가 행을 복원해 flash-attn 으로 계산합니다.
+    /// 회전 형식이면 q 를 회전 좌표계로 옮겨 계산하고 출력만 원래 좌표계로 되돌립니다.
+    #[cfg(feature = "turbo-quant")]
+    pub fn attend_packed(
+        &self,
+        q: &Tensor,
+        k_rows: &Tensor,
+        v_rows: &Tensor,
+        kv_len: usize,
+        scaling: f64,
+    ) -> Result<Tensor> {
+        let dt = q.dtype();
+        let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scaling as f32).causal();
+        let q_in = if self.rot.is_some() {
+            self.rotate(q)?.to_dtype(dt)?.contiguous()?
+        } else {
+            q.contiguous()?
+        };
+        let o = candle_nn::turbo_quant::attention_packed(
+            &q_in, k_rows, v_rows, kv_len, &self.kq, &self.vq, &cfg,
+        )?;
+        Ok(if self.rot.is_some() {
+            self.unrotate(&o)?.to_dtype(dt)?
+        } else {
+            o.to_dtype(dt)?
+        })
+    }
+
     #[cfg_attr(not(feature = "turbo-quant"), allow(dead_code))]
     fn words(&self, keys: bool) -> usize {
         if keys {
@@ -395,6 +426,58 @@ pub fn kv_quant_options() -> candle_core::accel::TurboQuantOptions {
         }
     }
     o
+}
+
+/// 🌟 [KV-PRECISION] KV 정밀도 정책 (`LOGIS_KV_PRECISION`).
+/// - `auto` (기본): VRAM 여유가 충분하면 KV 를 압축하지 않고 모델 dtype(원본) 그대로 두고,
+///   모자랄 때만 TurboQuant(벡터별 스케일 FP8)로 압축합니다.
+/// - `exact`: 항상 원본 KV (메모리가 모자라 RAM/SSD 로 내릴 때만 기존처럼 압축)
+/// - `compressed`: 항상 압축 KV (이전 동작)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvPrecisionPolicy {
+    Auto,
+    Exact,
+    Compressed,
+}
+
+pub fn kv_precision_policy() -> KvPrecisionPolicy {
+    static P: std::sync::OnceLock<KvPrecisionPolicy> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        match std::env::var("LOGIS_KV_PRECISION").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+            "exact" | "full" | "bf16" | "f16" => KvPrecisionPolicy::Exact,
+            "compressed" | "turbo" | "fp8" | "compact" => KvPrecisionPolicy::Compressed,
+            _ => KvPrecisionPolicy::Auto,
+        }
+    })
+}
+
+/// 🌟 [KV-PRECISION] 이번 생성의 KV 를 압축하지 않고 원본 정밀도로 둘 수 있는지. `(원본, 잰 VRAM free)`
+///
+/// 실측(Qwen3-0.6B 실모델, 같은 토큰 열 강제): 벡터별 FP8 KV 는 JSON 추출·검증 프롬프트에서 다음 토큰이
+/// 원본 KV 와 100% 같았지만, 수천 토큰 뒤의 긴 자유 서술에서는 4% 안팎의 스텝에서 1순위 토큰이 바뀌었습니다.
+/// 압축의 이득(메모리·전송량)은 KV 가 VRAM 에 넉넉히 들어가는 짧은 문맥에서는 거의 없으므로,
+/// `exact_bytes`(원본 KV 예상치) + KV 안전 여유(640MB) + `reserve`(이번 계산의 다른 순간치) 가
+/// VRAM free 안에 들어가면 원본을 씁니다. 들어가지 않으면(긴 문맥·VRAM 부족·오프로딩) 압축합니다.
+/// CPU 는 원래 KV 를 압축하지 않으므로 그대로(원본) 둡니다.
+pub fn exact_kv_affordable(device: &Device, exact_bytes: u64, reserve: u64) -> (bool, Option<u64>) {
+    match kv_precision_policy() {
+        KvPrecisionPolicy::Exact => return (true, None),
+        KvPrecisionPolicy::Compressed => return (false, None),
+        KvPrecisionPolicy::Auto => {}
+    }
+    use crate::utils::GpuDeviceExt;
+    if !(device.is_cuda_or_rocm() || device.is_vulkan()) {
+        return (true, None);
+    }
+    // 메모리 풀이 쥐고 있던 이전 계산의 여분을 돌려준 뒤 잽니다.
+    let _ = device.synchronize();
+    match crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize) {
+        Some((free, _)) => (
+            free >= exact_bytes + crate::utils::resources::KV_VRAM_SAFETY_MARGIN_BYTES + reserve,
+            Some(free),
+        ),
+        None => (false, None),
+    }
 }
 
 /// 이 장치에서 실제로 쓰일 (K, V) 압축 형식
@@ -707,4 +790,106 @@ impl BlockAttention {
             _ => o,
         }))
     }
+}
+
+/// 🌟 [OFFLOAD-ATTN] 블록 하나의 K/V (어텐션 계산 직전, 계산 장치에 올라온 상태).
+/// `tq` 가 Some 이면 `k` / `v` 는 그 형식의 압축 u32 행 `(b, kv_heads, len, words)`,
+/// None 이면 평문(FP8/F16/F32) `(b, kv_heads, len, d)` 입니다.
+pub struct KvPart {
+    pub k: Tensor,
+    pub v: Tensor,
+    pub tq: Option<TqMeta>,
+    /// 블록의 첫 토큰 위치
+    pub off: usize,
+    /// 블록에 든 토큰 수
+    pub len: usize,
+}
+
+impl KvPart {
+    /// 블록 K/V 가 차지하는 바이트 수
+    pub fn bytes(&self) -> usize {
+        self.k.elem_count() * self.k.dtype().size_in_bytes()
+            + self.v.elem_count() * self.v.dtype().size_in_bytes()
+    }
+}
+
+/// 🌟 [OFFLOAD-ATTN] 디코딩(q_len 1): 모든 블록이 같은 TurboQuant 형식이면 압축 행을 그대로 이어 붙여
+/// fused 커널 한 번으로 계산합니다. (블록마다 복원 → matmul → 온라인 소프트맥스 병합을 반복하지 않습니다)
+/// RAM 에 있는 블록은 압축된 채로 올라옵니다. 조건이 맞지 않으면 `Ok(None)`.
+pub fn fused_decode_attention(q: &Tensor, parts: &[KvPart], scaling: f64) -> Result<Option<Tensor>> {
+    #[cfg(feature = "turbo-quant")]
+    {
+        let Some(meta) = parts.first().and_then(|p| p.tq) else {
+            return Ok(None);
+        };
+        if parts.iter().any(|p| p.tq != Some(meta) || p.len == 0) {
+            return Ok(None);
+        }
+        let dev = q.device();
+        let codec = codec_for(&meta, dev)?;
+        let total: usize = parts.iter().map(|p| p.len).sum();
+        let rows = |pick: &dyn Fn(&KvPart) -> &Tensor| -> Result<Tensor> {
+            let mut v = Vec::with_capacity(parts.len());
+            for p in parts {
+                v.push(pick(p).narrow(2, 0, p.len)?.to_device(dev)?);
+            }
+            Ok(if v.len() == 1 { v.remove(0) } else { Tensor::cat(&v, 2)? })
+        };
+        let k_rows = rows(&|p| &p.k)?;
+        let v_rows = rows(&|p| &p.v)?;
+        return Ok(Some(codec.attend_packed(q, &k_rows, &v_rows, total, scaling)?));
+    }
+    #[cfg(not(feature = "turbo-quant"))]
+    {
+        let _ = (q, parts, scaling);
+        Ok(None)
+    }
+}
+
+/// 🌟 [OFFLOAD-ATTN] 과거 이력(`hist_end` 앞 위치, 압축 블록이면 복원) 뒤에 이번 스텝의 **원본** K/V 를
+/// 이어 붙여 타일 flash-attn 으로 계산합니다. (causal, 쿼리는 마지막 q_len 위치)
+/// - 프리필 청크가 자기 자신(같은 청크의 K/V)을 볼 때 압축 오차가 없습니다. 기존 블록 경로는 방금 압축한
+///   블록을 다시 풀어 썼기 때문에 프롬프트 전체가 FP8 오차를 안고 계산되었습니다.
+/// - S(q_len × kv_len) 행렬을 만들지 않으므로 프리필 순간 VRAM 이 블록 수와 무관하게 작습니다.
+/// `q`: `(b, q_heads, q_len, d)` 스케일 전, `k_cur` / `v_cur`: `(b, kv_heads, q_len, d)`.
+pub fn flash_history_attention(
+    q: &Tensor,
+    k_cur: &Tensor,
+    v_cur: &Tensor,
+    parts: &[KvPart],
+    hist_end: usize,
+    scaling: f64,
+) -> Result<Tensor> {
+    let dev = q.device();
+    let dt = q.dtype();
+    let mut ks: Vec<Tensor> = Vec::with_capacity(parts.len() + 1);
+    let mut vs: Vec<Tensor> = Vec::with_capacity(parts.len() + 1);
+    for p in parts {
+        if p.off >= hist_end {
+            continue;
+        }
+        let take = p.len.min(hist_end - p.off);
+        if take == 0 {
+            continue;
+        }
+        let k = p.k.narrow(2, 0, take)?.contiguous()?;
+        let v = p.v.narrow(2, 0, take)?.contiguous()?;
+        match p.tq {
+            Some(meta) => {
+                let codec = codec_for(&meta, dev)?;
+                ks.push(codec.unpack_k(&k, dt)?);
+                vs.push(codec.unpack_v(&v, dt)?);
+            }
+            None => {
+                ks.push(k.to_device(dev)?.to_dtype(dt)?);
+                vs.push(v.to_device(dev)?.to_dtype(dt)?);
+            }
+        }
+    }
+    ks.push(k_cur.to_dtype(dt)?);
+    vs.push(v_cur.to_dtype(dt)?);
+    let k = if ks.len() == 1 { ks.remove(0) } else { Tensor::cat(&ks, 2)? }.contiguous()?;
+    let v = if vs.len() == 1 { vs.remove(0) } else { Tensor::cat(&vs, 2)? }.contiguous()?;
+    let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scaling as f32).causal();
+    Ok(candle_nn::flash_attn::flash_attn_bhsd(&q.contiguous()?, &k, &v, &cfg)?)
 }
