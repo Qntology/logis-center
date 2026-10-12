@@ -9,11 +9,174 @@ use candle_nn::{
 };
 
 pub mod gguf;
+// 🌟 [TURBO-KV-BLOCK] 블록 단위 KV(Qwen3.5)용 TurboQuant 코덱과 블록 어텐션 누산기, KV 압축 형식 정책
+pub mod kv_turbo;
+// 🌟 [ACCEL-CHECK] GPU 가속 커널(FlashAttention / TurboQuant) 자가 검증과 실측 정확도 감시
+pub mod accel_check;
 
 use crate::{
     position_embed::rope::{RoPE, apply_rotary_pos_emb, apply_rotary_pos_emb_roformer},
     utils::tensor_utils::{prepare_causal_attention_mask, repeat_kv},
 };
+
+#[cfg(feature = "turbo-quant")]
+use candle_nn::{
+    flash_attn::{FlashAttnConfig, flash_attn_bhsd},
+    turbo_quant::TurboKvCache,
+};
+
+/// 🌟 [TURBO-KV] TurboKvCache 압축 버퍼가 한 번에 늘어나는 토큰 수입니다.
+#[cfg(feature = "turbo-quant")]
+pub const TURBO_KV_GROW_BY: usize = 1024;
+
+/// 🌟 [TURBO-KV] KV 캐시를 TurboQuant 로 압축 보관할 수 있는 빌드·장치·설정인지.
+/// `turbo-quant` feature 로 빌드되었고, GPU(CUDA / ROCm / Vulkan) 장치이며,
+/// `CANDLE_TURBO_QUANT=off` 로 끄지 않았을 때만 true 입니다.
+/// false 이면 각 모델은 기존 KV 경로(FP8 압축, RAM 대피 등)를 그대로 사용합니다.
+pub fn turbo_kv_active(device: &candle_core::Device) -> bool {
+    #[cfg(feature = "turbo-quant")]
+    {
+        return matches!(
+            device,
+            candle_core::Device::Cuda(_) | candle_core::Device::Rocm(_) | candle_core::Device::Vulkan(_)
+        ) && candle_core::accel::config().turbo_quant.enabled;
+    }
+    #[cfg(not(feature = "turbo-quant"))]
+    {
+        let _ = device;
+        false
+    }
+}
+
+/// 🌟 [TURBO-KV] [`turbo_kv_active`] 이면서, 이 장치·head_dim 에서 GPU 자가 검증([`accel_check`])을
+/// 통과했고 실측 감시가 TurboQuant 를 끄지 않았는지. 모델들은 이 함수로 압축 캐시 사용 여부를 정합니다.
+pub fn turbo_kv_ready(device: &candle_core::Device, head_dim: usize) -> bool {
+    turbo_kv_active(device) && accel_check::turbo_quant_ok(device, head_dim)
+}
+
+/// 🌟 [TURBO-KV] 이번 forward 에 압축 캐시 경로를 쓸지 (Qwen3 / QwenVL).
+/// - 기본 FP8 형식: 첫 프리필 청크부터 씁니다. (과거 이력은 압축본, 현재 청크는 원본으로 계산)
+/// - 4bit 등 저비트 형식: 프리필은 기존 경로로 계산하고, 디코딩(q_len == 1)부터 이력을 한 번에
+///   압축 캐시로 옮깁니다. 프롬프트 표현이 저비트 오차를 레이어마다 누적하지 않도록 하기 위해서입니다.
+/// - 이미 압축 캐시에 이력이 있으면 계속 씁니다.
+pub fn turbo_kv_use(
+    device: &candle_core::Device,
+    head_dim: usize,
+    q_len: usize,
+    has_turbo_history: bool,
+) -> bool {
+    turbo_kv_ready(device, head_dim)
+        && (q_len == 1 || has_turbo_history || !kv_turbo::kv_is_compact(device))
+}
+
+/// 🌟 [TURBO-KV] [`turbo_kv_step`] 결과
+#[cfg(feature = "turbo-quant")]
+pub struct TurboStep {
+    /// 어텐션 출력 (batch, q_heads, q_len, head_dim)
+    pub out: Tensor,
+    /// 실측 감시가 압축 캐시를 버린 경우, 호출부가 평문 캐시로 이어 쓸 원본 전체 K/V
+    pub plain_kv: Option<(Tensor, Tensor)>,
+}
+
+/// 🌟 [TURBO-KV] 한 스텝 분량의 K/V 를 TurboQuant 압축 캐시에 붙이고 어텐션을 계산합니다.
+///
+/// - `q`: (batch, q_heads, q_len, head_dim), `k`/`v`: (batch, kv_heads, q_len, head_dim)
+/// - 출력: (batch, q_heads, q_len, head_dim)
+/// - 마스크는 causal(bottom-right 정렬)로 고정됩니다. 청크 프리필(seqlen_offset > 0)도 그대로 맞습니다.
+/// - 원본 전체 K/V 가 손에 있을 때(빈 캐시의 첫 채움, 또는 `prev` 평문 이력 흡수)는 원본으로
+///   정확하게 계산합니다. `prev` 는 스냅샷 복원본·RAM 대피본·4bit 형식의 프리필 결과처럼 그것이
+///   전체 이력인 평문 캐시이므로, 압축 캐시를 비우고 먼저 흡수한 뒤 새 토큰을 붙입니다.
+/// - 이력이 압축 캐시에만 있는 청크 프리필(q_len > 1)은 압축된 이력을 풀어 원본 현재 청크와 이어 붙이고
+///   타일 flash-attn 커널로 계산합니다. (기존 "FP8 이력 + 원본 현재 청크" 경로와 같은 구성)
+/// - 디코딩(q_len == 1)은 압축 캐시 위에서 바로(fused) 계산합니다.
+/// - [`accel_check`] 실측 감시: 원본으로 계산하는 스텝에서 같은 질의를 압축 캐시로도 계산해
+///   오차를 기록하고, 비정상이면 압축 캐시를 버리고 원본 K/V 를 `plain_kv` 로 돌려줍니다.
+#[cfg(feature = "turbo-quant")]
+pub fn turbo_kv_step(
+    cache: &mut Option<TurboKvCache>,
+    prev: Option<(Tensor, Tensor)>,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    scaling: f64,
+) -> Result<TurboStep> {
+    let dev = k.device().clone();
+    if cache.is_none() {
+        *cache = Some(TurboKvCache::with_options(
+            &kv_turbo::kv_quant_options(),
+            head_dim,
+            TURBO_KV_GROW_BY,
+            &dev,
+        )?);
+    }
+    let Some(c) = cache.as_mut() else {
+        anyhow::bail!("turbo-kv: 캐시 초기화 실패");
+    };
+    let q = q.contiguous()?;
+    let k = k.contiguous()?;
+    let v = v.contiguous()?;
+    let q_len = q.dim(2)?;
+    let cfg = FlashAttnConfig::new(scaling as f32).causal();
+    // 🌟 [ACCEL-CHECK] 아래에서 flash-attn 을 쓰므로 이 dtype·head_dim 의 자가 검증을 먼저 끝냅니다.
+    //    (실패하면 이 백엔드의 fused flash-attn 이 꺼지고 candle 의 비융합 경로로 계산됩니다)
+    let _ = accel_check::flash_attn_ok(&dev, q.dtype(), head_dim);
+
+    // 원본 전체 K/V 가 손에 있는 경우: 평문 이력 흡수(prev) 또는 빈 캐시의 첫 채움
+    let exact_full = match prev {
+        Some((pk, pv)) => {
+            c.reset();
+            let pk = pk.to_device(&dev)?.to_dtype(k.dtype())?.contiguous()?;
+            let pv = pv.to_device(&dev)?.to_dtype(v.dtype())?.contiguous()?;
+            c.append(&pk, &pv)?;
+            c.append(&k, &v)?;
+            Some((Tensor::cat(&[&pk, &k], 2)?, Tensor::cat(&[&pv, &v], 2)?))
+        }
+        None if c.seq_len() == 0 => {
+            c.append(&k, &v)?;
+            Some((k.clone(), v.clone()))
+        }
+        None => None,
+    };
+
+    if let Some((full_k, full_v)) = exact_full {
+        let out = flash_attn_bhsd(&q, &full_k, &full_v, &cfg)?;
+        // 🌟 [ACCEL-CHECK] 실측 감시: 같은 질의를 압축 캐시로도 계산해 실제 오차를 기록합니다.
+        if accel_check::probe_wanted(&dev) {
+            let label = match c.formats() {
+                Some((kf, vf)) => format!("K {kf} / V {vf}"),
+                None => "plain".to_string(),
+            };
+            let packed = c.attention(&q, &cfg)?;
+            let rel = accel_check::rel_err(&packed, &out)?;
+            if !accel_check::record_probe(&dev, rel, &label) {
+                *cache = None;
+                return Ok(TurboStep { out, plain_kv: Some((full_k, full_v)) });
+            }
+        }
+        return Ok(TurboStep { out, plain_kv: None });
+    }
+
+    if q_len > 1 {
+        // 청크 프리필: 과거 이력은 압축본을 풀어서, 이번 청크는 원본 그대로 계산합니다.
+        let hist = c.keys_values()?;
+        c.append(&k, &v)?;
+        let out = match hist {
+            Some((hk, hv)) => {
+                let full_k = Tensor::cat(&[&hk.to_dtype(k.dtype())?, &k], 2)?;
+                let full_v = Tensor::cat(&[&hv.to_dtype(v.dtype())?, &v], 2)?;
+                flash_attn_bhsd(&q, &full_k, &full_v, &cfg)?
+            }
+            None => flash_attn_bhsd(&q, &k, &v, &cfg)?,
+        };
+        return Ok(TurboStep { out, plain_kv: None });
+    }
+
+    // 디코딩: 압축 캐시 위에서 바로(fused) 계산합니다.
+    c.append(&k, &v)?;
+    let out = c.attention(&q, &cfg)?;
+    Ok(TurboStep { out, plain_kv: None })
+}
 
 #[derive(Debug, Clone)]
 pub struct GateUpDownMLP {
@@ -429,6 +592,11 @@ pub struct QKNormAttention {
     head_dim: usize,
     scaling: f64,
     pub kv_cache: Option<(Tensor, Tensor)>,
+    // 🌟 [TURBO-KV] TurboQuant 로 압축된 KV 캐시. 이 경로가 켜져 있으면 kv_cache(평문)는 비어 있습니다.
+    #[cfg(feature = "turbo-quant")]
+    turbo_kv: Option<TurboKvCache>,
+    // 🌟 [TURBO-KV] 레이어가 TurboQuant 경로를 써도 되는지. KV 를 RAM 으로 대피시키는 동안은 false.
+    turbo_kv_allowed: bool,
 }
 
 impl QKNormAttention {
@@ -496,6 +664,9 @@ impl QKNormAttention {
             head_dim,
             scaling,
             kv_cache: None,
+            #[cfg(feature = "turbo-quant")]
+            turbo_kv: None,
+            turbo_kv_allowed: true,
         })
     }
 
@@ -527,7 +698,45 @@ impl QKNormAttention {
             .transpose(1, 2)?;
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
-        
+
+        // 🌟 [TURBO-KV] GPU + turbo-quant 빌드에서는 새 K/V 를 TurboQuant 압축 캐시에 붙이고
+        //    압축된 캐시로 어텐션을 계산합니다. (FP8 재압축/전체 복원 왕복이 사라집니다)
+        //    attention_mask 는 Qwen3 의 표준 causal 마스크이므로 causal 설정으로 대체됩니다.
+        //    언제 압축 캐시를 쓰는지는 turbo_kv_use (형식 정책·GPU 자가 검증·실측 감시) 가 정합니다.
+        #[cfg(feature = "turbo-quant")]
+        {
+            let dev = query_states.device().clone();
+            if self.turbo_kv_allowed
+                && turbo_kv_use(&dev, self.head_dim, q_len, self.has_turbo_kv())
+            {
+                let prev = self.kv_cache.take();
+                let step = turbo_kv_step(
+                    &mut self.turbo_kv,
+                    prev,
+                    &query_states,
+                    &key_states,
+                    &value_states,
+                    self.head_dim,
+                    self.scaling,
+                )?;
+                if let Some(kv) = step.plain_kv {
+                    // 실측 감시가 압축 캐시를 버렸습니다. 원본 K/V 로 기존 경로를 이어 갑니다.
+                    self.kv_cache = Some(kv);
+                }
+                let attn_output = step
+                    .out
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+                return Ok(attn_output.apply(&self.o_proj)?);
+            }
+            // 압축 캐시를 더 쓰지 않는데 이력이 남아 있으면(자가 검증·실측 감시가 TurboQuant 를 끈 경우 등)
+            // 평문 캐시로 풀어 기존 경로로 이어 갑니다. 풀지 못하면 문맥 없이 계속하지 않도록 에러를 냅니다.
+            if self.kv_cache.is_none() && self.has_turbo_kv() {
+                self.kv_cache = self.take_turbo_kv()?;
+            }
+        }
+
         // 🌟 [CRITICAL FIX] `&self.kv_cache`로 참조(Borrow)하면 이전 캐시와 새 캐시가 VRAM에 동시에 존재하여 2배 폭발이 일어납니다!
         // `take()`로 소유권을 완전히 빼앗아 연산 직후 이전 캐시가 VRAM에서 즉시 소멸되도록 수정합니다.
         let (key_states, value_states) = match self.kv_cache.take() {
@@ -561,7 +770,55 @@ impl QKNormAttention {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
+        self.kv_cache = None;
+        self.reset_turbo_kv();
+    }
+
+    /// 🌟 [TURBO-KV] TurboQuant 경로 허용 여부를 바꿉니다. (KV 를 RAM/SSD 로 대피시킬 때 false)
+    pub fn set_turbo_kv_allowed(&mut self, allowed: bool) {
+        self.turbo_kv_allowed = allowed;
+    }
+
+    /// 🌟 [TURBO-KV] 압축 캐시를 비웁니다. (평문 kv_cache 는 건드리지 않습니다)
+    pub fn reset_turbo_kv(&mut self) {
+        #[cfg(feature = "turbo-quant")]
+        {
+            self.turbo_kv = None;
+        }
+    }
+
+    /// 🌟 [TURBO-KV] 압축 캐시에 토큰이 들어 있는지.
+    pub fn has_turbo_kv(&self) -> bool {
+        #[cfg(feature = "turbo-quant")]
+        {
+            return self.turbo_kv.as_ref().map_or(false, |c| c.seq_len() > 0);
+        }
+        #[cfg(not(feature = "turbo-quant"))]
+        {
+            false
+        }
+    }
+
+    /// 🌟 [TURBO-KV] 압축 캐시를 원래 dtype 의 (k, v) 로 풀어 돌려줍니다. 캐시는 그대로 유지됩니다. (스냅샷 저장용)
+    /// 형태: (batch, kv_heads, seq, head_dim)
+    pub fn turbo_kv_snapshot(&self) -> Result<Option<(Tensor, Tensor)>> {
+        #[cfg(feature = "turbo-quant")]
+        {
+            if let Some(c) = &self.turbo_kv {
+                if c.seq_len() > 0 {
+                    return Ok(c.keys_values()?);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// 🌟 [TURBO-KV] 압축 캐시를 풀어서 꺼내고 비웁니다. (VRAM → RAM 대피 전환용)
+    /// 압축 해제에 실패하면 캐시를 그대로 둔 채 에러를 돌려줍니다.
+    pub fn take_turbo_kv(&mut self) -> Result<Option<(Tensor, Tensor)>> {
+        let kv = self.turbo_kv_snapshot()?;
+        self.reset_turbo_kv();
+        Ok(kv)
     }
 }
 
@@ -806,28 +1063,56 @@ pub fn eager_attention_forward(
 
     #[cfg(feature = "flash-attn")]
     {
-        // Flash Attention은 GQA를 네이티브로 지원하며 BF16/F16을 요구합니다.
-        let q = query_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
-        let k = key_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
-        let v = value_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
-        
-        let attn_output = candle_flash_attn::flash_attn(
-            &q, &k, &v,
-            scaling as f32,
-            attention_mask.is_some(),
-        )?.transpose(1, 2)?;
-        
-        return Ok(attn_output.to_dtype(orig_dtype)?.contiguous()?);
+        // 🌟 [ACCEL-CHECK] fused flash-attn 이 꺼져 있거나(CANDLE_FLASH_ATTN=off 등) 이 GPU 의
+        //    자가 검증을 통과하지 못하면 아래의 기존 블록 어텐션(GQA 접기 + 블록 온라인 소프트맥스)으로 계산합니다.
+        //    (candle 의 비융합 대체 경로는 점수 행렬 전체를 F32 로 만들기 때문에 긴 문맥에서 VRAM 을 많이 씁니다)
+        if accel_check::flash_attn_ok(dev, target_dtype, query_states.dim(D::Minus1)?) {
+            // Flash Attention은 GQA를 네이티브로 지원하며 BF16/F16을 요구합니다.
+            let q = query_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+            let k = key_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+            let v = value_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
+
+            // flash_attn 은 (batch, seq, heads, head_dim) 을 그대로 돌려줍니다.
+            // 아래 비-flash 경로와 같은 (b, q_len, h, d) 레이아웃이므로 다시 transpose 하지 않습니다.
+            // (예전에는 여기서 transpose(1, 2) 를 한 번 더 해서 호출부의 reshape 가 헤드/토큰을 뒤섞었습니다)
+            let attn_output = candle_flash_attn::flash_attn(
+                &q, &k, &v,
+                scaling as f32,
+                attention_mask.is_some(),
+            )?;
+
+            return Ok(attn_output.to_dtype(orig_dtype)?.contiguous()?);
+        }
     }
 
-    #[cfg(not(feature = "flash-attn"))]
     {
         let kv_seq_len = key_states.dim(2)?;
         let block_size = 4096;
 
+        // 마스크가 현재 청크 길이만큼만 있으면(이전 이력 없이 만든 causal 마스크) 이력 부분을 0(모두 보임)으로
+        // 채워 오른쪽(bottom-right)에 맞춥니다. flash-attn 경로의 causal 과 같은 의미입니다.
+        let padded_mask = match attention_mask {
+            Some(m) if m.dim(D::Minus1)? < kv_seq_len => {
+                let mut pad_shape = m.dims().to_vec();
+                let last = pad_shape.len() - 1;
+                pad_shape[last] = kv_seq_len - m.dim(D::Minus1)?;
+                let pad = Tensor::zeros(pad_shape, m.dtype(), m.device())?;
+                Some(Tensor::cat(&[&pad, m], D::Minus1)?)
+            }
+            _ => None,
+        };
+        let attention_mask = padded_mask.as_ref().or(attention_mask);
+
         // [GQA-FOLD] repeat_kv는 K/V 전체를 groups배로 물리 복제합니다.
         // Q의 head 축을 접으면 동일 결과를 복제 없이 얻으므로, VRAM 피크와 대역폭을 함께 절감합니다.
-        let groups = num_key_value_groups.unwrap_or(1).max(1);
+        // 그룹 수를 넘겨받지 못했으면 헤드 수(q 헤드 = kv 헤드 × groups)에서 구합니다.
+        let groups = match num_key_value_groups {
+            Some(g) => g.max(1),
+            None => {
+                let (q_heads, kv_heads) = (query_states.dim(1)?, key_states.dim(1)?);
+                if kv_heads > 0 && q_heads % kv_heads == 0 { q_heads / kv_heads } else { 1 }
+            }
+        };
 
         let q_aligned = query_states.to_dtype(target_dtype)?.contiguous()?;
         let k_aligned = key_states.to_dtype(target_dtype)?.contiguous()?;
@@ -848,7 +1133,7 @@ pub fn eager_attention_forward(
             let attn_folded = q_work.matmul(&k_aligned.transpose(D::Minus2, D::Minus1)?)?;
             let attn_folded = (attn_folded * scaling)?;
             // [UNFOLD-SCORES] [b, kv_h, groups*q_l, kv_len] → [b, q_h, q_l, kv_len]
-            let mut attn_weights = if groups > 1 {
+            let attn_weights = if groups > 1 {
                 attn_folded.reshape((q_b, q_h, q_l, kv_seq_len))?
             } else {
                 attn_folded
@@ -891,7 +1176,7 @@ pub fn eager_attention_forward(
             // [GQA-FOLD] q_work로 matmul → [b, kv_h, groups*q_l, block_len]
             let attn_folded = (q_work.matmul(&k_block.transpose(2, 3)?)? * scaling)?;
             // [UNFOLD-SCORES] 마스크 적용을 위해 원래 헤드 배열로 복원
-            let mut attn_weights = if groups > 1 {
+            let attn_weights = if groups > 1 {
                 attn_folded.reshape((q_b, q_h, q_l, block_len))?
             } else {
                 attn_folded

@@ -102,6 +102,9 @@ pub struct LayerKVDump {
     pub k_shape: Tensor,
     pub raw_k: Option<Tensor>,
     pub raw_v: Option<Tensor>,
+    /// 🌟 [TURBO-KV-BLOCK] Some 이면 raw_k / raw_v 가 TurboQuant 압축 u32 행입니다.
+    ///   SSD 에는 형 변환 없이 그대로, `tq_meta` 텐서와 함께 저장합니다.
+    pub tq_meta: Option<crate::models::common::kv_turbo::TqMeta>,
 }
 
 pub struct BakeTask {
@@ -368,6 +371,17 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                         let io_tx_nested = io_tx_inner.clone();
 
                         tokio::spawn(async move {
+                            let tq_meta = src.tq_meta;
+                            if let (Some(rk), Some(rv), Some(_)) = (src.raw_k.as_ref(), src.raw_v.as_ref(), tq_meta) {
+                                // 🌟 [TURBO-KV-BLOCK] TurboQuant 압축 블록은 u32 행을 그대로 저장합니다.
+                                //    (F32 변환이나 헤드/차원 정렬을 하면 압축 데이터가 깨집니다)
+                                let k_cpu = rk.to_device(&Device::Cpu).unwrap_or_else(|_| rk.clone());
+                                let v_cpu = rv.to_device(&Device::Cpu).unwrap_or_else(|_| rv.clone());
+                                src.k_data = k_cpu.contiguous().unwrap_or(k_cpu);
+                                src.v_data = v_cpu.contiguous().unwrap_or(v_cpu);
+                                src.raw_k = None;
+                                src.raw_v = None;
+                            }
                             if let (Some(rk), Some(rv)) = (src.raw_k.take(), src.raw_v.take()) {
                                 let k_cpu = rk.to_device(&Device::Cpu).unwrap_or(rk);
                                 let v_cpu = rv.to_device(&Device::Cpu).unwrap_or(rv);
@@ -411,7 +425,14 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                             map.insert(format!("{}k_data", prefix), src.k_data.clone());
                             map.insert(format!("{}v_data", prefix), src.v_data.clone());
                             map.insert(format!("{}k_shape", prefix), src.k_shape.clone());
-                            
+                            // 🌟 [TURBO-KV-BLOCK] 압축 형식(형식·비트·회전·시드)을 함께 기록해 로드 시 코덱을 다시 만듭니다.
+                            //    이 텐서가 없는 파일은 기존 FP8/F32 블록으로 읽힙니다.
+                            if let Some(meta) = tq_meta {
+                                if let Ok(t) = meta.to_tensor() {
+                                    map.insert(format!("{}tq_meta", prefix), t);
+                                }
+                            }
+
                             let file_path = task_dir.join(format!("l{}.st", act_l));
                             
                             
@@ -444,6 +465,12 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                     let prefix = format!("b{}_l{}_", b_idx_off, target_layer);
                                     let get_t = |s: &str| st.tensor(&format!("{}{}", prefix, s)).ok();
                                 
+                                    // 🌟 [TURBO-KV-BLOCK] TurboQuant 압축 블록(Qwen3.5 전용 형식)은 이 경로의 소비자
+                                    //    (QuantizedQwen 어텐션)가 풀 수 없으므로 RAM 캐시에 올리지 않습니다.
+                                    if get_t("tq_meta").is_some() {
+                                        println!("[TURBO-KV-BLOCK] {:?} 는 TurboQuant 압축 블록이라 이 로더에서는 건너뜁니다.", file_path);
+                                        return;
+                                    }
                                     if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
                                         let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                                         let file_shape: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
@@ -464,7 +491,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
                                             kd_t = kd_t.to_dtype(DType::F32).unwrap_or(kd_t);
                                             vd_t = vd_t.to_dtype(DType::F32).unwrap_or(vd_t);
                                         }
-                                        let meta = BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: file_shape };
+                                        let meta = BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: file_shape, tq: None };
                                         
                                         if let Ok(mut r) = reg.entries.write() {
                                             if b_idx < r.len() {

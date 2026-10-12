@@ -46,8 +46,8 @@ candle-core = "0.11.0"
 ahash = "0.8.11"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
-candle-flash-attn = { version = "0.11.0", optional = true }
-candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", optional = true }
+candle-flash-attn = { version = "0.11.0", optional = true, default-features = false }
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca", optional = true }
 tokenizers = "0.22.1"
 num = "0.4.3"
 minijinja = "2.12.0"
@@ -92,16 +92,24 @@ io-uring = "0.7.13"
 metal = "0.33.0"
 
 [features]
-default = ["cuda"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-rocm = ["dep:candle-rocm", "candle-core/rocm", "candle-nn/rocm"]
-vulkan = ["candle-core/vulkan", "candle-nn/vulkan"]
+default = ["cuda", "flash-attn", "turbo-quant"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "candle-flash-attn?/cuda"]
+rocm = ["dep:candle-rocm", "candle-core/rocm", "candle-nn/rocm", "candle-flash-attn?/rocm"]
+vulkan = ["candle-core/vulkan", "candle-nn/vulkan", "candle-flash-attn?/vulkan"]
 metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
-flash-attn = []
+# Fused FlashAttention (v1/v2/v3 tiers, picked per GPU) from the candle-rocm-vulkan fork.
+# Activates the `#[cfg(feature = "flash-attn")]` paths in models/common and models/qwen/common.
+flash-attn = ["dep:candle-flash-attn", "candle-flash-attn/flash-attn", "candle-core/flash-attn", "candle-nn/flash-attn"]
+# TurboQuant / NVFP4 / MXFP4 / MXFP8 / FP8 quantization kernels (candle_nn::turbo_quant).
+turbo-quant = ["candle-core/turbo-quant", "candle-nn/turbo-quant"]
 
+# candle-rocm-vulkan 포크는 아래 rev(커밋)에 고정합니다. rev 를 바꾸면 cargo 가 자동으로 새 커밋을 받아옵니다.
+# 02d1800 = FlashAttention v1/v2/v3 + TurboQuant 가 들어간 master (PR #5).
+# 위 candle-rocm 의존성과 아래 3개 패치는 반드시 같은 rev 여야 candle-core 가 하나로 합쳐집니다.
 [patch.crates-io]
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan.git" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan.git" }
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca" }
+candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan.git", rev = "02d18006ada74ac51a71fed3967bee996050e6ca" }
 
 
 [profile.dev]

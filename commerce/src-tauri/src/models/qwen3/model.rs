@@ -140,6 +140,29 @@ impl Qwen3DecoderLayer {
     /// 🌟 [KV RESIDENCY] 디코딩 진입 시 계산된 목표 배치 위치를 주입합니다.
     pub fn set_kv_residency(&mut self, residency: crate::utils::resources::KvResidency) {
         self.kv_residency = residency;
+
+        // 🌟 [TURBO-KV] TurboQuant 압축 캐시는 VRAM 상주 전용입니다.
+        //    RAM/SSD 대피가 결정되면 압축 캐시를 풀어 기존 FP8 + RAM 경로로 넘기고,
+        //    다시 VRAM 상주가 결정되면 다음 forward 에서 FP8 캐시를 압축 캐시로 흡수합니다.
+        let turbo_ok = residency == crate::utils::resources::KvResidency::Vram;
+        self.self_attn.set_turbo_kv_allowed(turbo_ok);
+        if !turbo_ok {
+            match self.self_attn.take_turbo_kv() {
+                Ok(Some((k, v))) => {
+                    self.self_attn.kv_cache = Some((k, v));
+                    if let Err(e) = self.compress_kv_in_vram() {
+                        eprintln!("[TURBO-KV] FP8 전환 실패: {e}");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // 압축 해제가 실패하면 문맥을 잃지 않도록 압축 캐시를 VRAM 에 그대로 둡니다.
+                    eprintln!("[TURBO-KV] 압축 캐시 해제 실패, VRAM 에 유지합니다: {e}");
+                    self.self_attn.set_turbo_kv_allowed(true);
+                }
+            }
+        }
+
         // 이미 보관 중인 캐시가 있다면 즉시 목표 위치로 이주시킵니다.
         if let Some(cache) = self.fp8_cache.take() {
             let moved = match residency {
@@ -202,6 +225,15 @@ impl Qwen3DecoderLayer {
     pub fn get_kv_cache(&self) -> Option<(Tensor, Tensor)> {
         if let Some(cache) = &self.self_attn.kv_cache {
             Some(cache.clone())
+        } else if self.self_attn.has_turbo_kv() {
+            // 🌟 [TURBO-KV] 압축 캐시를 원래 dtype 으로 풀어 스냅샷으로 돌려줍니다. (캐시는 유지)
+            match self.self_attn.turbo_kv_snapshot() {
+                Ok(kv) => kv,
+                Err(e) => {
+                    eprintln!("[TURBO-KV] 스냅샷 압축 해제 실패: {e}");
+                    None
+                }
+            }
         } else if let Some(fp8_cache) = &self.fp8_cache {
             // 스냅샷 저장을 위해 호출될 경우, 원래 타입으로 복원하여 반환
             let target_dtype = candle_core::DType::F32; // 저장용 기본 타입
@@ -219,6 +251,9 @@ impl Qwen3DecoderLayer {
     }
 
     pub fn set_kv_cache(&mut self, cache: Option<(Tensor, Tensor)>) {
+        // 🌟 [TURBO-KV] 스냅샷이 전체 이력을 대체하므로 압축 캐시도 비웁니다.
+        //    (TurboQuant 경로라면 다음 forward 에서 이 평문 캐시를 압축 캐시로 흡수합니다)
+        self.self_attn.reset_turbo_kv();
         self.self_attn.kv_cache = cache;
         self.fp8_cache = None;
     }
@@ -317,6 +352,8 @@ impl Qwen3Model {
             hidden_states =
                 decode_layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
         }
+        // 🌟 [ACCEL-CHECK] 이번 forward 에서 기록된 TurboQuant 실측 오차가 있으면 한 줄로 남깁니다.
+        crate::models::common::accel_check::flush_probe_report(hidden_states.device());
         hidden_states = self.norm.forward(&hidden_states)?;
         let hidden_state = hidden_states.narrow(1, seq_len - 1, 1)?;
         let logits = self.lm_head.forward(&hidden_state)?;

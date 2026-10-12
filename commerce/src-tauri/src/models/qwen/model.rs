@@ -601,6 +601,9 @@ pub struct QwenVLTextAttention {
     pub num_kv_groups: usize,
     pub scaling: f64,
     pub kv_cache: Option<(Tensor, Tensor)>,
+    // 🌟 [TURBO-KV] TurboQuant 로 압축된 KV 캐시 (GPU + turbo-quant 빌드에서 kv_cache 대신 사용)
+    #[cfg(feature = "turbo-quant")]
+    pub turbo_kv: Option<candle_nn::turbo_quant::TurboKvCache>,
 }
 
 impl QwenVLTextAttention {
@@ -643,6 +646,8 @@ impl QwenVLTextAttention {
             head_dim,
             scaling,
             kv_cache: None,
+            #[cfg(feature = "turbo-quant")]
+            turbo_kv: None,
         })
     }
 
@@ -674,6 +679,47 @@ impl QwenVLTextAttention {
             .transpose(1, 2)?;
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+
+        // 🌟 [TURBO-KV] GPU + turbo-quant 빌드에서는 F4 캐스팅 캐시 대신 TurboQuant 압축 캐시를 씁니다.
+        //    (기본은 벡터별 스케일 FP8, CANDLE_TURBO_QUANT_BITS=4 등으로 4bit 선택 가능)
+        //    attention_mask 는 표준 causal 마스크이므로 causal(bottom-right) 설정으로 대체됩니다.
+        //    언제 압축 캐시를 쓰는지는 turbo_kv_use (형식 정책·GPU 자가 검증·실측 감시) 가 정합니다.
+        #[cfg(feature = "turbo-quant")]
+        {
+            let has_turbo = self.turbo_kv.as_ref().map_or(false, |c| c.seq_len() > 0);
+            if crate::models::common::turbo_kv_use(xs.device(), self.head_dim, q_len, has_turbo) {
+                let prev = self.kv_cache.take();
+                let step = crate::models::common::turbo_kv_step(
+                    &mut self.turbo_kv,
+                    prev,
+                    &query_states,
+                    &key_states,
+                    &value_states,
+                    self.head_dim,
+                    self.scaling,
+                )?;
+                if let Some(kv) = step.plain_kv {
+                    // 실측 감시가 압축 캐시를 버렸습니다. 원본 K/V 로 기존 경로를 이어 갑니다.
+                    self.kv_cache = Some(kv);
+                }
+                let attn_output = step
+                    .out
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+                return Ok(attn_output.apply(&self.o_proj)?);
+            }
+            // 압축 캐시를 더 쓰지 않는데 이력이 남아 있으면 평문 캐시로 풀어 기존 경로로 이어 갑니다.
+            if has_turbo && self.kv_cache.is_none() {
+                let kv = match self.turbo_kv.as_ref() {
+                    Some(c) => c.keys_values()?,
+                    None => None,
+                };
+                self.turbo_kv = None;
+                self.kv_cache = kv;
+            }
+        }
+
         let (key_states, value_states) = match &self.kv_cache {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
@@ -706,7 +752,11 @@ impl QwenVLTextAttention {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
+        self.kv_cache = None;
+        #[cfg(feature = "turbo-quant")]
+        {
+            self.turbo_kv = None;
+        }
     }
 }
 
@@ -853,6 +903,8 @@ impl QwenVLTextModel {
                 }
             }
         }
+        // 🌟 [ACCEL-CHECK] 이번 forward 에서 기록된 TurboQuant 실측 오차가 있으면 한 줄로 남깁니다.
+        crate::models::common::accel_check::flush_probe_report(xs.device());
         let xs = xs.apply(&self.norm)?;
         Ok(xs)
     }
