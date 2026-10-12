@@ -912,6 +912,14 @@ impl Qwen3_5Attention {
         let dev = xs.device();
         let target_dtype = xs.dtype();
 
+        // 🌟 [TURBO-KV-BLOCK] GPU + turbo-quant 빌드에서는 새 블록을 TurboQuant 압축 u32 행으로 보관합니다.
+        //    기본은 벡터별 스케일 FP8(정확도 우선, 기존 FP8 블록과 거의 같은 크기)이고,
+        //    CANDLE_TURBO_QUANT_BITS=4 등으로 4bit 를 고르면 FP8 대비 약 56% 크기입니다. (kv_turbo::kv_quant_options)
+        //    None 이면(CPU, CANDLE_TURBO_QUANT=off, turbo-quant 미빌드, GPU 자가 검증 실패) 기존 FP8 경로 그대로입니다.
+        //    새 블록을 만들 때만 필요하므로 처음 필요할 때 한 번 정합니다.
+        let head_dim = self.head_dim;
+        let mut tq_codec: Option<Option<std::sync::Arc<crate::models::common::kv_turbo::TqBlockCodec>>> = None;
+
         let mut tokens_to_process = q_len;
         let mut chunk_offset = 0;
         while tokens_to_process > 0 {
@@ -930,14 +938,24 @@ impl Qwen3_5Attention {
                         let pk = if !pk.device().same_device(dev) { pk.to_device(dev)? } else { pk };
                         let pv = if !pv.device().same_device(dev) { pv.to_device(dev)? } else { pv };
 
-                        let pk_f = pk.to_dtype(target_dtype).unwrap_or_else(|_| pk.clone());
-                        let pv_f = pv.to_dtype(target_dtype).unwrap_or_else(|_| pv.clone());
+                        if let Some(meta) = inner.tq {
+                            // 🌟 [TURBO-KV-BLOCK] 압축 블록: 새 토큰만 같은 코덱으로 압축해 뒤에 붙입니다.
+                            //    (FP8 경로처럼 블록 전체를 풀었다가 다시 압축하지 않습니다)
+                            let codec = crate::models::common::kv_turbo::codec_for(&meta, dev)?;
+                            let nk = codec.pack_k(&k_piece)?;
+                            let nv = codec.pack_v(&v_piece)?;
+                            inner.k_cache = Some(Tensor::cat(&[&pk, &nk], 2)?.contiguous()?);
+                            inner.v_cache = Some(Tensor::cat(&[&pv, &nv], 2)?.contiguous()?);
+                        } else {
+                            let pk_f = pk.to_dtype(target_dtype).unwrap_or_else(|_| pk.clone());
+                            let pv_f = pv.to_dtype(target_dtype).unwrap_or_else(|_| pv.clone());
 
-                        let cat_k = Tensor::cat(&[&pk_f, &k_piece], 2)?.contiguous()?;
-                        let cat_v = Tensor::cat(&[&pv_f, &v_piece], 2)?.contiguous()?;
+                            let cat_k = Tensor::cat(&[&pk_f, &k_piece], 2)?.contiguous()?;
+                            let cat_v = Tensor::cat(&[&pv_f, &v_piece], 2)?.contiguous()?;
 
-                        inner.k_cache = Some(if dev.is_cuda_or_rocm() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
-                        inner.v_cache = Some(if dev.is_cuda_or_rocm() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
+                            inner.k_cache = Some(if dev.is_cuda_or_rocm() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
+                            inner.v_cache = Some(if dev.is_cuda_or_rocm() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
+                        }
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
                         
@@ -961,8 +979,21 @@ impl Qwen3_5Attention {
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
-                    inner.k_cache = Some(if dev.is_cuda_or_rocm() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece }); 
-                    inner.v_cache = Some(if dev.is_cuda_or_rocm() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
+                    let codec = tq_codec
+                        .get_or_insert_with(|| crate::models::common::kv_turbo::block_codec(head_dim, dev))
+                        .clone();
+                    match &codec {
+                        Some(codec) => {
+                            // 🌟 [TURBO-KV-BLOCK] 새 블록은 처음부터 TurboQuant 압축 u32 행으로 보관합니다.
+                            inner.k_cache = Some(codec.pack_k(&k_piece)?);
+                            inner.v_cache = Some(codec.pack_v(&v_piece)?);
+                            inner.tq = Some(codec.meta);
+                        }
+                        None => {
+                            inner.k_cache = Some(if dev.is_cuda_or_rocm() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece });
+                            inner.v_cache = Some(if dev.is_cuda_or_rocm() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
+                        }
+                    }
                 }
                 
                 let mut reg = self.registry.entries.write().unwrap();
@@ -981,21 +1012,14 @@ impl Qwen3_5Attention {
 
         
         // 이제 0.6B처럼 무조건 청크 단위 Online Softmax 로직을 타게 되어 수압이 0으로 방어됩니다.
-
-        let mut out_res: Option<Tensor> = None;
-        let mut m_n: Option<Tensor> = None;
-        let mut l_n: Option<Tensor> = None;
-
+        // 🌟 [TURBO-KV-BLOCK] 블록 순회 Online Softmax 계산은 kv_turbo::BlockAttention 으로 옮겼습니다.
+        //    FP8/평문 블록은 기존과 똑같이 계산하고, TurboQuant 블록은 풀어서(회전 형식이면 회전 좌표계에서) 계산한 뒤 합칩니다.
         let q_aligned = (query_states * self.scaling)?.contiguous()?;
-
-        // [GQA-FOLD] K/V groups배 복제를 제거하기 위해 Q head 축을 접습니다.
-        let (q_b, q_h, q_l, q_d) = q_aligned.dims4()?;
-        let kv_h = self.num_key_value_heads;
-        let q_folded = if self.num_kv_groups > 1 {
-            q_aligned.reshape((q_b, kv_h, self.num_kv_groups * q_l, q_d))?
-        } else {
-            q_aligned.clone()
-        };
+        let mut block_attn = crate::models::common::kv_turbo::BlockAttention::new(
+            &q_aligned,
+            self.num_key_value_heads,
+            self.num_kv_groups,
+        )?;
 
         for block in &self.kv_blocks {
             let (index, b_off, b_len) = {
@@ -1005,26 +1029,37 @@ impl Qwen3_5Attention {
             if b_off >= total_tokens_now { continue; }
 
             
-            let (k_block, v_block, _is_temporary) = {
+            // (k, v, tq): tq 가 Some 이면 k / v 는 TurboQuant 압축 u32 행이고 복원은 누산기가 합니다.
+            let (k_block, v_block, block_tq) = {
                 let mut inner = block.inner.write().unwrap(); 
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
-                    if inner.location == KVLocation::VRAM {
-                        (k.to_dtype(target_dtype).unwrap_or_else(|_| k.clone()), v.to_dtype(target_dtype).unwrap_or_else(|_| v.clone()), false) // VRAM에 있다면 복원해서 씀
+                    if inner.tq.is_some() {
+                        // 🌟 [TURBO-KV-BLOCK] 압축 블록은 형 변환 없이 장치만 맞춥니다. (RAM 블록이면 압축된 채로 PCIe 전송)
+                        (k.to_device(dev)?, v.to_device(dev)?, inner.tq)
+                    } else if inner.location == KVLocation::VRAM {
+                        (k.to_dtype(target_dtype).unwrap_or_else(|_| k.clone()), v.to_dtype(target_dtype).unwrap_or_else(|_| v.clone()), None) // VRAM에 있다면 복원해서 씀
                     } else {
                         // RAM에 있다면 GPU로 잠깐 복사해서 씀
-                        (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?, true)
+                        (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?, None)
                     }
                 } else {
                     let mut k_cpu = None;
                     let mut v_cpu = None;
+                    let mut loaded_tq: Option<crate::models::common::kv_turbo::TqMeta> = None;
                     
                     {
                         let reg = self.registry.entries.read().unwrap();
                         let cache = reg[index].bitkv_cache.read().unwrap();
                         if let Some(m) = &cache[self.layer_idx] {
-                            let kd_t = if dev.is_cpu() { m.k_data.to_dtype(DType::F32)? } else { m.k_data.clone() };
-                            let vd_t = if dev.is_cpu() { m.v_data.to_dtype(DType::F32)? } else { m.v_data.clone() };
-                            k_cpu = Some(kd_t); v_cpu = Some(vd_t);
+                            if m.tq.is_some() {
+                                // 🌟 [TURBO-KV-BLOCK] RAM 캐시의 압축 블록은 그대로 사용합니다.
+                                k_cpu = Some(m.k_data.clone()); v_cpu = Some(m.v_data.clone());
+                                loaded_tq = m.tq;
+                            } else {
+                                let kd_t = if dev.is_cpu() { m.k_data.to_dtype(DType::F32)? } else { m.k_data.clone() };
+                                let vd_t = if dev.is_cpu() { m.v_data.to_dtype(DType::F32)? } else { m.v_data.clone() };
+                                k_cpu = Some(kd_t); v_cpu = Some(vd_t);
+                            }
                         }
                     }
 
@@ -1066,6 +1101,38 @@ impl Qwen3_5Attention {
                                                 if let (Some(kd), Some(vd), Some(sh)) = (get_t("k_data"), get_t("v_data"), get_t("k_shape")) {
                                                     let sh_u32: Vec<u32> = sh.data().chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                                                     let meta_os: Vec<usize> = sh_u32.iter().map(|&x| x as usize).collect();
+
+                                                    // 🌟 [TURBO-KV-BLOCK] `tq_meta` 텐서가 있으면 TurboQuant 압축 블록입니다.
+                                                    //    u32 행을 각자의 모양 그대로 읽고, 형식은 파일의 메타데이터를 따릅니다.
+                                                    let file_tq = get_t("tq_meta").and_then(|t| crate::models::common::kv_turbo::TqMeta::from_le_bytes(t.data()));
+                                                    if let Some(tq) = file_tq {
+                                                        let packed = if kd.dtype() == safetensors::Dtype::U32 && vd.dtype() == safetensors::Dtype::U32 {
+                                                            match (
+                                                                Tensor::from_raw_buffer(kd.data(), DType::U32, kd.shape(), &Device::Cpu),
+                                                                Tensor::from_raw_buffer(vd.data(), DType::U32, vd.shape(), &Device::Cpu),
+                                                            ) {
+                                                                (Ok(kd_t), Ok(vd_t)) => Some((kd_t, vd_t)),
+                                                                _ => None,
+                                                            }
+                                                        } else {
+                                                            None
+                                                        };
+                                                        if let Some((kd_t, vd_t)) = packed {
+                                                            k_cpu = Some(kd_t.clone());
+                                                            v_cpu = Some(vd_t.clone());
+                                                            loaded_tq = Some(tq);
+
+                                                            let mut reg = self.registry.entries.write().unwrap();
+                                                            if index < reg.len() {
+                                                                reg[index].ssd_path = Some(full_path.clone());
+                                                                reg[index].location[self.layer_idx] = KVLocation::RAM;
+                                                                let mut cache = reg[index].bitkv_cache.write().unwrap();
+                                                                cache[self.layer_idx] = Some(crate::models::qwen::quantized_model::BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: meta_os, tq: Some(tq) });
+                                                            }
+                                                            break;
+                                                        }
+                                                        println!("[TURBO-KV-BLOCK] 압축 블록 {:?} 를 읽지 못했습니다 (k {:?} v {:?}).", block_file, kd.dtype(), vd.dtype());
+                                                    } else {
                                                     
                                                     let saved_dtype = match kd.dtype() {
                                                         safetensors::Dtype::F64 => DType::F8E4M3,
@@ -1090,9 +1157,10 @@ impl Qwen3_5Attention {
                                                         reg[index].ssd_path = Some(full_path.clone());
                                                         reg[index].location[self.layer_idx] = KVLocation::RAM; 
                                                         let mut cache = reg[index].bitkv_cache.write().unwrap();
-                                                        cache[self.layer_idx] = Some(crate::models::qwen::quantized_model::BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: meta_os });
+                                                        cache[self.layer_idx] = Some(crate::models::qwen::quantized_model::BitKVMetadata { k_data: kd_t, v_data: vd_t, original_shape: meta_os, tq: None });
                                                     }
                                                     break;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1112,106 +1180,41 @@ impl Qwen3_5Attention {
                     let k_safe = k_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
                     let v_safe = v_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
                     
-                    let k_gpu = k_safe.to_device(dev)?.to_dtype(target_dtype)?;
-                    let v_gpu = v_safe.to_device(dev)?.to_dtype(target_dtype)?;
+                    let (k_gpu, v_gpu) = if loaded_tq.is_some() {
+                        // 🌟 [TURBO-KV-BLOCK] 압축 블록은 압축된 채로 장치에 올립니다. (복원은 누산기가 합니다)
+                        (k_safe.to_device(dev)?, v_safe.to_device(dev)?)
+                    } else {
+                        (k_safe.to_device(dev)?.to_dtype(target_dtype)?, v_safe.to_device(dev)?.to_dtype(target_dtype)?)
+                    };
 
                     
                     inner.k_cache = Some(k_safe);
                     inner.v_cache = Some(v_safe);
                     inner.location = KVLocation::RAM;
+                    inner.tq = loaded_tq;
 
-                    (k_gpu, v_gpu, true)
+                    (k_gpu, v_gpu, loaded_tq)
                 }
             };
 
-            let k = k_block.contiguous()?;
-            let v = v_block.contiguous()?;
-
-            let actual_kv_len = k.dim(2)?;
-
-            // [ZERO-COPY-T] transpose 뷰를 그대로 matmul에 전달합니다.
-            let k_t = k.transpose(2, 3)?;
-
-            let s_folded = q_folded.matmul(&k_t)?;
-            let mut s_chunk = if self.num_kv_groups > 1 {
-                s_folded.reshape((q_b, q_h, q_l, actual_kv_len))?
-            } else {
-                s_folded
-            };
-
-            if let Some(mask) = &attention_mask {
-                let mask_len = mask.dim(candle_core::D::Minus1)?;
-                if b_off < mask_len {
-                    let take = std::cmp::min(actual_kv_len, mask_len - b_off);
-                    let chunk_mask = mask.narrow(candle_core::D::Minus1, b_off, take)?;
-                    if take < actual_kv_len {
-                        let left_masked = s_chunk.narrow(candle_core::D::Minus1, 0, take)?.broadcast_add(&chunk_mask)?;
-                        let right_unmasked = s_chunk.narrow(candle_core::D::Minus1, take, actual_kv_len - take)?;
-                        s_chunk = Tensor::cat(&[&left_masked, &right_unmasked], candle_core::D::Minus1)?;
-                    } else {
-                        s_chunk = s_chunk.broadcast_add(&chunk_mask)?; 
+            match block_tq {
+                Some(meta) => match crate::models::common::kv_turbo::codec_for(&meta, dev) {
+                    Ok(codec) => block_attn.add_packed(&k_block, &v_block, &codec, attention_mask, b_off)?,
+                    Err(e) => {
+                        // 이 빌드가 압축 블록을 풀 수 없으면(turbo-quant 미빌드 등) 그 블록만 건너뜁니다.
+                        println!("[TURBO-KV-BLOCK] 레이어 {} 블록 {} 를 복원할 수 없어 건너뜁니다: {}", self.layer_idx, index, e);
                     }
-                }
+                },
+                None => block_attn.add_plain(&k_block, &v_block, attention_mask, b_off)?,
             }
 
-            
-            let s_chunk_f32 = s_chunk.to_dtype(DType::F32)?;
-            let m_j = s_chunk_f32.max_keepdim(candle_core::D::Minus1)?;
-            
-            
-            // -inf - (-inf) = NaN이 발생하여 모델 뇌가 파괴되는 현상(!!!!!!!! 출력)을 원천 차단합니다.
-            let safe_floor = Tensor::new(-10000.0_f32, m_j.device())?.broadcast_as(m_j.shape())?;
-            let m_j_safe = m_j.maximum(&safe_floor)?;
-
-            // m_j 대신 m_j_safe를 사용하여 빼기 연산 수행
-            let p_j = s_chunk_f32.broadcast_sub(&m_j_safe)?.exp()?;
-            let l_j = p_j.sum_keepdim(candle_core::D::Minus1)?;
-
-            // [GQA-FOLD] P @ V 도 접어서 계산 후 원래 head 배열로 복원합니다.
-            let p_v = p_j.to_dtype(v.dtype())?.contiguous()?;
-            let p_folded = if self.num_kv_groups > 1 {
-                p_v.reshape((q_b, kv_h, self.num_kv_groups * q_l, actual_kv_len))?
-            } else {
-                p_v
-            };
-            let out_folded = p_folded.matmul(&v)?;
-            let out_j = if self.num_kv_groups > 1 {
-                out_folded.reshape((q_b, q_h, q_l, self.head_dim))?
-            } else {
-                out_folded
-            };
-            let out_j_f32 = out_j.to_dtype(DType::F32)?;
-
-            match out_res.as_ref() {
-                None => {
-                    out_res = Some(out_j_f32); 
-                    m_n = Some(m_j); 
-                    l_n = Some(l_j);
-                }
-                Some(prev_out_f32) => {
-                    let prev_m = m_n.as_ref().unwrap();
-                    let prev_l = l_n.as_ref().unwrap();
-                    
-                    let m_new = prev_m.maximum(&m_j)?;
-                    let diff_old = prev_m.broadcast_sub(&m_new)?.exp()?;
-                    let diff_new = m_j.broadcast_sub(&m_new)?.exp()?;
-                    
-                    let l_new = prev_l.broadcast_mul(&diff_old)?.add(&l_j.broadcast_mul(&diff_new)?)?;
-                    let out_new_f32 = prev_out_f32.broadcast_mul(&diff_old)?.add(&out_j_f32.broadcast_mul(&diff_new)?)?;
-                    
-                    out_res = Some(out_new_f32);
-                    m_n = Some(m_new);
-                    l_n = Some(l_new);
-                }
-            }
-            
-            drop(k);
-            drop(v);
+            drop(k_block);
+            drop(v_block);
         }
 
         
-        let attn_output = if let (Some(out_res_val), Some(l_val)) = (out_res, l_n) {
-            out_res_val.broadcast_div(&l_val)?.to_dtype(target_dtype)? // 👈 F32 정밀도 연산 후 BF16 변환
+        let attn_output = if let Some(out) = block_attn.finish()? {
+            out.to_dtype(target_dtype)? // 👈 F32 정밀도 연산 후 BF16 변환
         } else {
             return Err(anyhow!("No KV data processed"));
         };
@@ -2070,9 +2073,15 @@ impl Qwen3_5TextModel {
                             let k = inner.k_cache.take();
                             let v = inner.v_cache.take();
                             if let (Some(k_t), Some(v_t)) = (k, v) {
+                                if inner.tq.is_some() {
+                                    // 🌟 [TURBO-KV-BLOCK] 압축 블록은 형 변환 없이 그대로 RAM 으로 내립니다.
+                                    inner.k_cache = Some(k_t.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_t.clone()));
+                                    inner.v_cache = Some(v_t.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_t.clone()));
+                                } else {
                                 let target_dtype = if k_t.device().is_cuda_or_rocm() || k_t.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
                                 inner.k_cache = Some(k_t.to_dtype(target_dtype).unwrap_or_else(|_| k_t.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_t.clone()));
                                 inner.v_cache = Some(v_t.to_dtype(target_dtype).unwrap_or_else(|_| v_t.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_t.clone()));
+                                }
                                 inner.location = KVLocation::RAM;
                                 if idx < reg.len() { reg[idx].location[l_idx] = KVLocation::RAM; }
                             }
@@ -2088,6 +2097,8 @@ impl Qwen3_5TextModel {
                         {
                             garbage_bin.push((inner.k_cache.take(), inner.v_cache.take()));
                             inner.location = KVLocation::SSD;
+                            // 🌟 [TURBO-KV-BLOCK] 다시 읽을 때 SSD 파일의 tq_meta 로 형식을 정합니다.
+                            inner.tq = None;
                             
                             reg[idx].location[l_idx] = KVLocation::SSD;
                             let mut cache = reg[idx].bitkv_cache.write().unwrap();
@@ -2144,6 +2155,8 @@ impl Qwen3_5TextModel {
                                             k_shape: candle_core::Tensor::from_vec(k_shape_u32, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
                                             raw_k: Some(k_cpu.contiguous().unwrap_or(k_cpu.clone())),
                                             raw_v: Some(v_cpu.contiguous().unwrap_or(v_cpu.clone())),
+                                            // 🌟 [TURBO-KV-BLOCK] 압축 블록이면 형식과 함께 압축된 채로 SSD 에 기록됩니다.
+                                            tq_meta: inner.tq,
                                         },
                                         inner.offset,
                                         inner.index
@@ -2416,6 +2429,8 @@ impl Qwen3_5TextModel {
                 let mut gpu_k_list = Vec::new();
                 let mut gpu_v_list = Vec::new();
                 let mut target_indices = Vec::new();
+                // 🌟 [TURBO-KV-BLOCK] TurboQuant 압축 블록은 BF16 변환·병합 없이 따로 내립니다.
+                let mut packed_indices = Vec::new();
 
                 // 1. 읽기 락만 짧게 잡고 넘길 대상들을 수집 및 VRAM 선행 처리
                 for (idx, block) in attn.kv_blocks.iter().enumerate() {
@@ -2423,6 +2438,10 @@ impl Qwen3_5TextModel {
                     let is_full = inner.len == 1024;
                     
                     if is_full && inner.k_cache.is_some() && inner.location == crate::models::qwen::quantized_model::KVLocation::VRAM {
+                        if inner.tq.is_some() {
+                            packed_indices.push(idx);
+                            continue;
+                        }
                         let k = inner.k_cache.as_ref().unwrap();
                         let v = inner.v_cache.as_ref().unwrap();
                         
@@ -2476,6 +2495,7 @@ impl Qwen3_5TextModel {
                                 k_shape: candle_core::Tensor::from_vec(k_shape_u32, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
                                 raw_k: Some(k_cpu.clone()),
                                 raw_v: Some(v_cpu.clone()),
+                                tq_meta: None,
                             });
                             
                             let mut reg = attn.registry.entries.write().unwrap();
@@ -2492,6 +2512,52 @@ impl Qwen3_5TextModel {
                         if inner.index < reg.len() {
                             reg[inner.index].location[l_idx] = crate::models::qwen::quantized_model::KVLocation::RAM;
                         }
+                    }
+                }
+
+                // 🌟 [TURBO-KV-BLOCK] 압축 블록: u32 행을 그대로 RAM 으로 내리고, 변경된 블록은
+                //    압축된 채로(tq_meta 포함) SSD 에 기록합니다. FP8 경로 대비 전송량과 파일 크기가 작습니다.
+                for &idx in packed_indices.iter() {
+                    let mut inner = attn.kv_blocks[idx].inner.write().unwrap();
+                    let (k_cpu, v_cpu) = match (inner.k_cache.as_ref(), inner.v_cache.as_ref()) {
+                        (Some(k), Some(v)) => (
+                            k.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k.clone()),
+                            v.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v.clone()),
+                        ),
+                        _ => continue,
+                    };
+                    let is_dirty = {
+                        let reg = attn.registry.entries.read().unwrap();
+                        if inner.index < reg.len() && l_idx < reg[inner.index].is_dirty.len() {
+                            reg[inner.index].is_dirty[l_idx]
+                        } else { true }
+                    };
+
+                    if is_dirty {
+                        let k_shape_u32: Vec<u32> = k_cpu.shape().dims().iter().map(|&x| x as u32).collect();
+                        block_groups.entry((inner.offset, inner.index)).or_default().push(LayerKVDump {
+                            layer_idx: l_idx,
+                            k_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
+                            v_data: candle_core::Tensor::zeros((1,), candle_core::DType::U8, &candle_core::Device::Cpu).unwrap(),
+                            k_shape: candle_core::Tensor::from_vec(k_shape_u32, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
+                            raw_k: Some(k_cpu.clone()),
+                            raw_v: Some(v_cpu.clone()),
+                            tq_meta: inner.tq,
+                        });
+
+                        let mut reg = attn.registry.entries.write().unwrap();
+                        if inner.index < reg.len() {
+                            reg[inner.index].is_dirty[l_idx] = false;
+                        }
+                    }
+
+                    inner.k_cache = Some(k_cpu);
+                    inner.v_cache = Some(v_cpu);
+                    inner.location = crate::models::qwen::quantized_model::KVLocation::RAM;
+
+                    let mut reg = attn.registry.entries.write().unwrap();
+                    if inner.index < reg.len() {
+                        reg[inner.index].location[l_idx] = crate::models::qwen::quantized_model::KVLocation::RAM;
                     }
                 }
             }

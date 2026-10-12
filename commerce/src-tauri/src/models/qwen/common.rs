@@ -660,6 +660,20 @@ pub fn eager_attention_forward(
         // KV 캐시가 FP8이거나 모델이 F32로 동작 중일 경우 강제로 BF16으로 캐스팅하여 하드웨어 크래시를 방지합니다.
         let target_dtype = if query_states.device().is_cuda() { candle_core::DType::BF16 } else { query_states.dtype() };
         
+        // 🌟 [ACCEL-CHECK] fused flash-attn 이 꺼져 있거나(CANDLE_FLASH_ATTN=off 등) 이 GPU 의 자가 검증을
+        //    통과하지 못하면, GQA 를 지원하는 공용 블록 어텐션(models::common)으로 계산합니다.
+        //    (이 파일 아래의 비-flash 경로는 GQA 를 다루지 않아 텍스트 모델에 쓸 수 없습니다)
+        if !crate::models::common::accel_check::flash_attn_ok(query_states.device(), target_dtype, _d_head) {
+            return crate::models::common::eager_attention_forward(
+                query_states,
+                key_states,
+                value_states,
+                _num_key_value_groups,
+                attention_mask,
+                scaling,
+            );
+        }
+
         let q_aligned = query_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
         let k_aligned = key_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;
         let v_aligned = value_states.to_dtype(target_dtype)?.transpose(1, 2)?.contiguous()?;

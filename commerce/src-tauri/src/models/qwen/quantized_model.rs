@@ -431,6 +431,9 @@ pub struct KVBlockInner {
     pub len: usize,
     pub offset: usize, 
     pub bitkv_metadata: Option<BitKVMetadata>,
+    /// 🌟 [TURBO-KV-BLOCK] Some 이면 k_cache / v_cache 가 TurboQuant 로 압축된 u32 행
+    ///   (batch, kv_heads, tokens, words) 입니다. None 이면 기존 FP8 / F32 / BF16 텐서입니다.
+    pub tq: Option<crate::models::common::kv_turbo::TqMeta>,
 }
 
 impl KVBlock {
@@ -445,6 +448,7 @@ impl KVBlock {
                 len,
                 offset,
                 bitkv_metadata: None,
+                tq: None,
             })),
         }
     }
@@ -455,6 +459,8 @@ pub struct BitKVMetadata {
     pub k_data: Tensor,
     pub v_data: Tensor,
     pub original_shape: Vec<usize>,
+    /// 🌟 [TURBO-KV-BLOCK] Some 이면 k_data / v_data 가 TurboQuant 압축 u32 행입니다.
+    pub tq: Option<crate::models::common::kv_turbo::TqMeta>,
 }
 
 #[derive(Clone)]
@@ -1179,6 +1185,7 @@ impl QuantizedQwenVLTextAttention {
                         k_shape: Tensor::from_vec(k_shape_u32, (4,), &Device::Cpu).unwrap(),
                         raw_k: Some(k_cpu),
                         raw_v: Some(v_cpu),
+                        tq_meta: None,
                     };
                     let sid = crate::models::qwen::generate::SLOT_MANAGER.acquire_write_slot(b_len).await;
                     
@@ -2104,6 +2111,7 @@ impl QuantizedQwenVLTextModel {
                         offset: off, len: 0, index: idx, location: KVLocation::SSD,
                         bitkv_metadata: None,
                         ssd_path: None,
+                        tq: None,
                     }))
                 });
             }
@@ -2613,6 +2621,7 @@ impl QuantizedQwenVLTextModel {
                             k_shape: candle_core::Tensor::from_vec(k_shape_u32, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
                             raw_k: Some(k_cpu.clone()),
                             raw_v: Some(v_cpu.clone()),
+                            tq_meta: None,
                         });
                         
                         let mut reg = attn.registry.entries.write().unwrap();
@@ -2740,6 +2749,7 @@ impl QuantizedQwenVLTextModel {
                         k_shape: Tensor::from_vec(k_shape_vec, (k_cpu.shape().dims().len(),), &candle_core::Device::Cpu).unwrap(),
                         raw_k: Some(k_cpu), 
                         raw_v: Some(v_cpu), 
+                        tq_meta: None,
                     },
                     inner.offset,
                     inner.len,
