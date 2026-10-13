@@ -3,6 +3,15 @@ You are running in a Claude Code cloud session: an Ubuntu 24.04 x86_64 VM (about
 - Linux CPU verification: run it directly in this VM (cargo build/test here).
 - macOS verification (Apple Silicon CPU, Metal, MoltenVK/Vulkan): run it on GitHub-hosted macOS runners through GitHub Actions. Push commits, let the workflow run, read the results, fix, push again.
 
+If GitHub access is missing, do not stop. A checkout without a remote, a push refused with "not in this session's authorized repository set", or `gh api` returning 403 all mean GitHub access is missing. In that case:
+- Say so once at the start, with the exact error. The fix on my side is to start the session from claude.ai/code with both repositories selected.
+- Then keep going with everything that does not need GitHub access, in this order:
+  1. The mock model generator (item 10) and the test model-path fix (`LOGIS_MODELS_DIR`).
+  2. The Linux CPU verification and the CPU kernel / cache-hierarchy experiments (section 3-2).
+  3. The code changes the checklist calls for, including the `.github/workflows/mac-verify.yml` files.
+- Commit locally on the working branches (`git clone` of the public fork still works for reading). If this checkout has no remote, add `origin` = https://github.com/sungu-che/logis-center and branch from `origin/main` if it can be fetched.
+- At the end, list exactly what is waiting for push and macOS CI.
+
 How to drive GitHub Actions from this session:
 1. Workflow file: create or update `.github/workflows/mac-verify.yml` in the repo you are testing (runs-on: macos-15, plus macos-14 if useful). Trigger it with `on: push` on your working branch and `on: workflow_dispatch`. Give each job a hard `timeout-minutes`, cache `~/.cargo/registry`, `~/.cargo/git` and `target/` with actions/cache, and upload test output as an artifact (actions/upload-artifact) in addition to printing it to the job log.
 2. Pushing: git push goes through the GitHub proxy. Push to a working branch (for example `claude/mac-verify`), never to master/main. Pushes that touch `.github/workflows/` need the `workflow` permission. If such a push is rejected, stop and tell me; I will commit the workflow file myself. Do not try to work around it.
