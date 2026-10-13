@@ -17,6 +17,7 @@
 //! - `vulkan`        : (feature="vulkan") Vulkan 디바이스 연산을 CPU 결과와 대조
 //! - `utils_*`       : utils 계층 순수 로직
 //! - `models_cpu`    : 모델 보조 로직 (CPU)
+//! - `qwen4_exp`     : Qwen4-Exp 포트 정확도 (tests/fixtures/qwen4_exp_tiny, HF 기준 logits)
 //! - `app_*`         : 앱 계층 (logic / store / scheduler / model::merge)
 
 mod common;
@@ -34,6 +35,8 @@ mod utils_text;
 mod utils_schema;
 // models (CPU: 위치 임베딩, 텐서 유틸, KV 레지스트리, 비전 캐시, 설정)
 mod models_cpu;
+// Qwen4-Exp candle 포트 ↔ transformers 기준 logits (작은 무작위 체크포인트, CPU + CUDA)
+mod qwen4_exp;
 // 앱 계층 (업무 규칙, LanceDB 저장소, 스케줄러, LLM 출력 병합)
 mod app_logic;
 mod app_store;
