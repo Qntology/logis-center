@@ -161,7 +161,8 @@ fn global_text_cache_survives_purge_paths() {
     for site in ["note_purge(\"unload_embedding\")", "note_purge(\"deep_purge\")", "note_purge(\"relay (image pipeline)\")"] {
         assert!(lifecycle.contains(site), "lifecycle.rs 에 {} 가 없습니다", site);
     }
-    assert_eq!(lifecycle.matches("note_purge(").count(), 3, "퍼지 지점 수가 바뀌었습니다");
+    // 4곳: unload_embedding · deep_purge 2곳(6dc0245f 의 drop_embedding 분기 + 기존 전체 퍼지) · relay
+    assert_eq!(lifecycle.matches("note_purge(").count(), 4, "퍼지 지점 수가 바뀌었습니다");
     for (no, line) in lifecycle.lines().enumerate() {
         let l = line.to_ascii_lowercase();
         let code = l.split("//").next().unwrap_or("");
@@ -540,10 +541,10 @@ fn field_bank_prefetch_covers_every_loop_request() {
 // ---------------------------------------------------------------------
 //  GPU: embed_many(배치) vs embed(per-text)  — LOGIS_TEST_MODELS=1
 // ---------------------------------------------------------------------
-fn granite_dir() -> Option<std::path::PathBuf> {
-    let base = std::env::var("LOCALAPPDATA").ok()?;
-    let p = std::path::Path::new(&base).join("logis-center").join("models").join("granite-embedding-97m-multilingual-r2");
-    if p.join("model.safetensors").exists() { Some(p) } else { None }
+/// `LOGIS_MODELS_DIR` 또는 OS 별 앱 데이터 경로의 granite 디렉터리 (tests/it/common.rs).
+/// 목업(tests/fixtures/granite_mock)이면 디렉터리에 `MOCK` 파일이 있습니다.
+fn granite_dir() -> Result<std::path::PathBuf, String> {
+    crate::common::model_subdir("granite-embedding-97m-multilingual-r2", "model.safetensors")
 }
 
 /// ~300개의 길이가 섞인 텍스트: 짧은 뱅크 구, 질의형 n-gram, 긴 레이아웃 텍스트(>64, >512 토큰 포함).
@@ -600,10 +601,12 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
         println!("LOGIS_TEST_MODELS=1 이 아니라 건너뜁니다.");
         return;
     }
-    let Some(dir) = granite_dir() else {
-        println!("모델 디렉터리가 없어 건너뜁니다.");
-        return;
+    let dir = match granite_dir() {
+        Ok(d) => d,
+        Err(e) => return crate::common::skip_or_fail(&e),
     };
+    let mock = dir.join("MOCK").exists();
+    println!("[GPU-EQ] 모델: {} ({})", dir.display(), if mock { "목업 · 무작위 가중치" } else { "실모델" });
     // LOGIS_TEST_EMBED_DEVICE=cpu 이면 CPU 에서, 아니면 이 빌드의 GPU(CUDA/ROCm/Vulkan) 에서 봅니다.
     let device = if std::env::var("LOGIS_TEST_EMBED_DEVICE").map(|v| v.trim().eq_ignore_ascii_case("cpu")).unwrap_or(false) {
         candle_core::Device::Cpu
@@ -855,4 +858,202 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
     // AMD 에서는 이 테스트가 그 기본값의 실기기 근거입니다. 실패하면 LOGIS_EMBED_BATCHED=0 으로 되돌립니다.
     assert!(bt_mean_s >= pt_mean_s - 2e-4 && bt_mean_l >= pt_mean_l - 2e-4, "embed_many 의 F32 기준 정확도가 per-text 보다 낮습니다");
     assert!(batched.iter().all(|v| v.iter().any(|&x| x != 0.0)));
+}
+
+// ---------------------------------------------------------------------
+//  판정 수준 일치: Stage-1 승자 · NMS 생존 스팬 · Plinko 슬롯 — per-text vs embed_many (LOGIS_TEST_MODELS=1)
+// ---------------------------------------------------------------------
+
+/// query_commerce 의 Stage-1(RAW-CHUNK 채점표 → 승자) + NMS(우선순위 → 점수 → 길이, 겹치면 탈락)를
+/// 같은 규칙으로 돌려 (start, end, 승자 카테고리) 생존 목록을 돌려줍니다. `emb` 는 텍스트 → 벡터.
+fn stage1_nms_decisions(
+    lang: &str,
+    query: &str,
+    categories: &[&str],
+    emb: &dyn Fn(&str) -> Vec<f32>,
+) -> (Vec<(usize, usize, String)>, Vec<(usize, usize, String)>) {
+    use tauri_app_lib::utils::ai_utils::{raw_chunk_spans, LayoutScoreTable};
+    use tauri_app_lib::utils::parsing::get_multi_pass_contexts;
+    // 레이아웃 뱅크 (build_layout 과 같은 키 규칙, 실제 임베더)
+    let intent_anchors = [
+        ("order", "manage order list, check order status"),
+        ("goods", "product catalog data, items, find, search clothes"),
+        ("tracking", "shipment status, tracking number, parcel"),
+        ("review", "reviews, ratings, complaints"),
+        ("coupon", "coupon codes, discount vouchers"),
+        ("event", "marketing campaigns, promotions"),
+    ];
+    let mut anchor_embs = HashMap::new();
+    for (cat, text) in intent_anchors {
+        anchor_embs.insert(cat.to_string(), emb(text));
+    }
+    let mut layout_embs = HashMap::new();
+    for cat in categories {
+        for (key, bias, prej) in get_multi_pass_contexts(cat, lang) {
+            let prej = if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej };
+            layout_embs.insert(format!("{}_{}_bias", cat, key), emb(&bias));
+            layout_embs.insert(format!("{}_{}_prejudice", cat, key), emb(&prej));
+        }
+    }
+    let mut table = LayoutScoreTable::new();
+    for cat in categories {
+        table.ensure_cat(cat, get_multi_pass_contexts(cat, lang), &layout_embs, &anchor_embs);
+    }
+    let verb_emb = emb(&format!("{} verb, predicate, idiom", lang));
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let mut winners = Vec::new();
+    let mut evaluated: Vec<(usize, usize, String, String, f32)> = Vec::new();
+    for (start, end, text) in raw_chunk_spans(&words) {
+        let scores: HashMap<String, f32> = table.raw_chunk_scores(&emb(&text), &verb_emb, end - start).into_iter().collect();
+        let (cat, s) = winner(&scores);
+        winners.push((start, end, cat.clone()));
+        if s > 0.0 {
+            evaluated.push((start, end, text, cat, s));
+        }
+    }
+    let priority = |c: &str| if matches!(c, "goods" | "order" | "tracking") { 1 } else { 2 };
+    evaluated.sort_by(|a, b| {
+        priority(&a.3)
+            .cmp(&priority(&b.3))
+            .then(b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal))
+            .then(b.2.len().cmp(&a.2.len()))
+    });
+    let mut survivors: Vec<(usize, usize, String)> = Vec::new();
+    for (s, e, _, cat, _) in evaluated {
+        if !survivors.iter().any(|(ss, se, _)| s < *se && e > *ss) {
+            survivors.push((s, e, cat));
+        }
+    }
+    survivors.sort();
+    (winners, survivors)
+}
+
+/// 인덱싱 PLINKO(nl_convert::plinko_game_for_indexing) 의 (청크, 확정 속성) 목록.
+fn plinko_slots(emb: &(dyn Fn(&str) -> Vec<f32> + Sync)) -> Vec<(String, String)> {
+    use tauri_app_lib::utils::ai_utils::split_bias_phrases_weighted;
+    use tauri_app_lib::utils::nl_convert::{field_format_to_string, plinko_game_for_indexing, ChunkMetadata};
+    let fields = tauri_app_lib::utils::bias_schema::get_list_schema_fields("goods", "", "ko");
+    let names: Vec<String> = fields.iter().map(|f| f.0.clone()).collect();
+    let formats: Vec<String> = names.iter().map(|n| field_format_to_string(n)).collect();
+    let mut banks = Vec::new();
+    let mut weights = Vec::new();
+    for (_, _, bias_target, _) in &fields {
+        let (phrases, w) = split_bias_phrases_weighted(bias_target);
+        banks.push(phrases.iter().map(|p| emb(p)).collect::<Vec<_>>());
+        weights.push(w);
+    }
+    let rows = [
+        "여름 린넨 원피스 블루 M 사이즈 판매가 39,000원 할인율 20% 재고 12개",
+        "무선 블루투스 이어폰 WE-PRO-2 정가 89,000원 무료배송 리뷰 4.8점 312개",
+        "남성 반팔 티셔츠 화이트 L 상품코드 TS-2024-77 https://shop.example.com/p/77",
+        "아동 운동화 230mm 핑크 품절 입고예정 다음주 월요일",
+    ];
+    let chunks: Vec<ChunkMetadata> = rows
+        .iter()
+        .map(|t| ChunkMetadata {
+            chunk_text: t.to_string(),
+            property: String::new(),
+            property_format: String::new(),
+            bias_phrases: Vec::new(),
+            prejudice_phrases: Vec::new(),
+            value_part: String::new(),
+            confirmed: false,
+        })
+        .collect();
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let res = rt.block_on(plinko_game_for_indexing(&chunks, &names, &banks, &weights, &formats, |t: String| {
+        std::future::ready(emb(&t))
+    }));
+    res.into_iter().map(|r| (r.chunk_text, r.property)).collect()
+}
+
+#[test]
+#[ignore = "로컬 모델 필요: LOGIS_TEST_MODELS=1"]
+fn embed_many_decisions_match_per_text() {
+    if std::env::var("LOGIS_TEST_MODELS").map(|v| v != "1").unwrap_or(true) {
+        println!("LOGIS_TEST_MODELS=1 이 아니라 건너뜁니다.");
+        return;
+    }
+    let dir = match granite_dir() {
+        Ok(d) => d,
+        Err(e) => return crate::common::skip_or_fail(&e),
+    };
+    let mock = dir.join("MOCK").exists();
+    let device = if std::env::var("LOGIS_TEST_EMBED_DEVICE").map(|v| v.trim().eq_ignore_ascii_case("cpu")).unwrap_or(false) {
+        candle_core::Device::Cpu
+    } else {
+        match tauri_app_lib::utils::new_gpu_device(0) {
+            Some(d) => d,
+            None => return crate::common::skip_or_fail("GPU 장치가 없습니다"),
+        }
+    };
+    use std::sync::Mutex;
+    use tauri_app_lib::models::embedding::EmbeddingModel;
+    let model = EmbeddingModel::new_with_device(&dir, &device).expect("load");
+    let opts = model.batch_opts();
+    // per-text: 텍스트마다 embed() (같은 텍스트는 같은 벡터라 메모해도 판정은 같습니다).
+    // batched: 앱처럼 처음 보는 텍스트는 embed_many 로 구하고 캐시(첫 벡터 유지).
+    let per_text_memo: Mutex<HashMap<String, Vec<f32>>> = Mutex::new(HashMap::new());
+    let per_text = |t: &str| -> Vec<f32> {
+        if let Some(v) = per_text_memo.lock().unwrap().get(t) {
+            return v.clone();
+        }
+        let v = model.embed(t).unwrap();
+        per_text_memo.lock().unwrap().insert(t.to_string(), v.clone());
+        v
+    };
+    let cache: Mutex<HashMap<String, Vec<f32>>> = Mutex::new(HashMap::new());
+    let batched = |t: &str| -> Vec<f32> {
+        if let Some(v) = cache.lock().unwrap().get(t) {
+            return v.clone();
+        }
+        let v = model.embed_many(&[t.to_string()], &opts).unwrap().pop().unwrap();
+        cache.lock().unwrap().entry(t.to_string()).or_insert(v).clone()
+    };
+    let categories = ["order", "goods", "tracking", "review", "coupon", "event", ""];
+    let queries = [
+        ("ko", "여름 원피스 중에서 할인율 20%에 속하지만 재고가 남은 상품 찾아줘 빨리"),
+        ("ko", "지난달 배송 지연된 주문 송장 번호 알려줘"),
+        ("en", "show me summer dresses under 50 dollars with good reviews and free shipping"),
+        ("ja", "先月 配送 遅延 注文 一覧 を 見せて"),
+    ];
+    let (mut w_same, mut w_total, mut nms_same, mut nms_total) = (0usize, 0usize, 0usize, 0usize);
+    for (lang, q) in queries {
+        // 배치 경로: 질의의 모든 스팬을 먼저 한 번에(앱의 RAW-CHUNK 프리패치와 같은 호출 구성) 넣습니다.
+        let words: Vec<&str> = q.split_whitespace().collect();
+        let spans: Vec<String> = tauri_app_lib::utils::ai_utils::raw_chunk_spans(&words).into_iter().map(|s| s.2).collect();
+        for (t, v) in spans.iter().zip(model.embed_many(&spans, &opts).unwrap()) {
+            cache.lock().unwrap().entry(t.clone()).or_insert(v);
+        }
+        let (wa, na) = stage1_nms_decisions(lang, q, &categories, &per_text);
+        let (wb, nb) = stage1_nms_decisions(lang, q, &categories, &batched);
+        w_total += wa.len();
+        w_same += wa.iter().zip(wb.iter()).filter(|(a, b)| a == b).count();
+        nms_total += 1;
+        if na == nb {
+            nms_same += 1;
+        } else {
+            println!("[DECISION-EQ] NMS 불일치 '{}': per-text {:?} vs embed_many {:?}", q, na, nb);
+        }
+    }
+    let pa = plinko_slots(&per_text);
+    let pb = plinko_slots(&batched);
+    let p_same = pa.iter().zip(pb.iter()).filter(|(a, b)| a == b).count();
+    if pa != pb {
+        println!("[DECISION-EQ] Plinko per-text {:?}\n[DECISION-EQ] Plinko embed_many {:?}", pa, pb);
+    }
+    println!(
+        "[DECISION-EQ] 모델 {} · 장치 {} · 정책 fixed_shape={} | Stage-1 승자 {}/{} · NMS 생존 목록 {}/{} 질의 · Plinko 슬롯 {} ({}/{} 청크)",
+        if mock { "목업" } else { "실모델" },
+        tauri_app_lib::models::embedding::text_cache::device_class(&device),
+        opts.fixed_shape,
+        w_same, w_total, nms_same, nms_total,
+        if pa == pb { "일치" } else { "불일치" }, p_same, pa.len().max(pb.len())
+    );
+    if device.is_cpu() && !opts.fixed_shape {
+        // CPU 동적 모드는 per-text 와 벡터가 비트 동일하므로 판정도 완전히 같아야 합니다.
+        assert_eq!(w_same, w_total, "Stage-1 승자가 per-text 와 다릅니다");
+        assert_eq!(nms_same, nms_total, "NMS 생존 목록이 per-text 와 다릅니다");
+        assert_eq!(pa, pb, "Plinko 슬롯이 per-text 와 다릅니다");
+    }
 }

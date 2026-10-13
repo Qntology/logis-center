@@ -22,9 +22,9 @@ fn enabled() -> bool {
     std::env::var("LOGIS_TEST_MODELS").map(|v| v == "1").unwrap_or(false)
 }
 
+/// `LOGIS_MODELS_DIR` 또는 OS 별 앱 데이터 경로 (tests/it/common.rs).
 fn models_dir() -> PathBuf {
-    let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
-    PathBuf::from(base).join("logis-center").join("models")
+    crate::common::models_dir()
 }
 
 /// GPU 0번 장치. CUDA 빌드는 기존과 같이 `Device::new_cuda(0)`, ROCm 빌드는 `Device::new_rocm(0)` 을 씁니다.

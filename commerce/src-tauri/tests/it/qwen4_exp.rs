@@ -361,15 +361,18 @@ fn qwen4_exp_tiny_cpu_mmap_ple_matches_hf() -> R {
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
+/// GPU 공통(CUDA · ROCm · Vulkan · Metal): 이 빌드의 GPU 0번(`utils::new_gpu_device`)에서 CPU 와 같은 기준.
+/// 장치를 열 수 없으면 건너뜁니다(`LOGIS_REQUIRE_GPU=1` 이면 실패 — CI 에서 건너뜀을 통과로 세지 않게).
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan", feature = "metal"))]
 #[test]
-fn qwen4_exp_tiny_cuda_matches_hf() -> R {
-    let dev = match Device::new_cuda(0) {
-        Ok(d) => d,
-        Err(e) => {
-            println!("[QWEN4-EXP] CUDA 장치를 열 수 없어 건너뜁니다: {e}");
-            return Ok(());
-        }
+fn qwen4_exp_tiny_gpu_matches_hf() -> R {
+    let Some(dev) = tauri_app_lib::utils::new_gpu_device(0) else {
+        assert!(
+            std::env::var("LOGIS_REQUIRE_GPU").map(|v| v != "1").unwrap_or(true),
+            "LOGIS_REQUIRE_GPU=1 인데 GPU 장치를 열 수 없습니다"
+        );
+        println!("[QWEN4-EXP] GPU 장치를 열 수 없어 건너뜁니다.");
+        return Ok(());
     };
     for opts in [dense_opts(), mmap_opts()] {
         for v in ["", "variant_b"] {
@@ -377,14 +380,19 @@ fn qwen4_exp_tiny_cuda_matches_hf() -> R {
             assert_report(if v.is_empty() { "variant_a" } else { v }, &r);
         }
     }
-    let agree = bf16_top1(&dev)?;
-    assert!(agree >= 0.75, "CUDA BF16 top-1 일치율 {agree}");
+    // BF16 matmul 은 CUDA/ROCm 만 기준 수치가 있습니다(Metal/Vulkan BF16 은 측정만).
+    match bf16_top1(&dev) {
+        Ok(agree) if dev.is_cuda() || dev.is_rocm() => assert!(agree >= 0.75, "GPU BF16 top-1 일치율 {agree}"),
+        Ok(_) => {}
+        Err(e) if !(dev.is_cuda() || dev.is_rocm()) => println!("[QWEN4-EXP] BF16 on {:?} 미지원: {e}", dev.location()),
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
 /// BF16 경로(HF 캐스팅 순서 재현) 는 F32 기준 대비 top-1 일치율만 봅니다 (무작위 tiny 모델이라 logits 간격이 좁음).
 /// 참고: HF 자체를 bf16 으로 돌려도 F32 대비 top-1 93.8 %, max |Δ| 1.83 입니다. CPU 백엔드는 BF16 matmul 미지원이라 GPU 만.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm", feature = "vulkan", feature = "metal")), allow(dead_code))]
 fn bf16_top1(device: &Device) -> anyhow::Result<f32> {
     let dir = fixture("");
     let rf = load_ref(&dir)?;

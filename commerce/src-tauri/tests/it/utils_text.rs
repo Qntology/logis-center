@@ -731,3 +731,35 @@ fn deterministic_time_guide_builds_override_and_condition() {
     assert_eq!(get_deterministic_time_guide("", "en"), (String::new(), None));
     assert_eq!(get_deterministic_time_guide("Time Intent [bogus]", "en"), (String::new(), None));
 }
+
+// ---------------------------------------------------------------------
+//  [UTF8-STREAM] 토큰 단위 스트리밍은 완성된 UTF-8 글자만 내보냅니다 (플랫폼 공통 · Mac 검증 항목)
+// ---------------------------------------------------------------------
+#[test]
+fn utf8_token_stream_emits_only_complete_chars() {
+    use tauri_app_lib::tokenizer::{TokenizerModel, Utf8TokenStream};
+    // ByteLevel BPE (tests/fixtures/granite_mock/tokenizer.json): 한글 · 이모지 한 글자가 여러 토큰으로 갈립니다.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/granite_mock/tokenizer.json");
+    let tok = TokenizerModel::new(tokenizers::Tokenizer::from_file(&path).expect("tokenizer"));
+    for text in [
+        "총액 267,000원 · 배송 완료 👍",
+        "주문 #20231 서울 강남구 테헤란로 152 — 무선 이어폰 3개 🎧🚚",
+        "先月の配送遅延 注文一覧 ✅ emoji 🇰🇷 끝",
+    ] {
+        let ids = tok.text_encode_vec(text.to_string(), false).unwrap();
+        // 토큰 하나만 디코드하면 깨지는 경우가 실제로 있어야 이 테스트가 의미가 있습니다.
+        let broken = ids.iter().filter(|&&t| tok.token_decode(vec![t]).unwrap().contains('\u{FFFD}')).count();
+        assert!(broken > 0, "'{text}': 글자를 쪼개는 토큰이 없습니다(테스트 토크나이저 확인)");
+        let mut s = Utf8TokenStream::new();
+        let mut out = String::new();
+        for &t in &ids {
+            let piece = s.push(&tok, t);
+            assert!(!piece.contains('\u{FFFD}'), "'{text}': 미완성 글자가 표준출력으로 나갔습니다: {piece:?}");
+            out.push_str(&piece);
+        }
+        out.push_str(&s.finish(&tok));
+        assert_eq!(out, tok.token_decode(ids.clone()).unwrap(), "스트림 합 ≠ 전체 디코드");
+        assert_eq!(out.trim_start(), text);
+        println!("[UTF8-STREAM] {} 토큰 (단독 디코드 시 깨지는 토큰 {}) → {:?}", ids.len(), broken, out);
+    }
+}
