@@ -208,3 +208,61 @@ fn gpu_qwen3_load_unload_returns_vram() {
     }
     assert_eq!(dev.take_deferred_error(), None, "지연 CUDA 오류가 남아 있습니다");
 }
+
+// =====================================================================
+//  🌟 [ROCM-EXIT] Windows ROCm 종료 경로 — 자식 프로세스를 여러 번 띄워 멈춤이 없는지 확인
+// ---------------------------------------------------------------------
+//  자식: ROCm 장치에서 여러 모양의 GEMM(F32/BF16, rocBLAS)을 돌린 뒤 rocm_exit_now_if_used(0) 로 끝납니다.
+//  부모: 자식을 20번 실행해 매번 60초 안에 종료 코드 0 으로 끝나고 [ROCM-EXIT] 줄을 찍는지 봅니다.
+//  (예전 정상 종료 경로는 rocBLAS/HIP DLL 해제 중 간헐적으로 무한 대기했습니다)
+// =====================================================================
+#[cfg(all(windows, feature = "rocm"))]
+#[test]
+#[ignore = "GPU 필요: ROCm 종료 경로를 자식 프로세스로 20회 확인"]
+fn gpu_rocm_fast_exit_never_hangs() {
+    const CHILD_ENV: &str = "LOGIS_ROCM_EXIT_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let dev = tauri_app_lib::utils::new_gpu_device(0).expect("ROCm 장치");
+        assert!(dev.is_rocm(), "ROCm 장치가 아닙니다: {dev:?}");
+        for (m, n, k) in [(1usize, 1024usize, 1024usize), (7, 3072, 1024), (64, 1024, 3072), (256, 151_936, 1024), (900, 2048, 2048)] {
+            for dt in [DType::F32, DType::BF16] {
+                let a = Tensor::ones((m, k), dt, &dev).unwrap();
+                let b = Tensor::ones((k, n.min(8192)), dt, &dev).unwrap();
+                let _ = a.matmul(&b).unwrap();
+            }
+        }
+        dev.synchronize().unwrap();
+        println!("[ROCM-EXIT-TEST] 자식: GEMM 완료, 종료 경로 진입");
+        tauri_app_lib::utils::device_utils::rocm_exit_now_if_used(0);
+        panic!("rocm_exit_now_if_used 가 돌아왔습니다 (프로세스가 끝나야 합니다)");
+    }
+
+    let exe = std::env::current_exe().unwrap();
+    let runs: usize = std::env::var("LOGIS_ROCM_EXIT_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    for i in 0..runs {
+        let started = std::time::Instant::now();
+        let mut child = std::process::Command::new(&exe)
+            .args(["--exact", "mem_lifecycle::gpu_rocm_fast_exit_never_hangs", "--ignored", "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(60) {
+                let _ = child.kill();
+                panic!("자식 {i}: 60초 안에 끝나지 않았습니다 (종료 멈춤)");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        println!("[ROCM-EXIT-TEST] 자식 {i}: {status} · {:.2}s", started.elapsed().as_secs_f64());
+        assert!(status.success(), "자식 {i}: 종료 코드 {status}\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.contains("[ROCM-EXIT]"), "자식 {i}: [ROCM-EXIT] 줄이 없습니다\n{stdout}");
+        assert!(!stdout.contains("test result:"), "자식 {i}: 테스트 하네스가 정상 종료 경로로 끝났습니다\n{stdout}");
+    }
+}

@@ -507,7 +507,9 @@ impl QuantizedQwenVLTextAttention {
         self.vram_merged_v = None;
         self.merged_vram_block_count = 0;
 
-        let target_dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
+        // 🌟 [KV-ROCM] ROCm 도 BF16 으로 올립니다(이 파일의 다른 VRAM KV 경로와 같음). 예전에는 CUDA 만 BF16 이라
+        //    AMD 에서 장치 이동 후 다시 올린 블록이 F32(VRAM 2배)로 남았습니다.
+        let target_dtype = if device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         for block in &mut self.kv_blocks {
             let (index, mut inner) = {
                 let inner = block.inner.write().unwrap();
