@@ -129,6 +129,8 @@ impl Qwen3_5GenerateModel {
         
         let mut reader = std::io::Cursor::new(&mmap_arc[..]);
         let content = gguf_file::Content::read(&mut reader)?;
+        // 🌟 [QWEN4-EXP] arch 'qwen4exp' GGUF 를 Qwen3.5 그래프로 잘못 읽지 않도록 먼저 막습니다.
+        crate::models::qwen4_exp::registry::ensure_not_qwen4exp_gguf(&content)?;
         
         // Content Clone 우회를 위한 메타데이터 Arc 래핑
         let mut reader_clone = std::io::Cursor::new(&mmap_arc[..]);

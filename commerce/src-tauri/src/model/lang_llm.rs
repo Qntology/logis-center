@@ -44,10 +44,12 @@ const KNOWN_CODES: &[&str] = &[
     "tel", "tgk", "tgl", "tha", "tur", "ukr", "urd", "vie", "war", "ydd", "zho",
 ];
 
+/// 언어 엔진 런타임 로더. config.json 으로 아키텍처를 판별해 Qwen3.5(Q4_K_M GGUF) 또는 Qwen4-Exp(safetensors) 생성기를
+/// 돌려줍니다 (`models::qwen4_exp::registry::load_lang_runtime`).
 pub type LangLlmLoader = fn(
     &Path,
     &candle_core::Device,
-) -> anyhow::Result<crate::models::qwen3_5::generate::Qwen3_5GenerateModel>;
+) -> anyhow::Result<crate::models::qwen4_exp::TextGenerator>;
 
 static LOADER: OnceCell<LangLlmLoader> = OnceCell::new();
 
