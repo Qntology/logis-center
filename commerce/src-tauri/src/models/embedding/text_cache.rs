@@ -35,8 +35,10 @@ use std::sync::{Arc, Mutex};
 /// per-text 순전파(오늘의 embed()) 결과 공간의 태그.
 /// 순전파 수치가 바뀌는 변경을 하면 반드시 이 태그를 올려야 합니다.
 pub const FORWARD_TAG_PER_TEXT: &str = "granite-r2/fwd-pertext/v1";
-/// 배치 순전파(embed_many) 결과 공간의 태그.
+/// 배치 순전파(embed_many, 고정 모양 · CUDA/ROCm) 결과 공간의 태그.
 pub const FORWARD_TAG_BATCHED: &str = "granite-r2/fwd-batched/v1";
+/// 배치 순전파(embed_many, 동적 행 수 · CPU/Vulkan) 결과 공간의 태그.
+pub const FORWARD_TAG_BATCHED_DYN: &str = "granite-r2/fwd-batched-dyn/v1";
 
 /// LRU 계층 기본 상한(엔트리). 384×f32 = 1.5KB 이므로 약 38MB.
 pub const DEFAULT_LRU_CAP: usize = 24_576;
@@ -429,7 +431,8 @@ pub fn refresh_fingerprint(dir: &Path, class: &'static str) -> u64 {
     if let Some(old) = old {
         if old != fp {
             let n = GRANITE_TEXT_CACHE.forget_space(space_id(old, FORWARD_TAG_PER_TEXT))
-                + GRANITE_TEXT_CACHE.forget_space(space_id(old, FORWARD_TAG_BATCHED));
+                + GRANITE_TEXT_CACHE.forget_space(space_id(old, FORWARD_TAG_BATCHED))
+                + GRANITE_TEXT_CACHE.forget_space(space_id(old, FORWARD_TAG_BATCHED_DYN));
             println!(
                 "[EMBED-CACHE] ♻️ 임베딩 모델 파일이 바뀌어 지문이 달라졌습니다. 옛 벡터 {}건을 버립니다.",
                 n
@@ -441,10 +444,12 @@ pub fn refresh_fingerprint(dir: &Path, class: &'static str) -> u64 {
 
 /// 이 장치에서 실제로 쓰이는 순전파 경로의 태그.
 pub fn forward_tag(device: &Device) -> &'static str {
-    if super::batched_enabled(device) {
+    if !super::batched_enabled(device) {
+        FORWARD_TAG_PER_TEXT
+    } else if super::BatchOpts::for_device(device).fixed_shape {
         FORWARD_TAG_BATCHED
     } else {
-        FORWARD_TAG_PER_TEXT
+        FORWARD_TAG_BATCHED_DYN
     }
 }
 
