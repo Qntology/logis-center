@@ -32,6 +32,7 @@ pub fn new_gpu_device(id: usize) -> Option<Device> {
     }
     #[cfg(feature = "rocm")]
     if let Ok(d) = Device::new_rocm(id) {
+        ROCM_USED.store(true, std::sync::atomic::Ordering::SeqCst);
         return Some(d);
     }
     #[cfg(feature = "vulkan")]
@@ -40,6 +41,135 @@ pub fn new_gpu_device(id: usize) -> Option<Device> {
     }
     let _ = id;
     None
+}
+
+/// ROCm 장치를 한 번이라도 만들었는지 (종료 경로 판정용).
+static ROCM_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// =====================================================================
+// 🌟 [ROCM-EXIT] Windows ROCm 종료 시 멈춤 회피
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   AMD 검증(RX 6600, HIP SDK 7.2)에서 GPU 테스트 프로세스 68개 중 2개가 할 일을 다 끝낸 뒤
+//   ExitProcess 안에서 멈췄습니다. ExitProcess 는 다른 스레드를 먼저 끝낸 다음 DLL 을 내리는데,
+//   rocblas.dll 의 종료 처리기가 amdhip64 를 부르고, amdhip64 는 이미 사라진 HIP 런타임
+//   스레드를 기다리며 무한히 돕니다(SwitchToThread 루프). taskkill 로도 끝나지 않고 GPU 를 쥔 채 남습니다.
+//  ── 해결 ──
+//   ROCm 장치를 쓴 프로세스는 종료 직전에 GPU 작업을 끝내고(동기화 + 풀 반환) 출력을 비운 뒤
+//   TerminateProcess 로 끝냅니다. DLL 해제 단계를 건너뛰므로 멈출 자리가 없습니다.
+//   Rust 소멸자는 std::process::exit 에서도 돌지 않으므로 잃는 정리는 C 수준 atexit 뿐입니다.
+//   `LOGIS_ROCM_FAST_EXIT=0` 이면 예전처럼 정상 종료 경로를 탑니다.
+// =====================================================================
+/// ROCm 장치를 쓴 Windows 프로세스면 GPU 를 정리하고 즉시 프로세스를 끝냅니다(돌아오지 않음).
+/// 그 밖의 빌드·장치에서는 아무것도 하지 않고 돌아옵니다.
+pub fn rocm_exit_now_if_used(code: u32) {
+    #[cfg(all(windows, feature = "rocm"))]
+    {
+        use std::io::Write;
+        if !ROCM_USED.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if std::env::var("LOGIS_ROCM_FAST_EXIT").map(|v| v.trim() == "0").unwrap_or(false) {
+            println!("[ROCM-EXIT] LOGIS_ROCM_FAST_EXIT=0 → 정상 종료 경로를 탑니다.");
+            return;
+        }
+        let devices: Vec<Device> = DEVICE_CACHE
+            .lock()
+            .map(|c| c.iter().flatten().filter(|d| d.is_rocm()).cloned().collect())
+            .unwrap_or_default();
+        for d in &devices {
+            let _ = d.synchronize();
+            if let Device::Rocm(r) = d {
+                let _ = r.trim_memory_pool();
+            }
+        }
+        println!("[ROCM-EXIT] GPU 정리 완료 → DLL 해제를 건너뛰고 종료합니다 (rocBLAS/HIP 종료 멈춤 회피).");
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+            TerminateProcess(GetCurrentProcess(), code);
+        }
+    }
+    let _ = code;
+}
+
+// =====================================================================
+// 🌟 [VRAM-WDDM] Windows ROCm 의 free VRAM 을 다른 프로세스 사용량까지 반영해 보정
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   Windows 의 hipMemGetInfo free 는 '전체 − 이 프로세스가 잡은 양' 입니다. 다른 프로세스(dwm,
+//   브라우저, AMD 소프트웨어 등)가 쓰는 VRAM 이 빠져 있어, RX 6600 실측으로 장치 전체 기준보다
+//   약 1GB 크게 나왔습니다. 8GB 카드에서는 KV-PLAN 이 실제로는 모자란 VRAM 을 고를 수 있습니다.
+//  ── 해결 ──
+//   DXGI 가 이 프로세스에 주는 로컬 메모리 예산(Budget − CurrentUsage)은 다른 프로세스 사용량을
+//   반영합니다. AMD 어댑터(VendorId 0x1002)의 그 값과 HIP free 중 작은 쪽을 씁니다.
+//   메모리 풀 유휴분은 이 프로세스가 이미 잡은 양이라 보정 뒤에 그대로 더합니다.
+//   DXGI 조회가 실패하면 HIP 값을 그대로 씁니다. `LOGIS_VRAM_WDDM=0` 이면 보정하지 않습니다.
+// =====================================================================
+#[cfg(all(windows, feature = "rocm"))]
+mod wddm {
+    use std::sync::Mutex;
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, IDXGIAdapter3, IDXGIFactory1, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+        DXGI_QUERY_VIDEO_MEMORY_INFO,
+    };
+
+    struct Adapter(IDXGIAdapter3);
+    // DXGI 어댑터 질의는 스레드에 묶이지 않습니다(free-threaded). 호출은 Mutex 로 직렬화합니다.
+    unsafe impl Send for Adapter {}
+
+    static ADAPTER: Mutex<Option<Option<Adapter>>> = Mutex::new(None);
+
+    /// 전용 메모리가 가장 큰 AMD 어댑터.
+    fn find_amd_adapter() -> Option<Adapter> {
+        unsafe {
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+            let mut best: Option<(usize, IDXGIAdapter3)> = None;
+            let mut i = 0;
+            while let Ok(a) = factory.EnumAdapters1(i) {
+                i += 1;
+                let Ok(desc) = a.GetDesc1() else { continue };
+                if desc.VendorId != 0x1002 {
+                    continue;
+                }
+                let Ok(a3) = a.cast::<IDXGIAdapter3>() else { continue };
+                if best.as_ref().map_or(true, |(m, _)| desc.DedicatedVideoMemory > *m) {
+                    best = Some((desc.DedicatedVideoMemory, a3));
+                }
+            }
+            best.map(|(_, a)| Adapter(a))
+        }
+    }
+
+    /// 이 프로세스가 더 쓸 수 있는 로컬(VRAM) 메모리 = Budget − CurrentUsage.
+    pub fn local_free_bytes() -> Option<u64> {
+        let mut g = ADAPTER.lock().ok()?;
+        if g.is_none() {
+            *g = Some(find_amd_adapter());
+        }
+        let adapter = g.as_ref()?.as_ref()?;
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        unsafe { adapter.0.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).ok()? };
+        Some(info.Budget.saturating_sub(info.CurrentUsage))
+    }
+}
+
+/// ROCm(Windows) 의 드라이버 free 를 DXGI 예산으로 보정합니다(작은 쪽). 그 밖에는 그대로.
+fn clamp_free_to_os_budget(gpu_id: usize, is_rocm: bool, free: u64) -> u64 {
+    #[cfg(all(windows, feature = "rocm"))]
+    {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("LOGIS_VRAM_WDDM").map(|v| v.trim() == "0").unwrap_or(false));
+        if is_rocm && gpu_id == 0 && !off {
+            if let Some(budget_free) = wddm::local_free_bytes() {
+                return free.min(budget_free);
+            }
+        }
+    }
+    let _ = (gpu_id, is_rocm);
+    free
 }
 
 // =====================================================================
@@ -146,7 +276,7 @@ impl GpuMemProbe {
         }
         #[cfg(feature = "rocm")]
         if let Ok((free, total)) = candle_rocm::mem_info(gpu_id) {
-            return Some((free as u64, total as u64));
+            return Some((clamp_free_to_os_budget(gpu_id, true, free as u64), total as u64));
         }
         #[cfg(feature = "vulkan")]
         if gpu_id == 0 && *VULKAN_DEVICE_COUNT > 0 {
@@ -218,10 +348,16 @@ fn device_mem_info(gpu_id: usize) -> Option<(u64, u64)> {
 }
 
 /// 주어진 장치의 `(실효 free, total)` 바이트. CPU 이거나 조회가 실패하면 None.
+/// ROCm(Windows) 은 드라이버 free 를 DXGI 예산으로 보정한 뒤 풀 유휴분을 더합니다([VRAM-WDDM]).
 pub fn device_mem_info_of(dev: &Device) -> Option<(u64, u64)> {
     let (free, total) = dev.mem_info().ok().flatten()?;
+    let gpu_id = match dev.location() {
+        candle_core::DeviceLocation::Rocm { gpu_id } => gpu_id,
+        _ => 0,
+    };
+    let free = clamp_free_to_os_budget(gpu_id, dev.is_rocm(), free as u64);
     let idle = dev.pool_idle_bytes().unwrap_or(0);
-    Some(((free as u64).saturating_add(idle as u64), total as u64))
+    Some((free.saturating_add(idle as u64), total as u64))
 }
 
 /// 실효 free VRAM(bytes). 장치가 있으면 장치 값, 없으면 NVML. GPU 가 없으면 None.

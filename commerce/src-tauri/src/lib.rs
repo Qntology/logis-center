@@ -5618,6 +5618,9 @@ pub fn run() {
                 }
 
                 println!("[APP] Browser shutdown complete.");
+
+                // 3. 🌟 [ROCM-EXIT] Windows ROCm: rocBLAS/HIP DLL 해제 중 멈춤을 피해 여기서 바로 끝냅니다.
+                crate::utils::device_utils::rocm_exit_now_if_used(0);
             }
         });
 }
