@@ -1,0 +1,40 @@
+From c1de5014d61db58ed813c1547630114c9bec718c Mon Sep 17 00:00:00 2001
+From: sungu-che <127634415+sungu-che@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 22:50:14 +0000
+Subject: [PATCH 5/5] quantized: CPU f16 forward_exact prefill accumulates in
+ f32
+
+w8a16_generic_cpu failed on Apple Silicon (macos-15 runner): Q8_0 192x1024 m=9 in=F16
+max_rel 5.69e-3 > 5e-3, vs 5.10e-4 on x86. The gemm crate's f16 kernel accumulates in f16 on
+AArch64 with FEAT_FP16. Keep the CUDA semantics on the CPU instead: weight rounded to f16
+(dequantize_to(F16)), f32 activations and accumulation, one rounding to f16 at the end.
+x86: quantized_tests 42/42 (F16 m=9 max_rel 2.3e-4..5.7e-4).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GcxyAs2y3NUizfXh9YWmxx
+---
+ candle-core/src/quantized/mod.rs | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/candle-core/src/quantized/mod.rs b/candle-core/src/quantized/mod.rs
+index 6917147..64e6bb3 100644
+--- a/candle-core/src/quantized/mod.rs
++++ b/candle-core/src/quantized/mod.rs
+@@ -979,6 +979,14 @@ impl QTensor {
+             _ => {
+                 // The CPU backend has no bf16 matmul: bf16 prefill runs in f32 there.
+                 let cpu_bf16 = dtype == DType::BF16 && xs.device().is_cpu();
++                // f16 on the CPU: the gemm crate's f16 kernel accumulates in f16 on AArch64 with
++                // FEAT_FP16 (Apple Silicon: max_rel 5.7e-3 vs 5.1e-4 on x86 in w8a16_generic_cpu).
++                // Keep the CUDA semantics instead: weight rounded to f16, f32 accumulation.
++                let cpu_f16 = dtype == DType::F16 && xs.device().is_cpu() && rows > EXACT_MV_MAX_ROWS;
++                if cpu_f16 {
++                    let w = self.dequantize_to(DType::F16, xs.device())?.to_dtype(DType::F32)?;
++                    return linear_forward(&xs.to_dtype(DType::F32)?, &w)?.to_dtype(dtype);
++                }
+                 let compute = if rows <= EXACT_MV_MAX_ROWS || cpu_bf16 {
+                     DType::F32
+                 } else {
+-- 
+2.43.0
+
