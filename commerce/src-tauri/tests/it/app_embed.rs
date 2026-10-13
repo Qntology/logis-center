@@ -612,6 +612,14 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
     let t_load = std::time::Instant::now();
     let model = EmbeddingModel::new_with_device(&dir, &device).expect("load");
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
+    // 장치별 배치 순전파 기본값 (처음 판정할 때 [EMBED-BATCHED] 줄이 한 번 찍힙니다). 이 테스트는
+    // embed_many / embed 를 직접 부르므로 LOGIS_EMBED_BATCHED 는 아래 수치 경로를 바꾸지 않습니다.
+    println!(
+        "[EMBED-BATCHED-TEST] 장치 {} · batched_enabled = {} · 캐시 공간 태그 {}",
+        tauri_app_lib::models::embedding::text_cache::device_class(&device),
+        model.batched_enabled(),
+        tauri_app_lib::models::embedding::text_cache::forward_tag(&device)
+    );
     let t_reload = std::time::Instant::now();
     let model2 = EmbeddingModel::new_with_device(&dir, &device).expect("reload");
     let reload_ms = t_reload.elapsed().as_secs_f64() * 1000.0;
@@ -821,7 +829,8 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
     assert!(min_cos > 0.995, "최소 코사인 {} — 배치 경로 수치가 허용 범위를 벗어났습니다", min_cos);
     // 배치 경로가 F32 참값에서 per-text 보다 눈에 띄게 멀어지면 안 됩니다.
     // 허용폭 2e-4 는 의도한 절충입니다: BF16 GEMM 은 모양마다 커널이 달라 배치 경로가 per-text 와
-    // 비트 동일할 수 없고, 평균 코사인 차는 1e-4 수준(측정)입니다. 그래서 ROCm 은 실기기 검증 전까지 기본 OFF 입니다.
+    // 비트 동일할 수 없고, 평균 코사인 차는 1e-4 수준(측정, CUDA)입니다. ROCm 도 기본 ON 이므로(models/embedding.rs)
+    // AMD 에서는 이 테스트가 그 기본값의 실기기 근거입니다. 실패하면 LOGIS_EMBED_BATCHED=0 으로 되돌립니다.
     assert!(bt_mean_s >= pt_mean_s - 2e-4 && bt_mean_l >= pt_mean_l - 2e-4, "embed_many 의 F32 기준 정확도가 per-text 보다 낮습니다");
     assert!(batched.iter().all(|v| v.iter().any(|&x| x != 0.0)));
 }

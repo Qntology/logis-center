@@ -268,13 +268,13 @@ impl QuantizedLinear {
         Ok(self.inner.dequantize_f16()?)
     }
 
-    /// 🌟 [W8A16] F16/BF16 입력을 정확 경로(`forward_exact`)로 보낼지: CUDA 에 상주한 Q8_0 가중치일 때만.
-    /// (K-quant 가중치·다른 장치는 기존 경로 그대로)
+    /// 🌟 [W8A16] F16/BF16 입력을 정확 경로(`forward_exact`)로 보낼지: CUDA/ROCm 에 상주한 Q8_0 가중치일 때만.
+    /// (K-quant 가중치·다른 장치는 기존 경로 그대로. ROCm 은 포크의 QRocmStorage 정확 경로를 씁니다. RX 6600 실측: Qwen3-0.6B top-1 100%, KLD 5.0e-4)
     fn exact_ok(&self, xs: &Tensor) -> bool {
         matches!(xs.dtype(), DType::F16 | DType::BF16)
             && q8_exact_enabled()
             && matches!(&self.inner, QMatMul::QTensor(t)
-                if t.dtype() == candle_core::quantized::GgmlDType::Q8_0 && t.device().is_cuda())
+                if t.dtype() == candle_core::quantized::GgmlDType::Q8_0 && (t.device().is_cuda() || t.device().is_rocm()))
     }
 }
 
