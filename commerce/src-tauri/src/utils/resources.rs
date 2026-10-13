@@ -375,7 +375,7 @@ pub fn plan_kv_residency_legacy(input: &KvPlanInput) -> KvResidency {
     decision
 }
 
-/ Global System Monitor Instance
+// Global System Monitor Instance
 static SYSTEM_MONITOR: Lazy<Arc<Mutex<System>>> = Lazy::new(|| {
     let mut sys = System::new_with_specifics(
         RefreshKind::new()
