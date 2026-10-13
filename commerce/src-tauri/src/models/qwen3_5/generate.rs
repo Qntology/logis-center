@@ -129,6 +129,8 @@ impl Qwen3_5GenerateModel {
         
         let mut reader = std::io::Cursor::new(&mmap_arc[..]);
         let content = gguf_file::Content::read(&mut reader)?;
+        // 🌟 [QWEN4-EXP] arch 'qwen4exp' GGUF 를 Qwen3.5 그래프로 잘못 읽지 않도록 먼저 막습니다.
+        crate::models::qwen4_exp::registry::ensure_not_qwen4exp_gguf(&content)?;
         
         // Content Clone 우회를 위한 메타데이터 Arc 래핑
         let mut reader_clone = std::io::Cursor::new(&mmap_arc[..]);
@@ -191,6 +193,9 @@ impl Qwen3_5GenerateModel {
             Some(mmap_arc.clone()),
             Some(ct_arc)
         )?;
+        // 🌟 [WEIGHT-RESIDENT] 텍스트 전용 생성기(4B 등)는 호출이 끝나도 VRAM 여유가 있으면 층 가중치를 남겨
+        //    다음 호출에서 다시 읽지 않습니다. 비전 타워를 붙였다 떼는 생성기(2B + mmproj)는 예전처럼 매번 내려놓습니다.
+        qwen3_5.language_model.keep_warm = target_mmproj.is_none();
 
         // 🌟 [VISION-SKELETON] 가중치 0바이트로 비전 구조만 붙입니다.
         //    실패하면 순수 텍스트 모드로 안전하게 강등됩니다.
@@ -328,6 +333,7 @@ impl Qwen3_5GenerateModel {
         let video_grid_thw: Option<&Tensor> = video_grid_thw.as_ref();
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
+        self.qwen3_5.language_model.set_planned_decode_tokens(sample_len as usize); // 🌟 [KV-PLAN v2] KV 여유 토큰 = 실제 max_tokens
         
         let mut cur_pixel_values = pixel_values;
         let mut cur_pixel_values_video = pixel_values_video;
@@ -344,6 +350,8 @@ impl Qwen3_5GenerateModel {
         let is_strict_json = mes_text.contains("/no_think") || mes_text.contains("RETURN JSON ONLY") || mes_text.contains("Return ONLY");
         let mut gen_text_buffer = String::new(); 
         let mut print_buffer = String::new();
+        // 🌟 [UTF8-STREAM] 표준출력에는 완성된 UTF-8 글자만 내보냅니다. (gen_text_buffer·최종 텍스트는 그대로)
+        let mut utf8_stream = crate::tokenizer::Utf8TokenStream::new();
 
         // 🌟 [Contrastive Semantic Steering] 오답 레이블 진영을 밀어내는 Prejudice 텐서 연산
         let mut semantic_prejudice_tensor: Option<Tensor> = None;
@@ -563,10 +571,13 @@ impl Qwen3_5GenerateModel {
             let mut is_json_finished = false; 
 
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
-                print_buffer.push_str(&piece);
+                print_buffer.push_str(&utf8_stream.push(&self.tokenizer, next_token));
                 gen_text_buffer.push_str(&piece);
 
                 if print_buffer.len() >= 10 || piece.contains('\n') || next_token == self.eos_token_id {
+                    if next_token == self.eos_token_id {
+                        print_buffer.push_str(&utf8_stream.finish(&self.tokenizer));
+                    }
                     print!("{}", print_buffer);
                     let _ = std::io::stdout().flush();
                     print_buffer.clear(); 
@@ -580,6 +591,7 @@ impl Qwen3_5GenerateModel {
                         else if c == '}' { depth -= 1; }
                     }
                     if has_started && depth == 0 && gen_text_buffer.trim_end().ends_with('}') {
+                        print_buffer.push_str(&utf8_stream.finish(&self.tokenizer));
                         if !print_buffer.is_empty() {
                             print!("{}", print_buffer);
                             let _ = std::io::stdout().flush();
@@ -658,16 +670,7 @@ impl Qwen3_5GenerateModel {
         // 🌟 [종료 직후 메모리 즉각 강제 반환] 
         // 80% -> 65% 지연 반환 현상 해결! OS 레벨 메모리를 즉시 강제 회수하여 65% 상태를 유지시킵니다.
         if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-        #[cfg(target_os = "macos")]
-        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+        crate::models::common::legacy_working_set_trim();
 
         Ok(res)
     }
@@ -693,6 +696,7 @@ impl Qwen3_5GenerateModel {
         
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
+        self.qwen3_5.language_model.set_planned_decode_tokens(sample_len as usize); // 🌟 [KV-PLAN v2] KV 여유 토큰 = 실제 max_tokens
 
         let (mut input_ids, mut seqlen_offset, mut cur_pixel_values, mut cur_image_thw, mut cur_pixel_values_video, mut cur_video_thw) = if !is_continuation {
 
@@ -779,6 +783,8 @@ impl Qwen3_5GenerateModel {
         
         let mut gen_text_buffer = String::new();
         let mut print_buffer = String::new();
+        // 🌟 [UTF8-STREAM] 표준출력에는 완성된 UTF-8 글자만 내보냅니다. (gen_text_buffer·최종 텍스트는 그대로)
+        let mut utf8_stream = crate::tokenizer::Utf8TokenStream::new();
 
         // 🌟 [Contrastive Semantic Steering] 오답 레이블 진영 밀어내기 (Prejudice)
         let mut semantic_prejudice_tensor: Option<Tensor> = None;
@@ -1005,10 +1011,13 @@ impl Qwen3_5GenerateModel {
             let mut is_json_finished = false;
 
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
-                print_buffer.push_str(&piece);
+                print_buffer.push_str(&utf8_stream.push(&self.tokenizer, next_token));
                 gen_text_buffer.push_str(&piece);
 
                 if print_buffer.len() >= 10 || piece.contains('\n') || next_token == self.eos_token_id {
+                    if next_token == self.eos_token_id {
+                        print_buffer.push_str(&utf8_stream.finish(&self.tokenizer));
+                    }
                     print!("{}", print_buffer);
                     let _ = std::io::stdout().flush();
                     print_buffer.clear(); 
@@ -1022,6 +1031,7 @@ impl Qwen3_5GenerateModel {
                         else if c == '}' { depth -= 1; }
                     }
                     if has_started && depth == 0 && gen_text_buffer.trim_end().ends_with('}') {
+                        print_buffer.push_str(&utf8_stream.finish(&self.tokenizer));
                         if !print_buffer.is_empty() {
                             print!("{}", print_buffer);
                             let _ = std::io::stdout().flush();
@@ -1100,16 +1110,7 @@ impl Qwen3_5GenerateModel {
 
         // 🌟 [종료 직후 메모리 즉각 강제 반환] 
         if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-        #[cfg(target_os = "macos")]
-        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+        crate::models::common::legacy_working_set_trim();
 
         Ok(GenerationResult {
             text: res_text,
@@ -1189,16 +1190,7 @@ impl Qwen3_5GenerateModel {
 
         // 🌟 [종료 직후 메모리 즉각 강제 반환]
         if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-        #[cfg(target_os = "macos")]
-        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+        crate::models::common::legacy_working_set_trim();
 
         Ok(safe_toks)
     }

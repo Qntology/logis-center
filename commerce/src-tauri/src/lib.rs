@@ -5349,7 +5349,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    crate::model::lang_llm::register_loader(crate::model::lang_gguf::load_runtime);
+    crate::model::lang_llm::register_loader(crate::models::qwen4_exp::registry::load_lang_runtime);
     let model = Arc::new(TokioMutex::new(None));
     let store = Arc::new(TokioMutex::new(None));
     let cancellation_token = Arc::new(AtomicBool::new(false));
@@ -5618,6 +5618,9 @@ pub fn run() {
                 }
 
                 println!("[APP] Browser shutdown complete.");
+
+                // 3. 🌟 [ROCM-EXIT] Windows ROCm: rocBLAS/HIP DLL 해제 중 멈춤을 피해 여기서 바로 끝냅니다.
+                crate::utils::device_utils::rocm_exit_now_if_used(0);
             }
         });
 }

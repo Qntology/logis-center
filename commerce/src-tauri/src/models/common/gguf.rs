@@ -16,6 +16,51 @@ use tokenizers::{self, AddedToken, Tokenizer, models::bpe::BPE};
 
 use crate::tokenizer::TokenizerModel;
 
+/// 🌟 [MMAP-LOAD] GGUF 텐서를 파일 전체 바이트(메모리 맵 `&mmap[..]`)에서 바로 읽습니다.
+///
+/// `Content::tensor` 는 텐서마다 힙 버퍼를 새로 잡아 맵의 페이지를 한 번 복사한 뒤 장치로 올립니다.
+/// 층 가중치를 레이어마다 다시 읽는 스트리밍 경로에서는 그 복사가 층 크기만큼 매번 반복되고
+/// 힙도 그때마다 크게 출렁입니다. 여기서는 맵의 바이트를 그대로 넘겨 GPU 업로드가 맵 페이지를 직접 읽습니다.
+/// (CPU 장치는 어차피 자기 저장소로 복사합니다. 결과 텐서는 `Content::tensor` 와 비트 단위로 같습니다)
+pub fn qtensor_from_bytes(
+    ct: &gguf_file::Content,
+    file: &[u8],
+    name: &str,
+    device: &Device,
+) -> candle_core::Result<QTensor> {
+    let info = ct
+        .tensor_infos
+        .get(name)
+        .ok_or_else(|| candle_core::Error::Msg(format!("cannot find tensor info for {name}")))?;
+    let elems = info.shape.elem_count();
+    let block = info.ggml_dtype.block_size();
+    if block == 0 || elems % block != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "{name}: {elems} elements are not a multiple of the block size {block}"
+        )));
+    }
+    let size = elems / block * info.ggml_dtype.type_size();
+    let start = usize::try_from(ct.tensor_data_offset.saturating_add(info.offset))
+        .map_err(|_| candle_core::Error::Msg(format!("{name}: offset does not fit in memory")))?;
+    if start.checked_add(size).map_or(true, |end| end > file.len()) {
+        return Err(candle_core::Error::Msg(format!(
+            "{name}: needs {size} bytes at offset {start}, the file has {}",
+            file.len()
+        )));
+    }
+    let raw = &file[start..start + size];
+    // GGML 블록(f16/f32 필드)으로 다시 해석되므로 정렬이 맞지 않으면(정상 GGUF·맵에서는 생기지 않음) 복사 경로로 읽습니다.
+    if (raw.as_ptr() as usize) % 4 != 0 {
+        return info.read(&mut std::io::Cursor::new(file), ct.tensor_data_offset, device);
+    }
+    candle_core::quantized::ggml_file::qtensor_from_ggml(
+        info.ggml_dtype,
+        raw,
+        info.shape.dims().to_vec(),
+        device,
+    )
+}
+
 pub struct Gguf<R: Read + Seek> {
     ct: gguf_file::Content,
     reader: R,
@@ -222,11 +267,59 @@ impl QuantizedLinear {
     pub fn inner_dequantize(&self) -> Result<Tensor> {
         Ok(self.inner.dequantize_f16()?)
     }
+
+    /// 🌟 [W8A16] F16/BF16 입력을 정확 경로(`forward_exact`)로 보낼지: CUDA/ROCm 에 상주한 Q8_0 가중치일 때만.
+    /// (K-quant 가중치·다른 장치는 기존 경로 그대로. ROCm 은 포크의 QRocmStorage 정확 경로를 씁니다. RX 6600 실측: Qwen3-0.6B top-1 100%, KLD 5.0e-4)
+    fn exact_ok(&self, xs: &Tensor) -> bool {
+        matches!(xs.dtype(), DType::F16 | DType::BF16)
+            && q8_exact_enabled()
+            && matches!(&self.inner, QMatMul::QTensor(t)
+                if t.dtype() == candle_core::quantized::GgmlDType::Q8_0 && (t.device().is_cuda() || t.device().is_rocm()))
+    }
+}
+
+// =====================================================================
+// 🌟 [W8A16] Q8_0 가중치 × F16/BF16 활성값의 정확 행렬곱
+// ---------------------------------------------------------------------
+//  기존: F16 입력은 `forward_via_f16` (호출마다 가중치 전체를 F16 으로 풀고 F16 matmul — 디코드 1토큰에도
+//        25MB 급 순간 버퍼), BF16 입력은 `forward` (MMVQ/MMQ: 활성값을 Q8_1 로 양자화).
+//  지금: `QMatMul::forward_exact` — 활성값을 양자화하지 않습니다. 디코드(≤8행)는 Q8_0 블록을 커널 안에서
+//        f32 로 풀어 f32 누산, 프리필은 활성 dtype 타일로 풀어 f32 누산 GEMM. 정확도는 같거나 낫습니다.
+//  `LOGIS_Q8_EXACT=0` 이면 기존 경로. 테스트는 [`set_q8_exact_override`] 로 같은 프로세스에서 비교합니다.
+// =====================================================================
+static Q8_EXACT_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 🌟 [W8A16] 테스트용 강제값. `None` = 환경변수 기본, `Some(true/false)` = 강제로 켜기/끄기.
+pub fn set_q8_exact_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    Q8_EXACT_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn q8_exact_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match Q8_EXACT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => *ON.get_or_init(|| {
+            let v = std::env::var("LOGIS_Q8_EXACT").unwrap_or_default().trim().to_ascii_lowercase();
+            let on = !matches!(v.as_str(), "0" | "off" | "false" | "no" | "legacy");
+            if !on {
+                println!("[W8A16] LOGIS_Q8_EXACT={v} → Q8_0 선형층을 기존 경로(F16 전체 역양자화 / Q8_1 활성 양자화)로 계산합니다.");
+            }
+            on
+        }),
+    }
 }
 
 impl Module for QuantizedLinear {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let xs = if xs.dtype() == DType::F16 {
+        let xs = if self.exact_ok(xs) {
+            self.inner.forward_exact(xs)?
+        } else if xs.dtype() == DType::F16 {
             self.inner.forward_via_f16(xs)?
         } else {
             self.inner.forward(xs)?
@@ -239,10 +332,35 @@ impl Module for QuantizedLinear {
     }
 }
 
+/// 🌟 [W8A16] 양자화 가중치를 그대로 상주시키고 활성값은 양자화하지 않는 정확 선형층 (Qwen3-0.6B Q8_0).
+/// 출력 dtype = 입력 dtype (F32 입력이면 F32 logits).
+#[derive(Debug, Clone)]
+pub struct ExactQLinear {
+    w: std::sync::Arc<QTensor>,
+}
+
+impl ExactQLinear {
+    pub fn new(w: std::sync::Arc<QTensor>) -> Self {
+        Self { w }
+    }
+
+    pub fn weight(&self) -> &std::sync::Arc<QTensor> {
+        &self.w
+    }
+}
+
+impl Module for ExactQLinear {
+    fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        self.w.forward_exact(xs)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ProjKind {
     QuantizedProj(QuantizedLinear),
     LinearProj(Linear),
+    /// 🌟 [W8A16] 정확 양자화 선형층 (활성 양자화 없음)
+    Exact(ExactQLinear),
 }
 
 impl Module for ProjKind {
@@ -250,6 +368,7 @@ impl Module for ProjKind {
         match self {
             ProjKind::QuantizedProj(q) => q.forward(xs),
             ProjKind::LinearProj(l) => l.forward(xs),
+            ProjKind::Exact(e) => e.forward(xs),
         }
     }
 }
@@ -285,14 +404,15 @@ impl GateUpDownMLPGguf {
         self.down_proj = dummy;
     }
 
-    pub fn load_weights_inplace<R: Read + Seek>(&mut self, ct: &gguf_file::Content, reader: &mut R, prefix: &str, device: &Device) -> Result<()> {
-        let gate_w = ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?;
+    /// `data`: GGUF 파일 전체 바이트(메모리 맵). [`qtensor_from_bytes`] 로 힙 복사 없이 읽습니다.
+    pub fn load_weights_inplace(&mut self, ct: &gguf_file::Content, data: &[u8], prefix: &str, device: &Device) -> Result<()> {
+        let gate_w = qtensor_from_bytes(ct, data, &format!("{prefix}.ffn_gate.weight"), device)?;
         self.gate_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(gate_w)?, None));
         
-        let up_w = ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?;
+        let up_w = qtensor_from_bytes(ct, data, &format!("{prefix}.ffn_up.weight"), device)?;
         self.up_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(up_w)?, None));
         
-        let down_w = ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?;
+        let down_w = qtensor_from_bytes(ct, data, &format!("{prefix}.ffn_down.weight"), device)?;
         self.down_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(down_w)?, None));
         
         Ok(())

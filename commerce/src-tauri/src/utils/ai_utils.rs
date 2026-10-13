@@ -1193,6 +1193,21 @@ pub fn surprisal_dual_scores<V: AsRef<Vec<f32>>>(
         s_sims.push(v);
     }
 
+    surprisal_finish(&pool, &f_order, &f_sims, &p_order, &p_sims, schema_names, &s_sims)
+}
+
+/// surprisal_dual_scores 의 공통 후반부(풀 통계 → 필터/스키마 점수).
+/// 뱅크 캐시 버전(surprisal_dual_scores_bank)도 같은 풀·같은 순서를 만들어 이 함수를 거치므로
+/// 두 경로의 결과는 비트 단위로 같습니다.
+fn surprisal_finish(
+    pool: &[f32],
+    f_order: &[(String, String)],
+    f_sims: &[Vec<f32>],
+    p_order: &[(String, String)],
+    p_sims: &[Vec<f32>],
+    schema_names: &[String],
+    s_sims: &[Vec<f32>],
+) -> (Vec<SurprisalScore>, Vec<SurprisalScore>) {
     if pool.len() < 2 { return (Vec::new(), Vec::new()); }
     let mean: f32 = pool.iter().sum::<f32>() / (pool.len() as f32);
     let var: f32 = pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / (pool.len() as f32);
@@ -7913,4 +7928,444 @@ pub fn extract_pug_context(lines: &[&str], target_idx: usize) -> String {
     }
     
     context_lines.join("\n")
+}
+// =====================================================================
+// 🌟 [EMB-BANK] 노름·0벡터 표식을 미리 계산해 둔 임베딩 뱅크 (비트 단위 동일 채점)
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   cosine_similarity 는 호출마다 두 벡터의 노름을 다시 계산하고,
+//   max-pool 계열은 호출마다 0벡터인지 전 요소를 다시 훑었습니다.
+//   Plinko 는 단어 하나에 뱅크 코사인을 ~1만 번(속성 1115 · 필터 437+ · 동사 500 ·
+//   surprisal 2~4회 × ~1800) 계산하므로, 뱅크 쪽 노름 재계산이 CPU 시간의 2/3 였습니다.
+//
+//  ── 해결 ──
+//   뱅크를 만들 때 행마다 l2_norm_exact 와 0벡터 표식을 한 번만 계산합니다.
+//   질의 벡터의 노름도 질의당 한 번만 계산합니다.
+//   cosine_with_norms 는 cosine_similarity 와 '같은 식, 같은 순서' 로 내적·노름을 계산하므로
+//   (Rust 는 FMA 축약이나 부동소수 재결합을 하지 않습니다) 결과가 비트 단위로 같습니다.
+//   행이 많은 뱅크(≥ PAR_MIN_ROWS)는 rayon 으로 코사인을 병렬 계산하되 원래 순서대로
+//   모은 뒤, max / 풀 적재 / 평균·분산은 기존과 같은 순서로 순차 처리합니다.
+// =====================================================================
+
+/// 병렬 코사인으로 전환하는 최소 행 수. (작은 뱅크는 스레드 전환 비용이 더 큽니다)
+pub const PAR_MIN_ROWS: usize = 256;
+
+/// cosine_similarity 와 같은 식의 L2 노름.
+#[inline]
+pub fn l2_norm_exact(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// cosine_similarity 와 비트 단위로 같은 값을 내는, 노름을 미리 받은 코사인.
+#[inline]
+pub fn cosine_with_norms(a: &[f32], na: f32, b: &[f32], nb: f32) -> f32 {
+    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    if na == 0.0 || nb == 0.0 { 0.0 } else { dot_product / (na * nb) }
+}
+
+/// 기존 코드의 `e.iter().all(|&v| v == 0.0)` 와 같은 판정.
+#[inline]
+pub fn is_zero_vec(v: &[f32]) -> bool {
+    v.iter().all(|&x| x == 0.0)
+}
+
+/// 노름·0벡터 표식을 미리 계산한 뱅크(행은 원본을 빌립니다).
+pub struct NormBank<'a> {
+    pub rows: Vec<&'a [f32]>,
+    pub norms: Vec<f32>,
+    pub zero: Vec<bool>,
+}
+
+impl<'a> NormBank<'a> {
+    pub fn new<V: AsRef<[f32]>>(rows: &'a [V]) -> Self {
+        Self::from_rows(rows.iter().map(|r| r.as_ref()).collect())
+    }
+
+    pub fn from_rows(rows: Vec<&'a [f32]>) -> Self {
+        let norms: Vec<f32> = if rows.len() >= PAR_MIN_ROWS {
+            use rayon::prelude::*;
+            rows.par_iter().map(|r| l2_norm_exact(r)).collect()
+        } else {
+            rows.iter().map(|r| l2_norm_exact(r)).collect()
+        };
+        let zero = rows.iter().map(|r| is_zero_vec(r)).collect();
+        Self { rows, norms, zero }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// 모든 행과의 코사인(원래 순서). 큰 뱅크는 병렬로 계산하고 순서대로 모읍니다.
+    pub fn sims(&self, q: &[f32], qn: f32) -> Vec<f32> {
+        if self.rows.len() >= PAR_MIN_ROWS {
+            use rayon::prelude::*;
+            self.rows
+                .par_iter()
+                .zip(self.norms.par_iter())
+                .map(|(r, n)| cosine_with_norms(q, qn, r, *n))
+                .collect()
+        } else {
+            self.rows.iter().zip(self.norms.iter()).map(|(r, n)| cosine_with_norms(q, qn, r, *n)).collect()
+        }
+    }
+
+    /// i 번째 행과의 코사인.
+    #[inline]
+    pub fn cos(&self, i: usize, q: &[f32], qn: f32) -> f32 {
+        cosine_with_norms(q, qn, self.rows[i], self.norms[i])
+    }
+}
+
+/// max_pool_sim 과 같은 결과(0.0 바닥 · 엄격한 `>` · 0벡터 행도 포함).
+pub fn max_pool_sim_bank(q: &[f32], qn: f32, bank: &NormBank) -> f32 {
+    let mut best = 0.0f32;
+    for s in bank.sims(q, qn) {
+        if s > best { best = s; }
+    }
+    best
+}
+
+/// weighted_max_pool_sim 과 같은 결과(0벡터 행 건너뜀 · 가중치 없으면 1.0).
+pub fn weighted_max_pool_sim_bank(q: &[f32], qn: f32, bank: &NormBank, weights: &[f32]) -> f32 {
+    let mut best = 0.0f32;
+    if bank.rows.len() >= PAR_MIN_ROWS {
+        let sims = bank.sims(q, qn);
+        for (i, s) in sims.into_iter().enumerate() {
+            if bank.zero[i] { continue; }
+            let w = weights.get(i).copied().unwrap_or(1.0);
+            let s = s * w;
+            if s > best { best = s; }
+        }
+    } else {
+        for i in 0..bank.rows.len() {
+            if bank.zero[i] { continue; }
+            let w = weights.get(i).copied().unwrap_or(1.0);
+            let s = bank.cos(i, q, qn) * w;
+            if s > best { best = s; }
+        }
+    }
+    best
+}
+
+/// `for e in bank { if zero(e) continue; m = max(m, cos) }` (0.0 바닥) 와 같은 결과.
+pub fn max_pool_sim_nonzero_bank(q: &[f32], qn: f32, bank: &NormBank) -> f32 {
+    let mut m = 0.0f32;
+    for (i, s) in bank.sims(q, qn).into_iter().enumerate() {
+        if bank.zero[i] { continue; }
+        if s > m { m = s; }
+    }
+    m
+}
+
+/// (category, key, embedding) 트리플 뱅크 + group_sims 의 묶음 구조를 미리 계산합니다.
+pub struct TripleBank<'a> {
+    pub bank: NormBank<'a>,
+    /// 각 행이 속한 묶음 번호(0벡터 행은 None — group_sims 처럼 건너뜀).
+    group_of: Vec<Option<usize>>,
+    /// 묶음 (category, key) 의 첫 등장 순서.
+    pub order: Vec<(String, String)>,
+}
+
+impl<'a> TripleBank<'a> {
+    pub fn new<V: AsRef<Vec<f32>>>(src: &'a [(String, String, V)]) -> Self {
+        let bank = NormBank::from_rows(src.iter().map(|(_, _, e)| e.as_ref().as_slice()).collect());
+        let mut order: Vec<(String, String)> = Vec::new();
+        let mut index: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        let mut group_of = Vec::with_capacity(src.len());
+        for (i, (c, k, _)) in src.iter().enumerate() {
+            if bank.zero[i] {
+                group_of.push(None);
+                continue;
+            }
+            let key = (c.clone(), k.clone());
+            let gi = match index.get(&key) {
+                Some(&g) => g,
+                None => {
+                    index.insert(key.clone(), order.len());
+                    order.push(key);
+                    order.len() - 1
+                }
+            };
+            group_of.push(Some(gi));
+        }
+        Self { bank, group_of, order }
+    }
+
+    /// group_sims 와 같은 (묶음별 sims, 풀 적재) 를 만듭니다.
+    fn group_sims(&self, q: &[f32], qn: f32, pool: &mut Vec<f32>) -> Vec<Vec<f32>> {
+        let mut sims: Vec<Vec<f32>> = vec![Vec::new(); self.order.len()];
+        let all = self.bank.sims(q, qn);
+        for (i, s) in all.into_iter().enumerate() {
+            if let Some(g) = self.group_of[i] {
+                pool.push(s);
+                sims[g].push(s);
+            }
+        }
+        sims
+    }
+
+    /// `for (_, _, e) in src { if zero continue; m = max(m, cos) }` (0.0 바닥).
+    pub fn max_nonzero(&self, q: &[f32], qn: f32) -> f32 {
+        max_pool_sim_nonzero_bank(q, qn, &self.bank)
+    }
+}
+
+/// surprisal_dual_scores 와 비트 단위로 같은 결과를 내는 뱅크 캐시 버전.
+/// (같은 순서로 풀을 채우고 같은 surprisal_finish 를 거칩니다)
+pub fn surprisal_dual_scores_bank(
+    query: &[f32],
+    filter_bias: &TripleBank,
+    filter_prej: &TripleBank,
+    schema_names: &[String],
+    schema_banks: &[NormBank],
+    schema_skip: &[bool],
+) -> (Vec<SurprisalScore>, Vec<SurprisalScore>) {
+    let qn = l2_norm_exact(query);
+    let mut pool: Vec<f32> = Vec::new();
+    let f_sims = filter_bias.group_sims(query, qn, &mut pool);
+    let p_sims = filter_prej.group_sims(query, qn, &mut pool);
+
+    let mut s_sims: Vec<Vec<f32>> = Vec::with_capacity(schema_banks.len());
+    for (i, bank) in schema_banks.iter().enumerate() {
+        let mut v: Vec<f32> = Vec::new();
+        if !schema_skip.get(i).copied().unwrap_or(false) {
+            let all = bank.sims(query, qn);
+            for (j, s) in all.into_iter().enumerate() {
+                if bank.zero[j] { continue; }
+                pool.push(s);
+                v.push(s);
+            }
+        }
+        s_sims.push(v);
+    }
+
+    surprisal_finish(&pool, &filter_bias.order, &f_sims, &filter_prej.order, &p_sims, schema_names, &s_sims)
+}
+
+// =====================================================================
+// 🌟 [STAGE1-CTX] RAW-CHUNK n-gram 채점표 (루프 밖에서 한 번 구축)
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   n-gram 마다 7개 카테고리 × get_multi_pass_contexts() 를 다시 만들고
+//   (ko 42KB · en 89KB 의 bias 문자열 재조립, 질의당 ~294회),
+//   키마다 format! 두 번 + HashMap 조회 + 384 f32 벡터 clone 두 번을 했습니다.
+//
+//  ── 해결 ──
+//   get_multi_pass_contexts 는 (BIAS_DICT, cat, lang) 의 순수 함수이므로
+//   카테고리별 (bias 행, prejudice 행) 인덱스를 미리 만들어 둡니다.
+//   조회 문자열·HashMap(같은 키는 마지막 삽입이 이김)은 기존과 똑같이 써서
+//   같은 벡터를 가리키고, 없는 키는 기존의 0벡터처럼 코사인 0.0 으로 취급합니다.
+//   점수 식(정렬·상위 5개 감쇠 합·앵커 0.5·길이 가중치)은 한 글자도 바꾸지 않습니다.
+// =====================================================================
+pub struct LayoutCatCtx {
+    pub cat: String,
+    /// 컨텍스트 키 순서대로 (bias 행, prejudice 행).
+    pub keys: Vec<(Option<usize>, Option<usize>)>,
+    pub anchor: Option<usize>,
+}
+
+pub struct LayoutScoreTable {
+    rows: Vec<Vec<f32>>,
+    norms: Vec<f32>,
+    row_of_key: std::collections::HashMap<String, usize>,
+    pub cats: Vec<LayoutCatCtx>,
+}
+
+impl LayoutScoreTable {
+    pub fn new() -> Self {
+        Self { rows: Vec::new(), norms: Vec::new(), row_of_key: std::collections::HashMap::new(), cats: Vec::new() }
+    }
+
+    fn intern(&mut self, lookup_key: &str, src: &std::collections::HashMap<String, Vec<f32>>) -> Option<usize> {
+        if let Some(&i) = self.row_of_key.get(lookup_key) {
+            return Some(i);
+        }
+        let v = src.get(lookup_key)?;
+        let i = self.rows.len();
+        self.norms.push(l2_norm_exact(v));
+        self.rows.push(v.clone());
+        self.row_of_key.insert(lookup_key.to_string(), i);
+        Some(i)
+    }
+
+    /// 카테고리 하나를 등록합니다(이미 있으면 아무것도 하지 않음).
+    /// `contexts` = get_multi_pass_contexts(cat, lang) 결과 그대로.
+    pub fn ensure_cat(
+        &mut self,
+        cat: &str,
+        contexts: Vec<(String, String, String)>,
+        layout_embs: &std::collections::HashMap<String, Vec<f32>>,
+        anchor_embs: &std::collections::HashMap<String, Vec<f32>>,
+    ) {
+        if self.cats.iter().any(|c| c.cat == cat) {
+            return;
+        }
+        let mut keys = Vec::with_capacity(contexts.len());
+        for (key, _bias, _prej) in contexts {
+            let b = self.intern(&format!("{}_{}_bias", cat, key), layout_embs);
+            let p = self.intern(&format!("{}_{}_prejudice", cat, key), layout_embs);
+            keys.push((b, p));
+        }
+        let anchor = self.intern_anchor(cat, anchor_embs);
+        self.cats.push(LayoutCatCtx { cat: cat.to_string(), keys, anchor });
+    }
+
+    fn intern_anchor(&mut self, cat: &str, anchor_embs: &std::collections::HashMap<String, Vec<f32>>) -> Option<usize> {
+        let key = format!("\u{0}anchor\u{0}{}", cat);
+        if let Some(&i) = self.row_of_key.get(&key) {
+            return Some(i);
+        }
+        let v = anchor_embs.get(cat)?;
+        let i = self.rows.len();
+        self.norms.push(l2_norm_exact(v));
+        self.rows.push(v.clone());
+        self.row_of_key.insert(key, i);
+        Some(i)
+    }
+
+    pub fn has_cat(&self, cat: &str) -> bool {
+        self.cats.iter().any(|c| c.cat == cat)
+    }
+
+    #[inline]
+    fn cos_row(&self, row: Option<usize>, q: &[f32], qn: f32) -> f32 {
+        match row {
+            Some(i) => cosine_with_norms(q, qn, &self.rows[i], self.norms[i]),
+            // 기존: unwrap_or(vec![0.0; 384]) → 노름 0 → 코사인 0.0
+            None => 0.0,
+        }
+    }
+
+    /// STAGE-1 RAW-CHUNK 의 카테고리별 기초 점수(등록 순서). 기존 인라인 루프와 비트 단위로 같습니다.
+    pub fn raw_chunk_scores(&self, test_emb: &[f32], verb_emb: &[f32], word_count: usize) -> Vec<(String, f32)> {
+        let qn = l2_norm_exact(test_emb);
+        let v_sim = cosine_with_norms(test_emb, qn, verb_emb, l2_norm_exact(verb_emb));
+        let beta = if word_count <= 2 { 0.05 } else { 0.10 };
+        let verb_penalty = v_sim * beta;
+        let penalty_weight = if word_count <= 2 { 0.3 } else { 0.7 };
+
+        let mut out = Vec::with_capacity(self.cats.len());
+        for c in &self.cats {
+            let mut field_scores: Vec<f32> = Vec::with_capacity(c.keys.len());
+            for (b, p) in &c.keys {
+                let bias_score = self.cos_row(*b, test_emb, qn);
+                let prej_score = self.cos_row(*p, test_emb, qn);
+                let field_score = (bias_score - (prej_score * penalty_weight) - verb_penalty).max(0.0);
+                field_scores.push(field_score);
+            }
+            let anchor_score = match c.anchor {
+                Some(i) => cosine_with_norms(test_emb, qn, &self.rows[i], self.norms[i]).max(0.0),
+                None => 0.0,
+            };
+            field_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let mut multi_pass_score = 0.0;
+            let mut weight = 1.0;
+            let max_pass = field_scores.len().min(5);
+            for i in 0..max_pass {
+                multi_pass_score += field_scores[i] * weight;
+                weight *= 0.5;
+            }
+            multi_pass_score += anchor_score * 0.5;
+            let length_weight = 1.0 + ((word_count as f32 - 2.0) * 0.15);
+            let weighted_base_score = multi_pass_score * length_weight;
+            out.push((c.cat.clone(), weighted_base_score));
+        }
+        out
+    }
+
+    /// GAP BRIDGING 대결 점수: 카테고리의 (bias − prejudice).max(0) 상위 5개 감쇠 합.
+    /// 등록되지 않은 카테고리면 None.
+    pub fn gap_score(&self, emb: &[f32], cat: &str) -> Option<f32> {
+        let c = self.cats.iter().find(|c| c.cat == cat)?;
+        let qn = l2_norm_exact(emb);
+        let mut scores: Vec<f32> = Vec::with_capacity(c.keys.len());
+        for (b, p) in &c.keys {
+            scores.push((self.cos_row(*b, emb, qn) - self.cos_row(*p, emb, qn)).max(0.0));
+        }
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let mut score = 0.0;
+        let mut weight = 1.0;
+        for j in 0..scores.len().min(5) {
+            score += scores[j] * weight;
+            weight *= 0.5;
+        }
+        Some(score)
+    }
+}
+
+impl Default for LayoutScoreTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 🌟 [EMBED-PREFETCH] RAW-CHUNK 가 평가할 n-gram 스팬 (start, end, text) 목록.
+/// 기존 이중 루프(start, end = start+2 ..= min(len, start+8))와 같은 순서입니다.
+pub fn raw_chunk_spans(words: &[&str]) -> Vec<(usize, usize, String)> {
+    let mut spans = Vec::new();
+    for start in 0..words.len() {
+        let max_end = words.len().min(start + 8);
+        for end in (start + 2)..=max_end {
+            spans.push((start, end, words[start..end].join(" ")));
+        }
+    }
+    spans
+}
+
+/// 🌟 [EMBED-PREFETCH] 연속 단어 창(길이 min_len..=max_len) 텍스트. 추측성 프리패치용.
+pub fn contiguous_windows(words: &[&str], min_len: usize, max_len: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for start in 0..words.len() {
+        for len in min_len.max(1)..=max_len {
+            if start + len > words.len() { break; }
+            out.push(words[start..start + len].join(" "));
+        }
+    }
+    out
+}
+
+/// 🌟 [EMBED-PREFETCH] scheduler 의 필드 뱅크 루프가 필드마다 1건씩 요청하는 텍스트
+/// (bias_target · split_bias_phrases_weighted 구 · 결합 prejudice " , ")를 같은 규칙으로 모읍니다.
+/// `prej_bank` = Some((doc_lang, page_type)) 이면 필드별 prejudice_phrase_bank 구도 넣습니다.
+pub fn field_bank_prefetch_texts(fields: &[(String, String, String, String)], prej_bank: Option<(&str, &str)>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (f_idx, (fname, _, bias_target, predefined_prej)) in fields.iter().enumerate() {
+        out.push(bias_target.clone());
+        let (phrases, _) = split_bias_phrases_weighted(bias_target);
+        out.extend(phrases);
+        if let Some((doc_lang, page_type)) = prej_bank {
+            out.extend(prejudice_phrase_bank(doc_lang, page_type, fname));
+        }
+        let mut dynamic_prej_texts = Vec::new();
+        if !predefined_prej.trim().is_empty() {
+            dynamic_prej_texts.push(predefined_prej.clone());
+        }
+        for (other_idx, (_, _, other_bias, _)) in fields.iter().enumerate() {
+            if f_idx != other_idx {
+                dynamic_prej_texts.push(other_bias.clone());
+            }
+        }
+        out.push(dynamic_prej_texts.join(" , "));
+    }
+    out
+}
+
+/// 🌟 [EMBED-PREFETCH] LABEL BANK 루프(필드마다 라벨 구 + 편견 구 2회 호출)의 텍스트를 한 벌로 모읍니다.
+/// 라벨 구가 비어 있는 필드는 루프처럼 건너뜁니다.
+pub fn label_bank_prefetch_texts(fields: &[(String, String, String, String)], doc_lang: &str, page_type: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (fname, _, _, _) in fields {
+        let (label_phrases, _) = label_phrase_bank(doc_lang, page_type, fname);
+        if label_phrases.is_empty() {
+            continue;
+        }
+        out.extend(label_phrases);
+        out.extend(prejudice_phrase_bank(doc_lang, page_type, fname));
+    }
+    out
 }

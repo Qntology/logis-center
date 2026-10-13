@@ -207,6 +207,22 @@ pub struct Qwen3_5GatedDeltaNet {
     conv_state_cache: Option<Tensor>,
     recurrent_state_cache: Option<Tensor>,
     pub is_state_dirty: bool,
+    // 🌟 [GDN-FUSED] v-head 가 읽는 k-head 대응 방식 (GGUF alphaedge.v_head_order, 기본 Grouped = repeat_interleave)
+    v_head_order: candle_core::delta_rule::GdnHeadOrder,
+}
+
+/// 🌟 [GDN-FUSED] GGUF 메타데이터 `alphaedge.v_head_order` ("grouped" / "tiled"). 없으면 Qwen3.5 기본값 Grouped.
+fn gguf_v_head_order<R: Read + Seek>(gguf: &Gguf<R>) -> candle_core::delta_rule::GdnHeadOrder {
+    let v = gguf
+        .get_matedata("alphaedge.v_head_order")
+        .ok()
+        .and_then(|v| v.to_string().ok().cloned())
+        .unwrap_or_default();
+    if v.trim().eq_ignore_ascii_case("tiled") {
+        candle_core::delta_rule::GdnHeadOrder::Tiled
+    } else {
+        candle_core::delta_rule::GdnHeadOrder::Grouped
+    }
 }
 
 impl Qwen3_5GatedDeltaNet {
@@ -254,6 +270,7 @@ impl Qwen3_5GatedDeltaNet {
             conv_state_cache: None,
             recurrent_state_cache: None,
             is_state_dirty: false,
+            v_head_order: candle_core::delta_rule::GdnHeadOrder::Grouped,
         })
     }
 
@@ -311,6 +328,7 @@ impl Qwen3_5GatedDeltaNet {
             conv_state_cache: None,
             recurrent_state_cache: None,
             is_state_dirty: false,
+            v_head_order: gguf_v_head_order(gguf),
         })
     }
 
@@ -331,7 +349,8 @@ impl Qwen3_5GatedDeltaNet {
         let conv_state_new = Tensor::cat(&[&state_to_use, xs], D::Minus1)?;
         
         let next_cache_len = conv_state_new.dim(D::Minus1)?;
-        let conv_update = conv_state_new.narrow(D::Minus1, next_cache_len - take_len, take_len)?;
+        // 🌟 [GDN-02] narrow 뷰는 [B,C,K] 버퍼 전체를 붙잡으므로 마지막 K-1 열만 연속 복사해 둡니다. (값은 비트 단위로 같음)
+        let conv_update = conv_state_new.narrow(D::Minus1, next_cache_len - take_len, take_len)?.contiguous()?;
         self.conv_state_cache = Some(conv_update);
         
         let out = conv1d_depthwise(&conv_state_new, self.conv1d.weight(), self.conv1d.bias())?;
@@ -611,9 +630,15 @@ impl Qwen3_5GatedDeltaNet {
             self.recurrent_state_cache = Some(rec.to_device(dev)?.to_dtype(candle_core::DType::F32)?);
         }
 
+        // 🌟 [GDN-FUSED] 포크의 융합 커널이 있으면 혼합기 전체(conv·SiLU·L2 norm·게이트·스캔)를 한 번에 계산합니다.
+        let gdn_cfg = self.gdn_config();
+        if crate::models::common::gdn_fused_enabled(dev, &gdn_cfg) {
+            return self.forward_fused(xs, &gdn_cfg);
+        }
+
         let (bs, seq_len, _) = xs.dims3()?;
-        
-        
+
+
         let mut mixed_qkv = self.in_proj_qkv.forward(xs)?
             .to_dtype(dtype)? // 👈 SSM 입력 타입 보정
             .transpose(1, 2)?
@@ -632,8 +657,10 @@ impl Qwen3_5GatedDeltaNet {
             let take_len = self.conv_kernel_size - 1;
             let (bs, dim, seq_len) = mixed_qkv.dims3()?;
             
+            // 🌟 [GDN-02] narrow 뷰를 그대로 두면 [B,C,T] 프리필 버퍼 전체가 상태로 살아남아(RAM 대피 시 통째로 복사)
+            //    마지막 K-1 열만 연속 복사합니다. 값은 비트 단위로 같습니다.
             let next_conv_state = if seq_len >= take_len {
-                mixed_qkv.narrow(D::Minus1, seq_len - take_len, take_len)?
+                mixed_qkv.narrow(D::Minus1, seq_len - take_len, take_len)?.contiguous()?
             } else {
                 mixed_qkv.pad_with_zeros(D::Minus1, take_len - seq_len, 0)?
             };
@@ -708,6 +735,81 @@ impl Qwen3_5GatedDeltaNet {
         Ok(output)
     }
 
+    /// 🌟 [GDN-FUSED] 포크 융합 커널에 넘길 층 형상.
+    fn gdn_config(&self) -> candle_core::delta_rule::GdnConfig {
+        let mut cfg = candle_core::delta_rule::GdnConfig::new(
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+        );
+        cfg.conv_kernel = self.conv_kernel_size;
+        cfg.v_head_order = self.v_head_order;
+        cfg
+    }
+
+    /// 🌟 [GDN-FUSED] 융합 경로: 프로젝션 → `fused_gated_delta_rule`(conv+SiLU+L2norm+게이트+스캔, F32 연산)
+    /// → `fused_gated_rms_norm` → out_proj.
+    ///
+    /// 상태 형식은 기존 경로와 같습니다: conv 상태 `[B, C, K-1]` (모델 dtype, conv 이전 입력의 마지막 K-1 열),
+    /// 재귀 상태 `[B, Hv, Dk, Dv]` F32. 커널이 새 상태를 따로 만들어 돌려주므로 프리필 버퍼를 붙잡지 않습니다.
+    /// 기존 경로와 달리 conv·L2 norm·g·beta 를 F16 모델(2B)에서도 F32 로 계산합니다(기준 구현에 더 가까움).
+    fn forward_fused(&mut self, xs: &Tensor, cfg: &candle_core::delta_rule::GdnConfig) -> Result<Tensor> {
+        let dtype = xs.dtype();
+        let (bs, seq_len, _) = xs.dims3()?;
+        // [B, T, C] 그대로 넘깁니다 (전치·연속 복사 없음).
+        let mixed_qkv = self.in_proj_qkv.forward(xs)?.to_dtype(dtype)?;
+        let z = self
+            .in_proj_z
+            .forward(xs)?
+            .to_dtype(dtype)?
+            .reshape((bs, seq_len, self.num_v_heads, self.head_v_dim))?;
+        let b = self.in_proj_b.forward(xs)?.to_dtype(dtype)?;
+        let a = self.in_proj_a.forward(xs)?.to_dtype(dtype)?;
+
+        // 스냅샷 등에서 온 conv 상태 길이가 K-1 과 다르면 기존 경로와 같은 규칙(뒤쪽 K-1 열 / 앞쪽 0 채움)으로 맞춥니다.
+        let take_len = self.conv_kernel_size - 1;
+        // (커널이 실패해도 문맥을 잃지 않도록 기존 상태는 성공한 뒤에만 교체합니다)
+        let conv_state = match self.conv_state_cache.as_ref() {
+            Some(s) => {
+                let len = s.dim(D::Minus1)?;
+                let s = if len > take_len {
+                    s.narrow(D::Minus1, len - take_len, take_len)?
+                } else if len < take_len {
+                    s.pad_with_zeros(D::Minus1, take_len - len, 0)?
+                } else {
+                    s.clone()
+                };
+                Some(s.contiguous()?)
+            }
+            None => None,
+        };
+        let rec_state = self.recurrent_state_cache.clone();
+
+        let out = candle_core::delta_rule::fused_gated_delta_rule(
+            &mixed_qkv,
+            self.conv1d.weight(),
+            self.conv1d.bias(),
+            conv_state.as_ref(),
+            &a,
+            &b,
+            &self.a_log,
+            &self.dt_bias,
+            rec_state.as_ref(),
+            cfg,
+        )?;
+        drop(mixed_qkv);
+        self.conv_state_cache = Some(out.conv_state);
+        self.recurrent_state_cache = Some(out.recurrent_state);
+
+        // 게이트 RMSNorm: x / sqrt(mean(x²)+eps) · w · silu(z), F32 연산 후 모델 dtype.
+        let core = candle_core::delta_rule::fused_gated_rms_norm(&out.out, &z, &self.norm.weight, self.norm.eps())?;
+        let core = core.reshape((bs, seq_len, ()))?;
+        let output = self.out_proj.forward(&core)?.to_dtype(dtype)?;
+        self.is_state_dirty = true;
+        Ok(output)
+    }
+
     pub fn clear_cache(&mut self) {
         self.conv_state_cache = None;
         self.recurrent_state_cache = None;
@@ -739,11 +841,11 @@ impl Qwen3_5GatedDeltaNet {
         self.conv1d = candle_nn::Conv1d::new(dummy_t.clone(), None, candle_nn::Conv1dConfig::default());
     }
 
-    pub fn load_weights_inplace<R: std::io::Read + std::io::Seek>(&mut self, ct: &candle_core::quantized::gguf_file::Content, reader: &mut R, prefix: &str, device: &Device) -> Result<()> {
+    pub fn load_weights_inplace(&mut self, ct: &candle_core::quantized::gguf_file::Content, data: &[u8], prefix: &str, device: &Device) -> Result<()> {
         let conv_dim = self.key_dim * 2 + self.value_dim;
         
         
-        let t_conv1d = ct.tensor(reader, &format!("{prefix}.ssm_conv1d.weight"), device)?;
+        let t_conv1d = crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.ssm_conv1d.weight"), device)?;
         let conv1d_weight_raw = t_conv1d.dequantize_f16(device).or_else(|_| t_conv1d.dequantize(device))?.to_dtype(DType::F32)?.contiguous()?;
         
         let conv1d_weight = conv1d_weight_raw.reshape((conv_dim, 1, self.conv_kernel_size))?;
@@ -753,27 +855,48 @@ impl Qwen3_5GatedDeltaNet {
         });
         
         
-        let t_dt = ct.tensor(reader, &format!("{prefix}.ssm_dt.bias"), device)?;
+        let t_dt = crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.ssm_dt.bias"), device)?;
         let dt_bias_raw = t_dt.dequantize_f16(device).or_else(|_| t_dt.dequantize(device))?;
         self.dt_bias = dt_bias_raw.to_dtype(DType::F32)?; 
         
         
-        let t_a = ct.tensor(reader, &format!("{prefix}.ssm_a"), device)?;
+        let t_a = crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.ssm_a"), device)?;
         let a_log_raw = t_a.dequantize_f16(device).or_else(|_| t_a.dequantize(device))?;
         self.a_log = a_log_raw.to_dtype(DType::F32)?;  
         
         
-        let t_norm = ct.tensor(reader, &format!("{prefix}.ssm_norm.weight"), device)?;
+        let t_norm = crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.ssm_norm.weight"), device)?;
         let norm_weight = t_norm.dequantize_f16(device).or_else(|_| t_norm.dequantize(device))?.to_dtype(DType::F32)?;
         self.norm = Qwen3_5RMSNormGated::from_weight(norm_weight, 1e-6)?;
         
-        self.out_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ssm_out.weight"), device)?)?, None));
-        self.in_proj_qkv = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_qkv.weight"), device)?)?, None));
-        self.in_proj_z = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_gate.weight"), device)?)?, None));
-        self.in_proj_b = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ssm_beta.weight"), device)?)?, None));
-        self.in_proj_a = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ssm_alpha.weight"), device)?)?, None));
+        self.out_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.ssm_out.weight"), device)?)?, None));
+        self.in_proj_qkv = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.attn_qkv.weight"), device)?)?, None));
+        self.in_proj_z = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.attn_gate.weight"), device)?)?, None));
+        self.in_proj_b = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.ssm_beta.weight"), device)?)?, None));
+        self.in_proj_a = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.ssm_alpha.weight"), device)?)?, None));
         Ok(())
     }
+}
+
+/// 🌟 [OFFLOAD-ATTN] 블록을 한 번에 모아 계산할 때 허용하는 최대 크기(복원 기준 K+V 바이트).
+/// 넘으면 블록을 하나씩 올려 계산하는 기존 경로로 메모리를 묶어 둡니다. (4B 기준 약 12만 토큰)
+pub const OFFLOAD_ATTN_GATHER_BUDGET: usize = 512 * 1024 * 1024;
+
+/// 🌟 [OFFLOAD-ATTN] fused flash-attn 을 쓸 수 없을 때(빌드·설정·자가 검증) 비융합 경로가 만들 점수 행렬의 상한.
+/// 넘으면 프리필을 블록 순회 경로로 계산합니다.
+pub const OFFLOAD_ATTN_UNFUSED_BUDGET: usize = 256 * 1024 * 1024;
+
+/// `LOGIS_KV_BLOCK_ATTN=legacy` (또는 `block`, `off`) 이면 기존 블록 순회 경로만 씁니다. (A/B 비교용)
+fn offload_attn_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("LOGIS_KV_BLOCK_ATTN").unwrap_or_default().trim().to_ascii_lowercase();
+        let on = !matches!(v.as_str(), "legacy" | "block" | "off" | "0" | "false");
+        if !on {
+            println!("[OFFLOAD-ATTN] LOGIS_KV_BLOCK_ATTN={v} → Qwen3.5 어텐션을 기존 블록 순회 경로로 계산합니다.");
+        }
+        on
+    })
 }
 
 pub struct Qwen3_5Attention {
@@ -801,6 +924,30 @@ pub struct Qwen3_5Attention {
     pub vram_merged_k: Option<Tensor>,
     pub vram_merged_v: Option<Tensor>,
     pub merged_vram_block_count: usize,
+    // 🌟 [KV-PRECISION] true 면 새 블록을 압축(TurboQuant·FP8)하지 않고 모델 dtype 으로 둡니다.
+    //    문맥 시작 시 VRAM 여유로 정합니다. RAM/SSD 로 내릴 때는 기존처럼 FP8 로 줄여 내립니다.
+    pub kv_exact: bool,
+    /// 🌟 [KV-HALF] 원본 KV 를 F16(넘치면 BF16) 으로 보관합니다 (F32 모델에서 원본 KV 를 고른 경우, kv_turbo::kv_half_mode).
+    pub kv_half: bool,
+}
+
+/// 🌟 [KV-HALF] 원본 KV 조각을 반정밀도로 바꿉니다.
+/// - `prev` 가 있으면(기존 블록에 이어 붙임) 그 dtype 을 따릅니다. F16 블록에 붙는 값은 F16 범위로 잘라 inf 를 막습니다.
+/// - 새 블록이면 |x| 최댓값을 한 번 재서 F16 범위를 넘으면 BF16 으로 보관합니다.
+pub fn half_kv_piece(x: &Tensor, prev: Option<DType>) -> Result<Tensor> {
+    let lim = crate::models::common::kv_turbo::F16_SAFE_MAX as f64;
+    match prev {
+        Some(DType::BF16) => Ok(x.to_dtype(DType::BF16)?),
+        Some(_) => Ok(x.clamp(-lim, lim)?.to_dtype(DType::F16)?),
+        None => {
+            let max_abs = x.abs()?.flatten_all()?.max(0)?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+            if max_abs.is_finite() && (max_abs as f64) <= lim {
+                Ok(x.to_dtype(DType::F16)?)
+            } else {
+                Ok(x.to_dtype(DType::BF16)?)
+            }
+        }
+    }
 }
 
 impl Qwen3_5Attention {
@@ -833,6 +980,8 @@ impl Qwen3_5Attention {
             vram_merged_k: None,
             vram_merged_v: None,
             merged_vram_block_count: 0,
+            kv_exact: false,
+            kv_half: false,
         })
     }
 
@@ -866,6 +1015,8 @@ impl Qwen3_5Attention {
             vram_merged_k: None,
             vram_merged_v: None,
             merged_vram_block_count: 0,
+            kv_exact: false,
+            kv_half: false,
         })
     }
 
@@ -946,6 +1097,12 @@ impl Qwen3_5Attention {
                             let nv = codec.pack_v(&v_piece)?;
                             inner.k_cache = Some(Tensor::cat(&[&pk, &nk], 2)?.contiguous()?);
                             inner.v_cache = Some(Tensor::cat(&[&pv, &nv], 2)?.contiguous()?);
+                        } else if self.kv_exact && self.kv_half && matches!(pk.dtype(), DType::F16 | DType::BF16) {
+                            // 🌟 [KV-HALF] 보관 dtype 그대로 이어 붙입니다 (블록 전체를 F32 로 풀었다 다시 줄이지 않습니다).
+                            let nk = half_kv_piece(&k_piece, Some(pk.dtype()))?;
+                            let nv = half_kv_piece(&v_piece, Some(pv.dtype()))?;
+                            inner.k_cache = Some(Tensor::cat(&[&pk, &nk], 2)?.contiguous()?);
+                            inner.v_cache = Some(Tensor::cat(&[&pv, &nv], 2)?.contiguous()?);
                         } else {
                             let pk_f = pk.to_dtype(target_dtype).unwrap_or_else(|_| pk.clone());
                             let pv_f = pv.to_dtype(target_dtype).unwrap_or_else(|_| pv.clone());
@@ -953,8 +1110,10 @@ impl Qwen3_5Attention {
                             let cat_k = Tensor::cat(&[&pk_f, &k_piece], 2)?.contiguous()?;
                             let cat_v = Tensor::cat(&[&pv_f, &v_piece], 2)?.contiguous()?;
 
-                            inner.k_cache = Some(if dev.is_cuda_or_rocm() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
-                            inner.v_cache = Some(if dev.is_cuda_or_rocm() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
+                            // 🌟 [KV-PRECISION] 원본 KV 모드면 FP8 로 줄이지 않습니다.
+                            let fp8 = dev.is_cuda_or_rocm() && !self.kv_exact;
+                            inner.k_cache = Some(if fp8 { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
+                            inner.v_cache = Some(if fp8 { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
                         }
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
@@ -979,9 +1138,14 @@ impl Qwen3_5Attention {
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
-                    let codec = tq_codec
-                        .get_or_insert_with(|| crate::models::common::kv_turbo::block_codec(head_dim, dev))
-                        .clone();
+                    // 🌟 [KV-PRECISION] 원본 KV 모드면 압축 코덱을 쓰지 않습니다.
+                    let codec = if self.kv_exact {
+                        None
+                    } else {
+                        tq_codec
+                            .get_or_insert_with(|| crate::models::common::kv_turbo::block_codec(head_dim, dev))
+                            .clone()
+                    };
                     match &codec {
                         Some(codec) => {
                             // 🌟 [TURBO-KV-BLOCK] 새 블록은 처음부터 TurboQuant 압축 u32 행으로 보관합니다.
@@ -989,9 +1153,15 @@ impl Qwen3_5Attention {
                             inner.v_cache = Some(codec.pack_v(&v_piece)?);
                             inner.tq = Some(codec.meta);
                         }
+                        None if self.kv_exact && self.kv_half => {
+                            // 🌟 [KV-HALF] 원본 KV 를 F16 으로 보관합니다 (|x| 가 F16 범위를 넘으면 BF16).
+                            inner.k_cache = Some(half_kv_piece(&k_piece, None)?);
+                            inner.v_cache = Some(half_kv_piece(&v_piece, None)?);
+                        }
                         None => {
-                            inner.k_cache = Some(if dev.is_cuda_or_rocm() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece });
-                            inner.v_cache = Some(if dev.is_cuda_or_rocm() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
+                            let fp8 = dev.is_cuda_or_rocm() && !self.kv_exact;
+                            inner.k_cache = Some(if fp8 { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece });
+                            inner.v_cache = Some(if fp8 { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
                         }
                     }
                 }
@@ -1011,15 +1181,16 @@ impl Qwen3_5Attention {
         let total_tokens_now = seqlen_offset + q_len;
 
         
-        // 이제 0.6B처럼 무조건 청크 단위 Online Softmax 로직을 타게 되어 수압이 0으로 방어됩니다.
-        // 🌟 [TURBO-KV-BLOCK] 블록 순회 Online Softmax 계산은 kv_turbo::BlockAttention 으로 옮겼습니다.
-        //    FP8/평문 블록은 기존과 똑같이 계산하고, TurboQuant 블록은 풀어서(회전 형식이면 회전 좌표계에서) 계산한 뒤 합칩니다.
-        let q_aligned = (query_states * self.scaling)?.contiguous()?;
-        let mut block_attn = crate::models::common::kv_turbo::BlockAttention::new(
-            &q_aligned,
-            self.num_key_value_heads,
-            self.num_kv_groups,
-        )?;
+        // 🌟 [OFFLOAD-ATTN] 블록을 먼저 계산 장치로 모은 뒤(필요하면 RAM/SSD 에서 읽어 오고) 한 번에 계산합니다.
+        //   - 디코딩: 모든 블록이 같은 TurboQuant 형식이면 압축 행을 이어 붙여 fused 커널 한 번으로 계산합니다.
+        //   - 프리필(과 그 밖의 경우): 과거 이력은 복원하고, 이번 청크는 압축 전 원본 K/V 로 이어 붙여 flash-attn 으로 계산합니다.
+        //     기존 블록 경로는 방금 압축한 이번 청크를 다시 풀어 썼기 때문에 프롬프트 전체가 압축 오차를 안고 계산되었습니다.
+        //   - 디코딩 배치 계획이 Vram 인데 RAM 에 내려가 있던 블록(프리필 중 RAM 으로 대피한 블록, SSD 에서 읽은 블록)은
+        //     한 번 올린 뒤 VRAM 에 둡니다. 토큰마다 같은 블록을 다시 PCIe 로 올리지 않습니다.
+        //   - 모은 크기가 예산을 넘거나 계산이 실패하면 기존 블록 순회(온라인 소프트맥스) 경로로 계산합니다.
+        let promote_to_vram =
+            self.kv_residency == crate::utils::resources::KvResidency::Vram && !dev.is_cpu();
+        let mut parts: Vec<crate::models::common::kv_turbo::KvPart> = Vec::with_capacity(self.kv_blocks.len());
 
         for block in &self.kv_blocks {
             let (index, b_off, b_len) = {
@@ -1035,12 +1206,32 @@ impl Qwen3_5Attention {
                 if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                     if inner.tq.is_some() {
                         // 🌟 [TURBO-KV-BLOCK] 압축 블록은 형 변환 없이 장치만 맞춥니다. (RAM 블록이면 압축된 채로 PCIe 전송)
-                        (k.to_device(dev)?, v.to_device(dev)?, inner.tq)
+                        let (kd, vd) = (k.to_device(dev)?, v.to_device(dev)?);
+                        if promote_to_vram && inner.location != KVLocation::VRAM {
+                            inner.k_cache = Some(kd.clone());
+                            inner.v_cache = Some(vd.clone());
+                            inner.location = KVLocation::VRAM;
+                            let mut reg = self.registry.entries.write().unwrap();
+                            if index < reg.len() && self.layer_idx < reg[index].location.len() {
+                                reg[index].location[self.layer_idx] = KVLocation::VRAM;
+                            }
+                        }
+                        (kd, vd, inner.tq)
                     } else if inner.location == KVLocation::VRAM {
                         (k.to_dtype(target_dtype).unwrap_or_else(|_| k.clone()), v.to_dtype(target_dtype).unwrap_or_else(|_| v.clone()), None) // VRAM에 있다면 복원해서 씀
                     } else {
-                        // RAM에 있다면 GPU로 잠깐 복사해서 씀
-                        (k.to_device(dev)?.to_dtype(target_dtype)?, v.to_device(dev)?.to_dtype(target_dtype)?, None)
+                        // RAM에 있다면 GPU로 복사해서 씀 (배치 계획이 Vram 이면 저장 형식 그대로 VRAM 에 둡니다)
+                        let (kd, vd) = (k.to_device(dev)?, v.to_device(dev)?);
+                        if promote_to_vram {
+                            inner.k_cache = Some(kd.clone());
+                            inner.v_cache = Some(vd.clone());
+                            inner.location = KVLocation::VRAM;
+                            let mut reg = self.registry.entries.write().unwrap();
+                            if index < reg.len() && self.layer_idx < reg[index].location.len() {
+                                reg[index].location[self.layer_idx] = KVLocation::VRAM;
+                            }
+                        }
+                        (kd.to_dtype(target_dtype)?, vd.to_dtype(target_dtype)?, None)
                     }
                 } else {
                     let mut k_cpu = None;
@@ -1176,48 +1367,83 @@ impl Qwen3_5Attention {
                         }
                     }
                     
-                    let fallback_shape = vec![1, self.num_key_value_heads, b_len, self.head_dim]; 
-                    let k_safe = k_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
-                    let v_safe = v_cpu.unwrap_or_else(|| Tensor::zeros(fallback_shape.as_slice(), DType::BF16, &Device::Cpu).unwrap());
-                    
-                    let (k_gpu, v_gpu) = if loaded_tq.is_some() {
-                        // 🌟 [TURBO-KV-BLOCK] 압축 블록은 압축된 채로 장치에 올립니다. (복원은 누산기가 합니다)
-                        (k_safe.to_device(dev)?, v_safe.to_device(dev)?)
-                    } else {
-                        (k_safe.to_device(dev)?.to_dtype(target_dtype)?, v_safe.to_device(dev)?.to_dtype(target_dtype)?)
+                    // 🌟 [OFFLOAD-ATTN] RAM 캐시에도 SSD 에도 블록이 없으면 0 으로 채운 K/V 를 어텐션에 넣지 않습니다.
+                    //    (0 키는 점수 0 으로 소프트맥스에 끼어들어 실제 문맥을 희석합니다. 빈 블록을 캐시에 남기지도 않아서
+                    //     비동기 SSD 기록이 끝난 뒤의 토큰에서는 다시 읽어 옵니다)
+                    let (Some(k_safe), Some(v_safe)) = (k_cpu, v_cpu) else {
+                        static MISSING_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !MISSING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            println!(
+                                "[OFFLOAD-ATTN] ⚠️ 레이어 {} 블록 {} (토큰 {}..{}) 를 RAM 캐시와 SSD 어디에서도 찾지 못해 이번 계산에서 제외합니다. (0 으로 채워 넣던 기존 동작은 문맥을 희석했습니다. 이후 같은 경고는 생략)",
+                                self.layer_idx, index, b_off, b_off + b_len
+                            );
+                        }
+                        continue;
                     };
 
-                    
-                    inner.k_cache = Some(k_safe);
-                    inner.v_cache = Some(v_safe);
-                    inner.location = KVLocation::RAM;
+                    // 🌟 [TURBO-KV-BLOCK] 압축 블록은 압축된 채로 장치에 올립니다. (복원은 계산 경로가 합니다)
+                    let (k_raw, v_raw) = (k_safe.to_device(dev)?, v_safe.to_device(dev)?);
+                    let (k_gpu, v_gpu) = if loaded_tq.is_some() {
+                        (k_raw.clone(), v_raw.clone())
+                    } else {
+                        (k_raw.to_dtype(target_dtype)?, v_raw.to_dtype(target_dtype)?)
+                    };
+
                     inner.tq = loaded_tq;
+                    if promote_to_vram {
+                        // 🌟 [OFFLOAD-ATTN] 배치 계획이 Vram 이면 저장 형식 그대로 VRAM 에 두고, RAM 사본은 버립니다.
+                        inner.k_cache = Some(k_raw);
+                        inner.v_cache = Some(v_raw);
+                        inner.location = KVLocation::VRAM;
+                        let reg = self.registry.entries.read().unwrap();
+                        if index < reg.len() {
+                            if let Ok(mut cache) = reg[index].bitkv_cache.write() {
+                                if self.layer_idx < cache.len() {
+                                    cache[self.layer_idx] = None;
+                                }
+                            }
+                        }
+                        drop(reg);
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if index < reg.len() && self.layer_idx < reg[index].location.len() {
+                            reg[index].location[self.layer_idx] = KVLocation::VRAM;
+                        }
+                    } else {
+                        inner.k_cache = Some(k_safe);
+                        inner.v_cache = Some(v_safe);
+                        inner.location = KVLocation::RAM;
+                    }
 
                     (k_gpu, v_gpu, loaded_tq)
                 }
             };
 
-            match block_tq {
-                Some(meta) => match crate::models::common::kv_turbo::codec_for(&meta, dev) {
-                    Ok(codec) => block_attn.add_packed(&k_block, &v_block, &codec, attention_mask, b_off)?,
-                    Err(e) => {
-                        // 이 빌드가 압축 블록을 풀 수 없으면(turbo-quant 미빌드 등) 그 블록만 건너뜁니다.
-                        println!("[TURBO-KV-BLOCK] 레이어 {} 블록 {} 를 복원할 수 없어 건너뜁니다: {}", self.layer_idx, index, e);
-                    }
-                },
-                None => block_attn.add_plain(&k_block, &v_block, attention_mask, b_off)?,
+            // 블록 텐서의 실제 행 수를 넘지 않게 합니다. (SSD 파일이 장부보다 짧은 경우 대비)
+            let rows = k_block.dim(2).unwrap_or(0).min(v_block.dim(2).unwrap_or(0));
+            let len = b_len.min(rows);
+            if len == 0 {
+                continue;
             }
-
-            drop(k_block);
-            drop(v_block);
+            parts.push(crate::models::common::kv_turbo::KvPart {
+                k: k_block,
+                v: v_block,
+                tq: block_tq,
+                off: b_off,
+                len,
+            });
         }
 
-        
-        let attn_output = if let Some(out) = block_attn.finish()? {
-            out.to_dtype(target_dtype)? // 👈 F32 정밀도 연산 후 BF16 변환
-        } else {
-            return Err(anyhow!("No KV data processed"));
-        };
+        let attn_output = self.attend_parts(
+            &query_states,
+            &key_states,
+            &value_states,
+            &parts,
+            attention_mask,
+            seqlen_offset,
+            total_tokens_now,
+        )?;
+        drop(parts);
+        let attn_output = attn_output.to_dtype(target_dtype)?;
 
         let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?.contiguous()?;
         
@@ -1228,6 +1454,97 @@ impl Qwen3_5Attention {
         let attn_output = attn_output.mul(&gate_final)?;
         
         Ok(attn_output.apply(&self.o_proj)?.to_dtype(target_dtype)?)
+    }
+
+    /// 🌟 [OFFLOAD-ATTN] 계산 장치로 모은 블록(`parts`)으로 어텐션을 계산합니다.
+    /// 출력: `(b, q_heads, q_len, d)` (dtype 은 호출부가 맞춥니다)
+    ///
+    /// 1. 디코딩이고 모든 블록이 같은 TurboQuant 형식이면: 압축 행을 이어 붙여 fused 커널 한 번.
+    /// 2. 그 밖에는: 과거 이력(복원) + 이번 스텝의 원본 K/V → 타일 flash-attn 한 번.
+    /// 3. 모을 크기가 [`OFFLOAD_ATTN_GATHER_BUDGET`] 를 넘거나, 1·2 가 실패하거나,
+    ///    `LOGIS_KV_BLOCK_ATTN=legacy` 이면: 기존 블록 순회(온라인 소프트맥스).
+    #[allow(clippy::too_many_arguments)]
+    fn attend_parts(
+        &self,
+        query_states: &Tensor,
+        key_states: &Tensor,
+        value_states: &Tensor,
+        parts: &[crate::models::common::kv_turbo::KvPart],
+        attention_mask: Option<&Tensor>,
+        seqlen_offset: usize,
+        total_tokens: usize,
+    ) -> Result<Tensor> {
+        use crate::models::common::{accel_check, kv_turbo};
+        let q_len = query_states.dim(2)?;
+        let dev = query_states.device();
+        if offload_attn_enabled() {
+            let dense_bytes = total_tokens
+                * self.num_key_value_heads
+                * self.head_dim
+                * 2
+                * query_states.dtype().size_in_bytes();
+            // 이 dtype·head_dim 의 flash-attn 자가 검증. fused 커널을 못 쓰면 candle 의 비융합 경로가
+            // 점수 행렬(q_len × 전체 길이) 전체를 만들므로, 긴 프리필은 블록 순회 경로로 메모리를 묶어 둡니다.
+            let fa_fused = accel_check::flash_attn_ok(dev, query_states.dtype(), self.head_dim);
+            let score_bytes = query_states.dim(0)? * self.num_attention_heads * q_len * total_tokens * 4 * 3;
+            let unfused_too_big = !fa_fused && q_len > 1 && score_bytes > OFFLOAD_ATTN_UNFUSED_BUDGET;
+            if dense_bytes <= OFFLOAD_ATTN_GATHER_BUDGET && !unfused_too_big {
+                let fast = (|| -> Result<Tensor> {
+                    if q_len == 1 {
+                        if let Some(o) = kv_turbo::fused_decode_attention(query_states, parts, self.scaling)? {
+                            return Ok(o);
+                        }
+                    }
+                    kv_turbo::flash_history_attention(
+                        query_states,
+                        key_states,
+                        value_states,
+                        parts,
+                        seqlen_offset,
+                        self.scaling,
+                    )
+                })();
+                match fast {
+                    Ok(o) => return Ok(o),
+                    Err(e) => {
+                        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            println!(
+                                "[OFFLOAD-ATTN] ⚠️ 레이어 {} 를 한 번에 계산하지 못해 블록 순회 경로로 계산합니다: {} (이후 같은 경고는 생략)",
+                                self.layer_idx, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 기존 블록 순회 경로 (블록마다 계산 후 온라인 소프트맥스로 병합)
+        let q_aligned = query_states.affine(self.scaling, 0.0)?.contiguous()?;
+        let mut block_attn = kv_turbo::BlockAttention::new(
+            &q_aligned,
+            self.num_key_value_heads,
+            self.num_kv_groups,
+        )?;
+        for p in parts {
+            let k = p.k.narrow(2, 0, p.len)?;
+            let v = p.v.narrow(2, 0, p.len)?;
+            match p.tq {
+                Some(meta) => match kv_turbo::codec_for(&meta, dev) {
+                    Ok(codec) => block_attn.add_packed(&k, &v, &codec, attention_mask, p.off)?,
+                    Err(e) => {
+                        // 이 빌드가 압축 블록을 풀 수 없으면(turbo-quant 미빌드 등) 그 블록만 건너뜁니다.
+                        println!(
+                            "[TURBO-KV-BLOCK] 레이어 {} 블록(토큰 {}..) 를 복원할 수 없어 건너뜁니다: {}",
+                            self.layer_idx, p.off, e
+                        );
+                    }
+                },
+                None => block_attn.add_plain(&k, &v, attention_mask, p.off)?,
+            }
+        }
+        // 👈 F32 정밀도 연산 결과 (호출부가 모델 dtype 으로 변환)
+        block_attn.finish()?.ok_or_else(|| anyhow!("No KV data processed"))
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -1295,19 +1612,19 @@ impl Qwen3_5Attention {
         self.merged_vram_block_count = 0;
     }
 
-    pub fn load_weights_inplace<R: std::io::Read + std::io::Seek>(&mut self, ct: &candle_core::quantized::gguf_file::Content, reader: &mut R, prefix: &str, device: &Device) -> Result<()> {
-        self.q_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?)?, None));
-        self.k_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?)?, None));
-        self.v_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?)?, None));
-        self.o_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?)?, None));
+    pub fn load_weights_inplace(&mut self, ct: &candle_core::quantized::gguf_file::Content, data: &[u8], prefix: &str, device: &Device) -> Result<()> {
+        self.q_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.attn_q.weight"), device)?)?, None));
+        self.k_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.attn_k.weight"), device)?)?, None));
+        self.v_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.attn_v.weight"), device)?)?, None));
+        self.o_proj = ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_qtensor(crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.attn_output.weight"), device)?)?, None));
         
         
-        let t_q_norm = ct.tensor(reader, &format!("{prefix}.attn_q_norm.weight"), device)?;
+        let t_q_norm = crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.attn_q_norm.weight"), device)?;
         let q_norm_w = t_q_norm.dequantize_f16(device).or_else(|_| t_q_norm.dequantize(device))?.to_dtype(DType::F32)?;
         self.q_norm = Qwen3_5RMSNorm::from_weight(q_norm_w, self.q_norm.eps())?;
         
         
-        let t_k_norm = ct.tensor(reader, &format!("{prefix}.attn_k_norm.weight"), device)?;
+        let t_k_norm = crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.attn_k_norm.weight"), device)?;
         let k_norm_w = t_k_norm.dequantize_f16(device).or_else(|_| t_k_norm.dequantize(device))?.to_dtype(DType::F32)?;
         self.k_norm = Qwen3_5RMSNorm::from_weight(k_norm_w, self.k_norm.eps())?;
         Ok(())
@@ -1448,6 +1765,7 @@ impl Qwen3_5DecoderLayer {
                 out_proj: dummy_p.clone(), in_proj_qkv: dummy_p.clone(), in_proj_z: dummy_p.clone(),
                 in_proj_b: dummy_p.clone(), in_proj_a: dummy_p.clone(),
                 conv_state_cache: None, recurrent_state_cache: None, is_state_dirty: false,
+                v_head_order: gguf_v_head_order(gguf),
             })
         } else {
             let num_attention_heads = gguf.get_matedata("qwen35.attention.head_count")?.to_u32()? as usize;
@@ -1463,6 +1781,7 @@ impl Qwen3_5DecoderLayer {
                 kv_blocks: Vec::new(), registry, layer_idx, active_session_id: None, active_kv_name: None,
                 kv_residency: crate::utils::resources::KvResidency::Ssd,
                 vram_merged_k: None, vram_merged_v: None, merged_vram_block_count: 0,
+                kv_exact: false, kv_half: false,
             })
         };
 
@@ -1578,20 +1897,20 @@ impl Qwen3_5DecoderLayer {
 
     pub fn is_cleared(&self) -> bool { self.input_layernorm.is_cleared() }
 
-    pub fn load_weights_inplace<R: std::io::Read + std::io::Seek>(&mut self, ct: &candle_core::quantized::gguf_file::Content, reader: &mut R, prefix: &str, device: &Device) -> Result<()> {
+    pub fn load_weights_inplace(&mut self, ct: &candle_core::quantized::gguf_file::Content, data: &[u8], prefix: &str, device: &Device) -> Result<()> {
         match &mut self.attn {
-            AttnKind::LinearAttn(attn) => attn.load_weights_inplace(ct, reader, prefix, device)?,
-            AttnKind::SelfAttn(attn) => attn.load_weights_inplace(ct, reader, prefix, device)?,
+            AttnKind::LinearAttn(attn) => attn.load_weights_inplace(ct, data, prefix, device)?,
+            AttnKind::SelfAttn(attn) => attn.load_weights_inplace(ct, data, prefix, device)?,
         }
-        self.mlp.load_weights_inplace(ct, reader, prefix, device)?;
+        self.mlp.load_weights_inplace(ct, data, prefix, device)?;
         
         
-        let t_in = ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?;
+        let t_in = crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.attn_norm.weight"), device)?;
         let in_norm_w = t_in.dequantize_f16(device).or_else(|_| t_in.dequantize(device))?.to_dtype(DType::F32)?;
         self.input_layernorm = Qwen3_5RMSNorm::from_weight(in_norm_w, self.input_layernorm.eps())?;
         
         
-        let t_post = ct.tensor(reader, &format!("{prefix}.post_attention_norm.weight"), device)?;
+        let t_post = crate::models::common::gguf::qtensor_from_bytes(ct, data, &format!("{prefix}.post_attention_norm.weight"), device)?;
         let post_norm_w = t_post.dequantize_f16(device).or_else(|_| t_post.dequantize(device))?.to_dtype(DType::F32)?;
         self.post_attention_layernorm = Qwen3_5RMSNorm::from_weight(post_norm_w, self.post_attention_layernorm.eps())?;
         Ok(())
@@ -1609,7 +1928,9 @@ pub const QWEN35_DECODE_HEADROOM_TOKENS: usize = 2048;
 
 pub const DECODE_RESIDENT_VRAM_MARGIN_BYTES: u64 = 640 * 1024 * 1024;
 
-fn decode_resident_gate(on_cuda: bool, weight_bytes: u64, kv_bytes: u64) -> (bool, Option<u64>) {
+/// 🌟 [WEIGHT-RESIDENT] `weight_bytes` 는 층 가중치 전체, `missing_bytes` 는 그중 아직 VRAM 에 없는(새로 읽어야 하는) 양입니다.
+/// 이미 올라와 있는 층은 VRAM free 에서 빠져 있으므로 다시 요구하지 않습니다.
+fn decode_resident_gate(on_cuda: bool, weight_bytes: u64, missing_bytes: u64, kv_bytes: u64) -> (bool, Option<u64>) {
     if !on_cuda {
         return ((crate::utils::resources::free_ram_bytes() as u64) > 6_000_000_000, None);
     }
@@ -1617,11 +1938,89 @@ fn decode_resident_gate(on_cuda: bool, weight_bytes: u64, kv_bytes: u64) -> (boo
         .map(|(free, _)| free);
     match free {
         Some(f) => (
-            weight_bytes > 0 && f >= weight_bytes + kv_bytes + DECODE_RESIDENT_VRAM_MARGIN_BYTES,
+            weight_bytes > 0 && f >= missing_bytes + kv_bytes + DECODE_RESIDENT_VRAM_MARGIN_BYTES,
             Some(f),
         ),
         None => (false, None),
     }
+}
+
+/// 🌟 [WEIGHT-RESIDENT] 상주 가중치를 둔 채 계산할 때 최소한 남겨 둘 VRAM (KV·활성값 순간치 외 여유).
+/// 이보다 모자라면 상주 층을 내려놓고 기존 스트리밍 경로로 돌아갑니다.
+pub const RESIDENT_MIN_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// 디코딩 한 토큰의 활성값 순간치(대략). 프리필은 [`Qwen3_5TextModel::prefill_transient_bytes`] 로 계산합니다.
+pub const DECODE_TRANSIENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 🌟 [KV-PLAN v2] Qwen3.5 메모리 계획 상태. `clear_cache` 뒤에도 직전 KV 판정(히스테리시스)은 남고,
+/// 생성기 인스턴스가 버려지면(퍼지·작업 종료) 함께 사라집니다.
+#[derive(Debug, Clone, Default)]
+pub struct Qwen35MemState {
+    /// 이번 생성의 최대 새 토큰 수 (generate 가 알려 줌). 0 이면 모름 → [`QWEN35_DECODE_HEADROOM_TOKENS`].
+    pub planned_decode_tokens: usize,
+    /// 직전 호출의 KV 계층 판정 (계층이 이웃 호출 사이에 뒤집히지 않게 합니다).
+    pub last_kv_plan: Option<crate::utils::resources::KvResidency>,
+    /// 이번 호출 동안 GDN conv/recurrent 상태를 VRAM 에 둘지. None = 아직 판정 전(둡니다).
+    pub ssm_in_vram: Option<bool>,
+    /// 원본 KV 를 F16 으로 보관하는지 (F32 모델).
+    pub kv_half: bool,
+    /// SSD 계획에서 RAM 에 둘 수 있는 KV 바이트 상한 / 지금 RAM 에 있는 KV 바이트.
+    pub ram_kv_budget: u64,
+    pub ram_kv_bytes: u64,
+}
+
+/// `LOGIS_SSM_RESIDENCY=follow_kv` 이면 예전처럼 KV 계획이 Vram 일 때만 GDN 상태를 VRAM 에 두고,
+/// 아니면 층마다 CPU 로 내렸다가 다음 토큰에 다시 올립니다.
+fn ssm_follows_kv_plan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LOGIS_SSM_RESIDENCY")
+            .map(|v| v.trim().eq_ignore_ascii_case("follow_kv"))
+            .unwrap_or(false)
+    })
+}
+
+/// `LOGIS_KV_DEMOTE=fp8` 이면 원본 KV 블록을 RAM 으로 내릴 때 예전처럼 스케일 없는 FP8 로 바꿉니다.
+/// 기본은 TurboQuant 벡터별 스케일 FP8 코덱으로 압축합니다 (정확도가 같거나 높습니다).
+fn kv_demote_plain_fp8() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LOGIS_KV_DEMOTE")
+            .map(|v| v.trim().eq_ignore_ascii_case("fp8"))
+            .unwrap_or(false)
+    })
+}
+
+/// KV 블록의 K+V 바이트 (텐서가 없으면 0).
+fn kv_block_bytes(k: Option<&Tensor>, v: Option<&Tensor>) -> u64 {
+    let b = |t: Option<&Tensor>| t.map(|t| (t.elem_count() * t.dtype().size_in_bytes()) as u64).unwrap_or(0);
+    b(k) + b(v)
+}
+
+fn env_switch(var: &str, default: bool) -> bool {
+    match std::env::var(var) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            if v.is_empty() {
+                default
+            } else {
+                !matches!(v.as_str(), "0" | "false" | "off" | "no")
+            }
+        }
+        Err(_) => default,
+    }
+}
+
+/// `LOGIS_PREFILL_RESIDENT=0` 이면 프리필은 예전처럼 층을 읽고 바로 비웁니다.
+fn prefill_resident_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_switch("LOGIS_PREFILL_RESIDENT", true))
+}
+
+/// `LOGIS_KEEP_WEIGHTS_WARM=0` 이면 호출이 끝날 때마다 층 가중치를 내려놓습니다(예전 동작).
+fn keep_weights_warm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| env_switch("LOGIS_KEEP_WEIGHTS_WARM", true))
 }
 
 pub struct Qwen3_5TextModel {
@@ -1646,6 +2045,16 @@ pub struct Qwen3_5TextModel {
     pub mmap: Option<std::sync::Arc<memmap2::Mmap>>,
     pub ct: Option<std::sync::Arc<candle_core::quantized::gguf_file::Content>>,
     pub base_name: String,
+    /// 🌟 [WEIGHT-RESIDENT] 호출이 끝나도 VRAM 에 올린 층 가중치를 그대로 둘 수 있는 인스턴스인지.
+    /// 텍스트 전용 생성기(4B 등)만 켭니다. 비전 타워를 붙였다 떼는 2B 는 예전처럼 호출마다 내려놓습니다.
+    /// 생성기 슬롯이 비워지면(퍼지·다른 모델 적재) 인스턴스와 함께 해제됩니다.
+    pub keep_warm: bool,
+    /// 🌟 [KV-PRECISION] 이번 문맥의 KV 를 원본 정밀도로 두는지 (문맥 첫 프리필에서 정함)
+    pub kv_exact: bool,
+    /// 🌟 [KV-PRECISION] 바깥 모델이 알려 주는 이번 프롬프트 전체 길이 (청크로 나눠 들어와도 전체 기준으로 판정)
+    pub planned_prompt_len: usize,
+    /// 🌟 [KV-PLAN v2] 메모리 계획 상태 (최대 새 토큰 수 · 직전 판정 · GDN 상태 상주 · 반정밀도 KV · SSD 계획의 RAM 예산)
+    pub mem: Qwen35MemState,
 }
 
 impl Qwen3_5TextModel {
@@ -1666,7 +2075,7 @@ impl Qwen3_5TextModel {
             embed_tokens, layers, norm, rotary_emb, mrope_section: config.rope_parameters.mrope_section.clone(), dtype: vb.dtype(),
             registry, current_kv_len: 0, active_session_id: None, active_kv_name: None,
             kv_plan: None, keep_weights_resident: false, resident_prefix: 0, release_streamed_pages: false,
-            mmap: None, ct: None, base_name: "model".to_string(), 
+            mmap: None, ct: None, base_name: "model".to_string(), keep_warm: false, kv_exact: false, planned_prompt_len: 0, mem: Qwen35MemState::default(),
         })
     }
 
@@ -1787,17 +2196,17 @@ impl Qwen3_5TextModel {
             embed_tokens, layers, norm, rotary_emb, mrope_section, dtype,
             registry, current_kv_len: 0, active_session_id: None, active_kv_name: None,
             kv_plan: None, keep_weights_resident: false, resident_prefix: 0, release_streamed_pages: false,
-            mmap: mmap_handle, ct: ct_handle, base_name: "model".to_string(),
+            mmap: mmap_handle, ct: ct_handle, base_name: "model".to_string(), keep_warm: false, kv_exact: false, planned_prompt_len: 0, mem: Qwen35MemState::default(),
         })
     }
 
     // 찰나의 순간에 디스크에서 가중치를 퍼 올리는 JIT 로더
     pub fn reload_layer(&mut self, layer_idx: usize, device: &Device) -> Result<()> {
         if let (Some(mmap), Some(ct)) = (self.mmap.as_ref(), self.ct.as_ref()) {
-            let mut reader = std::io::Cursor::new(&mmap[..]);
             // Qwen 3.5 gguf 블록 접두어
             let prefix = format!("blk.{layer_idx}");
-            self.layers[layer_idx].load_weights_inplace(ct, &mut reader, &prefix, device)?;
+            // 🌟 [MMAP-LOAD] 맵의 바이트를 그대로 넘겨 텐서마다 힙에 복사하지 않고 장치로 올립니다.
+            self.layers[layer_idx].load_weights_inplace(ct, &mmap[..], &prefix, device)?;
         }
         Ok(())
     }
@@ -1831,29 +2240,97 @@ impl Qwen3_5TextModel {
         let kv_residency = if is_decoding {
             if self.kv_plan.is_none() {
                 let (full_attn_layers, kv_heads, kv_head_dim) = self.kv_plan_geometry();
-                let planned = seqlen_offset + seq_len + QWEN35_DECODE_HEADROOM_TOKENS;
+                let legacy_plan = crate::utils::resources::kv_plan_legacy();
+                // 🌟 [KV-PLAN v2] 여유 토큰은 이번 생성의 실제 max_tokens(상한 2048), 이미 VRAM 에 만든 프롬프트 KV 는 다시 요구하지 않습니다.
+                let headroom = if legacy_plan { QWEN35_DECODE_HEADROOM_TOKENS } else { self.decode_headroom_tokens() };
+                let planned = seqlen_offset + seq_len + headroom;
+                let already = if legacy_plan { 0 } else { self.vram_kv_tokens().min(seqlen_offset) };
                 let label = if crate::model::lang_llm::resident_variant().is_some() { "Qwen3.5-4B(alphaedge)" } else { "Qwen3.5(2B)" };
-                let plan = crate::utils::resources::plan_kv_residency(
-                    &crate::utils::resources::KvPlanInput {
-                        gpu_id: crate::utils::resources::primary_gpu_id(),
-                        is_cpu_mode: xs.device().is_cpu(),
-                        num_kv_layers: full_attn_layers,
-                        num_kv_heads: kv_heads,
-                        head_dim: kv_head_dim,
-                        bytes_per_elem: 1,
-                        planned_tokens: planned,
-                        label,
-                    },
-                );
+                let mut per_token = if legacy_plan {
+                    (full_attn_layers * kv_heads * kv_head_dim * 2 * self.kv_elem_bytes()) as u64
+                } else {
+                    self.kv_bytes_per_token_now(xs.device())
+                };
+                // 🌟 [WEIGHT-RESIDENT] 동기화로 메모리 풀이 쥐고 있던 프리필 순간치를 돌려준 뒤 VRAM 을 잽니다.
+                //    (동기화 없이 재면 이미 끝난 프리필 활성값까지 '사용 중' 으로 잡혀 판정이 실제보다 비관적입니다)
+                //    상주 층 때문에 디코딩 여유조차 모자라면 여기서 상주 층을 내려놓습니다.
+                let mut kv_need = per_token * planned.saturating_sub(already) as u64;
+                let _ = self.ensure_resident_reserve(xs.device(), kv_need + DECODE_TRANSIENT_BYTES);
+                let plan_input = |bpe: usize| crate::utils::resources::KvPlanInput {
+                    gpu_id: crate::utils::resources::primary_gpu_id(),
+                    is_cpu_mode: xs.device().is_cpu(),
+                    num_kv_layers: full_attn_layers,
+                    num_kv_heads: kv_heads,
+                    head_dim: kv_head_dim,
+                    // 🌟 [KV-PRECISION] 원본 KV 면 보관 dtype 크기, 압축이면 FP8(1바이트) 기준 (예전 판정용)
+                    bytes_per_elem: bpe,
+                    planned_tokens: planned,
+                    label,
+                };
+                let prev_plan = self.mem.last_kv_plan;
+                let extra = |bpt: u64| crate::utils::resources::KvPlanExtra {
+                    already_tokens: already,
+                    decode_transient_bytes: DECODE_TRANSIENT_BYTES,
+                    bytes_per_token: Some(bpt),
+                    prev: prev_plan,
+                };
+                let mut plan = crate::utils::resources::plan_kv_residency_ex(&plan_input(self.kv_elem_bytes()), &extra(per_token));
+                // 🌟 [KV-PLAN v2] 원본 KV 가 VRAM 에 안 들어가면 RAM 으로 내리기 전에 VRAM 안에서 벡터별 FP8 로 압축해 봅니다.
+                //    (예전에는 RAM 으로 내리면서 스케일 없는 FP8 로 캐스팅했으므로 정확도가 같거나 높습니다)
+                if !legacy_plan && self.kv_exact && plan != crate::utils::resources::KvResidency::Vram && xs.device().is_cuda_or_rocm() {
+                    let packed = self.recompress_vram_kv(xs.device());
+                    if packed > 0 {
+                        per_token = self.kv_bytes_per_token_now(xs.device());
+                        kv_need = per_token * planned.saturating_sub(already) as u64;
+                        plan = crate::utils::resources::plan_kv_residency_ex(&plan_input(self.kv_elem_bytes()), &extra(per_token));
+                        println!(
+                            "[KV-PLAN] {} | 원본 KV 블록 {}개를 VRAM 안에서 벡터별 FP8 로 압축했습니다 → {:?}",
+                            label, packed, plan
+                        );
+                    }
+                }
+                self.mem.last_kv_plan = Some(plan);
+                // 🌟 [SSM-RESIDENT] GDN 상태는 프리필에서 이미 VRAM 에 있습니다. KV 계층과 무관하게 그대로 두고,
+                //    디코딩 순간치조차 못 남길 만큼 VRAM 이 모자랄 때만 CPU 로 내립니다.
+                if !ssm_follows_kv_plan() && xs.device().is_cuda_or_rocm() {
+                    let free = crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize).map(|(f, _)| f);
+                    let keep_ssm = free.map_or(true, |f| f >= crate::utils::resources::KV_VRAM_MARGIN_MIN_BYTES);
+                    if self.mem.ssm_in_vram != Some(keep_ssm) {
+                        println!(
+                            "[SSM-RESIDENT] {} | GDN 상태 {:.0} MB → {} (VRAM free {})",
+                            label,
+                            self.ssm_state_bytes() as f64 / 1e6,
+                            if keep_ssm { "VRAM 유지 (KV 계층과 무관, 토큰마다 CPU 왕복 없음)" } else { "CPU 대피 (VRAM 부족)" },
+                            free.map(|f| format!("{:.0} MB", f as f64 / 1e6)).unwrap_or_else(|| "?".to_string())
+                        );
+                    }
+                    self.mem.ssm_in_vram = Some(keep_ssm);
+                }
+                // 🌟 [KV-SSD-LRU] SSD 계획이어도 RAM 예산 안의 블록은 RAM 에 두고, 넘칠 때만 오래된 블록부터 SSD 로 내립니다.
+                if plan == crate::utils::resources::KvResidency::Ssd {
+                    let ram_free = crate::utils::resources::free_ram_bytes();
+                    let margin = crate::utils::resources::kv_ram_margin_bytes(crate::utils::resources::total_ram_bytes());
+                    self.mem.ram_kv_budget = ram_free.saturating_sub(margin);
+                    self.mem.ram_kv_bytes = self.ram_kv_bytes_now();
+                }
                 let weight_bytes = self.decode_resident_bytes();
-                let kv_bytes = (full_attn_layers * kv_heads * kv_head_dim * 2 * planned) as u64;
-                let (keep, vram_free) = decode_resident_gate(xs.device().is_cuda_or_rocm(), weight_bytes, kv_bytes);
-                let (prefix, prefix_bytes) = match vram_free {
+                let kv_bytes = kv_need;
+                // 🌟 [WEIGHT-RESIDENT] 이미 VRAM 에 있는 층(프리필에서 올린 층, 직전 호출에서 남긴 층)은 다시 요구하지 않습니다.
+                let missing_bytes = self.missing_layer_bytes();
+                let (mut keep, vram_free) =
+                    decode_resident_gate(xs.device().is_cuda_or_rocm(), weight_bytes, missing_bytes, kv_bytes);
+                let (mut prefix, _prefix_load_bytes) = match vram_free {
                     Some(free) if !keep => self.decode_resident_prefix(
                         free.saturating_sub(kv_bytes + DECODE_RESIDENT_VRAM_MARGIN_BYTES + self.max_layer_bytes()),
                     ),
                     _ => (0, 0),
                 };
+                // 🌟 [DECODE-RESIDENT] 앞쪽 상주 층 수가 전체와 같으면 '전부 상주' 입니다 (예전 로그: Partial 32/32).
+                if !keep && prefix >= total_layers && total_layers > 0 {
+                    keep = true;
+                    prefix = 0;
+                }
+                let prefix_bytes: u64 = (0..prefix).map(|i| self.layer_bytes(i)).sum();
                 let streamed_bytes = if keep { 0 } else { weight_bytes.saturating_sub(prefix_bytes) };
                 let ram_free = crate::utils::resources::free_ram_bytes() as u64;
                 let release_streamed =
@@ -1874,9 +2351,11 @@ impl Qwen3_5TextModel {
                 let page_mode = if release_streamed { "켬" } else { "끔" };
                 match vram_free {
                     Some(free) => println!(
-                        "[DECODE-RESIDENT] {} | 층 가중치 {:.0} MB + KV {:.0} MB + margin {:.0} MB vs VRAM free {:.0} MB → {}",
+                        "[DECODE-RESIDENT] {} | 층 가중치 {:.0} MB (이미 VRAM 상주 {:.0} MB · 새로 읽을 {:.0} MB) + KV {:.0} MB + margin {:.0} MB vs VRAM free {:.0} MB → {}",
                         label,
                         weight_bytes as f64 / 1e6,
+                        weight_bytes.saturating_sub(missing_bytes) as f64 / 1e6,
+                        missing_bytes as f64 / 1e6,
                         kv_bytes as f64 / 1e6,
                         DECODE_RESIDENT_VRAM_MARGIN_BYTES as f64 / 1e6,
                         free as f64 / 1e6,
@@ -1918,10 +2397,24 @@ impl Qwen3_5TextModel {
             self.kv_plan.unwrap_or(crate::utils::resources::KvResidency::Ssd)
         } else {
             self.kv_plan = None;
-            self.keep_weights_resident = false;
-            self.resident_prefix = 0;
-            self.release_streamed_pages = (crate::utils::resources::free_ram_bytes() as u64)
-                < crate::model::RAM_PRESSURE_MARGIN_BYTES + self.decode_resident_bytes();
+            // 🌟 [WEIGHT-RESIDENT] 프리필에서 읽은 층을 계산 뒤에도 VRAM 에 둘지 디코딩과 같은 기준으로 정합니다.
+            //    통과하면 디코딩 첫 토큰에서 같은 층을 mmap 에서 다시 읽지 않습니다(호출당 층 가중치 전송 2회 → 1회,
+            //    이전 호출에서 남긴 층이 있으면 0회). 통과하지 못하면 예전처럼 읽고 바로 비웁니다.
+            let (keep, prefix) = self.plan_prefill_residency(xs.device(), seq_len, seqlen_offset);
+            self.keep_weights_resident = keep;
+            self.resident_prefix = prefix;
+            resident_decided = keep || prefix > 0;
+            if seqlen_offset == 0 {
+                self.plan_kv_precision(xs.device(), seq_len, keep, prefix);
+            }
+            let streamed_bytes: u64 = if keep {
+                0
+            } else {
+                (prefix..total_layers).map(|i| self.layer_bytes(i)).sum()
+            };
+            self.release_streamed_pages = streamed_bytes > 0
+                && (crate::utils::resources::free_ram_bytes() as u64)
+                    < crate::model::RAM_PRESSURE_MARGIN_BYTES + streamed_bytes;
             for layer in self.layers.iter_mut() {
                 layer.set_kv_residency(crate::utils::resources::KvResidency::Ssd);
             }
@@ -1931,8 +2424,13 @@ impl Qwen3_5TextModel {
         let mut keep_resident = self.keep_weights_resident;
         let mut resident_prefix = self.resident_prefix;
         let release_streamed = self.release_streamed_pages;
+        // 🌟 [WEIGHT-RESIDENT] 이번 forward 에서 새로 올려 상주시킨 층 수 (이미 상주하던 층은 세지 않습니다)
+        let mut newly_resident = 0usize;
         for l_idx in 0..total_layers {
             if self.layers[l_idx].is_cleared() {
+                if keep_resident || l_idx < resident_prefix {
+                    newly_resident += 1;
+                }
                 if let Err(e) = self.reload_layer(l_idx, xs.device()) {
                     if !keep_resident && resident_prefix == 0 {
                         return Err(e);
@@ -1956,9 +2454,13 @@ impl Qwen3_5TextModel {
                     }
                     self.reload_layer(l_idx, xs.device())?;
                 }
-                if release_streamed || (is_decoding && (keep_resident || l_idx < resident_prefix)) {
+                if release_streamed || keep_resident || l_idx < resident_prefix {
                     self.release_layer_pages(l_idx);
                 }
+            }
+            // 🌟 [PREFETCH] 다음 층을 다시 읽어야 하면(스트리밍) 이 층을 계산하는 동안 OS 가 그 파일 페이지를 미리 읽게 합니다.
+            if l_idx + 1 < total_layers && self.layers[l_idx + 1].is_cleared() {
+                self.prefetch_layer_pages(l_idx + 1);
             }
             let layer = &mut self.layers[l_idx];
             if let AttnKind::SelfAttn(attn) = &mut layer.attn {
@@ -2025,8 +2527,13 @@ impl Qwen3_5TextModel {
             // 🌟 [KV RESIDENCY - SSM] SSM state 는 토큰 수와 무관한 고정 크기(레이어 합계 약 50~100MB)입니다.
             //    VRAM 상주가 확정된 디코딩 구간에서는 CPU 대피를 건너뛰어
             //    매 토큰 27개 레이어 × CPU↔GPU 왕복을 통째로 제거합니다.
-            let ssm_keep_in_vram =
-                is_decoding && kv_residency == crate::utils::resources::KvResidency::Vram;
+            //    🌟 [SSM-RESIDENT] 기본은 KV 계층과 무관하게 이번 호출 동안 VRAM 에 둡니다
+            //    (`LOGIS_SSM_RESIDENCY=follow_kv` 이면 예전 규칙).
+            let ssm_keep_in_vram = if ssm_follows_kv_plan() {
+                is_decoding && kv_residency == crate::utils::resources::KvResidency::Vram
+            } else {
+                !xs.device().is_cpu() && self.mem.ssm_in_vram.unwrap_or(true)
+            };
 
             if layer.layer_type == "linear_attention" && !ssm_keep_in_vram {
                 let is_dirty_backup = layer.is_ssm_dirty(); 
@@ -2058,6 +2565,10 @@ impl Qwen3_5TextModel {
                 if let AttnKind::SelfAttn(attn) = &mut layer.attn {
                     let mut reg = attn.registry.entries.write().unwrap();
                     let total_blocks = attn.kv_blocks.len();
+                    let demote_head_dim = attn.head_dim;
+                    // 🌟 [KV-DEMOTE] 원본 블록을 내릴 때 쓸 벡터별 FP8 코덱 (처음 필요할 때 한 번 정합니다)
+                    let mut demote_codec: Option<Option<std::sync::Arc<crate::models::common::kv_turbo::TqBlockCodec>>> = None;
+                    let legacy_ssd = crate::utils::resources::kv_plan_legacy();
                     
                     let mut garbage_bin = Vec::new();
                     
@@ -2078,10 +2589,39 @@ impl Qwen3_5TextModel {
                                     inner.k_cache = Some(k_t.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_t.clone()));
                                     inner.v_cache = Some(v_t.to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_t.clone()));
                                 } else {
+                                // 🌟 [KV-DEMOTE] 원본 블록은 TurboQuant 벡터별 FP8 로 압축해 내립니다 (스케일 없는 FP8 캐스팅보다 정확).
+                                //    코덱이 없거나(CPU·미빌드·4bit 정책) `LOGIS_KV_DEMOTE=fp8` 이면 예전 경로입니다.
+                                let codec = if kv_demote_plain_fp8() || !k_t.device().is_cuda_or_rocm() || k_t.dtype() == candle_core::DType::F8E4M3 {
+                                    None
+                                } else {
+                                    demote_codec
+                                        .get_or_insert_with(|| {
+                                            if crate::models::common::kv_turbo::kv_is_compact(k_t.device()) {
+                                                None
+                                            } else {
+                                                crate::models::common::kv_turbo::block_codec(demote_head_dim, k_t.device())
+                                            }
+                                        })
+                                        .clone()
+                                };
+                                let packed = codec.as_ref().and_then(|c| match (c.pack_k(&k_t), c.pack_v(&v_t)) {
+                                    (Ok(pk), Ok(pv)) => match (pk.to_device(&candle_core::Device::Cpu), pv.to_device(&candle_core::Device::Cpu)) {
+                                        (Ok(pk), Ok(pv)) => Some((pk, pv, c.meta)),
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                });
+                                if let Some((pk, pv, meta)) = packed {
+                                    inner.k_cache = Some(pk);
+                                    inner.v_cache = Some(pv);
+                                    inner.tq = Some(meta);
+                                } else {
                                 let target_dtype = if k_t.device().is_cuda_or_rocm() || k_t.dtype() == candle_core::DType::F8E4M3 { candle_core::DType::F8E4M3 } else { candle_core::DType::F32 };
                                 inner.k_cache = Some(k_t.to_dtype(target_dtype).unwrap_or_else(|_| k_t.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| k_t.clone()));
                                 inner.v_cache = Some(v_t.to_dtype(target_dtype).unwrap_or_else(|_| v_t.clone()).to_device(&candle_core::Device::Cpu).unwrap_or_else(|_| v_t.clone()));
                                 }
+                                }
+                                self.mem.ram_kv_bytes += kv_block_bytes(inner.k_cache.as_ref(), inner.v_cache.as_ref());
                                 inner.location = KVLocation::RAM;
                                 if idx < reg.len() { reg[idx].location[l_idx] = KVLocation::RAM; }
                             }
@@ -2090,11 +2630,22 @@ impl Qwen3_5TextModel {
                         // 🌟 [RAM 상주 유지] RAM 여유가 확인된 경우에는 여기서 멈춥니다.
                         //    기존 코드는 RAM 을 경유지로만 쓰고 즉시 SSD 로 버렸기 때문에
                         //    다음 토큰마다 SSD 재읽기 경로를 반드시 다시 타야 했습니다.
+                        // 🌟 [KV-REGISTRY] SSD 경로가 있어도 이 블록이 아직 기록되지 않았으면(is_dirty) 버리지 않습니다.
+                        //    (이전 문맥이 남긴 경로·늦게 끝난 기록 작업이 경로를 채운 경우 다른 문맥의 파일을 읽게 됩니다)
+                        //    🌟 [KV-SSD-LRU] RAM 예산 안이면 다음 토큰이 또 읽을 블록이므로 버리지 않습니다
+                        //    (예전에는 매 토큰 버리고 매 토큰 디스크에서 다시 읽었습니다). `LOGIS_KV_PLAN=legacy` 이면 예전 동작.
+                        let over_ram_budget = legacy_ssd || self.mem.ram_kv_bytes > self.mem.ram_kv_budget;
                         if demote_to_ssd
+                            && over_ram_budget
                             && inner.location == KVLocation::RAM
                             && idx < reg.len()
                             && reg[idx].ssd_path.is_some()
+                            && !reg[idx].is_dirty.get(l_idx).copied().unwrap_or(true)
                         {
+                            self.mem.ram_kv_bytes = self
+                                .mem
+                                .ram_kv_bytes
+                                .saturating_sub(kv_block_bytes(inner.k_cache.as_ref(), inner.v_cache.as_ref()));
                             garbage_bin.push((inner.k_cache.take(), inner.v_cache.take()));
                             inner.location = KVLocation::SSD;
                             // 🌟 [TURBO-KV-BLOCK] 다시 읽을 때 SSD 파일의 tq_meta 로 형식을 정합니다.
@@ -2203,21 +2754,27 @@ impl Qwen3_5TextModel {
             }
         }
         
-        if resident_decided && keep_resident {
+        // 🌟 [WEIGHT-RESIDENT] 이번 forward 에서 실제로 새로 올린 층이 있을 때만 알립니다.
+        //    (프리필에서 이미 올렸거나 직전 호출에서 남긴 층은 다시 읽지 않았으므로 조용히 넘어갑니다)
+        let phase = if is_decoding { "첫 디코딩 토큰" } else { "프리필" };
+        if resident_decided && keep_resident && newly_resident > 0 {
             let free_prev = crate::utils::resources::free_ram_bytes() as u64;
             crate::model::release_os_working_set();
             let (free_now, total) = crate::model::ram_snapshot();
             println!(
-                "[DECODE-RESIDENT] 첫 디코딩 토큰에서 층 {}개를 VRAM 에 올렸습니다. 남은 토큰은 mmap 을 읽지 않으므로 작업 집합을 반환합니다 | RAM 여유 {}MB → {}MB | {}",
+                "[DECODE-RESIDENT] {}에서 층 {}개를 VRAM 에 올렸습니다 (전체 {}개 상주). 남은 계산은 mmap 을 읽지 않으므로 작업 집합을 반환합니다 | RAM 여유 {}MB → {}MB | {}",
+                phase,
+                newly_resident,
                 total_layers,
                 free_prev / 1_000_000,
                 free_now / 1_000_000,
                 crate::model::ram_pressure_line(free_now, total)
             );
-        } else if resident_decided && resident_prefix > 0 {
+        } else if resident_decided && resident_prefix > 0 && newly_resident > 0 {
             let (free_now, total) = crate::model::ram_snapshot();
             println!(
-                "[DECODE-RESIDENT] 첫 디코딩 토큰에서 층 {}/{}개를 VRAM 에 올렸고 그 층의 파일 페이지는 바로 작업 집합에서 내려놓았습니다. 나머지 {}개 층은 토큰마다 mmap 에서 읽고 {} | {}",
+                "[DECODE-RESIDENT] {}에서 층 {}/{}개를 VRAM 에 올렸고 그 층의 파일 페이지는 바로 작업 집합에서 내려놓았습니다. 나머지 {}개 층은 매번 mmap 에서 읽고 {} | {}",
+                phase,
                 resident_prefix,
                 total_layers,
                 total_layers - resident_prefix,
@@ -2248,14 +2805,158 @@ impl Qwen3_5TextModel {
         (layers, heads, dim)
     }
 
-    pub fn clear_cache(&mut self) {
-        let was_resident = self.keep_weights_resident || self.resident_prefix > 0;
-        for layer in self.layers.iter_mut() {
-            layer.clear_cache();
-            if was_resident {
-                layer.clear_weights();
+    /// 🌟 [KV-PLAN v2] generate 가 이번 생성의 최대 새 토큰 수(max_tokens)를 알려 줍니다. KV 계획의 여유 토큰이 됩니다.
+    pub fn set_planned_decode_tokens(&mut self, max_new_tokens: usize) {
+        self.mem.planned_decode_tokens = max_new_tokens;
+    }
+
+    /// KV 계획에 쓰는 디코딩 여유 토큰 수 = min(이번 max_tokens, 2048). 모르면 2048.
+    pub fn decode_headroom_tokens(&self) -> usize {
+        match self.mem.planned_decode_tokens {
+            0 => QWEN35_DECODE_HEADROOM_TOKENS,
+            n => n.min(QWEN35_DECODE_HEADROOM_TOKENS),
+        }
+    }
+
+    /// 지금 VRAM 에 만들어져 있는 KV 토큰 수 (첫 full_attention 층 기준). 이 KV 는 VRAM free 에서 이미 빠져 있습니다.
+    pub fn vram_kv_tokens(&self) -> usize {
+        for layer in self.layers.iter() {
+            if let AttnKind::SelfAttn(attn) = &layer.attn {
+                return attn
+                    .kv_blocks
+                    .iter()
+                    .map(|b| {
+                        let i = b.inner.read().unwrap();
+                        if i.location == KVLocation::VRAM && i.k_cache.is_some() { i.len } else { 0 }
+                    })
+                    .sum();
             }
         }
+        0
+    }
+
+    /// 지금 RAM 에 있는 KV 바이트 (모든 full_attention 층).
+    fn ram_kv_bytes_now(&self) -> u64 {
+        let mut total = 0u64;
+        for layer in self.layers.iter() {
+            if let AttnKind::SelfAttn(attn) = &layer.attn {
+                for b in attn.kv_blocks.iter() {
+                    let i = b.inner.read().unwrap();
+                    if i.location == KVLocation::RAM {
+                        total += kv_block_bytes(i.k_cache.as_ref(), i.v_cache.as_ref());
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    /// GDN(linear_attention) 층들의 conv + recurrent 상태 바이트.
+    pub fn ssm_state_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .filter(|l| l.layer_type == "linear_attention")
+            .map(|l| {
+                let (c, r) = l.get_ssm_states();
+                kv_block_bytes(c.as_ref(), r.as_ref())
+            })
+            .sum()
+    }
+
+    /// 🌟 [KV-PLAN v2] 지금 정밀도의 토큰당 KV 바이트 (전 full_attention 층 K+V).
+    /// 원본이면 보관 dtype 크기(F16 보관이면 2), 압축이면 TurboQuant 행 머리까지 포함한 실제 행 크기.
+    pub fn kv_bytes_per_token_now(&self, dev: &Device) -> u64 {
+        let (layers, heads, dim) = self.kv_plan_geometry();
+        if self.kv_exact {
+            let elem = if self.mem.kv_half { 2 } else { self.dtype.size_in_bytes() };
+            return crate::utils::resources::kv_bytes_per_token_exact(layers, heads, dim, elem);
+        }
+        match crate::models::common::kv_turbo::default_meta(dim, dev) {
+            Ok(m) if dev.is_cuda_or_rocm() => (m.bytes_per_token_head() * layers * heads) as u64,
+            _ => crate::utils::resources::kv_bytes_per_token_compressed(layers, heads, dim),
+        }
+    }
+
+    /// 🌟 [KV-PLAN v2] VRAM 에 있는 원본 KV 블록을 그 자리에서 TurboQuant 벡터별 FP8 로 압축합니다. 압축한 블록 수.
+    /// 전부 성공하면 이후 새 토큰도 압축 블록으로 쌓습니다. 코덱이 없으면(4bit 정책·미빌드 등) 아무것도 하지 않습니다.
+    fn recompress_vram_kv(&mut self, dev: &Device) -> usize {
+        if kv_demote_plain_fp8() || crate::models::common::kv_turbo::kv_is_compact(dev) {
+            return 0;
+        }
+        let (_, _, dim) = self.kv_plan_geometry();
+        let Some(codec) = crate::models::common::kv_turbo::block_codec(dim, dev) else {
+            return 0;
+        };
+        let mut packed = 0usize;
+        let mut failed = 0usize;
+        for layer in self.layers.iter_mut() {
+            if let AttnKind::SelfAttn(attn) = &mut layer.attn {
+                for block in attn.kv_blocks.iter() {
+                    let mut inner = block.inner.write().unwrap();
+                    if inner.location != KVLocation::VRAM || inner.tq.is_some() {
+                        continue;
+                    }
+                    let packed_pair = match (inner.k_cache.as_ref(), inner.v_cache.as_ref()) {
+                        (Some(k), Some(v)) if k.dtype() != DType::F8E4M3 => match (codec.pack_k(k), codec.pack_v(v)) {
+                            (Ok(pk), Ok(pv)) => Some((pk, pv)),
+                            _ => None,
+                        },
+                        _ => continue,
+                    };
+                    match packed_pair {
+                        Some((pk, pv)) => {
+                            inner.k_cache = Some(pk);
+                            inner.v_cache = Some(pv);
+                            inner.tq = Some(codec.meta);
+                            packed += 1;
+                        }
+                        None => failed += 1,
+                    }
+                }
+            }
+        }
+        if failed == 0 {
+            for layer in self.layers.iter_mut() {
+                if let AttnKind::SelfAttn(attn) = &mut layer.attn {
+                    attn.kv_exact = false;
+                    attn.kv_half = false;
+                }
+            }
+            self.kv_exact = false;
+            self.mem.kv_half = false;
+        }
+        let _ = dev.synchronize();
+        packed
+    }
+
+    pub fn clear_cache(&mut self) {
+        let was_resident = self.keep_weights_resident
+            || self.resident_prefix > 0
+            || self.layers.iter().any(|l| !l.is_cleared());
+        // 🌟 [WEIGHT-RESIDENT] 텍스트 전용 생성기는 VRAM 여유가 있으면 층 가중치를 남겨 다음 호출이
+        //    프리필·디코딩에서 다시 읽지 않게 합니다. (생성기 슬롯이 비워질 때 함께 해제됩니다)
+        let keep_warm = was_resident && self.keep_warm_ok();
+        for layer in self.layers.iter_mut() {
+            layer.clear_cache();
+            if was_resident && !keep_warm {
+                layer.clear_weights();
+            }
+            // 🌟 [KV-PRECISION] 다음 문맥의 첫 프리필에서 다시 정합니다. (그 전까지는 압축이 기본)
+            if let AttnKind::SelfAttn(attn) = &mut layer.attn {
+                attn.kv_exact = false;
+                attn.kv_half = false;
+            }
+        }
+        self.kv_exact = false;
+        self.planned_prompt_len = 0;
+        // 🌟 [KV-PLAN v2] 직전 KV 판정(last_kv_plan)은 히스테리시스용으로 남기고 나머지는 다음 호출에서 다시 정합니다.
+        self.mem.planned_decode_tokens = 0;
+        self.mem.ssm_in_vram = None;
+        self.mem.kv_half = false;
+        self.mem.ram_kv_budget = 0;
+        self.mem.ram_kv_bytes = 0;
+        // 🌟 [KV-REGISTRY] 이전 문맥의 RAM 사본·SSD 경로가 다음 문맥에 섞이지 않게 장부도 비웁니다.
+        self.reset_registry_runtime();
         self.current_kv_len = 0;
         self.kv_plan = None;
         self.keep_weights_resident = false;
@@ -2305,18 +3006,337 @@ impl Qwen3_5TextModel {
         (0..self.layers.len()).map(|i| self.layer_bytes(i)).max().unwrap_or(0)
     }
 
+    /// 앞에서부터 VRAM 에 둘 수 있는 층 수와 그러려고 새로 읽어야 하는 바이트.
+    /// 🌟 [WEIGHT-RESIDENT] 이미 올라와 있는 층은 추가 비용이 0 입니다.
     fn decode_resident_prefix(&self, budget: u64) -> (usize, u64) {
         let mut count = 0usize;
         let mut bytes = 0u64;
         for i in 0..self.layers.len() {
             let b = self.layer_bytes(i);
-            if b == 0 || bytes + b > budget {
+            let cost = if self.layers[i].is_cleared() { b } else { 0 };
+            if b == 0 || bytes + cost > budget {
                 break;
             }
-            bytes += b;
+            bytes += cost;
             count += 1;
         }
         (count, bytes)
+    }
+
+    /// 🌟 [WEIGHT-RESIDENT] 아직 VRAM 에 없어 다시 읽어야 하는 층 가중치 바이트
+    fn missing_layer_bytes(&self) -> u64 {
+        (0..self.layers.len())
+            .filter(|&i| self.layers[i].is_cleared())
+            .map(|i| self.layer_bytes(i))
+            .sum()
+    }
+
+    /// 🌟 [WEIGHT-RESIDENT] VRAM 에 올라와 있는 층 가중치 바이트
+    pub fn resident_layer_bytes(&self) -> u64 {
+        (0..self.layers.len())
+            .filter(|&i| !self.layers[i].is_cleared())
+            .map(|i| self.layer_bytes(i))
+            .sum()
+    }
+
+    /// 🌟 [WEIGHT-RESIDENT] 프리필 한 번(청크 `seq_len` 토큰)에 순간적으로 필요한 활성값 VRAM 의 보수적 추정치.
+    /// (은닉 상태·MLP 중간값·SSM 청크 행렬·양자화 matmul 의 역양자화 버퍼)
+    fn prefill_transient_bytes(&self, seq_len: usize) -> u64 {
+        let hidden = self.embed_tokens.hidden().max(1) as u64;
+        let inter = self
+            .ct
+            .as_ref()
+            .and_then(|ct| ct.metadata.get("qwen35.feed_forward_length"))
+            .and_then(|v| v.to_u32().ok())
+            .map(|v| v as u64)
+            .unwrap_or(hidden * 4);
+        let per_token = hidden * 4 * 8 + inter * 4 * 3;
+        seq_len as u64 * per_token + 128 * 1024 * 1024
+    }
+
+    /// 🌟 [WEIGHT-RESIDENT] 상주 층을 둔 채로 `need` 바이트(KV·활성값 순간치)를 쓸 수 있는지 확인합니다.
+    /// 동기화로 메모리 풀이 쥔 여분을 돌려준 뒤 재고, [`RESIDENT_MIN_RESERVE_BYTES`] 까지 더해도 모자라면
+    /// 상주 층을 모두 내려놓습니다(예전 스트리밍 경로). 반환값은 그 뒤의 VRAM free (CUDA/ROCm 밖이면 None).
+    fn ensure_resident_reserve(&mut self, dev: &Device, need: u64) -> Option<u64> {
+        if !dev.is_cuda_or_rocm() {
+            return None;
+        }
+        let _ = dev.synchronize();
+        let gpu = crate::utils::resources::primary_gpu_id() as usize;
+        let free = crate::utils::gpu_mem_info(gpu).map(|(f, _)| f)?;
+        let resident = self.resident_layer_bytes();
+        if resident > 0 && free < need + RESIDENT_MIN_RESERVE_BYTES {
+            let held = self.layers.iter().filter(|l| !l.is_cleared()).count();
+            for layer in self.layers.iter_mut() {
+                layer.clear_weights();
+            }
+            self.keep_weights_resident = false;
+            self.resident_prefix = 0;
+            let _ = dev.synchronize();
+            let after = crate::utils::gpu_mem_info(gpu).map(|(f, _)| f);
+            println!(
+                "[WEIGHT-RESIDENT] VRAM free {:.0} MB 가 필요량 {:.0} MB + 여유 {:.0} MB 보다 작아 상주하던 층 {}개 {:.0} MB 를 내려놓습니다 → free {:.0} MB (이번 계산은 층을 읽고 바로 비우는 경로부터 다시 판정합니다)",
+                free as f64 / 1e6,
+                need as f64 / 1e6,
+                RESIDENT_MIN_RESERVE_BYTES as f64 / 1e6,
+                held,
+                resident as f64 / 1e6,
+                after.unwrap_or(free) as f64 / 1e6
+            );
+            return after;
+        }
+        Some(free)
+    }
+
+    /// 🌟 [WEIGHT-RESIDENT] 프리필에서 읽은 층을 계산 뒤에도 VRAM 에 둘지 정합니다. `(전부 상주, 앞쪽 상주 층 수)`
+    /// 디코딩 진입 판정과 같은 기준(새로 읽을 가중치 + KV + margin ≤ VRAM free)에 프리필 활성값 순간치를 더해 판정합니다.
+    fn plan_prefill_residency(&mut self, dev: &Device, seq_len: usize, seqlen_offset: usize) -> (bool, usize) {
+        if !dev.is_cuda_or_rocm() || !prefill_resident_enabled() || self.ct.is_none() {
+            return (false, 0);
+        }
+        let weight_bytes = self.decode_resident_bytes();
+        if weight_bytes == 0 {
+            return (false, 0);
+        }
+        let (full_attn_layers, kv_heads, kv_head_dim) = self.kv_plan_geometry();
+        // 🌟 [KV-PLAN v2] 이미 VRAM 에 만든 KV(seqlen_offset 토큰)는 다시 요구하지 않고, 여유 토큰은 실제 max_tokens 입니다.
+        let kv_bytes = if crate::utils::resources::kv_plan_legacy() {
+            let planned = seqlen_offset + seq_len + QWEN35_DECODE_HEADROOM_TOKENS;
+            (full_attn_layers * kv_heads * kv_head_dim * 2 * planned) as u64
+        } else {
+            let new_tokens = seq_len + self.decode_headroom_tokens();
+            self.kv_bytes_per_token_now(dev) * new_tokens as u64
+        };
+        let transient = self.prefill_transient_bytes(seq_len);
+        let Some(free) = self.ensure_resident_reserve(dev, kv_bytes + transient) else {
+            return (false, 0);
+        };
+        let missing = self.missing_layer_bytes();
+        let n = self.layers.len();
+        let mut keep = free >= missing + kv_bytes + transient + DECODE_RESIDENT_VRAM_MARGIN_BYTES;
+        let mut prefix = if keep {
+            0
+        } else {
+            self.decode_resident_prefix(free.saturating_sub(
+                kv_bytes + transient + DECODE_RESIDENT_VRAM_MARGIN_BYTES + self.max_layer_bytes(),
+            ))
+            .0
+        };
+        let already_all = !keep && prefix >= n && n > 0;
+        if already_all {
+            // 🌟 [PREFILL-RESIDENT] 모든 층이 이미 상주 → '전부 상주' 로 둡니다 (디코딩 판정·로그와 일치).
+            keep = true;
+            prefix = 0;
+        }
+        if seqlen_offset == 0 {
+            let verdict = if already_all {
+                format!("이미 올라와 있는 층 {n}개를 그대로 씁니다 (새로 읽지 않습니다)")
+            } else if keep {
+                format!("전부 상주 (층 {n}개 · 디코딩에서 다시 읽지 않습니다)")
+            } else if prefix >= n {
+                format!("이미 올라와 있는 층 {n}개를 그대로 씁니다 (새로 읽지 않습니다)")
+            } else if prefix > 0 {
+                format!("앞쪽 층 {prefix}/{n}개 상주, 나머지는 읽고 바로 비움")
+            } else {
+                "상주 없음 (예전처럼 층을 읽고 바로 비웁니다)".to_string()
+            };
+            println!(
+                "[PREFILL-RESIDENT] {} 토큰 | 층 가중치 {:.0} MB (이미 상주 {:.0} MB · 새로 읽을 {:.0} MB) + KV {:.0} MB + 프리필 순간치 {:.0} MB + margin {:.0} MB vs VRAM free {:.0} MB → {}",
+                seq_len,
+                weight_bytes as f64 / 1e6,
+                weight_bytes.saturating_sub(missing) as f64 / 1e6,
+                missing as f64 / 1e6,
+                kv_bytes as f64 / 1e6,
+                transient as f64 / 1e6,
+                DECODE_RESIDENT_VRAM_MARGIN_BYTES as f64 / 1e6,
+                free as f64 / 1e6,
+                verdict
+            );
+        }
+        (keep, prefix)
+    }
+
+    /// 🌟 [KV-PRECISION] KV 원소 하나의 바이트 수 (원본이면 모델 dtype, 압축이면 FP8 기준 1)
+    fn kv_elem_bytes(&self) -> usize {
+        if self.kv_exact {
+            if self.mem.kv_half { 2 } else { self.dtype.size_in_bytes() }
+        } else {
+            1
+        }
+    }
+
+    /// 🌟 [KV-PRECISION] 문맥 첫 프리필에서 이번 문맥의 KV 를 원본 정밀도로 둘지 정합니다.
+    /// 프리필이 상주시키기로 한 층 가중치·프리필 순간치를 먼저 빼고, 남는 VRAM 에 원본 KV(+ 디코딩 여유 토큰)와
+    /// 안전 여유가 들어가면 원본으로 둡니다(kv_turbo::exact_kv_affordable). 들어가지 않으면 TurboQuant 압축 블록입니다.
+    fn plan_kv_precision(&mut self, dev: &Device, seq_len: usize, keep: bool, prefix: usize) {
+        use crate::models::common::kv_turbo::{self as kvt, KvHalfMode};
+        let (full_attn_layers, kv_heads, kv_head_dim) = self.kv_plan_geometry();
+        let legacy = crate::utils::resources::kv_plan_legacy();
+        let prompt = self.planned_prompt_len.max(seq_len);
+        let headroom = if legacy { QWEN35_DECODE_HEADROOM_TOKENS } else { self.decode_headroom_tokens() };
+        let planned = prompt + headroom;
+        let exact_bytes =
+            (full_attn_layers * kv_heads * kv_head_dim * 2 * planned * self.dtype.size_in_bytes()) as u64;
+        // 프리필이 새로 올려 둘 층 가중치 + 프리필 순간치 (층을 스트리밍할 때만 스트리밍 버퍼 1층분을 더합니다)
+        let n = self.layers.len();
+        let weights_to_load: u64 = if keep {
+            self.missing_layer_bytes()
+        } else {
+            let streaming = legacy || prefix < n;
+            (0..prefix.min(n))
+                .filter(|&i| self.layers[i].is_cleared())
+                .map(|i| self.layer_bytes(i))
+                .sum::<u64>()
+                + if streaming { self.max_layer_bytes() } else { 0 }
+        };
+        let reserve = weights_to_load + self.prefill_transient_bytes(seq_len);
+        // 🌟 [KV-PLAN v2] KV 안전 여유는 비례값 max(96MB, 2 × 디코딩 순간치) (예전 고정 640MB 는 LOGIS_KV_PLAN=legacy)
+        let margin = if legacy {
+            crate::utils::resources::KV_VRAM_SAFETY_MARGIN_BYTES
+        } else {
+            crate::utils::resources::kv_vram_margin_bytes(DECODE_TRANSIENT_BYTES)
+        };
+        let (mut exact, mut free) = kvt::exact_kv_affordable_with_margin(dev, exact_bytes, reserve, margin);
+        // 🌟 [KV-HALF] F32 모델: F32 원본 KV 가 안 들어가면 F16 원본(절반 크기)을 먼저 시도합니다 (FP8 압축보다 정확).
+        let mut half = false;
+        if self.dtype == DType::F32 && dev.is_cuda_or_rocm() {
+            let half_bytes = exact_bytes / 2;
+            let half_fits = || {
+                crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize)
+                    .map(|(f, _)| (f >= half_bytes + margin + reserve, f))
+            };
+            match kvt::kv_half_mode() {
+                KvHalfMode::Off => {}
+                KvHalfMode::Prefer => {
+                    if exact {
+                        half = true;
+                    } else if let Some((ok, f)) = half_fits() {
+                        free = Some(f);
+                        exact = ok;
+                        half = ok;
+                    }
+                }
+                KvHalfMode::Auto => {
+                    if !exact && kvt::kv_precision_policy() == kvt::KvPrecisionPolicy::Auto {
+                        if let Some((ok, f)) = half_fits() {
+                            free = Some(f);
+                            exact = ok;
+                            half = ok;
+                        }
+                    }
+                }
+            }
+        }
+        self.kv_exact = exact;
+        self.mem.kv_half = half;
+        for layer in self.layers.iter_mut() {
+            if let AttnKind::SelfAttn(attn) = &mut layer.attn {
+                attn.kv_exact = exact;
+                attn.kv_half = half;
+            }
+        }
+        if dev.is_cuda_or_rocm() || dev.is_vulkan() {
+            println!(
+                "[KV-PRECISION] Qwen3.5 | 프롬프트 {} + 여유 {} 토큰 · 원본 KV {:.0} MB (F16 보관 시 {:.0} MB) + 가중치·순간치 {:.0} MB + 여유 {:.0} MB vs VRAM free {} → {}",
+                prompt,
+                headroom,
+                exact_bytes as f64 / 1e6,
+                (exact_bytes / 2) as f64 / 1e6,
+                reserve as f64 / 1e6,
+                margin as f64 / 1e6,
+                free.map(|f| format!("{:.0} MB", f as f64 / 1e6)).unwrap_or_else(|| "?".to_string()),
+                if exact && half {
+                    "원본 KV · F16 보관 (압축하지 않음 · F32 계산)"
+                } else if exact {
+                    "원본 KV (압축하지 않음 · 정확도 우선)"
+                } else {
+                    "TurboQuant 압축 KV (메모리 우선)"
+                }
+            );
+        }
+    }
+
+    /// 🌟 [WEIGHT-RESIDENT] 호출이 끝난 뒤에도 층 가중치를 VRAM 에 남겨 둘지.
+    /// 텍스트 전용 생성기([`Self::keep_warm`])이고, CUDA/ROCm 에서 KV 를 비운 뒤의 VRAM free 가
+    /// margin 이상일 때만 남깁니다. (`LOGIS_KEEP_WEIGHTS_WARM=0` 이면 예전처럼 매번 내려놓습니다)
+    fn keep_warm_ok(&self) -> bool {
+        if !self.keep_warm || !keep_weights_warm_enabled() {
+            return false;
+        }
+        let dev = self.norm.weight.device().clone();
+        if !dev.is_cuda_or_rocm() {
+            return false;
+        }
+        let _ = dev.synchronize();
+        match crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize) {
+            Some((free, _)) => free >= DECODE_RESIDENT_VRAM_MARGIN_BYTES,
+            None => false,
+        }
+    }
+
+    /// 🌟 [WEIGHT-RESIDENT] VRAM 에 상주시킨 층 가중치를 모두 내려놓습니다.
+    pub fn release_resident_weights(&mut self) {
+        for layer in self.layers.iter_mut() {
+            layer.clear_weights();
+        }
+        self.keep_weights_resident = false;
+        self.resident_prefix = 0;
+    }
+
+    /// 🌟 [KV-REGISTRY] 블록 장부의 실행 중 상태(RAM 사본, SSD 경로, 변경 표시)를 비웁니다.
+    /// 장부는 블록 번호로만 찾기 때문에, 비우지 않으면 다음 문맥의 같은 번호 블록이 이전 문맥의
+    /// RAM 사본·SSD 파일을 읽을 수 있습니다. (RAM 사본은 프로세스 메모리도 계속 붙잡습니다)
+    pub fn reset_registry_runtime(&self) {
+        if let Ok(mut reg) = self.registry.entries.write() {
+            for e in reg.iter_mut() {
+                if let Ok(mut cache) = e.bitkv_cache.write() {
+                    for slot in cache.iter_mut() {
+                        *slot = None;
+                    }
+                }
+                e.ssd_path = None;
+                e.is_dirty.fill(true);
+            }
+        }
+    }
+
+    /// 🌟 [PREFETCH] 곧 다시 읽을 층의 파일 페이지를 OS 가 미리(비동기로) 읽어 두게 합니다.
+    /// 층을 스트리밍하는 동안 지금 층을 계산하는 시간에 다음 층의 디스크 읽기가 겹치므로,
+    /// RAM 압박으로 페이지가 내려간 상태(SSD 재읽기)에서 층마다 기다리던 시간이 줄어듭니다.
+    /// 이미 메모리에 있는 페이지면 아무 일도 하지 않습니다. 계산 결과에는 영향이 없습니다.
+    fn prefetch_layer_pages(&self, layer_idx: usize) {
+        let mmap = match self.mmap.as_ref() {
+            Some(m) => m,
+            None => return,
+        };
+        let ranges: Vec<(usize, usize)> = self
+            .layer_file_ranges(layer_idx)
+            .into_iter()
+            .filter(|&(start, len)| len > 0 && start < mmap.len())
+            .map(|(start, len)| (start, len.min(mmap.len() - start)))
+            .collect();
+        if ranges.is_empty() {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            let entries: Vec<WIN32_MEMORY_RANGE_ENTRY> = ranges
+                .iter()
+                .map(|&(start, len)| WIN32_MEMORY_RANGE_ENTRY {
+                    VirtualAddress: mmap.as_ptr().add(start) as *mut std::ffi::c_void,
+                    NumberOfBytes: len,
+                })
+                .collect();
+            let _ = PrefetchVirtualMemory(GetCurrentProcess(), entries.len(), entries.as_ptr(), 0);
+        }
+        #[cfg(unix)]
+        {
+            for (start, len) in ranges {
+                let _ = mmap.advise_range(memmap2::Advice::WillNeed, start, len);
+            }
+        }
     }
 
     fn release_layer_pages(&self, layer_idx: usize) {
@@ -2363,6 +3383,9 @@ impl Qwen3_5TextModel {
         let index: LayerIndex = serde_json::from_str(&index_json).unwrap_or_else(|_| LayerIndex { layer_idx: 0, total_tokens: 0, blocks: vec![] });
         let total_tokens = index.total_tokens;
 
+        // 🌟 [KV-REGISTRY] 다른 스냅샷에서 읽어 둔 RAM 사본이 남아 있으면 새 스냅샷의 같은 번호 블록 대신 그것을 읽습니다.
+        //    복원할 때마다 장부의 RAM 사본과 경로를 비우고 아래에서 이 스냅샷의 경로로 다시 채웁니다.
+        self.reset_registry_runtime();
         {
             let mut reg = self.registry.entries.write().unwrap();
             let needed_blocks = (total_tokens + 1023) / 1024;
@@ -2634,6 +3657,11 @@ impl Qwen3_5TextModel {
         Ok(())
     }
 }
+
+/// 🌟 [P2B-TEST] 실모델 대조 테스트(tests/it/p2b_models.rs)는 앱의 작업 중지 신호 파일(EXTRACTION_STOPPED)과
+/// 무관하게 프리필해야 합니다. 앱 상태 파일을 건드리지 않도록 테스트 프로세스 안에서만 이 검사를 끕니다.
+/// 기본값 false = 기존 동작 (앱 코드는 이 값을 바꾸지 않습니다).
+pub static IGNORE_STOP_SIGNAL_FOR_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ----------------------------------------------------------------------------------
 // [Qwen3_5Model] 최상위 모델 구조 수정 및 인자 전달
@@ -3162,10 +4190,16 @@ impl Qwen3_5Model {
         if total_len > 1 {
             let mut processed = 0;
             let mut current_offset = seqlen_offset;
+            // 🌟 [KV-PRECISION] 프리필이 청크로 나뉘어도 KV 정밀도는 프롬프트 전체 길이로 판정합니다.
+            if seqlen_offset == 0 {
+                self.language_model.planned_prompt_len = total_len;
+            }
             
             while processed < total_len {
                 
-                if crate::utils::is_extraction_stopped() {
+                if !IGNORE_STOP_SIGNAL_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed)
+                    && crate::utils::is_extraction_stopped()
+                {
                     return Err(anyhow::anyhow!("Task cancelled"));
                 }
 

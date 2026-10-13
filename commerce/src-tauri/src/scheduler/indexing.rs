@@ -384,7 +384,11 @@ pub async fn index_item_chunks(
     }
 
     let model_for_embed = model.clone();
-    let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
+    // 🌟 [EMBED-PREFETCH] PLINKO 패스가 1건씩 임베딩하던 청크·창을 먼저 한 번의 배치로 올립니다.
+    //    배치 순전파가 켜져 있으면 모든 연속 창까지 추측해 넣습니다(결과는 같고 캐시 적중만 늘어남).
+    let model_for_prefetch = model.clone();
+    let speculative_prefetch = model.embed_speculation_cheap();
+    let enriched_chunks = crate::nl_convert::run_phase_b_pipeline_prefetch(
         &raw_chunks,
         doc_lang,
         page_type,
@@ -396,6 +400,11 @@ pub async fn index_item_chunks(
             let m = model_for_embed.clone();
             async move { m.get_embedding(text).await.unwrap_or(vec![0.0; 384]) }
         },
+        move |texts: Vec<String>| {
+            let m = model_for_prefetch.clone();
+            async move { m.prefetch_embeddings(texts).await }
+        },
+        speculative_prefetch,
     ).await;
 
     // 🌟 [SCHEMA WHITELIST] 스키마에 없는 property 는 검색 축이 아닙니다.

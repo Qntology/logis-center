@@ -215,7 +215,9 @@ pub async fn start_background_worker(
                         {
                             let mut model_lock = model.lock().await;
                             if let Some(m) = model_lock.as_ref() {
-                                m.deep_purge_resources().await;
+                                // 🌟 [TASK-END] 상주 층·KV·생성기·임베딩을 내리고 풀/작업 버퍼까지 반환한 뒤 [VRAM-AUDIT] 를 남깁니다.
+                                //    장치는 프로세스 전역 공유 장치라 LogisModel 을 버려도 DeviceId 가 늘지 않습니다.
+                                m.end_task_cleanup("task completed").await;
                             }
                             *model_lock = None;
                         }
@@ -240,7 +242,7 @@ pub async fn start_background_worker(
                             let mut model_lock: tokio::sync::MutexGuard<Option<LogisModel>> = model.lock().await;
                             if let Some(m) = model_lock.as_ref() {
                                 println!("[Scheduler] Error detected. Performing emergency memory release...");
-                                m.deep_purge_resources().await;
+                                m.end_task_cleanup("task failed").await;
                             }
                             *model_lock = None;
                         }

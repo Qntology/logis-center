@@ -359,38 +359,58 @@ impl crate::model::LogisModel {
     }
 
     // =====================================================================
-    // 🌟 [CROSSOVER] 임베딩 캐시 RAM 상한
+    // 🌟 [EMBED-CACHE] 임베딩 벡터 캐시 = 프로세스 전역 GRANITE_TEXT_CACHE
     // ---------------------------------------------------------------------
-    //  ── 왜 필요해졌나 ──
-    //   get_embedding_batch 가 캐시를 쓰게 되면서 적재량이 크게 늘어납니다.
-    //   기존에는 단건 호출만 캐시했기에 사실상 자라지 않았고,
-    //   그래서 상한이 없어도 문제가 드러나지 않았습니다.
+    //  ── 무엇이 바뀌었나 ──
+    //   예전에는 self.embedding_cache(HashMap)를 썼고, 64MB 를 넘으면 전체를 비웠으며
+    //   unload_embedding / deep_purge / Qwen3.5 릴레이도 매번 비웠습니다.
+    //   이제 get_embedding / get_embedding_batch 는 models::embedding::text_cache 의
+    //   전역 캐시를 읽고 씁니다. 퍼지와 무관하게 유지되고, 상한을 넘으면
+    //   오래된 LRU 엔트리 10% 만 퇴출하며, 뱅크 구는 고정 계층에 둡니다.
+    //   self.embedding_cache 필드는 API 호환을 위해 남겨 두었지만 더 이상 쓰지 않습니다.
     //
-    //  ── 이 값의 성격 ──
-    //   판정 임계치가 아니라 'RAM 사용 상한' 입니다. 정확도에 전혀 영향이 없고,
-    //   초과 시 캐시를 비워도 결과가 달라지지 않습니다(다시 계산할 뿐입니다).
-    //   기존 코드가 이미 unload_embedding / deep_purge 에서 cache.clear() 를
-    //   수행하므로, 전체 비우기는 이 코드베이스의 기존 정리 방식과 동일합니다.
-    const EMBED_CACHE_RAM_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+    //  ── 캐시 키 ──
+    //   (모델 지문 + 장치 dtype 계열 + 순전파 태그, 텍스트).
+    //   배치 순전파(embed_many, 고정 모양 / 동적)와 per-text 순전파는 서로 다른 공간이라
+    //   두 경로의 벡터가 섞이지 않습니다.
+    //
+    //  ── 0벡터 ──
+    //   모델이 사라졌거나 연산이 실패해 생긴 0벡터는 반환 길이를 지키기 위해
+    //   돌려주기만 하고 캐시에는 넣지 않습니다(영구 캐시 오염 방지).
+    // =====================================================================
 
-    /// 캐시 엔트리 하나의 대략적 RAM 점유(바이트).
-    ///   벡터 384 × f32 = 1536B + 키 문자열/해시 오버헤드 ≈ 96B
-    const EMBED_CACHE_ENTRY_BYTES: usize = 384 * 4 + 96;
-
-    fn guard_embedding_cache(cache: &mut std::collections::HashMap<String, Vec<f32>>) {
-        let cap = Self::EMBED_CACHE_RAM_BUDGET_BYTES / Self::EMBED_CACHE_ENTRY_BYTES;
-        if cache.len() > cap {
-            println!(
-                "[MODEL] 🧹 [EMBED CACHE] 엔트리 {}개가 RAM 예산({}MB)을 초과하여 캐시를 비웁니다. (정확도 영향 없음)",
-                cache.len(),
-                Self::EMBED_CACHE_RAM_BUDGET_BYTES / (1024 * 1024)
-            );
-            cache.clear();
-        }
+    /// 이 LogisModel 의 임베딩 캐시 공간 id.
+    pub fn embed_cache_space(&self) -> u64 {
+        crate::models::embedding::text_cache::space_for(&self.embedding_path, &self.device_config.device)
     }
 
+    /// 배치 순전파가 켜져 있어 '쓰일지 모르는 텍스트까지 미리 임베딩' 하는 추측성 프리패치가 싼지 여부.
+    /// (per-text 경로에서는 추측분 1건마다 순전파 1회가 그대로 들기 때문에 하지 않습니다)
+    pub fn embed_speculation_cheap(&self) -> bool {
+        // CPU · Vulkan 도 배치 순전파를 쓰지만 연산이 CPU 쪽이라 추측분이 싸지 않습니다(예전과 같이 CUDA/ROCm 만).
+        use crate::utils::GpuDeviceExt;
+        !self.is_cpu_mode
+            && self.device_config.device.is_cuda_or_rocm()
+            && crate::models::embedding::batched_enabled(&self.device_config.device)
+    }
+
+    // =====================================================================
+    // 🌟 [RAM WATCH / EMBED] 작업 집합 반환 폭주 제거 (E16)
+    // ---------------------------------------------------------------------
+    //  ── 무엇이 문제였나 ──
+    //   여유 RAM 이 압박 기준(2GB) 미만이면 미적중 배치마다(2초 간격) 프로세스
+    //   작업 집합을 통째로 반환했습니다. 이 PC 는 평소 여유가 1.8GB 라 거의 매번
+    //   발동했고, 반환된 토크나이저·bias JSON·캐시 페이지가 곧바로 소프트 폴트로
+    //   되돌아오며 임베딩 루프를 느리게 하고 RAM 그래프를 톱니로 만들었습니다.
+    //
+    //  ── 해결 ──
+    //   반환은 '저수위(압박 기준의 절반) 미만' 일 때만, 10초에 한 번까지 합니다.
+    //   압박 기준과 저수위 사이에서는 반환하지 않고 30초에 한 번 기록만 남깁니다.
+    //   SDS 기준선 기록은 기존과 같이 매번 합니다.
+    // =====================================================================
     fn embed_ram_watch(&self, texts: usize) {
-        static LAST_PRESSURE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static LAST_TRIM_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static LAST_NOTE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (avail, total) = crate::model::ram_snapshot();
         crate::utils::score_dynamics::record_baseline("model.ram_free_mb.embed", (avail / 1_000_000) as f32);
         crate::utils::score_dynamics::record_baseline("model.ram_used_pct.embed", crate::model::ram_used_pct(avail, total));
@@ -401,59 +421,103 @@ impl crate::model::LogisModel {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let last_ms = LAST_PRESSURE_MS.load(std::sync::atomic::Ordering::Relaxed);
-        if last_ms > 0 && now_ms.saturating_sub(last_ms) < 2_000 {
+        let low_water = crate::model::RAM_PRESSURE_MARGIN_BYTES / 2;
+        if avail >= low_water {
+            let last = LAST_NOTE_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if last == 0 || now_ms.saturating_sub(last) >= 30_000 {
+                LAST_NOTE_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "[MODEL] 🧠 [RAM WATCH / EMBED] 실연산 {}건 직전 여유 {}MB / 총 {}MB — 압박 기준 {}MB 미만이지만 저수위 {}MB 위라 작업 집합 반환을 생략합니다 (반환 폭주 방지 · 이 줄은 30초에 한 번)",
+                    texts,
+                    avail / 1_000_000,
+                    total / 1_000_000,
+                    crate::model::RAM_PRESSURE_MARGIN_BYTES / 1_000_000,
+                    low_water / 1_000_000
+                );
+            }
             return;
         }
-        LAST_PRESSURE_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        let last_ms = LAST_TRIM_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if last_ms > 0 && now_ms.saturating_sub(last_ms) < 10_000 {
+            return;
+        }
+        LAST_TRIM_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        // 🌟 [EMBED-CACHE] RAM 비상(저수위 미만): 질의 텍스트 LRU 계층을 비웁니다.
+        //    뱅크 구(고정 계층)는 남기므로 다음 검색의 뱅크 재계산은 생기지 않습니다.
+        let dropped = crate::models::embedding::text_cache::GRANITE_TEXT_CACHE.drop_lru_tier();
         crate::model::release_os_working_set();
         let (free_now, _) = crate::model::ram_snapshot();
         crate::utils::score_dynamics::record_baseline(
             "model.ram_trim_gain_mb.embed",
             (free_now.saturating_sub(avail) / 1_000_000) as f32,
         );
+        let cache = crate::models::embedding::text_cache::GRANITE_TEXT_CACHE.stats();
         println!(
-            "[MODEL] 🧠 [RAM WATCH / EMBED] 실연산 {}건 직전 {} → 작업 집합 반환 후 여유 {}MB | 임베딩 장치 {} · 임베딩 캐시 상한 {}MB | 반환과 이 줄은 2초에 한 번까지 (SDS 는 매번 기록)",
+            "[MODEL] 🧠 [RAM WATCH / EMBED] 실연산 {}건 직전 {} → 저수위 {}MB 미만이라 임베딩 캐시 LRU {}건 비움 + 작업 집합 반환 후 여유 {}MB | 임베딩 장치 {} · 임베딩 캐시 {}건(고정 {}) | 반환은 10초에 한 번까지 (SDS 는 매번 기록)",
             texts,
             crate::model::ram_pressure_line(avail, total),
+            low_water / 1_000_000,
+            dropped,
             free_now / 1_000_000,
             if self.is_cpu_mode { "CPU(가중치가 RAM 에 있음)" } else { "GPU(가중치가 VRAM 에 있음)" },
-            Self::EMBED_CACHE_RAM_BUDGET_BYTES / (1024 * 1024)
+            cache.entries,
+            cache.pinned
         );
     }
 
     pub async fn get_embedding(&self, text: String) -> anyhow::Result<Vec<f32>> {
-        // 🌟 1. 메모리 캐시부터 확인합니다 (중복된 텍스트면 GPU 연산 원천 차단)
-        {
-            let cache = self.embedding_cache.lock().await;
-            if let Some(vector) = cache.get(&text) {
-                return Ok(vector.clone());
-            }
+        use crate::models::embedding::text_cache::{is_cacheable, GRANITE_TEXT_CACHE};
+        // 🌟 1. 전역 캐시부터 확인합니다 (중복된 텍스트면 GPU 연산·모델 로드 원천 차단)
+        let space = self.embed_cache_space();
+        if let Some(vector) = GRANITE_TEXT_CACHE.get(space, &text) {
+            return Ok(vector.to_vec());
         }
         // Ensure embedding model is loaded (and generator is unloaded)
         self.ensure_embedding().await?;
         // 🌟 [CROSSOVER] 이 호출이 실제로 쓴 순간 점유를 학습합니다.
         //    가중치가 아니라 activation 축이며, embedding_budget_mb() 에 더해져
         //    다음 예산 판정이 '연산 중 여유' 까지 포함하게 만듭니다.
+        //    (NVML 은 이제 전역 핸들이라 질의 1회가 ~0.01ms 입니다)
         let free_before = self.get_free_vram_mb();
         let embedding_model_arc = self.embedding_model.clone();
         let text_clone = text.clone();
-        
-        let vector = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<f32>> {
+
+        // (벡터, 이 공간의 값인지) — 배치 경로가 실패해 per-text 로 대신 구한 벡터는 다른 공간의 값입니다.
+        let (vector, in_space) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<f32>, bool)> {
             let guard = embedding_model_arc.blocking_lock();
             if let Some(model) = guard.as_ref() {
-                model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
+                if model.batched_enabled() {
+                    // 🌟 [EMBED-BATCHED] 1건도 배치와 같은 경로(embed_many)를 거칩니다.
+                    //    그래서 단건으로 구한 벡터와 어떤 배치 안에서 구한 벡터가 비트 단위로 같고,
+                    //    캐시 공간도 배치 경로와 같습니다. 실패(OOM · Vulkan VRAM 사본 실패 등)하면
+                    //    get_embedding_batch 와 같이 per-text 로 계산하고 캐시에는 넣지 않습니다.
+                    match model.embed_many(std::slice::from_ref(&text_clone), &model.batch_opts()) {
+                        Ok(mut v) => Ok((v.pop().unwrap_or_else(|| vec![0.0; crate::models::embedding::EMBED_DIM]), true)),
+                        Err(e) => {
+                            println!(
+                                "[EMBED-BATCHED] ⚠️ 단건 배치 순전파 실패({}). per-text 경로로 계산하고 캐시에는 넣지 않습니다.",
+                                e
+                            );
+                            let v = model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+                            Ok((v, false))
+                        }
+                    }
+                } else {
+                    Ok((model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?, true))
+                }
             } else {
                 // Fallback to zeros if model failed to load
-                Ok(vec![0.0; 384])
+                Ok((vec![0.0; crate::models::embedding::EMBED_DIM], true))
             }
         }).await??;
         self.observe_activation_headroom(free_before);
-        // 🌟 2. 새로 연산된 벡터를 해시맵 캐시에 저장하여 다음 루프 때 재사용합니다.
-        {
-            let mut cache = self.embedding_cache.lock().await;
-            Self::guard_embedding_cache(&mut cache);
-            cache.insert(text, vector.clone());
+        // 🌟 2. 새로 연산된 벡터를 전역 캐시에 저장합니다. (0벡터는 저장하지 않음)
+        if !in_space {
+            // 다른 공간(per-text)의 값이라 캐시하지 않습니다.
+        } else if is_cacheable(&vector) {
+            GRANITE_TEXT_CACHE.insert(space, text, std::sync::Arc::from(vector.as_slice()), false);
+        } else {
+            println!("[MODEL] ⚠️ [EMBED FAIL] 1건이 0벡터로 반환되었습니다. 캐시에 넣지 않고 다음 호출에서 다시 계산합니다.");
         }
         Ok(vector)
     }
@@ -480,23 +544,61 @@ impl crate::model::LogisModel {
     //      틀린 벡터가 그대로 저장되는 무증상 손상입니다.
     //      spawn_blocking 하나 안에서 락을 쥔 채 청크를 순회하면
     //      activation 축소라는 목적은 그대로 달성하면서 이 위험이 사라집니다.
+    //
+    //   ④ 🌟 [EMBED-BATCHED] CUDA/ROCm/CPU/Vulkan 에서는 embed_many(진짜 배치 순전파)를 씁니다.
+    //      실패한 묶음만 per-text 로 다시 계산하고, 그 벡터는 다른 공간의 값이므로
+    //      캐시에 넣지 않습니다.
     // =====================================================================
     pub async fn get_embedding_batch(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.get_embedding_batch_inner(texts, false).await
+    }
+
+    /// 🌟 [EMBED-CACHE] 질의와 무관한 뱅크 구(속성·필터·동사·레이아웃·라벨 뱅크) 전용.
+    /// 결과는 get_embedding_batch 와 같고, 캐시의 '고정' 계층에 들어가 LRU 퇴출 대상이 아닙니다.
+    pub async fn get_embedding_batch_pinned(&self, texts: Vec<String>) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.get_embedding_batch_inner(texts, true).await
+    }
+
+    /// 🌟 [EMBED-PREFETCH] 루프가 곧 1건씩 요청할 텍스트를 한 번의 배치로 미리 캐시에 올립니다.
+    /// 이후 get_embedding 은 전부 캐시 적중이라 결과가 같고(같은 벡터), 모델·NVML·spawn 비용이 사라집니다.
+    pub async fn prefetch_embeddings(&self, texts: Vec<String>) {
+        if texts.is_empty() {
+            return;
+        }
+        if let Err(e) = self.get_embedding_batch_inner(texts, false).await {
+            println!("[MODEL] ⚠️ [EMBED-PREFETCH] 프리패치 실패({}). 루프가 1건씩 계산합니다.", e);
+        }
+    }
+
+    /// 뱅크 구 프리패치(고정 계층).
+    pub async fn prefetch_embeddings_pinned(&self, texts: Vec<String>) {
+        if texts.is_empty() {
+            return;
+        }
+        if let Err(e) = self.get_embedding_batch_inner(texts, true).await {
+            println!("[MODEL] ⚠️ [EMBED-PREFETCH] 뱅크 프리패치 실패({}). 루프가 1건씩 계산합니다.", e);
+        }
+    }
+
+    async fn get_embedding_batch_inner(&self, texts: Vec<String>, pinned: bool) -> anyhow::Result<Vec<Vec<f32>>> {
+        use crate::models::embedding::text_cache::{is_cacheable, GRANITE_TEXT_CACHE};
+        use crate::models::embedding::EMBED_DIM;
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
         // ── ① 캐시 조회 + 배치 내 중복 제거 ──
         //    miss_texts[i] 를 계산하면 miss_slots[i] 의 모든 자리에 채워 넣습니다.
+        let space = self.embed_cache_space();
+        let cached = GRANITE_TEXT_CACHE.get_many(space, &texts, pinned);
         let mut out: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         let mut miss_texts: Vec<String> = Vec::new();
         let mut miss_slots: Vec<Vec<usize>> = Vec::new();
         {
-            let cache = self.embedding_cache.lock().await;
             let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-            for (i, t) in texts.iter().enumerate() {
-                if let Some(v) = cache.get(t) {
-                    out[i] = Some(v.clone());
+            for (i, (t, c)) in texts.iter().zip(cached.into_iter()).enumerate() {
+                if let Some(v) = c {
+                    out[i] = Some(v.to_vec());
                     continue;
                 }
                 match seen.get(t.as_str()) {
@@ -517,13 +619,13 @@ impl crate::model::LogisModel {
         //    ensure_embedding 조차 부르지 않으므로, 생성 모델이 상주 중이어도
         //    임베딩이 되올라오는 일이 없습니다. 피크가 물리적으로 발생하지 않습니다.
         if miss_texts.is_empty() {
-            if hit_count > 0 {
+            if hit_count > 1 {
                 println!(
                     "[MODEL] ⚡ [EMBED CACHE] {}건 전부 캐시 적중. 모델 로드 없이 반환합니다.",
                     hit_count
                 );
             }
-            return Ok(out.into_iter().map(|v| v.unwrap_or_else(|| vec![0.0; 384])).collect());
+            return Ok(out.into_iter().map(|v| v.unwrap_or_else(|| vec![0.0; EMBED_DIM])).collect());
         }
 
         self.ensure_embedding().await?;
@@ -541,56 +643,142 @@ impl crate::model::LogisModel {
         let miss_for_compute = miss_texts.clone();
         let miss_len = miss_texts.len();
 
-        let (computed, used_threads) = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<(Vec<Vec<f32>>, usize)> {
+        struct Computed {
+            vecs: Vec<Vec<f32>>,
+            cacheable: Vec<bool>,
+            threads: usize,
+            batched: Option<crate::models::embedding::BatchRunStats>,
+            ms: f64,
+        }
+
+        let computed = tokio::task::spawn_blocking(
+            move || -> anyhow::Result<Computed> {
                 // 🌟 락을 '한 번만' 잡고 순회합니다.
                 //    이 스코프가 끝날 때까지 모델이 파기될 수 없으므로
                 //    중간에 0벡터로 대체되는 무증상 손상이 원천 차단됩니다.
+                let started = std::time::Instant::now();
                 let guard = embedding_model_arc.blocking_lock();
+                let n = miss_for_compute.len();
                 let model = match guard.as_ref() {
                     Some(m) => m,
-                    None => return Ok((vec![vec![0.0; 384]; miss_for_compute.len()], 0)),
+                    None => {
+                        return Ok(Computed {
+                            vecs: vec![vec![0.0; EMBED_DIM]; n],
+                            cacheable: vec![false; n],
+                            threads: 0,
+                            batched: None,
+                            ms: 0.0,
+                        })
+                    }
                 };
-                // 관측에 쓸 실제 스레드 수를 미리 확보합니다.
-                let threads = model.last_thread_count(miss_for_compute.len().min(RAM_CHUNK));
-                let mut acc: Vec<Vec<f32>> = Vec::with_capacity(miss_for_compute.len());
-                for part in miss_for_compute.chunks(RAM_CHUNK) {
-                    let v = model
-                        .embed_batch(part)
-                        .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
-                    acc.extend(v);
+                let mut acc: Vec<Vec<f32>> = Vec::with_capacity(n);
+                let mut cacheable: Vec<bool> = Vec::with_capacity(n);
+                if model.batched_enabled() {
+                    // 🌟 [EMBED-BATCHED] 진짜 배치 순전파. 실패한 묶음만 per-text 로 대체합니다.
+                    let opts = model.batch_opts();
+                    let mut st = crate::models::embedding::BatchRunStats::default();
+                    for part in miss_for_compute.chunks(RAM_CHUNK) {
+                        match model.embed_many_with_stats(part, &opts) {
+                            Ok((v, s)) => {
+                                st.texts += s.texts;
+                                st.seqs += s.seqs;
+                                st.micro_batches += s.micro_batches;
+                                st.padded_batches += s.padded_batches;
+                                st.real_tokens += s.real_tokens;
+                                st.computed_tokens += s.computed_tokens;
+                                cacheable.extend(std::iter::repeat(true).take(v.len()));
+                                acc.extend(v);
+                            }
+                            Err(e) => {
+                                println!(
+                                    "[EMBED-BATCHED] ⚠️ 배치 순전파 실패({}). 이 묶음 {}건은 per-text 경로로 계산하고 캐시에는 넣지 않습니다.",
+                                    e, part.len()
+                                );
+                                let v = model
+                                    .embed_batch(part)
+                                    .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+                                cacheable.extend(std::iter::repeat(false).take(v.len()));
+                                acc.extend(v);
+                            }
+                        }
+                    }
+                    Ok(Computed { vecs: acc, cacheable, threads: 0, batched: Some(st), ms: started.elapsed().as_secs_f64() * 1000.0 })
+                } else {
+                    // 관측에 쓸 실제 스레드 수를 미리 확보합니다.
+                    let threads = model.last_thread_count(n.min(RAM_CHUNK));
+                    for part in miss_for_compute.chunks(RAM_CHUNK) {
+                        let v = model
+                            .embed_batch(part)
+                            .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+                        cacheable.extend(std::iter::repeat(true).take(v.len()));
+                        acc.extend(v);
+                    }
+                    Ok(Computed { vecs: acc, cacheable, threads, batched: None, ms: started.elapsed().as_secs_f64() * 1000.0 })
                 }
-                Ok((acc, threads))
             },
         ).await??;
 
         // 🌟 [CROSSOVER] 두 축을 함께 관측합니다.
         //    ① 총 순간 점유 → embedding_budget_mb 에 반영 (가중치 축)
-        //    ② 스레드당 점유 → adaptive_thread_count 에 반영 (activation 축)
+        //    ② 스레드당 점유 → adaptive_thread_count 에 반영 (activation 축, per-text 경로만)
         self.observe_activation_headroom(free_before);
-        if used_threads > 0 && miss_len > 0 {
+        if computed.threads > 0 && miss_len > 0 {
             crate::models::embedding::EmbeddingModel::record_unit_activation(
                 free_before,
                 self.get_free_vram_mb(),
-                used_threads,
+                computed.threads,
             );
         }
-
-        // ── ④ 결과 흩뿌리기 + 캐시 적재 ──
-        {
-            let mut cache = self.embedding_cache.lock().await;
-            Self::guard_embedding_cache(&mut cache);
-            for (mi, vec) in computed.into_iter().enumerate() {
-                if mi >= miss_slots.len() { break; }
-                for &slot in &miss_slots[mi] {
-                    out[slot] = Some(vec.clone());
-                }
-                cache.insert(miss_texts[mi].clone(), vec);
+        if miss_len >= 2 {
+            match computed.batched {
+                Some(st) => println!(
+                    "[EMBED-PROF] 배치 순전파 {}건 ({}청크) | 마이크로배치 {}개 (패딩 {}) | 실토큰 {} / 연산토큰 {} | {:.0}ms ({:.0}건/s){}",
+                    miss_len,
+                    st.seqs,
+                    st.micro_batches,
+                    st.padded_batches,
+                    st.real_tokens,
+                    st.computed_tokens,
+                    computed.ms,
+                    miss_len as f64 * 1000.0 / computed.ms.max(0.001),
+                    if pinned { " | 고정 계층" } else { "" }
+                ),
+                None => println!(
+                    "[EMBED-PROF] per-text 순전파 {}건 | 스레드 {} | {:.0}ms ({:.0}건/s){}",
+                    miss_len,
+                    computed.threads,
+                    computed.ms,
+                    miss_len as f64 * 1000.0 / computed.ms.max(0.001),
+                    if pinned { " | 고정 계층" } else { "" }
+                ),
             }
+        }
+
+        // ── ④ 결과 흩뿌리기 + 캐시 적재 (0벡터·대체 경로 벡터는 적재하지 않음) ──
+        let mut inserts: Vec<(String, std::sync::Arc<[f32]>)> = Vec::with_capacity(miss_len);
+        let mut failed = 0usize;
+        for (mi, vec) in computed.vecs.into_iter().enumerate() {
+            if mi >= miss_slots.len() { break; }
+            let ok = is_cacheable(&vec);
+            if !ok {
+                failed += 1;
+            } else if computed.cacheable.get(mi).copied().unwrap_or(false) {
+                inserts.push((miss_texts[mi].clone(), std::sync::Arc::from(vec.as_slice())));
+            }
+            for &slot in &miss_slots[mi] {
+                out[slot] = Some(vec.clone());
+            }
+        }
+        GRANITE_TEXT_CACHE.insert_many(space, inserts, pinned);
+        if failed > 0 {
+            println!(
+                "[MODEL] ⚠️ [EMBED FAIL] {}건이 0벡터로 반환되었습니다. 길이 계약을 위해 0벡터로 채우되 캐시에는 넣지 않습니다.",
+                failed
+            );
         }
 
         // 모델이 사라졌거나 embed_batch 가 짧게 반환한 자리는 0벡터로 채웁니다.
         // (호출부는 전부 이 길이를 전제로 인덱싱하므로 길이 보존이 계약입니다)
-        Ok(out.into_iter().map(|v| v.unwrap_or_else(|| vec![0.0; 384])).collect())
+        Ok(out.into_iter().map(|v| v.unwrap_or_else(|| vec![0.0; EMBED_DIM])).collect())
     }
 }

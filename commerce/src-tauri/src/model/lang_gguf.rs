@@ -207,6 +207,13 @@ pub fn runtime_ready(model_dir: &Path) -> bool {
 static CONVERT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn prepare(model_dir: &Path, progress: &(dyn Fn(u64, u64) + Sync)) -> Result<PathBuf> {
+    // 🌟 [QWEN4-EXP] qwen4_exp 체크포인트는 qwen35 GGUF 로 변환하면 그래프가 달라집니다 (hc/PLE/QSA/MoE).
+    if crate::models::qwen4_exp::registry::is_qwen4_exp_dir(model_dir) {
+        bail!(
+            "[LANG-GGUF] {:?} 는 Qwen4-Exp(qwen4_exp) 체크포인트입니다. qwen35 Q4_K_M 변환은 지원하지 않으며, models::qwen4_exp::TextGenerator::load_dir 로 safetensors 를 직접 읽어야 합니다.",
+            model_dir
+        );
+    }
     if runtime_ready(model_dir) {
         return Ok(runtime_gguf(model_dir));
     }

@@ -18,6 +18,50 @@ use base64::Engine;
 use tokio::sync::Mutex as TokioMutex;
 use std::time::{Duration, Instant};
 
+/// 퍼지 범위. `Phase` 는 같은 작업 안의 단계 전환(임베딩은 예산이 되면 유지, 풀 일부 유지),
+/// `TaskEnd` 는 작업 종료(전부 반환).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PurgeScope {
+    Phase,
+    TaskEnd,
+}
+
+/// `LOGIS_PURGE_MODE=legacy` 이면 예전 퍼지(임베딩 항상 파기·300ms 대기·작업 집합 반환·고정 대기)를 씁니다.
+pub fn purge_mode_legacy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LOGIS_PURGE_MODE")
+            .map(|v| v.trim().eq_ignore_ascii_case("legacy"))
+            .unwrap_or(false)
+    })
+}
+
+/// `LOGIS_PURGE_KEEP_EMBED=0` 이면 단계 퍼지에서도 임베딩을 항상 내립니다 (예산이 남아도).
+pub fn purge_keeps_embedding() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LOGIS_PURGE_KEEP_EMBED")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true)
+    })
+}
+
+/// `LOGIS_TASK_END_RELEASE=0` 이면 작업 종료 시 예전처럼 단계 퍼지만 합니다.
+pub fn task_end_release_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LOGIS_TASK_END_RELEASE")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true)
+    })
+}
+
+/// 🌟 [VRAM-WATCH] 정착 대기 판정 (순수 함수, 테스트용 공개).
+/// 목표를 이미 넘었으면 즉시 성공, 측정 실패(None)는 진행 판단에 쓰지 않습니다.
+pub fn vram_settle_reached(current_free: Option<u64>, target_bytes: u64) -> bool {
+    matches!(current_free, Some(f) if f >= target_bytes)
+}
+
 impl LogisModel {
     pub async fn unload_embedding(&self) {
         {
@@ -27,19 +71,43 @@ impl LogisModel {
                 println!("[MODEL] Embedding Model unloaded to free VRAM.");
             }
         }
-        {
-            let mut cache = self.embedding_cache.lock().await;
-            cache.clear();
-            println!("[MODEL] Embedding Memory Cache cleared to free RAM.");
-        }
+        // 🌟 [EMBED-CACHE] 벡터 캐시는 RAM 만 쓰므로 VRAM 반환과 무관합니다. 비우지 않습니다.
+        crate::models::embedding::text_cache::note_purge("unload_embedding");
         if !self.is_cpu_mode {
-            if self.device_config.device.is_cuda_or_rocm() {
-                let _ = self.device_config.device.synchronize();
-            }
-            utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
-            println!("[MODEL] CUDA Context synchronized and memory pool flushed.");
+            self.settle_device("unload_embedding", utils::phase_pool_keep_bytes(), false).await;
+            println!("[MODEL] 장치 동기화 + 메모리 풀 반환 완료.");
         }
         self.sync_crossover_phase().await;
+    }
+
+    /// 🌟 [POOL-TRIM] 공유 장치를 동기화하고 메모리 풀을 `keep_bytes` 까지 돌려줍니다 (블로킹 작업은 spawn_blocking, 10초 상한).
+    /// 예전 flush_gpu_memory_pool 은 장치를 새로 만들었다 버리며 그 부수효과(cuBLAS 파기 시 동기화)에 기대었습니다.
+    pub async fn settle_device(&self, label: &'static str, keep_bytes: usize, release_ws: bool) {
+        if self.is_cpu_mode || self.device_config.device.is_cpu() {
+            return;
+        }
+        let dev = self.device_config.device.clone();
+        let r = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || utils::settle_gpu_memory(&dev, keep_bytes, release_ws, label)),
+        )
+        .await;
+        match r {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => println!("[POOL-TRIM] {} | join error: {:?}", label, e),
+            Err(_) => println!("[POOL-TRIM] ⚠️ {} | 10초 상한 도달. 동기화 없이 진행합니다.", label),
+        }
+    }
+
+    /// 🌟 [BG-IO] 백그라운드 KV 기록 작업을 모두 끝낼 때까지 기다립니다 (상한 10초).
+    /// 예전 퍼지는 워터마크(64건)까지만 기다려 KV 사본이 퍼지 뒤에도 RAM 에 남았습니다.
+    async fn drain_background_io(label: &str) {
+        if tokio::time::timeout(Duration::from_secs(10), crate::models::qwen::generate::drain_global_io())
+            .await
+            .is_err()
+        {
+            println!("[BG-IO] ⚠️ {} | 백그라운드 KV 기록이 10초 안에 끝나지 않아 기다리지 않고 진행합니다.", label);
+        }
     }
     pub async fn unload_generation_slots(&self, reason: &str) {
         let _hold = self.hold_generation();
@@ -48,6 +116,7 @@ impl LogisModel {
             self.generator.lock().await.is_some()
                 || self.qwen3_generator.lock().await.is_some()
                 || self.qwen3_5_generator.lock().await.is_some()
+                || self.qwen4_exp_generator.lock().await.is_some()
         };
         if !had {
             println!("[CROSSOVER] ⚡ [GEN UNLOAD SKIP] 반환할 생성 슬롯이 없습니다. ({})", reason);
@@ -56,7 +125,7 @@ impl LogisModel {
         }
 
         println!("[CROSSOVER] 🔻 [GEN UNLOAD] 생성 슬롯만 반환합니다. ({})", reason);
-        crate::models::qwen::generate::wait_for_global_io().await;
+        Self::drain_background_io("gen unload").await;
 
         {
             let mut gen = self.generator.lock().await;
@@ -82,6 +151,11 @@ impl LogisModel {
                 g.clear_kv_cache();
                 drop(g);
             }
+            if let Some(mut g) = self.qwen4_exp_generator.lock().await.take() {
+                println!("[CROSSOVER] Dropping Qwen4-Exp generator...");
+                g.clear_kv_cache();
+                drop(g);
+            }
             crate::model::lang_llm::set_resident_variant(None);
         }
         {
@@ -89,30 +163,182 @@ impl LogisModel {
         }
 
         if !self.is_cpu_mode {
-            let dev = self.device_config.device.clone();
-            let sync = tokio::time::timeout(
-                Duration::from_secs(5),
-                tokio::task::spawn_blocking(move || {
-                    if dev.is_cuda_or_rocm() {
-                        let _ = dev.synchronize();
-                    }
-                }),
-            ).await;
-            match sync {
-                Ok(Ok(())) => {},
-                Ok(Err(e)) => println!("[CROSSOVER] CUDA sync join error: {:?}", e),
-                Err(_) => println!("[CROSSOVER] ⚠️ CUDA sync 5s 상한 도달. 동기화 없이 진행합니다."),
-            }
-            // caching allocator 가 붙들고 있는 풀을 OS 로 밀어냅니다.
-            utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
+            // 공유 장치 전체를 동기화한 뒤 메모리 풀을 다음 단계용 여분만 남기고 돌려줍니다.
+            self.settle_device("unload_generation_slots", utils::phase_pool_keep_bytes(), false).await;
+            crate::models::common::kv_turbo::clear_codec_cache();
         }
 
         self.sync_crossover_phase().await;
         println!("[CROSSOVER] ✅ [GEN UNLOAD] 완료. 자유 {}MB", self.get_free_vram_mb());
     }
 
-    /// [CLEANUP] Aggressive Factory Reset Purge (Reinforced with Diagnostics)
+    /// [CLEANUP] 단계 전환 퍼지. 생성 슬롯·SigLIP2 를 내리고, 임베딩은 다음 단계 예산에 들어가면 남깁니다.
+    /// `LOGIS_PURGE_MODE=legacy` 이면 예전 퍼지(임베딩까지 항상 파기, 300ms 대기, 작업 집합 반환)를 씁니다.
     pub async fn deep_purge_resources(&self) {
+        if purge_mode_legacy() {
+            return self.deep_purge_resources_legacy().await;
+        }
+        self.purge_resources(PurgeScope::Phase).await;
+    }
+
+    /// 🌟 [TASK-END] 작업 종료 정리: 모든 슬롯(임베딩·Qwen3.5 상주 층 포함)을 내리고, 백그라운드 KV 기록을 끝까지 기다린 뒤
+    /// 장치 동기화 → 양자화 작업 버퍼 반환 → 메모리 풀 전부 반환 → 힙 반환 1회 → [VRAM-AUDIT] 한 줄.
+    pub async fn end_task_cleanup(&self, reason: &str) {
+        if purge_mode_legacy() || !task_end_release_enabled() {
+            self.deep_purge_resources().await;
+            return;
+        }
+        println!("[TASK-END] 🧹 작업 종료 정리를 시작합니다. ({})", reason);
+        self.purge_resources(PurgeScope::TaskEnd).await;
+    }
+
+    async fn purge_resources(&self, scope: PurgeScope) {
+        let _purge_hold = self.hold_generation();
+        let task_end = scope == PurgeScope::TaskEnd;
+        let gen_resident = self.generation_resident().await;
+        let vis_resident = self.siglip2_model.lock().await.is_some();
+        let emb_resident = self.embedding_resident().await;
+
+        // ── 1. 내릴 것이 없으면 퍼지 전체를 건너뜁니다 (작업 종료는 풀·작업 버퍼 반환만 수행) ──
+        if !gen_resident && !vis_resident && !(task_end && emb_resident) {
+            if task_end {
+                self.finish_task_release().await;
+            } else {
+                println!("[DIAG-PURGE] ⚡ [PURGE SKIP] 내릴 생성·비전 슬롯이 없어 퍼지를 생략합니다. (임베딩 상주: {})", emb_resident);
+                // 다른 계산이 남긴 풀 유휴분만 다음 단계용 여분까지 돌려줍니다 (동기화 + 반환, 슬롯은 건드리지 않음).
+                let keep = utils::phase_pool_keep_bytes();
+                if !self.is_cpu_mode && self.device_config.device.pool_idle_bytes().unwrap_or(0) > keep {
+                    self.settle_device("purge skip: 풀 유휴분 반환", keep, false).await;
+                }
+            }
+            *self.current_size.lock().await = None;
+            self.sync_crossover_phase().await;
+            return;
+        }
+
+        println!("[DIAG-PURGE] Step 0: 백그라운드 KV 기록을 끝까지 기다립니다...");
+        Self::drain_background_io("purge").await;
+        if !self.is_cpu_mode {
+            let _ = self.device_config.device.bind_to_thread();
+            utils::gpu_checkpoint(&self.device_config.device, "purge 시작");
+        }
+        println!("[DIAG-PURGE] Step 1: Clearing ALL Generation Slots...");
+        {
+            let mut gen = self.generator.lock().await;
+            if let Some(mut g) = gen.take() {
+                println!("[DIAG-PURGE] Dropping Active Generator (0.6B)...");
+                let _ = g.clear_kv_cache();
+                let _ = g.qwen.drop_kv_storage();
+                drop(g);
+            }
+        }
+        {
+            let mut q3_gen = self.qwen3_generator.lock().await;
+            if let Some(mut g) = q3_gen.take() {
+                println!("[DIAG-PURGE] Dropping Qwen3 Generator...");
+                g.clear_kv_cache();
+                drop(g);
+            }
+        }
+        {
+            let mut q35_gen = self.qwen3_5_generator.lock().await;
+            if let Some(mut g) = q35_gen.take() {
+                println!("[DIAG-PURGE] Dropping Qwen 3.5 Generator (상주 층 포함)...");
+                g.clear_kv_cache();
+                g.qwen3_5.language_model.release_resident_weights();
+                drop(g);
+            }
+            if let Some(mut g) = self.qwen4_exp_generator.lock().await.take() {
+                println!("[DIAG-PURGE] Dropping Qwen4-Exp Generator...");
+                g.clear_kv_cache();
+                drop(g);
+            }
+            crate::model::lang_llm::set_resident_variant(None);
+        }
+        {
+            let mut vis_guard = self.siglip2_model.lock().await;
+            if vis_guard.is_some() {
+                *vis_guard = None;
+                println!("[DIAG-PURGE] SigLIP2 vision engine dropped.");
+            }
+        }
+        *self.current_size.lock().await = None;
+        crate::models::common::kv_turbo::clear_codec_cache();
+
+        // ── 2. 생성 슬롯을 반환한 뒤의 실효 free 로 임베딩 유지 여부를 정합니다 ──
+        //    (벡터 캐시는 퍼지와 무관하게 살아 있으므로 임베딩 모델만의 문제입니다)
+        let keep_bytes = if task_end { 0 } else { utils::phase_pool_keep_bytes() };
+        if !self.is_cpu_mode {
+            self.settle_device("purge: 생성 슬롯 반환", keep_bytes, false).await;
+        }
+        let drop_embedding = task_end || {
+            let free_mb = self.get_free_vram_mb();
+            let next_mb = self
+                .generation_budget_mb(ModelSize::Qwen3)
+                .max(self.generation_budget_mb(ModelSize::Qwen3_5));
+            let keep = emb_resident && purge_keeps_embedding() && free_mb >= next_mb;
+            if emb_resident {
+                println!(
+                    "[DIAG-PURGE] Step 2: 임베딩 {} (실효 free {}MB vs 다음 단계 생성 예산 {}MB)",
+                    if keep { "유지 — 다음 단계 예산 안에 들어갑니다" } else { "해제 — 다음 단계 예산이 모자랍니다" },
+                    free_mb,
+                    next_mb
+                );
+            }
+            !keep
+        };
+        if drop_embedding && emb_resident {
+            if let Some(e) = self.embedding_model.lock().await.take() {
+                drop(e);
+            }
+            crate::models::embedding::text_cache::note_purge("deep_purge");
+            if !self.is_cpu_mode && !task_end {
+                self.settle_device("purge: 임베딩 반환", keep_bytes, false).await;
+            }
+        }
+
+        if task_end {
+            self.finish_task_release().await;
+        }
+
+        // 🌟 [VISION-CACHE] 이미 초기화된 경우에만 통계를 찍습니다 (퍼지가 디스크 스캔을 유발하지 않게).
+        if let Some(cache) = crate::models::vision_cache::vision_cache_if_initialized() {
+            let (hits, misses) = cache.stats();
+            if hits + misses > 0 {
+                let rate = (hits as f64 / (hits + misses) as f64) * 100.0;
+                println!("[VISION-CACHE] Session stats — hits: {} | misses: {} | hit rate: {:.1}%", hits, misses, rate);
+            }
+        }
+        println!("[DIAG-PURGE] Purge Complete. 실효 free {}MB", self.get_free_vram_mb());
+        self.sync_crossover_phase().await;
+    }
+
+    /// 작업 종료 공통 마무리: 장치 동기화 + 작업 버퍼 반환 + 풀 전부 반환, 힙 반환 1회, [VRAM-AUDIT].
+    async fn finish_task_release(&self) {
+        if !self.is_cpu_mode {
+            self.settle_device("task end", 0, true).await;
+        }
+        utils::release_heap();
+        if self.is_cpu_mode || self.device_config.device.is_cpu() {
+            println!("[VRAM-AUDIT] CPU 모드 | 지연 오류 누계 {}", utils::deferred_error_count());
+            return;
+        }
+        let dev = self.device_config.device.clone();
+        let (free, total) = utils::device_mem_info_of(&dev).unwrap_or((0, 0));
+        let idle = dev.pool_idle_bytes().unwrap_or(0) as u64;
+        let pending = dev.take_deferred_error();
+        println!(
+            "[VRAM-AUDIT] 작업 종료 | 실효 free {:.0} MB / 총 {:.0} MB | 풀 유휴 {:.0} MB | 지연 오류 누계 {}{}",
+            free as f64 / 1e6,
+            total as f64 / 1e6,
+            idle as f64 / 1e6,
+            utils::deferred_error_count() + pending.is_some() as u64,
+            pending.map(|e| format!(" | 방금 회수: {}", e)).unwrap_or_default()
+        );
+    }
+
+    /// [CLEANUP] 예전 퍼지 (LOGIS_PURGE_MODE=legacy)
+    pub async fn deep_purge_resources_legacy(&self) {
         let _purge_hold = self.hold_generation();
         println!("[DIAG-PURGE] Step 0: Waiting for background IO to finish...");
         crate::models::qwen::generate::wait_for_global_io().await; // [cite: 254]
@@ -146,6 +372,11 @@ impl LogisModel {
                 g.clear_kv_cache();
                 drop(g);
             }
+            if let Some(mut g) = self.qwen4_exp_generator.lock().await.take() {
+                println!("[DIAG-PURGE] Dropping Qwen4-Exp Generator...");
+                g.clear_kv_cache();
+                drop(g);
+            }
             crate::model::lang_llm::set_resident_variant(None);
         }
         
@@ -155,10 +386,10 @@ impl LogisModel {
             if let Some(e) = emb.take() {
                 drop(e);
             }
-            // 🌟 램 누수 방지를 위해 캐시도 깔끔하게 비워줍니다.
-            let mut cache = self.embedding_cache.lock().await;
-            cache.clear();
         }
+        // 🌟 [EMBED-CACHE] 질의와 무관한 뱅크 벡터까지 매번 다시 계산하던 원인이었습니다.
+        //    전역 캐시는 LRU 상한으로 RAM 이 묶여 있으므로 퍼지에서 비우지 않습니다.
+        crate::models::embedding::text_cache::note_purge("deep_purge");
 
         // 🌟 [SigLIP2] 비전 엔진도 함께 해제합니다.
         //    mmap 백엔드라 상주량이 LLM 보다 작지만,
@@ -234,7 +465,75 @@ impl LogisModel {
     // --- [NEW] VRAM Settlement Monitor (Smart Polling) ---
     pub async fn wait_for_vram_settle(&self, target_free_mb: u64, timeout_sec: u64, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         if self.is_cpu_mode { return Ok(()); }
+        if purge_mode_legacy() {
+            return self.wait_for_vram_settle_legacy(target_free_mb, timeout_sec, cancel_token).await;
+        }
+        // 🌟 [VRAM-WATCH] 실효 free(드라이버 free + 풀 유휴분)는 동기화·풀 반환 직후 이미 정확하므로
+        //    목표를 넘었으면 바로 돌아갑니다. 기준값은 첫 측정값이고(0.00 GB 로 시작하지 않음),
+        //    측정 실패는 0 으로 바꾸지 않고 건너뜁니다. 작업 집합 반환·고정 대기는 하지 않습니다.
+        let start = Instant::now();
+        let target_bytes = target_free_mb * 1024 * 1024;
+        let gpu = self.device_config.gpu_id as usize;
+        let first = utils::effective_free_vram_bytes(gpu);
+        if vram_settle_reached(first, target_bytes) {
+            return Ok(());
+        }
+        let mut last = first;
+        println!(
+            "[VRAM-WATCH] 실효 free {} < 목표 {} MB. 장치를 정리하며 기다립니다 (상한 {}초)...",
+            first.map(|f| format!("{:.2} GB", f as f64 / 1e9)).unwrap_or_else(|| "?".to_string()),
+            target_free_mb,
+            timeout_sec
+        );
+        self.settle_device("vram settle", 0, false).await;
+        let mut last_gain = Instant::now();
+        loop {
+            if let Some(token) = &cancel_token {
+                if token.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(anyhow::anyhow!("Task cancelled during VRAM wait"));
+                }
+            }
+            let cur = utils::effective_free_vram_bytes(gpu);
+            if vram_settle_reached(cur, target_bytes) {
+                println!(
+                    "[VRAM-WATCH] Success! VRAM Secured: {:.2} GB ({}ms)",
+                    cur.unwrap_or(0) as f64 / 1e9,
+                    start.elapsed().as_millis()
+                );
+                return Ok(());
+            }
+            if let (Some(c), Some(l)) = (cur, last) {
+                if c > l + (20 << 20) {
+                    last_gain = Instant::now();
+                    println!("[VRAM-WATCH] Reclaiming... ({:.2} GB -> {:.2} GB)", l as f64 / 1e9, c as f64 / 1e9);
+                }
+            }
+            // 동기화·풀 반환 뒤 1초 동안 늘지 않으면 이 프로세스가 더 돌려줄 것이 없는 상태입니다.
+            if last_gain.elapsed() >= Duration::from_secs(1) {
+                println!(
+                    "[VRAM-WATCH] 1초 동안 더 늘지 않아 {} 로 진행합니다 (목표 {} MB · 나머지는 다른 프로세스 점유).",
+                    last.map(|f| format!("{:.2} GB", f as f64 / 1e9)).unwrap_or_else(|| "?".to_string()),
+                    target_free_mb
+                );
+                return Ok(());
+            }
+            if cur.is_some() {
+                last = cur;
+            }
+            if start.elapsed().as_secs() >= timeout_sec {
+                println!(
+                    "[VRAM-WATCH] Timeout reached. Proceeding with {} (Target: {:.2} GB)",
+                    last.map(|f| format!("{:.2} GB", f as f64 / 1e9)).unwrap_or_else(|| "?".to_string()),
+                    target_free_mb as f64 / 1024.0
+                );
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
 
+    /// 예전 정착 대기 (LOGIS_PURGE_MODE=legacy)
+    async fn wait_for_vram_settle_legacy(&self, target_free_mb: u64, timeout_sec: u64, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<()> {
         println!("[VRAM-WATCH] Monitoring VRAM (Target > {} MB)...", target_free_mb);
         let start = Instant::now();
         let target_bytes = target_free_mb * 1024 * 1024;
@@ -438,7 +737,7 @@ impl LogisModel {
 
         if target_size == ModelSize::Qwen3_5
             && crate::model::lang_llm::resident_variant().is_some()
-            && self.qwen3_5_generator.lock().await.is_some()
+            && (self.qwen3_5_generator.lock().await.is_some() || self.qwen4_exp_generator.lock().await.is_some())
         {
             println!("[RELAY] 🔁 음차 전용 Qwen3.5-4B 가 상주 중이라 범용 Qwen3.5-2B 로 교체합니다. 이미 올라온 모델로 보고 건너뛰는 빠른 경로를 타지 않습니다.");
             *self.current_size.lock().await = None;
@@ -533,7 +832,9 @@ impl LogisModel {
         self.deep_purge_resources().await;
         
         if !self.is_cpu_mode {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            if purge_mode_legacy() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
             self.wait_for_vram_settle(1200, 5, cancel_token.clone()).await?;
         }
 
@@ -623,6 +924,7 @@ impl LogisModel {
             let other_resident = {
                 self.generator.lock().await.is_some()
                     || self.qwen3_5_generator.lock().await.is_some()
+                    || self.qwen4_exp_generator.lock().await.is_some()
             };
             let vision_resident = { self.siglip2_model.lock().await.is_some() };
             let keep_embedding = embed_resident
@@ -857,7 +1159,9 @@ impl LogisModel {
         let make_params = || Self::translit_params(prompt);
 
         let lang_variant = crate::model::lang_llm::resident_variant();
-        let first = {
+        let first = if self.qwen4_exp_generator.lock().await.is_some() {
+            self.generate_on_qwen4_exp_slot(make_params(), cancel_token.clone(), None).await
+        } else {
             let mut gen_guard = self.qwen3_5_generator.lock().await;
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow::anyhow!("Qwen3.5 Generator is missing"))?;
             let r = gen.generate(make_params(), cancel_token.clone(), None, None, None, None).await;
@@ -922,8 +1226,8 @@ impl LogisModel {
     pub async fn ensure_qwen3_5_lang(&self, code: &str) -> anyhow::Result<()> {
         use crate::model::lang_llm;
         {
-            let guard = self.qwen3_5_generator.lock().await;
-            if guard.is_some() && lang_llm::resident_variant().as_deref() == Some(code) {
+            let resident = self.qwen3_5_generator.lock().await.is_some() || self.qwen4_exp_generator.lock().await.is_some();
+            if resident && lang_llm::resident_variant().as_deref() == Some(code) {
                 return Ok(());
             }
         }
@@ -1023,8 +1327,15 @@ impl LogisModel {
                 return Err(anyhow!("Qwen3.5-4B-{} load timeout (900s)", code));
             }
         };
-        {
-            *self.qwen3_5_generator.lock().await = Some(gen);
+        // 🌟 [QWEN4-EXP] 로더가 config.json 으로 판별한 아키텍처에 맞는 슬롯에 둡니다.
+        match gen {
+            crate::models::qwen4_exp::TextGenerator::Qwen35(g) => {
+                *self.qwen3_5_generator.lock().await = Some(*g);
+            }
+            crate::models::qwen4_exp::TextGenerator::Qwen4Exp(g) => {
+                println!("[MODEL] 🧠 {} 는 Qwen4-Exp(qwen4_exp) 체크포인트라 Qwen4-Exp 슬롯에 둡니다.", lang_llm::repo_id(code));
+                *self.qwen4_exp_generator.lock().await = Some(*g);
+            }
         }
         lang_llm::set_resident_variant(Some(code.to_string()));
         let embed_after = self.embedding_resident().await;
@@ -1192,6 +1503,21 @@ impl LogisModel {
         }
     }
 
+    /// 🌟 [QWEN4-EXP] 언어 엔진이 Qwen4-Exp 슬롯에 있을 때 그 슬롯에서 생성하고 캐시를 비웁니다.
+    ///    호출자는 슬롯이 차 있을 때만 부르고, 비어 있으면 기존 `qwen3_5_generator` 경로로 진행합니다.
+    async fn generate_on_qwen4_exp_slot(
+        &self,
+        params: ChatCompletionParameters,
+        cancel_token: Option<Arc<AtomicBool>>,
+        ignore_list: Option<&[String]>,
+    ) -> anyhow::Result<String> {
+        let mut guard = self.qwen4_exp_generator.lock().await;
+        let gen = guard.as_mut().ok_or_else(|| anyhow!("Qwen4-Exp 언어 엔진이 슬롯에 없습니다"))?;
+        let r = gen.generate(params, cancel_token, None, None, ignore_list, None).await;
+        gen.clear_kv_cache();
+        r
+    }
+
     pub async fn generate_lang_json(
         &self,
         code: &str,
@@ -1211,7 +1537,9 @@ impl LogisModel {
             top_p: Some(0.95),
             ..Default::default()
         };
-        let raw = {
+        let raw = if self.qwen4_exp_generator.lock().await.is_some() {
+            self.generate_on_qwen4_exp_slot(params, cancel_token, ignore_list).await
+        } else {
             let mut guard = self.qwen3_5_generator.lock().await;
             let gen = guard
                 .as_mut()
@@ -1257,11 +1585,18 @@ impl LogisModel {
     pub async fn deep_purge_keep_lang(&self, doc_lang: &str) -> Option<String> {
         use crate::model::lang_llm;
         let code = lang_llm::alphaedge_code(doc_lang).map(|c| c.to_string());
-        let kept = match code.as_deref() {
-            Some(c) if lang_llm::resident_variant().as_deref() == Some(c) => self.qwen3_5_generator.lock().await.take(),
-            _ => None,
-        };
+        let resident_here = code.as_deref().is_some() && lang_llm::resident_variant().as_deref() == code.as_deref();
+        let kept = if resident_here { self.qwen3_5_generator.lock().await.take() } else { None };
+        let kept_q4 = if resident_here { self.qwen4_exp_generator.lock().await.take() } else { None };
         self.deep_purge_resources().await;
+        if let (Some(mut g), Some(c)) = (kept_q4, code.clone()) {
+            g.clear_kv_cache();
+            *self.qwen4_exp_generator.lock().await = Some(g);
+            *self.current_size.lock().await = Some(ModelSize::Qwen3_5);
+            lang_llm::set_resident_variant(Some(c.clone()));
+            self.sync_crossover_phase().await;
+            return Some(c);
+        }
         match (kept, code) {
             (Some(mut g), Some(c)) => {
                 let _ = g.clear_kv_cache();
@@ -1277,7 +1612,15 @@ impl LogisModel {
 
     pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {
         if crate::model::lang_llm::resident_variant().is_some() {
-            let dropped = {
+            let dropped_q4 = match self.qwen4_exp_generator.lock().await.take() {
+                Some(mut g) => {
+                    g.clear_kv_cache();
+                    drop(g);
+                    true
+                }
+                None => false,
+            };
+            let dropped_q35 = {
                 let mut guard = self.qwen3_5_generator.lock().await;
                 match guard.take() {
                     Some(mut g) => {
@@ -1288,6 +1631,7 @@ impl LogisModel {
                     None => false,
                 }
             };
+            let dropped = dropped_q4 || dropped_q35;
             crate::model::lang_llm::set_resident_variant(None);
             if dropped {
                 *self.current_size.lock().await = None;
@@ -1336,16 +1680,15 @@ impl LogisModel {
                         println!("[RELAY] Embedding model released for VRAM (image pipeline).");
                     }
                 }
-                {
-                    let mut cache = self.embedding_cache.lock().await;
-                    cache.clear();
-                }
+                // 🌟 [EMBED-CACHE] 모델만 내리고 벡터 캐시는 유지합니다(RAM 전용, VRAM 무관).
+                crate::models::embedding::text_cache::note_purge("relay (image pipeline)");
             } else {
                 let embed_resident = { self.embedding_model.lock().await.is_some() };
                 let other_resident = {
                     self.generator.lock().await.is_some()
                         || self.qwen3_generator.lock().await.is_some()
                         || self.qwen3_5_generator.lock().await.is_some()
+                        || self.qwen4_exp_generator.lock().await.is_some()
                 };
                 let keep_embedding = embed_resident
                     && !other_resident
@@ -1606,38 +1949,11 @@ impl LogisModel {
             reason
         );
         if !self.is_cpu_mode {
-            let dev = self.device_config.device.clone();
-            let sync_res = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                tokio::task::spawn_blocking(move || {
-                    if dev.is_cuda_or_rocm() {
-                        let _ = dev.synchronize();
-                    }
-                }),
-            )
-            .await;
-            match sync_res {
-                Ok(Ok(())) => println!("[VRAM] CUDA synchronize OK."),
-                Ok(Err(e)) => println!("[VRAM] CUDA synchronize join error: {:?}", e),
-                Err(_) => println!("[VRAM] ⚠️ CUDA synchronize 5s timeout — 드라이버 스톨 감지, 동기화 없이 진행합니다."),
-            }
-            utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
-            println!("[VRAM] CUDA context refresh done. Proceeding to STAGE-5.");
-            if let Some(token) = None::<Arc<AtomicBool>> {
-                let _ = token;
-            }
+            self.settle_device("release_siglip2", utils::phase_pool_keep_bytes(), false).await;
+            println!("[VRAM] 장치 동기화 + 메모리 풀 반환 완료. Proceeding to STAGE-5.");
             let _ = self.wait_for_vram_settle(1200, 10, None).await;
         }
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-        #[cfg(target_os = "macos")]
-        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+        utils::legacy_working_set_trim();
     }
     pub async fn with_siglip_text<T, F>(&self, what: &str, f: F) -> anyhow::Result<T>
     where
@@ -1711,9 +2027,17 @@ impl LogisModel {
                 gpu_id: 0,
             };
         } else {
-            let fresh_dev = utils::new_gpu_device(config.gpu_id as usize).unwrap_or(candle_core::Device::Cpu);
-            config.device = fresh_dev;
-            println!("🚀 [MODEL] Running in default mode ({}) with Fresh CUDA Context", config.name);
+            // 🌟 [ONE-DEVICE] 프로세스 전역 공유 장치를 그대로 씁니다 (get_optimal_device_config 가 DEVICE_CACHE 에서 꺼낸 장치).
+            //    예전에는 여기서 장치를 새로 만들어 작업마다 DeviceId 가 늘고, 커널 재컴파일·작업 버퍼 누수가 생겼습니다.
+            //    CUDA 의 primary context 는 원래 하나뿐이라 '새 컨텍스트' 는 존재하지 않았습니다.
+            if config.device.is_cpu() && !config.is_cpu {
+                println!("⚠️ [MODEL] GPU 장치를 만들지 못해 CPU 모드로 전환합니다.");
+                config.is_cpu = true;
+            }
+            if !config.device.is_cpu() {
+                utils::gpu_checkpoint(&config.device, "LogisModel::new");
+            }
+            println!("🚀 [MODEL] Running in default mode ({}) on shared device {:?}", config.name, config.device);
         }
 
         let app_dir = crate::utils::get_app_dir();
@@ -1740,6 +2064,7 @@ impl LogisModel {
             generator: Arc::new(TokioMutex::new(None)),
             qwen3_generator: Arc::new(TokioMutex::new(None)), // 🌟 추가
             qwen3_5_generator: Arc::new(TokioMutex::new(None)),
+            qwen4_exp_generator: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
             embedding_cache: Arc::new(TokioMutex::new(std::collections::HashMap::new())), // 🌟 캐시 초기화
             generation_hold: Arc::new(std::sync::atomic::AtomicU32::new(0)),

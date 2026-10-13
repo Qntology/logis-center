@@ -35,6 +35,9 @@ pub struct LogisModel {
     pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, 
     pub qwen3_generator: Arc<TokioMutex<Option<Qwen3GenerateModel>>>, 
     pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>,
+    /// 🌟 [QWEN4-EXP] 언어 엔진 슬롯이 Qwen4-Exp 체크포인트를 읽었을 때 쓰는 자리 (`qwen3_5_generator` 와 동시에 차지 않음).
+    ///    `lang_llm::resident_variant()` 가 가리키는 엔진이 이 슬롯 또는 `qwen3_5_generator` 에 있습니다.
+    pub qwen4_exp_generator: Arc<TokioMutex<Option<crate::models::qwen4_exp::Qwen4ExpGenerateModel>>>,
     
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     pub embedding_cache: Arc<TokioMutex<std::collections::HashMap<String, Vec<f32>>>>,
@@ -224,26 +227,15 @@ pub fn ram_pressure_line(avail: u64, total: u64) -> String {
     )
 }
 
+/// 🌟 [HEAP-RELEASE] RAM 압박 시 메모리 반환.
+/// 기본은 mimalloc 의 빈 힙 페이지만 OS 로 돌려줍니다(utils::release_heap). 예전처럼 작업 집합 전체를
+/// 내쫓으면(SetProcessWorkingSetSizeEx) mmap 가중치·토크나이저 페이지가 곧바로 다시 읽혀 RAM 이 톱니처럼
+/// 오르내리고 수 초씩 멈췄습니다. `LOGIS_MEM_TRIM=legacy` 이면 예전 동작입니다.
 pub fn release_os_working_set() {
-    #[cfg(target_os = "windows")]
-    unsafe {
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-    }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        extern "C" {
-            fn malloc_trim(pad: usize) -> i32;
-        }
-        malloc_trim(0);
-    }
-    #[cfg(target_os = "macos")]
-    unsafe {
-        extern "C" {
-            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-        }
-        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    if crate::utils::legacy_ws_trim_enabled() {
+        crate::utils::force_working_set_trim();
+    } else {
+        crate::utils::release_heap();
     }
 }
 
@@ -330,7 +322,7 @@ impl LogisModel {
     pub async fn resident_generation_cost_mb(&self) -> u64 {
         let qwen = self.generator.lock().await.is_some();
         let qwen3 = self.qwen3_generator.lock().await.is_some();
-        let qwen3_5 = self.qwen3_5_generator.lock().await.is_some();
+        let qwen3_5 = self.qwen3_5_generator.lock().await.is_some() || self.qwen4_exp_generator.lock().await.is_some();
         let mut total = 0u64;
         if qwen {
             total += Self::measured_generation_mb(0);
@@ -386,6 +378,7 @@ impl LogisModel {
         self.generator.lock().await.is_some()
             || self.qwen3_generator.lock().await.is_some()
             || self.qwen3_5_generator.lock().await.is_some()
+            || self.qwen4_exp_generator.lock().await.is_some()
     }
 
     /// 🌟 실제 슬롯 상태를 읽어 페이즈 원장을 사실과 일치시킵니다.

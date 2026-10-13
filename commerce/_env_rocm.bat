@@ -10,9 +10,14 @@ if not defined VS_SCRIPT (
     exit /b 1
 )
 if not defined VCVARS_VER set "VCVARS_VER=14.44"
-call "%VS_SCRIPT%" %VS_ARGS% -vcvars_ver=%VCVARS_VER% > "%TEMP%\vcvars_out.txt" 2>&1
+rem Per-call log folder: two consoles running this at once must not share one file.
+call :unique_tmp VCVARS_DIR
+set "VCVARS_LOG=%VCVARS_DIR%\vcvars_out.txt"
+call "%VS_SCRIPT%" %VS_ARGS% -vcvars_ver=%VCVARS_VER% > "%VCVARS_LOG%" 2>&1
 echo [MSVC] requested=%VCVARS_VER% active=%VCToolsVersion%
-type "%TEMP%\vcvars_out.txt"
+type "%VCVARS_LOG%"
+del "%VCVARS_LOG%" > nul 2>&1
+rmdir "%VCVARS_DIR%" > nul 2>&1
 set "PYTHONIOENCODING=utf-8"
 
 rem ---------------------------------------------------------------------------------------------
@@ -120,4 +125,13 @@ exit /b 0
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" exit /b 0
 for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call :probe_vs "%%I"
+exit /b 0
+
+:unique_tmp
+rem Creates a fresh folder under %TEMP% and stores its path in the variable named by %1.
+rem mkdir is atomic, so consoles that start in the same second (same %RANDOM% seed) cannot share it.
+set "UT_DIR=%TEMP%\logis_env_%RANDOM%%RANDOM%"
+mkdir "%UT_DIR%" > nul 2>&1 || goto :unique_tmp
+set "%~1=%UT_DIR%"
+set "UT_DIR="
 exit /b 0

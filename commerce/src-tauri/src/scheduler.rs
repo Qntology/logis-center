@@ -4013,6 +4013,14 @@ pub async fn process_task(
             
             let mut field_formats: Vec<FieldFormat> = Vec::new();
 
+            // 🌟 [EMBED-PREFETCH] 필드마다 3번씩(bias · 구 뱅크 · 결합 prejudice) 나뉘던 임베딩 호출과
+            //    루프 뒤의 레이아웃 prejudice 를 한 번의 배치로 미리 올립니다(질의 무관 뱅크 → 고정 계층).
+            //    아래 루프는 전부 캐시 적중이라 결과가 같고, 호출마다 들던 spawn · 모델 락 비용이 사라집니다.
+            {
+                let mut pre = crate::utils::ai_utils::field_bank_prefetch_texts(&fields, None);
+                pre.push(crate::parsing::get_layout_bias(&page_type, &doc_lang).1);
+                model.prefetch_embeddings_pinned(pre).await;
+            }
             for (f_idx, (fname, _, bias_target, predefined_prej)) in fields.iter().enumerate() {
                 let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
 
@@ -4224,6 +4232,10 @@ pub async fn process_task(
                 let mut hdr_label_weights: Vec<Vec<f32>> = Vec::new();
                 let mut hdr_prej_embs: Vec<Vec<Vec<f32>>> = Vec::new();
 
+                // 🌟 [EMBED-PREFETCH] 필드마다 2번씩(라벨 구 · 편견 구) 나뉘던 LABEL BANK 임베딩을 한 번의 배치로 미리 올립니다.
+                model
+                    .prefetch_embeddings_pinned(crate::utils::ai_utils::label_bank_prefetch_texts(&fields, &doc_lang, &page_type))
+                    .await;
                 for (fname, _, _, _) in &fields {
                     let (label_phrases, label_weights) = label_phrase_bank(&doc_lang, &page_type, fname);
                     if label_phrases.is_empty() { continue; }
@@ -6895,6 +6907,11 @@ pub async fn process_task(
             let mut field_is_analytic: Vec<bool> = Vec::new();
             let mut field_formats: Vec<FieldFormat> = Vec::new();
 
+            // 🌟 [EMBED-PREFETCH] 필드마다 4번씩(bias · 구 뱅크 · 편견 구 뱅크 · 결합 prejudice) 나뉘던 임베딩 호출을
+            //    한 번의 배치로 미리 올립니다(질의 무관 뱅크 → 고정 계층). 아래 루프는 전부 캐시 적중이라 결과가 같습니다.
+            model
+                .prefetch_embeddings_pinned(crate::utils::ai_utils::field_bank_prefetch_texts(&fields, Some((doc_lang.as_str(), page_type.as_str()))))
+                .await;
             for (f_idx, (fname, _, bias_target, predefined_prej)) in fields.iter().enumerate() {
                 let bias_emb = model.get_embedding(bias_target.clone()).await.unwrap_or(vec![0.0; 384]);
 
@@ -7188,6 +7205,10 @@ pub async fn process_task(
                 let mut d_prej_raw: Vec<Vec<Vec<f32>>> = Vec::new();
                 let mut d_prej_texts: Vec<Vec<String>> = Vec::new();
 
+                // 🌟 [EMBED-PREFETCH] 필드마다 2번씩(라벨 구 · 편견 구) 나뉘던 LABEL BANK 임베딩을 한 번의 배치로 미리 올립니다.
+                model
+                    .prefetch_embeddings_pinned(crate::utils::ai_utils::label_bank_prefetch_texts(&fields, &doc_lang, &page_type))
+                    .await;
                 for (fname, _, _, _) in &fields {
                     let (lp, lw) = label_phrase_bank(&doc_lang, &page_type, fname);
                     if lp.is_empty() { continue; }
@@ -9771,7 +9792,11 @@ pub async fn process_task(
                 
                 
                 let model_for_embed = model.clone();
-                let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
+                // 🌟 [EMBED-PREFETCH] PLINKO 패스가 1건씩 임베딩하던 청크·창을 먼저 한 번의 배치로 올립니다.
+                //    배치 순전파가 켜져 있으면 모든 연속 창까지 추측해 넣습니다(결과는 같고 캐시 적중만 늘어남).
+                let model_for_prefetch = model.clone();
+                let speculative_prefetch = model.embed_speculation_cheap();
+                let enriched_chunks = crate::nl_convert::run_phase_b_pipeline_prefetch(
                     &raw_chunks,
                     &doc_lang,
                     &page_type,
@@ -9785,6 +9810,11 @@ pub async fn process_task(
                             m.get_embedding(text).await.unwrap_or(vec![0.0; 384])
                         }
                     },
+                    move |texts: Vec<String>| {
+                        let m = model_for_prefetch.clone();
+                        async move { m.prefetch_embeddings(texts).await }
+                    },
+                    speculative_prefetch,
                 ).await;
                 crate::nl_convert::log_enriched_chunks(&enriched_chunks);
 
@@ -10131,7 +10161,11 @@ pub async fn process_task(
                         }
 
                         let model_for_embed = model.clone();
-                        let enriched_chunks = crate::nl_convert::run_phase_b_pipeline(
+                        // 🌟 [EMBED-PREFETCH] PLINKO 패스가 1건씩 임베딩하던 청크·창을 먼저 한 번의 배치로 올립니다.
+                        //    배치 순전파가 켜져 있으면 모든 연속 창까지 추측해 넣습니다(결과는 같고 캐시 적중만 늘어남).
+                        let model_for_prefetch = model.clone();
+                        let speculative_prefetch = model.embed_speculation_cheap();
+                        let enriched_chunks = crate::nl_convert::run_phase_b_pipeline_prefetch(
                             &raw_chunks,
                             &doc_lang,
                             &page_type,
@@ -10145,6 +10179,11 @@ pub async fn process_task(
                                     m.get_embedding(text).await.unwrap_or(vec![0.0; 384])
                                 }
                             },
+                            move |texts: Vec<String>| {
+                                let m = model_for_prefetch.clone();
+                                async move { m.prefetch_embeddings(texts).await }
+                            },
+                            speculative_prefetch,
                         ).await;
 
                         if !enriched_chunks.is_empty() {

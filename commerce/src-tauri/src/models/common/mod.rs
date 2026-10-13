@@ -180,9 +180,10 @@ pub fn turbo_kv_step(
 
 #[derive(Debug, Clone)]
 pub struct GateUpDownMLP {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    // 🌟 [W8A16] dense Linear(safetensors·기존 경로) 또는 정확 양자화 선형층(Qwen3 Q8_0 상주)
+    gate_proj: gguf::ProjKind,
+    up_proj: gguf::ProjKind,
+    down_proj: gguf::ProjKind,
     act_fn: Activation,
 }
 
@@ -204,11 +205,21 @@ impl GateUpDownMLP {
         let up_proj = linear_b(hidden_size, intermediate_size, bias, vb.pp(up_pp_name))?;
         let down_proj = linear_b(intermediate_size, hidden_size, bias, vb.pp(down_pp_name))?;
         Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
+            gate_proj: gguf::ProjKind::LinearProj(gate_proj),
+            up_proj: gguf::ProjKind::LinearProj(up_proj),
+            down_proj: gguf::ProjKind::LinearProj(down_proj),
             act_fn,
         })
+    }
+
+    /// 🌟 [W8A16] 이미 만든 프로젝션으로 조립합니다. (Qwen3 Q8_0 상주 로더)
+    pub fn from_projs(
+        gate_proj: gguf::ProjKind,
+        up_proj: gguf::ProjKind,
+        down_proj: gguf::ProjKind,
+        act_fn: Activation,
+    ) -> Self {
+        Self { gate_proj, up_proj, down_proj, act_fn }
     }
 }
 
@@ -580,10 +591,11 @@ impl QKVCatAttention {
 }
 
 pub struct QKNormAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    // 🌟 [W8A16] dense Linear(기존 경로) 또는 정확 양자화 선형층(Qwen3 Q8_0 상주)
+    q_proj: gguf::ProjKind,
+    k_proj: gguf::ProjKind,
+    v_proj: gguf::ProjKind,
+    o_proj: gguf::ProjKind,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     num_attention_heads: usize,
@@ -617,8 +629,6 @@ impl QKNormAttention {
     ) -> Result<Self> {
         let head_dim = head_dim.unwrap_or(hidden_size / num_attention_heads);
         let num_key_value_heads = num_key_value_heads.unwrap_or(num_attention_heads);
-        let num_kv_groups = num_attention_heads / num_key_value_heads;
-        let scaling = 1f64 / f64::sqrt(head_dim as f64);
         let q_proj_pp_name = q_proj_pp_name.unwrap_or("q_proj");
         let k_proj_pp_name = k_proj_pp_name.unwrap_or("k_proj");
         let v_proj_pp_name = v_proj_pp_name.unwrap_or("v_proj");
@@ -651,7 +661,33 @@ impl QKNormAttention {
         )?;
         let q_norm = rms_norm(head_dim, rms_norm_eps, vb.pp(q_norm_pp_name))?;
         let k_norm = rms_norm(head_dim, rms_norm_eps, vb.pp(k_norm_pp_name))?;
-        Ok(Self {
+        Ok(Self::from_parts(
+            gguf::ProjKind::LinearProj(q_proj),
+            gguf::ProjKind::LinearProj(k_proj),
+            gguf::ProjKind::LinearProj(v_proj),
+            gguf::ProjKind::LinearProj(o_proj),
+            q_norm,
+            k_norm,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+        ))
+    }
+
+    /// 🌟 [W8A16] 이미 만든 프로젝션·노름으로 조립합니다. (Qwen3 Q8_0 상주 로더)
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        q_proj: gguf::ProjKind,
+        k_proj: gguf::ProjKind,
+        v_proj: gguf::ProjKind,
+        o_proj: gguf::ProjKind,
+        q_norm: RmsNorm,
+        k_norm: RmsNorm,
+        num_attention_heads: usize,
+        num_key_value_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        Self {
             q_proj,
             k_proj,
             v_proj,
@@ -660,14 +696,14 @@ impl QKNormAttention {
             k_norm,
             num_attention_heads,
             num_key_value_heads,
-            num_kv_groups,
+            num_kv_groups: num_attention_heads / num_key_value_heads.max(1),
             head_dim,
-            scaling,
+            scaling: 1f64 / f64::sqrt(head_dim as f64),
             kv_cache: None,
             #[cfg(feature = "turbo-quant")]
             turbo_kv: None,
             turbo_kv_allowed: true,
-        })
+        }
     }
 
     pub fn forward(
@@ -1793,4 +1829,72 @@ pub fn conv1d_depthwise(input: &Tensor, weight: &Tensor, bias: Option<&Tensor>) 
             Ok(out.broadcast_add(&bias)?)
         }
     }
+}
+// =====================================================================
+// 🌟 [GDN-FUSED] Gated DeltaNet(선형 어텐션) 융합 커널 사용 여부
+// ---------------------------------------------------------------------
+//  Qwen3.5 / Qwen4-Exp 의 선형 어텐션 혼합기(conv1d + SiLU + L2 norm + 게이트 + delta rule 스캔)를
+//  포크의 `candle_core::delta_rule::fused_gated_delta_rule` 한 번의 호출로 계산할지 정합니다.
+//  - `LOGIS_GDN_FUSED=0` (또는 off/false/legacy) 이면 기존 텐서 연산 경로를 씁니다. (A/B 비교용)
+//  - 포크가 이 장치에 커널을 갖고 있지 않으면(Vulkan/Metal 등) 언제나 기존 경로입니다.
+//  - 테스트는 [`set_gdn_fused_override`] 로 같은 프로세스 안에서 두 경로를 번갈아 돌립니다.
+// =====================================================================
+static GDN_FUSED_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 🌟 [GDN-FUSED] 테스트용 강제값. `None` = 환경변수 기본, `Some(true/false)` = 강제로 켜기/끄기.
+pub fn set_gdn_fused_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    GDN_FUSED_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn gdn_fused_env() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("LOGIS_GDN_FUSED").unwrap_or_default().trim().to_ascii_lowercase();
+        let on = !matches!(v.as_str(), "0" | "off" | "false" | "no" | "legacy");
+        if !on {
+            println!("[GDN-FUSED] LOGIS_GDN_FUSED={v} → 선형 어텐션(Gated DeltaNet)을 기존 텐서 연산 경로로 계산합니다.");
+        }
+        on
+    })
+}
+
+/// 🌟 [GDN-FUSED] 이 장치·형상에서 융합 GDN 커널을 쓸지.
+pub fn gdn_fused_enabled(device: &candle_core::Device, cfg: &candle_core::delta_rule::GdnConfig) -> bool {
+    let want = match GDN_FUSED_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => gdn_fused_env(),
+    };
+    want && candle_core::delta_rule::fused_gdn_supported_for(device, cfg)
+}
+
+/// 🌟 [WS-TRIM] 생성 호출·프리필 청크마다 하던 프로세스 작업 집합(working set) 강제 반환.
+///
+/// 매 호출마다 OS 에 페이지를 토해내게 하면 다음 호출이 같은 페이지를 다시 폴트로 끌어와
+/// RAM 사용량이 널뛰고(내렸다 다시 오름) 시간도 듭니다. 기본은 아무것도 하지 않으며,
+/// `LOGIS_GEN_WS_TRIM=1` 이면 예전처럼 SetProcessWorkingSetSizeEx / malloc_trim 을 호출합니다.
+pub fn legacy_working_set_trim() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let v = std::env::var("LOGIS_GEN_WS_TRIM").unwrap_or_default().trim().to_ascii_lowercase();
+        matches!(v.as_str(), "1" | "on" | "true" | "yes")
+    });
+    if !on {
+        return;
+    }
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
+    #[cfg(target_os = "macos")]
+    unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
 }
