@@ -315,37 +315,15 @@ mod linux_impl {
 }
 
 // --- macOS Implementation ---
+// 🌟 [MAC-VERIFY] 예전 구현은 metal 크레이트(0.33)에 없는 MTLIO API(IOCommandQueue ·
+//    new_io_command_queue)를 불러 macOS 빌드가 컴파일되지 않았습니다(macos-15 러너 첫 빌드에서 확인).
+//    MTLIOCommandBuffer 는 MTLBuffer 로만 읽어 들이므로 호스트 Vec 로 돌려주는 이 함수 계약과도 맞지 않습니다.
+//    통합 메모리라 KV 블록은 결국 호스트 메모리에 있으므로 std::fs 로 읽고 씁니다(io_backend = "fs-fallback").
 #[cfg(target_os = "macos")]
 mod macos_impl {
     use super::*;
-    use metal::*;
-    struct MacContext { queue: IOCommandQueue }
-    unsafe impl Send for MacContext {}
-    unsafe impl Sync for MacContext {}
-    pub fn is_available() -> bool { CONTEXT.is_ok() }
-    static CONTEXT: Lazy<Result<Arc<MacContext>>> = Lazy::new(|| {
-        let device = Device::system_default().ok_or_else(|| {
-            println!("[DirectLoader] No Metal device found. Falling back to fs::read/fs::write.");
-            anyhow!("No Metal device found")
-        })?;
-        let queue = device.new_io_command_queue(&IOCommandQueueDescriptor::new()).map_err(|e| {
-            println!("[DirectLoader] Metal IO command queue creation failed: {}. Falling back to fs::read/fs::write.", e);
-            anyhow!(e)
-        })?;
-        println!("[DirectLoader] Metal IO command queue initialized successfully.");
-        Ok(Arc::new(MacContext { queue }))
-    });
-    pub fn load_block(path: &Path) -> Result<Vec<u8>> {
-        let ctx = CONTEXT.as_ref().map_err(|e| anyhow!(e))?;
-        let io_handle = ctx.queue.new_io_handle(&path.to_string_lossy()).map_err(|e| anyhow!(e))?;
-        let size = fs::metadata(path)?.len() as usize;
-        let mut buffer = vec![0u8; size];
-        let command_buffer = ctx.queue.new_io_command_buffer();
-        command_buffer.load_buffer(&io_handle, 0, size, buffer.as_mut_ptr() as *mut _, 0);
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        Ok(buffer)
-    }
+    pub fn is_available() -> bool { false }
+    pub fn load_block(path: &Path) -> Result<Vec<u8>> { fs::read(path).map_err(|e| anyhow!(e)) }
     pub fn save_block(path: &Path, data: &[u8]) -> Result<()> { fs::write(path, data).map_err(|e| anyhow!(e)) }
 }
 
