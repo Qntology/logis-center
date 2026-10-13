@@ -181,6 +181,8 @@ jobs:
         with:
           path: ${{ runner.temp }}/real-models
           key: granite-r2-real-v1
+      - name: protoc (lancedb / lance-encoding build script)
+        run: brew install protobuf >/dev/null 2>&1 || brew install protobuf
       - name: mock granite model (seeded, identical on every platform)
         run: |
           pip install -q numpy
