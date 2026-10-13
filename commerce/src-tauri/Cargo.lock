@@ -3621,6 +3621,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed-cpu-kernels"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "embed-resource"
 version = "3.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7001,6 +7008,7 @@ dependencies = [
  "dirs 6.0.0",
  "drag",
  "ego-tree",
+ "embed-cpu-kernels",
  "encoding_rs",
  "ethers-core",
  "ethers-signers",

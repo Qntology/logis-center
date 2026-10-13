@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub mod text_cache;
 mod batched;
+pub(crate) mod cpu_packed;
 pub use batched::{BatchOpts, BatchRunStats};
 
 /// 임베딩 차원 (granite-embedding-97m-multilingual-r2 hidden_size).
@@ -186,8 +187,14 @@ impl Attention {
 
     /// `mask` = [B, 1, 1, L] 가산 마스크(유효 0 / 패딩 -inf). None 이면 기존과 같은 무마스크 경로.
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
-        let (batch_size, seq_len, _) = x.dims3()?;
         let qkv = self.wqkv.forward(x)?;
+        let y = self.attend(&qkv, cos, sin, mask)?;
+        Ok(self.wo.forward(&y)?)
+    }
+
+    /// QKV 투영 뒤 ~ Wo 앞의 attention 본체 (qkv [B, L, 3H] → [B, L, H]). CPU 패킹 경로도 이 연산을 그대로 씁니다.
+    fn attend(&self, qkv: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        let (batch_size, seq_len, _) = qkv.dims3()?;
 
         let hidden_size = self.num_heads * self.head_dim;
         // narrow 이후 메모리 연속성 보장
@@ -216,8 +223,7 @@ impl Attention {
         let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1)?;
 
         // 두 번째 matmul 진입 전 att와 v의 연속성 보장, 그리고 최종 reshape 전 transpose 결과의 연속성 보장
-        let y = att.contiguous()?.matmul(&v.contiguous()?)?.transpose(1, 2)?.contiguous()?.reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
-        Ok(self.wo.forward(&y)?)
+        att.contiguous()?.matmul(&v.contiguous()?)?.transpose(1, 2)?.contiguous()?.reshape((batch_size, seq_len, self.num_heads * self.head_dim))
     }
 }
 
@@ -245,6 +251,8 @@ pub struct FloatModel {
     layers: Vec<DecoderLayer>,
     final_norm: RmsNorm,
     rotary: Arc<RotaryEmbedding>,
+    /// 🌟 [EMBED-CPU-PACKED] CPU + LOGIS_EMBED_CPU_KERNEL=packed 일 때만 (embedding/cpu_packed.rs).
+    packed: Option<cpu_packed::PackedModel>,
 }
 
 impl FloatModel {
@@ -261,7 +269,81 @@ impl FloatModel {
             layers.push(DecoderLayer::new(cfg, vb.pp(format!("layers.{}", i)))?);
         }
         let final_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("final_norm"))?;
-        Ok(Self { tok_embeddings, embeddings_norm, layers, final_norm, rotary })
+        let mut model = Self { tok_embeddings, embeddings_norm, layers, final_norm, rotary, packed: None };
+        if device.is_cpu() && cpu_packed::enabled() {
+            model.packed = model.build_packed(cfg)?;
+        }
+        Ok(model)
+    }
+
+    /// Linear 가중치를 NR 열 패널로 한 번 다시 배치합니다. 모양이 NR 배수가 아니면 None(기존 경로).
+    fn build_packed(&self, cfg: &Config) -> candle_core::Result<Option<cpu_packed::PackedModel>> {
+        use cpu_packed::{PackedW, NR};
+        let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
+        if h % NR != 0 || i % NR != 0 {
+            println!("[EMBED-CPU-PACKED] hidden {h} / intermediate {i} 가 {NR} 의 배수가 아니라 기존 경로를 씁니다.");
+            return Ok(None);
+        }
+        let v = |t: &Tensor| -> candle_core::Result<Vec<f32>> { t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>() };
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            layers.push(cpu_packed::PackedLayer {
+                wqkv: PackedW::pack(&v(l.self_attn.wqkv.weight())?, 3 * h, h),
+                attn_wo: PackedW::pack(&v(l.self_attn.wo.weight())?, h, h),
+                wi: PackedW::pack_glu(&v(l.mlp.wi.weight())?, i, h),
+                mlp_wo: PackedW::pack(&v(l.mlp.wo.weight())?, h, i),
+                attn_norm: match &l.attn_norm {
+                    Some(n) => Some(v(&n.weight)?),
+                    None => None,
+                },
+                mlp_norm: v(&l.mlp_norm.weight)?,
+            });
+        }
+        Ok(Some(cpu_packed::PackedModel {
+            layers,
+            emb_norm: v(&self.embeddings_norm.weight)?,
+            final_norm: v(&self.final_norm.weight)?,
+            eps: cfg.norm_eps as f32,
+        }))
+    }
+
+    /// 🌟 [EMBED-CPU-PACKED] forward_hidden 의 CPU 패킹 판본. attention 본체(attend)는 같은 candle 연산입니다.
+    fn forward_hidden_packed(&self, p: &cpu_packed::PackedModel, x: Tensor, seq_len: usize, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        use cpu_packed::{gemm, rms_norm, Blocking, Epilogue};
+        let (b, l, h) = x.dims3()?;
+        debug_assert_eq!(l, seq_len);
+        let m = b * l;
+        let i_sz = p.layers.first().map(|pl| pl.mlp_wo.k).unwrap_or(0);
+        let threads = rayon::current_num_threads();
+        let blk = Blocking::default();
+        let mut xs: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut xn = vec![0f32; m * h];
+        rms_norm(&xs, h, &p.emb_norm, p.eps, &mut xn);
+        std::mem::swap(&mut xs, &mut xn);
+        let (cos, sin) = self.rotary.cos_sin(seq_len)?;
+        let mut qkv = vec![0f32; m * 3 * h];
+        let mut o = vec![0f32; m * h];
+        let mut act = vec![0f32; m * i_sz];
+        for (layer, pl) in self.layers.iter().zip(&p.layers) {
+            let src: &[f32] = match &pl.attn_norm {
+                Some(w) => {
+                    rms_norm(&xs, h, w, p.eps, &mut xn);
+                    &xn
+                }
+                None => &xs,
+            };
+            gemm(src, m, &pl.wqkv, &mut qkv, blk, Epilogue::Store, threads);
+            let qkv_t = Tensor::from_slice(&qkv, (b, l, 3 * h), &Device::Cpu)?;
+            let y = layer.self_attn.attend(&qkv_t, &cos, &sin, mask)?.flatten_all()?.to_vec1::<f32>()?;
+            gemm(&y, m, &pl.attn_wo, &mut o, blk, Epilogue::Store, threads);
+            xs.iter_mut().zip(&o).for_each(|(a, d)| *a += d);
+            rms_norm(&xs, h, &pl.mlp_norm, p.eps, &mut xn);
+            gemm(&xn, m, &pl.wi, &mut act, blk, Epilogue::SiluMul, threads);
+            gemm(&act, m, &pl.mlp_wo, &mut o, blk, Epilogue::Store, threads);
+            xs.iter_mut().zip(&o).for_each(|(a, d)| *a += d);
+        }
+        rms_norm(&xs, h, &p.final_norm, p.eps, &mut xn);
+        Tensor::from_vec(xn, (b, l, h), &Device::Cpu)
     }
 
     pub fn forward(&self, input_ids: &Tensor, _device: &Device) -> candle_core::Result<Tensor> {
@@ -281,6 +363,9 @@ impl FloatModel {
     }
 
     fn forward_hidden(&self, x: Tensor, seq_len: usize, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        if let Some(p) = &self.packed {
+            return self.forward_hidden_packed(p, x, seq_len, mask);
+        }
         let mut x = self.embeddings_norm.forward(&x)?;
         let (cos, sin) = self.rotary.cos_sin(seq_len)?;
 

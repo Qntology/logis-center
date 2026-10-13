@@ -81,6 +81,8 @@ windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_S
 libc = "0.2"
 boa_engine = { path = "../crates/boa-engine/core/engine" }
 onnxruntime = { path = "../crates/onnxruntime" }
+# 🌟 [EMBED-CPU-PACKED] CPU 임베딩 패킹 GEMM (opt-in: LOGIS_EMBED_CPU_KERNEL=packed, models/embedding/cpu_packed.rs)
+embed-cpu-kernels = { path = "../crates/embed-cpu-kernels" }
 ndarray = "0.15.1"
 whatlang = "0.18.0"
 any_ascii = "0.3.3"
@@ -140,6 +142,8 @@ opt-level = 3
 [profile.dev.package.gemm-f32]
 opt-level = 3
 [profile.dev.package.gemm-f64]
+opt-level = 3
+[profile.dev.package.embed-cpu-kernels]
 opt-level = 3
 [profile.dev.package.half]
 opt-level = 3
