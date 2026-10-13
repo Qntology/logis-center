@@ -159,11 +159,9 @@ fn gpu_qwen3_load_unload_returns_vram() {
         println!("LOGIS_TEST_MODELS=1 이 아니라 건너뜁니다.");
         return;
     }
-    let Ok(base) = std::env::var("LOCALAPPDATA") else { return };
-    let dir = std::path::Path::new(&base).join("logis-center").join("models").join("Qwen3-0.6B-Instruct-gguf");
+    let dir = crate::common::models_dir().join("Qwen3-0.6B-Instruct-gguf");
     if !dir.exists() {
-        println!("모델 디렉터리가 없어 건너뜁니다.");
-        return;
+        return crate::common::skip_or_fail(&format!("모델 디렉터리 {} 가 없습니다", dir.display()));
     }
     use tauri_app_lib::utils::{device_mem_info_of, get_gpu_device, settle_gpu_memory};
     let dev = get_gpu_device(0);

@@ -83,7 +83,8 @@ impl Default for BatchOpts {
 }
 
 impl BatchOpts {
-    /// 장치별 정책: CUDA/ROCm 은 고정 모양, CPU · Vulkan 은 동적 행 수(⑥).
+    /// 장치별 정책: CUDA/ROCm · Metal 은 고정 모양, CPU · Vulkan 은 동적 행 수(⑥).
+    /// Metal 은 GEMM 커널(gemv · 타일)을 M 에 따라 바꾸므로 GPU 처럼 고정 모양입니다(embedding.rs 의 Metal 주석).
     /// `LOGIS_EMBED_FIXED_SHAPE=1|0` 이면 장치와 무관하게 강제합니다(진단용 · 캐시 공간 태그도 따라 바뀝니다).
     pub fn for_device(device: &Device) -> Self {
         let mut o = Self::default();

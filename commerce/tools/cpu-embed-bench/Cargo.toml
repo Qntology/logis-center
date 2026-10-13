@@ -1,0 +1,24 @@
+[package]
+name = "cpu-embed-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Mac/Linux CPU verification 3-2: profile of the granite embedding batched forward and custom cache-blocked kernels"
+
+# Stand-alone (not part of the app build). Uses the sibling fork checkout like the app's path form:
+# <dir>/logis-center/commerce/tools/cpu-embed-bench -> <dir>/candle-rocm-vulkan
+[workspace]
+
+[dependencies]
+candle-core = { path = "../../../../candle-rocm-vulkan/candle-core", default-features = false }
+candle-nn = { path = "../../../../candle-rocm-vulkan/candle-nn", default-features = false }
+embed-cpu-kernels = { path = "../../crates/embed-cpu-kernels" }
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+debug = 1
+codegen-units = 4

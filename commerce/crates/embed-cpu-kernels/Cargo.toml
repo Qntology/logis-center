@@ -1,0 +1,9 @@
+[package]
+name = "embed-cpu-kernels"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Packed-weight, cache-blocked f32 GEMM + fused RMSNorm / SiLU·up for the granite embedding CPU forward ([EMBED-CPU-PACKED])"
+
+[dependencies]
+rayon = "1.10"

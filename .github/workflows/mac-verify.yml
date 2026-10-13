@@ -1,0 +1,189 @@
+# Mac verification of the [EMBED-BATCHED] batched embedding forward and the 10/12–10/13 work
+# (docs/mac-verify.md). Runs on GitHub-hosted Apple Silicon runners.
+#
+# Fork changes (sungu-che/candle-rocm-vulkan) are carried as a patch series in
+# patches/candle-rocm-vulkan/*.patch (mode B: this session could not push to the fork). Every job that
+# builds against the fork checks the fork out at master next to logis-center, applies the series with
+# `git am`, and switches the four fork lines of commerce/src-tauri/Cargo.toml to the path form inside
+# the job only (the committed Cargo.toml keeps the Qntology git lines).
+#
+# Hosted macOS runners are VMs: Metal / MoltenVK may be unavailable. The `probe` step of each GPU job
+# records system_profiler, MTLCreateSystemDefaultDevice, candle Device::new_metal(0) and
+# vulkaninfo; when the device is missing the runtime steps print "NOT RUN (no GPU on hosted runner)"
+# and the job still builds everything (build-only verification). A skipped runtime step is never a pass:
+# the summary file says NOT RUN explicitly.
+name: mac-verify
+
+on:
+  push:
+    branches: ["claude/mac-verify", "claude/mac-*"]
+  workflow_dispatch:
+
+concurrency:
+  group: mac-verify-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  # The app's debug test build is ~27 GB with debuginfo; without it it fits runner disk and caches.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+  GRANITE_REPO: ibm-granite/granite-embedding-97m-multilingual-r2
+
+jobs:
+  # ── 1. Environment: CPU caches, GPU visibility (both macOS images) ──
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: CPU / cache info
+        run: |
+          mkdir -p out
+          {
+            echo "## ${{ matrix.os }}"; sw_vers; uname -a
+            sysctl -a | grep -E 'hw\.(perflevel|l1|l2|l3|cachelinesize|ncpu|memsize|physicalcpu|logicalcpu)|machdep\.cpu' || true
+          } | tee out/cpu.txt
+      - name: system_profiler SPDisplaysDataType
+        run: system_profiler SPDisplaysDataType | tee out/displays.txt
+      - name: MTLCreateSystemDefaultDevice
+        run: |
+          cat > mtl.swift <<'EOF'
+          import Metal
+          if let d = MTLCreateSystemDefaultDevice() {
+            print("MTL OK name=\(d.name) unified=\(d.hasUnifiedMemory) recommendedMaxWorkingSetSize=\(d.recommendedMaxWorkingSetSize) currentAllocatedSize=\(d.currentAllocatedSize)")
+          } else { print("MTL NONE (MTLCreateSystemDefaultDevice returned nil)") }
+          EOF
+          swift mtl.swift 2>&1 | tee out/metal.txt || echo "MTL swift check failed" | tee -a out/metal.txt
+      - name: MoltenVK + vulkaninfo
+        run: |
+          brew install molten-vk vulkan-loader vulkan-tools >/dev/null 2>&1 || brew install molten-vk vulkan-loader vulkan-tools
+          ICD="$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json"
+          echo "VK_ICD_FILENAMES=$ICD" | tee out/vulkan.txt
+          VK_ICD_FILENAMES="$ICD" vulkaninfo --summary 2>&1 | tee -a out/vulkan.txt || echo "vulkaninfo failed" | tee -a out/vulkan.txt
+      - name: toolchain
+        run: |
+          { xcode-select -p; clang --version | head -1; rustc --version || true; cargo --version || true; } | tee out/toolchain.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-${{ matrix.os }}
+          path: out/
+
+  # ── 2. Fork build/tests (CPU · Metal · MoltenVK) ──
+  fork:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, metal, vulkan]
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: logis-center }
+      - uses: actions/checkout@v4
+        with: { repository: sungu-che/candle-rocm-vulkan, ref: master, path: candle-rocm-vulkan, fetch-depth: 0 }
+      - name: apply fork patch series
+        run: logis-center/.github/scripts/apply-fork-patches.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            candle-rocm-vulkan/target
+          key: fork-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('candle-rocm-vulkan/Cargo.lock', 'logis-center/patches/candle-rocm-vulkan/*.patch') }}
+          restore-keys: fork-${{ matrix.backend }}-${{ runner.os }}-
+      - name: MoltenVK
+        if: matrix.backend == 'vulkan'
+        run: |
+          brew install molten-vk vulkan-loader vulkan-tools >/dev/null 2>&1 || brew install molten-vk vulkan-loader vulkan-tools
+          echo "VK_ICD_FILENAMES=$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json" >> "$GITHUB_ENV"
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix vulkan-loader)/lib:$(brew --prefix molten-vk)/lib" >> "$GITHUB_ENV"
+      - name: run
+        working-directory: candle-rocm-vulkan
+        run: ../logis-center/.github/scripts/fork-tests.sh ${{ matrix.backend }} ../out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fork-${{ matrix.backend }}
+          path: out/
+
+  # ── 3. App (logis-center) build + tests (CPU · Metal · MoltenVK) ──
+  app:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [cpu, metal, vulkan]
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: logis-center }
+      - uses: actions/checkout@v4
+        with: { repository: sungu-che/candle-rocm-vulkan, ref: master, path: candle-rocm-vulkan, fetch-depth: 0 }
+      - name: apply fork patch series + path dependencies (job only)
+        run: |
+          logis-center/.github/scripts/apply-fork-patches.sh
+          logis-center/.github/scripts/use-fork-path.sh logis-center/commerce/src-tauri/Cargo.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            logis-center/commerce/src-tauri/target
+          key: app-${{ matrix.backend }}-${{ runner.os }}-${{ hashFiles('logis-center/commerce/src-tauri/Cargo.lock', 'logis-center/patches/candle-rocm-vulkan/*.patch') }}
+          restore-keys: app-${{ matrix.backend }}-${{ runner.os }}-
+      - name: real granite model (Hugging Face, cache restore)
+        id: real
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/real-models
+          key: granite-r2-real-v1
+      - name: download real granite model
+        id: dl
+        if: steps.real.outputs.cache-hit != 'true'
+        run: |
+          d="$RUNNER_TEMP/real-models/granite-embedding-97m-multilingual-r2"; mkdir -p "$d"
+          ok=true
+          for f in config.json tokenizer.json model.safetensors; do
+            curl -fsSL --retry 3 -o "$d/$f" "https://huggingface.co/$GRANITE_REPO/resolve/main/$f" || { echo "download of $f failed"; ok=false; break; }
+          done
+          if [ "$ok" != true ]; then rm -rf "$RUNNER_TEMP/real-models"; fi
+          ls -la "$d" 2>/dev/null || true
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+      # Only a complete download is cached (a failed one must not poison the key).
+      - name: real granite model (cache save)
+        if: steps.dl.outputs.ok == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/real-models
+          key: granite-r2-real-v1
+      - name: mock granite model (seeded, identical on every platform)
+        run: |
+          pip install -q numpy
+          python -I logis-center/commerce/src-tauri/tests/fixtures/granite_mock/gen_granite_mock.py "$RUNNER_TEMP/mock-models"
+      - name: MoltenVK
+        if: matrix.backend == 'vulkan'
+        run: |
+          brew install molten-vk vulkan-loader vulkan-tools >/dev/null 2>&1 || brew install molten-vk vulkan-loader vulkan-tools
+          echo "VK_ICD_FILENAMES=$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json" >> "$GITHUB_ENV"
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix vulkan-loader)/lib:$(brew --prefix molten-vk)/lib" >> "$GITHUB_ENV"
+      - name: run
+        working-directory: logis-center/commerce
+        env:
+          MOCK_MODELS: ${{ runner.temp }}/mock-models
+          REAL_MODELS: ${{ runner.temp }}/real-models
+        run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-${{ matrix.backend }}
+          path: out/

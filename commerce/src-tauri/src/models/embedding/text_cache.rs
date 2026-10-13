@@ -364,6 +364,9 @@ pub fn device_class(device: &Device) -> &'static str {
         "vulkan-f32"
     } else if device.is_metal() {
         "metal-f32"
+    } else if device.is_cpu() && super::cpu_packed::enabled() {
+        // [EMBED-CPU-PACKED] 다른 커널(패킹 GEMM · 융합 RMSNorm)이라 벡터가 1e-6 수준 달라 공간을 나눕니다.
+        "cpu-f32-packed"
     } else if device.is_cpu() {
         "cpu-f32"
     } else {
