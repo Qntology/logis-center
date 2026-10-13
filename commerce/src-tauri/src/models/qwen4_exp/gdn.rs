@@ -79,6 +79,36 @@ pub fn gdn_forward(
     let in_dt = mixed_qkv.dtype();
     let dev = mixed_qkv.device();
 
+    // ── 0. 🌟 [GDN-FUSED] 포크 융합 커널 (같은 계약, F32 연산). LOGIS_GDN_FUSED=0 이거나 커널이 없는 장치면 아래 텐서 경로 ──
+    let fused_cfg = candle_core::delta_rule::GdnConfig {
+        num_k_heads: hk,
+        num_v_heads: hv,
+        head_k_dim: dk,
+        head_v_dim: dv,
+        conv_kernel: k,
+        use_qk_l2norm: cfg.use_qk_l2norm,
+        l2norm_eps: cfg.l2norm_eps,
+        v_head_order: match cfg.v_head_order {
+            GdnHeadOrder::Grouped => candle_core::delta_rule::GdnHeadOrder::Grouped,
+            GdnHeadOrder::Tiled => candle_core::delta_rule::GdnHeadOrder::Tiled,
+        },
+    };
+    if crate::models::common::gdn_fused_enabled(dev, &fused_cfg) {
+        let o = candle_core::delta_rule::fused_gated_delta_rule(
+            mixed_qkv,
+            conv_weight,
+            conv_bias,
+            conv_state,
+            a,
+            b,
+            neg_a,
+            dt_bias,
+            recurrent_state,
+            &fused_cfg,
+        )?;
+        return Ok(GdnOutput { out: o.out, conv_state: o.conv_state, recurrent_state: o.recurrent_state });
+    }
+
     // ── 1. causal depthwise conv + SiLU (F32 연산) ──
     let w = conv_weight.to_dtype(DType::F32)?.reshape((c, k))?;
     let x = mixed_qkv.transpose(1, 2)?.contiguous()?; // [B, C, T]

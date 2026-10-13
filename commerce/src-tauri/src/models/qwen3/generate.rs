@@ -82,7 +82,21 @@ impl Qwen3GenerateModel {
             model_name: "qwen3".to_string(),
         })
     }
+    /// 🌟 [Q8-RESIDENT] CUDA 에서는 Q8_0 가중치를 그대로 GPU 에 상주시키고(정확 W8A16), 그 외 장치나
+    /// `LOGIS_QWEN3_DENSE=1` 이면 기존처럼 BF16/F32 로 역양자화해 올립니다.
     pub fn init_from_gguf(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
+        let dense_env = std::env::var("LOGIS_QWEN3_DENSE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+            .unwrap_or(false);
+        let q8 = !dense_env && get_device(device).is_cuda();
+        if dense_env {
+            println!("[QWEN3-Q8] LOGIS_QWEN3_DENSE=1 → 기존 BF16 역양자화 경로로 로드합니다.");
+        }
+        Self::init_from_gguf_with(path, device, dtype, q8)
+    }
+
+    /// 🌟 [Q8-RESIDENT] `q8_resident` 를 직접 고르는 로더 (테스트·A/B 용). Q8 로드가 실패하면 기존 경로로 돌아갑니다.
+    pub fn init_from_gguf_with(path: &str, device: Option<&Device>, dtype: Option<DType>, q8_resident: bool) -> Result<Self> {
         let chat_template = ChatTemplate::init(path)?;
         let tokenizer = TokenizerModel::init(path)?;
         let config_path = std::path::Path::new(path).join("config.json");
@@ -90,10 +104,42 @@ impl Qwen3GenerateModel {
         let device = get_device(device);
         let cfg_dtype = cfg.torch_dtype.as_str();
         let dtype = get_dtype(dtype, cfg_dtype);
-        
+
         let gguf_files = crate::utils::find_type_files(path, "gguf")?;
         let model_file = gguf_files.first().ok_or_else(|| anyhow::anyhow!("No GGUF found"))?;
-        
+
+        let generation_config_path = std::path::Path::new(path).join("generation_config.json");
+        if q8_resident {
+            // mmap 페이지에서 GPU 로 바로 복사합니다 (힙 사본·F32/F16 중간 사본 없음). 맵은 로드 직후 닫습니다.
+            let loaded = (|| -> Result<Qwen3Model> {
+                let file = std::fs::File::open(model_file)?;
+                let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+                let ct = candle_core::quantized::gguf_file::Content::read(&mut std::io::Cursor::new(&mmap[..]))?;
+                println!(
+                    "[QWEN3-Q8] Q8_0 가중치를 역양자화 없이 GPU 에 상주시킵니다 (정확 W8A16 · 활성 {:?} · F32 logits)",
+                    dtype
+                );
+                Qwen3Model::new_from_gguf_q8(&cfg, &ct, &mmap, &device, dtype)
+            })();
+            match loaded {
+                Ok(qwen3) => {
+                    let generation_config: Qwen3GenerationConfig =
+                        serde_json::from_slice(&std::fs::read(&generation_config_path).unwrap_or_default()).unwrap_or_default();
+                    return Ok(Qwen3GenerateModel {
+                        chat_template,
+                        tokenizer,
+                        qwen3,
+                        device: device.clone(),
+                        eos_token_id1: generation_config.eos_token_id.get(0).cloned().unwrap_or(151643) as u32,
+                        eos_token_id2: generation_config.eos_token_id.get(1).cloned().unwrap_or(151645) as u32,
+                        generation_config,
+                        model_name: "qwen3".to_string(),
+                    });
+                }
+                Err(e) => println!("[QWEN3-Q8] ⚠️ Q8 상주 로드 실패 → 기존 BF16 역양자화 경로로 로드합니다: {e}"),
+            }
+        }
+
         let mut file = std::fs::File::open(model_file)?;
         let ct = candle_core::quantized::gguf_file::Content::read(&mut file)?;
         
@@ -138,8 +184,7 @@ impl Qwen3GenerateModel {
         
         let vb = VarBuilder::from_tensors(data, dtype, &device);
         let qwen3 = Qwen3Model::new(&cfg, vb)?;
-        
-        let generation_config_path = std::path::Path::new(path).join("generation_config.json");
+
         let generation_config: Qwen3GenerationConfig =
             serde_json::from_slice(&std::fs::read(generation_config_path).unwrap_or_default()).unwrap_or_default();
 
@@ -197,13 +242,13 @@ impl Qwen3GenerateModel {
 
         // 🌟 [핵심] to_dtype 을 여기 붙이지 않습니다. 원본 참조만 들고,
         //    narrow 로 잘라낸 블록에만 F32 승격을 겁니다.
-        let all_embs = self.qwen3.get_embed_tokens();
-        let vocab = all_embs.dim(0)?;
+        // 🌟 [Q8-RESIDENT] Dense 표면 narrow 후 F32 승격(기존과 동일), Q8_0 표면 블록 행만 정확 복원합니다.
+        let vocab = self.qwen3.embed_vocab()?;
         let mut sim_parts: Vec<Tensor> = Vec::with_capacity(vocab / VOCAB_CHUNK + 1);
         let mut off = 0usize;
         while off < vocab {
             let take = (vocab - off).min(VOCAB_CHUNK);
-            let blk = all_embs.narrow(0, off, take)?.to_dtype(DType::F32)?;
+            let blk = self.qwen3.embed_rows_f32(off, take)?;
             let blk_norm = blk.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
             let blk_normalized = blk.broadcast_div(&blk_norm)?;
             sim_parts.push(blk_normalized.matmul(&target_col)?.squeeze(1)?);
@@ -324,7 +369,8 @@ impl Qwen3GenerateModel {
         if seq_len == 0 { return Ok(()); }
 
         // 🌟 [Chunked Prefill] VRAM 및 RAM 널뛰기를 원천 방어하기 위해 청크 사이즈를 256으로 축소하여 강하게 압박합니다.
-        let chunk_size = 256;
+        // 🌟 [Q8-RESIDENT] Q8 상주 경로는 프리필마다 가중치를 타일로 풀어 GEMM 하므로 청크를 1024 로 키웁니다 (기존 BF16 경로는 256).
+        let chunk_size = if self.qwen3.is_q8_resident() { 1024 } else { 256 };
         let mut seqlen_offset = 0;
         
         while seqlen_offset < seq_len {
@@ -340,16 +386,7 @@ impl Qwen3GenerateModel {
             // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU를 동기화하고 시스템 메모리(RAM)를 강제로 반환시킵니다.
             if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            }
-            #[cfg(target_os = "linux")]
-            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-            #[cfg(target_os = "macos")]
-            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            crate::models::common::legacy_working_set_trim();
 
             seqlen_offset += take;
         }
@@ -437,7 +474,8 @@ impl Qwen3GenerateModel {
         }
 
         // 🌟 [Phase 1: Chunked Prefill] VRAM 폭발과 RAM 널뛰기를 막기 위해 256 토큰 단위로 강하게 압박합니다.
-        let chunk_size = 256;
+        // 🌟 [Q8-RESIDENT] Q8 상주 경로는 프리필마다 가중치를 타일로 풀어 GEMM 하므로 청크를 1024 로 키웁니다 (기존 BF16 경로는 256).
+        let chunk_size = if self.qwen3.is_q8_resident() { 1024 } else { 256 };
         let mut next_token = 0;
         let mut current_chunk_offset = 0;
         
@@ -455,16 +493,7 @@ impl Qwen3GenerateModel {
             // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU를 동기화하고 시스템 메모리(RAM)를 강제로 반환시킵니다.
             if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            }
-            #[cfg(target_os = "linux")]
-            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-            #[cfg(target_os = "macos")]
-            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            crate::models::common::legacy_working_set_trim();
 
             seqlen_offset += take;
             current_chunk_offset += take;
@@ -673,16 +702,7 @@ impl Qwen3GenerateModel {
                 // 🌟 [VRAM 최적화 3] 디코딩 중 발생하는 KV Cache 병합(Cat) 찌꺼기 텐서들을 즉시 날려버립니다.
                 if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-                #[cfg(target_os = "linux")]
-                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-                #[cfg(target_os = "macos")]
-                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+                crate::models::common::legacy_working_set_trim();
             }
         }
 
@@ -746,7 +766,8 @@ impl Qwen3GenerateModel {
         self.plan_kv_precision(prompt_seq_len + sample_len as usize);
 
         // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 256 토큰 단위로 강하게 잘라 VRAM 및 RAM 널뛰기를 막습니다.
-        let chunk_size = 256;
+        // 🌟 [Q8-RESIDENT] Q8 상주 경로는 프리필마다 가중치를 타일로 풀어 GEMM 하므로 청크를 1024 로 키웁니다 (기존 BF16 경로는 256).
+        let chunk_size = if self.qwen3.is_q8_resident() { 1024 } else { 256 };
         let mut next_token = 0;
         
         while seqlen_offset < prompt_seq_len {
@@ -763,16 +784,7 @@ impl Qwen3GenerateModel {
             // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU 동기화 및 시스템 메모리 강제 반환을 수행합니다.
             if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            }
-            #[cfg(target_os = "linux")]
-            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-            #[cfg(target_os = "macos")]
-            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            crate::models::common::legacy_working_set_trim();
 
             seqlen_offset += take;
             
@@ -980,16 +992,7 @@ impl Qwen3GenerateModel {
                 // 🌟 [VRAM 최적화 3] 디코딩 중 발생하는 KV Cache 병합(Cat) 찌꺼기 텐서들을 즉시 날려버립니다.
                 if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
 
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-                #[cfg(target_os = "linux")]
-                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-                #[cfg(target_os = "macos")]
-                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+                crate::models::common::legacy_working_set_trim();
             }
         }
 
@@ -1000,5 +1003,10 @@ impl Qwen3GenerateModel {
 
     pub fn clear_kv_cache(&mut self) {
         self.qwen3.clear_kv_cache();
+    }
+
+    /// 🌟 [Q8-RESIDENT] 정확도·속도 비교 테스트용: 내부 모델에 직접 접근합니다.
+    pub fn model_mut(&mut self) -> &mut Qwen3Model {
+        &mut self.qwen3
     }
 }
