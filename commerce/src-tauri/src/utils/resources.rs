@@ -167,8 +167,171 @@ pub fn free_ram_bytes() -> u64 {
     sys.available_memory()
 }
 
-/// 디코딩 단계 KV Cache 배치 위치를 결정합니다.
+//// 디코딩 단계 KV Cache 배치 위치를 결정합니다.
+/// 호출부가 순간치·이미 상주한 토큰을 알려 주지 않는 예전 서명입니다. 여유는 예전과 같은 640MB 이고,
+/// 필요량은 `planned_tokens` 전체입니다. (`LOGIS_KV_PLAN=legacy` 이면 예전 판정 그대로)
 pub fn plan_kv_residency(input: &KvPlanInput) -> KvResidency {
+    plan_kv_residency_ex(input, &KvPlanExtra::default())
+}
+
+// ============================================================================
+// 🌟 [KV-PLAN v2] 증분 가격 + 비례 여유 + 히스테리시스
+// ----------------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   (1) 이미 VRAM 에 만들어진 프롬프트 KV 를 free 에서 한 번 빼고 필요량으로 또 요구했습니다.
+//   (2) 디코딩 여유 토큰을 실제 max_tokens(96~512) 가 아니라 고정 2048 로 잡았습니다.
+//   (3) 여유가 고정 640MB(VRAM) / 2GB(RAM) 라 4GB 카드·7.5GB RAM 에서 48MB KV 가 SSD 로 갔습니다.
+//   (4) 호출마다 순간 free 로만 판정해 이웃 호출 사이에 Vram / Ssd 가 뒤집혔습니다.
+//  ── 해결 ──
+//   필요량 = (앞으로 새로 생길 토큰 수) x 정확한 토큰당 바이트,
+//   VRAM 여유 = max(96MB, 2 x 디코딩 순간치), RAM 여유 = min(2GB, 총 RAM 의 15%),
+//   이전 판정보다 좋은 계층으로 올라갈 때만 max(64MB, 필요량 10%) 의 띠를 더 요구합니다.
+// ============================================================================
+
+/// VRAM 여유의 하한.
+pub const KV_VRAM_MARGIN_MIN_BYTES: u64 = 96 * 1024 * 1024;
+/// 순간치를 알려 주지 않는 호출부에 쓰는 순간치 (여유 = 2 x 이 값 = 예전과 같은 640MB).
+pub const LEGACY_DECODE_TRANSIENT_BYTES: u64 = KV_VRAM_SAFETY_MARGIN_BYTES / 2;
+/// 계층을 올릴 때 요구하는 추가 띠의 하한.
+pub const KV_TIER_HYSTERESIS_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `LOGIS_KV_PLAN=legacy` 이면 예전 판정(전체 토큰 · 고정 여유 · 히스테리시스 없음)을 씁니다.
+pub fn kv_plan_legacy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LOGIS_KV_PLAN")
+            .map(|v| v.trim().eq_ignore_ascii_case("legacy"))
+            .unwrap_or(false)
+    })
+}
+
+/// VRAM 여유 = max(96MB, 2 x 디코딩 한 스텝 순간치).
+pub fn kv_vram_margin_bytes(decode_transient_bytes: u64) -> u64 {
+    KV_VRAM_MARGIN_MIN_BYTES.max(decode_transient_bytes.saturating_mul(2))
+}
+
+/// RAM 여유 = min(2GB, 총 RAM 의 15%).
+pub fn kv_ram_margin_bytes(total_ram_bytes: u64) -> u64 {
+    KV_RAM_SAFETY_MARGIN_BYTES.min(total_ram_bytes / 100 * 15)
+}
+
+/// 총 RAM(bytes), 프로세스당 1회만 읽습니다.
+pub fn total_ram_bytes() -> u64 {
+    static T: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.total_memory()
+    })
+}
+
+/// 압축 KV(TurboQuant 벡터별 FP8) 한 행(토큰 1 · 헤드 1 · K 또는 V)의 바이트 수.
+/// 코드 d 바이트 + 행 머리(스케일 등) 2워드 = d + 8 → d=256 이면 264 B(264/256), d=128 이면 136 B(34/32).
+/// 장치를 알면 `kv_turbo::default_meta(d, dev).bytes_per_token_head()` 가 정확한 값입니다.
+pub fn tq_fp8_row_bytes(head_dim: usize) -> u64 {
+    head_dim as u64 + 8
+}
+
+/// 압축 KV 토큰당 바이트 (전 레이어 K+V).
+pub fn kv_bytes_per_token_compressed(num_kv_layers: usize, num_kv_heads: usize, head_dim: usize) -> u64 {
+    2 * num_kv_layers as u64 * num_kv_heads as u64 * tq_fp8_row_bytes(head_dim)
+}
+
+/// 원본 KV 토큰당 바이트 (전 레이어 K+V, 원소 크기 `elem_bytes`).
+pub fn kv_bytes_per_token_exact(num_kv_layers: usize, num_kv_heads: usize, head_dim: usize, elem_bytes: usize) -> u64 {
+    2 * num_kv_layers as u64 * num_kv_heads as u64 * head_dim as u64 * elem_bytes as u64
+}
+
+/// [`plan_kv_residency_ex`] 의 추가 입력 (모두 선택).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KvPlanExtra {
+    /// 이미 VRAM 에 만들어져 free 에서 빠져 있는 토큰 수 (필요량에서 뺍니다).
+    pub already_tokens: usize,
+    /// 디코딩 한 스텝의 활성값 순간치. 0 이면 모름 → 예전 640MB 여유.
+    pub decode_transient_bytes: u64,
+    /// 토큰당 바이트를 직접 줄 때 (압축 KV 행 머리 포함 등). None 이면 `kv_bytes_per_token(input)`.
+    pub bytes_per_token: Option<u64>,
+    /// 직전 판정 (히스테리시스).
+    pub prev: Option<KvResidency>,
+}
+
+/// 🌟 [KV-PLAN] 순수 판정 함수 (테스트 가능). `vram_free` 가 None(측정 실패)이면 VRAM 을 고르지 않습니다.
+/// 계층 선호: VRAM > RAM > SSD. 직전보다 좋은 계층으로 올라갈 때만 띠(max(64MB, 필요량 10%))를 더 요구합니다.
+pub fn decide_kv_tier(
+    need: u64,
+    vram_free: Option<u64>,
+    ram_free: u64,
+    vram_margin: u64,
+    ram_margin: u64,
+    prev: Option<KvResidency>,
+) -> KvResidency {
+    let band = KV_TIER_HYSTERESIS_MIN_BYTES.max(need / 10);
+    let rank = |r: KvResidency| match r {
+        KvResidency::Vram => 2,
+        KvResidency::Ram => 1,
+        KvResidency::Ssd => 0,
+    };
+    let prev_rank = prev.map(rank);
+    let fits = |free: u64, margin: u64, tier: KvResidency| {
+        let extra = match prev_rank {
+            Some(p) if rank(tier) > p => band,
+            _ => 0,
+        };
+        free >= need.saturating_add(margin).saturating_add(extra)
+    };
+    if let Some(v) = vram_free {
+        if v > 0 && fits(v, vram_margin, KvResidency::Vram) {
+            return KvResidency::Vram;
+        }
+    }
+    if fits(ram_free, ram_margin, KvResidency::Ram) {
+        return KvResidency::Ram;
+    }
+    KvResidency::Ssd
+}
+
+/// 디코딩 단계 KV Cache 배치 위치 (증분 가격 · 비례 여유 · 히스테리시스).
+pub fn plan_kv_residency_ex(input: &KvPlanInput, extra: &KvPlanExtra) -> KvResidency {
+    if kv_plan_legacy() {
+        return plan_kv_residency_legacy(input);
+    }
+    let per_token = extra.bytes_per_token.unwrap_or_else(|| kv_bytes_per_token(input));
+    let new_tokens = input.planned_tokens.saturating_sub(extra.already_tokens);
+    let need = per_token.saturating_mul(new_tokens as u64);
+    if input.is_cpu_mode {
+        println!("[KV-PLAN] {} | CPU Mode → RAM 상주 (Need: {:.2} MB)", input.label, need as f64 / 1e6);
+        return KvResidency::Ram;
+    }
+    let transient = if extra.decode_transient_bytes == 0 {
+        LEGACY_DECODE_TRANSIENT_BYTES
+    } else {
+        extra.decode_transient_bytes
+    };
+    let vram_margin = kv_vram_margin_bytes(transient);
+    let ram_margin = kv_ram_margin_bytes(total_ram_bytes());
+    let vram_free = crate::utils::gpu_mem_info(input.gpu_id as usize).map(|(f, _)| f);
+    let ram_free = free_ram_bytes();
+    let decision = decide_kv_tier(need, vram_free, ram_free, vram_margin, ram_margin, extra.prev);
+    println!(
+        "[KV-PLAN] {} | Tokens: {} (이미 상주 {} · 새로 {}) | PerToken: {} B | Need: {:.2} MB | VRAM free: {} (margin {:.0} MB) | RAM free: {:.2} MB (margin {:.0} MB) | 직전 {:?} → {:?}",
+        input.label,
+        input.planned_tokens,
+        extra.already_tokens.min(input.planned_tokens),
+        new_tokens,
+        per_token,
+        need as f64 / 1e6,
+        vram_free.map(|v| format!("{:.2} MB", v as f64 / 1e6)).unwrap_or_else(|| "?".to_string()),
+        vram_margin as f64 / 1e6,
+        ram_free as f64 / 1e6,
+        ram_margin as f64 / 1e6,
+        extra.prev,
+        decision
+    );
+    decision
+}
+
+/// 예전 판정 (`LOGIS_KV_PLAN=legacy`).
+pub fn plan_kv_residency_legacy(input: &KvPlanInput) -> KvResidency {
     let per_token = kv_bytes_per_token(input);
     let need = per_token.saturating_mul(input.planned_tokens as u64);
 
@@ -212,7 +375,7 @@ pub fn plan_kv_residency(input: &KvPlanInput) -> KvResidency {
     decision
 }
 
-// Global System Monitor Instance
+/ Global System Monitor Instance
 static SYSTEM_MONITOR: Lazy<Arc<Mutex<System>>> = Lazy::new(|| {
     let mut sys = System::new_with_specifics(
         RefreshKind::new()

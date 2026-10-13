@@ -138,6 +138,10 @@ impl GpuMemProbe {
     }
 
     pub fn mem_info(&self, gpu_id: usize) -> Option<(u64, u64)> {
+        // 🌟 [VRAM-SOURCE] 이미 만든 GPU 장치가 있으면 드라이버 값(+ 메모리 풀의 유휴분)을 씁니다.
+        if let Some(info) = device_mem_info(gpu_id) {
+            return Some(info);
+        }
         #[cfg(feature = "rocm")]
         if let Ok((free, total)) = candle_rocm::mem_info(gpu_id) {
             return Some((free as u64, total as u64));
@@ -172,26 +176,174 @@ pub fn gpu_mem_info(gpu_id: usize) -> Option<(u64, u64)> {
     GpuMemProbe::new().mem_info(gpu_id)
 }
 
+// =====================================================================
+// 🌟 [VRAM-SOURCE] VRAM 숫자는 장치(드라이버)에서 직접 읽습니다.
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   NVML free 는 메모리 풀이 쥐고 있는(바로 다시 쓸 수 있는) 블록까지 '사용 중' 으로 셉니다.
+//   그래서 동기화 직후인지 아닌지에 따라 같은 상태가 수백 MB 씩 다르게 보였고,
+//   KV-PLAN · 상주 판정 · 공존 판정이 호출마다 뒤집혔습니다.
+//  ── 해결 ──
+//   이미 만든 GPU 장치(DEVICE_CACHE)가 있으면 Device::mem_info (CUDA/ROCm/Vulkan 공통, NVML 재초기화 없음)
+//   와 Device::effective_free_memory (= free + 풀 유휴분) 를 씁니다. 장치가 없을 때만 NVML 로 돌아갑니다.
+//   장치를 새로 만들지는 않습니다(조회가 CUDA 컨텍스트를 만들면 안 되므로).
+//   `LOGIS_VRAM_SOURCE=nvml` 이면 예전처럼 항상 NVML 을 씁니다.
+// =====================================================================
+
+/// `LOGIS_VRAM_SOURCE=nvml` 이면 예전처럼 NVML 값만 씁니다.
+pub fn vram_source_is_nvml() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LOGIS_VRAM_SOURCE")
+            .map(|v| v.trim().eq_ignore_ascii_case("nvml"))
+            .unwrap_or(false)
+    })
+}
+
+/// 이미 만들어 둔 GPU 장치 (없으면 None — 새로 만들지 않습니다).
+pub fn cached_gpu_device(id: usize) -> Option<Device> {
+    let cache = DEVICE_CACHE.lock().ok()?;
+    cache.get(id).and_then(|d| d.clone()).filter(|d| !d.is_cpu())
+}
+
+/// 장치에서 읽은 `(실효 free, total)` 바이트. 실효 free = 드라이버 free + 메모리 풀 유휴분.
+fn device_mem_info(gpu_id: usize) -> Option<(u64, u64)> {
+    if vram_source_is_nvml() {
+        return None;
+    }
+    let dev = cached_gpu_device(gpu_id)?;
+    device_mem_info_of(&dev)
+}
+
+/// 주어진 장치의 `(실효 free, total)` 바이트. CPU 이거나 조회가 실패하면 None.
+pub fn device_mem_info_of(dev: &Device) -> Option<(u64, u64)> {
+    let (free, total) = dev.mem_info().ok().flatten()?;
+    let idle = dev.pool_idle_bytes().unwrap_or(0);
+    Some(((free as u64).saturating_add(idle as u64), total as u64))
+}
+
+/// 실효 free VRAM(bytes). 장치가 있으면 장치 값, 없으면 NVML. GPU 가 없으면 None.
+pub fn effective_free_vram_bytes(gpu_id: usize) -> Option<u64> {
+    gpu_mem_info(gpu_id).map(|(free, _)| free)
+}
+
+/// 단계 사이(같은 작업 안) 퍼지에서 메모리 풀에 남겨 둘 양. 다음 단계가 드라이버를 거치지 않고 재사용합니다.
+/// `LOGIS_PHASE_POOL_KEEP_MB` 로 바꿀 수 있습니다(기본 256MB, 0 이면 매번 전부 반환).
+pub fn phase_pool_keep_bytes() -> usize {
+    static KEEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| {
+        std::env::var("LOGIS_PHASE_POOL_KEEP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(256)
+            << 20
+    })
+}
+
+static DEFERRED_ERROR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 지금까지 [`gpu_checkpoint`] 가 회수한 지연 오류 수.
+pub fn deferred_error_count() -> u64 {
+    DEFERRED_ERROR_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 🌟 [CUDA-DEFERRED] 드라이버가 Drop 등에서 돌려주지 못하고 쌓아 둔 오류를 꺼내 기록합니다.
+/// 꺼낸 오류는 사라지므로, 다음 동기화가 엉뚱한 곳에서 실패하지 않습니다.
+pub fn gpu_checkpoint(dev: &Device, label: &str) -> Option<String> {
+    let err = dev.take_deferred_error()?;
+    DEFERRED_ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    println!("[CUDA-DEFERRED] ⚠️ {} | 앞선 작업이 남긴 지연 오류를 회수했습니다: {}", label, err);
+    Some(err)
+}
+
+/// 🌟 [POOL-TRIM] 장치를 현재 스레드에 묶고 → 지연 오류 회수 → 모든 스트림 동기화 → 풀을 `keep_bytes` 까지 반환.
+/// `release_ws` 이면 양자화 matmul 작업 버퍼까지 반환합니다(작업 종료 시). 블로킹 함수입니다.
+pub fn settle_gpu_memory(dev: &Device, keep_bytes: usize, release_ws: bool, label: &str) -> candle_core::Result<()> {
+    if dev.is_cpu() {
+        return Ok(());
+    }
+    let _ = dev.bind_to_thread();
+    gpu_checkpoint(dev, label);
+    let r = dev.synchronize_all();
+    gpu_checkpoint(dev, label);
+    if let Err(e) = &r {
+        println!("[POOL-TRIM] ⚠️ {} | 장치 동기화 실패: {:?}", label, e);
+    }
+    if release_ws {
+        if let Err(e) = dev.release_workspaces() {
+            println!("[POOL-TRIM] ⚠️ {} | 작업 버퍼 반환 실패: {:?}", label, e);
+        }
+    }
+    let t = dev.trim_memory_pool(keep_bytes);
+    if let Err(e) = &t {
+        println!("[POOL-TRIM] ⚠️ {} | 메모리 풀 반환 실패: {:?}", label, e);
+    }
+    r.and(t)
+}
+
+/// 메모리 풀을 드라이버로 돌려줍니다 (예전처럼 장치를 새로 만들었다 버리지 않습니다).
 pub fn flush_gpu_memory_pool(gpu_id: usize) {
-    #[cfg(feature = "cuda")]
-    {
-        let _ = Device::new_cuda(gpu_id);
+    flush_gpu_memory_pool_keep(gpu_id, 0);
+}
+
+/// [`flush_gpu_memory_pool`] 과 같되 풀에 `keep_bytes` 를 남깁니다.
+pub fn flush_gpu_memory_pool_keep(gpu_id: usize, keep_bytes: usize) {
+    if let Some(dev) = cached_gpu_device(gpu_id) {
+        let _ = settle_gpu_memory(&dev, keep_bytes, false, "flush_gpu_memory_pool");
     }
-    #[cfg(feature = "rocm")]
-    {
-        if let Device::Rocm(d) = get_gpu_device(gpu_id) {
-            if d.release_cached_resources().is_err() {
-                let _ = d.trim_memory_pool();
-            }
+}
+
+/// 🌟 [HEAP-RELEASE] mimalloc 이 쥐고 있는 빈 힙 페이지를 OS 로 돌려줍니다.
+/// 작업 집합 전체를 내쫓는 SetProcessWorkingSetSizeEx 와 달리 쓰던 페이지(mmap 가중치·토크나이저)는 건드리지 않습니다.
+pub fn release_heap() {
+    extern "C" {
+        fn mi_collect(force: bool);
+    }
+    // SAFETY: mimalloc 은 전역 할당기(main.rs)이고 libmimalloc-sys 가 링크하는 C 함수입니다.
+    unsafe { mi_collect(true) }
+}
+
+/// `LOGIS_MEM_TRIM=legacy` 이면 예전 위치들(퍼지·정착 대기·생성 루프)에서 작업 집합 전체 반환을 다시 수행합니다.
+pub fn legacy_ws_trim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LOGIS_MEM_TRIM")
+            .map(|v| v.trim().eq_ignore_ascii_case("legacy"))
+            .unwrap_or(false)
+    })
+}
+
+/// 프로세스 작업 집합 전체 반환 (SetProcessWorkingSetSizeEx(-1,-1)). 무조건 수행합니다.
+pub fn force_working_set_trim() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
+        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
         }
+        malloc_trim(0);
     }
-    #[cfg(feature = "vulkan")]
-    {
-        if let Device::Vulkan(d) = get_gpu_device(gpu_id) {
-            let _ = d.trim_memory_pool();
+    #[cfg(target_os = "macos")]
+    unsafe {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
         }
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
     }
-    let _ = gpu_id;
+}
+
+/// 🌟 [RAM-SAWTOOTH] 반복 경로(퍼지·생성 루프·정착 대기)의 작업 집합 반환 자리.
+/// 기본은 아무것도 하지 않습니다. 작업 집합을 통째로 내쫓으면 곧바로 다시 읽어 오는 페이지 폴트가
+/// 이어져 RAM 사용량이 톱니처럼 오르내리고 수 초씩 멈췄습니다. `LOGIS_MEM_TRIM=legacy` 이면 예전처럼 수행합니다.
+pub fn legacy_working_set_trim() {
+    if legacy_ws_trim_enabled() {
+        force_working_set_trim();
+    }
 }
 
 pub fn trim_idle_gpu_pool(device: &Device) {

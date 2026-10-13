@@ -303,6 +303,11 @@ pub static VISION_CACHE: Lazy<VisionEmbedCache> = Lazy::new(|| {
     VisionEmbedCache::new(dir, DEFAULT_MAX_BYTES)
 });
 
+/// 🌟 [VISION-CACHE] 이미 초기화된 경우에만 캐시를 돌려줍니다 (퍼지의 통계 출력이 디스크 스캔을 유발하지 않게).
+pub fn vision_cache_if_initialized() -> Option<&'static VisionEmbedCache> {
+    Lazy::get(&VISION_CACHE)
+}
+
 /// 🌟 [SAFETY] 캐시 히트 결과가 실제 프롬프트의 이미지 토큰 수와 맞는지 검증합니다.
 /// 불일치 시 None 을 반환해 ViT 재계산으로 안전하게 폴백시킵니다.
 pub fn validate_embed_shape(embeds: &Tensor, expected_tokens: usize) -> Result<()> {

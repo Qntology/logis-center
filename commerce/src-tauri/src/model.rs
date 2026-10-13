@@ -227,26 +227,15 @@ pub fn ram_pressure_line(avail: u64, total: u64) -> String {
     )
 }
 
+/// 🌟 [HEAP-RELEASE] RAM 압박 시 메모리 반환.
+/// 기본은 mimalloc 의 빈 힙 페이지만 OS 로 돌려줍니다(utils::release_heap). 예전처럼 작업 집합 전체를
+/// 내쫓으면(SetProcessWorkingSetSizeEx) mmap 가중치·토크나이저 페이지가 곧바로 다시 읽혀 RAM 이 톱니처럼
+/// 오르내리고 수 초씩 멈췄습니다. `LOGIS_MEM_TRIM=legacy` 이면 예전 동작입니다.
 pub fn release_os_working_set() {
-    #[cfg(target_os = "windows")]
-    unsafe {
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-        let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-    }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        extern "C" {
-            fn malloc_trim(pad: usize) -> i32;
-        }
-        malloc_trim(0);
-    }
-    #[cfg(target_os = "macos")]
-    unsafe {
-        extern "C" {
-            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
-        }
-        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    if crate::utils::legacy_ws_trim_enabled() {
+        crate::utils::force_working_set_trim();
+    } else {
+        crate::utils::release_heap();
     }
 }
 

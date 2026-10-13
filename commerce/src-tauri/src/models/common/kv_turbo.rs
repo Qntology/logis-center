@@ -347,29 +347,39 @@ impl TqBlockCodec {
 }
 
 #[cfg(feature = "turbo-quant")]
-fn codec_cache() -> &'static std::sync::Mutex<
-    std::collections::HashMap<(TqMeta, candle_core::DeviceLocation), Arc<TqBlockCodec>>,
-> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(TqMeta, candle_core::DeviceLocation), Arc<TqBlockCodec>>>,
-    > = std::sync::OnceLock::new();
+type CodecMap = std::collections::HashMap<(TqMeta, candle_core::DeviceLocation), Vec<Arc<TqBlockCodec>>>;
+
+#[cfg(feature = "turbo-quant")]
+fn codec_cache() -> &'static std::sync::Mutex<CodecMap> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<CodecMap>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// `meta` 형식의 코덱 (장치별로 한 번만 만들어 재사용합니다).
+///
+/// 🌟 [CODEC-CACHE] 위치(gpu 번호)가 같아도 장치 인스턴스가 다르면(`same_device` 거짓) 다른 코덱입니다.
+/// 예전에는 위치만으로 찾아서 첫 작업의 장치가 영구히 붙잡히고, 이후 작업은 매 스텝 장치 간 복사를 했습니다.
 pub fn codec_for(meta: &TqMeta, device: &Device) -> Result<Arc<TqBlockCodec>> {
     #[cfg(feature = "turbo-quant")]
     {
         let key = (*meta, device.location());
-        if let Some(c) = codec_cache().lock().map_err(|_| anyhow!("turbo-kv: 코덱 캐시 잠금 실패"))?.get(&key) {
-            return Ok(c.clone());
+        {
+            let mut cache = codec_cache().lock().map_err(|_| anyhow!("turbo-kv: 코덱 캐시 잠금 실패"))?;
+            if let Some(list) = cache.get_mut(&key) {
+                if let Some(c) = list.iter().find(|c| c.device.same_device(device)) {
+                    return Ok(c.clone());
+                }
+                // 같은 위치의 옛 장치 코덱은 버립니다 (옛 장치를 붙잡지 않도록).
+                list.clear();
+            }
         }
         let codec = Arc::new(TqBlockCodec::new(*meta, device)?);
         codec_cache()
             .lock()
             .map_err(|_| anyhow!("turbo-kv: 코덱 캐시 잠금 실패"))?
             .entry(key)
-            .or_insert_with(|| codec.clone());
+            .or_default()
+            .push(codec.clone());
         return Ok(codec);
     }
     #[cfg(not(feature = "turbo-quant"))]
@@ -377,6 +387,24 @@ pub fn codec_for(meta: &TqMeta, device: &Device) -> Result<Arc<TqBlockCodec>> {
         let _ = (meta, device);
         bail!(NO_FEATURE)
     }
+}
+
+/// 🌟 [CODEC-CACHE] 코덱 캐시를 비웁니다 (퍼지·작업 종료). 다음 사용 때 같은 시드로 다시 만들어지므로 결과는 같습니다.
+pub fn clear_codec_cache() {
+    #[cfg(feature = "turbo-quant")]
+    if let Ok(mut c) = codec_cache().lock() {
+        c.clear();
+    }
+}
+
+/// 현재 캐시에 든 코덱 수 (테스트·진단용).
+pub fn codec_cache_len() -> usize {
+    #[cfg(feature = "turbo-quant")]
+    {
+        return codec_cache().lock().map(|c| c.values().map(|v| v.len()).sum()).unwrap_or(0);
+    }
+    #[cfg(not(feature = "turbo-quant"))]
+    0
 }
 
 /// 사용자가 KV 압축 형식·비트를 직접 고르는 환경 변수들
@@ -444,7 +472,7 @@ pub fn kv_precision_policy() -> KvPrecisionPolicy {
     static P: std::sync::OnceLock<KvPrecisionPolicy> = std::sync::OnceLock::new();
     *P.get_or_init(|| {
         match std::env::var("LOGIS_KV_PRECISION").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
-            "exact" | "full" | "bf16" | "f16" => KvPrecisionPolicy::Exact,
+            "exact" | "full" | "bf16" | "f16" | "exact32" | "f32" | "half" | "exact16" => KvPrecisionPolicy::Exact,
             "compressed" | "turbo" | "fp8" | "compact" => KvPrecisionPolicy::Compressed,
             _ => KvPrecisionPolicy::Auto,
         }
@@ -476,6 +504,49 @@ pub fn exact_kv_affordable(device: &Device, exact_bytes: u64, reserve: u64) -> (
             free >= exact_bytes + crate::utils::resources::KV_VRAM_SAFETY_MARGIN_BYTES + reserve,
             Some(free),
         ),
+        None => (false, None),
+    }
+}
+
+/// 🌟 [KV-HALF] F32 로 도는 모델의 원본 KV 를 F16 으로 보관할지 (`LOGIS_KV_PRECISION`).
+/// - `Auto` (기본): F32 원본 KV 가 VRAM 에 들어가면 F32, 안 들어가고 F16 이면 들어가면 F16, 둘 다 안 되면 압축.
+///   (예전에는 F32 가 안 들어가면 곧바로 FP8 압축이었으므로 어떤 경우에도 정밀도가 같거나 높습니다)
+/// - `Prefer` (`half` / `exact16` / `f16`): 원본 KV 를 고르면 항상 F16 으로 보관합니다.
+/// - `Off` (`exact32` / `f32`): 예전처럼 F32 로만 보관합니다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvHalfMode {
+    Auto,
+    Prefer,
+    Off,
+}
+
+pub fn kv_half_mode() -> KvHalfMode {
+    static M: std::sync::OnceLock<KvHalfMode> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        match std::env::var("LOGIS_KV_PRECISION").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+            "exact32" | "f32" => KvHalfMode::Off,
+            "half" | "exact16" | "f16" => KvHalfMode::Prefer,
+            _ => KvHalfMode::Auto,
+        }
+    })
+}
+
+/// F16 로 담을 수 있는 최댓값 (넘으면 BF16 으로 보관합니다).
+pub const F16_SAFE_MAX: f32 = 60000.0;
+
+/// [`exact_kv_affordable`] 과 같되 KV 안전 여유를 호출부가 정합니다 (비례 여유, [`crate::utils::resources::kv_vram_margin_bytes`]).
+pub fn exact_kv_affordable_with_margin(device: &Device, exact_bytes: u64, reserve: u64, margin: u64) -> (bool, Option<u64>) {
+    match kv_precision_policy() {
+        KvPrecisionPolicy::Exact => return (true, None),
+        KvPrecisionPolicy::Compressed => return (false, None),
+        KvPrecisionPolicy::Auto => {}
+    }
+    use crate::utils::GpuDeviceExt;
+    if !(device.is_cuda_or_rocm() || device.is_vulkan()) {
+        return (true, None);
+    }
+    match crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize) {
+        Some((free, _)) => (free >= exact_bytes + margin + reserve, Some(free)),
         None => (false, None),
     }
 }
