@@ -256,15 +256,15 @@ impl Qwen4ExpTextConfig {
                 bail!("[QWEN4-EXP] 지원하지 않는 layer type: {t}");
             }
         }
-        self.gate_act()?;
         // 전문가·공유 전문가 MLP 와 GDN causal conv 는 HF 에서 `ACT2FN[hidden_act]` 입니다. 포트는 SiLU 로 구현했으므로
-        // 다른 활성 함수는 조용히 틀린 출력을 내지 않도록 거부합니다.
+        // 다른 활성 함수는 조용히 틀린 출력을 내지 않도록 거부합니다. (output gate 는 hidden_act 를 물려받으므로 먼저 검사)
         if !matches!(self.hidden_act.as_str(), "silu" | "swish") {
             bail!(
                 "[QWEN4-EXP] hidden_act '{}' 는 지원하지 않습니다 (전문가/공유 전문가/GDN conv 가 SiLU 로 구현됨)",
                 self.hidden_act
             );
         }
+        self.gate_act()?;
         // HF 는 rope_type 이 "default" 가 아니면 ROPE_INIT_FUNCTIONS[rope_type] (yarn/linear/dynamic ...) 으로
         // inv_freq 와 attention_scaling 을 바꿉니다. RopeTable 은 기본 RoPE 만 만들므로 나머지는 거부합니다.
         let rt = self.rope_type();

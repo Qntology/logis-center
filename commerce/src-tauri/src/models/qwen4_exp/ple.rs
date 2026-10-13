@@ -353,6 +353,11 @@ impl PleLayer {
         })
     }
 
+    /// n-gram 표를 장치에 통째로 올리지 않고 mmap 에서 행 단위로 모으는지 여부.
+    pub fn is_mmap_table(&self) -> bool {
+        matches!(self.table, NgramTable::Mmap { .. })
+    }
+
     pub fn clear_cache(&mut self) {
         self.conv_state = None;
         self.ngram_ctx.clear();
