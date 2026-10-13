@@ -371,7 +371,7 @@ impl crate::model::LogisModel {
     //
     //  ── 캐시 키 ──
     //   (모델 지문 + 장치 dtype 계열 + 순전파 태그, 텍스트).
-    //   CUDA/ROCm 배치 순전파(embed_many)와 per-text 순전파는 서로 다른 공간이라
+    //   배치 순전파(embed_many, 고정 모양 / 동적)와 per-text 순전파는 서로 다른 공간이라
     //   두 경로의 벡터가 섞이지 않습니다.
     //
     //  ── 0벡터 ──
@@ -387,7 +387,11 @@ impl crate::model::LogisModel {
     /// 배치 순전파가 켜져 있어 '쓰일지 모르는 텍스트까지 미리 임베딩' 하는 추측성 프리패치가 싼지 여부.
     /// (per-text 경로에서는 추측분 1건마다 순전파 1회가 그대로 들기 때문에 하지 않습니다)
     pub fn embed_speculation_cheap(&self) -> bool {
-        !self.is_cpu_mode && crate::models::embedding::batched_enabled(&self.device_config.device)
+        // CPU · Vulkan 도 배치 순전파를 쓰지만 연산이 CPU 쪽이라 추측분이 싸지 않습니다(예전과 같이 CUDA/ROCm 만).
+        use crate::utils::GpuDeviceExt;
+        !self.is_cpu_mode
+            && self.device_config.device.is_cuda_or_rocm()
+            && crate::models::embedding::batched_enabled(&self.device_config.device)
     }
 
     // =====================================================================
@@ -478,28 +482,39 @@ impl crate::model::LogisModel {
         let embedding_model_arc = self.embedding_model.clone();
         let text_clone = text.clone();
 
-        let vector = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<f32>> {
+        // (벡터, 이 공간의 값인지) — 배치 경로가 실패해 per-text 로 대신 구한 벡터는 다른 공간의 값입니다.
+        let (vector, in_space) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<f32>, bool)> {
             let guard = embedding_model_arc.blocking_lock();
             if let Some(model) = guard.as_ref() {
                 if model.batched_enabled() {
-                    // 🌟 [EMBED-BATCHED] 1건도 배치와 같은 고정 모양 마이크로배치를 거칩니다.
+                    // 🌟 [EMBED-BATCHED] 1건도 배치와 같은 경로(embed_many)를 거칩니다.
                     //    그래서 단건으로 구한 벡터와 어떤 배치 안에서 구한 벡터가 비트 단위로 같고,
-                    //    캐시 공간도 배치 경로와 같습니다.
-                    let mut v = model
-                        .embed_many(std::slice::from_ref(&text_clone), &crate::models::embedding::BatchOpts::default())
-                        .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
-                    Ok(v.pop().unwrap_or_else(|| vec![0.0; crate::models::embedding::EMBED_DIM]))
+                    //    캐시 공간도 배치 경로와 같습니다. 실패(OOM · Vulkan VRAM 사본 실패 등)하면
+                    //    get_embedding_batch 와 같이 per-text 로 계산하고 캐시에는 넣지 않습니다.
+                    match model.embed_many(std::slice::from_ref(&text_clone), &model.batch_opts()) {
+                        Ok(mut v) => Ok((v.pop().unwrap_or_else(|| vec![0.0; crate::models::embedding::EMBED_DIM]), true)),
+                        Err(e) => {
+                            println!(
+                                "[EMBED-BATCHED] ⚠️ 단건 배치 순전파 실패({}). per-text 경로로 계산하고 캐시에는 넣지 않습니다.",
+                                e
+                            );
+                            let v = model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+                            Ok((v, false))
+                        }
+                    }
                 } else {
-                    model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))
+                    Ok((model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?, true))
                 }
             } else {
                 // Fallback to zeros if model failed to load
-                Ok(vec![0.0; crate::models::embedding::EMBED_DIM])
+                Ok((vec![0.0; crate::models::embedding::EMBED_DIM], true))
             }
         }).await??;
         self.observe_activation_headroom(free_before);
         // 🌟 2. 새로 연산된 벡터를 전역 캐시에 저장합니다. (0벡터는 저장하지 않음)
-        if is_cacheable(&vector) {
+        if !in_space {
+            // 다른 공간(per-text)의 값이라 캐시하지 않습니다.
+        } else if is_cacheable(&vector) {
             GRANITE_TEXT_CACHE.insert(space, text, std::sync::Arc::from(vector.as_slice()), false);
         } else {
             println!("[MODEL] ⚠️ [EMBED FAIL] 1건이 0벡터로 반환되었습니다. 캐시에 넣지 않고 다음 호출에서 다시 계산합니다.");
@@ -530,7 +545,7 @@ impl crate::model::LogisModel {
     //      spawn_blocking 하나 안에서 락을 쥔 채 청크를 순회하면
     //      activation 축소라는 목적은 그대로 달성하면서 이 위험이 사라집니다.
     //
-    //   ④ 🌟 [EMBED-BATCHED] CUDA/ROCm 에서는 embed_many(진짜 배치 순전파)를 씁니다.
+    //   ④ 🌟 [EMBED-BATCHED] CUDA/ROCm/CPU/Vulkan 에서는 embed_many(진짜 배치 순전파)를 씁니다.
     //      실패한 묶음만 per-text 로 다시 계산하고, 그 벡터는 다른 공간의 값이므로
     //      캐시에 넣지 않습니다.
     // =====================================================================
@@ -660,7 +675,7 @@ impl crate::model::LogisModel {
                 let mut cacheable: Vec<bool> = Vec::with_capacity(n);
                 if model.batched_enabled() {
                     // 🌟 [EMBED-BATCHED] 진짜 배치 순전파. 실패한 묶음만 per-text 로 대체합니다.
-                    let opts = crate::models::embedding::BatchOpts::default();
+                    let opts = model.batch_opts();
                     let mut st = crate::models::embedding::BatchRunStats::default();
                     for part in miss_for_compute.chunks(RAM_CHUNK) {
                         match model.embed_many_with_stats(part, &opts) {

@@ -604,11 +604,17 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
         println!("모델 디렉터리가 없어 건너뜁니다.");
         return;
     };
-    let Some(device) = tauri_app_lib::utils::new_gpu_device(0) else {
-        println!("GPU 장치가 없어 건너뜁니다.");
-        return;
+    // LOGIS_TEST_EMBED_DEVICE=cpu 이면 CPU 에서, 아니면 이 빌드의 GPU(CUDA/ROCm/Vulkan) 에서 봅니다.
+    let device = if std::env::var("LOGIS_TEST_EMBED_DEVICE").map(|v| v.trim().eq_ignore_ascii_case("cpu")).unwrap_or(false) {
+        candle_core::Device::Cpu
+    } else {
+        let Some(d) = tauri_app_lib::utils::new_gpu_device(0) else {
+            println!("GPU 장치가 없어 건너뜁니다.");
+            return;
+        };
+        d
     };
-    use tauri_app_lib::models::embedding::{BatchOpts, EmbeddingModel};
+    use tauri_app_lib::models::embedding::EmbeddingModel;
     let t_load = std::time::Instant::now();
     let model = EmbeddingModel::new_with_device(&dir, &device).expect("load");
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
@@ -640,7 +646,7 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
 
     // 예열
     let _ = model.embed(&texts[0]).unwrap();
-    let _ = model.embed_many(&texts[..8], &BatchOpts::default()).unwrap();
+    let _ = model.embed_many(&texts[..8], &model.batch_opts()).unwrap();
     let _ = device.synchronize();
 
     // ── 기준: per-text embed() 순차 ──
@@ -676,7 +682,7 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
     let threaded_s = t1.elapsed().as_secs_f64();
 
     // ── 배치 순전파 (2회째를 측정) ──
-    let opts = BatchOpts::default();
+    let opts = model.batch_opts();
     let (batched_first, _) = model.embed_many_with_stats(&texts, &opts).unwrap();
     let t2 = std::time::Instant::now();
     let (batched, st) = model.embed_many_with_stats(&texts, &opts).unwrap();
@@ -690,6 +696,18 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
     let t4 = std::time::Instant::now();
     let _ = model.embed_many(&short_texts, &opts).unwrap();
     let short_batch_s = t4.elapsed().as_secs_f64();
+    // 단건 호출 지연(검색 질의 1건): 고정 모양은 1건이어도 B(L) 행을 계산합니다.
+    let singles: Vec<&String> = short_texts.iter().step_by((short_texts.len() / 20).max(1)).take(20).collect();
+    let t5 = std::time::Instant::now();
+    for t in &singles { let _ = model.embed(t).unwrap(); }
+    let single_per_ms = t5.elapsed().as_secs_f64() * 1000.0 / singles.len() as f64;
+    let t6 = std::time::Instant::now();
+    for t in &singles { let _ = model.embed_many(std::slice::from_ref(*t), &opts).unwrap(); }
+    let single_batch_ms = t6.elapsed().as_secs_f64() * 1000.0 / singles.len() as f64;
+    println!(
+        "[GPU-EQ] 단건 호출(짧은 구 {}건 평균): per-text {:.1}ms · embed_many {:.1}ms (token_budget {})",
+        singles.len(), single_per_ms, single_batch_ms, opts.token_budget
+    );
 
     // ── 수치 대조 ──
     let mut min_cos = f32::MAX;
@@ -826,6 +844,10 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
     assert_eq!(probe_identical, probe.len(), "표본끼리 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
     assert_eq!(sub_identical, sub_idx.len(), "역순 절반 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
     assert_eq!(batched_repro, texts.len(), "같은 입력의 embed_many 는 실행마다 비트 단위로 같아야 합니다");
+    if device.is_cpu() {
+        // CPU 동적 배치(정확한 길이 묶음)는 per-text 와 같은 연산이라 모든 텍스트가 비트 동일해야 합니다.
+        assert_eq!(identical, texts.len(), "CPU embed_many 가 per-text 와 비트 단위로 다릅니다");
+    }
     assert!(min_cos > 0.995, "최소 코사인 {} — 배치 경로 수치가 허용 범위를 벗어났습니다", min_cos);
     // 배치 경로가 F32 참값에서 per-text 보다 눈에 띄게 멀어지면 안 됩니다.
     // 허용폭 2e-4 는 의도한 절충입니다: BF16 GEMM 은 모양마다 커널이 달라 배치 경로가 per-text 와

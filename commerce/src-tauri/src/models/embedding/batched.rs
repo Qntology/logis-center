@@ -1,5 +1,5 @@
 // =====================================================================
-// 🌟 [EMBED-BATCHED] 진짜 배치 순전파 (CUDA / ROCm 전용)
+// 🌟 [EMBED-BATCHED] 진짜 배치 순전파 (CUDA / ROCm / CPU / Vulkan)
 // ---------------------------------------------------------------------
 //  ── 무엇이 문제였나 ──
 //   embed_batch 는 3스레드가 embed() 를 1건씩 돌리는 구조라,
@@ -25,6 +25,19 @@
 //      텍스트가 함께 들어왔는지, 먼저 캐시한 쪽이 어느 호출이었는지와 무관합니다
 //      (고정 모양이면 GEMM 커널 선택이 같고, 행 사이 연산이 섞이지 않습니다).
 //      B(L)·L ≤ token_budget(기본 1024) 이라 단건 호출의 연산량도 1024 토큰 이하입니다.
+//   ⑥ 🌟 [EMBED-BATCHED / DYNAMIC] CPU 는 고정 모양을 쓰지 않고 실제 행만 묶습니다(fixed_shape=false).
+//      CPU 는 연산량이 곧 시간이라 더미 행이 그대로 손해입니다(실측, Ryzen 5600X · 320건:
+//      고정 모양 예산 1024 는 per-text 의 0.4배 속도, 단건 589ms vs 16.7ms). 대신 CPU gemm 은
+//      행 결과가 M(=B·L) 과 행 위치에 따라 바뀌지 않아(같은 텍스트가 per-text M=L 과 배치 M=B·L 에서
+//      303/303 비트 동일), 행 수가 호출마다 달라도 한 텍스트의 벡터는 그 텍스트만의 함수입니다.
+//      패딩 버킷도 쓰지 않고(exact_len_max = 512) 정확한 길이끼리만 묶어, CPU 에서는 배치 결과가
+//      per-text 와 320/320 비트 동일합니다(전체 1.6배 · 짧은 구 2.8배, 단건 호출은 같은 비용).
+//      Vulkan 은 연산마다 GPU/CPU 경로를 크기·가중치 사용 횟수로 고르는 하이브리드라, 이 구간을
+//      포크의 고정 실행 모드(shaders::scoped_exec_mode, 기본 Gpu: 가중치 행렬곱은 항상 GPU GEMM ·
+//      나머지는 CPU 경로)로 묶습니다. 실측(RX 6600): 전체 1.6배 · 짧은 구 3.5배, 구성 무관 비트 동일.
+//      (기존 per-text Vulkan 경로는 같은 텍스트 2회가 319/320 만 같았습니다 — 가중치 VRAM 사본이
+//       2번째 사용부터 생겨 경로가 바뀌기 때문. 배치 경로는 이 문제가 없습니다)
+//      tests/it/app_embed.rs 가 구성 무관성(단건 · 표본 · 역순 절반)을 비트 단위로 확인합니다.
 //
 //  ── 정확도 ──
 //   cuBLAS GEMM 은 M = B·L 과 M = L 에서 다른 커널(또는 split-K)을 고를 수 있어
@@ -52,20 +65,41 @@ pub struct BatchOpts {
     pub exact_len_max: usize,
     /// 그보다 긴 텍스트의 버킷 길이 올림 단위.
     pub pad_step: usize,
+    /// true: 모든 마이크로배치를 B(L) 행 고정 모양으로 돌립니다(모자란 행은 더미, GPU 기본).
+    /// false: 실제 구성원 행만 돌립니다(CPU · Vulkan, ⑥).
+    pub fixed_shape: bool,
 }
 
 impl Default for BatchOpts {
+    /// GPU(CUDA/ROCm) 기본값: 고정 모양. 장치별 값은 [`BatchOpts::for_device`].
     fn default() -> Self {
         let token_budget = std::env::var("LOGIS_EMBED_TOKEN_BUDGET")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|v| *v >= 64)
             .unwrap_or(1024);
-        Self { token_budget, attn_budget: 1 << 19, max_rows: 256, exact_len_max: 64, pad_step: 32 }
+        Self { token_budget, attn_budget: 1 << 19, max_rows: 256, exact_len_max: 64, pad_step: 32, fixed_shape: true }
     }
 }
 
 impl BatchOpts {
+    /// 장치별 정책: CUDA/ROCm 은 고정 모양, CPU · Vulkan 은 동적 행 수(⑥).
+    /// `LOGIS_EMBED_FIXED_SHAPE=1|0` 이면 장치와 무관하게 강제합니다(진단용 · 캐시 공간 태그도 따라 바뀝니다).
+    pub fn for_device(device: &Device) -> Self {
+        let mut o = Self::default();
+        o.fixed_shape = !(device.is_cpu() || device.is_vulkan());
+        if let Ok(v) = std::env::var("LOGIS_EMBED_FIXED_SHAPE") {
+            o.fixed_shape = v.trim() != "0";
+        }
+        if !o.fixed_shape {
+            // 동적 모드는 패딩 버킷을 쓰지 않습니다: 긴 텍스트는 연산량이 시간을 정해 묶어도 이득이 없고
+            // (실측 CPU: 65~512토큰 17건이 패딩·마스크 때문에 오히려 느림), 정확한 길이끼리만 묶으면
+            // 모든 행이 per-text 와 같은 리덕션 길이가 됩니다.
+            o.exact_len_max = EMBED_CHUNK_TOKENS;
+        }
+        o
+    }
+
     /// 길이 L 버킷의 마이크로배치 행 수.
     pub fn rows_for(&self, len: usize) -> usize {
         let l = len.max(1);
@@ -83,6 +117,22 @@ impl BatchOpts {
             (((len + step - 1) / step) * step).min(EMBED_CHUNK_TOKENS.max(len))
         }
     }
+}
+
+/// Vulkan 배치 순전파의 고정 실행 모드. 기본 Gpu(가중치 행렬곱은 항상 GPU GEMM, 나머지는 CPU 경로),
+/// `LOGIS_EMBED_VK_MODE=host` 이면 전부 CPU 경로(CPU 백엔드와 같은 비트).
+#[cfg(feature = "vulkan")]
+fn vulkan_exec_mode() -> candle_core::vulkan_backend::shaders::ExecMode {
+    use candle_core::vulkan_backend::shaders::ExecMode;
+    static MODE: std::sync::OnceLock<ExecMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let host = std::env::var("LOGIS_EMBED_VK_MODE")
+            .map(|v| v.trim().eq_ignore_ascii_case("host"))
+            .unwrap_or(false);
+        let m = if host { ExecMode::Host } else { ExecMode::Gpu };
+        println!("[EMBED-BATCHED] Vulkan 배치 순전파 실행 모드: {:?} (LOGIS_EMBED_VK_MODE=host|gpu)", m);
+        m
+    })
 }
 
 /// 512 토큰 청크 하나.
@@ -141,6 +191,13 @@ impl EmbeddingModel {
         }
 
         // ── 3. 마이크로배치 순전파 (결과는 GPU 에 모아 둠) ──
+        // Vulkan: 연산마다 GPU/CPU 경로를 크기·가중치 사용 횟수로 고르면 같은 행이 배치 구성에 따라
+        // 다른 커널을 타서 비트가 달라집니다. 이 구간은 포크의 고정 실행 모드로 경로를 묶습니다(⑥).
+        #[cfg(feature = "vulkan")]
+        let _vk_mode = self
+            .device
+            .is_vulkan()
+            .then(|| candle_core::vulkan_backend::shaders::scoped_exec_mode(vulkan_exec_mode()));
         let mut outs: Vec<Tensor> = Vec::new();
         let mut order: Vec<usize> = Vec::with_capacity(seqs.len());
         for (&blen, members) in buckets.iter() {
@@ -150,7 +207,9 @@ impl EmbeddingModel {
                 // 실패(OOM 등)는 더 작은 모양으로 다시 돌리지 않고 그대로 올립니다.
                 // 작은 모양은 다른 수치를 내기 때문입니다. 호출부(get_embedding_batch)가
                 // 그 묶음만 per-text 로 계산하고 캐시에는 넣지 않습니다.
-                let pooled = self.forward_group(&seqs, group, blen, rows, exact, &mut stats)?;
+                // ⑥ 동적 모드는 실제 구성원 행만 돌립니다(더미 없음).
+                let shape_rows = if opts.fixed_shape { rows } else { group.len() };
+                let pooled = self.forward_group(&seqs, group, blen, shape_rows, exact, &mut stats)?;
                 outs.push(pooled);
                 order.extend_from_slice(group);
             }
