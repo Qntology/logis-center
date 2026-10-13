@@ -40,17 +40,81 @@ pub fn new_gpu_device(id: usize) -> Option<Device> {
     None
 }
 
+// =====================================================================
+// 🌟 [NVML-GLOBAL] 프로세스 전역 NVML 핸들
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   GpuMemProbe::new() 가 호출마다 Nvml::init() 을 수행했습니다.
+//   nvml-wrapper 0.9 의 init 은 nvml.dll 을 LoadLibrary → nvmlInit_v2 하고,
+//   Drop 에서 nvmlShutdown → FreeLibrary 까지 합니다.
+//   이 PC 실측으로 질의 1회가 15~16ms(첫 회 88~214ms) 였고, 살아 있는
+//   핸들로 질의하면 0.007ms 입니다. 임베딩 미적중 1건이 2~5회 질의를 하므로
+//   검색 1회에 수 초가 VRAM '측정' 에만 쓰이고 있었습니다.
+//
+//  ── 해결 ──
+//   최초 성공한 Nvml 을 OnceCell 에 두고 프로세스가 끝날 때까지 재사용합니다.
+//   Nvml 은 Send + Sync 이므로 &'static 으로 공유해도 안전합니다.
+//   반환하는 숫자는 기존과 완전히 같고(같은 nvmlDeviceGetMemoryInfo),
+//   init/shutdown 만 사라집니다. 초기화 실패는 5초 간격으로만 재시도하여
+//   NVIDIA 드라이버가 없는 PC 에서 매 질의마다 DLL 탐색을 반복하지 않습니다.
+//   ROCm / Vulkan 빌드는 기존과 같이 NVML 을 쓰지 않습니다.
+// =====================================================================
+#[cfg(not(any(feature = "rocm", feature = "vulkan")))]
+static NVML_HANDLE: once_cell::sync::OnceCell<Nvml> = once_cell::sync::OnceCell::new();
+#[cfg(not(any(feature = "rocm", feature = "vulkan")))]
+static NVML_RETRY_AFTER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 실제로 성공한 Nvml::init() 횟수. 전역 핸들이 재사용되는지 검증하는 데 씁니다.
+static NVML_INIT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 프로세스 전역 NVML 핸들. NVML 을 쓰지 않는 빌드이거나 초기화에 실패하면 None.
+pub fn nvml_handle() -> Option<&'static Nvml> {
+    #[cfg(any(feature = "rocm", feature = "vulkan"))]
+    {
+        None
+    }
+    #[cfg(not(any(feature = "rocm", feature = "vulkan")))]
+    {
+        use std::sync::atomic::Ordering;
+        if let Some(n) = NVML_HANDLE.get() {
+            return Some(n);
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if now_ms < NVML_RETRY_AFTER_MS.load(Ordering::Relaxed) {
+            return None;
+        }
+        match NVML_HANDLE.get_or_try_init(|| {
+            let r = Nvml::init();
+            if r.is_ok() {
+                NVML_INIT_COUNT.fetch_add(1, Ordering::SeqCst);
+                println!("[NVML-GLOBAL] ✅ 프로세스 전역 NVML 핸들을 열었습니다. 이후 VRAM 질의는 init/shutdown 없이 재사용합니다.");
+            }
+            r
+        }) {
+            Ok(n) => Some(n),
+            Err(e) => {
+                NVML_RETRY_AFTER_MS.store(now_ms + 5_000, Ordering::Relaxed);
+                println!("[NVML-GLOBAL] ⚠️ NVML 초기화 실패({}). 5초 뒤에 다시 시도합니다.", e);
+                None
+            }
+        }
+    }
+}
+
+/// 지금까지 성공한 Nvml::init() 횟수 (전역 핸들 재사용 검증용, 정상이면 0 또는 1).
+pub fn nvml_init_count() -> u64 {
+    NVML_INIT_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub struct GpuMemProbe {
-    nvml: Option<Nvml>,
+    nvml: Option<&'static Nvml>,
 }
 
 impl GpuMemProbe {
     pub fn new() -> Self {
-        #[cfg(any(feature = "rocm", feature = "vulkan"))]
-        let nvml = None;
-        #[cfg(not(any(feature = "rocm", feature = "vulkan")))]
-        let nvml = Nvml::init().ok();
-        Self { nvml }
+        Self { nvml: nvml_handle() }
     }
 
     pub fn device_count(&self) -> usize {
@@ -69,7 +133,6 @@ impl GpuMemProbe {
             }
         }
         self.nvml
-            .as_ref()
             .and_then(|n| n.device_count().ok())
             .unwrap_or(0) as usize
     }
@@ -88,8 +151,7 @@ impl GpuMemProbe {
             }
         }
         let mem = self
-            .nvml
-            .as_ref()?
+            .nvml?
             .device_by_index(gpu_id as u32)
             .ok()?
             .memory_info()

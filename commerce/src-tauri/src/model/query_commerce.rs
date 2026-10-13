@@ -124,7 +124,7 @@ impl crate::model::LogisModel {
         }
 
         // 2. 단 한 번의 배치 호출로 모든 임베딩 벡터를 한 장바구니에 획득
-        let embedded_texts = self.get_embedding_batch(texts_to_embed).await.unwrap_or_else(|_| vec![vec![0.0; 384]; emb_mappings.len()]);
+        let embedded_texts = self.get_embedding_batch_pinned(texts_to_embed).await.unwrap_or_else(|_| vec![vec![0.0; 384]; emb_mappings.len()]);
 
         // 3. 획득한 벡터와 카테고리/키 값을 매칭하여 해시맵에 일괄 삽입
         for (i, (cat, emb_type)) in emb_mappings.into_iter().enumerate() {
@@ -167,7 +167,7 @@ impl crate::model::LogisModel {
         let operator_embs: Vec<Vec<f32>> = if op_bank_texts.is_empty() {
             Vec::new()
         } else {
-            self.get_embedding_batch(op_bank_texts.clone()).await
+            self.get_embedding_batch_pinned(op_bank_texts.clone()).await
                 .unwrap_or_else(|_| vec![vec![0.0; 384]; op_bank_texts.len()])
         };
 
@@ -568,91 +568,57 @@ impl crate::model::LogisModel {
 
         let mut raw_spans = Vec::new();
 
-        for start in 0..words.len() {
-            let max_end = words.len().min(start + 8);
-            
-            // 🌟 [단어 수 제한] start + 2 로 설정하여 단일 단어(1단어)는 배제합니다.
-            for end in (start + 2)..=max_end {
-                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
-                    emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
-                    return Ok(json!({ "context": [], "cancelled": true }));
-                }
-                
-                let test_text = words[start..end].join(" ");
-                let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                
-                // 🌟 [추가] Verb Penalty 및 단어 길이 가중치 계산
-                let word_count = end - start;
-                let v_sim = cosine_similarity(&test_emb, &verb_emb);
-                let beta = if word_count <= 2 { 0.05 } else { 0.10 };
-                let verb_penalty = v_sim * beta;
-                let penalty_weight = if word_count <= 2 { 0.3 } else { 0.7 };
+        // 🌟 [EMBED-PREFETCH] RAW-CHUNK 스팬(2~8단어 모든 창)은 루프 전에 이미 확정됩니다.
+        //    기존에는 n-gram 마다 get_embedding 을 1건씩(spawn_blocking + NVML + 배치 1 순전파)
+        //    불렀습니다(10단어 질의 = 42회). 한 번의 배치로 전부 임베딩합니다.
+        //    get_embedding_batch 는 get_embedding 과 같은 순전파·같은 캐시를 쓰므로 벡터가 같습니다.
+        let span_list = crate::utils::ai_utils::raw_chunk_spans(&words);
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
+        let span_embs: Vec<Vec<f32>> = if span_list.is_empty() {
+            Vec::new()
+        } else {
+            self.get_embedding_batch(span_list.iter().map(|(_, _, t)| t.clone()).collect()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; span_list.len()])
+        };
 
-                let mut scores = std::collections::HashMap::new();
-                for cat in &categories {
-                    let contexts = crate::parsing::get_multi_pass_contexts(cat, &query_lang);
-                    let mut field_scores = Vec::new();
+        // 🌟 [STAGE1-CTX] get_multi_pass_contexts 를 n-gram × 카테고리마다 다시 만들지 않고
+        //    카테고리별 (bias, prejudice) 행 인덱스를 한 번만 만듭니다. (GAP BRIDGING 도 재사용)
+        //    점수 식은 기존과 같고, 결과는 비트 단위로 같습니다.
+        let mut layout_table = crate::utils::ai_utils::LayoutScoreTable::new();
+        for cat in &categories {
+            layout_table.ensure_cat(cat, crate::parsing::get_multi_pass_contexts(cat, &query_lang), &layout_embs, &anchor_embs);
+        }
+        let zero_emb = vec![0.0f32; 384];
 
-                    for (key, _bias, _prejudice) in contexts {
-                        let bias_emb = layout_embs.get(&format!("{}_{}_bias", cat, key)).cloned().unwrap_or(vec![0.0; 384]);
-                        let prej_emb = layout_embs.get(&format!("{}_{}_prejudice", cat, key)).cloned().unwrap_or(vec![0.0; 384]);
-                        
-                        let bias_score = cosine_similarity(&test_emb, &bias_emb);
-                        let prej_score = cosine_similarity(&test_emb, &prej_emb);
-
-                        // 🌟 [수정] penalty_weight 및 verb_penalty를 적용한 강화된 점수 차감
-                        let field_score = (bias_score - (prej_score * penalty_weight) - verb_penalty).max(0.0);
-                        field_scores.push(field_score);
-                    }
-
-                    // 🌟 2. Intent Anchor 점수 합산 (해당 카테고리의 anchor가 있다면)
-                    let anchor_score = if let Some(anchor_emb) = anchor_embs.get(*cat) {
-                        cosine_similarity(&test_emb, anchor_emb).max(0.0)
-                    } else {
-                        0.0
-                    };
-
-                    // 🌟 [멀티 패스 스코어 평가]
-                    field_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                    
-                    // 🌟 [진정한 멀티패스 반영: 동적 감쇠 누적 합산 (Decaying Sum)]
-                    // 상위 N개 점수를 동적으로 순회하며 가중치를 반감(1.0, 0.5, 0.25, 0.125...)시켜 합산합니다.
-                    // 무한히 더해도 최대값이 수렴하므로, 필드 개수가 많은(예: 40개) 도메인이 
-                    // 잡음(Noise)을 끌어모아 점수를 뻥튀기하는 현상을 수학적으로 완벽히 차단합니다.
-                    let mut multi_pass_score = 0.0;
-                    let mut weight = 1.0;
-                    
-                    // 🌟 상위 5개까지만 유의미한 멀티패스 공명으로 인정하여 합산합니다.
-                    let max_pass = field_scores.len().min(5);
-                    for i in 0..max_pass {
-                        multi_pass_score += field_scores[i] * weight;
-                        weight *= 0.5; // 다음 순위의 필드 점수는 반영 비율을 절반으로 깎습니다.
-                    }
-                    
-                    // 🌟 [Intent Anchors 반영] 멀티패스 스코어에 Anchor 스코어를 결합 (가중치 조절 가능, 여기선 0.5 적용)
-                    multi_pass_score += anchor_score * 0.5;
-                    
-                    // 🌟 [단어 개수 가중치 상향] 단어가 많이 합쳐질수록 문맥이 명확해지므로 길이에 비례하여 가중치를 부여합니다.
-                    // 파편이 긴 문장을 잡아먹는 현상(NMS Battle 하극상)을 완벽히 막기 위해 가산점을 단어당 15%로 대폭 상향합니다.
-                    let word_count = end - start;
-                    let length_weight = 1.0 + ((word_count as f32 - 2.0) * 0.15); 
-                    let weighted_base_score = multi_pass_score * length_weight;
-                    
-                    scores.insert(cat.to_string(), weighted_base_score);
-                }
-                
-                // 🌟 [DEBUG LOG] 1차 슬라이딩 윈도우(기초 점수) 평가 결과 출력
-                let mut raw_score_log = String::new();
-                let mut sorted_raw: Vec<(&String, &f32)> = scores.iter().filter(|(k, _)| !k.is_empty()).collect();
-                sorted_raw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                
-                for (cat, score) in sorted_raw.iter().take(3) {
-                    raw_score_log.push_str(&format!("{}: {:.4} | ", cat, score));
-                }
-                emit_term(&format!("    🔍 [RAW-CHUNK] '{}' -> Top: {}", test_text, raw_score_log.trim_end_matches(" | ")));
-
-                raw_spans.push(SpanData { start, end, text: test_text, scores });
+        for (si, (start, end, test_text)) in span_list.into_iter().enumerate() {
+            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                return Ok(json!({ "context": [], "cancelled": true }));
             }
+            let test_emb: &[f32] = span_embs.get(si).map(|v| v.as_slice()).unwrap_or(&zero_emb);
+
+            // 🌟 Verb Penalty · 단어 길이 가중치 · 멀티패스 감쇠 합 · Intent Anchor 는
+            //    LayoutScoreTable::raw_chunk_scores 안에서 기존 식 그대로 계산합니다.
+            let word_count = end - start;
+            let mut scores = std::collections::HashMap::new();
+            for (cat, weighted_base_score) in layout_table.raw_chunk_scores(test_emb, &verb_emb, word_count) {
+                scores.insert(cat, weighted_base_score);
+            }
+            
+            // 🌟 [DEBUG LOG] 1차 슬라이딩 윈도우(기초 점수) 평가 결과 출력
+            let mut raw_score_log = String::new();
+            let mut sorted_raw: Vec<(&String, &f32)> = scores.iter().filter(|(k, _)| !k.is_empty()).collect();
+            sorted_raw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            
+            for (cat, score) in sorted_raw.iter().take(3) {
+                raw_score_log.push_str(&format!("{}: {:.4} | ", cat, score));
+            }
+            emit_term(&format!("    🔍 [RAW-CHUNK] '{}' -> Top: {}", test_text, raw_score_log.trim_end_matches(" | ")));
+
+            raw_spans.push(SpanData { start, end, text: test_text, scores });
         }
 
         // 🌟 [신규: 서브 도메인 동적 승급 (Sub-Domain Dynamic Boost) 분석 및 개선]
@@ -677,6 +643,27 @@ impl crate::model::LogisModel {
         }
         // 2. review, coupon, event 카테고리에 대해 각각 bias와 (나머지 카테고리의 합인) prejudice를 계산
         let target_cats = ["review", "coupon", "event"];
+        // 🌟 [EMBED-PREFETCH] 아래 루프의 bias/prejudice 텍스트(최대 6건)를 한 번의 배치로 미리 올립니다.
+        //    질의와 무관한 레이아웃 텍스트이므로 고정 계층에 둡니다. 루프의 get_embedding 은 전부 캐시 적중입니다.
+        {
+            let mut pre: Vec<String> = Vec::new();
+            for target_cat in &target_cats {
+                let core_bias = cat_core_texts.get(*target_cat).cloned().unwrap_or_default();
+                let mut core_prej = String::new();
+                for other_cat in &all_cats {
+                    if other_cat != target_cat {
+                        if let Some(other_text) = cat_core_texts.get(*other_cat) {
+                            core_prej.push_str(other_text);
+                        }
+                    }
+                }
+                if !core_bias.is_empty() && !core_prej.is_empty() {
+                    pre.push(core_bias);
+                    pre.push(core_prej);
+                }
+            }
+            self.prefetch_embeddings_pinned(pre).await;
+        }
         for target_cat in &target_cats {
             let core_bias = cat_core_texts.get(*target_cat).cloned().unwrap_or_default();
             
@@ -893,6 +880,29 @@ impl crate::model::LogisModel {
                 final_bounds[0].0 = 0;
             }
 
+            // 🌟 [EMBED-PREFETCH] 갭마다 왼쪽/오른쪽 흡수 텍스트를 1건씩 임베딩하던 것을 한 번의 배치로 미리 올립니다.
+            //    왼쪽 승자의 시작점은 직전 갭에서 오른쪽이 이기면 직전 갭 시작으로 바뀌므로,
+            //    두 경우를 모두(갭당 최대 3건) 추측해 넣습니다. 추측분은 캐시 엔트리만 늘릴 뿐 결과와 무관합니다.
+            //    추측분(직전 갭 시작 변형)은 배치 순전파일 때만 넣습니다(per-text 경로에서는 1건 = 순전파 1회).
+            {
+                let spec = self.embed_speculation_cheap();
+                let mut pre: Vec<String> = Vec::new();
+                for i in 0..(final_bounds.len() - 1) {
+                    let gap_start = final_bounds[i].1;
+                    let gap_end = final_bounds[i + 1].0;
+                    if gap_start >= gap_end { continue; }
+                    pre.push(words[final_bounds[i].0..gap_end].join(" "));
+                    if spec && i > 0 {
+                        let prev_gap_start = final_bounds[i - 1].1;
+                        if prev_gap_start < final_bounds[i].0 {
+                            pre.push(words[prev_gap_start..gap_end].join(" "));
+                        }
+                    }
+                    pre.push(words[gap_start..final_bounds[i + 1].1].join(" "));
+                }
+                self.prefetch_embeddings(pre).await;
+            }
+
             // 2. 중간(Gap) 고아 단어 양방향 점수 대결 흡수 (예: "20%에", "속하지만")
             for i in 0..(final_bounds.len() - 1) {
                 let gap_start = final_bounds[i].1;
@@ -905,35 +915,20 @@ impl crate::model::LogisModel {
                     let left_cat = &final_bounds[i].2;
                     let left_test_text = words[final_bounds[i].0..gap_end].join(" ");
                     let left_emb = self.get_embedding(left_test_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                    let left_contexts = crate::parsing::get_multi_pass_contexts(left_cat, &query_lang);
-                    
-                    let mut left_scores = Vec::new();
-                    for (key, _bias, _prej) in left_contexts {
-                        let bias_emb = layout_embs.get(&format!("{}_{}_bias", left_cat, key)).cloned().unwrap_or(vec![0.0; 384]);
-                        let prej_emb = layout_embs.get(&format!("{}_{}_prejudice", left_cat, key)).cloned().unwrap_or(vec![0.0; 384]);
-                        left_scores.push((cosine_similarity(&left_emb, &bias_emb) - cosine_similarity(&left_emb, &prej_emb)).max(0.0));
+                    // 🌟 [STAGE1-CTX] 카테고리별 (bias − prejudice) 상위 5개 감쇠 합 (기존 식 그대로, 채점표 재사용)
+                    if !layout_table.has_cat(left_cat) {
+                        layout_table.ensure_cat(left_cat, crate::parsing::get_multi_pass_contexts(left_cat, &query_lang), &layout_embs, &anchor_embs);
                     }
-                    left_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                    let mut left_score = 0.0;
-                    let mut weight = 1.0;
-                    for j in 0..left_scores.len().min(5) { left_score += left_scores[j] * weight; weight *= 0.5; }
+                    let left_score = layout_table.gap_score(&left_emb, left_cat).unwrap_or(0.0);
 
                     // 대결 B: 오른쪽 승자가 흡수했을 때의 멀티패스 점수 계산
                     let right_cat = &final_bounds[i+1].2;
                     let right_test_text = words[gap_start..final_bounds[i+1].1].join(" ");
                     let right_emb = self.get_embedding(right_test_text.clone()).await.unwrap_or(vec![0.0; 384]);
-                    let right_contexts = crate::parsing::get_multi_pass_contexts(right_cat, &query_lang);
-                    
-                    let mut right_scores = Vec::new();
-                    for (key, _bias, _prej) in right_contexts {
-                        let bias_emb = layout_embs.get(&format!("{}_{}_bias", right_cat, key)).cloned().unwrap_or(vec![0.0; 384]);
-                        let prej_emb = layout_embs.get(&format!("{}_{}_prejudice", right_cat, key)).cloned().unwrap_or(vec![0.0; 384]);
-                        right_scores.push((cosine_similarity(&right_emb, &bias_emb) - cosine_similarity(&right_emb, &prej_emb)).max(0.0));
+                    if !layout_table.has_cat(right_cat) {
+                        layout_table.ensure_cat(right_cat, crate::parsing::get_multi_pass_contexts(right_cat, &query_lang), &layout_embs, &anchor_embs);
                     }
-                    right_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                    let mut right_score = 0.0;
-                    let mut weight = 1.0;
-                    for j in 0..right_scores.len().min(5) { right_score += right_scores[j] * weight; weight *= 0.5; }
+                    let right_score = layout_table.gap_score(&right_emb, right_cat).unwrap_or(0.0);
 
                     // ⚔️ 대결 결과 판정 및 최종 흡수
                     if left_score >= right_score {
@@ -1313,7 +1308,7 @@ impl crate::model::LogisModel {
 
                 let mut flat_embs: Vec<Vec<f32>> = Vec::with_capacity(flat_phrases.len());
                 for chunk in flat_phrases.chunks(200) {
-                    let part = self.get_embedding_batch(chunk.to_vec()).await
+                    let part = self.get_embedding_batch_pinned(chunk.to_vec()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk.len()]);
                     flat_embs.extend(part);
                 }
@@ -1370,10 +1365,10 @@ impl crate::model::LogisModel {
                     }
                 }
 
-                let prej_embs = self.get_embedding_batch(prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
+                let prej_embs = self.get_embedding_batch_pinned(prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
                 
-                let dynamic_bias_embs = self.get_embedding_batch(dynamic_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
-                let dynamic_prej_embs = self.get_embedding_batch(dynamic_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
+                let dynamic_bias_embs = self.get_embedding_batch_pinned(dynamic_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
+                let dynamic_prej_embs = self.get_embedding_batch_pinned(dynamic_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
 
                 // ── 0) 전담 필터 카테고리가 이미 처리하는 키는 '속성' 후보가 아닙니다.
                 //       season_filters.summer / operators.gt / metrics.time 등이 루트 DFS 로
@@ -1415,7 +1410,7 @@ impl crate::model::LogisModel {
                 let temporal_phrase_embs: Vec<Vec<f32>> = if temporal_phrase_texts.is_empty() {
                     Vec::new()
                 } else {
-                    self.get_embedding_batch(temporal_phrase_texts.clone()).await
+                    self.get_embedding_batch_pinned(temporal_phrase_texts.clone()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; temporal_phrase_texts.len()])
                 };
                 // 🌟 [NUMERIC OPERATOR PHRASE BANK PRE-BUILD]
@@ -1444,7 +1439,7 @@ impl crate::model::LogisModel {
                 let op_phrase_embs: Vec<Vec<f32>> = if op_phrase_texts.is_empty() {
                     Vec::new()
                 } else {
-                    self.get_embedding_batch(op_phrase_texts.clone()).await
+                    self.get_embedding_batch_pinned(op_phrase_texts.clone()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; op_phrase_texts.len()])
                 };
                 // 🌟 [METRICS FAMILY BANK] bias.json 의 metrics.* 를 (계열, 구) 로 펼쳐 임베딩합니다.
@@ -1456,7 +1451,7 @@ impl crate::model::LogisModel {
                 let metric_family_raw: Vec<Vec<f32>> = if metric_family_texts.is_empty() {
                     Vec::new()
                 } else {
-                    self.get_embedding_batch(metric_family_texts.clone()).await
+                    self.get_embedding_batch_pinned(metric_family_texts.clone()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; metric_family_texts.len()])
                 };
                 let metric_family_bank: Vec<(String, Vec<f32>)> = metric_family_defs.iter()
@@ -1479,7 +1474,7 @@ impl crate::model::LogisModel {
                 let all_filter_raw_embs: Vec<Vec<f32>> = if all_filter_texts.is_empty() {
                     Vec::new()
                 } else {
-                    self.get_embedding_batch(all_filter_texts.clone()).await
+                    self.get_embedding_batch_pinned(all_filter_texts.clone()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; all_filter_texts.len()])
                 };
                 // (category, key, embedding) 트리플로 재조립
@@ -1498,7 +1493,7 @@ impl crate::model::LogisModel {
                 let bridge_raw: Vec<Vec<f32>> = if bridge_texts.is_empty() {
                     Vec::new()
                 } else {
-                    self.get_embedding_batch(bridge_texts.clone()).await
+                    self.get_embedding_batch_pinned(bridge_texts.clone()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; bridge_texts.len()])
                 };
                 let abstract_bridge_embs: Vec<(String, String, Vec<f32>)> = bridge_defs.iter()
@@ -1529,7 +1524,7 @@ impl crate::model::LogisModel {
                 let filter_prej_raw: Vec<Vec<f32>> = if filter_prej_texts.is_empty() {
                     Vec::new()
                 } else {
-                    self.get_embedding_batch(filter_prej_texts.clone()).await
+                    self.get_embedding_batch_pinned(filter_prej_texts.clone()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; filter_prej_texts.len()])
                 };
                 let all_filter_prej_embs: Vec<(String, String, Vec<f32>)> = filter_prej_defs.iter()
@@ -1644,8 +1639,8 @@ impl crate::model::LogisModel {
                     if bias_bank.is_empty() || prej_bank.is_empty() || cand_words.is_empty() {
                         None
                     } else {
-                        let bias_embs = self.get_embedding_batch(bias_bank).await.unwrap_or_default();
-                        let prej_embs = self.get_embedding_batch(prej_bank).await.unwrap_or_default();
+                        let bias_embs = self.get_embedding_batch_pinned(bias_bank).await.unwrap_or_default();
+                        let prej_embs = self.get_embedding_batch_pinned(prej_bank).await.unwrap_or_default();
                         let word_embs = self.get_embedding_batch(cand_words.clone()).await.unwrap_or_default();
                         let mut best: Option<(String, f32, f32)> = None;
                         let mut prej_max = 0.0f32;
@@ -1679,17 +1674,53 @@ impl crate::model::LogisModel {
                 let domain_type_embs: Vec<Vec<f32>> = if domain_type_texts.is_empty() {
                     Vec::new()
                 } else {
-                    self.get_embedding_batch(domain_type_texts.clone()).await
+                    self.get_embedding_batch_pinned(domain_type_texts.clone()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; domain_type_texts.len()])
                 };
+                // 🌟 [EMBED-PREFETCH] 이 세그먼트가 1건씩 요청할 단어 임베딩(도메인 지시어 판정 ·
+                //    Plinko ACTION VERB 게이트)과 어간 후보(closed_tail_stems · shared_prefix_stems 상위 2개,
+                //    STEM SUBSTITUTION 과 같은 규칙)를 한 번의 배치로 미리 올립니다.
+                //    배치 순전파가 켜져 있으면(추측이 싸면) 연속 단어 창(2~8단어, PLINKO SLIDE 후보)도 함께 올립니다.
+                //    아래 루프는 그대로 get_embedding 을 1건씩 부르지만 전부 캐시 적중이라 판정이 같습니다.
+                //    어간은 루프의 게이트(ACTION VERB · FUNCTIONAL WORD DROP 등)를 통과한 단어에서만 쓰이므로
+                //    추측분입니다. per-text 경로(CPU · Vulkan · LOGIS_EMBED_BATCHED=0)에서는 추측분 1건이
+                //    순전파 1회라, 확실히 쓰는 단어만 올리고 어간·창은 배치 순전파일 때만 올립니다.
+                {
+                    let spec = self.embed_speculation_cheap();
+                    let mut pre: Vec<String> = Vec::new();
+                    for w in words.iter() {
+                        pre.push(w.to_string());
+                        if spec && !w.chars().any(|c| c.is_ascii_digit()) {
+                            for (stem, _) in crate::utils::ai_utils::closed_tail_stems(w) {
+                                pre.push(stem);
+                            }
+                            for st in crate::utils::ai_utils::shared_prefix_stems(w, &ext_words_string).into_iter().take(2) {
+                                pre.push(st);
+                            }
+                        }
+                    }
+                    if spec {
+                        pre.extend(crate::utils::ai_utils::contiguous_windows(&words, 2, 8));
+                    }
+                    let mut seen_pre: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    pre.retain(|t| !t.trim().is_empty() && seen_pre.insert(t.clone()));
+                    self.prefetch_embeddings(pre).await;
+                }
+                // 🌟 [EMB-BANK] 속성 구 뱅크의 노름·0벡터 표식을 한 번만 계산합니다(채점 결과는 비트 단위로 같음).
+                let prop_banks: Vec<crate::utils::ai_utils::NormBank> = prop_phrase_embs
+                    .iter()
+                    .map(|b| crate::utils::ai_utils::NormBank::new(b))
+                    .collect();
+
                 let mut domain_indicator_words: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for word in &words {
                     if word.chars().any(|c| c.is_ascii_digit()) { continue; }
                     let word_emb_d = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
                     if word_emb_d.iter().all(|&v| v == 0.0) { continue; }
+                    let word_norm_d = crate::utils::ai_utils::l2_norm_exact(&word_emb_d);
                     let mut best_schema_for_word = f32::MIN;
                     for pi in 0..prop_phrase_embs.len() {
-                        let s = crate::utils::ai_utils::weighted_max_pool_sim(&word_emb_d, &prop_phrase_embs[pi], &prop_phrase_weights[pi]);
+                        let s = crate::utils::ai_utils::weighted_max_pool_sim_bank(&word_emb_d, word_norm_d, &prop_banks[pi], &prop_phrase_weights[pi]);
                         if s > best_schema_for_word { best_schema_for_word = s; }
                     }
                     let word_key = crate::utils::ai_utils::lower_alnum(word);
@@ -1754,7 +1785,7 @@ impl crate::model::LogisModel {
                                     .unwrap_or_default()
                             };
                             if !sales_bridge_bias.is_empty() {
-                                let bridge_embs = self.get_embedding_batch(sales_bridge_bias.clone()).await
+                                let bridge_embs = self.get_embedding_batch_pinned(sales_bridge_bias.clone()).await
                                     .unwrap_or_else(|_| vec![vec![0.0; 384]; sales_bridge_bias.len()]);
                                 let bridge_score = crate::utils::ai_utils::max_pool_sim(&word_emb_d, &bridge_embs);
                                 // 기존 최고 도메인 점수의 90% 이상이면 브릿지 발동
@@ -1801,9 +1832,18 @@ impl crate::model::LogisModel {
                 let action_verb_embs: Vec<Vec<f32>> = if action_verb_phrases.is_empty() {
                     Vec::new()
                 } else {
-                    self.get_embedding_batch(action_verb_phrases.clone()).await
+                    self.get_embedding_batch_pinned(action_verb_phrases.clone()).await
                         .unwrap_or_else(|_| vec![vec![0.0; 384]; action_verb_phrases.len()])
                 };
+
+                // 🌟 [EMB-BANK] Plinko 단어 루프가 단어마다 훑는 뱅크들의 노름·0벡터 표식을 한 번만 계산합니다.
+                let action_bank = crate::utils::ai_utils::NormBank::new(&action_verb_embs);
+                let operator_bank = crate::utils::ai_utils::NormBank::new(&operator_embs);
+                let op_phrase_bank = crate::utils::ai_utils::NormBank::new(&op_phrase_embs);
+                let temporal_bank = crate::utils::ai_utils::NormBank::new(&temporal_phrase_embs);
+                let prej_bank_rows = crate::utils::ai_utils::NormBank::new(&prej_embs);
+                let filter_tbank = crate::utils::ai_utils::TripleBank::new(&all_filter_embs);
+                let filter_prej_tbank = crate::utils::ai_utils::TripleBank::new(&all_filter_prej_embs);
 
                 let marks = crate::utils::ai_utils::qualifier_marks(&words, &|j: usize| period_words.contains(words[j]));
                 let negated_words: std::collections::HashSet<&str> = words
@@ -1998,8 +2038,9 @@ impl crate::model::LogisModel {
                         }
                     }
                     let word_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
-                    let action_sim = crate::utils::ai_utils::max_pool_sim(&word_emb, &action_verb_embs);
-                    let op_sim = crate::utils::ai_utils::max_pool_sim(&word_emb, &operator_embs);
+                    let word_norm = crate::utils::ai_utils::l2_norm_exact(&word_emb);
+                    let action_sim = crate::utils::ai_utils::max_pool_sim_bank(&word_emb, word_norm, &action_bank);
+                    let op_sim = crate::utils::ai_utils::max_pool_sim_bank(&word_emb, word_norm, &operator_bank);
                     let word_has_digit = word.chars().any(|c| c.is_ascii_digit());
 
                     // 🌟 [REVERSE VERIFICATION] action_verbs 는 ~500구 다국어 뱅크이고
@@ -2018,30 +2059,22 @@ impl crate::model::LogisModel {
                     let mut max_prop_sim = 0.0f32;
                     for pi in 0..prop_phrase_embs.len() {
                         if prop_is_filter_owned[pi] { continue; }
-                        let s = crate::utils::ai_utils::weighted_max_pool_sim(
-                            &word_emb, &prop_phrase_embs[pi], &prop_phrase_weights[pi],
+                        let s = crate::utils::ai_utils::weighted_max_pool_sim_bank(
+                            &word_emb, word_norm, &prop_banks[pi], &prop_phrase_weights[pi],
                         );
                         if s > max_prop_sim { max_prop_sim = s; }
                     }
                     let op_bank_sim = if op_phrase_embs.is_empty() {
                         op_sim
                     } else {
-                        crate::utils::ai_utils::max_pool_sim(&word_emb, &op_phrase_embs).max(op_sim)
+                        crate::utils::ai_utils::max_pool_sim_bank(&word_emb, word_norm, &op_phrase_bank).max(op_sim)
                     };
                     let temporal_sim = if temporal_phrase_embs.is_empty() {
                         0.0f32
                     } else {
-                        crate::utils::ai_utils::max_pool_sim(&word_emb, &temporal_phrase_embs)
+                        crate::utils::ai_utils::max_pool_sim_bank(&word_emb, word_norm, &temporal_bank)
                     };
-                    let filter_sim = {
-                        let mut m = 0.0f32;
-                        for (_, _, e) in all_filter_embs.iter() {
-                            if e.iter().all(|&v| v == 0.0) { continue; }
-                            let s = cosine_similarity(&word_emb, e);
-                            if s > m { m = s; }
-                        }
-                        m
-                    };
+                    let filter_sim = filter_tbank.max_nonzero(&word_emb, word_norm);
 
                     let rival_max = max_prop_sim
                         .max(op_bank_sim)
@@ -2144,9 +2177,9 @@ impl crate::model::LogisModel {
                         }
                         if !stems.is_empty() {
                             let base_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
-                            let (_, base_schema) = crate::utils::ai_utils::surprisal_dual_scores(
-                                &base_emb, &all_filter_embs, &all_filter_prej_embs,
-                                &prop_keys, &prop_phrase_embs, &prop_is_filter_owned,
+                            let (_, base_schema) = crate::utils::ai_utils::surprisal_dual_scores_bank(
+                                &base_emb, &filter_tbank, &filter_prej_tbank,
+                                &prop_keys, &prop_banks, &prop_is_filter_owned,
                             );
                             let base_top = base_schema.first().map(|s| s.surprisal).unwrap_or(f32::MIN);
 
@@ -2154,9 +2187,9 @@ impl crate::model::LogisModel {
                             for stem in stems.iter() {
                                 let se = self.get_embedding(stem.clone()).await.unwrap_or(vec![0.0; 384]);
                                 if se.iter().all(|&v| v == 0.0) { continue; }
-                                let (_, stem_schema) = crate::utils::ai_utils::surprisal_dual_scores(
-                                    &se, &all_filter_embs, &all_filter_prej_embs,
-                                    &prop_keys, &prop_phrase_embs, &prop_is_filter_owned,
+                                let (_, stem_schema) = crate::utils::ai_utils::surprisal_dual_scores_bank(
+                                    &se, &filter_tbank, &filter_prej_tbank,
+                                    &prop_keys, &prop_banks, &prop_is_filter_owned,
                                 );
                                 let stem_top = stem_schema.first().map(|s| s.surprisal).unwrap_or(f32::MIN);
                                 if stem_top > base_top && best_stem.as_ref().map_or(true, |(_, b)| stem_top > *b) {
@@ -2191,12 +2224,12 @@ impl crate::model::LogisModel {
                     if !word_has_digit && !all_filter_embs.is_empty() {
                         let we = self.get_embedding(effective_word.clone()).await.unwrap_or(vec![0.0; 384]);
                         if !we.iter().all(|&v| v == 0.0) {
-                            let (f_scores, s_scores) = crate::utils::ai_utils::surprisal_dual_scores(
+                            let (f_scores, s_scores) = crate::utils::ai_utils::surprisal_dual_scores_bank(
                                 &we,
-                                &all_filter_embs,
-                                &all_filter_prej_embs,
+                                &filter_tbank,
+                                &filter_prej_tbank,
                                 &prop_keys,
-                                &prop_phrase_embs,
+                                &prop_banks,
                                 &prop_is_filter_owned,
                             );
 
@@ -2309,6 +2342,7 @@ impl crate::model::LogisModel {
                     let penalty_weight = if word_count <= 2 { 0.3 } else { 0.7 };
 
                     let mut candidates: Vec<(String, f32)> = Vec::new();
+                    let test_norm = crate::utils::ai_utils::l2_norm_exact(&test_emb);
 
                     for i in 0..prop_keys.len() {
                         if prop_is_filter_owned[i] { continue; }
@@ -2316,8 +2350,8 @@ impl crate::model::LogisModel {
                         //    이로써 'contains() 문자열 포함 시 +0.5' 라는 의미 판정 하드코딩과
                         //    매직 상수 0.5 를 동시에 제거합니다.
                         //    구가 원문과 동일하면 코사인이 1.0 이므로 보너스 없이 1순위가 확정됩니다.
-                        let b_score = crate::utils::ai_utils::weighted_max_pool_sim(&test_emb, &prop_phrase_embs[i], &prop_phrase_weights[i]);
-                        let p_score = cosine_similarity(&test_emb, &prej_embs[i]);
+                        let b_score = crate::utils::ai_utils::weighted_max_pool_sim_bank(&test_emb, test_norm, &prop_banks[i], &prop_phrase_weights[i]);
+                        let p_score = prej_bank_rows.cos(i, &test_emb, test_norm);
 
                         let score = b_score - (p_score * penalty_weight) - verb_penalty;
 
@@ -2372,13 +2406,14 @@ impl crate::model::LogisModel {
                         let r_penalty_weight = 0.3;
 
                         let mut r_candidates: Vec<(String, f32)> = Vec::new();
+                        let reset_norm = crate::utils::ai_utils::l2_norm_exact(&reset_emb);
                         for i in 0..prop_keys.len() {
                             if prop_is_filter_owned[i] { continue; }
                             // 🌟 [PHRASE MAX-POOL] 리셋 윈도우도 동일하게 구 단위 최대 유사도로 통일합니다.
                             //    '가디건' 은 title 뱅크에 편입된 semantic 앵커 구('의류명')와 직접 경쟁하게 되어
                             //    더 이상 tags/brand_name 으로 흘러가지 않습니다.
-                            let b_score = crate::utils::ai_utils::weighted_max_pool_sim(&reset_emb, &prop_phrase_embs[i], &prop_phrase_weights[i]);
-                            let p_score = cosine_similarity(&reset_emb, &prej_embs[i]);
+                            let b_score = crate::utils::ai_utils::weighted_max_pool_sim_bank(&reset_emb, reset_norm, &prop_banks[i], &prop_phrase_weights[i]);
+                            let p_score = prej_bank_rows.cos(i, &reset_emb, reset_norm);
 
                             let score = b_score - (p_score * r_penalty_weight) - r_verb_penalty;
 
