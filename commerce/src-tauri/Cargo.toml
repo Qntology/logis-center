@@ -50,8 +50,8 @@ candle-flash-attn = { version = "0.11.0", optional = true, default-features = fa
 # 🌟 [FORK-GIT] candle-rocm-vulkan 포크는 Qntology 원격 master 를 따라갑니다(master 가 메인). 실제 커밋은 Cargo.lock 이 고정합니다.
 #    앱이 쓰는 API(attention_packed · fused_gdn_supported · forward_exact 등)가 원격 master 에 들어 있어야 빌드됩니다.
 #    원격에 아직 없는 로컬 포크로 빌드할 때만 아래 path 줄로 바꾸세요. (아래 [patch.crates-io] 3줄도 함께)
-# candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master", optional = true }
-candle-rocm = { path = "../../../candle-rocm-vulkan/candle-backend", optional = true }
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master", optional = true }
+# candle-rocm = { path = "../../../candle-rocm-vulkan/candle-backend", optional = true }
 tokenizers = "0.22.1"
 num = "0.4.3"
 minijinja = "2.12.0"
@@ -111,14 +111,14 @@ turbo-quant = ["candle-core/turbo-quant", "candle-nn/turbo-quant"]
 # 새 커밋을 받으려면 cargo update 로 포크 패키지(candle-core · candle-nn · candle-flash-attn · candle-rocm)를 갱신하세요.
 # 위 candle-rocm 의존성과 아래 3개 패치는 반드시 같은 git 주소·브랜치여야 candle-core 가 하나로 합쳐집니다.
 # 🌟 [FORK-GIT] 원격에 아직 없는 로컬 포크(../../../candle-rocm-vulkan)로 빌드하려면 git 3줄을 주석 처리하고 path 3줄의 주석을 푸세요.
-# ⚠️ [VERIFY-ROCM] AMD 실기기 검증(RX 6600 · gfx1032)은 이 로컬 포크 path 로 했습니다. git 줄로 되돌리는 것은 별도로 진행합니다.
+# ✅ [VERIFY-ROCM] AMD 실기기 검증(RX 6600 · gfx1032) 수정분은 Qntology master(PR #8) 에 들어가 git 줄로 돌아왔습니다.
 [patch.crates-io]
-# candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-# candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-# candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-candle-core = { path = "../../../candle-rocm-vulkan/candle-core" }
-candle-nn = { path = "../../../candle-rocm-vulkan/candle-nn" }
-candle-flash-attn = { path = "../../../candle-rocm-vulkan/candle-flash-attn" }
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
+candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
+# candle-core = { path = "../../../candle-rocm-vulkan/candle-core" }
+# candle-nn = { path = "../../../candle-rocm-vulkan/candle-nn" }
+# candle-flash-attn = { path = "../../../candle-rocm-vulkan/candle-flash-attn" }
 
 
 [profile.dev]

@@ -1342,6 +1342,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?branch=master#60ec257e67f44b5881d83aa1d83cea4f6e9d5a8a"
 dependencies = [
  "ash",
  "byteorder",
@@ -1376,6 +1377,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.11.0"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?branch=master#60ec257e67f44b5881d83aa1d83cea4f6e9d5a8a"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -1409,6 +1411,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?branch=master#60ec257e67f44b5881d83aa1d83cea4f6e9d5a8a"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -1425,6 +1428,7 @@ dependencies = [
 [[package]]
 name = "candle-rocm"
 version = "0.2.0"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?branch=master#60ec257e67f44b5881d83aa1d83cea4f6e9d5a8a"
 dependencies = [
  "candle-core",
 ]
@@ -5042,6 +5046,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hip-runtime"
 version = "0.2.0"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?branch=master#60ec257e67f44b5881d83aa1d83cea4f6e9d5a8a"
 dependencies = [
  "hip-sys",
 ]
@@ -5049,6 +5054,7 @@ dependencies = [
 [[package]]
 name = "hip-sys"
 version = "0.2.0"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?branch=master#60ec257e67f44b5881d83aa1d83cea4f6e9d5a8a"
 
 [[package]]
 name = "hkdf"
