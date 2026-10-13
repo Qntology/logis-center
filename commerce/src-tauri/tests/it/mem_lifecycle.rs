@@ -177,6 +177,12 @@ fn gpu_qwen3_load_unload_returns_vram() {
         let again = Device::new_cuda(0).expect("cuda");
         assert!(again.same_device(&dev), "Device::new_cuda 는 번호당 하나의 공유 장치여야 합니다");
     }
+    // ROCm 빌드: get_gpu_device 가 ROCm 장치를 골랐을 때만 같은 확인 (CUDA 빌드는 위 블록 그대로).
+    #[cfg(feature = "rocm")]
+    if dev.is_rocm() {
+        let again = Device::new_rocm(0).expect("rocm");
+        assert!(again.same_device(&dev), "Device::new_rocm 는 번호당 하나의 공유 장치여야 합니다");
+    }
     settle_gpu_memory(&dev, 0, true, "test start").expect("settle");
     let (start, total) = device_mem_info_of(&dev).expect("mem_info");
     println!("[VRAM-TEST] 시작 실효 free {:.0} MB / 총 {:.0} MB", start as f64 / 1e6, total as f64 / 1e6);

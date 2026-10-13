@@ -82,13 +82,13 @@ impl Qwen3GenerateModel {
             model_name: "qwen3".to_string(),
         })
     }
-    /// 🌟 [Q8-RESIDENT] CUDA 에서는 Q8_0 가중치를 그대로 GPU 에 상주시키고(정확 W8A16), 그 외 장치나
+    /// 🌟 [Q8-RESIDENT] CUDA/ROCm 에서는 Q8_0 가중치를 그대로 GPU 에 상주시키고(정확 W8A16), 그 외 장치나
     /// `LOGIS_QWEN3_DENSE=1` 이면 기존처럼 BF16/F32 로 역양자화해 올립니다.
     pub fn init_from_gguf(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
         let dense_env = std::env::var("LOGIS_QWEN3_DENSE")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
             .unwrap_or(false);
-        let q8 = !dense_env && get_device(device).is_cuda();
+        let q8 = !dense_env && { let d = get_device(device); d.is_cuda() || d.is_rocm() };
         if dense_env {
             println!("[QWEN3-Q8] LOGIS_QWEN3_DENSE=1 → 기존 BF16 역양자화 경로로 로드합니다.");
         }
