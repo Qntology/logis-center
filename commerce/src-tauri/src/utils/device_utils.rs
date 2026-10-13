@@ -39,6 +39,12 @@ pub fn new_gpu_device(id: usize) -> Option<Device> {
     if let Ok(d) = Device::new_vulkan(id) {
         return Some(d);
     }
+    // 🌟 [MAC-VERIFY] Metal 빌드도 같은 진입점으로 장치를 엽니다(get_gpu_device 의 Metal 분기와 같은 장치).
+    //    없으면 테스트(app_embed 등)가 Metal 빌드에서 'GPU 장치가 없어 건너뜁니다' 로 조용히 빠졌습니다.
+    #[cfg(feature = "metal")]
+    if let Ok(d) = Device::new_metal(id) {
+        return Some(d);
+    }
     let _ = id;
     None
 }

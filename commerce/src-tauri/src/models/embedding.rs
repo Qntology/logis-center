@@ -25,7 +25,11 @@ pub const EMBED_CHUNK_TOKENS: usize = 512;
 //   배치 구성과 무관하게 비트 동일, per-text 대비 최소 코사인 0.99976(≤64토큰)/1.0(>64토큰),
 //   F32 기준 평균 코사인은 두 경로 동일. 문제가 보이면 LOGIS_EMBED_BATCHED=0 으로 즉시 되돌릴 수 있습니다.
 //   CPU · Vulkan 은 고정 모양 대신 동적 행 수로 묶습니다(batched.rs ⑥, BatchOpts::for_device).
-//   Metal 은 검증 전이라 기존 per-text 경로입니다.
+//   Metal 은 실기기 검증 전이라 기본은 기존 per-text 경로이고, LOGIS_EMBED_BATCHED=1 이면 켭니다(opt-in).
+//   켜면 CUDA/ROCm 과 같은 고정 모양입니다(BatchOpts::for_device): candle 의 Metal GEMM(MLX 포트)은
+//   M==1·N==1 이면 gemv, M<16 이면 다른 타일, b·M·N ≥ 2^20 이면 큰 타일을 골라 같은 행도 M 에 따라
+//   k 누산 순서가 바뀔 수 있으므로, 행 수를 길이 L 만의 함수로 고정해야 구성 무관이 됩니다.
+//   (docs/mac-verify.md · 포크 tests/matmul_m_invariance_tests.rs 의 metal_ 측정)
 //   값은 프로세스 안에서 한 번만 읽습니다. 캐시 공간(순전파 태그)이
 //   이 판정에 묶여 있어, 도중에 바뀌면 같은 텍스트가 두 공간에 섞이기 때문입니다.
 // =====================================================================
@@ -33,7 +37,7 @@ pub const EMBED_CHUNK_TOKENS: usize = 512;
 static EMBED_BATCHED_ENV: once_cell::sync::Lazy<Option<bool>> = once_cell::sync::Lazy::new(|| {
     let v = std::env::var("LOGIS_EMBED_BATCHED").ok().map(|v| v.trim() != "0");
     println!(
-        "[EMBED-BATCHED] LOGIS_EMBED_BATCHED → {} (CUDA/ROCm/CPU/Vulkan 기본 ON · Metal 은 per-text)",
+        "[EMBED-BATCHED] LOGIS_EMBED_BATCHED → {} (CUDA/ROCm/CPU/Vulkan 기본 ON · Metal 은 =1 일 때만)",
         match v { None => "미설정", Some(true) => "배치 순전파 ON", Some(false) => "per-text 순전파" }
     );
     v
@@ -43,6 +47,9 @@ static EMBED_BATCHED_ENV: once_cell::sync::Lazy<Option<bool>> = once_cell::sync:
 pub fn batched_enabled(device: &Device) -> bool {
     if device.is_cuda() || device.is_rocm() || device.is_cpu() || device.is_vulkan() {
         EMBED_BATCHED_ENV.unwrap_or(true)
+    } else if device.is_metal() {
+        // 🌟 [MAC-VERIFY] Metal 은 opt-in (실행 검증 전). 고정 모양 정책은 BatchOpts::for_device.
+        EMBED_BATCHED_ENV.unwrap_or(false)
     } else {
         false
     }

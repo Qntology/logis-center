@@ -316,12 +316,14 @@ impl OnnxPrebuiltArchive for Triplet {
             // onnxruntime-win-arm64-1.28.0.zip
             // onnxruntime-linux-x64-1.28.0.tgz
             // onnxruntime-osx-x64-1.28.0.tgz
+            // onnxruntime-osx-arm64-1.28.0.tgz (Apple Silicon; [MAC-VERIFY] 없으면 macOS arm64 빌드가 여기서 panic)
             (Os::Windows, Architecture::X86, Accelerator::None)
             | (Os::Windows, Architecture::X86_64, Accelerator::None)
             | (Os::Windows, Architecture::Arm, Accelerator::None)
             | (Os::Windows, Architecture::Arm64, Accelerator::None)
             | (Os::Linux, Architecture::X86_64, Accelerator::None)
-            | (Os::MacOs, Architecture::X86_64, Accelerator::None) => Cow::from(format!(
+            | (Os::MacOs, Architecture::X86_64, Accelerator::None)
+            | (Os::MacOs, Architecture::Arm64, Accelerator::None) => Cow::from(format!(
                 "{}-{}",
                 self.os.as_onnx_str(),
                 self.arch.as_onnx_str()
