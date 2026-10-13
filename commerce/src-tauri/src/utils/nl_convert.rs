@@ -2172,6 +2172,75 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Vec<f32>>,
 {
+    plinko_game_for_indexing_prefetch(
+        chunks,
+        field_names,
+        field_phrase_embs,
+        field_phrase_weights,
+        field_formats,
+        embed_fn,
+        |_: Vec<String>| std::future::ready(()),
+        false,
+    )
+    .await
+}
+
+/// 🌟 [EMBED-PREFETCH] 이 패스가 임베딩할 텍스트를 먼저 한 번의 배치로 올리는 판본입니다.
+///   - confirmed 청크의 전체 텍스트와 발견 모드 청크의 첫 창(첫 단어)은 반드시 쓰이므로 항상 넣습니다.
+///   - `speculative` (배치 순전파처럼 추측이 쌀 때)면 발견 모드 청크의 모든 연속 창
+///     (리셋 위치와 무관한 시작~끝 조합)도 넣습니다.
+///   이후 embed_fn 호출은 캐시 적중이라 결과(벡터·판정)는 프리패치가 없을 때와 같습니다.
+pub async fn plinko_game_for_indexing_prefetch<F, Fut, P, PFut>(
+    chunks: &[ChunkMetadata],
+    field_names: &[String],
+    field_phrase_embs: &[Vec<Vec<f32>>],
+    field_phrase_weights: &[Vec<f32>],
+    field_formats: &[String],
+    embed_fn: F,
+    prefetch_fn: P,
+    speculative: bool,
+) -> Vec<PlinkoResult>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Vec<f32>>,
+    P: Fn(Vec<String>) -> PFut,
+    PFut: std::future::Future<Output = ()>,
+{
+    {
+        let mut pre: Vec<String> = Vec::new();
+        for chunk_meta in chunks {
+            let words: Vec<&str> = chunk_meta.chunk_text.split_whitespace().collect();
+            if words.is_empty() {
+                continue;
+            }
+            if chunk_meta.confirmed {
+                pre.push(chunk_meta.chunk_text.clone());
+                continue;
+            }
+            pre.push(words[0].to_string());
+            if speculative {
+                if words.len() <= 16 {
+                    for st in 0..words.len() {
+                        for en in (st + 1)..=words.len() {
+                            pre.push(words[st..en].join(" "));
+                        }
+                    }
+                } else {
+                    for en in 1..=words.len() {
+                        pre.push(words[0..en].join(" "));
+                    }
+                    for w in &words {
+                        pre.push(w.to_string());
+                    }
+                }
+            }
+        }
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        pre.retain(|t| seen.insert(t.clone()));
+        if !pre.is_empty() {
+            prefetch_fn(pre).await;
+        }
+    }
     let mut results: Vec<PlinkoResult> = Vec::with_capacity(chunks.len());
     let mut confirm_count = 0usize;
     let mut discover_count = 0usize;
@@ -2643,6 +2712,41 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Vec<f32>>,
 {
+    run_phase_b_pipeline_prefetch(
+        raw_chunks,
+        doc_lang,
+        page_type,
+        field_names,
+        field_phrase_embs,
+        field_phrase_weights,
+        field_formats,
+        embed_fn,
+        |_: Vec<String>| std::future::ready(()),
+        false,
+    )
+    .await
+}
+
+/// 🌟 [EMBED-PREFETCH] run_phase_b_pipeline 과 같고, PLINKO 패스 직전에 그 패스가 쓸 텍스트를
+/// `prefetch_fn` 한 번으로 미리 임베딩합니다(plinko_game_for_indexing_prefetch 참조).
+pub async fn run_phase_b_pipeline_prefetch<F, Fut, P, PFut>(
+    raw_chunks: &[(String, String, bool)],
+    doc_lang: &str,
+    page_type: &str,
+    field_names: &[String],
+    field_phrase_embs: &[Vec<Vec<f32>>],
+    field_phrase_weights: &[Vec<f32>],
+    field_formats: &[String],
+    embed_fn: F,
+    prefetch_fn: P,
+    speculative: bool,
+) -> Vec<ChunkMetadata>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Vec<f32>>,
+    P: Fn(Vec<String>) -> PFut,
+    PFut: std::future::Future<Output = ()>,
+{
     let _sds_index_guard = crate::utils::score_dynamics::indexing_guard();
     const SYSTEM_PROPERTIES: [&str; 17] = [
         "masked_text", "text", "unclassified", "context_intro", "json_data",
@@ -2750,13 +2854,15 @@ where
 
     // ── PHASE C: PLINKO GAME ──
     // Step 4: 확인 모드(confirmed) + Sliding Window Cliff Detection(비confirmed)
-    let plinko_results = plinko_game_for_indexing(
+    let plinko_results = plinko_game_for_indexing_prefetch(
         &gated,
         field_names,
         field_phrase_embs,
         field_phrase_weights,
         field_formats,
         embed_fn,
+        prefetch_fn,
+        speculative,
     ).await;
 
     // Step 5: confirmed 우선 + 그리디 배타 배정

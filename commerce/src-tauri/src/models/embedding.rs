@@ -7,6 +7,38 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 use std::path::Path;
 
+pub mod text_cache;
+mod batched;
+pub use batched::{BatchOpts, BatchRunStats};
+
+/// 임베딩 차원 (granite-embedding-97m-multilingual-r2 hidden_size).
+pub const EMBED_DIM: usize = 384;
+/// 한 번의 순전파에 넣는 최대 토큰 수 (기존 embed() 와 동일한 512 청크).
+pub const EMBED_CHUNK_TOKENS: usize = 512;
+
+// =====================================================================
+// 🌟 [EMBED-BATCHED] 배치 순전파 사용 여부
+// ---------------------------------------------------------------------
+//   CUDA / ROCm 에서는 기본 ON 입니다. LOGIS_EMBED_BATCHED=0 이면 기존
+//   per-text 경로(embed_batch 의 3스레드 × embed())로 돌아갑니다.
+//   Vulkan / CPU 는 항상 기존 경로입니다(F32 · 다른 커널이라 검증 범위 밖).
+//   값은 프로세스 안에서 한 번만 읽습니다. 캐시 공간(순전파 태그)이
+//   이 판정에 묶여 있어, 도중에 바뀌면 같은 텍스트가 두 공간에 섞이기 때문입니다.
+// =====================================================================
+static EMBED_BATCHED_ENV: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+    let on = std::env::var("LOGIS_EMBED_BATCHED").map(|v| v.trim() != "0").unwrap_or(true);
+    println!(
+        "[EMBED-BATCHED] LOGIS_EMBED_BATCHED → {} (CUDA/ROCm 에서만 적용, Vulkan/CPU 는 항상 per-text)",
+        if on { "배치 순전파 ON" } else { "per-text 순전파" }
+    );
+    on
+});
+
+/// 이 장치에서 배치 순전파(embed_many)를 쓰는지 여부.
+pub fn batched_enabled(device: &Device) -> bool {
+    device.is_cuda_or_rocm() && *EMBED_BATCHED_ENV
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub hidden_size: usize,
@@ -29,10 +61,6 @@ impl RmsNorm {
     fn new(dim: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<Self> {
         let weight = vb.get(dim, "weight")?;
         Ok(Self { weight, eps })
-    }
-
-    fn from_tensor(weight: Tensor, eps: f64) -> Self {
-        Self { weight, eps }
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
@@ -67,27 +95,29 @@ impl RotaryEmbedding {
         Ok(Self { cos, sin })
     }
 
-    fn forward(&self, q: &Tensor, k: &Tensor, seq_len: usize) -> candle_core::Result<(Tensor, Tensor)> {
+    // 🌟 [ROPE-HOIST] 기존에는 12개 층이 매번 cos/sin 을 narrow → cat → unsqueeze →
+    //    contiguous 로 다시 만들었고(q·k 각각), 순전파당 ~48개의 복사 커널이 쓰였습니다.
+    //    값은 seq_len 에만 의존하므로 순전파당 한 번 만들고 모든 층이 공유합니다.
+    //    같은 텐서 연산(같은 narrow·cat·contiguous)이라 값은 비트 단위로 동일합니다.
+    /// [1, 1, seq_len, head_dim] 모양의 (cos, sin).
+    fn cos_sin(&self, seq_len: usize) -> candle_core::Result<(Tensor, Tensor)> {
         let cos = self.cos.narrow(0, 0, seq_len)?;
         let sin = self.sin.narrow(0, 0, seq_len)?;
-        
-        // 초기화 시점부터 이미 q.dtype()과 동일하게 맞춰져 있으므로 매번 실행되던 캐스팅 오버헤드를 제거합니다.
-        
         let cos = Tensor::cat(&[&cos, &cos], candle_core::D::Minus1)?;
         let sin = Tensor::cat(&[&sin, &sin], candle_core::D::Minus1)?;
+        let cos = cos.unsqueeze(0)?.unsqueeze(0)?.contiguous()?;
+        let sin = sin.unsqueeze(0)?.unsqueeze(0)?.contiguous()?;
+        Ok((cos, sin))
+    }
 
-        let apply_rotary = |x: &Tensor| -> candle_core::Result<Tensor> {
-            let last_dim = x.dim(candle_core::D::Minus1)?;
-            // narrow 이후 메모리 연속성 보장
-            let x1 = x.narrow(candle_core::D::Minus1, 0, last_dim / 2)?.contiguous()?;
-            let x2 = x.narrow(candle_core::D::Minus1, last_dim / 2, last_dim / 2)?.contiguous()?;
-            let rotated = Tensor::cat(&[&x2.neg()?, &x1], candle_core::D::Minus1)?;
-            let cos = cos.unsqueeze(0)?.unsqueeze(0)?.contiguous()?;
-            let sin = sin.unsqueeze(0)?.unsqueeze(0)?.contiguous()?;
-            Ok((x.contiguous()?.broadcast_mul(&cos)? + rotated.broadcast_mul(&sin)?)?)
-        };
-
-        Ok((apply_rotary(q)?, apply_rotary(k)?))
+    /// x * cos + rotate_half(x) * sin (기존 apply_rotary 와 같은 연산 순서).
+    fn apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+        let last_dim = x.dim(candle_core::D::Minus1)?;
+        // narrow 이후 메모리 연속성 보장
+        let x1 = x.narrow(candle_core::D::Minus1, 0, last_dim / 2)?.contiguous()?;
+        let x2 = x.narrow(candle_core::D::Minus1, last_dim / 2, last_dim / 2)?.contiguous()?;
+        let rotated = Tensor::cat(&[&x2.neg()?, &x1], candle_core::D::Minus1)?;
+        Ok((x.contiguous()?.broadcast_mul(cos)? + rotated.broadcast_mul(sin)?)?)
     }
 }
 
@@ -118,7 +148,7 @@ impl Module for Mlp {
         let gate = wi_out.narrow(candle_core::D::Minus1, 0, last_dim / 2)?.contiguous()?;
         let up = wi_out.narrow(candle_core::D::Minus1, last_dim / 2, last_dim / 2)?.contiguous()?;
         // 연산 결과에 대해 Linear 계층(matmul) 진입 전 연속성 보장
-        let act = (candle_nn::ops::silu(&gate)? * up)?.contiguous()?; 
+        let act = (candle_nn::ops::silu(&gate)? * up)?.contiguous()?;
         Ok(self.wo.forward(&act)?)
     }
 }
@@ -128,21 +158,21 @@ struct Attention {
     wo: candle_nn::Linear,
     num_heads: usize,
     head_dim: usize,
-    rotary: Arc<RotaryEmbedding>,
 }
 
 impl Attention {
-    fn new(cfg: &Config, vb: VarBuilder, rotary: Arc<RotaryEmbedding>) -> candle_core::Result<Self> {
+    fn new(cfg: &Config, vb: VarBuilder) -> candle_core::Result<Self> {
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         let wqkv = linear(cfg.hidden_size, 3 * cfg.hidden_size, vb.pp("Wqkv"))?;
         let wo = linear(cfg.hidden_size, cfg.hidden_size, vb.pp("Wo"))?;
-        Ok(Self { wqkv, wo, num_heads: cfg.num_attention_heads, head_dim, rotary })
+        Ok(Self { wqkv, wo, num_heads: cfg.num_attention_heads, head_dim })
     }
 
-    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+    /// `mask` = [B, 1, 1, L] 가산 마스크(유효 0 / 패딩 -inf). None 이면 기존과 같은 무마스크 경로.
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
         let (batch_size, seq_len, _) = x.dims3()?;
         let qkv = self.wqkv.forward(x)?;
-        
+
         let hidden_size = self.num_heads * self.head_dim;
         // narrow 이후 메모리 연속성 보장
         let q_all = qkv.narrow(2, 0, hidden_size)?.contiguous()?;
@@ -154,15 +184,21 @@ impl Attention {
         let k = k_all.reshape((batch_size, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
         let v = v_all.reshape((batch_size, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
 
-        let (q, k) = self.rotary.forward(&q, &k, seq_len)?;
+        let q = RotaryEmbedding::apply(&q, cos, sin)?;
+        let k = RotaryEmbedding::apply(&k, cos, sin)?;
 
         // matmul 진입 전 q와 k.transpose의 연속성 완벽 보장
         let q_cont = q.contiguous()?;
         let k_trans_cont = k.transpose(2, 3)?.contiguous()?;
 
         let att = (q_cont.matmul(&k_trans_cont)? / (self.head_dim as f64).sqrt())?;
+        // 🌟 [EMBED-BATCHED] 패딩 버킷에서만 가산 마스크를 더합니다(exp(-inf)=0).
+        let att = match mask {
+            Some(m) => att.broadcast_add(m)?,
+            None => att,
+        };
         let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1)?;
-        
+
         // 두 번째 matmul 진입 전 att와 v의 연속성 보장, 그리고 최종 reshape 전 transpose 결과의 연속성 보장
         let y = att.contiguous()?.matmul(&v.contiguous()?)?.transpose(1, 2)?.contiguous()?.reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
         Ok(self.wo.forward(&y)?)
@@ -177,8 +213,8 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, vb: VarBuilder, rotary: Arc<RotaryEmbedding>) -> candle_core::Result<Self> {
-        let self_attn = Attention::new(cfg, vb.pp("attn"), rotary.clone())?;
+    fn new(cfg: &Config, vb: VarBuilder) -> candle_core::Result<Self> {
+        let self_attn = Attention::new(cfg, vb.pp("attn"))?;
         let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
         // 🌟 [CRITICAL FIX] Granite(ModernBERT)는 layers.0에서 attn_norm을 생략하므로 Option(.ok())으로 안전하게 받습니다.
         let attn_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("attn_norm")).ok();
@@ -192,6 +228,7 @@ pub struct FloatModel {
     embeddings_norm: RmsNorm,
     layers: Vec<DecoderLayer>,
     final_norm: RmsNorm,
+    rotary: Arc<RotaryEmbedding>,
 }
 
 impl FloatModel {
@@ -199,26 +236,38 @@ impl FloatModel {
         // CPU 강제 할당을 제거하고 전달받은 디바이스(VRAM)와 데이터 타입(BF16)을 그대로 사용합니다.
         let tok_embeddings = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embeddings.tok_embeddings"))?;
         let embeddings_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("embeddings.norm"))?;
-        
+
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 32768, 150000.0, device)?);
-        
+
         let mut layers = Vec::new();
         for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(cfg, vb.pp(format!("layers.{}", i)), rotary.clone())?);
+            layers.push(DecoderLayer::new(cfg, vb.pp(format!("layers.{}", i)))?);
         }
         let final_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("final_norm"))?;
-        Ok(Self { tok_embeddings, embeddings_norm, layers, final_norm })
+        Ok(Self { tok_embeddings, embeddings_norm, layers, final_norm, rotary })
     }
 
-    pub fn forward(&self, input_ids: &Tensor, device: &Device) -> candle_core::Result<Tensor> {
+    pub fn forward(&self, input_ids: &Tensor, _device: &Device) -> candle_core::Result<Tensor> {
         let seq_len = input_ids.dim(0)?;
         // 임베딩 텐서가 이미 VRAM에 올라가 있으므로 to_device() 복사 오버헤드를 제거합니다.
-        let mut x = self.tok_embeddings.forward(input_ids)?;
-        x = x.reshape((1, seq_len, ()))?;
-        
-        x = self.embeddings_norm.forward(&x)?;
-        
+        let x = self.tok_embeddings.forward(input_ids)?;
+        let x = x.reshape((1, seq_len, ()))?;
+        self.forward_hidden(x, seq_len, None)
+    }
+
+    /// 🌟 [EMBED-BATCHED] `ids` = [B*L] (행 우선) → [B, L, H].
+    /// B=1 · mask=None 이면 `forward` 와 완전히 같은 연산열입니다.
+    pub(crate) fn forward_batch(&self, ids: &Tensor, batch: usize, seq_len: usize, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        let x = self.tok_embeddings.forward(ids)?;
+        let x = x.reshape((batch, seq_len, ()))?;
+        self.forward_hidden(x, seq_len, mask)
+    }
+
+    fn forward_hidden(&self, x: Tensor, seq_len: usize, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
+        let mut x = self.embeddings_norm.forward(&x)?;
+        let (cos, sin) = self.rotary.cos_sin(seq_len)?;
+
         for layer in &self.layers {
             let residual = &x;
             // 🌟 [CRITICAL FIX] attn_norm이 없는 레이어(layers.0)는 직전의 x를 그대로 사용합니다.
@@ -226,9 +275,9 @@ impl FloatModel {
                 Some(norm) => norm.forward(&x)?,
                 None => x.clone(),
             };
-            let attn_out = layer.self_attn.forward(&x_norm)?;
+            let attn_out = layer.self_attn.forward(&x_norm, &cos, &sin, mask)?;
             x = (residual + attn_out)?;
-            
+
             let residual = &x;
             let x_norm = layer.mlp_norm.forward(&x)?;
             let mlp_out = layer.mlp.forward(&x_norm)?;
@@ -238,12 +287,75 @@ impl FloatModel {
     }
 }
 
+// =====================================================================
+// 🌟 [EMBED-TOKENIZER] 토크나이저 전역 공유
+// ---------------------------------------------------------------------
+//   tokenizer.json 은 27MB 이고 파싱에 0.75~0.85s 가 걸립니다(실측).
+//   퍼지마다 EmbeddingModel 이 다시 만들어지면서 매번 다시 파싱했습니다.
+//   (경로, 크기, 수정시각) 이 같으면 같은 Arc<Tokenizer> 를 재사용합니다.
+//   Tokenizer::encode 는 &self 이고 Send + Sync 이므로 공유해도 안전합니다.
+// =====================================================================
+type TokKey = (std::path::PathBuf, u64, u128);
+static EMBED_TOKENIZERS: once_cell::sync::Lazy<std::sync::Mutex<Vec<(TokKey, Arc<Tokenizer>)>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(Vec::new()));
+
+fn shared_tokenizer(path: &Path) -> Result<Arc<Tokenizer>> {
+    let meta = std::fs::metadata(path)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key: TokKey = (path.to_path_buf(), meta.len(), mtime);
+    let mut g = EMBED_TOKENIZERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, t)) = g.iter().find(|(k, _)| *k == key) {
+        println!("[EMBED-TOKENIZER] ♻️ 토크나이저 재사용 (재파싱 생략)");
+        return Ok(t.clone());
+    }
+    let started = std::time::Instant::now();
+    let tok = Arc::new(Tokenizer::from_file(path).map_err(anyhow::Error::msg)?);
+    // 같은 경로의 옛 판본은 버립니다(파일이 교체된 경우).
+    g.retain(|(k, _)| k.0 != key.0);
+    g.push((key, tok.clone()));
+    println!("[EMBED-TOKENIZER] 📖 토크나이저 최초 파싱 {:.0}ms (이후 재로드는 재사용)", started.elapsed().as_secs_f64() * 1000.0);
+    Ok(tok)
+}
+
+/// 청크 벡터들을 텍스트 하나의 벡터로 합칩니다.
+/// 기존 embed() 의 f32 산술(청크 순서대로 누적 → 개수로 나눔 → 재정규화)을 그대로 옮긴 것입니다.
+pub(crate) fn aggregate_chunk_vectors(chunks: &[&[f32]]) -> Vec<f32> {
+    let mut accumulated_vector = vec![0.0f32; EMBED_DIM];
+    let mut total_chunks = 0.0f32;
+    for vec in chunks {
+        for (i, val) in vec.iter().enumerate() {
+            accumulated_vector[i] += val;
+        }
+        total_chunks += 1.0;
+    }
+    if total_chunks > 0.0 {
+        for val in accumulated_vector.iter_mut() {
+            *val /= total_chunks;
+        }
+        let sum_sq: f32 = accumulated_vector.iter().map(|v| v * v).sum();
+        let norm = sum_sq.sqrt();
+        if norm > 1e-6 {
+            for val in accumulated_vector.iter_mut() {
+                *val /= norm;
+            }
+        }
+    }
+    accumulated_vector
+}
+
 // --- Wrapper ---
 
 pub struct EmbeddingModel {
     model: FloatModel,
-    tokenizer: Tokenizer,
+    tokenizer: Arc<Tokenizer>,
     device: Device,
+    dtype: DType,
+    pad_id: u32,
 }
 
 impl EmbeddingModel {
@@ -261,7 +373,7 @@ impl EmbeddingModel {
 
         let config_str = std::fs::read_to_string(config_path)?;
         let config: Config = serde_json::from_str(&config_str)?;
-        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(anyhow::Error::msg)?;
+        let tokenizer = shared_tokenizer(&tokenizer_path)?;
 
         let dtype = if device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
 
@@ -273,58 +385,58 @@ impl EmbeddingModel {
             return Err(anyhow!("No valid model found (looked for model.safetensors)"));
         };
 
-        Ok(Self { model, tokenizer, device: device.clone() })
+        // 🌟 [EMBED-CACHE] 모델 파일이 바뀌었으면 캐시 공간을 새 지문으로 넘깁니다.
+        text_cache::refresh_fingerprint(model_path, text_cache::device_class(device));
+
+        let pad_id = config.pad_token_id.unwrap_or(0) as u32;
+        Ok(Self { model, tokenizer, device: device.clone(), dtype, pad_id })
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// 이 모델 인스턴스가 배치 순전파를 쓰는지 여부.
+    pub fn batched_enabled(&self) -> bool {
+        batched_enabled(&self.device)
+    }
+
+    /// 특수 토큰 포함 토큰 수 (embed() 와 같은 encode(text, true)). 진단·검증용.
+    pub fn token_len(&self, text: &str) -> Result<usize> {
+        Ok(self.tokenizer.encode(text, true).map_err(anyhow::Error::msg)?.get_ids().len())
     }
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let tokens = self.tokenizer.encode(text, true).map_err(anyhow::Error::msg)?;
         let token_ids = tokens.get_ids();
-        
-        if token_ids.is_empty() { return Ok(vec![0.0; 384]); }
 
-        let chunk_size = 512;
-        let chunks: Vec<&[u32]> = token_ids.chunks(chunk_size).collect();
-        
-        let mut accumulated_vector = vec![0.0; 384];
-        let mut total_chunks = 0.0;
+        if token_ids.is_empty() { return Ok(vec![0.0; EMBED_DIM]); }
 
-        for chunk in chunks {
+        let mut chunk_vectors: Vec<Vec<f32>> = Vec::new();
+        for chunk in token_ids.chunks(EMBED_CHUNK_TOKENS) {
             // 입력 텐서를 처음부터 타겟 디바이스(VRAM)로 올립니다.
             let input_tensor = Tensor::new(chunk, &self.device).map_err(anyhow::Error::msg)?;
             let hidden_states = self.model.forward(&input_tensor, &self.device).map_err(anyhow::Error::msg)?;
-            
-            let (_b, s, _h) = hidden_states.dims3().map_err(anyhow::Error::msg)?;
-            let sum = hidden_states.sum(1).map_err(anyhow::Error::msg)?; 
-            let mean = (sum / (s as f64)).map_err(anyhow::Error::msg)?;
-            
-            let norm = mean.sqr().map_err(anyhow::Error::msg)?.sum_all().map_err(anyhow::Error::msg)?.sqrt().map_err(anyhow::Error::msg)?;
-            let normalized = mean.broadcast_div(&norm).map_err(anyhow::Error::msg)?;
-            
+            let normalized = Self::pool_single(&hidden_states)?;
+
             // 🌟 [CRITICAL FIX] VRAM(GPU)에 존재하는 최종 연산 결과 텐서를 시스템 메모리(CPU)로 안전하게 명시적 복사한 뒤, F32 배열로 캐스팅합니다.
             let normalized_cpu = normalized.to_device(&Device::Cpu).map_err(anyhow::Error::msg)?;
             let normalized_f32 = normalized_cpu.to_dtype(candle_core::DType::F32).map_err(anyhow::Error::msg)?;
             let vec: Vec<f32> = normalized_f32.flatten_all().map_err(anyhow::Error::msg)?.to_vec1().map_err(anyhow::Error::msg)?;
-            
-            for (i, val) in vec.iter().enumerate() {
-                accumulated_vector[i] += val;
-            }
-            total_chunks += 1.0;
+            chunk_vectors.push(vec);
         }
 
-        if total_chunks > 0.0 {
-            for val in accumulated_vector.iter_mut() {
-                *val /= total_chunks;
-            }
-            let sum_sq: f32 = accumulated_vector.iter().map(|v| v * v).sum();
-            let norm = sum_sq.sqrt();
-            if norm > 1e-6 {
-                for val in accumulated_vector.iter_mut() {
-                    *val /= norm;
-                }
-            }
-        }
+        let refs: Vec<&[f32]> = chunk_vectors.iter().map(|v| v.as_slice()).collect();
+        Ok(aggregate_chunk_vectors(&refs))
+    }
 
-        Ok(accumulated_vector)
+    /// [1, s, H] → 평균 풀링 + L2 정규화 [1, H] (기존 embed() 의 GPU 측 연산 그대로).
+    fn pool_single(hidden_states: &Tensor) -> Result<Tensor> {
+        let (_b, s, _h) = hidden_states.dims3().map_err(anyhow::Error::msg)?;
+        let sum = hidden_states.sum(1).map_err(anyhow::Error::msg)?;
+        let mean = (sum / (s as f64)).map_err(anyhow::Error::msg)?;
+        let norm = mean.sqr().map_err(anyhow::Error::msg)?.sum_all().map_err(anyhow::Error::msg)?.sqrt().map_err(anyhow::Error::msg)?;
+        mean.broadcast_div(&norm).map_err(anyhow::Error::msg)
     }
 
     // =====================================================================
@@ -336,6 +448,8 @@ impl EmbeddingModel {
     //   texts.len() 을 100 으로 주든 1000 으로 주든 순전파는 항상 1건 단위입니다.
     //   시퀀스 길이도 embed() 내부에서 512 로 이미 고정되어 있습니다.
     //   즉 activation 의 유일한 변수는 '동시에 순전파하는 스레드 수' 입니다.
+    //   (CUDA/ROCm 의 기본 경로는 이제 embed_many 이며, 이 함수는
+    //    LOGIS_EMBED_BATCHED=0 · Vulkan · CPU 경로에서만 쓰입니다)
     //
     //  ── 3 이 왜 위험한가 ──
     //   Attention::forward 는 .contiguous() 를 12회 호출하며 매번 새 텐서를
@@ -365,6 +479,19 @@ impl EmbeddingModel {
     fn adaptive_thread_count(&self, len: usize) -> usize {
         const MAX_THREADS: usize = 3;
         if self.device.is_cpu() { return 1; }
+        // 🌟 [EMBED-THREADS] CUDA 는 1스레드 (E9).
+        //    CudaDevice 는 스레드마다 다른 per-thread 기본 스트림에 커널을 넣지만 cuBLAS 핸들(작업 공간)은
+        //    하나를 공유합니다. 실측(320건): 3스레드 embed_batch 결과 중 2건이 같은 텍스트의 순차 embed() 와
+        //    비트 단위로 달랐습니다(동시 GEMM 의 작업 공간 공유가 의심됨). 3스레드 이득은 1.15배뿐이었고,
+        //    CUDA 기본 경로는 이제 배치 순전파(embed_many)이므로 per-text 경로는 결정론을 우선합니다.
+        //    LOGIS_EMBED_PERTEXT_THREADS=3 이면 기존 동작으로 돌아갑니다.
+        if self.device.is_cuda() {
+            let forced = std::env::var("LOGIS_EMBED_PERTEXT_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+            match forced {
+                Some(n) if n > 1 => return n.min(MAX_THREADS).min(len).max(1),
+                _ => return 1,
+            }
+        }
         let cap = MAX_THREADS.min(len).max(1);
         let unit = Self::observed_unit_mb();
         if unit == 0 {
@@ -387,9 +514,9 @@ impl EmbeddingModel {
 
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() { return Ok(Vec::new()); }
-        
-        let mut results = vec![vec![0.0; 384]; texts.len()];
-        
+
+        let mut results = vec![vec![0.0; EMBED_DIM]; texts.len()];
+
         // 🌟 [CRITICAL FIX] 장치(Device) 타입에 따른 스레드 동적 분기 및 VRAM 최적화
         // GPU(CUDA)일 경우 워프 스케줄링 한계와 PCIe 대역폭 병목을 방지하기 위해 가장 이상적인 3개로 제한합니다.
         // CPU일 경우 스레드 경합(Thread Contention)과 L3 캐시 오염을 막기 위해 무조건 1개(직렬)로 강제 고정합니다.
@@ -398,23 +525,25 @@ impl EmbeddingModel {
         //    여유가 얇으면 1~2 로 줄입니다. activation 이 스레드 수에 비례하므로
         //    이것이 이 코드베이스에서 순간 피크를 줄이는 유일한 실효 축입니다.
         let num_threads = self.adaptive_thread_count(texts.len());
-        
-        let chunk_size = (texts.len() + num_threads - 1) / num_threads; 
-        
+
+        let chunk_size = (texts.len() + num_threads - 1) / num_threads;
+
         std::thread::scope(|s| {
             let mut handles = Vec::new();
-            
+
             for (chunk_idx, chunk) in texts.chunks(chunk_size).enumerate() {
                 let start_idx = chunk_idx * chunk_size;
                 handles.push(s.spawn(move || {
                     let mut local_res = Vec::with_capacity(chunk.len());
                     for text in chunk {
-                        local_res.push(self.embed(text).unwrap_or(vec![0.0; 384]));
+                        // 실패는 0벡터로 자리만 지킵니다. 호출부(get_embedding_batch)는
+                        // 0벡터를 캐시에 넣지 않으므로 다음 호출에서 다시 계산됩니다.
+                        local_res.push(self.embed(text).unwrap_or(vec![0.0; EMBED_DIM]));
                     }
                     (start_idx, local_res)
                 }));
             }
-            
+
             for handle in handles {
                 if let Ok((start_idx, local_res)) = handle.join() {
                     for (i, vector) in local_res.into_iter().enumerate() {
@@ -425,12 +554,12 @@ impl EmbeddingModel {
                 }
             }
         });
-        
+
         // 🌟 [MEMORY CLEAR] 임베딩 배치 연산 종료 후 즉각적인 VRAM 동기화 및 가비지 텐서 회수
         if !self.device.is_cpu() {
             let _ = self.device.synchronize();
         }
-        
+
         Ok(results)
     }
 

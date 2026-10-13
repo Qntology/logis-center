@@ -301,8 +301,9 @@ impl crate::model::LogisModel {
         } else {
             let mut acc: Vec<Vec<f32>> = Vec::with_capacity(bank_texts.len());
             for part in bank_texts.chunks(200) {
+                // 🌟 [EMBED-CACHE] 질의와 무관한 판정/편견 뱅크 → 전역 캐시 고정 계층
                 let e = self
-                    .get_embedding_batch(part.to_vec())
+                    .get_embedding_batch_pinned(part.to_vec())
                     .await
                     .unwrap_or_else(|_| vec![vec![0.0; 384]; part.len()]);
                 acc.extend(e);
@@ -314,8 +315,9 @@ impl crate::model::LogisModel {
         } else {
             let mut acc: Vec<Vec<f32>> = Vec::with_capacity(prej_texts.len());
             for part in prej_texts.chunks(200) {
+                // 🌟 [EMBED-CACHE] 질의와 무관한 판정/편견 뱅크 → 전역 캐시 고정 계층
                 let e = self
-                    .get_embedding_batch(part.to_vec())
+                    .get_embedding_batch_pinned(part.to_vec())
                     .await
                     .unwrap_or_else(|_| vec![vec![0.0; 384]; part.len()]);
                 acc.extend(e);

@@ -27,11 +27,8 @@ impl LogisModel {
                 println!("[MODEL] Embedding Model unloaded to free VRAM.");
             }
         }
-        {
-            let mut cache = self.embedding_cache.lock().await;
-            cache.clear();
-            println!("[MODEL] Embedding Memory Cache cleared to free RAM.");
-        }
+        // 🌟 [EMBED-CACHE] 벡터 캐시는 RAM 만 쓰므로 VRAM 반환과 무관합니다. 비우지 않습니다.
+        crate::models::embedding::text_cache::note_purge("unload_embedding");
         if !self.is_cpu_mode {
             if self.device_config.device.is_cuda_or_rocm() {
                 let _ = self.device_config.device.synchronize();
@@ -155,10 +152,10 @@ impl LogisModel {
             if let Some(e) = emb.take() {
                 drop(e);
             }
-            // 🌟 램 누수 방지를 위해 캐시도 깔끔하게 비워줍니다.
-            let mut cache = self.embedding_cache.lock().await;
-            cache.clear();
         }
+        // 🌟 [EMBED-CACHE] 질의와 무관한 뱅크 벡터까지 매번 다시 계산하던 원인이었습니다.
+        //    전역 캐시는 LRU 상한으로 RAM 이 묶여 있으므로 퍼지에서 비우지 않습니다.
+        crate::models::embedding::text_cache::note_purge("deep_purge");
 
         // 🌟 [SigLIP2] 비전 엔진도 함께 해제합니다.
         //    mmap 백엔드라 상주량이 LLM 보다 작지만,
@@ -1336,10 +1333,8 @@ impl LogisModel {
                         println!("[RELAY] Embedding model released for VRAM (image pipeline).");
                     }
                 }
-                {
-                    let mut cache = self.embedding_cache.lock().await;
-                    cache.clear();
-                }
+                // 🌟 [EMBED-CACHE] 모델만 내리고 벡터 캐시는 유지합니다(RAM 전용, VRAM 무관).
+                crate::models::embedding::text_cache::note_purge("relay (image pipeline)");
             } else {
                 let embed_resident = { self.embedding_model.lock().await.is_some() };
                 let other_resident = {
