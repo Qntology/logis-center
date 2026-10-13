@@ -36,6 +36,16 @@ pub fn purge_mode_legacy() -> bool {
     })
 }
 
+/// `LOGIS_PURGE_KEEP_EMBED=0` 이면 단계 퍼지에서도 임베딩을 항상 내립니다 (예산이 남아도).
+pub fn purge_keeps_embedding() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LOGIS_PURGE_KEEP_EMBED")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true)
+    })
+}
+
 /// `LOGIS_TASK_END_RELEASE=0` 이면 작업 종료 시 예전처럼 단계 퍼지만 합니다.
 pub fn task_end_release_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -195,6 +205,11 @@ impl LogisModel {
                 self.finish_task_release().await;
             } else {
                 println!("[DIAG-PURGE] ⚡ [PURGE SKIP] 내릴 생성·비전 슬롯이 없어 퍼지를 생략합니다. (임베딩 상주: {})", emb_resident);
+                // 다른 계산이 남긴 풀 유휴분만 다음 단계용 여분까지 돌려줍니다 (동기화 + 반환, 슬롯은 건드리지 않음).
+                let keep = utils::phase_pool_keep_bytes();
+                if !self.is_cpu_mode && self.device_config.device.pool_idle_bytes().unwrap_or(0) > keep {
+                    self.settle_device("purge skip: 풀 유휴분 반환", keep, false).await;
+                }
             }
             *self.current_size.lock().await = None;
             self.sync_crossover_phase().await;
@@ -261,7 +276,7 @@ impl LogisModel {
             let next_mb = self
                 .generation_budget_mb(ModelSize::Qwen3)
                 .max(self.generation_budget_mb(ModelSize::Qwen3_5));
-            let keep = emb_resident && free_mb >= next_mb;
+            let keep = emb_resident && purge_keeps_embedding() && free_mb >= next_mb;
             if emb_resident {
                 println!(
                     "[DIAG-PURGE] Step 2: 임베딩 {} (실효 free {}MB vs 다음 단계 생성 예산 {}MB)",

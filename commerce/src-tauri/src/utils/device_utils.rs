@@ -5,6 +5,8 @@ use std::process::Command;
 use nvml_wrapper::Nvml;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
+// mi_collect(release_heap) 를 쓰는 lib 대상(cdylib 포함)에도 mimalloc 정적 라이브러리를 링크합니다.
+extern crate mimalloc as _;
 
 // [FIX] 장치 번호별로 장치 객체를 캐싱하여 중복 생성 방지 (DeviceId 폭주 해결)
 static DEVICE_CACHE: Lazy<Mutex<Vec<Option<Device>>>> = Lazy::new(|| Mutex::new(vec![None; 8]));

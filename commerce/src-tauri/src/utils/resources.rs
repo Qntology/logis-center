@@ -242,6 +242,11 @@ pub fn kv_bytes_per_token_exact(num_kv_layers: usize, num_kv_heads: usize, head_
     2 * num_kv_layers as u64 * num_kv_heads as u64 * head_dim as u64 * elem_bytes as u64
 }
 
+/// 🌟 [KV-PLAN v2] 필요량 = 토큰당 바이트 x (계획 토큰 - 이미 VRAM 에 있는 토큰).
+pub fn kv_need_bytes(per_token: u64, planned_tokens: usize, already_tokens: usize) -> u64 {
+    per_token.saturating_mul(planned_tokens.saturating_sub(already_tokens) as u64)
+}
+
 /// [`plan_kv_residency_ex`] 의 추가 입력 (모두 선택).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KvPlanExtra {
@@ -297,7 +302,7 @@ pub fn plan_kv_residency_ex(input: &KvPlanInput, extra: &KvPlanExtra) -> KvResid
     }
     let per_token = extra.bytes_per_token.unwrap_or_else(|| kv_bytes_per_token(input));
     let new_tokens = input.planned_tokens.saturating_sub(extra.already_tokens);
-    let need = per_token.saturating_mul(new_tokens as u64);
+    let need = kv_need_bytes(per_token, input.planned_tokens, extra.already_tokens);
     if input.is_cpu_mode {
         println!("[KV-PLAN] {} | CPU Mode → RAM 상주 (Need: {:.2} MB)", input.label, need as f64 / 1e6);
         return KvResidency::Ram;
