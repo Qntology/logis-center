@@ -44,3 +44,5 @@ mod app_scheduler;
 mod app_model;
 // 임베딩 처리량 · NMS 배틀 가속 (전역 캐시 · NVML 핸들 · 프리패치 동치 · 배치 순전파 GPU 대조)
 mod app_embed;
+// P2b 실모델 대조: 융합 GDN(Qwen3.5) · Qwen3-0.6B Q8_0 상주 정확 W8A16 (LOGIS_TEST_MODELS=1, --ignored)
+mod p2b_models;

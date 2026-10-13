@@ -3278,6 +3278,11 @@ impl Qwen3_5TextModel {
     }
 }
 
+/// 🌟 [P2B-TEST] 실모델 대조 테스트(tests/it/p2b_models.rs)는 앱의 작업 중지 신호 파일(EXTRACTION_STOPPED)과
+/// 무관하게 프리필해야 합니다. 앱 상태 파일을 건드리지 않도록 테스트 프로세스 안에서만 이 검사를 끕니다.
+/// 기본값 false = 기존 동작 (앱 코드는 이 값을 바꾸지 않습니다).
+pub static IGNORE_STOP_SIGNAL_FOR_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // ----------------------------------------------------------------------------------
 // [Qwen3_5Model] 최상위 모델 구조 수정 및 인자 전달
 // ----------------------------------------------------------------------------------
@@ -3812,7 +3817,9 @@ impl Qwen3_5Model {
             
             while processed < total_len {
                 
-                if crate::utils::is_extraction_stopped() {
+                if !IGNORE_STOP_SIGNAL_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed)
+                    && crate::utils::is_extraction_stopped()
+                {
                     return Err(anyhow::anyhow!("Task cancelled"));
                 }
 
