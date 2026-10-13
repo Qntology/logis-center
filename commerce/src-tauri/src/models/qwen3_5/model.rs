@@ -207,6 +207,22 @@ pub struct Qwen3_5GatedDeltaNet {
     conv_state_cache: Option<Tensor>,
     recurrent_state_cache: Option<Tensor>,
     pub is_state_dirty: bool,
+    // 🌟 [GDN-FUSED] v-head 가 읽는 k-head 대응 방식 (GGUF alphaedge.v_head_order, 기본 Grouped = repeat_interleave)
+    v_head_order: candle_core::delta_rule::GdnHeadOrder,
+}
+
+/// 🌟 [GDN-FUSED] GGUF 메타데이터 `alphaedge.v_head_order` ("grouped" / "tiled"). 없으면 Qwen3.5 기본값 Grouped.
+fn gguf_v_head_order<R: Read + Seek>(gguf: &Gguf<R>) -> candle_core::delta_rule::GdnHeadOrder {
+    let v = gguf
+        .get_matedata("alphaedge.v_head_order")
+        .ok()
+        .and_then(|v| v.to_string().ok().cloned())
+        .unwrap_or_default();
+    if v.trim().eq_ignore_ascii_case("tiled") {
+        candle_core::delta_rule::GdnHeadOrder::Tiled
+    } else {
+        candle_core::delta_rule::GdnHeadOrder::Grouped
+    }
 }
 
 impl Qwen3_5GatedDeltaNet {
@@ -254,6 +270,7 @@ impl Qwen3_5GatedDeltaNet {
             conv_state_cache: None,
             recurrent_state_cache: None,
             is_state_dirty: false,
+            v_head_order: candle_core::delta_rule::GdnHeadOrder::Grouped,
         })
     }
 
@@ -311,6 +328,7 @@ impl Qwen3_5GatedDeltaNet {
             conv_state_cache: None,
             recurrent_state_cache: None,
             is_state_dirty: false,
+            v_head_order: gguf_v_head_order(gguf),
         })
     }
 
@@ -331,7 +349,8 @@ impl Qwen3_5GatedDeltaNet {
         let conv_state_new = Tensor::cat(&[&state_to_use, xs], D::Minus1)?;
         
         let next_cache_len = conv_state_new.dim(D::Minus1)?;
-        let conv_update = conv_state_new.narrow(D::Minus1, next_cache_len - take_len, take_len)?;
+        // 🌟 [GDN-02] narrow 뷰는 [B,C,K] 버퍼 전체를 붙잡으므로 마지막 K-1 열만 연속 복사해 둡니다. (값은 비트 단위로 같음)
+        let conv_update = conv_state_new.narrow(D::Minus1, next_cache_len - take_len, take_len)?.contiguous()?;
         self.conv_state_cache = Some(conv_update);
         
         let out = conv1d_depthwise(&conv_state_new, self.conv1d.weight(), self.conv1d.bias())?;
@@ -611,9 +630,15 @@ impl Qwen3_5GatedDeltaNet {
             self.recurrent_state_cache = Some(rec.to_device(dev)?.to_dtype(candle_core::DType::F32)?);
         }
 
+        // 🌟 [GDN-FUSED] 포크의 융합 커널이 있으면 혼합기 전체(conv·SiLU·L2 norm·게이트·스캔)를 한 번에 계산합니다.
+        let gdn_cfg = self.gdn_config();
+        if crate::models::common::gdn_fused_enabled(dev, &gdn_cfg) {
+            return self.forward_fused(xs, &gdn_cfg);
+        }
+
         let (bs, seq_len, _) = xs.dims3()?;
-        
-        
+
+
         let mut mixed_qkv = self.in_proj_qkv.forward(xs)?
             .to_dtype(dtype)? // 👈 SSM 입력 타입 보정
             .transpose(1, 2)?
@@ -632,8 +657,10 @@ impl Qwen3_5GatedDeltaNet {
             let take_len = self.conv_kernel_size - 1;
             let (bs, dim, seq_len) = mixed_qkv.dims3()?;
             
+            // 🌟 [GDN-02] narrow 뷰를 그대로 두면 [B,C,T] 프리필 버퍼 전체가 상태로 살아남아(RAM 대피 시 통째로 복사)
+            //    마지막 K-1 열만 연속 복사합니다. 값은 비트 단위로 같습니다.
             let next_conv_state = if seq_len >= take_len {
-                mixed_qkv.narrow(D::Minus1, seq_len - take_len, take_len)?
+                mixed_qkv.narrow(D::Minus1, seq_len - take_len, take_len)?.contiguous()?
             } else {
                 mixed_qkv.pad_with_zeros(D::Minus1, take_len - seq_len, 0)?
             };
@@ -705,6 +732,81 @@ impl Qwen3_5GatedDeltaNet {
         let output = self.out_proj.forward(&core_attn_out)?.to_dtype(dtype)?; 
 
         self.is_state_dirty = true; 
+        Ok(output)
+    }
+
+    /// 🌟 [GDN-FUSED] 포크 융합 커널에 넘길 층 형상.
+    fn gdn_config(&self) -> candle_core::delta_rule::GdnConfig {
+        let mut cfg = candle_core::delta_rule::GdnConfig::new(
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+        );
+        cfg.conv_kernel = self.conv_kernel_size;
+        cfg.v_head_order = self.v_head_order;
+        cfg
+    }
+
+    /// 🌟 [GDN-FUSED] 융합 경로: 프로젝션 → `fused_gated_delta_rule`(conv+SiLU+L2norm+게이트+스캔, F32 연산)
+    /// → `fused_gated_rms_norm` → out_proj.
+    ///
+    /// 상태 형식은 기존 경로와 같습니다: conv 상태 `[B, C, K-1]` (모델 dtype, conv 이전 입력의 마지막 K-1 열),
+    /// 재귀 상태 `[B, Hv, Dk, Dv]` F32. 커널이 새 상태를 따로 만들어 돌려주므로 프리필 버퍼를 붙잡지 않습니다.
+    /// 기존 경로와 달리 conv·L2 norm·g·beta 를 F16 모델(2B)에서도 F32 로 계산합니다(기준 구현에 더 가까움).
+    fn forward_fused(&mut self, xs: &Tensor, cfg: &candle_core::delta_rule::GdnConfig) -> Result<Tensor> {
+        let dtype = xs.dtype();
+        let (bs, seq_len, _) = xs.dims3()?;
+        // [B, T, C] 그대로 넘깁니다 (전치·연속 복사 없음).
+        let mixed_qkv = self.in_proj_qkv.forward(xs)?.to_dtype(dtype)?;
+        let z = self
+            .in_proj_z
+            .forward(xs)?
+            .to_dtype(dtype)?
+            .reshape((bs, seq_len, self.num_v_heads, self.head_v_dim))?;
+        let b = self.in_proj_b.forward(xs)?.to_dtype(dtype)?;
+        let a = self.in_proj_a.forward(xs)?.to_dtype(dtype)?;
+
+        // 스냅샷 등에서 온 conv 상태 길이가 K-1 과 다르면 기존 경로와 같은 규칙(뒤쪽 K-1 열 / 앞쪽 0 채움)으로 맞춥니다.
+        let take_len = self.conv_kernel_size - 1;
+        // (커널이 실패해도 문맥을 잃지 않도록 기존 상태는 성공한 뒤에만 교체합니다)
+        let conv_state = match self.conv_state_cache.as_ref() {
+            Some(s) => {
+                let len = s.dim(D::Minus1)?;
+                let s = if len > take_len {
+                    s.narrow(D::Minus1, len - take_len, take_len)?
+                } else if len < take_len {
+                    s.pad_with_zeros(D::Minus1, take_len - len, 0)?
+                } else {
+                    s.clone()
+                };
+                Some(s.contiguous()?)
+            }
+            None => None,
+        };
+        let rec_state = self.recurrent_state_cache.clone();
+
+        let out = candle_core::delta_rule::fused_gated_delta_rule(
+            &mixed_qkv,
+            self.conv1d.weight(),
+            self.conv1d.bias(),
+            conv_state.as_ref(),
+            &a,
+            &b,
+            &self.a_log,
+            &self.dt_bias,
+            rec_state.as_ref(),
+            cfg,
+        )?;
+        drop(mixed_qkv);
+        self.conv_state_cache = Some(out.conv_state);
+        self.recurrent_state_cache = Some(out.recurrent_state);
+
+        // 게이트 RMSNorm: x / sqrt(mean(x²)+eps) · w · silu(z), F32 연산 후 모델 dtype.
+        let core = candle_core::delta_rule::fused_gated_rms_norm(&out.out, &z, &self.norm.weight, self.norm.eps())?;
+        let core = core.reshape((bs, seq_len, ()))?;
+        let output = self.out_proj.forward(&core)?.to_dtype(dtype)?;
+        self.is_state_dirty = true;
         Ok(output)
     }
 
@@ -1663,6 +1765,7 @@ impl Qwen3_5DecoderLayer {
                 out_proj: dummy_p.clone(), in_proj_qkv: dummy_p.clone(), in_proj_z: dummy_p.clone(),
                 in_proj_b: dummy_p.clone(), in_proj_a: dummy_p.clone(),
                 conv_state_cache: None, recurrent_state_cache: None, is_state_dirty: false,
+                v_head_order: gguf_v_head_order(gguf),
             })
         } else {
             let num_attention_heads = gguf.get_matedata("qwen35.attention.head_count")?.to_u32()? as usize;
@@ -3555,6 +3658,11 @@ impl Qwen3_5TextModel {
     }
 }
 
+/// 🌟 [P2B-TEST] 실모델 대조 테스트(tests/it/p2b_models.rs)는 앱의 작업 중지 신호 파일(EXTRACTION_STOPPED)과
+/// 무관하게 프리필해야 합니다. 앱 상태 파일을 건드리지 않도록 테스트 프로세스 안에서만 이 검사를 끕니다.
+/// 기본값 false = 기존 동작 (앱 코드는 이 값을 바꾸지 않습니다).
+pub static IGNORE_STOP_SIGNAL_FOR_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // ----------------------------------------------------------------------------------
 // [Qwen3_5Model] 최상위 모델 구조 수정 및 인자 전달
 // ----------------------------------------------------------------------------------
@@ -4089,7 +4197,9 @@ impl Qwen3_5Model {
             
             while processed < total_len {
                 
-                if crate::utils::is_extraction_stopped() {
+                if !IGNORE_STOP_SIGNAL_FOR_TESTS.load(std::sync::atomic::Ordering::Relaxed)
+                    && crate::utils::is_extraction_stopped()
+                {
                     return Err(anyhow::anyhow!("Task cancelled"));
                 }
 

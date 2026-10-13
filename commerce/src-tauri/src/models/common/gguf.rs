@@ -267,11 +267,59 @@ impl QuantizedLinear {
     pub fn inner_dequantize(&self) -> Result<Tensor> {
         Ok(self.inner.dequantize_f16()?)
     }
+
+    /// 🌟 [W8A16] F16/BF16 입력을 정확 경로(`forward_exact`)로 보낼지: CUDA 에 상주한 Q8_0 가중치일 때만.
+    /// (K-quant 가중치·다른 장치는 기존 경로 그대로)
+    fn exact_ok(&self, xs: &Tensor) -> bool {
+        matches!(xs.dtype(), DType::F16 | DType::BF16)
+            && q8_exact_enabled()
+            && matches!(&self.inner, QMatMul::QTensor(t)
+                if t.dtype() == candle_core::quantized::GgmlDType::Q8_0 && t.device().is_cuda())
+    }
+}
+
+// =====================================================================
+// 🌟 [W8A16] Q8_0 가중치 × F16/BF16 활성값의 정확 행렬곱
+// ---------------------------------------------------------------------
+//  기존: F16 입력은 `forward_via_f16` (호출마다 가중치 전체를 F16 으로 풀고 F16 matmul — 디코드 1토큰에도
+//        25MB 급 순간 버퍼), BF16 입력은 `forward` (MMVQ/MMQ: 활성값을 Q8_1 로 양자화).
+//  지금: `QMatMul::forward_exact` — 활성값을 양자화하지 않습니다. 디코드(≤8행)는 Q8_0 블록을 커널 안에서
+//        f32 로 풀어 f32 누산, 프리필은 활성 dtype 타일로 풀어 f32 누산 GEMM. 정확도는 같거나 낫습니다.
+//  `LOGIS_Q8_EXACT=0` 이면 기존 경로. 테스트는 [`set_q8_exact_override`] 로 같은 프로세스에서 비교합니다.
+// =====================================================================
+static Q8_EXACT_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 🌟 [W8A16] 테스트용 강제값. `None` = 환경변수 기본, `Some(true/false)` = 강제로 켜기/끄기.
+pub fn set_q8_exact_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    Q8_EXACT_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn q8_exact_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match Q8_EXACT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => *ON.get_or_init(|| {
+            let v = std::env::var("LOGIS_Q8_EXACT").unwrap_or_default().trim().to_ascii_lowercase();
+            let on = !matches!(v.as_str(), "0" | "off" | "false" | "no" | "legacy");
+            if !on {
+                println!("[W8A16] LOGIS_Q8_EXACT={v} → Q8_0 선형층을 기존 경로(F16 전체 역양자화 / Q8_1 활성 양자화)로 계산합니다.");
+            }
+            on
+        }),
+    }
 }
 
 impl Module for QuantizedLinear {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let xs = if xs.dtype() == DType::F16 {
+        let xs = if self.exact_ok(xs) {
+            self.inner.forward_exact(xs)?
+        } else if xs.dtype() == DType::F16 {
             self.inner.forward_via_f16(xs)?
         } else {
             self.inner.forward(xs)?
@@ -284,10 +332,35 @@ impl Module for QuantizedLinear {
     }
 }
 
+/// 🌟 [W8A16] 양자화 가중치를 그대로 상주시키고 활성값은 양자화하지 않는 정확 선형층 (Qwen3-0.6B Q8_0).
+/// 출력 dtype = 입력 dtype (F32 입력이면 F32 logits).
+#[derive(Debug, Clone)]
+pub struct ExactQLinear {
+    w: std::sync::Arc<QTensor>,
+}
+
+impl ExactQLinear {
+    pub fn new(w: std::sync::Arc<QTensor>) -> Self {
+        Self { w }
+    }
+
+    pub fn weight(&self) -> &std::sync::Arc<QTensor> {
+        &self.w
+    }
+}
+
+impl Module for ExactQLinear {
+    fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        self.w.forward_exact(xs)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ProjKind {
     QuantizedProj(QuantizedLinear),
     LinearProj(Linear),
+    /// 🌟 [W8A16] 정확 양자화 선형층 (활성 양자화 없음)
+    Exact(ExactQLinear),
 }
 
 impl Module for ProjKind {
@@ -295,6 +368,7 @@ impl Module for ProjKind {
         match self {
             ProjKind::QuantizedProj(q) => q.forward(xs),
             ProjKind::LinearProj(l) => l.forward(xs),
+            ProjKind::Exact(e) => e.forward(xs),
         }
     }
 }
