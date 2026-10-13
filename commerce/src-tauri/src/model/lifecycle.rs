@@ -48,6 +48,7 @@ impl LogisModel {
             self.generator.lock().await.is_some()
                 || self.qwen3_generator.lock().await.is_some()
                 || self.qwen3_5_generator.lock().await.is_some()
+                || self.qwen4_exp_generator.lock().await.is_some()
         };
         if !had {
             println!("[CROSSOVER] ⚡ [GEN UNLOAD SKIP] 반환할 생성 슬롯이 없습니다. ({})", reason);
@@ -79,6 +80,11 @@ impl LogisModel {
             let mut q35 = self.qwen3_5_generator.lock().await;
             if let Some(mut g) = q35.take() {
                 println!("[CROSSOVER] Dropping Qwen3.5 generator...");
+                g.clear_kv_cache();
+                drop(g);
+            }
+            if let Some(mut g) = self.qwen4_exp_generator.lock().await.take() {
+                println!("[CROSSOVER] Dropping Qwen4-Exp generator...");
                 g.clear_kv_cache();
                 drop(g);
             }
@@ -143,6 +149,11 @@ impl LogisModel {
             let mut q35_gen = self.qwen3_5_generator.lock().await;
             if let Some(mut g) = q35_gen.take() {
                 println!("[DIAG-PURGE] Dropping Qwen 3.5 Generator...");
+                g.clear_kv_cache();
+                drop(g);
+            }
+            if let Some(mut g) = self.qwen4_exp_generator.lock().await.take() {
+                println!("[DIAG-PURGE] Dropping Qwen4-Exp Generator...");
                 g.clear_kv_cache();
                 drop(g);
             }
@@ -438,7 +449,7 @@ impl LogisModel {
 
         if target_size == ModelSize::Qwen3_5
             && crate::model::lang_llm::resident_variant().is_some()
-            && self.qwen3_5_generator.lock().await.is_some()
+            && (self.qwen3_5_generator.lock().await.is_some() || self.qwen4_exp_generator.lock().await.is_some())
         {
             println!("[RELAY] 🔁 음차 전용 Qwen3.5-4B 가 상주 중이라 범용 Qwen3.5-2B 로 교체합니다. 이미 올라온 모델로 보고 건너뛰는 빠른 경로를 타지 않습니다.");
             *self.current_size.lock().await = None;
@@ -623,6 +634,7 @@ impl LogisModel {
             let other_resident = {
                 self.generator.lock().await.is_some()
                     || self.qwen3_5_generator.lock().await.is_some()
+                    || self.qwen4_exp_generator.lock().await.is_some()
             };
             let vision_resident = { self.siglip2_model.lock().await.is_some() };
             let keep_embedding = embed_resident
@@ -857,7 +869,9 @@ impl LogisModel {
         let make_params = || Self::translit_params(prompt);
 
         let lang_variant = crate::model::lang_llm::resident_variant();
-        let first = {
+        let first = if self.qwen4_exp_generator.lock().await.is_some() {
+            self.generate_on_qwen4_exp_slot(make_params(), cancel_token.clone(), None).await
+        } else {
             let mut gen_guard = self.qwen3_5_generator.lock().await;
             let gen = gen_guard.as_mut().ok_or_else(|| anyhow::anyhow!("Qwen3.5 Generator is missing"))?;
             let r = gen.generate(make_params(), cancel_token.clone(), None, None, None, None).await;
@@ -922,8 +936,8 @@ impl LogisModel {
     pub async fn ensure_qwen3_5_lang(&self, code: &str) -> anyhow::Result<()> {
         use crate::model::lang_llm;
         {
-            let guard = self.qwen3_5_generator.lock().await;
-            if guard.is_some() && lang_llm::resident_variant().as_deref() == Some(code) {
+            let resident = self.qwen3_5_generator.lock().await.is_some() || self.qwen4_exp_generator.lock().await.is_some();
+            if resident && lang_llm::resident_variant().as_deref() == Some(code) {
                 return Ok(());
             }
         }
@@ -1023,8 +1037,15 @@ impl LogisModel {
                 return Err(anyhow!("Qwen3.5-4B-{} load timeout (900s)", code));
             }
         };
-        {
-            *self.qwen3_5_generator.lock().await = Some(gen);
+        // 🌟 [QWEN4-EXP] 로더가 config.json 으로 판별한 아키텍처에 맞는 슬롯에 둡니다.
+        match gen {
+            crate::models::qwen4_exp::TextGenerator::Qwen35(g) => {
+                *self.qwen3_5_generator.lock().await = Some(*g);
+            }
+            crate::models::qwen4_exp::TextGenerator::Qwen4Exp(g) => {
+                println!("[MODEL] 🧠 {} 는 Qwen4-Exp(qwen4_exp) 체크포인트라 Qwen4-Exp 슬롯에 둡니다.", lang_llm::repo_id(code));
+                *self.qwen4_exp_generator.lock().await = Some(*g);
+            }
         }
         lang_llm::set_resident_variant(Some(code.to_string()));
         let embed_after = self.embedding_resident().await;
@@ -1192,6 +1213,21 @@ impl LogisModel {
         }
     }
 
+    /// 🌟 [QWEN4-EXP] 언어 엔진이 Qwen4-Exp 슬롯에 있을 때 그 슬롯에서 생성하고 캐시를 비웁니다.
+    ///    호출자는 슬롯이 차 있을 때만 부르고, 비어 있으면 기존 `qwen3_5_generator` 경로로 진행합니다.
+    async fn generate_on_qwen4_exp_slot(
+        &self,
+        params: ChatCompletionParameters,
+        cancel_token: Option<Arc<AtomicBool>>,
+        ignore_list: Option<&[String]>,
+    ) -> anyhow::Result<String> {
+        let mut guard = self.qwen4_exp_generator.lock().await;
+        let gen = guard.as_mut().ok_or_else(|| anyhow!("Qwen4-Exp 언어 엔진이 슬롯에 없습니다"))?;
+        let r = gen.generate(params, cancel_token, None, None, ignore_list, None).await;
+        gen.clear_kv_cache();
+        r
+    }
+
     pub async fn generate_lang_json(
         &self,
         code: &str,
@@ -1211,7 +1247,9 @@ impl LogisModel {
             top_p: Some(0.95),
             ..Default::default()
         };
-        let raw = {
+        let raw = if self.qwen4_exp_generator.lock().await.is_some() {
+            self.generate_on_qwen4_exp_slot(params, cancel_token, ignore_list).await
+        } else {
             let mut guard = self.qwen3_5_generator.lock().await;
             let gen = guard
                 .as_mut()
@@ -1257,11 +1295,18 @@ impl LogisModel {
     pub async fn deep_purge_keep_lang(&self, doc_lang: &str) -> Option<String> {
         use crate::model::lang_llm;
         let code = lang_llm::alphaedge_code(doc_lang).map(|c| c.to_string());
-        let kept = match code.as_deref() {
-            Some(c) if lang_llm::resident_variant().as_deref() == Some(c) => self.qwen3_5_generator.lock().await.take(),
-            _ => None,
-        };
+        let resident_here = code.as_deref().is_some() && lang_llm::resident_variant().as_deref() == code.as_deref();
+        let kept = if resident_here { self.qwen3_5_generator.lock().await.take() } else { None };
+        let kept_q4 = if resident_here { self.qwen4_exp_generator.lock().await.take() } else { None };
         self.deep_purge_resources().await;
+        if let (Some(mut g), Some(c)) = (kept_q4, code.clone()) {
+            g.clear_kv_cache();
+            *self.qwen4_exp_generator.lock().await = Some(g);
+            *self.current_size.lock().await = Some(ModelSize::Qwen3_5);
+            lang_llm::set_resident_variant(Some(c.clone()));
+            self.sync_crossover_phase().await;
+            return Some(c);
+        }
         match (kept, code) {
             (Some(mut g), Some(c)) => {
                 let _ = g.clear_kv_cache();
@@ -1277,7 +1322,15 @@ impl LogisModel {
 
     pub async fn ensure_qwen3_5(&self, needs_vision: bool) -> anyhow::Result<()> {
         if crate::model::lang_llm::resident_variant().is_some() {
-            let dropped = {
+            let dropped_q4 = match self.qwen4_exp_generator.lock().await.take() {
+                Some(mut g) => {
+                    g.clear_kv_cache();
+                    drop(g);
+                    true
+                }
+                None => false,
+            };
+            let dropped_q35 = {
                 let mut guard = self.qwen3_5_generator.lock().await;
                 match guard.take() {
                     Some(mut g) => {
@@ -1288,6 +1341,7 @@ impl LogisModel {
                     None => false,
                 }
             };
+            let dropped = dropped_q4 || dropped_q35;
             crate::model::lang_llm::set_resident_variant(None);
             if dropped {
                 *self.current_size.lock().await = None;
@@ -1346,6 +1400,7 @@ impl LogisModel {
                     self.generator.lock().await.is_some()
                         || self.qwen3_generator.lock().await.is_some()
                         || self.qwen3_5_generator.lock().await.is_some()
+                        || self.qwen4_exp_generator.lock().await.is_some()
                 };
                 let keep_embedding = embed_resident
                     && !other_resident
@@ -1740,6 +1795,7 @@ impl LogisModel {
             generator: Arc::new(TokioMutex::new(None)),
             qwen3_generator: Arc::new(TokioMutex::new(None)), // 🌟 추가
             qwen3_5_generator: Arc::new(TokioMutex::new(None)),
+            qwen4_exp_generator: Arc::new(TokioMutex::new(None)),
             embedding_model: Arc::new(TokioMutex::new(None)),
             embedding_cache: Arc::new(TokioMutex::new(std::collections::HashMap::new())), // 🌟 캐시 초기화
             generation_hold: Arc::new(std::sync::atomic::AtomicU32::new(0)),

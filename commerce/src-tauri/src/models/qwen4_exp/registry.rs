@@ -5,6 +5,10 @@
 //!    `architectures` (`Qwen4ExpFor*`) 로 Qwen4-Exp 를 알아보고,
 //!  - GGUF: `general.architecture == "qwen4exp"` 를 알아봅니다 (메타데이터 규격이 아직 없으므로 명확한 미지원 오류).
 //! [`TextGenerator`] 는 Qwen3.5 / Qwen4-Exp 생성기를 같은 `generate(..)` 호출로 감쌉니다.
+//!
+//! 앱 연결: `lang_llm` 의 런타임 로더(`register_loader`) 로 [`load_lang_runtime`] 이 등록됩니다. lifecycle 의
+//! `ensure_qwen3_5_lang` 이 이 로더로 읽은 결과를 아키텍처에 맞는 슬롯(`qwen3_5_generator` / `qwen4_exp_generator`) 에
+//! 두고, `generate_lang_json` · 음차 생성이 상주한 쪽으로 호출합니다.
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -41,7 +45,12 @@ fn arch_of_value(v: &serde_json::Value) -> TextArch {
     if types.iter().any(|t| t == "qwen4_exp" || t == "qwen4_exp_text" || t.starts_with("Qwen4ExpFor")) {
         return TextArch::Qwen4Exp;
     }
-    if types.iter().any(|t| t.starts_with("qwen3_5") || t.starts_with("Qwen3_5")) {
+    let q35: Vec<&String> = types.iter().filter(|t| t.starts_with("qwen3_5") || t.starts_with("Qwen3_5")).collect();
+    // qwen3_5_moe(_text) / Qwen3_5MoeFor* 는 Qwen3.5 밀집 그래프(와 GGUF 변환기) 로 읽을 수 없습니다.
+    if let Some(moe) = q35.iter().find(|t| t.to_ascii_lowercase().contains("moe")) {
+        return TextArch::Unknown((*moe).clone());
+    }
+    if !q35.is_empty() {
         return TextArch::Qwen35;
     }
     TextArch::Unknown(types.first().cloned().unwrap_or_default())
@@ -90,18 +99,24 @@ pub enum TextGenerator {
 
 impl TextGenerator {
     /// HF 디렉터리를 아키텍처에 맞는 생성기로 읽습니다 (config.json 판별).
+    ///  - Qwen4-Exp: safetensors 를 직접 읽습니다 (`dtype` 기본: CPU F32, GPU 는 config dtype).
+    ///  - Qwen3.5: 앱이 지금 쓰는 경로 그대로 `lang_gguf::load_runtime` (Q4_K_M GGUF 변환 → `init_from_gguf`).
+    ///    `Qwen3_5GenerateModel::init` 의 safetensors 로더는 GGUF 식 텐서 이름을 기대해 HF 체크포인트를 읽지 못합니다.
+    ///    이 경로는 `dtype` 을 쓰지 않습니다.
     pub fn load_dir(model_dir: &Path, device: &Device, dtype: Option<DType>) -> Result<Self> {
+        match detect_text_arch(model_dir) {
+            TextArch::Qwen4Exp => Self::load_qwen4_exp(model_dir, device, dtype),
+            TextArch::Qwen35 => Ok(Self::Qwen35(Box::new(crate::model::lang_gguf::load_runtime(model_dir, device)?))),
+            TextArch::Unknown(t) => bail!("[QWEN4-EXP] {:?}: 지원하지 않는 텍스트 아키텍처 '{t}'", model_dir),
+        }
+    }
+
+    fn load_qwen4_exp(model_dir: &Path, device: &Device, dtype: Option<DType>) -> Result<Self> {
         let path = model_dir
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("경로를 UTF-8 로 읽을 수 없습니다: {:?}", model_dir))?;
-        match detect_text_arch(model_dir) {
-            TextArch::Qwen4Exp => {
-                println!("[QWEN4-EXP] 🔎 {:?} → Qwen4-Exp (qwen4_exp) 로 판별했습니다.", model_dir);
-                Ok(Self::Qwen4Exp(Box::new(Qwen4ExpGenerateModel::init(path, Some(device), dtype)?)))
-            }
-            TextArch::Qwen35 => Ok(Self::Qwen35(Box::new(Qwen3_5GenerateModel::init(path, Some(device), dtype)?))),
-            TextArch::Unknown(t) => bail!("[QWEN4-EXP] {:?}: 지원하지 않는 텍스트 아키텍처 '{t}'", model_dir),
-        }
+        println!("[QWEN4-EXP] 🔎 {:?} → Qwen4-Exp (qwen4_exp) 로 판별했습니다.", model_dir);
+        Ok(Self::Qwen4Exp(Box::new(Qwen4ExpGenerateModel::init(path, Some(device), dtype)?)))
     }
 
     pub fn arch(&self) -> TextArch {
@@ -145,5 +160,16 @@ impl TextGenerator {
             Self::Qwen35(g) => g.eos_token_id,
             Self::Qwen4Exp(g) => g.eos_token_id,
         }
+    }
+}
+
+/// 앱의 언어 엔진 런타임 로더 (`lang_llm::register_loader` 에 등록, `lang_llm::LangLlmLoader` 형태).
+///  - config.json 이 Qwen4-Exp 면 safetensors 를 직접 읽어 `TextGenerator::Qwen4Exp`
+///  - 그 밖(Qwen3.5 alphaedge 엔진 등) 은 지금까지와 똑같이 `lang_gguf::load_runtime` → `TextGenerator::Qwen35`
+///    (config 의 model_type 이 무엇이든 기존 동작을 바꾸지 않습니다; 변환기가 직접 판단합니다)
+pub fn load_lang_runtime(model_dir: &Path, device: &Device) -> Result<TextGenerator> {
+    match detect_text_arch(model_dir) {
+        TextArch::Qwen4Exp => TextGenerator::load_qwen4_exp(model_dir, device, None),
+        _ => Ok(TextGenerator::Qwen35(Box::new(crate::model::lang_gguf::load_runtime(model_dir, device)?))),
     }
 }

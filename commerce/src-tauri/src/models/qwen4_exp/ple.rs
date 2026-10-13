@@ -28,8 +28,8 @@ const M1: u64 = 0xBF58_476D_1CE4_E5B9;
 const M2: u64 = 0x94D0_49BB_1331_11EB;
 const PRIME_1: u64 = 10_007;
 
-/// 이 크기(바이트)를 넘는 n-gram 표는 통째로 올리지 않고 mmap 에서 행 단위로 모읍니다.
-pub(crate) fn dense_table_limit() -> usize {
+/// 기본 dense 한도 (`LoadOptions::from_env`): 이 크기(바이트)를 넘는 n-gram 표는 통째로 올리지 않고 mmap 에서 행 단위로 모읍니다.
+pub(crate) fn dense_table_limit_from_env() -> usize {
     std::env::var("LOGIS_QWEN4_PLE_DENSE_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -158,7 +158,8 @@ pub enum NgramTable {
     /// 장치에 통째로 올린 `[rows, Dh]`
     Dense(Tensor),
     /// mmap 된 safetensors 샤드에서 필요한 행만 모읍니다 (기본 설정 표는 층당 ~82 GB).
-    Mmap { st: Arc<MmapedSafetensors>, shards: Vec<(String, usize)>, dh: usize },
+    /// 모든 샤드는 같은 dtype(`st_dtype`) 이어야 합니다 (로드 시 검사).
+    Mmap { st: Arc<MmapedSafetensors>, shards: Vec<(String, usize)>, dh: usize, st_dtype: DType },
 }
 
 impl NgramTable {
@@ -169,26 +170,30 @@ impl NgramTable {
                 let idx = Tensor::from_slice(ids, ids.len(), t.device())?;
                 Ok(t.index_select(&idx, 0)?.to_dtype(dtype)?)
             }
-            NgramTable::Mmap { st, shards, dh } => {
-                let mut rows: Vec<Tensor> = Vec::with_capacity(ids.len());
+            NgramTable::Mmap { st, shards, dh, st_dtype } => {
+                // 샤드 뷰는 호출당 한 번만 찾고, 행들을 미리 잡은 바이트 버퍼 하나에 모아 텐서 하나로 만듭니다
+                // (행마다 텐서를 만들어 cat 하면 2048 토큰 청크 × G=16 에서 3 만 개가 넘는 작은 텐서가 생깁니다).
+                let mut datas: Vec<(&[u8], usize)> = Vec::with_capacity(shards.len());
+                for (name, n) in shards {
+                    datas.push((st.get(name)?.data(), *n));
+                }
+                let row_bytes = dh * st_dtype.size_in_bytes();
+                let mut buf: Vec<u8> = Vec::with_capacity(ids.len() * row_bytes);
                 for &id in ids {
                     let mut r = id as usize;
                     let mut found = None;
-                    for (name, n) in shards {
-                        if r < *n {
-                            found = Some(name);
+                    for &(data, n) in &datas {
+                        if r < n {
+                            found = Some(data);
                             break;
                         }
-                        r -= *n;
+                        r -= n;
                     }
-                    let name = found.ok_or_else(|| anyhow!("[QWEN4-EXP] n-gram 행 {id} 이 표 범위를 벗어났습니다"))?;
-                    let view = st.get(name)?;
-                    let st_dt: DType = view.dtype().try_into()?;
-                    let es = st_dt.size_in_bytes();
-                    let bytes = &view.data()[r * dh * es..(r + 1) * dh * es];
-                    rows.push(Tensor::from_raw_buffer(bytes, st_dt, &[1, *dh], &Device::Cpu)?.to_dtype(dtype)?);
+                    let data = found.ok_or_else(|| anyhow!("[QWEN4-EXP] n-gram 행 {id} 이 표 범위를 벗어났습니다"))?;
+                    buf.extend_from_slice(&data[r * row_bytes..(r + 1) * row_bytes]);
                 }
-                Ok(Tensor::cat(&rows, 0)?.to_device(device)?)
+                let t = Tensor::from_raw_buffer(&buf, *st_dtype, &[ids.len(), *dh], &Device::Cpu)?;
+                Ok(t.to_dtype(dtype)?.to_device(device)?)
             }
         }
     }
@@ -214,12 +219,14 @@ pub struct PleLayer {
 
 impl PleLayer {
     /// `prefix`: 이 층 `ple` 모듈의 전체 이름 (mmap 표에서 샤드 이름을 찾을 때 씁니다).
+    /// `dense_limit`: 원본 표 크기가 이 바이트를 넘으면 mmap 행 수집 경로 (`LoadOptions::ple_dense_limit_bytes`).
     pub fn new(
         vb: VarBuilder,
         c: &Qwen4ExpTextConfig,
         ple_idx: usize,
         st: Option<&Arc<MmapedSafetensors>>,
         prefix: &str,
+        dense_limit: usize,
     ) -> Result<Self> {
         let h = c.hidden_size;
         let hc = c.hc_count;
@@ -260,41 +267,52 @@ impl PleLayer {
 
         // ── n-gram 표: 단일 weight 또는 shard_{k}.weight 를 dim 0 으로 이어 붙인 것 ──
         let single = format!("{emb_prefix}.ngram_embedding.weight");
-        let mut shards: Vec<(String, usize)> = Vec::new();
-        let mut table_dtype_size = 4usize;
+        // (이름, 행 수, dtype, 2차원 [rows, dh] 여부)
+        let mut found: Vec<(String, usize, DType, bool)> = Vec::new();
         if let Some(st) = st {
-            if let Ok(v) = st.get(&single) {
-                shards.push((single.clone(), v.shape()[0]));
-                table_dtype_size = DType::try_from(v.dtype()).map(|d| d.size_in_bytes()).unwrap_or(4);
-            } else {
-                for k in 0..c.split_ngram_parts.max(1) {
-                    let name = format!("{emb_prefix}.ngram_embedding.shard_{k}.weight");
-                    match st.get(&name) {
-                        Ok(v) => {
-                            table_dtype_size = DType::try_from(v.dtype()).map(|d| d.size_in_bytes()).unwrap_or(4);
-                            shards.push((name, v.shape()[0]));
-                        }
-                        Err(_) => break,
+            let mut names = vec![single.clone()];
+            if st.get(&single).is_err() {
+                names = (0..c.split_ngram_parts.max(1))
+                    .map(|k| format!("{emb_prefix}.ngram_embedding.shard_{k}.weight"))
+                    .collect();
+            }
+            for name in names {
+                match st.get(&name) {
+                    Ok(v) => {
+                        let shape = v.shape().to_vec();
+                        let dt = DType::try_from(v.dtype()).unwrap_or(DType::F32);
+                        found.push((name, shape[0], dt, shape.len() == 2 && shape[1] == dh));
                     }
+                    Err(_) => break,
                 }
             }
         }
-        let rows: usize = shards.iter().map(|(_, n)| *n).sum();
+        let table_dtype = found.first().map(|f| f.2).unwrap_or(DType::F32);
+        let rows: usize = found.iter().map(|f| f.1).sum();
         let vbe = vb.pp("ple_embedding").pp("ngram_embedding");
-        let table = if st.is_some() && !shards.is_empty() && rows * dh * table_dtype_size > dense_table_limit() {
+        let table = if st.is_some() && !found.is_empty() && rows * dh * table_dtype.size_in_bytes() > dense_limit {
             ensure!(rows >= hasher.padded_rows, "[QWEN4-EXP] n-gram 표 행 {rows} < 필요 {}", hasher.padded_rows);
+            ensure!(
+                found.iter().all(|f| f.3),
+                "[QWEN4-EXP] PLE#{ple_idx} n-gram 표 샤드 모양이 [rows, {dh}] 가 아닙니다"
+            );
+            ensure!(
+                found.iter().all(|f| f.2 == table_dtype),
+                "[QWEN4-EXP] PLE#{ple_idx} n-gram 표 샤드 dtype 이 서로 다릅니다"
+            );
             println!(
                 "[QWEN4-EXP] 🧮 PLE#{ple_idx} n-gram 표 {rows}행 × {dh} ({} MB) 는 mmap 행 수집으로 씁니다.",
-                rows * dh * table_dtype_size / (1024 * 1024)
+                rows * dh * table_dtype.size_in_bytes() / (1024 * 1024)
             );
-            NgramTable::Mmap { st: st.unwrap().clone(), shards, dh }
+            let shards = found.iter().map(|f| (f.0.clone(), f.1)).collect();
+            NgramTable::Mmap { st: st.unwrap().clone(), shards, dh, st_dtype: table_dtype }
         } else if vbe.contains_tensor("weight") {
             NgramTable::Dense(vbe.get((hasher.padded_rows, dh), "weight")?)
         } else {
             let mut parts = Vec::new();
             let mut k = 0;
             while vbe.contains_tensor(&format!("shard_{k}.weight")) {
-                let n = shards.get(k).map(|s| s.1).unwrap_or(hasher.padded_rows / c.split_ngram_parts.max(1));
+                let n = found.get(k).map(|s| s.1).unwrap_or(hasher.padded_rows / c.split_ngram_parts.max(1));
                 parts.push(vbe.get((n, dh), &format!("shard_{k}.weight"))?);
                 k += 1;
             }

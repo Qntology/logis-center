@@ -50,6 +50,7 @@ impl DecoderLayer {
         idx: usize,
         st: Option<&Arc<MmapedSafetensors>>,
         prefix: &str,
+        opts: &LoadOptions,
     ) -> Result<Self> {
         let mixer = match c.layer_kind(idx) {
             LayerKind::Linear => Mixer::Linear(GatedDeltaNet::new(vb.pp("linear_attn"), c)?),
@@ -57,7 +58,7 @@ impl DecoderLayer {
         };
         let mlp = SparseMoe::new(vb.pp("mlp"), c)?;
         let ple = match c.ple_index(idx) {
-            Some(p) => Some(PleLayer::new(vb.pp("ple"), c, p, st, &format!("{prefix}.ple"))?),
+            Some(p) => Some(PleLayer::new(vb.pp("ple"), c, p, st, &format!("{prefix}.ple"), opts.ple_dense_limit_bytes)?),
             None => None,
         };
         let (hc, h, r, eps) = (c.hc_count, c.hidden_size, c.hc_lowrank, c.rms_norm_eps);
@@ -138,8 +139,34 @@ pub fn safetensors_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// 장치에 통째로 올릴 가중치 바이트 추정 (MTP/비전 제외, mmap 행 수집으로 돌릴 큰 n-gram 표 제외).
-pub fn resident_weight_bytes(st: &MmapedSafetensors, dtype: DType) -> usize {
+/// 로드 옵션. 기본값은 환경 변수(`LOGIS_QWEN4_PLE_DENSE_MB`, `LOGIS_QWEN4_MAX_RESIDENT_GB`) 를 읽습니다.
+#[derive(Debug, Clone)]
+pub struct LoadOptions {
+    /// 원본 크기가 이 바이트를 넘는 PLE n-gram 표는 장치에 올리지 않고 mmap 에서 필요한 행만 모읍니다 (기본 512 MB).
+    /// 0 이면 모든 표가 mmap 행 수집 경로를 탑니다 (테스트로 그 경로를 강제할 때).
+    pub ple_dense_limit_bytes: usize,
+    /// 장치에 통째로 올릴 가중치 추정치 상한 (기본 6 GB). 넘으면 OOM 전에 명확한 오류로 거부합니다.
+    pub max_resident_bytes: usize,
+}
+
+impl LoadOptions {
+    pub fn from_env() -> Self {
+        let gb = std::env::var("LOGIS_QWEN4_MAX_RESIDENT_GB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(6.0);
+        Self { ple_dense_limit_bytes: super::ple::dense_table_limit_from_env(), max_resident_bytes: (gb * 1e9) as usize }
+    }
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        Self::from_env()
+    }
+}
+
+/// 장치에 통째로 올릴 가중치 바이트 추정 (MTP/비전 제외, `ple_dense_limit` 을 넘어 mmap 행 수집으로 돌릴 큰 n-gram 표 제외).
+pub fn resident_weight_bytes(st: &MmapedSafetensors, dtype: DType, ple_dense_limit: usize) -> usize {
     let mut table = 0usize;
     let mut table_dst = 0usize;
     let mut rest = 0usize;
@@ -160,28 +187,25 @@ pub fn resident_weight_bytes(st: &MmapedSafetensors, dtype: DType) -> usize {
             rest += elems * dtype.size_in_bytes();
         }
     }
-    if table <= super::ple::dense_table_limit() {
+    // ple.rs 와 같은 기준: 층별 표 크기가 아니라 합계로 보수적으로 판정합니다 (표가 여럿이면 과대 추정 쪽).
+    if table <= ple_dense_limit {
         rest += table_dst;
     }
     rest
 }
 
-fn resident_cap_bytes() -> usize {
-    let gb = std::env::var("LOGIS_QWEN4_MAX_RESIDENT_GB")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(6.0);
-    (gb * 1e9) as usize
-}
-
 impl Qwen4ExpForCausalLM {
-    /// HF 디렉터리(config.json + safetensors) 를 mmap VarBuilder 로 읽습니다.
+    /// HF 디렉터리(config.json + safetensors) 를 mmap VarBuilder 로 읽습니다 (옵션은 환경 변수 기본값).
     pub fn load(dir: &Path, dtype: DType, device: &Device) -> Result<Self> {
+        Self::load_with(dir, dtype, device, &LoadOptions::from_env())
+    }
+
+    pub fn load_with(dir: &Path, dtype: DType, device: &Device, opts: &LoadOptions) -> Result<Self> {
         let cfg = Qwen4ExpTextConfig::from_file(&dir.join("config.json"))?;
         let files = safetensors_files(dir)?;
         let st = Arc::new(unsafe { MmapedSafetensors::multi(&files)? });
-        let need = resident_weight_bytes(&st, dtype);
-        let cap = resident_cap_bytes();
+        let need = resident_weight_bytes(&st, dtype, opts.ple_dense_limit_bytes);
+        let cap = opts.max_resident_bytes;
         if need > cap {
             bail!(
                 "[QWEN4-EXP] 상주 가중치 추정 {:.1} GB > 한도 {:.1} GB (LOGIS_QWEN4_MAX_RESIDENT_GB). \
@@ -191,11 +215,20 @@ impl Qwen4ExpForCausalLM {
             );
         }
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? };
-        Self::new(vb, cfg, Some(st))
+        Self::new_with(vb, cfg, Some(st), opts)
     }
 
     /// `vb` 는 체크포인트 루트. 텍스트 전용(`model.*`) 과 VLM(`model.language_model.*`) 접두사를 모두 받습니다.
     pub fn new(vb: VarBuilder, cfg: Qwen4ExpTextConfig, st: Option<Arc<MmapedSafetensors>>) -> Result<Self> {
+        Self::new_with(vb, cfg, st, &LoadOptions::from_env())
+    }
+
+    pub fn new_with(
+        vb: VarBuilder,
+        cfg: Qwen4ExpTextConfig,
+        st: Option<Arc<MmapedSafetensors>>,
+        opts: &LoadOptions,
+    ) -> Result<Self> {
         let prefix = if vb.contains_tensor("model.language_model.embed_tokens.weight") {
             "model.language_model"
         } else if vb.contains_tensor("model.embed_tokens.weight") {
@@ -212,7 +245,7 @@ impl Qwen4ExpForCausalLM {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let lp = format!("{prefix}.layers.{i}");
-            layers.push(DecoderLayer::new(vm.pp(format!("layers.{i}")), &cfg, i, st.as_ref(), &lp)?);
+            layers.push(DecoderLayer::new(vm.pp(format!("layers.{i}")), &cfg, i, st.as_ref(), &lp, opts)?);
         }
         let mixer = GatedResidual::new(
             vm.pp("hyper_connection_mixer"),
@@ -222,10 +255,14 @@ impl Qwen4ExpForCausalLM {
             cfg.rms_norm_eps,
             false,
         )?;
-        let lm_head = if !cfg.tie_embeddings() && vb.contains_tensor("lm_head.weight") {
+        // 묶인(tied) 경우에만 embed_tokens 를 LM head 로 씁니다. 묶이지 않았는데 lm_head.weight 가 없으면
+        // 잘린/접두사가 틀린 체크포인트이므로 엉뚱한 출력 투영으로 생성하지 않고 거부합니다.
+        let lm_head = if cfg.tie_embeddings() {
+            Linear::new(emb_w, None)
+        } else if vb.contains_tensor("lm_head.weight") {
             Linear::new(vb.get((v, h), "lm_head.weight")?, None)
         } else {
-            Linear::new(emb_w, None)
+            bail!("[QWEN4-EXP] lm_head.weight 없음 (tie_word_embeddings=false). 체크포인트가 잘렸거나 접두사가 다릅니다.");
         };
         let rope = RopeTable::new(cfg.rope_theta(), cfg.rotary_dim(), dtype, &device);
         println!(

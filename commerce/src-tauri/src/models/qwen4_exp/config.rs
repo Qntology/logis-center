@@ -105,6 +105,9 @@ pub struct Qwen4ExpTextConfig {
     pub attention_bias: bool,
     #[serde(default)]
     pub rope_parameters: Option<Value>,
+    /// 구버전 키 (transformers 4.x). `rope_type`/`type` 만 검사에 씁니다.
+    #[serde(default)]
+    pub rope_scaling: Option<Value>,
     #[serde(default)]
     pub rope_theta: Option<f64>,
     #[serde(default)]
@@ -254,6 +257,20 @@ impl Qwen4ExpTextConfig {
             }
         }
         self.gate_act()?;
+        // 전문가·공유 전문가 MLP 와 GDN causal conv 는 HF 에서 `ACT2FN[hidden_act]` 입니다. 포트는 SiLU 로 구현했으므로
+        // 다른 활성 함수는 조용히 틀린 출력을 내지 않도록 거부합니다.
+        if !matches!(self.hidden_act.as_str(), "silu" | "swish") {
+            bail!(
+                "[QWEN4-EXP] hidden_act '{}' 는 지원하지 않습니다 (전문가/공유 전문가/GDN conv 가 SiLU 로 구현됨)",
+                self.hidden_act
+            );
+        }
+        // HF 는 rope_type 이 "default" 가 아니면 ROPE_INIT_FUNCTIONS[rope_type] (yarn/linear/dynamic ...) 으로
+        // inv_freq 와 attention_scaling 을 바꿉니다. RopeTable 은 기본 RoPE 만 만들므로 나머지는 거부합니다.
+        let rt = self.rope_type();
+        if rt != "default" {
+            bail!("[QWEN4-EXP] rope_type '{rt}' 는 아직 지원하지 않습니다 (기본 RoPE 만 구현)");
+        }
         if self.hc_count <= 1 {
             bail!("[QWEN4-EXP] hc_count > 1 이어야 합니다 (현재 {})", self.hc_count);
         }
@@ -366,11 +383,12 @@ impl Qwen4ExpTextConfig {
         (self.head_dim() as f64 * self.partial_rotary_factor()) as usize
     }
 
+    /// `rope_parameters` → 구버전 `rope_scaling` 순으로 `rope_type` (또는 레거시 `type`) 을 읽습니다. 없으면 "default".
     pub fn rope_type(&self) -> String {
-        self.rope_parameters
-            .as_ref()
-            .and_then(|v| v.get("rope_type"))
-            .and_then(|v| v.as_str())
+        [self.rope_parameters.as_ref(), self.rope_scaling.as_ref()]
+            .into_iter()
+            .flatten()
+            .find_map(|v| v.get("rope_type").or_else(|| v.get("type")).and_then(|t| t.as_str()))
             .unwrap_or("default")
             .to_string()
     }

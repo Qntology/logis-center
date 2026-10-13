@@ -9,6 +9,8 @@
 //! `ref.safetensors`: input_ids, schedule(증분 청크), full_logits(한 번에), inc_logits(프리필+증분, HF 캐시),
 //! hidden_{i}(층 출력), mixer, ngram_ids_{i}(PLE), qsa_mask_{i}(QSA 선택 마스크).
 //! 판정: max |Δlogit| ≤ 1e-4 (전체·증분 모두), argmax 일치 100 %, QSA 선택 마스크·n-gram id 완전 일치.
+//! PLE n-gram 표는 dense(장치 상주) 경로와 mmap 행 수집 경로(전체 크기 모델이 쓰는 경로, `ple_dense_limit_bytes = 0`)
+//! 둘 다 같은 기준으로 검사합니다. 앱 등록 경로(`lang_llm` 로더 = `registry::load_lang_runtime`) 도 확인합니다.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,7 +20,7 @@ use serde_json::json;
 
 use crate::common::TempDir;
 use tauri_app_lib::models::qwen4_exp::config::LayerKind;
-use tauri_app_lib::models::qwen4_exp::model::Mixer;
+use tauri_app_lib::models::qwen4_exp::model::{LoadOptions, Mixer};
 use tauri_app_lib::models::qwen4_exp::ple::{splitmix64, NgramHasher};
 use tauri_app_lib::models::qwen4_exp::qsa::selection_mask;
 use tauri_app_lib::models::qwen4_exp::{
@@ -77,11 +79,35 @@ struct Report {
     mixer_diff: f32,
 }
 
+/// dense 표 경로 (픽스처 표는 수십 KB 라 항상 장치에 올라갑니다)
+fn dense_opts() -> LoadOptions {
+    LoadOptions { ple_dense_limit_bytes: 512 * 1024 * 1024, max_resident_bytes: 6_000_000_000 }
+}
+
+/// mmap 행 수집 경로 강제 (전체 크기 모델의 ~82 GB/층 표가 쓰는 경로)
+fn mmap_opts() -> LoadOptions {
+    LoadOptions { ple_dense_limit_bytes: 0, max_resident_bytes: 6_000_000_000 }
+}
+
 /// 한 변형을 주어진 장치에서 돌려 HF 기준과 비교합니다.
-fn run_variant(variant: &str, device: &Device) -> anyhow::Result<Report> {
+fn run_variant(variant: &str, device: &Device, opts: &LoadOptions) -> anyhow::Result<Report> {
     let dir = fixture(variant);
     let rf = load_ref(&dir)?;
-    let mut model = Qwen4ExpForCausalLM::load(&dir, DType::F32, device)?;
+    let mut model = Qwen4ExpForCausalLM::load_with(&dir, DType::F32, device, opts)?;
+    let mmap_tables = model.layers.iter().filter_map(|l| l.ple.as_ref()).filter(|p| p.is_mmap_table()).count();
+    let ple_layers = model.layers.iter().filter(|l| l.ple.is_some()).count();
+    if opts.ple_dense_limit_bytes == 0 {
+        assert_eq!(mmap_tables, ple_layers, "[{variant}] mmap 경로가 강제되지 않았습니다");
+    } else {
+        assert_eq!(mmap_tables, 0, "[{variant}] 작은 표가 mmap 경로로 갔습니다");
+    }
+    // QSA 선택 결과는 기본으로 버립니다 (긴 프리필 메모리). 검증용으로만 켭니다.
+    for layer in model.layers.iter_mut() {
+        if let Mixer::Qsa(a) = &mut layer.mixer {
+            assert!(!a.record_selection, "record_selection 기본값은 false 여야 합니다");
+            a.record_selection = true;
+        }
+    }
     let n = rf.ids.len();
     let ids = Tensor::from_slice(rf.ids.as_slice(), (1, n), device)?;
 
@@ -136,9 +162,10 @@ fn run_variant(variant: &str, device: &Device) -> anyhow::Result<Report> {
 
     let rep = Report { full_diff, full_agree, inc_diff, inc_agree, layer_diffs, mixer_diff };
     println!(
-        "[QWEN4-EXP] {:>9} on {:?}: full |Δ| {:.3e} (argmax {:.1}%) · incremental |Δ| {:.3e} (argmax {:.1}%) · port full↔inc {:.3e} · layers {:?} · mixer {:.3e}",
+        "[QWEN4-EXP] {:>9} on {:?} (PLE 표 {}): full |Δ| {:.3e} (argmax {:.1}%) · incremental |Δ| {:.3e} (argmax {:.1}%) · port full↔inc {:.3e} · layers {:?} · mixer {:.3e}",
         if variant.is_empty() { "variant_a" } else { variant },
         device.location(),
+        if mmap_tables > 0 { "mmap 행 수집" } else { "dense" },
         rep.full_diff,
         rep.full_agree * 100.0,
         rep.inc_diff,
@@ -246,16 +273,70 @@ fn qwen4_exp_config_parsing() -> R {
 
     // 상주 가중치 추정 (전체 크기 모델을 통째로 올리려다 OOM 나기 전에 막는 가드의 입력)
     let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(fixture("").join("model.safetensors"))? };
-    let bytes = tauri_app_lib::models::qwen4_exp::model::resident_weight_bytes(&st, DType::F32);
+    let limit = dense_opts().ple_dense_limit_bytes;
+    let bytes = tauri_app_lib::models::qwen4_exp::model::resident_weight_bytes(&st, DType::F32, limit);
     let file = std::fs::metadata(fixture("").join("model.safetensors"))?.len() as usize;
     assert!(bytes <= file && bytes + 64 * 1024 > file, "추정 {bytes} vs 파일 {file}");
-    assert_eq!(tauri_app_lib::models::qwen4_exp::model::resident_weight_bytes(&st, DType::BF16) * 2, bytes);
+    assert_eq!(tauri_app_lib::models::qwen4_exp::model::resident_weight_bytes(&st, DType::BF16, limit) * 2, bytes);
+    // mmap 행 수집으로 돌릴 표는 상주 추정에서 빠집니다.
+    let without_tables = tauri_app_lib::models::qwen4_exp::model::resident_weight_bytes(&st, DType::F32, 0);
+    assert!(without_tables < bytes, "{without_tables} vs {bytes}");
     // rotary_dim(256) > indexer_head_dim(128) 은 HF 와 같이 거부
     assert!(Qwen4ExpTextConfig::from_value(&json!({
         "num_hidden_layers": 4, "indexer_n_heads": 4, "indexer_kv_heads": 1, "indexer_head_dim": 64,
         "indexer_budget": 8, "indexer_compress_ratio": 4
     }))
     .is_err());
+
+    // 포트가 구현하지 않은 변형은 조용히 틀린 logits 대신 명확한 오류로 거부합니다.
+    let base = json!({
+        "num_hidden_layers": 4, "indexer_n_heads": 4, "indexer_kv_heads": 1, "indexer_head_dim": 256,
+        "indexer_budget": 8, "indexer_compress_ratio": 4
+    });
+    let with = |k: &str, v: serde_json::Value| {
+        let mut c = base.clone();
+        c[k] = v;
+        Qwen4ExpTextConfig::from_value(&c)
+    };
+    assert!(Qwen4ExpTextConfig::from_value(&base).is_ok());
+    let yarn = with("rope_parameters", json!({"rope_type": "yarn", "factor": 4.0, "rope_theta": 1.0e7}));
+    assert!(yarn.unwrap_err().to_string().contains("rope_type 'yarn'"));
+    assert!(with("rope_scaling", json!({"type": "linear", "factor": 2.0})).is_err(), "구버전 rope_scaling.type");
+    assert!(with("rope_parameters", json!({"rope_type": "default", "rope_theta": 1.0e7})).is_ok());
+    let gelu = with("hidden_act", json!("gelu"));
+    assert!(gelu.unwrap_err().to_string().contains("hidden_act 'gelu'"));
+    // hidden_act 가 gelu 여도 output_gate_type 이 있으면 HF 검증은 통과하지만, 전문가/conv 는 gelu 라 포트는 거부해야 합니다.
+    let mut gated = base.clone();
+    gated["hidden_act"] = json!("gelu");
+    gated["output_gate_type"] = json!("sigmoid");
+    assert!(Qwen4ExpTextConfig::from_value(&gated).is_err());
+    assert!(with("hidden_act", json!("swish")).is_ok());
+    Ok(())
+}
+
+/// tie_word_embeddings=false 인데 lm_head.weight 가 없는 체크포인트는 embed_tokens 로 대신하지 않고 거부합니다.
+#[test]
+fn qwen4_exp_missing_lm_head_is_rejected() -> R {
+    let td = TempDir::new("qwen4_exp_nolmhead");
+    let dir = td.path();
+    std::fs::copy(fixture("").join("config.json"), dir.join("config.json"))?;
+    let mut ts = candle_core::safetensors::load(fixture("").join("model.safetensors"), &Device::Cpu)?;
+    assert!(ts.remove("lm_head.weight").is_some());
+    candle_core::safetensors::save(&ts, dir.join("model.safetensors"))?;
+    let err = match Qwen4ExpForCausalLM::load_with(dir, DType::F32, &Device::Cpu, &dense_opts()) {
+        Ok(_) => panic!("lm_head.weight 없는 체크포인트가 로드되었습니다"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("lm_head.weight"), "{err}");
+
+    // 묶인(tied) 설정이면 embed_tokens 를 LM head 로 씁니다.
+    let mut cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(fixture("").join("config.json"))?)?;
+    cfg["tie_word_embeddings"] = json!(true);
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&cfg)?)?;
+    let mut m = Qwen4ExpForCausalLM::load_with(dir, DType::F32, &Device::Cpu, &dense_opts())?;
+    let ids = Tensor::from_slice(&[5u32, 9, 11], (1, 3), &Device::Cpu)?;
+    let logits = m.forward(&ids, 0)?;
+    assert_eq!(logits.dims(), &[1, 3, 512]);
     Ok(())
 }
 
@@ -263,7 +344,18 @@ fn qwen4_exp_config_parsing() -> R {
 fn qwen4_exp_tiny_cpu_matches_hf() -> R {
     let dev = Device::Cpu;
     for v in ["", "variant_b"] {
-        let r = run_variant(v, &dev)?;
+        let r = run_variant(v, &dev, &dense_opts())?;
+        assert_report(if v.is_empty() { "variant_a" } else { v }, &r);
+    }
+    Ok(())
+}
+
+/// PLE n-gram 표를 mmap 행 수집 경로로 강제해도 (전체 크기 모델이 타는 경로) HF 기준과 같아야 합니다.
+#[test]
+fn qwen4_exp_tiny_cpu_mmap_ple_matches_hf() -> R {
+    let dev = Device::Cpu;
+    for v in ["", "variant_b"] {
+        let r = run_variant(v, &dev, &mmap_opts())?;
         assert_report(if v.is_empty() { "variant_a" } else { v }, &r);
     }
     Ok(())
@@ -279,9 +371,11 @@ fn qwen4_exp_tiny_cuda_matches_hf() -> R {
             return Ok(());
         }
     };
-    for v in ["", "variant_b"] {
-        let r = run_variant(v, &dev)?;
-        assert_report(if v.is_empty() { "variant_a" } else { v }, &r);
+    for opts in [dense_opts(), mmap_opts()] {
+        for v in ["", "variant_b"] {
+            let r = run_variant(v, &dev, &opts)?;
+            assert_report(if v.is_empty() { "variant_a" } else { v }, &r);
+        }
     }
     let agree = bf16_top1(&dev)?;
     assert!(agree >= 0.75, "CUDA BF16 top-1 일치율 {agree}");
@@ -337,9 +431,29 @@ fn qwen4_exp_registered_as_text_generator() -> R {
     let q35 = TempDir::new("qwen4_exp_q35cfg");
     std::fs::write(q35.path().join("config.json"), r#"{"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text"}}"#)?;
     assert_eq!(detect_text_arch(q35.path()), TextArch::Qwen35);
+    // Qwen3.5 MoE 는 밀집 Qwen3.5 그래프/변환기로 읽을 수 없으므로 미지원으로 판별합니다.
+    let moe = TempDir::new("qwen4_exp_q35moe");
+    std::fs::write(
+        moe.path().join("config.json"),
+        r#"{"model_type":"qwen3_5_moe","architectures":["Qwen3_5MoeForConditionalGeneration"],"text_config":{"model_type":"qwen3_5_moe_text"}}"#,
+    )?;
+    assert_eq!(detect_text_arch(moe.path()), TextArch::Unknown("qwen3_5_moe".to_string()));
+    let err = match TextGenerator::load_dir(moe.path(), &Device::Cpu, None) {
+        Ok(_) => panic!("qwen3_5_moe 가 로드되었습니다"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("qwen3_5_moe"), "{err}");
     // qwen35 GGUF 변환 경로는 Qwen4-Exp 체크포인트를 거부해야 합니다.
     let err = tauri_app_lib::model::lang_gguf::prepare(dir, &|_, _| {}).unwrap_err().to_string();
     assert!(err.contains("Qwen4-Exp"), "{err}");
+
+    // 앱의 실제 로드 경로: lib.rs run() 이 lang_llm::register_loader 로 등록하는 로더 (lifecycle 의
+    // ensure_qwen3_5_lang 이 이 로더로 읽어 qwen4_exp_generator 슬롯에 둡니다). 타입이 LangLlmLoader 와 맞아야 합니다.
+    let app_loader: tauri_app_lib::model::lang_llm::LangLlmLoader =
+        tauri_app_lib::models::qwen4_exp::registry::load_lang_runtime;
+    let via_app = app_loader(dir, &Device::Cpu)?;
+    assert_eq!(via_app.arch(), TextArch::Qwen4Exp, "lang_llm 로더가 Qwen4-Exp 를 Qwen3.5 GGUF 경로로 보냈습니다");
+    drop(via_app);
 
     let mut gen = TextGenerator::load_dir(dir, &Device::Cpu, Some(DType::F32))?;
     assert_eq!(gen.arch(), TextArch::Qwen4Exp);

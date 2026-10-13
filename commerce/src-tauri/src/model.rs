@@ -35,6 +35,9 @@ pub struct LogisModel {
     pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, 
     pub qwen3_generator: Arc<TokioMutex<Option<Qwen3GenerateModel>>>, 
     pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>,
+    /// 🌟 [QWEN4-EXP] 언어 엔진 슬롯이 Qwen4-Exp 체크포인트를 읽었을 때 쓰는 자리 (`qwen3_5_generator` 와 동시에 차지 않음).
+    ///    `lang_llm::resident_variant()` 가 가리키는 엔진이 이 슬롯 또는 `qwen3_5_generator` 에 있습니다.
+    pub qwen4_exp_generator: Arc<TokioMutex<Option<crate::models::qwen4_exp::Qwen4ExpGenerateModel>>>,
     
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     pub embedding_cache: Arc<TokioMutex<std::collections::HashMap<String, Vec<f32>>>>,
@@ -330,7 +333,7 @@ impl LogisModel {
     pub async fn resident_generation_cost_mb(&self) -> u64 {
         let qwen = self.generator.lock().await.is_some();
         let qwen3 = self.qwen3_generator.lock().await.is_some();
-        let qwen3_5 = self.qwen3_5_generator.lock().await.is_some();
+        let qwen3_5 = self.qwen3_5_generator.lock().await.is_some() || self.qwen4_exp_generator.lock().await.is_some();
         let mut total = 0u64;
         if qwen {
             total += Self::measured_generation_mb(0);
@@ -386,6 +389,7 @@ impl LogisModel {
         self.generator.lock().await.is_some()
             || self.qwen3_generator.lock().await.is_some()
             || self.qwen3_5_generator.lock().await.is_some()
+            || self.qwen4_exp_generator.lock().await.is_some()
     }
 
     /// 🌟 실제 슬롯 상태를 읽어 페이즈 원장을 사실과 일치시킵니다.

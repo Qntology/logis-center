@@ -195,7 +195,10 @@ pub struct QsaAttention {
     hd: usize,
     scale: f64,
     kv: KvCache, // [B, nKV, L, hd]
-    /// 마지막 forward 의 선택 결과 (검증/진단용)
+    /// true 일 때만 마지막 forward 의 선택 결과를 `last_selection` 에 남깁니다 (검증/진단용, 기본 false).
+    /// 긴 프리필에서는 행마다 (budget+C) 개 위치를 들고 있어 층당 수십 MB 가 되므로 평소에는 버립니다.
+    pub record_selection: bool,
+    /// 마지막 forward 의 선택 결과 (`record_selection` 이 켜졌을 때만 채움)
     pub last_selection: Vec<Vec<RowSelection>>,
 }
 
@@ -218,6 +221,7 @@ impl QsaAttention {
             hd,
             scale: (hd as f64).powf(-0.5),
             kv: KvCache::new(2, KV_GROW),
+            record_selection: false,
             last_selection: Vec::new(),
         })
     }
@@ -266,21 +270,29 @@ impl QsaAttention {
         let mut outs = Vec::with_capacity(bsz);
         for bi in 0..bsz {
             let qb = q.narrow(0, bi, 1)?;
-            let kb = k_all.narrow(0, bi, 1)?.contiguous()?;
-            let vb = v_all.narrow(0, bi, 1)?.contiguous()?;
             let rows = &sel[bi];
             let o = if t == 1 {
                 // 디코드: 선택 위치만 모아 마스크 없이 softmax (마스크 softmax 와 정확히 같음).
                 match &rows[0] {
-                    RowSelection::Dense => self.attend(&qb, &kb, &vb, None)?,
+                    RowSelection::Dense => {
+                        let kb = k_all.narrow(0, bi, 1)?.contiguous()?;
+                        let vb = v_all.narrow(0, bi, 1)?.contiguous()?;
+                        self.attend(&qb, &kb, &vb, None)?
+                    }
                     RowSelection::Sparse(idx) => {
+                        // 캐시 뷰(`narrow`, 비연속)를 통째로 복사하지 않고, 용량 버퍼 `[B, nKV, cap, hd]`(연속) 의
+                        // 배치 행에서 선택된 budget+C-1 개 위치만 index_select 로 모읍니다 (선택 위치 < 현재 길이 ≤ cap).
                         let ids = Tensor::from_slice(idx.as_slice(), idx.len(), m.device())?;
-                        let ks = kb.index_select(&ids, 2)?;
-                        let vs = vb.index_select(&ids, 2)?;
+                        let kbuf = self.kv.k_cache().all_data().as_ref().expect("kv appended");
+                        let vbuf = self.kv.v_cache().all_data().as_ref().expect("kv appended");
+                        let ks = kbuf.narrow(0, bi, 1)?.index_select(&ids, 2)?;
+                        let vs = vbuf.narrow(0, bi, 1)?.index_select(&ids, 2)?;
                         self.attend(&qb, &ks, &vs, None)?
                     }
                 }
             } else {
+                let kb = k_all.narrow(0, bi, 1)?.contiguous()?;
+                let vb = v_all.narrow(0, bi, 1)?.contiguous()?;
                 let mut tiles = Vec::new();
                 let mut r0 = 0;
                 while r0 < t {
@@ -294,7 +306,9 @@ impl QsaAttention {
             };
             outs.push(o);
         }
-        self.last_selection = sel;
+        if self.record_selection {
+            self.last_selection = sel;
+        }
         let attn = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? }; // [B, nH, T, hd]
         let attn = attn.transpose(1, 2)?.reshape((bsz, t, self.n_heads * self.hd))?;
         let attn = (attn * sigmoid(&gate)?)?;
