@@ -44,3 +44,5 @@ mod app_scheduler;
 mod app_model;
 // 임베딩 처리량 · NMS 배틀 가속 (전역 캐시 · NVML 핸들 · 프리패치 동치 · 배치 순전파 GPU 대조)
 mod app_embed;
+// 메모리 수명주기 · KV 계획 v2 (증분 가격 · 비례 여유 · 히스테리시스 · F16 원본 KV · 공유 장치 해제)
+mod mem_lifecycle;

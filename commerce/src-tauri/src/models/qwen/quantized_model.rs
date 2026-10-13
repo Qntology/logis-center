@@ -2518,16 +2518,7 @@ impl QuantizedQwenVLTextModel {
         // 레이어마다(= 토큰당 28회) 호출하면 다음 접근에서 페이지 폴트가 다시 발생해
         // 메모리는 안 줄고 속도만 떨어집니다. 프리필 경계에서만 수행합니다.
         if !is_decoding {
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            }
-            #[cfg(target_os = "linux")]
-            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-            #[cfg(target_os = "macos")]
-            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            crate::utils::legacy_working_set_trim(); // 🌟 [RAM-SAWTOOTH] 기본은 작업 집합을 내쫓지 않습니다 (LOGIS_MEM_TRIM=legacy)
         }
 
         Ok(next_xs)
@@ -2968,16 +2959,7 @@ impl QuantizedQwenVLTextModel {
 
         
         if !is_decoding {
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            }
-            #[cfg(target_os = "linux")]
-            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-            #[cfg(target_os = "macos")]
-            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            crate::utils::legacy_working_set_trim(); // 🌟 [RAM-SAWTOOTH] 기본은 작업 집합을 내쫓지 않습니다 (LOGIS_MEM_TRIM=legacy)
         }
 
         Ok(final_output)
@@ -3375,16 +3357,7 @@ impl QuantizedQwenVLModel {
 
     /// 🌟 [VISION-JIT] 텍스트 모델과 동일한 OS 레벨 강제 메모리 반환 루틴
     fn force_memory_release() {
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-        #[cfg(target_os = "macos")]
-        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+        crate::utils::legacy_working_set_trim(); // 🌟 [RAM-SAWTOOTH] 기본은 작업 집합을 내쫓지 않습니다 (LOGIS_MEM_TRIM=legacy)
     }
     
     fn get_vision_features(&self, pixel_values: &Tensor, image_grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {

@@ -333,6 +333,7 @@ impl Qwen3_5GenerateModel {
         let video_grid_thw: Option<&Tensor> = video_grid_thw.as_ref();
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
+        self.qwen3_5.language_model.set_planned_decode_tokens(sample_len as usize); // 🌟 [KV-PLAN v2] KV 여유 토큰 = 실제 max_tokens
         
         let mut cur_pixel_values = pixel_values;
         let mut cur_pixel_values_video = pixel_values_video;
@@ -698,6 +699,7 @@ impl Qwen3_5GenerateModel {
         
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
+        self.qwen3_5.language_model.set_planned_decode_tokens(sample_len as usize); // 🌟 [KV-PLAN v2] KV 여유 토큰 = 실제 max_tokens
 
         let (mut input_ids, mut seqlen_offset, mut cur_pixel_values, mut cur_image_thw, mut cur_pixel_values_video, mut cur_video_thw) = if !is_continuation {
 
