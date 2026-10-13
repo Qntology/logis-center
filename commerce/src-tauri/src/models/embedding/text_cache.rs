@@ -221,22 +221,36 @@ impl TextEmbedCache {
             return;
         }
         let need = g.lru_len - target;
-        let mut ages: Vec<(u64, u64, String)> = Vec::with_capacity(g.lru_len);
-        for (sp, m) in g.spaces.iter() {
-            for (k, e) in m.iter() {
-                if !e.pinned {
-                    ages.push((e.tick, *sp, k.clone()));
-                }
-            }
+        // 키 문자열을 복제하지 않습니다: LRU 시각(u64)만 모아 need 번째 시각을 경계로 잡고,
+        // 경계보다 오래된 것은 모두, 경계와 같은 시각은 모자란 만큼만 제자리에서 지웁니다.
+        let mut ticks: Vec<u64> = Vec::with_capacity(g.lru_len);
+        for m in g.spaces.values() {
+            ticks.extend(m.values().filter(|e| !e.pinned).map(|e| e.tick));
         }
-        ages.sort_unstable_by_key(|(t, _, _)| *t);
+        if ticks.is_empty() {
+            return;
+        }
+        let need = need.min(ticks.len());
+        let (_, cut, _) = ticks.select_nth_unstable(need - 1);
+        let cut = *cut;
+        let older = ticks.iter().filter(|&&t| t < cut).count();
+        drop(ticks);
+        let mut ties_left = need - older;
         let mut removed = 0usize;
-        for (_, sp, k) in ages.into_iter().take(need) {
-            if let Some(m) = g.spaces.get_mut(&sp) {
-                if m.remove(&k).is_some() {
-                    removed += 1;
+        for m in g.spaces.values_mut() {
+            m.retain(|_, e| {
+                if e.pinned || e.tick > cut {
+                    return true;
                 }
-            }
+                if e.tick == cut {
+                    if ties_left == 0 {
+                        return true;
+                    }
+                    ties_left -= 1;
+                }
+                removed += 1;
+                false
+            });
         }
         g.spaces.retain(|_, m| !m.is_empty());
         g.lru_len -= removed;

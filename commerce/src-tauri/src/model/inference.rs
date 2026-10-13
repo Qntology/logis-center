@@ -438,6 +438,9 @@ impl crate::model::LogisModel {
             return;
         }
         LAST_TRIM_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        // 🌟 [EMBED-CACHE] RAM 비상(저수위 미만): 질의 텍스트 LRU 계층을 비웁니다.
+        //    뱅크 구(고정 계층)는 남기므로 다음 검색의 뱅크 재계산은 생기지 않습니다.
+        let dropped = crate::models::embedding::text_cache::GRANITE_TEXT_CACHE.drop_lru_tier();
         crate::model::release_os_working_set();
         let (free_now, _) = crate::model::ram_snapshot();
         crate::utils::score_dynamics::record_baseline(
@@ -446,10 +449,11 @@ impl crate::model::LogisModel {
         );
         let cache = crate::models::embedding::text_cache::GRANITE_TEXT_CACHE.stats();
         println!(
-            "[MODEL] 🧠 [RAM WATCH / EMBED] 실연산 {}건 직전 {} → 저수위 {}MB 미만이라 작업 집합 반환 후 여유 {}MB | 임베딩 장치 {} · 임베딩 캐시 {}건(고정 {}) | 반환은 10초에 한 번까지 (SDS 는 매번 기록)",
+            "[MODEL] 🧠 [RAM WATCH / EMBED] 실연산 {}건 직전 {} → 저수위 {}MB 미만이라 임베딩 캐시 LRU {}건 비움 + 작업 집합 반환 후 여유 {}MB | 임베딩 장치 {} · 임베딩 캐시 {}건(고정 {}) | 반환은 10초에 한 번까지 (SDS 는 매번 기록)",
             texts,
             crate::model::ram_pressure_line(avail, total),
             low_water / 1_000_000,
+            dropped,
             free_now / 1_000_000,
             if self.is_cpu_mode { "CPU(가중치가 RAM 에 있음)" } else { "GPU(가중치가 VRAM 에 있음)" },
             cache.entries,
@@ -478,8 +482,9 @@ impl crate::model::LogisModel {
             let guard = embedding_model_arc.blocking_lock();
             if let Some(model) = guard.as_ref() {
                 if model.batched_enabled() {
-                    // 🌟 [EMBED-BATCHED] 1건이면 패딩 없는 1행 배치 = per-text 와 같은 연산열입니다.
-                    //    캐시 공간이 배치 경로와 같아야 하므로 같은 함수를 거칩니다.
+                    // 🌟 [EMBED-BATCHED] 1건도 배치와 같은 고정 모양 마이크로배치를 거칩니다.
+                    //    그래서 단건으로 구한 벡터와 어떤 배치 안에서 구한 벡터가 비트 단위로 같고,
+                    //    캐시 공간도 배치 경로와 같습니다.
                     let mut v = model
                         .embed_many(std::slice::from_ref(&text_clone), &crate::models::embedding::BatchOpts::default())
                         .map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;

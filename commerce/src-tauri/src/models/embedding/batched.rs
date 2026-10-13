@@ -17,13 +17,20 @@
 //        B(L) = min(max_rows, token_budget / L, attn_budget / L²)
 //   ④ 각 마이크로배치의 정규화 벡터 [B, 384] 는 GPU 에 모아 두고
 //      호출당 한 번만 D2H 합니다(커널 발사가 비동기라 다음 배치 준비와 겹칩니다).
-//   ⑤ 행이 1개뿐인 마이크로배치는 패딩 없이 per-text 와 똑같은 연산열로 돌립니다.
-//      그래서 단건 호출(get_embedding)은 기존 embed() 와 비트 단위로 같습니다.
+//   ⑤ 🌟 [EMBED-BATCHED / FIXED-SHAPE] 모든 마이크로배치는 항상 B(L) 행 × L 토큰
+//      고정 모양으로 돌립니다. 모자란 행은 첫 행의 복사본(더미)으로 채우고 출력은 버립니다.
+//      단건 호출도, 1행만 남은 그룹도 같은 모양을 거칩니다. 패딩 버킷(L>64)은 구성원이
+//      우연히 모두 버킷 길이여도 항상 마스크 경로로 돌립니다.
+//      그래서 한 텍스트의 벡터는 그 텍스트(청크) 만의 함수이고, 같은 호출에 어떤
+//      텍스트가 함께 들어왔는지, 먼저 캐시한 쪽이 어느 호출이었는지와 무관합니다
+//      (고정 모양이면 GEMM 커널 선택이 같고, 행 사이 연산이 섞이지 않습니다).
+//      B(L)·L ≤ token_budget(기본 1024) 이라 단건 호출의 연산량도 1024 토큰 이하입니다.
 //
 //  ── 정확도 ──
 //   cuBLAS GEMM 은 M = B·L 과 M = L 에서 다른 커널(또는 split-K)을 고를 수 있어
 //   BF16 1ulp 수준 차이가 날 수 있습니다. 패딩 버킷은 softmax / attn·V 의 리덕션
-//   길이가 달라집니다. 그래서 이 경로는 별도 캐시 공간(FORWARD_TAG_BATCHED)을 쓰고,
+//   길이가 달라집니다. 그래서 per-text 와는 비트 단위로 같지 않으며,
+//   이 경로는 별도 캐시 공간(FORWARD_TAG_BATCHED)을 쓰고,
 //   tests/it/app_embed.rs 의 GPU 검증(최소 코사인 · 최대 절대차)으로 확인합니다.
 //   LOGIS_EMBED_BATCHED=0 이면 기존 per-text 경로로 돌아갑니다.
 // =====================================================================
@@ -53,7 +60,7 @@ impl Default for BatchOpts {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|v| *v >= 64)
-            .unwrap_or(4096);
+            .unwrap_or(1024);
         Self { token_budget, attn_budget: 1 << 19, max_rows: 256, exact_len_max: 64, pad_step: 32 }
     }
 }
@@ -108,13 +115,7 @@ impl EmbeddingModel {
         if texts.is_empty() {
             return Ok((Vec::new(), stats));
         }
-        // ⑤ 단건 호출(get_embedding)은 per-text embed() 그대로 — 512 토큰을 넘는 텍스트의
-        //    두 청크가 같은 버킷에 들어가 패딩 배치가 되는 경우까지 포함해 항상 비트 단위로 같습니다.
-        if texts.len() == 1 {
-            let v = self.embed(&texts[0])?;
-            stats.micro_batches = 1;
-            return Ok((vec![v], stats));
-        }
+        // ⑤ 단건 호출도 지름길 없이 아래의 고정 모양 마이크로배치를 그대로 거칩니다.
 
         // ── 1. 토큰화 (embed() 와 같은 encode(text, true) · 텍스트별로) ──
         let mut seqs: Vec<Seq> = Vec::new();
@@ -144,23 +145,12 @@ impl EmbeddingModel {
         let mut order: Vec<usize> = Vec::with_capacity(seqs.len());
         for (&blen, members) in buckets.iter() {
             let rows = opts.rows_for(blen);
+            let exact = blen <= opts.exact_len_max;
             for group in members.chunks(rows) {
-                let pooled = match self.forward_group(&seqs, group, blen, &mut stats) {
-                    Ok(t) => t,
-                    Err(e) if group.len() > 1 => {
-                        // OOM 등: 이 그룹만 행 단위(per-text 와 같은 연산열)로 다시 돌립니다.
-                        println!(
-                            "[EMBED-BATCHED] ⚠️ 마이크로배치 {}행 × {}토큰 실패({}). 이 그룹만 1행씩 다시 계산합니다.",
-                            group.len(), blen, e
-                        );
-                        let mut parts = Vec::with_capacity(group.len());
-                        for si in group {
-                            parts.push(self.forward_group(&seqs, std::slice::from_ref(si), blen, &mut stats)?);
-                        }
-                        Tensor::cat(&parts, 0)?
-                    }
-                    Err(e) => return Err(e),
-                };
+                // 실패(OOM 등)는 더 작은 모양으로 다시 돌리지 않고 그대로 올립니다.
+                // 작은 모양은 다른 수치를 내기 때문입니다. 호출부(get_embedding_batch)가
+                // 그 묶음만 per-text 로 계산하고 캐시에는 넣지 않습니다.
+                let pooled = self.forward_group(&seqs, group, blen, rows, exact, &mut stats)?;
                 outs.push(pooled);
                 order.extend_from_slice(group);
             }
@@ -198,57 +188,62 @@ impl EmbeddingModel {
         Ok((out, stats))
     }
 
-    /// 마이크로배치 하나를 순전파하고 정규화된 [g, H] 텐서를 돌려줍니다(GPU 상주).
-    fn forward_group(&self, seqs: &[Seq], group: &[usize], blen: usize, stats: &mut BatchRunStats) -> Result<Tensor> {
+    /// 마이크로배치 하나를 고정 모양 [rows, blen] 으로 순전파하고, 실제 구성원 g 행의
+    /// 정규화된 [g, H] 텐서를 돌려줍니다(GPU 상주). rows · blen · exact 는 버킷 길이만의 함수이고,
+    /// g < rows 이면 첫 구성원의 복사본으로 나머지 행을 채운 뒤 그 출력은 버립니다.
+    fn forward_group(
+        &self,
+        seqs: &[Seq],
+        group: &[usize],
+        blen: usize,
+        rows: usize,
+        exact: bool,
+        stats: &mut BatchRunStats,
+    ) -> Result<Tensor> {
         let g = group.len();
+        debug_assert!(g >= 1 && g <= rows);
+        let l = blen;
         stats.micro_batches += 1;
+        stats.computed_tokens += rows * l;
 
-        // ⑤ 1행: 패딩 없이 per-text embed() 와 같은 연산열.
-        if g == 1 {
-            let ids = &seqs[group[0]].ids;
-            stats.computed_tokens += ids.len();
-            let input = Tensor::new(ids.as_slice(), &self.device)?;
-            let hidden = self.model.forward(&input, &self.device)?;
-            return Self::pool_single(&hidden);
-        }
-
-        let lens: Vec<usize> = group.iter().map(|&si| seqs[si].ids.len()).collect();
-        let exact = lens.iter().all(|&l| l == blen);
-        let l = if exact { blen } else { blen.max(*lens.iter().max().unwrap_or(&blen)) };
-        stats.computed_tokens += g * l;
-
-        let mut flat: Vec<u32> = Vec::with_capacity(g * l);
-        for &si in group {
-            let ids = &seqs[si].ids;
+        // 고정 모양의 행 목록: 실제 구성원 g 개 + 더미(첫 구성원 복사) rows-g 개.
+        let row_seq = |r: usize| -> usize { if r < g { group[r] } else { group[0] } };
+        let mut flat: Vec<u32> = Vec::with_capacity(rows * l);
+        for r in 0..rows {
+            let ids = &seqs[row_seq(r)].ids;
+            debug_assert!(ids.len() <= l && (!exact || ids.len() == l));
             flat.extend_from_slice(ids);
             flat.extend(std::iter::repeat(self.pad_id).take(l - ids.len()));
         }
-        let input = Tensor::from_vec(flat, g * l, &self.device)?;
+        let input = Tensor::from_vec(flat, rows * l, &self.device)?;
 
         if exact {
-            // ① 정확한 길이 버킷: 마스크 없음, 배치 풀링.
-            let hidden = self.model.forward_batch(&input, g, l, None)?;
-            let sum = hidden.sum(1)?; // [g, H]
+            // ① 정확한 길이 버킷(L ≤ exact_len_max): 마스크 없음, 배치 풀링.
+            let hidden = self.model.forward_batch(&input, rows, l, None)?;
+            let sum = hidden.sum(1)?; // [rows, H]
             let mean = (sum / (l as f64))?;
-            let norm = mean.sqr()?.sum_keepdim(1)?.sqrt()?; // [g, 1]
-            return Ok(mean.broadcast_div(&norm)?);
+            let norm = mean.sqr()?.sum_keepdim(1)?.sqrt()?; // [rows, 1]
+            let pooled = mean.broadcast_div(&norm)?;
+            return Ok(if g == rows { pooled } else { pooled.narrow(0, 0, g)? });
         }
 
-        // ② 패딩 버킷: 가산 마스크 [g,1,1,L] (유효 0 / 패딩 -inf).
+        // ② 패딩 버킷: 가산 마스크 [rows,1,1,L] (유효 0 / 패딩 -inf). 구성원 길이와 무관하게 항상 이 경로.
         stats.padded_batches += 1;
-        let mut mask: Vec<f32> = Vec::with_capacity(g * l);
-        for &len in &lens {
+        let mut mask: Vec<f32> = Vec::with_capacity(rows * l);
+        for r in 0..rows {
+            let len = seqs[row_seq(r)].ids.len();
             mask.extend(std::iter::repeat(0.0f32).take(len));
             mask.extend(std::iter::repeat(f32::NEG_INFINITY).take(l - len));
         }
-        let mask = Tensor::from_vec(mask, (g, 1, 1, l), &self.device)?.to_dtype(self.dtype)?;
-        let hidden = self.model.forward_batch(&input, g, l, Some(&mask))?;
-        // 풀링은 행마다 실제 길이만큼만 (per-text 와 같은 리덕션 길이).
-        let mut rows = Vec::with_capacity(g);
-        for (r, &len) in lens.iter().enumerate() {
+        let mask = Tensor::from_vec(mask, (rows, 1, 1, l), &self.device)?.to_dtype(self.dtype)?;
+        let hidden = self.model.forward_batch(&input, rows, l, Some(&mask))?;
+        // 풀링은 실제 구성원 행마다 실제 길이만큼만 (per-text 와 같은 리덕션 길이).
+        let mut out = Vec::with_capacity(g);
+        for (r, &si) in group.iter().enumerate() {
+            let len = seqs[si].ids.len();
             let h = hidden.narrow(0, r, 1)?.narrow(1, 0, len)?.contiguous()?;
-            rows.push(Self::pool_single(&h)?);
+            out.push(Self::pool_single(&h)?);
         }
-        Ok(Tensor::cat(&rows, 0)?)
+        Ok(Tensor::cat(&out, 0)?)
     }
 }

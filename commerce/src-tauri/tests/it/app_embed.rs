@@ -154,7 +154,27 @@ fn text_cache_first_vector_wins_and_spaces_are_isolated() {
 }
 
 #[test]
-fn global_text_cache_survives_purge_notes() {
+fn global_text_cache_survives_purge_paths() {
+    // lifecycle.rs 의 실제 퍼지 경로(unload_embedding / deep_purge / relay)가 캐시를 비우지 않고
+    // note_purge 만 부르는지 소스로 확인합니다(LogisModel 없이 돌릴 수 있는 범위의 검증).
+    let lifecycle = include_str!("../../src/model/lifecycle.rs");
+    for site in ["note_purge(\"unload_embedding\")", "note_purge(\"deep_purge\")", "note_purge(\"relay (image pipeline)\")"] {
+        assert!(lifecycle.contains(site), "lifecycle.rs 에 {} 가 없습니다", site);
+    }
+    assert_eq!(lifecycle.matches("note_purge(").count(), 3, "퍼지 지점 수가 바뀌었습니다");
+    for (no, line) in lifecycle.lines().enumerate() {
+        let l = line.to_ascii_lowercase();
+        let code = l.split("//").next().unwrap_or("");
+        assert!(
+            !(code.contains("cache") && code.contains(".clear()")),
+            "lifecycle.rs:{} 에서 캐시를 비웁니다: {}", no + 1, line.trim()
+        );
+        assert!(
+            !code.contains("drop_lru_tier") && !code.contains("forget_space("),
+            "lifecycle.rs:{} 에서 전역 임베딩 캐시를 지웁니다: {}", no + 1, line.trim()
+        );
+    }
+
     // 다른 테스트와 겹치지 않는 고유 공간
     let sp = space_id(0xA5A5_0001, "it-purge");
     let v: Vec<f32> = (0..384).map(|i| (i as f32 * 0.01).sin() + 0.5).collect();
@@ -357,8 +377,12 @@ fn winner(scores: &HashMap<String, f32>) -> (String, f32) {
     best
 }
 
+/// 같은 (가짜) 임베딩을 넣었을 때 RAW-CHUNK 스팬 목록 + LayoutScoreTable 채점이 기존의
+/// n-gram 1건씩 루프와 비트 단위로 같은 점수·승자·갭 점수를 내는지 확인합니다.
+/// (get_embedding_batch 와 get_embedding 의 벡터 동치는 여기서 보지 않습니다: per-text 모드에서
+///  둘은 같은 embed() 를 거치며, 배치 순전파의 구성 무관성은 GPU 테스트가 확인합니다)
 #[test]
-fn stage1_prefetch_scores_and_winners_are_bit_identical() {
+fn stage1_score_table_matches_per_ngram_loop_bit_identical() {
     let categories = ["order", "goods", "tracking", "review", "coupon", "event", ""];
     let queries = [
         ("ko", "여름 원피스 중에서 할인율 20%에 속하지만 재고가 남은 상품 찾아줘 빨리"),
@@ -688,13 +712,22 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
         }
         max_abs = max_abs.max(d);
     }
-    // 단건(1행 배치)은 per-text 와 비트 단위로 같아야 합니다.
+    // 구성 무관성: 같은 텍스트는 단건 호출 · 다른 구성의 배치(역순 절반 · 표본끼리) 어디서 구해도
+    // 전체 배치에서 구한 벡터와 비트 단위로 같아야 합니다(고정 모양 마이크로배치).
+    let same_bits = |a: &Vec<f32>, b: &Vec<f32>| a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits());
     let mut single_identical = 0usize;
     let probe: Vec<usize> = (0..texts.len()).step_by(texts.len() / 12 + 1).collect();
     for &i in &probe {
         let s = model.embed_many(std::slice::from_ref(&texts[i]), &opts).unwrap();
-        if s[0].iter().zip(per_text[i].iter()).all(|(x, y)| x.to_bits() == y.to_bits()) { single_identical += 1; }
+        if same_bits(&s[0], &batched[i]) { single_identical += 1; }
     }
+    let probe_texts: Vec<String> = probe.iter().map(|&i| texts[i].clone()).collect();
+    let probe_batch = model.embed_many(&probe_texts, &opts).unwrap();
+    let probe_identical = probe.iter().enumerate().filter(|(k, &i)| same_bits(&probe_batch[*k], &batched[i])).count();
+    let sub_idx: Vec<usize> = (0..texts.len()).rev().step_by(2).collect();
+    let sub_texts: Vec<String> = sub_idx.iter().map(|&i| texts[i].clone()).collect();
+    let sub_batch = model.embed_many(&sub_texts, &opts).unwrap();
+    let sub_identical = sub_idx.iter().enumerate().filter(|(k, &i)| same_bits(&sub_batch[*k], &batched[i])).count();
 
     let n = texts.len() as f64;
     println!(
@@ -714,8 +747,8 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
         min_cos, min_cos_short, min_cos_long, max_abs, identical, texts.len(), ident_short, n_short, ident_long, texts.len() - n_short, worst
     );
     println!(
-        "[GPU-EQ] 단건 embed_many == embed 비트 동일 {}/{} · 기존 3스레드 embed_batch == 순차 embed 비트 동일 {}/{}",
-        single_identical, probe.len(), thread_identical, texts.len()
+        "[GPU-EQ] 구성 무관성(전체 배치 대비 비트 동일): 단건 {}/{} · 표본끼리 배치 {}/{} · 역순 절반 배치 {}/{} | 기존 3스레드 embed_batch == 순차 embed 비트 동일 {}/{}",
+        single_identical, probe.len(), probe_identical, probe.len(), sub_identical, sub_idx.len(), thread_identical, texts.len()
     );
     let bits_eq = |a: &Vec<f32>, b: &Vec<f32>| a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits());
     let per_text_repro = (0..texts.len()).filter(|&i| bits_eq(&per_text[i], &per_text2[i])).count();
@@ -781,10 +814,14 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
         query_idx.len(), bank_idx.len(), agree_pb, query_idx.len(), agree_pr, query_idx.len(), agree_br, query_idx.len()
     );
 
-    assert_eq!(single_identical, probe.len(), "1행 배치는 per-text 와 비트 단위로 같아야 합니다");
+    assert_eq!(single_identical, probe.len(), "단건 호출 벡터가 배치 안의 벡터와 달라졌습니다(호출 구성 의존)");
+    assert_eq!(probe_identical, probe.len(), "표본끼리 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
+    assert_eq!(sub_identical, sub_idx.len(), "역순 절반 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
     assert_eq!(batched_repro, texts.len(), "같은 입력의 embed_many 는 실행마다 비트 단위로 같아야 합니다");
     assert!(min_cos > 0.995, "최소 코사인 {} — 배치 경로 수치가 허용 범위를 벗어났습니다", min_cos);
     // 배치 경로가 F32 참값에서 per-text 보다 눈에 띄게 멀어지면 안 됩니다.
+    // 허용폭 2e-4 는 의도한 절충입니다: BF16 GEMM 은 모양마다 커널이 달라 배치 경로가 per-text 와
+    // 비트 동일할 수 없고, 평균 코사인 차는 1e-4 수준(측정)입니다. 그래서 ROCm 은 실기기 검증 전까지 기본 OFF 입니다.
     assert!(bt_mean_s >= pt_mean_s - 2e-4 && bt_mean_l >= pt_mean_l - 2e-4, "embed_many 의 F32 기준 정확도가 per-text 보다 낮습니다");
     assert!(batched.iter().all(|v| v.iter().any(|&x| x != 0.0)));
 }

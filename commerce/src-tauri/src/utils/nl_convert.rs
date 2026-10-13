@@ -2187,8 +2187,8 @@ where
 
 /// 🌟 [EMBED-PREFETCH] 이 패스가 임베딩할 텍스트를 먼저 한 번의 배치로 올리는 판본입니다.
 ///   - confirmed 청크의 전체 텍스트와 발견 모드 청크의 첫 창(첫 단어)은 반드시 쓰이므로 항상 넣습니다.
-///   - `speculative` (배치 순전파처럼 추측이 쌀 때)면 발견 모드 청크의 모든 연속 창
-///     (리셋 위치와 무관한 시작~끝 조합)도 넣습니다.
+///   - `speculative` (배치 순전파처럼 추측이 쌀 때)면 발견 모드 청크의 0 부터의 접두 창과
+///     단어 하나짜리 창도 넣습니다.
 ///   이후 embed_fn 호출은 캐시 적중이라 결과(벡터·판정)는 프리패치가 없을 때와 같습니다.
 pub async fn plinko_game_for_indexing_prefetch<F, Fut, P, PFut>(
     chunks: &[ChunkMetadata],
@@ -2219,24 +2219,21 @@ where
             }
             pre.push(words[0].to_string());
             if speculative {
-                if words.len() <= 16 {
-                    for st in 0..words.len() {
-                        for en in (st + 1)..=words.len() {
-                            pre.push(words[st..en].join(" "));
-                        }
-                    }
-                } else {
-                    for en in 1..=words.len() {
-                        pre.push(words[0..en].join(" "));
-                    }
-                    for w in &words {
-                        pre.push(w.to_string());
-                    }
+                // 루프는 리셋 위치부터의 접두 창만 임베딩합니다. 모든 (시작, 끝) 조합(16단어면 136개)은
+                // 실제 사용량의 ~7배라 배치 이득을 상쇄하므로, 0 부터의 접두 창과 단어 하나짜리 창만 넣습니다.
+                for en in 1..=words.len() {
+                    pre.push(words[0..en].join(" "));
+                }
+                for w in &words {
+                    pre.push(w.to_string());
                 }
             }
         }
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         pre.retain(|t| seen.insert(t.clone()));
+        // 한 번의 프리패치가 캐시 LRU 상한의 절반을 넘으면, 같은 시각으로 들어간 엔트리가
+        // 쓰이기도 전에 퇴출될 수 있습니다. 앞쪽(확정·첫 창 우선 순서)만 남기고 나머지는 루프가 1건씩 계산합니다.
+        pre.truncate(crate::models::embedding::text_cache::DEFAULT_LRU_CAP / 2);
         if !pre.is_empty() {
             prefetch_fn(pre).await;
         }

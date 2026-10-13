@@ -883,14 +883,16 @@ impl crate::model::LogisModel {
             // 🌟 [EMBED-PREFETCH] 갭마다 왼쪽/오른쪽 흡수 텍스트를 1건씩 임베딩하던 것을 한 번의 배치로 미리 올립니다.
             //    왼쪽 승자의 시작점은 직전 갭에서 오른쪽이 이기면 직전 갭 시작으로 바뀌므로,
             //    두 경우를 모두(갭당 최대 3건) 추측해 넣습니다. 추측분은 캐시 엔트리만 늘릴 뿐 결과와 무관합니다.
+            //    추측분(직전 갭 시작 변형)은 배치 순전파일 때만 넣습니다(per-text 경로에서는 1건 = 순전파 1회).
             {
+                let spec = self.embed_speculation_cheap();
                 let mut pre: Vec<String> = Vec::new();
                 for i in 0..(final_bounds.len() - 1) {
                     let gap_start = final_bounds[i].1;
                     let gap_end = final_bounds[i + 1].0;
                     if gap_start >= gap_end { continue; }
                     pre.push(words[final_bounds[i].0..gap_end].join(" "));
-                    if i > 0 {
+                    if spec && i > 0 {
                         let prev_gap_start = final_bounds[i - 1].1;
                         if prev_gap_start < final_bounds[i].0 {
                             pre.push(words[prev_gap_start..gap_end].join(" "));
@@ -1680,11 +1682,15 @@ impl crate::model::LogisModel {
                 //    STEM SUBSTITUTION 과 같은 규칙)를 한 번의 배치로 미리 올립니다.
                 //    배치 순전파가 켜져 있으면(추측이 싸면) 연속 단어 창(2~8단어, PLINKO SLIDE 후보)도 함께 올립니다.
                 //    아래 루프는 그대로 get_embedding 을 1건씩 부르지만 전부 캐시 적중이라 판정이 같습니다.
+                //    어간은 루프의 게이트(ACTION VERB · FUNCTIONAL WORD DROP 등)를 통과한 단어에서만 쓰이므로
+                //    추측분입니다. per-text 경로(CPU · Vulkan · LOGIS_EMBED_BATCHED=0)에서는 추측분 1건이
+                //    순전파 1회라, 확실히 쓰는 단어만 올리고 어간·창은 배치 순전파일 때만 올립니다.
                 {
+                    let spec = self.embed_speculation_cheap();
                     let mut pre: Vec<String> = Vec::new();
                     for w in words.iter() {
                         pre.push(w.to_string());
-                        if !w.chars().any(|c| c.is_ascii_digit()) {
+                        if spec && !w.chars().any(|c| c.is_ascii_digit()) {
                             for (stem, _) in crate::utils::ai_utils::closed_tail_stems(w) {
                                 pre.push(stem);
                             }
@@ -1693,7 +1699,7 @@ impl crate::model::LogisModel {
                             }
                         }
                     }
-                    if self.embed_speculation_cheap() {
+                    if spec {
                         pre.extend(crate::utils::ai_utils::contiguous_windows(&words, 2, 8));
                     }
                     let mut seen_pre: std::collections::HashSet<String> = std::collections::HashSet::new();

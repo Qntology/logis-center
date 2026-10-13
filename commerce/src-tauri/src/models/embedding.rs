@@ -19,24 +19,32 @@ pub const EMBED_CHUNK_TOKENS: usize = 512;
 // =====================================================================
 // 🌟 [EMBED-BATCHED] 배치 순전파 사용 여부
 // ---------------------------------------------------------------------
-//   CUDA / ROCm 에서는 기본 ON 입니다. LOGIS_EMBED_BATCHED=0 이면 기존
-//   per-text 경로(embed_batch 의 3스레드 × embed())로 돌아갑니다.
+//   CUDA 에서는 기본 ON 입니다. LOGIS_EMBED_BATCHED=0 이면 기존
+//   per-text 경로(embed_batch 의 embed())로 돌아갑니다.
+//   ROCm 은 실기기 검증 전이라 기본 OFF 이고, LOGIS_EMBED_BATCHED=1 일 때만 켭니다.
 //   Vulkan / CPU 는 항상 기존 경로입니다(F32 · 다른 커널이라 검증 범위 밖).
 //   값은 프로세스 안에서 한 번만 읽습니다. 캐시 공간(순전파 태그)이
 //   이 판정에 묶여 있어, 도중에 바뀌면 같은 텍스트가 두 공간에 섞이기 때문입니다.
 // =====================================================================
-static EMBED_BATCHED_ENV: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
-    let on = std::env::var("LOGIS_EMBED_BATCHED").map(|v| v.trim() != "0").unwrap_or(true);
+/// None = 미설정, Some(false) = "0", Some(true) = 그 밖의 값.
+static EMBED_BATCHED_ENV: once_cell::sync::Lazy<Option<bool>> = once_cell::sync::Lazy::new(|| {
+    let v = std::env::var("LOGIS_EMBED_BATCHED").ok().map(|v| v.trim() != "0");
     println!(
-        "[EMBED-BATCHED] LOGIS_EMBED_BATCHED → {} (CUDA/ROCm 에서만 적용, Vulkan/CPU 는 항상 per-text)",
-        if on { "배치 순전파 ON" } else { "per-text 순전파" }
+        "[EMBED-BATCHED] LOGIS_EMBED_BATCHED → {} (CUDA 기본 ON · ROCm 기본 OFF · Vulkan/CPU 는 항상 per-text)",
+        match v { None => "미설정", Some(true) => "배치 순전파 ON", Some(false) => "per-text 순전파" }
     );
-    on
+    v
 });
 
 /// 이 장치에서 배치 순전파(embed_many)를 쓰는지 여부.
 pub fn batched_enabled(device: &Device) -> bool {
-    device.is_cuda_or_rocm() && *EMBED_BATCHED_ENV
+    if device.is_cuda() {
+        EMBED_BATCHED_ENV.unwrap_or(true)
+    } else if device.is_rocm() {
+        EMBED_BATCHED_ENV.unwrap_or(false)
+    } else {
+        false
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
