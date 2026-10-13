@@ -68,6 +68,15 @@ jobs:
       - name: toolchain
         run: |
           { xcode-select -p; clang --version | head -1; rustc --version || true; cargo --version || true; } | tee out/toolchain.txt
+      - name: publish probe results as annotations
+        if: always()
+        run: |
+          j() { sed 's/$/ ;;/' | tr -d '\n' | cut -c1-3800; }
+          echo "::notice title=cpu ${{ matrix.os }}::$(j < out/cpu.txt)"
+          echo "::notice title=displays ${{ matrix.os }}::$(grep -E 'Chipset|Type|Metal|Cores|Vendor|Display Type|Resolution' out/displays.txt | j)"
+          echo "::notice title=metal ${{ matrix.os }}::$(j < out/metal.txt)"
+          echo "::notice title=vulkan ${{ matrix.os }}::$(grep -E 'VK_ICD|deviceName|deviceType|apiVersion|driverName|ERROR|rror|Found' out/vulkan.txt | j)"
+          echo "::notice title=toolchain ${{ matrix.os }}::$(j < out/toolchain.txt)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

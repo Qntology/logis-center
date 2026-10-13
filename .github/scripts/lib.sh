@@ -22,9 +22,23 @@ run() {
   else
     echo "| $label | FAIL (exit $rc) | $label.log |" >> "$SUMMARY"
     echo "::error::$label failed (exit $rc)"
+    annotate_log "$label" "$log"
     FAILS=$((FAILS + 1))
   fi
   return 0
+}
+
+# annotate_log <label> <log>: surface the important lines of a failed step as annotations
+# (readable through the checks API even where artifact / log downloads are blocked).
+annotate_log() {
+  local label="$1" log="$2" n=0
+  while IFS= read -r line && [ $n -lt 8 ]; do
+    line="${line//'%'/'%25'}"
+    echo "::error title=$label::${line:0:900}"
+    n=$((n + 1))
+  done < <(grep -E -A3 "^error(\[|:)|panicked at|FAILED|^failures:|assertion" "$log" | grep -vE "^--$" | head -8)
+  # last lines too (build scripts often end with the real cause)
+  echo "::error title=$label (tail)::$(tail -n 12 "$log" | sed 's/$/ |/' | tr -d '\n' | cut -c1-900)"
 }
 
 # not_run <label> <reason>
@@ -43,7 +57,27 @@ require_measured() {
   fi
 }
 
+# Measurement lines and the summary table as a few long notices (annotations are readable through the
+# checks API; artifact / log blobs may not be reachable from where the results are read).
+publish_notices() {
+  local tmp="$OUT/.measure.txt"
+  grep -hE "\[(GPU-EQ|DECISION-EQ|EMBED-BATCHED-TEST|CPU-PACKED|EMBED-CPU-PACKED|[A-Za-z-]+-M-INV|[A-Za-z-]+-B-INV|UTF8-STREAM|CPU-3-2)\]|QWEN4-EXP\] +variant|DEVICE_PROBE|^- |^test result" "$OUT"/*.log 2>/dev/null | grep -v '^+ ' \
+    | cut -c1-600 > "$tmp" || true
+  echo "::notice title=summary::$(grep '^| ' "$SUMMARY" | tail -n +2 | sed 's/$/ ;;/' | tr -d '\n' | cut -c1-3900)"
+  local chunk="" n=0
+  while IFS= read -r line; do
+    if [ $(( ${#chunk} + ${#line} )) -gt 3800 ]; then
+      echo "::notice title=measure-$n::$chunk"; n=$((n + 1)); chunk=""
+      [ $n -ge 8 ] && break
+    fi
+    chunk="$chunk$line ;; "
+  done < "$tmp"
+  [ -n "$chunk" ] && [ $n -lt 8 ] && echo "::notice title=measure-$n::$chunk"
+  return 0
+}
+
 finish() {
+  publish_notices
   echo; cat "$SUMMARY"
   cat "$SUMMARY" >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
   [ "$FAILS" -eq 0 ]
