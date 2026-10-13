@@ -1,7 +1,7 @@
 From 91a7ab2b92f981217133d6adf7b83e9e0f5c09e4 Mon Sep 17 00:00:00 2001
 From: sungu-che <127634415+sungu-che@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 19:45:50 +0000
-Subject: [PATCH 2/5] vulkan: find MoltenVK on macOS (portability enumeration,
+Subject: [PATCH 2/6] vulkan: find MoltenVK on macOS (portability enumeration,
  portability_subset, loader path)
 
 - Instance: enable VK_KHR_portability_enumeration + ENUMERATE_PORTABILITY_KHR when the loader
