@@ -139,7 +139,11 @@ jobs:
         run: |
           logis-center/.github/scripts/apply-fork-patches.sh
           logis-center/.github/scripts/use-fork-path.sh logis-center/commerce/src-tauri/Cargo.toml
-      - uses: dtolnay/rust-toolchain@stable
+      # ring 0.17.14 (newest; via reqwest/rustls/lancedb) fails to compile on aarch64-apple-darwin with
+      # rustc 1.98: its const assert on the statically enabled CPU features (src/cpu/arm/darwin.rs:44/51)
+      # no longer holds. 1.97.0 builds it.
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: "1.97.0" }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - uses: actions/cache@v4
