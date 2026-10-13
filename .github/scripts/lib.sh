@@ -21,8 +21,7 @@ run() {
     echo "| $label | PASS | $label.log |" >> "$SUMMARY"
   else
     echo "| $label | FAIL (exit $rc) | $label.log |" >> "$SUMMARY"
-    echo "::error::$label failed (exit $rc)"
-    annotate_log "$label" "$log"
+    annotate_log "$label (exit $rc)" "$log"
     FAILS=$((FAILS + 1))
   fi
   return 0
@@ -31,14 +30,12 @@ run() {
 # annotate_log <label> <log>: surface the important lines of a failed step as annotations
 # (readable through the checks API even where artifact / log downloads are blocked).
 annotate_log() {
-  local label="$1" log="$2" n=0
-  while IFS= read -r line && [ $n -lt 8 ]; do
-    line="${line//'%'/'%25'}"
-    echo "::error title=$label::${line:0:900}"
-    n=$((n + 1))
-  done < <(grep -E -A3 "^error(\[|:)|panicked at|FAILED|^failures:|assertion" "$log" | grep -vE "^--$" | head -8)
-  # last lines too (build scripts often end with the real cause)
-  echo "::error title=$label (tail)::$(tail -n 12 "$log" | sed 's/$/ |/' | tr -d '\n' | cut -c1-900)"
+  # One annotation per failed step (GitHub keeps only 10 error annotations per step): the error /
+  # panic lines with their next lines, then the log tail, joined with " | ".
+  local label="$1" log="$2"
+  local body
+  body="$(grep -E -A4 "^error(\[|:)|panicked at|^failures:|assertion|FAILED" "$log" | grep -vE "^--$|^\s*[0-9]+: |^\s+at " | head -40 | sed 's/$/ |/' | tr -d '\n' | cut -c1-2800)"
+  echo "::error title=$label::$body || tail: $(tail -n 8 "$log" | sed 's/$/ |/' | tr -d '\n' | cut -c1-1000)"
 }
 
 # not_run <label> <reason>

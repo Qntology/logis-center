@@ -1,7 +1,7 @@
 From 30e502f51e6587f1d8d25f48e44c673999b2d9df Mon Sep 17 00:00:00 2001
 From: sungu-che <127634415+sungu-che@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 19:45:50 +0000
-Subject: [PATCH 3/3] metal: Device::mem_info from the recommended working set
+Subject: [PATCH 3/4] metal: Device::mem_info from the recommended working set
 
 Metal returned Ok(None), so the app's KV-PLAN / residency decisions had no free-memory number
 on Apple Silicon. Unified memory: total = MTLDevice.recommendedMaxWorkingSetSize, free = total
