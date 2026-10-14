@@ -12,12 +12,23 @@
 # vulkaninfo; when the device is missing the runtime steps print "NOT RUN (no GPU on hosted runner)"
 # and the job still builds everything (build-only verification). A skipped runtime step is never a pass:
 # the summary file says NOT RUN explicitly.
+#
+# Phase selection (a full run takes 3-4 h of macOS runner time): a workflow_dispatch takes `phases` / `full`;
+# a push whose head commit message contains "[accel-only]" runs only the app jobs' build + accel phases.
 name: mac-verify
 
 on:
   push:
     branches: ["claude/mac-verify", "claude/mac-*"]
   workflow_dispatch:
+    inputs:
+      phases:
+        description: "app phases to run after build (comma list of suite,embed,bench,real,accel)"
+        default: "suite,embed,bench,real,accel"
+      full:
+        description: "also run the probe and fork jobs"
+        type: boolean
+        default: true
 
 concurrency:
   group: mac-verify-${{ github.ref }}
@@ -34,6 +45,7 @@ env:
 jobs:
   # ── 1. Environment: CPU caches, GPU visibility (both macOS images) ──
   probe:
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name != 'workflow_dispatch' && !contains(github.event.head_commit.message, '[accel-only]')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -85,6 +97,7 @@ jobs:
 
   # ── 2. Fork build/tests (CPU · Metal · MoltenVK) ──
   fork:
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name != 'workflow_dispatch' && !contains(github.event.head_commit.message, '[accel-only]')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -135,7 +148,7 @@ jobs:
       matrix:
         backend: [cpu, metal, vulkan]
     runs-on: macos-15
-    timeout-minutes: 240
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
         with: { path: logis-center }
@@ -203,7 +216,7 @@ jobs:
         run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" build
       - name: suite (it, non-ignored)
         id: phase_suite
-        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' && contains(format(',{0},', inputs.phases || (contains(github.event.head_commit.message, '[accel-only]') && 'accel' || 'suite,embed,bench,real,accel')), ',suite,') }}
         timeout-minutes: 30
         working-directory: logis-center/commerce
         env:
@@ -212,7 +225,7 @@ jobs:
         run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" suite
       - name: embed (mock, default policy + comparisons)
         id: phase_embed
-        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' && contains(format(',{0},', inputs.phases || (contains(github.event.head_commit.message, '[accel-only]') && 'accel' || 'suite,embed,bench,real,accel')), ',embed,') }}
         timeout-minutes: 75
         working-directory: logis-center/commerce
         env:
@@ -221,7 +234,7 @@ jobs:
         run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" embed
       - name: bench (CPU, SSD offload I/O + 3-2 kernels)
         id: phase_bench
-        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' && contains(format(',{0},', inputs.phases || (contains(github.event.head_commit.message, '[accel-only]') && 'accel' || 'suite,embed,bench,real,accel')), ',bench,') }}
         timeout-minutes: 30
         working-directory: logis-center/commerce
         env:
@@ -230,13 +243,22 @@ jobs:
         run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" bench
       - name: real model (decision-level)
         id: phase_real
-        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' && contains(format(',{0},', inputs.phases || (contains(github.event.head_commit.message, '[accel-only]') && 'accel' || 'suite,embed,bench,real,accel')), ',real,') }}
         timeout-minutes: 50
         working-directory: logis-center/commerce
         env:
           MOCK_MODELS: ${{ runner.temp }}/mock-models
           REAL_MODELS: ${{ runner.temp }}/real-models
         run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" real
+      - name: accel (FA and TurboQuant teacher forcing, GDN paths, GPU memory, Vulkan Auto)
+        id: phase_accel
+        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' && contains(format(',{0},', inputs.phases || (contains(github.event.head_commit.message, '[accel-only]') && 'accel' || 'suite,embed,bench,real,accel')), ',accel,') }}
+        timeout-minutes: 90
+        working-directory: logis-center/commerce
+        env:
+          MOCK_MODELS: ${{ runner.temp }}/mock-models
+          REAL_MODELS: ${{ runner.temp }}/real-models
+        run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" accel
       - uses: actions/upload-artifact@v4
         if: always()
         with:

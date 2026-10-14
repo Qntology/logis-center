@@ -48,3 +48,7 @@ mod app_embed;
 mod mem_lifecycle;
 // P2b 실모델 대조: 융합 GDN(Qwen3.5) · Qwen3-0.6B Q8_0 상주 정확 W8A16 (LOGIS_TEST_MODELS=1, --ignored)
 mod p2b_models;
+// FlashAttention / TurboQuant 정확도 teacher-forcing (목업 Qwen3, FA on/off × TQ KV on/off, CPU + GPU)
+mod accel_accuracy;
+// GPU 메모리 보고 · 반환 · KV 계층 강제 (장치 공통: Metal · Vulkan · CUDA · ROCm)
+mod gpu_memory;

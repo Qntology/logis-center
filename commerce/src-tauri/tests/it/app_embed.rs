@@ -859,10 +859,17 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
         bt_mean_s - pt_mean_s, bt_mean_l - pt_mean_l,
         agree_pb, query_idx.len(), agree_br, query_idx.len()
     );
-    assert_eq!(single_identical, probe.len(), "단건 호출 벡터가 배치 안의 벡터와 달라졌습니다(호출 구성 의존)");
-    assert_eq!(probe_identical, probe.len(), "표본끼리 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
-    assert_eq!(sub_identical, sub_idx.len(), "역순 절반 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
-    assert_eq!(batched_repro, texts.len(), "같은 입력의 embed_many 는 실행마다 비트 단위로 같아야 합니다");
+    // LOGIS_EMBED_MEASURE_ONLY=1: 구성 무관성을 보장하지 않는 비교용 정책(예: Vulkan Auto 모드)의 측정 런 —
+    // 무관성 수치는 위 요약 줄에 남기고 단언만 생략합니다(정확도 · 코사인 단언은 그대로).
+    let measure_only = std::env::var("LOGIS_EMBED_MEASURE_ONLY").map(|v| v == "1").unwrap_or(false);
+    if measure_only {
+        println!("[GPU-EQ] 측정 전용 런(LOGIS_EMBED_MEASURE_ONLY=1): 구성 무관성 · 재현성 단언 생략");
+    } else {
+        assert_eq!(single_identical, probe.len(), "단건 호출 벡터가 배치 안의 벡터와 달라졌습니다(호출 구성 의존)");
+        assert_eq!(probe_identical, probe.len(), "표본끼리 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
+        assert_eq!(sub_identical, sub_idx.len(), "역순 절반 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
+        assert_eq!(batched_repro, texts.len(), "같은 입력의 embed_many 는 실행마다 비트 단위로 같아야 합니다");
+    }
     if device.is_cpu() {
         // CPU 동적 배치(정확한 길이 묶음)는 per-text 와 같은 연산이라 모든 텍스트가 비트 동일해야 합니다.
         assert_eq!(identical, texts.len(), "CPU embed_many 가 per-text 와 비트 단위로 다릅니다");

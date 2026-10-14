@@ -121,17 +121,20 @@ impl BatchOpts {
 }
 
 /// Vulkan 배치 순전파의 고정 실행 모드. 기본 Gpu(가중치 행렬곱은 항상 GPU GEMM, 나머지는 CPU 경로),
-/// `LOGIS_EMBED_VK_MODE=host` 이면 전부 CPU 경로(CPU 백엔드와 같은 비트).
+/// `LOGIS_EMBED_VK_MODE=host` 이면 전부 CPU 경로(CPU 백엔드와 같은 비트), `=auto` 는 비교 측정용
+/// (연산마다 크기 · 장치로 경로를 고르므로 배치 구성에 따라 비트가 달라질 수 있어 기본값이 될 수 없습니다).
 #[cfg(feature = "vulkan")]
 fn vulkan_exec_mode() -> candle_core::vulkan_backend::shaders::ExecMode {
     use candle_core::vulkan_backend::shaders::ExecMode;
     static MODE: std::sync::OnceLock<ExecMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        let host = std::env::var("LOGIS_EMBED_VK_MODE")
-            .map(|v| v.trim().eq_ignore_ascii_case("host"))
-            .unwrap_or(false);
-        let m = if host { ExecMode::Host } else { ExecMode::Gpu };
-        println!("[EMBED-BATCHED] Vulkan 배치 순전파 실행 모드: {:?} (LOGIS_EMBED_VK_MODE=host|gpu)", m);
+        let v = std::env::var("LOGIS_EMBED_VK_MODE").unwrap_or_default();
+        let m = match v.trim().to_ascii_lowercase().as_str() {
+            "host" => ExecMode::Host,
+            "auto" => ExecMode::Auto,
+            _ => ExecMode::Gpu,
+        };
+        println!("[EMBED-BATCHED] Vulkan 배치 순전파 실행 모드: {:?} (LOGIS_EMBED_VK_MODE=host|gpu|auto)", m);
         m
     })
 }

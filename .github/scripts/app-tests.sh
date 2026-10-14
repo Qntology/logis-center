@@ -2,16 +2,19 @@
 # logis-center app build + tests for one backend, one phase per workflow step (each step has its own
 # timeout and publishes its own annotations, so a slow later phase cannot lose the earlier results).
 # Run inside logis-center/commerce.
-#   app-tests.sh cpu|metal|vulkan <out-dir> build|suite|embed|bench|real
+#   app-tests.sh cpu|metal|vulkan <out-dir> build|suite|embed|bench|real|accel
 # Env: MOCK_MODELS (gen_granite_mock.py output root), REAL_MODELS (Hugging Face download root, optional)
 set -euo pipefail
 BACKEND="$1"; OUT="$(mkdir -p "$2" && cd "$2" && pwd)"; export OUT; PHASE="${3:-all}"
 . "$(dirname "$0")/lib.sh"
 
 case "$BACKEND" in
-  cpu)    FEAT=(--no-default-features) ;;
-  metal)  FEAT=(--no-default-features --features metal) ;;
+  cpu)    FEAT=(--no-default-features)
+          ACCEL_FEAT=(--no-default-features --features flash-attn,turbo-quant) ;;
+  metal)  FEAT=(--no-default-features --features metal)
+          ACCEL_FEAT=(--no-default-features --features metal,flash-attn,turbo-quant) ;;
   vulkan) FEAT=(--no-default-features --features vulkan)
+          ACCEL_FEAT=(--no-default-features --features vulkan,flash-attn,turbo-quant)
           # SIP strips DYLD_* from protected launchers; set it here so cargo and the test binary see it.
           if command -v brew >/dev/null; then
             export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix vulkan-loader)/lib:$(brew --prefix molten-vk)/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
@@ -90,6 +93,27 @@ real)
   else
     not_run "embed-$BACKEND-real" "real granite weights could not be downloaded (mock only)"
   fi
+  ;;
+accel)
+  # Mock / tiny-model checks of the acceleration paths (docs/mac-verify.md 3-5). Each test changes process-wide
+  # state (GDN override, accel config) or measures device-wide memory, so each runs alone (--test-threads 1).
+  # Fused GDN (CPU kernel) vs the tensor path on CPU and on this build's GPU: numbers + time.
+  run gdn-path cargo test --test it "${FEAT[@]}" -- qwen4_exp::gdn_fused --ignored --nocapture --test-threads 1
+  require_measured gdn-path "\\[GDN-PATH\\] CPU"
+  if [ "$BACKEND" != cpu ]; then
+    # Device memory reported / returned (Metal: fork patch 0003), KV-PLAN inputs, KV tiers on the GPU.
+    run gpu-mem cargo test --test it "${FEAT[@]}" -- gpu_memory:: --ignored --nocapture --test-threads 1
+    require_measured gpu-mem "\\[GPU-MEM\\] .*total"
+  fi
+  if [ "$BACKEND" = vulkan ]; then
+    # Auto (per-op GPU element-wise) vs the default Gpu mode: speed only — Auto is not batch-invariant.
+    embed embed-vulkan-mock-auto "$MOCK_MODELS" compare LOGIS_EMBED_VK_MODE=auto LOGIS_EMBED_MEASURE_ONLY=1
+  fi
+  # FlashAttention / TurboQuant KV on/off teacher forcing on a seeded mock Qwen3 (KLD, top-1). The app ships with
+  # both features on; this is a second build of the app with them.
+  run accel-build cargo test --test it "${ACCEL_FEAT[@]}" --no-run
+  run accel-acc cargo test --test it "${ACCEL_FEAT[@]}" -- accel_accuracy --ignored --nocapture --test-threads 1
+  require_measured accel-acc "\\[ACCEL-ACC\\]"
   ;;
 *) echo "unknown phase $PHASE"; exit 2 ;;
 esac

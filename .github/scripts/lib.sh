@@ -61,8 +61,8 @@ require_measured() {
 publish_notices() {
   # Key lines first (one-line summaries), each tagged with its run label, then the detail lines.
   local tmp="$OUT/.measure.txt"
-  local key="\[(EMBED-SUMMARY|DECISION-EQ)\]|\[KV-IO\] (write|best|cold read std)|QWEN4-EXP\] +variant_. on|-M-INV\] 측정 결과|-M-INV\] arch|\[CPU-3-2\]|DEVICE_PROBE|^test result: FAILED"
-  local detail="\[(GPU-EQ|UTF8-STREAM|KV-IO)\]|^- |^test result"
+  local key="\[(EMBED-SUMMARY|DECISION-EQ|ACCEL-ACC|GDN-PATH|GPU-MEM)\]|\[KV-IO\] (write|best|cold read std)|QWEN4-EXP\] +variant_. on|-M-INV\] 측정 결과|-M-INV\] arch|\[CPU-3-2\]|DEVICE_PROBE|^test result: FAILED"
+  local detail="\[(GPU-EQ|UTF8-STREAM|KV-IO|ACCEL-CHECK)\]|^- |^test result"
   : > "$tmp"
   for tag in ${PHASE_LABELS[@]+"${PHASE_LABELS[@]}"}; do
     local f="$OUT/$tag.log"

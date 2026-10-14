@@ -491,3 +491,119 @@ fn qwen4_exp_registered_as_text_generator() -> R {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+//  [MAC-VERIFY] 융합 GDN(CPU) vs 텐서 경로(CPU · GPU) — 수치와 시간 (docs/mac-verify.md 3-5)
+// ---------------------------------------------------------------------
+fn det_f32(n: usize, seed: u64, scale: f32) -> Vec<f32> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ((x >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+        })
+        .collect()
+}
+
+/// Qwen3.5 급 선형 어텐션 형상(Hk 8 · Hv 16 · Dk=Dv 128 · conv 4)에서 프리필 T=256 + 디코드 16 스텝(상태 이어 받기)을
+/// CPU 융합 커널 · CPU 텐서 경로 · GPU 텐서 경로(Metal/Vulkan 은 융합 커널이 없음)로 돌려 출력·상태와 시간을 비교합니다.
+/// Metal/Vulkan 전용 GDN 커널이 필요한지의 근거입니다(GPU 텐서 경로가 CPU 융합보다 느리면 필요).
+/// 전역 `set_gdn_fused_override` 를 바꾸고 시간을 재므로 병렬 suite 에서는 빠지고 단독으로 돌립니다
+/// (`cargo test --test it -- gdn_fused --ignored --nocapture --test-threads 1`).
+#[test]
+#[ignore]
+fn gdn_fused_cpu_vs_tensor_paths_numbers_and_time() -> R {
+    use std::time::Instant;
+    use tauri_app_lib::models::common::set_gdn_fused_override;
+    use tauri_app_lib::models::qwen4_exp::gdn::{gdn_forward, GdnConfig, GdnHeadOrder, GdnOutput};
+    let (hk, hv, dk, dv, k, t, steps) = (8usize, 16usize, 128usize, 128usize, 4usize, 256usize, 16usize);
+    let c = 2 * hk * dk + hv * dv;
+    let cfg = GdnConfig {
+        num_k_heads: hk,
+        num_v_heads: hv,
+        head_k_dim: dk,
+        head_v_dim: dv,
+        conv_kernel: k,
+        use_qk_l2norm: true,
+        l2norm_eps: 1e-6,
+        v_head_order: GdnHeadOrder::Grouped,
+    };
+    let host = |v: Vec<f32>, shape: &[usize]| Tensor::from_vec(v, shape, &Device::Cpu);
+    let n_tok = t + steps;
+    let qkv = host(det_f32(n_tok * c, 1, 1.0), &[1, n_tok, c])?;
+    let a = host(det_f32(n_tok * hv, 2, 1.0), &[1, n_tok, hv])?;
+    let b = host(det_f32(n_tok * hv, 3, 1.0), &[1, n_tok, hv])?;
+    let neg_a = host(det_f32(hv, 4, 0.5).into_iter().map(|x| -(x.abs() + 0.1)).collect(), &[hv])?;
+    let dt_bias = host(det_f32(hv, 5, 0.5), &[hv])?;
+    let conv_w = host(det_f32(c * k, 6, 0.5), &[c, k])?;
+    let conv_b = host(det_f32(c, 7, 0.1), &[c])?;
+
+    // (프리필 출력, 디코드 출력들, 최종 recurrent_state, 프리필 ms, 디코드 스텝당 ms)
+    let run = |dev: &Device, fused: Option<bool>| -> anyhow::Result<(Tensor, Vec<Tensor>, Tensor, f64, f64)> {
+        set_gdn_fused_override(fused);
+        let to = |x: &Tensor| x.to_device(dev);
+        let (qkv, a, b, neg_a, dt_bias, conv_w, conv_b) = (to(&qkv)?, to(&a)?, to(&b)?, to(&neg_a)?, to(&dt_bias)?, to(&conv_w)?, to(&conv_b)?);
+        let mut best_pre = f64::MAX;
+        let mut pre: Option<GdnOutput> = None;
+        for _ in 0..2 {
+            let t0 = Instant::now();
+            let o = gdn_forward(&qkv.narrow(1, 0, t)?, &conv_w, Some(&conv_b), None, &a.narrow(1, 0, t)?, &b.narrow(1, 0, t)?, &neg_a, &dt_bias, None, &cfg)?;
+            let _ = o.out.to_device(&Device::Cpu)?;
+            best_pre = best_pre.min(t0.elapsed().as_secs_f64() * 1e3);
+            pre = Some(o);
+        }
+        let pre = pre.unwrap();
+        let (mut conv_state, mut state) = (pre.conv_state.clone(), pre.recurrent_state.clone());
+        let mut outs = Vec::new();
+        let t0 = Instant::now();
+        for s in 0..steps {
+            let p = t + s;
+            let o = gdn_forward(&qkv.narrow(1, p, 1)?, &conv_w, Some(&conv_b), Some(&conv_state), &a.narrow(1, p, 1)?, &b.narrow(1, p, 1)?, &neg_a, &dt_bias, Some(&state), &cfg)?;
+            outs.push(o.out.to_device(&Device::Cpu)?);
+            conv_state = o.conv_state;
+            state = o.recurrent_state;
+        }
+        let per_step = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
+        set_gdn_fused_override(None);
+        Ok((pre.out.to_device(&Device::Cpu)?, outs, state.to_device(&Device::Cpu)?, best_pre, per_step))
+    };
+    let rel = |x: &Tensor, y: &Tensor| -> anyhow::Result<f32> {
+        let d = (x.to_dtype(DType::F32)? - y.to_dtype(DType::F32)?)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let m = y.to_dtype(DType::F32)?.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+        Ok(d / m)
+    };
+    let cmp = |x: &(Tensor, Vec<Tensor>, Tensor, f64, f64), y: &(Tensor, Vec<Tensor>, Tensor, f64, f64)| -> anyhow::Result<(f32, f32, f32)> {
+        let mut dec = 0f32;
+        for (p, q) in x.1.iter().zip(&y.1) {
+            dec = dec.max(rel(p, q)?);
+        }
+        Ok((rel(&x.0, &y.0)?, dec, rel(&x.2, &y.2)?))
+    };
+
+    let cpu_fused_supported = candle_core::delta_rule::fused_gdn_supported(&Device::Cpu);
+    let cpu_fused = run(&Device::Cpu, Some(true))?;
+    let cpu_tensor = run(&Device::Cpu, Some(false))?;
+    let (p, d, s) = cmp(&cpu_tensor, &cpu_fused)?;
+    println!(
+        "[GDN-PATH] CPU 융합({}) 프리필 T={t} {:.1}ms · 디코드 {:.2}ms/스텝 | CPU 텐서 경로 {:.1}ms · {:.2}ms/스텝 | 텐서↔융합 상대오차: 프리필 {:.1e} · 디코드 {:.1e} · 상태 {:.1e}",
+        if cpu_fused_supported { "커널" } else { "미지원→텐서" },
+        cpu_fused.3, cpu_fused.4, cpu_tensor.3, cpu_tensor.4, p, d, s
+    );
+    assert!(p <= 1e-3 && d <= 1e-3 && s <= 1e-3, "CPU 텐서 경로가 융합 커널과 다릅니다: {p:.2e} {d:.2e} {s:.2e}");
+
+    if let Some(dev) = tauri_app_lib::utils::new_gpu_device(0) {
+        let gpu_fused = candle_core::delta_rule::fused_gdn_supported(&dev);
+        let gpu = run(&dev, None)?;
+        let (p, d, s) = cmp(&gpu, &cpu_fused)?;
+        println!(
+            "[GDN-PATH] {:?} ({}) 프리필 T={t} {:.1}ms · 디코드 {:.2}ms/스텝 | CPU 융합 대비 상대오차: 프리필 {:.1e} · 디코드 {:.1e} · 상태 {:.1e} | 속도: 프리필 CPU 융합의 {:.2}배 · 디코드 {:.2}배",
+            dev.location(),
+            if gpu_fused { "융합 커널" } else { "융합 커널 없음 → 텐서 경로" },
+            gpu.3, gpu.4, p, d, s, cpu_fused.3 / gpu.3, cpu_fused.4 / gpu.4
+        );
+        assert!(p <= 1e-3 && d <= 1e-3 && s <= 1e-3, "GPU GDN 경로가 CPU 융합과 다릅니다: {p:.2e} {d:.2e} {s:.2e}");
+    }
+    Ok(())
+}
