@@ -103,13 +103,19 @@ jobs:
           sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1 vulkan-tools
           echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json" >> "$GITHUB_ENV"
           echo "CANDLE_VULKAN_ALLOW_CPU=1" >> "$GITHUB_ENV"
+      - name: CUDA toolkit (apt nvcc for the kernel build; no GPU)
+        if: matrix.name == 'linux-cuda-check'
+        run: sudo apt-get install -y -qq nvidia-cuda-toolkit
       - name: CUDA toolkit (nvcc for the kernel build; no GPU)
-        if: matrix.kind == 'cuda-check'
+        if: matrix.name == 'windows-cuda-check'
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
           cuda: "12.6.2"
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]'
+      - uses: actions/setup-python@v5
+        if: matrix.kind == 'run'
+        with: { python-version: "3.12" }
       - name: mock granite model (seeded, identical on every platform)
         if: matrix.kind == 'run'
         run: |
