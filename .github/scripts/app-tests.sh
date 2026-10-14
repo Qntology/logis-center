@@ -5,7 +5,7 @@
 #   app-tests.sh cpu|metal|vulkan <out-dir> build|suite|embed|bench|real|accel
 # Env: MOCK_MODELS (gen_granite_mock.py output root), REAL_MODELS (Hugging Face download root, optional),
 #      EMBED_BACKENDS (backends whose embed / real phases run, default all), EMBED_COMPARE (0: default policy only),
-#      ACCEL_TESTS (items of the accel phase: gdn,gpu-mem,vk-auto,fa,qwen4; default all but qwen4, which the suite runs)
+#      ACCEL_TESTS (items of the accel phase: gdn,gpu-mem,kv35,vk-auto,fa,qwen4; default all but qwen4, which the suite runs)
 set -euo pipefail
 BACKEND="$1"; OUT="$(mkdir -p "$2" && cd "$2" && pwd)"; export OUT; PHASE="${3:-all}"
 . "$(dirname "$0")/lib.sh"
@@ -114,7 +114,7 @@ accel)
   fi
   # Mock / tiny-model checks of the acceleration paths (docs/mac-verify.md 3-5). Each test changes process-wide
   # state (GDN override, accel config) or measures device-wide memory, so each runs alone (--test-threads 1).
-  want() { case ",${ACCEL_TESTS:-gdn,gpu-mem,vk-auto,fa}," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+  want() { case ",${ACCEL_TESTS:-gdn,gpu-mem,kv35,vk-auto,fa}," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
   if want qwen4; then
     run qwen4-exp-gpu env LOGIS_REQUIRE_GPU=0 cargo test --test it "${FEAT[@]}" -- qwen4_exp_tiny_gpu_matches_hf --nocapture
     require_measured qwen4-exp-gpu "QWEN4-EXP\\] +variant_a on (Metal|Vulkan)"
@@ -127,6 +127,11 @@ accel)
     run gpu-mem cargo test --test it "${FEAT[@]}" -- gpu_memory:: --ignored --nocapture --test-threads 1
     require_measured gpu-mem "\\[GPU-MEM\\] .*total"
   fi
+  if want kv35; then
+    # Qwen3.5 KV plan v2 on a mock Qwen3.5 (GGUF): Vram / Ram / Ssd tiers, GDN state on the device, kv_exact.
+    run qwen35-kv cargo test --test it "${FEAT[@]}" -- qwen35_kv::qwen35_kv_tiers qwen35_kv::qwen35_kv_ssd --ignored --nocapture --test-threads 1
+    require_measured qwen35-kv "\\[QWEN35-KV\\] 목업 Qwen3.5 · (Metal|Vulkan)"
+  fi
   if [ "$BACKEND" = vulkan ] && want vk-auto; then
     # Auto (per-op GPU element-wise) vs the default Gpu mode: speed only — Auto is not batch-invariant.
     embed embed-vulkan-mock-auto "$MOCK_MODELS" compare LOGIS_EMBED_VK_MODE=auto LOGIS_EMBED_MEASURE_ONLY=1
@@ -137,6 +142,11 @@ accel)
     run accel-build cargo test --test it "${ACCEL_FEAT[@]}" --no-run
     run accel-acc cargo test --test it "${ACCEL_FEAT[@]}" -- accel_accuracy --ignored --nocapture --test-threads 1
     require_measured accel-acc "\\[ACCEL-ACC\\]"
+    if want kv35; then
+      # Compressed (TurboQuant) KV blocks: LOGIS_KV_PRECISION is read once per process, so its own run.
+      run qwen35-kv-compressed env LOGIS_KV_PRECISION=compressed cargo test --test it "${ACCEL_FEAT[@]}" -- qwen35_kv::qwen35_kv_compressed --ignored --nocapture --test-threads 1
+      require_measured qwen35-kv-compressed "\\[QWEN35-KV\\] 압축 KV"
+    fi
   fi
   ;;
 *) echo "unknown phase $PHASE"; exit 2 ;;

@@ -1,7 +1,7 @@
 From c1de5014d61db58ed813c1547630114c9bec718c Mon Sep 17 00:00:00 2001
 From: sungu-che <127634415+sungu-che@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 22:50:14 +0000
-Subject: [PATCH 02/11] quantized: CPU f16 forward_exact prefill accumulates in
+Subject: [PATCH 02/12] quantized: CPU f16 forward_exact prefill accumulates in
  f32
 
 w8a16_generic_cpu failed on Apple Silicon (macos-15 runner): Q8_0 192x1024 m=9 in=F16

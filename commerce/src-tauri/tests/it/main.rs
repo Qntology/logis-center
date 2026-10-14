@@ -22,6 +22,11 @@
 
 mod common;
 
+/// 앱(src/main.rs)과 같은 전역 할당기. 메모리 반환 테스트(gpu_memory)가 출시 앱의 할당기 동작
+/// (mi_collect 로 빈 페이지 반환)을 재도록 합니다.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ── 1단계: 플랫폼 검증 (SSD 오프로딩 I/O · 합성 문서 · GPU) ──
 mod direct_loader;
 mod parsers;
@@ -52,3 +57,4 @@ mod p2b_models;
 mod accel_accuracy;
 // GPU 메모리 보고 · 반환 · KV 계층 강제 (장치 공통: Metal · Vulkan · CUDA · ROCm)
 mod gpu_memory;
+mod qwen35_kv;

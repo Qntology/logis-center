@@ -135,32 +135,56 @@ fn kv_tiers(dev: &Device) -> R {
 #[test]
 #[ignore]
 fn model_unload_returns_device_memory() -> R {
+    // 앱과 같은 조건: 전역 할당기 mimalloc(tests/it/main.rs, 앱 main.rs 와 동일) + 앱의 반환 경로
+    // (settle_gpu_memory → model::release_os_working_set). 첫 사이클의 잔여분은 런타임 1회 초기화
+    // (Metal/MoltenVK 프레임워크 · 컴파일된 커널 · 스레드 풀)이고, 둘째 사이클에서 더 늘면 누수입니다.
     let Some(dev) = gpu() else { return Ok(()) };
     settle_gpu_memory(&dev, 0, true, "unload test start")?;
+    tauri_app_lib::model::release_os_working_set();
     let (free0, _) = free_total(&dev)?;
     let rss0 = rss_mb();
-    {
-        let (cfg, w) = mock_qwen3(1024, 16, 64, 4)?; // 약 60 MB F32
-        let mut m = Qwen3Model::new(&cfg, VarBuilder::from_tensors(w, DType::F32, &dev))?;
-        let ids = Tensor::new(&[1u32, 2, 3, 4, 5, 6, 7, 8], &dev)?.unsqueeze(0)?;
-        let _ = m.forward(Some(&ids), None, 0)?.to_device(&Device::Cpu)?;
-        let (free_loaded, _) = free_total(&dev)?;
+    let mut after = Vec::new();
+    for cycle in 1..=2 {
+        {
+            let (cfg, w) = mock_qwen3(1024, 16, 64, 4)?; // 약 60 MB F32
+            let mut m = Qwen3Model::new(&cfg, VarBuilder::from_tensors(w, DType::F32, &dev))?;
+            let ids = Tensor::new(&[1u32, 2, 3, 4, 5, 6, 7, 8], &dev)?.unsqueeze(0)?;
+            let _ = m.forward(Some(&ids), None, 0)?.to_device(&Device::Cpu)?;
+            let (free_loaded, _) = free_total(&dev)?;
+            println!(
+                "[GPU-MEM] 사이클 {cycle} 목업 Qwen3 적재: 장치 free {:.0} → {:.0} MB (−{:.0}) · RSS {:.0} MB",
+                free0 as f64 / MB, free_loaded as f64 / MB, (free0 as f64 - free_loaded as f64) / MB, rss_mb()
+            );
+        }
+        settle_gpu_memory(&dev, 0, true, "unload test end")?;
+        tauri_app_lib::model::release_os_working_set();
+        let (free1, _) = free_total(&dev)?;
+        let rss1 = rss_mb();
         println!(
-            "[GPU-MEM] 목업 Qwen3 적재: 장치 free {:.0} → {:.0} MB (−{:.0}) · RSS {:.0} → {:.0} MB",
-            free0 as f64 / MB, free_loaded as f64 / MB, (free0 as f64 - free_loaded as f64) / MB, rss0, rss_mb()
+            "[GPU-MEM] 사이클 {cycle} 내린 뒤(settle + release_os_working_set): 장치 free {:.0} MB (시작 대비 {:+.0} MB) · RSS {:.0} MB (시작 대비 {:+.0} MB)",
+            free1 as f64 / MB, (free1 as f64 - free0 as f64) / MB, rss1, rss1 - rss0
         );
+        after.push((free1, rss1));
     }
-    settle_gpu_memory(&dev, 0, true, "unload test end")?;
-    let (free1, _) = free_total(&dev)?;
-    let rss1 = rss_mb();
+    let growth = after[1].1 - after[0].1;
     println!(
-        "[GPU-MEM] 내린 뒤(settle): 장치 free {:.0} MB (시작 대비 {:+.0} MB) · RSS {:.0} MB (시작 대비 {:+.0} MB)",
-        free1 as f64 / MB, (free1 as f64 - free0 as f64) / MB, rss1, rss1 - rss0
+        "[GPU-MEM] RSS: 첫 사이클 잔여 {:+.0} MB (1회 초기화) · 둘째 사이클 증가 {:+.0} MB (누수 판정)",
+        after[0].1 - rss0,
+        growth
     );
+    assert!(growth <= 32.0, "load/unload 를 반복할 때마다 RSS 가 늘었습니다 ({growth:+.0} MB/사이클)");
     if host_memory_device(&dev) {
-        println!("[GPU-MEM] CPU 형 장치(시스템 RAM): 반환 판정 생략");
+        println!("[GPU-MEM] CPU 형 장치(시스템 RAM): 장치 메모리 반환 판정 생략");
         return Ok(());
     }
-    assert!(free1 as f64 >= free0 as f64 - 32.0 * MB, "모델을 내린 뒤 장치 메모리가 돌아오지 않았습니다 ({:.0} → {:.0} MB)", free0 as f64 / MB, free1 as f64 / MB);
+    for (cycle, (free1, _)) in after.iter().enumerate() {
+        assert!(
+            *free1 as f64 >= free0 as f64 - 32.0 * MB,
+            "사이클 {}: 모델을 내린 뒤 장치 메모리가 돌아오지 않았습니다 ({:.0} → {:.0} MB)",
+            cycle + 1,
+            free0 as f64 / MB,
+            *free1 as f64 / MB
+        );
+    }
     Ok(())
 }

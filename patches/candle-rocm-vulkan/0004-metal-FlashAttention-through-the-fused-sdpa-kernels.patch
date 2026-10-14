@@ -1,7 +1,7 @@
 From 3ad50503df73d4bd21d671aff73ae63b220b2351 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 14 Oct 2026 03:16:11 +0000
-Subject: [PATCH 04/11] metal: FlashAttention through the fused sdpa kernels
+Subject: [PATCH 04/12] metal: FlashAttention through the fused sdpa kernels
 
 Metal had no fused attention: BackendSwitches::allows() returned false for it, so every
 flash-attn call took the unfused matmul + softmax path. flash_attn_with_config now runs the

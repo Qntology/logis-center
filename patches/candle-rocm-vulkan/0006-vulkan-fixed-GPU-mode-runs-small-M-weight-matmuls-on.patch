@@ -1,7 +1,7 @@
 From 51e2256d447755f932ae001799a7a2f160797c41 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 14 Oct 2026 03:16:11 +0000
-Subject: [PATCH 06/11] vulkan: fixed GPU mode runs small-M weight matmuls on
+Subject: [PATCH 06/12] vulkan: fixed GPU mode runs small-M weight matmuls on
  the host when the bits match
 
 Batched embedding under MoltenVK: a single short text through embed_many was ~20% slower

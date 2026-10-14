@@ -1,7 +1,7 @@
 From 9ca43d0b43376b401df09e15d4424f0d0d9fbfef Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 14 Oct 2026 04:03:09 +0000
-Subject: [PATCH 11/11] =?UTF-8?q?docs:=20mac-verify=20results=20=E2=80=94?=
+Subject: [PATCH 11/12] =?UTF-8?q?docs:=20mac-verify=20results=20=E2=80=94?=
  =?UTF-8?q?=20MoltenVK=20single=20call,=20Vulkan/Metal=20GDN,=20Metal=20FA?=
  =?UTF-8?q?=20all=20verified=20on=20macos-15?=
 MIME-Version: 1.0

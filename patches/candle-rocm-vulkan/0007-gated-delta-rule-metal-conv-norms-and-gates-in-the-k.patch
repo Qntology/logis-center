@@ -1,7 +1,7 @@
 From 806aba6bfb0480e783ad69a8755a082a49fd8361 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 14 Oct 2026 03:33:12 +0000
-Subject: [PATCH 07/11] gated delta rule (metal): conv, norms and gates in the
+Subject: [PATCH 07/12] gated delta rule (metal): conv, norms and gates in the
  kernels with precise math
 
 The first Metal path passed its self-check (7 tokens, max rel 5.4e-7) but failed two GPU cases
