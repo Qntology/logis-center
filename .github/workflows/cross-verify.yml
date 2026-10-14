@@ -139,7 +139,7 @@ jobs:
         if: matrix.kind == 'run' || matrix.kind == 'build'
         working-directory: logis-center/commerce/src-tauri
         run: |
-          . "$RUNNER_TEMP/annot.sh"
+          . "$RUNNER_TEMP/annot.sh"; set +e
           f="${{ matrix.features }}"
           cargo test --test it --no-default-features ${f:+--features $f} --no-run 2>&1 | tee "$RUNNER_TEMP/build.log" | tail -3
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/build.log"; exit 1; }
@@ -172,6 +172,6 @@ jobs:
         if: matrix.kind == 'check' || matrix.kind == 'cuda-check'
         working-directory: logis-center/commerce/src-tauri
         run: |
-          . "$RUNNER_TEMP/annot.sh"
+          . "$RUNNER_TEMP/annot.sh"; set +e
           cargo check --no-default-features --features "${{ matrix.features }}" --lib --bins --test it 2>&1 | tee "$RUNNER_TEMP/check.log" | tail -3
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/check.log"; exit 1; }
