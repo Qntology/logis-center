@@ -106,6 +106,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential pkg-config libssl-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
             libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
+      - name: tauri build inputs (same as .github/scripts/app-tests.sh)
+        working-directory: logis-center/commerce
+        run: |
+          # tauri::generate_context! needs ../dist; bundle.resources "dlls/*" needs one file.
+          [ -f dist/index.html ] || { mkdir -p dist; echo '<html></html>' > dist/index.html; }
+          mkdir -p src-tauri/dlls; [ -n "$(ls -A src-tauri/dlls)" ] || touch src-tauri/dlls/.gitkeep
       - name: protoc (lancedb / lance-encoding build script)
         run: |
           if [ "$RUNNER_OS" = Windows ]; then choco install protoc -y --no-progress; else sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler; fi
