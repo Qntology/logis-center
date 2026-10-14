@@ -103,8 +103,30 @@ jobs:
       - name: error-annotation helper
         run: |
           cat > "$RUNNER_TEMP/annot.sh" <<'SH'
-          # usage: annot LOGFILE — turn the first compiler / build-script errors into annotations
-          annot() { grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr|--- stdout|nvcc|fatal|^failures:|FAILED|exit code|STATUS_|not found' -A4 "$1" | head -40 | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-1500 | while IFS= read -r l || [ -n "$l" ]; do echo "::error::$l"; done; }
+          # annot LOGFILE : the first compiler / build-script / test errors + the last log lines, as one annotation
+          annot() {
+            local f="$1" msg
+            msg="$( { grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr|--- stdout|nvcc|fatal|^failures:|FAILED|exit code|STATUS_|not found' -A3 "$f" | cut -c1-300 | head -30; echo '--- last lines ---'; tail -25 "$f" | cut -c1-300; } | tr '\r' ' ' | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}' | cut -c1-3800 )"
+            echo "::error title=log::$msg"
+          }
+          # notice_lines TITLE LOGFILE REGEX : matching lines as one notice (proof of what really ran)
+          notice_lines() {
+            local msg
+            msg="$(grep -E "$3" "$2" | cut -c1-400 | head -8 | tr '\r' ' ' | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
+            echo "::notice title=$1::${msg:-<no matching lines>}"
+          }
+          # ort_path : Windows only — the ONNX Runtime DLL is linked dynamically and must be on PATH to start a test binary
+          ort_path() {
+            [ "$RUNNER_OS" = Windows ] || return 0
+            local dll d
+            dll="$(find target -name onnxruntime.dll 2>/dev/null | head -1)"
+            if [ -n "$dll" ]; then
+              d="$(cd "$(dirname "$dll")" && pwd)"; export PATH="$d:$PATH"
+              echo "::notice title=onnxruntime dll::$d : $(ls "$d" | grep -i '\.dll$' | tr '\n' ' ')"
+            else
+              echo "::warning title=onnxruntime dll::onnxruntime.dll not found under target"
+            fi
+          }
           SH
       - name: Tauri system libraries (Linux; macOS / Windows need none)
         if: runner.os == 'Linux'
@@ -154,6 +176,11 @@ jobs:
         if: matrix.name == 'windows-cuda'
         uses: ilammy/msvc-dev-cmd@v1
         with: { arch: x64 }
+      - name: Git for Windows link.exe shadows MSVC link.exe once the MSVC env is on PATH — move it away
+        if: matrix.name == 'windows-cuda'
+        run: |
+          if [ -f /usr/bin/link.exe ]; then mv /usr/bin/link.exe /usr/bin/link_git.exe; echo "moved Git link.exe"; fi
+          where.exe link
       - name: NVCC_CCBIN = the cl.exe on PATH (cudaforge then passes -ccbin and -allow-unsupported-compiler)
         if: matrix.name == 'windows-cuda'
         run: |
@@ -167,8 +194,8 @@ jobs:
         run: |
           printf '__global__ void k(float* x){ x[0] = 1.0f; }\n' > t.cu
           set +e
-          extra=""; [ -n "${NVCC_CCBIN:-}" ] && extra="-allow-unsupported-compiler -ccbin $NVCC_CCBIN"
-          nvcc -gencode arch=compute_80,code=sm_80 --expt-relaxed-constexpr -std=c++17 -O3 $extra -c t.cu -o t.obj > nvcc.log 2>&1; rc=$?
+          extra=(); [ -n "${NVCC_CCBIN:-}" ] && extra=(-allow-unsupported-compiler -ccbin "$NVCC_CCBIN")
+          nvcc -gencode arch=compute_80,code=sm_80 --expt-relaxed-constexpr -std=c++17 -O3 "${extra[@]}" -c t.cu -o t.obj > nvcc.log 2>&1; rc=$?
           cat nvcc.log
           msg="rc=$rc ccbin=${NVCC_CCBIN:-<none>}: $(head -c 1500 nvcc.log | tr '\r\n' '  ' | sed 's/%/%25/g')"
           if [ "$rc" = 0 ]; then echo "::notice title=nvcc diagnostic::$msg"; else echo "::error title=nvcc diagnostic::$msg"; exit 1; fi
@@ -197,16 +224,24 @@ jobs:
         if: matrix.kind == 'run'
         working-directory: logis-center/commerce/src-tauri
         run: |
-          . "$RUNNER_TEMP/annot.sh"; set +e
+          . "$RUNNER_TEMP/annot.sh"; set +e; ort_path
           f="${{ matrix.features }}"
           cargo test --test it --no-default-features ${f:+--features $f} -- --test-threads 2 2>&1 | tee "$RUNNER_TEMP/suite.log" | tail -5
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { echo "suite exit code: $rc"; annot "$RUNNER_TEMP/suite.log"; exit 1; }
+          notice_lines "suite result" "$RUNNER_TEMP/suite.log" '^test result'
       - name: "vision batch (ignored device tests — phrase encoding invariance on the device)"
         if: contains(fromJSON('["linux-vulkan","mac-metal","mac-vulkan"]'), matrix.name)
         working-directory: logis-center/commerce/src-tauri
         run: |
+          . "$RUNNER_TEMP/annot.sh"; set +e; ort_path
           f="${{ matrix.features }}"
-          cargo test --test it --no-default-features ${f:+--features $f} -- vision_batch --ignored --nocapture --test-threads 1
+          cargo test --test it --no-default-features ${f:+--features $f} -- vision_batch --ignored --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/vision.log" | tail -5
+          rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/vision.log"; exit 1; }
+          if grep -q 'VISION-BATCH\] 구 인코딩' "$RUNNER_TEMP/vision.log"; then
+            notice_lines "vision batch (device test ran)" "$RUNNER_TEMP/vision.log" 'VISION-BATCH'
+          else
+            echo "::error title=vision batch::NOT RUN — the device test skipped itself (no device found); this is not a pass"; exit 1
+          fi
       - name: embed-cpu-kernels contract tests
         if: matrix.kind == 'run' && matrix.features == ''
         working-directory: logis-center/commerce
@@ -219,6 +254,7 @@ jobs:
           LOGIS_TEST_MODELS: "1"
           LOGIS_REQUIRE_MODELS: "1"
         run: |
+          . "$RUNNER_TEMP/annot.sh"; ort_path
           LOGIS_MODELS_DIR="$RUNNER_TEMP/mock-models" cargo test --test it --no-default-features -- app_embed::gpu_embed_many_matches_per_text_and_is_faster --ignored --nocapture --test-threads 1
 
       # ── check: type check only ──
