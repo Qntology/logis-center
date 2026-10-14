@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "comma list of: mac-cpu, mac-metal, mac-vulkan, linux-cpu, linux-vulkan, linux-cuda, linux-rocm, windows-cpu, windows-vulkan, windows-cuda, windows-rocm (all = every one)"
+        description: "comma list of: mac-cpu, mac-metal, mac-vulkan, linux-cpu, linux-vulkan, linux-cuda, linux-rocm, windows-cpu, windows-vulkan, windows-cuda, windows-cuda12, windows-rocm (all = every one)"
         default: "all"
 
 concurrency:
@@ -26,6 +26,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # One toolchain for every OS and every run (a floating `stable` gave Mac / Linux / Windows different compilers
+  # within the same hours). Raise it here, in one place, and the cache keys follow.
+  RUST_VERSION: "1.99.0"
   CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
@@ -57,7 +60,10 @@ jobs:
             dict(name="linux-rocm", os="ubuntu-latest", kind="check", features="rocm,flash-attn,turbo-quant"),
             dict(name="windows-cpu", os="windows-latest", kind="run", features=""),
             dict(name="windows-vulkan", os="windows-latest", kind="build", features="vulkan"),
-            dict(name="windows-cuda", os="windows-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant"),
+            # CUDA 13 + VS 2026 (MSVC 14.51): the combination commerce/build_cargo.bat builds with
+            dict(name="windows-cuda", os="windows-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant", cuda="13.2.0", cuda_cap="75"),
+            # CUDA 12 (Pascal / Volta can only be built for by a 12.x toolkit) needs a VS 2022 toolset
+            dict(name="windows-cuda12", os="windows-2022", kind="cuda-check", features="cuda,flash-attn,turbo-quant", cuda="12.6.2", cuda_cap="80"),
             dict(name="windows-rocm", os="windows-latest", kind="check", features="rocm,flash-attn,turbo-quant"),
           ]
           inc = [i for i in inc if want is None or i["name"] in want]
@@ -78,8 +84,9 @@ jobs:
     env:
       # rocm: hipcc is not installed on the runner; the build script writes empty kernel images.
       CANDLE_ROCM_SKIP_KERNEL_BUILD: "1"
-      # cuda: no GPU to detect the compute capability from
-      CUDA_COMPUTE_CAP: "80"
+      # cuda: no GPU to detect the compute capability from. CUDA 13 needs Turing (sm_75) or newer, so the
+      # CUDA 13 job targets the oldest architecture it can build for; CUDA 12 keeps sm_80.
+      CUDA_COMPUTE_CAP: ${{ matrix.cuda_cap || '80' }}
     steps:
       - uses: actions/checkout@v4
         with: { path: logis-center }
@@ -91,15 +98,17 @@ jobs:
         run: |
           logis-center/.github/scripts/apply-fork-patches.sh
           logis-center/.github/scripts/use-fork-path.sh logis-center/commerce/src-tauri/Cargo.toml
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             logis-center/commerce/src-tauri/target
-          key: cross-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles('logis-center/commerce/src-tauri/Cargo.lock', 'logis-center/patches/candle-rocm-vulkan/*.patch') }}
-          restore-keys: cross-${{ matrix.name }}-${{ runner.os }}-
+          key: cross-${{ matrix.name }}-${{ matrix.os }}-rust${{ env.RUST_VERSION }}-${{ hashFiles('logis-center/commerce/src-tauri/Cargo.lock', 'logis-center/patches/candle-rocm-vulkan/*.patch') }}
+          restore-keys: cross-${{ matrix.name }}-${{ matrix.os }}-rust${{ env.RUST_VERSION }}-
       - name: error-annotation helper
         run: |
           cat > "$RUNNER_TEMP/annot.sh" <<'SH'
@@ -143,7 +152,12 @@ jobs:
       - name: protoc (lancedb / lance-encoding build script)
         run: |
           case "$RUNNER_OS" in
-            Windows) choco install protoc -y --no-progress ;;
+            Windows)
+              choco install protoc -y --no-progress
+              p="$(find /c/ProgramData/chocolatey -iname protoc.exe 2>/dev/null | head -1)"
+              [ -n "$p" ] || { echo "::error title=protoc::protoc.exe not found after choco install"; exit 1; }
+              echo "PROTOC=$(cygpath -w "$p")" >> "$GITHUB_ENV"   # do not rely on PATH being refreshed between steps
+              "$p" --version ;;
             macOS)   brew install protobuf >/dev/null 2>&1 || brew install protobuf ;;
             *)       sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler ;;
           esac
@@ -165,24 +179,33 @@ jobs:
       - name: CUDA toolkit (apt nvcc for the kernel build; no GPU)
         if: matrix.name == 'linux-cuda'
         run: sudo apt-get install -y -qq nvidia-cuda-toolkit
-      - name: CUDA toolkit (nvcc for the kernel build; no GPU)
-        if: matrix.name == 'windows-cuda'
+      - name: CUDA toolkit 13 (Windows; all components, names differ from 12)
+        if: matrix.kind == 'cuda-check' && runner.os == 'Windows' && startsWith(matrix.cuda, '13.')
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
-          cuda: "12.6.2"
+          cuda: ${{ matrix.cuda }}
+          method: network
+      - name: CUDA toolkit 12 (Windows; nvcc, headers, libs — no GPU)
+        if: matrix.kind == 'cuda-check' && runner.os == 'Windows' && startsWith(matrix.cuda, '12.')
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: ${{ matrix.cuda }}
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]'
+      - name: nvcc flags for CUDA 13 (CCCL needs the standard preprocessor; same as commerce/build_cargo.bat)
+        if: startsWith(matrix.cuda, '13.')
+        run: echo "NVCC_PREPEND_FLAGS=-Xcompiler /Zc:preprocessor" >> "$GITHUB_ENV"
       - name: MSVC developer environment (nvcc needs cl.exe in PATH)
-        if: matrix.name == 'windows-cuda'
+        if: matrix.kind == 'cuda-check' && runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with: { arch: x64 }
       - name: Git for Windows link.exe shadows MSVC link.exe once the MSVC env is on PATH — move it away
-        if: matrix.name == 'windows-cuda'
+        if: matrix.kind == 'cuda-check' && runner.os == 'Windows'
         run: |
           if [ -f /usr/bin/link.exe ]; then mv /usr/bin/link.exe /usr/bin/link_git.exe; echo "moved Git link.exe"; fi
           where.exe link
       - name: NVCC_CCBIN = the cl.exe on PATH (cudaforge then passes -ccbin and -allow-unsupported-compiler)
-        if: matrix.name == 'windows-cuda'
+        if: matrix.kind == 'cuda-check' && runner.os == 'Windows'
         run: |
           cl_path="$(where.exe cl | head -1 | tr -d '\r')"
           echo "cl.exe: $cl_path"
@@ -265,3 +288,15 @@ jobs:
           . "$RUNNER_TEMP/annot.sh"; set +e
           cargo check --no-default-features --features "${{ matrix.features }}" --lib --bins --test it 2>&1 | tee "$RUNNER_TEMP/check.log" | tail -3
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/check.log"; exit 1; }
+
+      # ── scope: say plainly what this job covered (a skipped stage is not a pass) ──
+      - name: scope of this job
+        if: always()
+        run: |
+          case "${{ matrix.kind }}" in
+            run)        msg="build + non-ignored suite; device tests only where listed. NOT RUN here: real CUDA / ROCm / Windows-GPU execution" ;;
+            build)      msg="build only. NOT RUN: tests (no software Vulkan driver on this runner)" ;;
+            check)      msg="type check only (cargo check). NOT RUN: build of test binaries, any test (no GPU / SDK to link or run)" ;;
+            cuda-check) msg="type check with a real nvcc kernel build (CUDA ${{ matrix.cuda || 'apt' }}, sm_${{ matrix.cuda_cap || '80' }}). NOT RUN: any test (no NVIDIA GPU)" ;;
+          esac
+          echo "::notice title=scope ${{ matrix.name }}::$msg"
