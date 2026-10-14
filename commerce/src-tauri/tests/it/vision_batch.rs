@@ -495,16 +495,12 @@ fn siglip2_phrase_rows_are_batch_invariant_cpu() -> anyhow::Result<()> {
 #[test]
 #[ignore]
 fn siglip2_phrase_rows_are_batch_invariant_gpu() -> anyhow::Result<()> {
-    use tauri_app_lib::utils::device_utils::{get_gpu_device, gpu_count};
-    if gpu_count() == 0 {
-        println!("[VISION-BATCH] GPU 없음 — NOT RUN");
-        return Ok(());
-    }
-    let dev = get_gpu_device(0);
-    if dev.is_cpu() {
+    // gpu_count() 는 CUDA/ROCm 장치 열거라 Metal 에서는 0 입니다 — gpu_memory.rs 와 같이 장치를 직접 만듭니다.
+    let dev = tauri_app_lib::utils::new_gpu_device(0).filter(|d| !d.is_cpu());
+    let Some(dev) = dev else {
         println!("[VISION-BATCH] GPU 장치를 얻지 못함 — NOT RUN");
         return Ok(());
-    }
+    };
     phrase_batch_invariance(&dev)
 }
 
