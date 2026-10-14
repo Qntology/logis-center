@@ -1,5 +1,5 @@
 // =====================================================================
-// 🌟 [EMBED-CPU-PACKED] CPU 임베딩 순전파용 패킹 GEMM (macOS 기본 ON, 그 밖은 opt-in: LOGIS_EMBED_CPU_KERNEL=packed)
+// 🌟 [EMBED-CPU-PACKED] CPU 임베딩 순전파용 패킹 GEMM (opt-in: LOGIS_EMBED_CPU_KERNEL=packed)
 // ---------------------------------------------------------------------
 //  ── 무엇이 문제였나 ──
 //   CPU 배치 순전파 시간의 대부분은 Linear(gemm 크레이트)입니다. 단건 호출(짧은 구, M = L ≈ 12)은
@@ -42,18 +42,15 @@ pub(crate) struct PackedModel {
     pub eps: f32,
 }
 
-/// 패킹 경로를 쓸지 (프로세스에서 한 번 읽음). `LOGIS_EMBED_CPU_KERNEL=packed|candle`.
-/// 기본값: macOS 는 packed — macos-15 Apple Silicon(3코어) 실측, 실모델 per-text 44.4 → 16.9 ms(2.6배),
-/// embed_many 44.9 → 17.4 ms, per-text 와 비트 동일 320/320 · 구성 무관 12/12 · 160/160 · 판정 150/150.
-/// 그 밖의 OS 는 candle 경로(기존 동작 그대로, Windows Ryzen 기준값 보존).
+/// 패킹 경로를 쓸지 (프로세스에서 한 번 읽음). `LOGIS_EMBED_CPU_KERNEL=packed`.
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var("LOGIS_EMBED_CPU_KERNEL")
             .map(|v| v.trim().eq_ignore_ascii_case("packed"))
-            .unwrap_or(cfg!(target_os = "macos"));
+            .unwrap_or(false);
         if on {
-            println!("[EMBED-CPU-PACKED] CPU 임베딩: 패킹 GEMM + 융합 RMSNorm/SiLU·up (LOGIS_EMBED_CPU_KERNEL=packed|candle, 타일 {}×{})", mr(), NR);
+            println!("[EMBED-CPU-PACKED] CPU 임베딩: 패킹 GEMM + 융합 RMSNorm/SiLU·up (LOGIS_EMBED_CPU_KERNEL=packed, 타일 {}×{})", mr(), NR);
         }
         on
     })
