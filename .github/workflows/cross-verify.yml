@@ -348,9 +348,9 @@ jobs:
           # the architecture the type-check step compiled is not compiled twice (only when that step passed)
           SWEEP_SKIP: ${{ steps.typecheck.outcome == 'success' && (matrix.cuda_cap || '80') || '' }}
           SWEEP_MINUTES: ${{ runner.os == 'Windows' && '75' || '60' }}
-          # lowest GPU generation the project supports (Volta). Below it a failure is reported (warning), not fatal:
-          # candle-kernels 0.11.0 has no half atomicAdd below sm_70 on CUDA 12.0, and CUDA 13 cannot target those at all.
-          SWEEP_MIN_SM: "70"
+          # lowest GPU generation the project builds for (Ampere, sm_80 = what the type check compiles). Below it a failure is a warning:
+          # crates.io candle-kernels 0.11.0 does not compile below sm_80 on CUDA 13 (__hmax_nan redefinition) nor below sm_70 on CUDA 12.
+          SWEEP_MIN_SM: "80"
         run: |
           if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
           "$py" ../../.github/scripts/cuda-arch-sweep.py
