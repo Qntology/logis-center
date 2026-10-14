@@ -9,11 +9,11 @@
 name: cross-verify
 
 on:
-  # A workflow file that is not on the default branch cannot be dispatched, so editing this file on the
-  # working branch also starts it (all targets).
+  # Every push to main (and to the working branch) runs all targets. A workflow file that is not on the
+  # default branch cannot be dispatched, so the working branch is triggered by push as well.
+  # `[skip ci]` in the head commit message skips it. workflow_dispatch takes a target list.
   push:
-    branches: ["claude/mac-verify"]
-    paths: [".github/workflows/cross-verify.yml"]
+    branches: ["main", "claude/mac-verify"]
   workflow_dispatch:
     inputs:
       targets:
@@ -81,6 +81,8 @@ jobs:
         with: { path: logis-center }
       - uses: actions/checkout@v4
         with: { repository: sungu-che/candle-rocm-vulkan, ref: master, path: candle-rocm-vulkan, fetch-depth: 0 }
+      - name: environment report (runner, before setup)
+        run: logis-center/.github/scripts/env-report.sh before-setup
       - name: apply fork patch series + path dependencies (job only)
         run: |
           logis-center/.github/scripts/apply-fork-patches.sh
@@ -98,7 +100,7 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/annot.sh" <<'SH'
           # usage: annot LOGFILE — turn the first compiler / build-script errors into annotations
-          annot() { grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr' -A4 "$1" | head -40 | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-1500 | while IFS= read -r l || [ -n "$l" ]; do echo "::error::$l"; done; }
+          annot() { grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr|--- stdout|nvcc|fatal|^failures:|FAILED|exit code|STATUS_|not found' -A4 "$1" | head -40 | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-1500 | while IFS= read -r l || [ -n "$l" ]; do echo "::error::$l"; done; }
           SH
       - name: Tauri system libraries (Linux; macOS / Windows need none)
         if: runner.os == 'Linux'
@@ -131,6 +133,28 @@ jobs:
           cuda: "12.6.2"
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]'
+      - name: MSVC developer environment (nvcc needs cl.exe in PATH)
+        if: matrix.name == 'windows-cuda-check'
+        uses: ilammy/msvc-dev-cmd@v1
+        with: { arch: x64 }
+      - name: NVCC_CCBIN = the cl.exe on PATH (cudaforge then passes -ccbin and -allow-unsupported-compiler)
+        if: matrix.name == 'windows-cuda-check'
+        run: |
+          cl_path="$(where.exe cl | head -1 | tr -d '\r')"
+          echo "cl.exe: $cl_path"
+          echo "NVCC_CCBIN=$cl_path" >> "$GITHUB_ENV"
+      - name: nvcc direct diagnostic (surfaces nvcc's own message; same flags as candle-kernels)
+        if: matrix.kind == 'cuda-check'
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}
+        run: |
+          printf '__global__ void k(float* x){ x[0] = 1.0f; }\n' > t.cu
+          set +e
+          extra=""; [ -n "${NVCC_CCBIN:-}" ] && extra="-allow-unsupported-compiler -ccbin $NVCC_CCBIN"
+          nvcc -gencode arch=compute_80,code=sm_80 --expt-relaxed-constexpr -std=c++17 -O3 $extra -c t.cu -o t.obj > nvcc.log 2>&1; rc=$?
+          cat nvcc.log
+          msg="rc=$rc ccbin=${NVCC_CCBIN:-<none>}: $(head -c 1500 nvcc.log | tr '\r\n' '  ' | sed 's/%/%25/g')"
+          if [ "$rc" = 0 ]; then echo "::notice title=nvcc diagnostic::$msg"; else echo "::error title=nvcc diagnostic::$msg"; exit 1; fi
       - uses: actions/setup-python@v5
         if: matrix.kind == 'run'
         with: { python-version: "3.12" }
@@ -139,6 +163,9 @@ jobs:
         run: |
           python -m pip install -q numpy
           python -I logis-center/commerce/src-tauri/tests/fixtures/granite_mock/gen_granite_mock.py "$RUNNER_TEMP/mock-models"
+
+      - name: environment report (after setup, before build)
+        run: logis-center/.github/scripts/env-report.sh before-build
 
       # ── run: build + suite ──
       - name: build (cargo test --no-run)
@@ -153,8 +180,10 @@ jobs:
         if: matrix.kind == 'run'
         working-directory: logis-center/commerce/src-tauri
         run: |
+          . "$RUNNER_TEMP/annot.sh"; set +e
           f="${{ matrix.features }}"
-          cargo test --test it --no-default-features ${f:+--features $f} -- --test-threads 2
+          cargo test --test it --no-default-features ${f:+--features $f} -- --test-threads 2 2>&1 | tee "$RUNNER_TEMP/suite.log" | tail -5
+          rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { echo "suite exit code: $rc"; annot "$RUNNER_TEMP/suite.log"; exit 1; }
       - name: vision batch + embed kernels (ignored device tests)
         if: matrix.name == 'linux-vulkan'
         working-directory: logis-center/commerce/src-tauri
