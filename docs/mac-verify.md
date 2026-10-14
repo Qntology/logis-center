@@ -28,6 +28,7 @@
 |---|---|
 | [38499518771](https://github.com/sungu-che/logis-center/actions/runs/38499518771) | 전체: probe 2, fork 3, app 3 |
 | [38506246088](https://github.com/sungu-che/logis-center/actions/runs/38506246088) | 포크 개선 3건 검증: fork Metal/Vulkan, app Metal/Vulkan의 suite · embed · real · accel |
+| [38508388995](https://github.com/sungu-che/logis-center/actions/runs/38508388995) | Metal GDN 정밀화(`806aba6`)만 재확인: fork `delta_rule_tests`, app `gdn-path` · `qwen4-exp-gpu` |
 
 - 결과는 잡 annotation으로 읽었습니다. 이 세션에서는 로그와 아티팩트 blob이 403이라서입니다.
 
@@ -156,10 +157,16 @@
   - 원인: 12층 × GPU 제출 1회 더(층당 0.8 ms). Gpu 모드는 모든 가중치 행렬곱을 GPU로 보내 제출과 대기를 매번 기다립니다.
   - 수정: host 공유 메모리에서는 행이 2..=32인 F32 가중치 행렬곱을 CPU에서 계산합니다.
   - 안전장치: 장치 · 형태마다 실제 가중치 16행으로 **CPU 결과가 GPU 커널 결과와 비트 동일할 때만** 이렇게 합니다. 그래서 행 결과는 여전히 배치와 무관합니다. 확인 결과는 `[VK-HOST-SMALL-M]` 줄로 남습니다.
-  - 결과: 4절 최종 런.
+  - **결과(run 38506246088): 실모델 단건 per-text 34.9 ms / embed_many 22.5 ms** — embed_many가 1.55배 빨라졌습니다(이전 58.6 ms, 20% 느림).
+    - 목업은 34.7 / 33.4 ms입니다. 전체 2.05배, 짧은 구 4.36배입니다.
+    - 구성 무관 12/12 · 12/12 · 160/160, 재현 320/320, 판정 150/150, Stage-1 154/154, NMS 4/4, Plinko 25/25가 모두 유지됐습니다.
+    - `[VK-HOST-SMALL-M]`에서 384×1152 · 384×384 · 384×3072 · 1536×384 모두 CPU == GPU로 확인돼 적용됐습니다.
 - [!] **Auto 모드(원소 연산도 GPU) 비교**
   - Auto는 크기 임계에 따라 경로가 바뀌어 배치 구성에 따라 비트가 달라질 수 있습니다. 그래서 기본값 후보가 아니고 측정 전용입니다(`LOGIS_EMBED_VK_MODE=auto`, `LOGIS_EMBED_MEASURE_ONLY=1`).
-  - 새 ExecMode는 만들지 않았습니다. 단건 손해의 원인은 원소 연산이 아니라 제출 횟수였기 때문입니다.
+  - 실측(run 38506246088, 목업):
+    - 전체 2.15배, 짧은 구 3.20배, 단건 36.1/35.3 ms입니다.
+    - 하지만 **구성 무관 1/12 · 1/12 · 121/160**, 비트 동일 34/320입니다. 결정 정책으로 쓸 수 없습니다.
+  - 새 ExecMode는 만들지 않았습니다. 단건 손해의 원인은 원소 연산이 아니라 제출 횟수였고, 작은 M 경로로 해결했습니다.
 
 ## 3-5. 10/12~10/13 작업 중 Mac 미검증 항목
 
@@ -172,7 +179,13 @@
   - 리눅스 CPU: FA on KLD 9.6e-14, top-1 100%, max|Δ| 2.3e-5. TQ는 CPU에서 비활성입니다.
   - 리눅스 lavapipe Vulkan: FA on KLD 5.7e-14, top-1 100%. TQ KV on 평균 KLD 1.66e-4, 최대 1.55e-2, top-1 100%.
   - Metal: FA가 비융합 폴백뿐이었습니다 → **포크에서 Metal sdpa 융합 커널로 연결**했습니다(`3ad5050`, 패치 0004). 앱 `accel_check` 자가 점검이 Metal도 검사합니다.
-  - Mac 수치: 4절 최종 런.
+  - **Mac (run 38506246088, 목업)**
+
+    | 장치 | FA 자가 점검 | FA on/off max|Δlogit| | KLD | top-1 | TurboQuant KV on |
+    |---|---|---|---|---|---|
+    | Metal (sdpa) | 통과 (7.0e-7, 5개 형태) | 1.82e-5 | 1.6e-13 | 100% | Metal에는 없음(비활성) |
+    | MoltenVK | 통과 (6.8e-7) | 2.19e-5 | 3.7e-14 | 100% | 평균 KLD 1.66e-4, 최대 1.55e-2, top-1 100%, max|Δlogit| 0.80. 자가 점검 K/V fp8 오차 평균 2.36% |
+    | Mac CPU | — | 2.46e-5 | 4.8e-14 | 100% | CPU 비활성 |
 - [x] **융합 GDN**
   - 포크 CPU `delta_rule_tests` 9 pass (Mac).
   - Metal과 Vulkan에는 융합 경로가 없었습니다. 리눅스 lavapipe 측정에서 텐서 경로는 CPU 융합 대비 프리필 0.09배, 디코드 0.32배였습니다.
@@ -180,7 +193,18 @@
     - Vulkan(host 공유 메모리)은 CPU 커널을 장치 텐서 위에서 돌립니다.
     - Metal은 네이티브 스캔 커널을 쓰고, CPU 커널과 자가 점검을 통과해야 켜집니다.
     - 포크 `delta_rule_tests`의 GPU 케이스(dk 256, Tiled, conv 2–5, dv 200 등)가 Metal과 Vulkan에서 돕니다.
-  - Mac 수치: 4절 최종 런.
+  - **Mac (Qwen3.5급 형태 Hk 8 · Hv 16 · Dk = Dv 128, 프리필 T=256 + 디코드 16)**
+
+    | 경로 | 프리필 | 디코드/스텝 | CPU 융합 대비 오차 |
+    |---|---|---|---|
+    | Mac CPU 융합 | 21.0 ms | 0.39 ms | — |
+    | MoltenVK 텐서 경로 (이전 기본) | 419.6 ms | 2.03 ms | 4.8e-7 |
+    | **MoltenVK 융합 (`f947435`)** | **20.0 ms (20.9배)** | **1.22 ms (1.67배)** | **0 (CPU 커널 그대로)** |
+    | Metal 텐서 경로 (이전 기본) | 167.6 ms | 7.60 ms | 6.6e-7 |
+    | Metal 융합 1차 커널 | 31.9 ms (5.26배) | 3.77 ms (2.02배) | 8.2e-7 |
+
+  - 포크 테스트: MoltenVK `delta_rule_tests` GPU 케이스 7 pass. Metal 1차 커널은 `gpu_matches_f64_reference` · `half_inputs` 실패(허용치 2e-5, fast math) → `806aba6` 정밀화 → **run 38508388995에서 재확인**.
+  - 참고: 이 가상 GPU에서는 Metal 경로가 CPU 융합 커널보다 느립니다. 명령 버퍼 동기화 비용 때문입니다.
 - [x] **Vulkan FA/TurboQuant GLSL**: MoltenVK에서 `vulkan_accel_tests` 3/3, `accel_vulkan` 4/4.
 - [x] **W8A16 forward_exact**: CPU · Metal · MoltenVK 모두 통과(포크 f32 누산 수정 후).
 - [x] **판정 수준 일치**: 새 테스트 `embed_many_decisions_match_per_text`, 실모델 기준.
@@ -191,7 +215,14 @@
   - Metal `mem_info`를 recommendedMaxWorkingSetSize − currentAllocatedSize로 바꿨습니다(포크 `30e502f`, master 반영).
   - 새 테스트 `gpu_memory.rs`: 할당과 해제가 free에 반영되는지, KV-PLAN 판정, VRAM/RAM KV 계층 강제 결과가 CPU와 같은지.
     - lavapipe: 계층 강제 VRAM · RAM 모두 CPU 대비 3.8e-6.
-  - Mac 수치: 4절 최종 런.
+  - **Mac (run 38506246088)**
+
+    | 장치 | total | 256 MiB 할당 → 해제 | 모델 언로드 후 장치 free | KV 계층 강제 VRAM · RAM | KV-PLAN 48/512/2048/8192 MB |
+    |---|---|---|---|---|---|
+    | Metal | 5011 MB | −270 → +268 MB | 시작 대비 +0 MB | CPU 대비 5.7e-6 | Vram · Vram · Vram · Ssd |
+    | MoltenVK | 7516 MB (free 5011) | −270 → +268 MB | 시작 대비 +0 MB | CPU 대비 0 | Vram · Vram · Vram · Ssd |
+
+  - 프로세스 RSS는 언로드 후 시작 대비 +146~154 MB 남습니다(할당기 보유분).
 - [x] **macOS SSD 오프로드** (`594f5b4e`): 8 MiB × 4스레드 병렬 pread/pwrite, F_NOCACHE, F_PREALLOCATE
 
 | macos-15, 512 MiB 블록 | std::fs | 병렬 F_NOCACHE (기본 4×8MiB) | 최고 (8×32MiB) |
@@ -209,7 +240,11 @@
   - 포크 변경도 Windows 기본 동작을 바꾸지 않습니다.
     - Vulkan GDN과 작은 M host 경로는 host 공유 메모리 장치에서만 켜집니다. 이산 GPU는 그대로입니다.
     - Metal FA와 GDN은 Metal 전용입니다.
-- [ ] **최종 런 38506246088**: 결과 기록 대기 중
+- [x] **포크 개선 검증 런 38506246088**
+  - fork Vulkan: 전부 통과.
+  - app Metal · app Vulkan: 전부 통과(suite 195 / 213, Qwen4-Exp Metal 2.69e-5 · Vulkan 3.10e-5, argmax 100%).
+  - fork Metal: GDN 테스트 2건 실패 → 수정 `806aba6`.
+- [ ] **Metal GDN 정밀화 재확인 run 38508388995**: 대기
 - [x] 기존 CPU 테스트: 리눅스 193 pass, macOS 194 pass.
 
 ## 5. 완료 기준 (장치마다)
@@ -218,17 +253,25 @@
 |---|---|---|---|---|
 | macOS CPU | 1.000000 | **통과** | **통과** | 전체 0.94배 · 짧은 구 1.57배 · 단건 44.4/44.9 ms (손해 없음) |
 | Metal | 1.000000 | **통과** | **통과** | 2.44배 · 단건 12.5/12.2 ms |
-| MoltenVK | 1.000000 (Δ ≤ 3e-8) | **통과** | **통과** | 2.20배 · 단건 49.0/58.6 ms → 최종 런 |
+| MoltenVK | 1.000000 (Δ ≤ 3e-8) | **통과** | **통과** | 2.05배 · 짧은 구 4.36배 · **단건 34.9/22.5 ms** (포크 `51e2256` 후, 이전 49.0/58.6) |
 | 리눅스 x86 CPU (목업) | 1.000000 | 목업만 | 통과 | 2.2배 |
 
 ## 커밋
 
-- logis-center `claude/mac-verify` (main은 PR #62로 첫 5커밋을 병합)
-- 포크 `sungu-che/candle-rocm-vulkan` `claude/mac-verify` (`51e2256`). master `4e7ebd0` 위의 커밋 6개:
-  - `c663a23` vulkan: GLSL barrier() → workgroup barrier
-  - `c1de501` quantized: CPU f16 forward_exact를 f32로 누산
-  - `a08ba34` vulkan tests: GPU-resident Q8_0는 정확한 W8A32 + Vulkan f16 forward_exact f32 누산
-  - `3ad5050` metal: FlashAttention을 fused sdpa 커널로
-  - `f947435` gated delta rule: Vulkan(host 공유 메모리) · Metal 융합 경로
-  - `51e2256` vulkan: 고정 GPU 모드에서 작은 M 가중치 행렬곱을 host로 (비트 일치 시)
-- 같은 내용의 패치 시리즈: `patches/candle-rocm-vulkan/0001–0006` (포크 master 기준)
+- **logis-center** `claude/mac-verify`
+  - main에는 PR #62로 첫 5커밋(작업 초기 체크리스트까지)이 병합돼 있습니다.
+  - 그 뒤 커밋: Metal 동적 기본 ON, macOS SSD 오프로드, 목업 accel 테스트(FA/TQ · GDN · GPU 메모리), CI 단계 · 선택 입력, 포크 패치 시리즈, 이 문서.
+- **포크** `sungu-che/candle-rocm-vulkan` `claude/mac-verify`. master `4e7ebd0`(처음 3개는 PR #10으로 반영) 위의 커밋:
+
+  | 커밋 | 내용 |
+  |---|---|
+  | `c663a23` | vulkan: GLSL barrier() → workgroup barrier |
+  | `c1de501` | quantized: CPU f16 forward_exact를 f32로 누산 |
+  | `a08ba34` | vulkan tests: GPU-resident Q8_0는 정확한 W8A32 + Vulkan f16 forward_exact f32 누산 |
+  | `3ad5050` | metal: FlashAttention을 fused sdpa 커널로 |
+  | `f947435` | gated delta rule: Vulkan(host 공유 메모리) · Metal 융합 경로 |
+  | `51e2256` | vulkan: 고정 GPU 모드에서 작은 M 가중치 행렬곱을 host로 (비트 일치 시) |
+  | `806aba6` | gated delta rule (metal): conv · norm · 게이트를 precise math 커널로 |
+  | `454e15f` · `1d746d8` | docs/mac-verify.md (개발 환경 · 진행 방식 · 결과 기록) |
+
+- 같은 내용의 패치 시리즈: `patches/candle-rocm-vulkan/0001–0009` (포크 master 기준, CI는 `git am --3way`로 적용).
