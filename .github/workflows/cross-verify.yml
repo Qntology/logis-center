@@ -12,7 +12,8 @@ name: cross-verify
 on:
   # Every push to main (and to the working branch) runs all targets. A workflow file that is not on the
   # default branch cannot be dispatched, so the working branch is triggered by push as well.
-  # `[skip ci]` in the head commit message skips it. workflow_dispatch takes a target list.
+  # `[skip ci]` in the head commit message skips it. `[targets: windows-cpu,windows-cuda]` in the head commit
+  # message runs only those jobs (no duplicate runs of what did not change); workflow_dispatch takes the same list.
   push:
     branches: ["main", "claude/mac-verify"]
   workflow_dispatch:
@@ -44,11 +45,16 @@ jobs:
       - id: m
         shell: bash
         env:
-          TARGETS: ${{ inputs.targets || 'all' }}
+          TARGETS: ${{ inputs.targets || '' }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os
-          t = os.environ["TARGETS"].replace(" ", "")
+          import json, os, re, sys
+          t = os.environ.get("TARGETS", "").strip()
+          if not t:
+              m = re.search(r"\[targets:\s*([^\]]+)\]", os.environ.get("COMMIT_MSG", ""))
+              t = m.group(1) if m else "all"
+          t = t.replace(" ", "")
           want = None if t == "all" else set(t.split(","))
           inc = [
             dict(name="mac-cpu", os="macos-15", kind="run", features=""),
@@ -60,13 +66,20 @@ jobs:
             dict(name="linux-rocm", os="ubuntu-latest", kind="check", features="rocm,flash-attn,turbo-quant"),
             dict(name="windows-cpu", os="windows-latest", kind="run", features=""),
             dict(name="windows-vulkan", os="windows-latest", kind="build", features="vulkan"),
-            # CUDA 13 + VS 2026 (MSVC 14.51): the combination commerce/build_cargo.bat builds with
-            dict(name="windows-cuda", os="windows-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant", cuda="13.2.0", cuda_cap="75"),
+            # CUDA 13 + VS 2026 (MSVC 14.51): the combination commerce/build_cargo.bat builds with.
+            # sm_80, not sm_75: candle-kernels 0.11.0 compatibility.cuh defines __hmax_nan / __hmin_nan for
+            # __CUDA_ARCH__ < 800, and the CUDA 13.2 headers already define them -> "already been defined" (sm_75 run).
+            dict(name="windows-cuda", os="windows-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant", cuda="13.2.0", cuda_cap="80"),
             # CUDA 12 (Pascal / Volta can only be built for by a 12.x toolkit) needs a VS 2022 toolset
             dict(name="windows-cuda12", os="windows-2022", kind="cuda-check", features="cuda,flash-attn,turbo-quant", cuda="12.6.2", cuda_cap="80"),
             dict(name="windows-rocm", os="windows-latest", kind="check", features="rocm,flash-attn,turbo-quant"),
           ]
+          unknown = (want or set()) - {i["name"] for i in inc}
+          if unknown:
+              print("unknown targets: " + ",".join(sorted(unknown)), file=sys.stderr)
+              sys.exit(1)
           inc = [i for i in inc if want is None or i["name"] in want]
+          print("::notice title=targets::" + ",".join(i["name"] for i in inc), file=sys.stderr)
           print("matrix=" + json.dumps({"include": inc}))
           PY
 
@@ -84,8 +97,7 @@ jobs:
     env:
       # rocm: hipcc is not installed on the runner; the build script writes empty kernel images.
       CANDLE_ROCM_SKIP_KERNEL_BUILD: "1"
-      # cuda: no GPU to detect the compute capability from. CUDA 13 needs Turing (sm_75) or newer, so the
-      # CUDA 13 job targets the oldest architecture it can build for; CUDA 12 keeps sm_80.
+      # cuda: no GPU to detect the compute capability from, so it is set per job (default sm_80, Ampere).
       CUDA_COMPUTE_CAP: ${{ matrix.cuda_cap || '80' }}
     steps:
       - uses: actions/checkout@v4
@@ -101,7 +113,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-      - uses: actions/cache@v4
+      # Restore here, save at the very end (`if: always()`): the combined actions/cache only saves when the job
+      # succeeds, so a job that kept failing (windows-cpu / windows-cuda) rebuilt everything from scratch every run.
+      - id: cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -123,6 +138,18 @@ jobs:
             local msg
             msg="$(grep -E "$3" "$2" | cut -c1-400 | head -8 | tr '\r' ' ' | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')"
             echo "::notice title=$1::${msg:-<no matching lines>}"
+          }
+          # dll_report EXE : Windows — name the DLLs the test binary imports that are not on PATH (STATUS_DLL_NOT_FOUND does not say which)
+          dll_report() {
+            local exe="$1" tool dlls d missing=""
+            tool="$(command -v llvm-objdump || command -v objdump || true)"
+            if [ -z "$tool" ] || [ ! -f "$exe" ]; then echo "::warning title=dll report::no objdump or no test binary ($exe)"; return 0; fi
+            dlls="$("$tool" -p "$exe" 2>/dev/null | grep -i 'DLL Name:' | sed 's/.*DLL Name: *//I' | tr -d '\r' | sort -u)"
+            for d in $dlls; do
+              case "$d" in api-ms-win-*|ext-ms-win-*) continue ;; esac
+              where.exe "$d" >/dev/null 2>&1 || missing="$missing $d"
+            done
+            echo "::notice title=dll report::$(echo $dlls | wc -w) imported DLLs; NOT found on PATH:${missing:- none}"
           }
           # ort_path : Windows only — the ONNX Runtime DLL is linked dynamically and must be on PATH to start a test binary
           ort_path() {
@@ -161,6 +188,17 @@ jobs:
             macOS)   brew install protobuf >/dev/null 2>&1 || brew install protobuf ;;
             *)       sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler ;;
           esac
+      - name: DirectStorage runtime DLLs (Windows, same NuGet package as commerce/run_cargo.bat)
+        if: runner.os == 'Windows' && matrix.kind == 'run'
+        run: |
+          v=1.3.0
+          d="$RUNNER_TEMP/dstorage"; mkdir -p "$d"
+          curl -fsSL --retry 3 -o "$d/pkg.nupkg" "https://www.nuget.org/api/v2/package/Microsoft.Direct3D.DirectStorage/$v"
+          unzip -q -o "$d/pkg.nupkg" -d "$d/pkg"
+          bin="$d/pkg/native/bin/x64"
+          ls -la "$bin" || { echo "::error title=DirectStorage::native/bin/x64 is not in the package"; find "$d/pkg" -maxdepth 3 | head -30; exit 1; }
+          echo "$(cygpath -w "$bin")" >> "$GITHUB_PATH"
+          echo "::notice title=DirectStorage DLLs::$v : $(ls "$bin" | tr '\n' ' ')"
       - name: macOS — target CPU (the virtual M1 runner cannot name its CPU; same as mac-verify.yml)
         if: runner.os == 'macOS'
         run: echo "RUSTFLAGS=-C target-cpu=apple-m1" >> "$GITHUB_ENV"
@@ -218,7 +256,7 @@ jobs:
           printf '__global__ void k(float* x){ x[0] = 1.0f; }\n' > t.cu
           set +e
           extra=(); [ -n "${NVCC_CCBIN:-}" ] && extra=(-allow-unsupported-compiler -ccbin "$NVCC_CCBIN")
-          nvcc -gencode arch=compute_80,code=sm_80 --expt-relaxed-constexpr -std=c++17 -O3 "${extra[@]}" -c t.cu -o t.obj > nvcc.log 2>&1; rc=$?
+          nvcc -gencode arch=compute_${CUDA_COMPUTE_CAP:-80},code=sm_${CUDA_COMPUTE_CAP:-80} --expt-relaxed-constexpr -std=c++17 -O3 "${extra[@]}" -c t.cu -o t.obj > nvcc.log 2>&1; rc=$?
           cat nvcc.log
           msg="rc=$rc ccbin=${NVCC_CCBIN:-<none>}: $(head -c 1500 nvcc.log | tr '\r\n' '  ' | sed 's/%/%25/g')"
           if [ "$rc" = 0 ]; then echo "::notice title=nvcc diagnostic::$msg"; else echo "::error title=nvcc diagnostic::$msg"; exit 1; fi
@@ -250,7 +288,12 @@ jobs:
           . "$RUNNER_TEMP/annot.sh"; set +e; ort_path
           f="${{ matrix.features }}"
           cargo test --test it --no-default-features ${f:+--features $f} -- --test-threads 2 2>&1 | tee "$RUNNER_TEMP/suite.log" | tail -5
-          rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { echo "suite exit code: $rc"; annot "$RUNNER_TEMP/suite.log"; exit 1; }
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" != 0 ]; then
+            echo "suite exit code: $rc"; annot "$RUNNER_TEMP/suite.log"
+            if grep -qE 'STATUS_DLL_NOT_FOUND|0xc0000135' "$RUNNER_TEMP/suite.log"; then dll_report "$(ls -t target/debug/deps/it-*.exe 2>/dev/null | head -1)"; fi
+            exit 1
+          fi
           notice_lines "suite result" "$RUNNER_TEMP/suite.log" '^test result'
       - name: "vision batch (ignored device tests — phrase encoding invariance on the device)"
         if: contains(fromJSON('["linux-vulkan","mac-metal","mac-vulkan"]'), matrix.name)
@@ -290,6 +333,17 @@ jobs:
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/check.log"; exit 1; }
 
       # ── scope: say plainly what this job covered (a skipped stage is not a pass) ──
+      - name: save build cache (also after a failed job; only when this exact key is not stored yet)
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            logis-center/commerce/src-tauri/target
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
       - name: scope of this job
         if: always()
         run: |
