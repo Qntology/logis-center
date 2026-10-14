@@ -870,8 +870,9 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
         assert_eq!(sub_identical, sub_idx.len(), "역순 절반 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
         assert_eq!(batched_repro, texts.len(), "같은 입력의 embed_many 는 실행마다 비트 단위로 같아야 합니다");
     }
-    if device.is_cpu() {
+    if device.is_cpu() && !opts.fixed_shape {
         // CPU 동적 배치(정확한 길이 묶음)는 per-text 와 같은 연산이라 모든 텍스트가 비트 동일해야 합니다.
+        // (LOGIS_EMBED_FIXED_SHAPE=1 비교 런은 긴 텍스트를 패딩하므로 해당 없음 — macos-15 CPU 304/320)
         assert_eq!(identical, texts.len(), "CPU embed_many 가 per-text 와 비트 단위로 다릅니다");
     }
     assert!(min_cos > 0.995, "최소 코사인 {} — 배치 경로 수치가 허용 범위를 벗어났습니다", min_cos);

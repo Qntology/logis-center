@@ -594,16 +594,29 @@ fn gdn_fused_cpu_vs_tensor_paths_numbers_and_time() -> R {
     assert!(p <= 1e-3 && d <= 1e-3 && s <= 1e-3, "CPU 텐서 경로가 융합 커널과 다릅니다: {p:.2e} {d:.2e} {s:.2e}");
 
     if let Some(dev) = tauri_app_lib::utils::new_gpu_device(0) {
+        // 이 장치의 기본 경로(융합 지원이면 융합: Metal 스캔 커널 · 공유 메모리 Vulkan 의 CPU 커널) vs 텐서 경로
         let gpu_fused = candle_core::delta_rule::fused_gdn_supported(&dev);
-        let gpu = run(&dev, None)?;
-        let (p, d, s) = cmp(&gpu, &cpu_fused)?;
+        let gpu_tensor = run(&dev, Some(false))?;
+        let gpu = if gpu_fused { run(&dev, Some(true))? } else { gpu_tensor.clone() };
+        for (label, r) in [("텐서 경로", &gpu_tensor), ("기본(융합)", &gpu)] {
+            if label == "기본(융합)" && !gpu_fused {
+                continue;
+            }
+            let (p, d, s) = cmp(r, &cpu_fused)?;
+            println!(
+                "[GDN-PATH] {:?} {label} 프리필 T={t} {:.1}ms · 디코드 {:.2}ms/스텝 | CPU 융합 대비 상대오차: 프리필 {:.1e} · 디코드 {:.1e} · 상태 {:.1e} | 속도: 프리필 CPU 융합의 {:.2}배 · 디코드 {:.2}배",
+                dev.location(),
+                r.3, r.4, p, d, s, cpu_fused.3 / r.3, cpu_fused.4 / r.4
+            );
+            assert!(p <= 1e-3 && d <= 1e-3 && s <= 1e-3, "{:?} {label}: CPU 융합과 다릅니다: {p:.2e} {d:.2e} {s:.2e}", dev.location());
+        }
         println!(
-            "[GDN-PATH] {:?} ({}) 프리필 T={t} {:.1}ms · 디코드 {:.2}ms/스텝 | CPU 융합 대비 상대오차: 프리필 {:.1e} · 디코드 {:.1e} · 상태 {:.1e} | 속도: 프리필 CPU 융합의 {:.2}배 · 디코드 {:.2}배",
+            "[GDN-PATH] {:?} 융합 지원 {} → 기본 경로가 텐서 경로 대비 프리필 {:.2}배 · 디코드 {:.2}배",
             dev.location(),
-            if gpu_fused { "융합 커널" } else { "융합 커널 없음 → 텐서 경로" },
-            gpu.3, gpu.4, p, d, s, cpu_fused.3 / gpu.3, cpu_fused.4 / gpu.4
+            gpu_fused,
+            gpu_tensor.3 / gpu.3,
+            gpu_tensor.4 / gpu.4
         );
-        assert!(p <= 1e-3 && d <= 1e-3 && s <= 1e-3, "GPU GDN 경로가 CPU 융합과 다릅니다: {p:.2e} {d:.2e} {s:.2e}");
     }
     Ok(())
 }

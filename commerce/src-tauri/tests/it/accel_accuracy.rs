@@ -6,7 +6,8 @@
 //!  - 순서: 프리필 64 토큰(q_len > 1, FA 프리필 경로) → 1 토큰씩 디코드 96 회(FA 디코드 · TurboQuant 압축 KV).
 //!  - 지표: 위치별 KLD(기준 ‖ 측정), top-1 일치율, max |Δlogit| (프리필 마지막 + 디코드 96 = 97 위치).
 //!  - 장치: CPU + 이 빌드의 GPU 0번(`utils::new_gpu_device`). TurboQuant KV 는 CUDA/ROCm/Vulkan 에서만
-//!    켜집니다(`turbo_kv_active`); Metal 은 융합 어텐션 커널이 없어 FA on 도 비융합 경로입니다.
+//!    켜집니다(`turbo_kv_active`). Metal 의 FA 는 포크의 Metal sdpa 융합 커널(포크 패치 0004)이며, 첫 사용 때
+//!    `accel_check` 자가 점검을 통과해야 켜집니다([ACCEL-CHECK] 줄).
 //! 판정: FA 는 F32 에서 무손실이어야 하므로 같은 장치 FA off 대비 max |Δlogit| ≤ 1e-3, 기준 대비 top-1 ≥ 95%.
 //! TurboQuant 는 손실 압축이라 측정값을 기록하고 느슨한 상한(평균 KLD ≤ 0.05 · top-1 ≥ 80%)만 봅니다.
 #![cfg(any(feature = "flash-attn", feature = "turbo-quant"))]

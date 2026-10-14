@@ -3,7 +3,8 @@
 # timeout and publishes its own annotations, so a slow later phase cannot lose the earlier results).
 # Run inside logis-center/commerce.
 #   app-tests.sh cpu|metal|vulkan <out-dir> build|suite|embed|bench|real|accel
-# Env: MOCK_MODELS (gen_granite_mock.py output root), REAL_MODELS (Hugging Face download root, optional)
+# Env: MOCK_MODELS (gen_granite_mock.py output root), REAL_MODELS (Hugging Face download root, optional),
+#      EMBED_BACKENDS (backends whose embed / real phases run, default all), EMBED_COMPARE (0: default policy only)
 set -euo pipefail
 BACKEND="$1"; OUT="$(mkdir -p "$2" && cd "$2" && pwd)"; export OUT; PHASE="${3:-all}"
 . "$(dirname "$0")/lib.sh"
@@ -43,6 +44,14 @@ embed() {
 }
 CPU_ENV=(); [ "$BACKEND" = cpu ] && CPU_ENV=(LOGIS_TEST_EMBED_DEVICE=cpu)
 
+# A targeted run re-measures only the backends a change touches (no duplicate runs of unchanged paths).
+case ",${EMBED_BACKENDS:-cpu,metal,vulkan}," in
+  *",$BACKEND,"*) ;;
+  *) if [ "$PHASE" = embed ] || [ "$PHASE" = real ]; then
+       echo "$PHASE phase: $BACKEND not in EMBED_BACKENDS=$EMBED_BACKENDS (unchanged by this run's change)"; exit 0
+     fi ;;
+esac
+
 case "$PHASE" in
 build)
   git -C ../../../candle-rocm-vulkan log --oneline -n 1 > "$OUT/fork-head.txt" 2>/dev/null || true
@@ -62,6 +71,7 @@ suite)
 embed)
   # [EMBED-BATCHED] mock model: default policy (main) + forced alternatives (compare)
   embed "embed-$BACKEND-mock" "$MOCK_MODELS" main ${CPU_ENV[@]+"${CPU_ENV[@]}"}
+  [ "${EMBED_COMPARE:-1}" = 0 ] && { finish; exit $?; }
   case "$BACKEND" in
     cpu)
       embed embed-cpu-mock-packed "$MOCK_MODELS" compare ${CPU_ENV[@]+"${CPU_ENV[@]}"} LOGIS_EMBED_CPU_KERNEL=packed
@@ -87,7 +97,7 @@ real)
   # real weights: decision-level checks (bank top-1 150 x 170) under the default policy
   if [ -f "${REAL_MODELS:-/nonexistent}/granite-embedding-97m-multilingual-r2/model.safetensors" ]; then
     embed "embed-$BACKEND-real" "$REAL_MODELS" main ${CPU_ENV[@]+"${CPU_ENV[@]}"}
-    if [ "$BACKEND" = cpu ]; then
+    if [ "$BACKEND" = cpu ] && [ "${EMBED_COMPARE:-1}" != 0 ]; then
       embed embed-cpu-real-packed "$REAL_MODELS" compare ${CPU_ENV[@]+"${CPU_ENV[@]}"} LOGIS_EMBED_CPU_KERNEL=packed
     fi
   else

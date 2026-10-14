@@ -31,7 +31,9 @@ metal)
   if grep -q "DEVICE_PROBE metal OK" "$OUT/probe-metal.log"; then
     run m-invariance-metal cargo test --release -p candle-core --features metal --test matmul_m_invariance_tests metal_ -- --ignored --nocapture
     run w8a16-generic-metal cargo test --release -p candle-core --features metal --test quantized_tests w8a16_generic_metal -- --nocapture
-    run delta-rule-metal cargo test --release -p candle-core --features metal --test delta_rule_tests -- --nocapture
+    # GPU cases only: the CPU-only tests (f64 oracle, host-emulated CUDA kernels) run in the cpu job.
+    run delta-rule-metal cargo test --release -p candle-core --features metal --test delta_rule_tests -- --nocapture \
+      --skip cpu_matches_f64_reference --skip host_emulated_kernels
     run matmul-tests-metal cargo test --release -p candle-core --features metal --test matmul_tests
   else
     for s in m-invariance-metal w8a16-generic-metal delta-rule-metal matmul-tests-metal; do
@@ -40,7 +42,7 @@ metal)
   fi
   ;;
 vulkan)
-  run build-core-vulkan cargo test --release -p candle-core --features vulkan --test vulkan_tests --test vulkan_accel_tests --test quantized_tests --test matmul_m_invariance_tests --no-run
+  run build-core-vulkan cargo test --release -p candle-core --features vulkan --test vulkan_tests --test vulkan_accel_tests --test quantized_tests --test matmul_m_invariance_tests --test delta_rule_tests --no-run
   run build-nn-vulkan cargo test --release -p candle-nn --features vulkan --test accel_vulkan --no-run
   run probe-vulkan cargo run --release -p candle-core --features vulkan --example device_probe
   if grep -q "DEVICE_PROBE vulkan OK" "$OUT/probe-vulkan.log"; then
@@ -50,8 +52,11 @@ vulkan)
     run nn-accel-vulkan cargo test --release -p candle-nn --features vulkan --test accel_vulkan -- --nocapture --test-threads 1
     run w8a16-generic-vulkan cargo test --release -p candle-core --features vulkan --test quantized_tests w8a16_generic_cuda::vulkan -- --nocapture
     run m-invariance-vulkan cargo test --release -p candle-core --features vulkan --test matmul_m_invariance_tests vulkan_ -- --ignored --nocapture
+    # Fused GDN on MoltenVK (host-shared memory: the CPU kernel on the device tensors), GPU cases only.
+    run delta-rule-vulkan cargo test --release -p candle-core --features vulkan --test delta_rule_tests -- --nocapture \
+      --skip cpu_matches_f64_reference --skip host_emulated_kernels
   else
-    for s in vulkan-tests fixed-exec-modes vulkan-accel-tests nn-accel-vulkan w8a16-generic-vulkan m-invariance-vulkan; do
+    for s in vulkan-tests fixed-exec-modes vulkan-accel-tests nn-accel-vulkan w8a16-generic-vulkan m-invariance-vulkan delta-rule-vulkan; do
       not_run "$s" "no Vulkan (MoltenVK) device on hosted runner (see probe-vulkan.log)"
     done
   fi

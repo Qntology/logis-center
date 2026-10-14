@@ -85,7 +85,7 @@ fn states() -> MutexGuard<'static, HashMap<DeviceLocation, DeviceState>> {
 }
 
 fn is_gpu(device: &Device) -> bool {
-    matches!(device, Device::Cuda(_) | Device::Rocm(_) | Device::Vulkan(_))
+    matches!(device, Device::Cuda(_) | Device::Rocm(_) | Device::Vulkan(_) | Device::Metal(_))
 }
 
 fn backend_name(device: &Device) -> &'static str {
@@ -93,6 +93,7 @@ fn backend_name(device: &Device) -> &'static str {
         Device::Cuda(_) => "cuda",
         Device::Rocm(_) => "rocm",
         Device::Vulkan(_) => "vulkan",
+        Device::Metal(_) => "metal",
         Device::Cpu => "cpu",
         _ => "other",
     }

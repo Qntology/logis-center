@@ -26,9 +26,21 @@ on:
         description: "app phases to run after build (comma list of suite,embed,bench,real,accel)"
         default: "suite,embed,bench,real,accel"
       full:
-        description: "also run the probe and fork jobs"
+        description: "also run the probe jobs"
         type: boolean
         default: true
+      app:
+        description: "app job backends (JSON list items)"
+        default: '"cpu","metal","vulkan"'
+      fork:
+        description: "fork job backends (JSON list items, none = skip)"
+        default: '"cpu","metal","vulkan"'
+      embed_backends:
+        description: "backends whose embed / real phases run"
+        default: "cpu,metal,vulkan"
+      embed_compare:
+        description: "1 = also the forced alternative embedding policies, 0 = default policy only"
+        default: "1"
 
 concurrency:
   group: mac-verify-${{ github.ref }}
@@ -97,11 +109,11 @@ jobs:
 
   # ── 2. Fork build/tests (CPU · Metal · MoltenVK) ──
   fork:
-    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.full) || (github.event_name != 'workflow_dispatch' && !contains(github.event.head_commit.message, '[accel-only]')) }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.fork != 'none') || (github.event_name != 'workflow_dispatch' && !contains(github.event.head_commit.message, '[accel-only]')) }}
     strategy:
       fail-fast: false
       matrix:
-        backend: [cpu, metal, vulkan]
+        backend: ${{ fromJSON(format('[{0}]', (inputs.fork != 'none' && inputs.fork) || '"cpu","metal","vulkan"')) }}
     runs-on: macos-15
     timeout-minutes: 120
     steps:
@@ -143,10 +155,12 @@ jobs:
     # (src/cpu/arm/darwin.rs:44/51) fails. RUSTFLAGS overrides build.rustflags for the job only.
     env:
       RUSTFLAGS: "-C target-cpu=apple-m1"
+      EMBED_BACKENDS: ${{ inputs.embed_backends || 'cpu,metal,vulkan' }}
+      EMBED_COMPARE: ${{ inputs.embed_compare || '1' }}
     strategy:
       fail-fast: false
       matrix:
-        backend: [cpu, metal, vulkan]
+        backend: ${{ fromJSON(format('[{0}]', inputs.app || '"cpu","metal","vulkan"')) }}
     runs-on: macos-15
     timeout-minutes: 330
     steps:

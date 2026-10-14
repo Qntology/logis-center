@@ -249,7 +249,7 @@ pub struct FloatModel {
     layers: Vec<DecoderLayer>,
     final_norm: RmsNorm,
     rotary: Arc<RotaryEmbedding>,
-    /// 🌟 [EMBED-CPU-PACKED] CPU + LOGIS_EMBED_CPU_KERNEL=packed 일 때만 (embedding/cpu_packed.rs).
+    /// 🌟 [EMBED-CPU-PACKED] CPU 이고 패킹 경로가 켜졌을 때만 (macOS 기본, embedding/cpu_packed.rs::enabled).
     packed: Option<cpu_packed::PackedModel>,
 }
 
