@@ -4,6 +4,15 @@
 set -euo pipefail
 BACKEND="$1"; OUT="$(mkdir -p "$2" && cd "$2" && pwd)"; export OUT
 . "$(dirname "$0")/lib.sh"
+# FORK_TESTS (comma list of run labels, default all): a targeted run re-runs only the tests a change
+# touches (builds and the device probe always run).
+if [ -n "${FORK_TESTS:-}" ] && [ "$FORK_TESTS" != all ]; then
+  eval "$(declare -f run | sed '1s/^run /run_all /')"
+  run() {
+    case "$1" in build-*|probe-*) run_all "$@"; return ;; esac
+    case ",$FORK_TESTS," in *",$1,"*) run_all "$@" ;; *) echo "skip $1 (FORK_TESTS=$FORK_TESTS)" ;; esac
+  }
+fi
 echo "fork HEAD $(git rev-parse --short HEAD)" | tee "$OUT/fork-head.txt"
 git log --oneline -n 15 >> "$OUT/fork-head.txt"
 

@@ -44,6 +44,9 @@ on:
       accel_tests:
         description: "items of the accel phase (gdn,gpu-mem,vk-auto,fa,qwen4)"
         default: "gdn,gpu-mem,vk-auto,fa"
+      fork_tests:
+        description: "fork test run labels (comma list, all = every test)"
+        default: "all"
 
 concurrency:
   group: mac-verify-${{ github.ref }}
@@ -119,6 +122,8 @@ jobs:
         backend: ${{ fromJSON(format('[{0}]', (inputs.fork != 'none' && inputs.fork) || '"cpu","metal","vulkan"')) }}
     runs-on: macos-15
     timeout-minutes: 120
+    env:
+      FORK_TESTS: ${{ inputs.fork_tests || 'all' }}
     steps:
       - uses: actions/checkout@v4
         with: { path: logis-center }
