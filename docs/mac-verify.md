@@ -32,6 +32,7 @@
 | [38508978460](https://github.com/sungu-che/logis-center/actions/runs/38508978460) | Metal 빈 버퍼 수정(`e4a7314`) 후 fork `delta_rule_tests`만 |
 | [38513842101](https://github.com/sungu-che/logis-center/actions/runs/38513842101) | 개선 4건(CPU 병렬 원소 연산 · Qwen3.5 KV · 언로드 RSS · Metal conv 상태): fork Metal `delta-rule-metal`, app 3종 suite · embed(기본 정책만) · accel `gdn,gpu-mem,kv35`. CPU 실모델 단계는 사용자가 취소 |
 | [38516449786](https://github.com/sungu-che/logis-center/actions/runs/38516449786) | 취소된 CPU 실모델 단계 + 고친 테스트 확인: app CPU suite · real, app Vulkan suite |
+| [38520324489](https://github.com/sungu-che/logis-center/actions/runs/38520324489) | CPU 실모델 단건 재측정(번갈아 · 중앙값), `EMBED_COMPARE=speed` |
 
 - 결과는 잡 annotation으로 읽었습니다. 이 세션에서는 로그와 아티팩트 blob이 403이라서입니다.
 
@@ -309,11 +310,14 @@
 - [!] **Vulkan suite 213/214**: 실패 1건은 `mem_lifecycle::half_kv_storage_error_is_small`(CPU 전용, 기존 테스트)입니다.
   - 시드 없는 `randn` 입력이라 무작위 입력 2000개 기준 오차 중앙값 7.7e-4 · p99 1.8e-3 · 최대 2.6e-3으로 약 0.5% 확률로 기준 2e-3을 넘습니다. 이 잡은 2.27e-3이었습니다.
   - 고정 시드(ChaCha8)로 바꿔 매번 6.26e-4입니다. 리눅스 lavapipe `--features vulkan` suite 214/214, **Mac MoltenVK suite 214/214 (38516449786)**.
-- [~] **Mac CPU 배치 속도**: 목업(38513842101)은 짧은 구 1.68배 → 3.31배, 전체 2.69배 → 1.90배, 단건 절대 시간 약 2배.
-  - 같은 런에서 코드가 바뀌지 않은 CPU 융합 GDN도 이전 21.0 ms → 25.3 ms(Vulkan 잡) · 40.0 ms(Metal 잡)로 러너 CPU 속도가 1.2~1.9배 흔들렸고, 테스트 바이너리 할당기가 시스템 malloc → mimalloc으로 바뀌었습니다. 한 번의 debug 빌드 측정으로는 원인을 가를 수 없어 개선 여부는 **미확정**입니다.
+- 참고 — **목업 CPU 속도**(38513842101): 짧은 구 1.68배 → 3.31배, 전체 2.69배 → 1.90배, 단건 절대 시간 약 2배.
+  - 같은 런에서 코드가 바뀌지 않은 CPU 융합 GDN도 이전 21.0 ms → 25.3 ms(Vulkan 잡) · 40.0 ms(Metal 잡)로 러너 CPU 속도가 1.2~1.9배 흔들렸고, 테스트 바이너리 할당기가 시스템 malloc → mimalloc으로 바뀌었습니다. 목업 한 번의 debug 빌드 측정으로는 원인을 가를 수 없었고, 판단은 아래 실모델 런으로 했습니다.
   - **CPU 실모델, 새 코드 (38516449786)**: 비트 동일 320/320(짧은 303 · 긴 17), 구성 무관 12/12 · 12/12 · 160/160, 재현 320/320, **판정 150/150 · Stage-1 154/154 · NMS 4/4 · Plinko 25/25**. suite 195 · packed 195.
     - 속도: **전체 0.94배 → 1.39배, 짧은 구 1.57배 → 3.00배** (per-text 40.59 s → embed_many 29.21 s, 짧은 구 33.70 s → 11.24 s).
     - 단건은 57.0 / 97.6 ms로 나왔지만, 단건 embed_many(B=1, 정확한 길이, 마스크 없음)는 per-text와 같은 연산열입니다. per-text 20회 → embed_many 20회를 몰아서 잰 평균이라 VM 순간 지연이 한쪽에 실린 것으로 보고, 측정을 3바퀴 번갈아 · 중앙값으로 바꿨습니다(리눅스 목업 92.6 / 90.4 ms, 예전 방식 86.5 / 98.0). Mac 재측정: run 38520324489 (`EMBED_COMPARE=speed`, 속도 · 비트 동일 테스트만).
+    - **38520324489: 단건 중앙값 per-text 87.9 ms / embed_many 76.8 ms → 단건 손해 없음.** 비트 동일 320/320, 구성 무관 12/12 · 12/12 · 160/160, 재현 320/320, F32 판정 150/150.
+    - 이 런은 평균이 193.5 / 179.9 ms일 만큼 순간 지연이 컸고 per-text 순차가 40.59 s → 84.92 s로 느려져, 전체 3.36배 · 짧은 구 6.09배는 부풀려진 값입니다. embed_many 절대 시간은 29.21 s → 25.30 s로 비슷합니다. 개선 폭은 보수적으로 38516449786의 **전체 1.39배 · 짧은 구 3.00배**(이전 0.94배 · 1.57배)로 기록합니다.
+- [x] **Mac CPU 배치 속도 (새 코드, 실모델)**: 전체 0.94배 → 1.39배, 짧은 구 1.57배 → 3.00배, 단건 손해 없음, 판정 · 비트 동일 유지.
 - 가상 GPU의 동기화 비용은 런마다 크게 다릅니다(MoltenVK GDN 텐서 경로 디코드 2.03 → 3.47 ms, 코드 변경 없음). MoltenVK 단건 47.5 / 67.2 ms(이전 목업 34.7 / 33.4)도 이 영향으로 봅니다. 실제 Apple GPU 수치는 `runner` 입력에 셀프호스티드 Apple Silicon 라벨을 넣어 같은 테스트로 잽니다.
 - 결정: `force_flush_all_active_blocks`의 RAM 사본 BF16 변환은 사용자 결정으로 그대로 둡니다(CUDA/ROCm은 FP8, 그 밖은 F32 저장).
 - FP8 강등 · VRAM 재압축 · kv_half는 CUDA/ROCm 전용 경로라 Mac · 리눅스 VM에서 실행할 수 없습니다.
