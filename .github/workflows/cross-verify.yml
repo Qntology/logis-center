@@ -1,0 +1,135 @@
+# Linux / Windows verification of the same code the Mac run covers (docs/mac-verify.md).
+#
+# GitHub-hosted runners have no GPU. So only what can really run is run:
+#   cpu            : build + the non-ignored suite (+ the embed-cpu-kernels contract tests)
+#   vulkan (Linux) : lavapipe (software Vulkan, a CPU device): suite + the device tests of the vision batch path
+#   vulkan (Win)   : build only (no software Vulkan ICD is installed) — reported as "build only"
+#   cuda / rocm    : type check only (`cargo check`); never executed, never reported as a pass of a run
+# Real CUDA / ROCm / Windows-GPU execution needs a self-hosted runner with that GPU.
+name: cross-verify
+
+on:
+  # A workflow file that is not on the default branch cannot be dispatched, so editing this file on the
+  # working branch also starts it (all targets).
+  push:
+    branches: ["claude/mac-verify"]
+    paths: [".github/workflows/cross-verify.yml"]
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "comma list of: linux-cpu, linux-vulkan, linux-cuda-check, linux-rocm-check, windows-cpu, windows-vulkan-build, windows-cuda-check, windows-rocm-check (all = every one)"
+        default: "all"
+
+concurrency:
+  group: cross-verify-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+  GRANITE_REPO: ibm-granite/granite-embedding-97m-multilingual-r2
+
+jobs:
+  cross:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-cpu, os: ubuntu-latest, kind: run, features: "" }
+          - { name: linux-vulkan, os: ubuntu-latest, kind: run, features: "vulkan" }
+          - { name: linux-cuda-check, os: ubuntu-latest, kind: cuda-check, features: "cuda,flash-attn,turbo-quant" }
+          - { name: linux-rocm-check, os: ubuntu-latest, kind: check, features: "rocm,flash-attn,turbo-quant" }
+          - { name: windows-cpu, os: windows-latest, kind: run, features: "" }
+          - { name: windows-vulkan-build, os: windows-latest, kind: build, features: "vulkan" }
+          - { name: windows-cuda-check, os: windows-latest, kind: cuda-check, features: "cuda,flash-attn,turbo-quant" }
+          - { name: windows-rocm-check, os: windows-latest, kind: check, features: "rocm,flash-attn,turbo-quant" }
+    name: ${{ matrix.name }}
+    if: ${{ (inputs.targets || 'all') == 'all' || contains(format(',{0},', inputs.targets), format(',{0},', matrix.name)) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    env:
+      # rocm: hipcc is not installed on the runner; the build script writes empty kernel images.
+      CANDLE_ROCM_SKIP_KERNEL_BUILD: "1"
+      # cuda: no GPU to detect the compute capability from
+      CUDA_COMPUTE_CAP: "80"
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: logis-center }
+      - uses: actions/checkout@v4
+        with: { repository: sungu-che/candle-rocm-vulkan, ref: master, path: candle-rocm-vulkan, fetch-depth: 0 }
+      - name: apply fork patch series + path dependencies (job only)
+        run: |
+          logis-center/.github/scripts/apply-fork-patches.sh
+          logis-center/.github/scripts/use-fork-path.sh logis-center/commerce/src-tauri/Cargo.toml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            logis-center/commerce/src-tauri/target
+          key: cross-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles('logis-center/commerce/src-tauri/Cargo.lock', 'logis-center/patches/candle-rocm-vulkan/*.patch') }}
+          restore-keys: cross-${{ matrix.name }}-${{ runner.os }}-
+      - name: protoc (lancedb / lance-encoding build script)
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then choco install protoc -y --no-progress; else sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler; fi
+      - name: software Vulkan (lavapipe)
+        if: matrix.name == 'linux-vulkan'
+        run: |
+          sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1 vulkan-tools
+          echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json" >> "$GITHUB_ENV"
+          echo "CANDLE_VULKAN_ALLOW_CPU=1" >> "$GITHUB_ENV"
+      - name: CUDA toolkit (nvcc for the kernel build; no GPU)
+        if: matrix.kind == 'cuda-check'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: "12.6.2"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]'
+      - name: mock granite model (seeded, identical on every platform)
+        if: matrix.kind == 'run'
+        run: |
+          python -m pip install -q numpy
+          python -I logis-center/commerce/src-tauri/tests/fixtures/granite_mock/gen_granite_mock.py "$RUNNER_TEMP/mock-models"
+
+      # ── run: build + suite ──
+      - name: build (cargo test --no-run)
+        if: matrix.kind == 'run' || matrix.kind == 'build'
+        working-directory: logis-center/commerce/src-tauri
+        run: |
+          f="${{ matrix.features }}"
+          cargo test --test it --no-default-features ${f:+--features $f} --no-run
+      - name: suite (it, non-ignored)
+        if: matrix.kind == 'run'
+        working-directory: logis-center/commerce/src-tauri
+        run: |
+          f="${{ matrix.features }}"
+          cargo test --test it --no-default-features ${f:+--features $f} -- --test-threads 2
+      - name: vision batch + embed kernels (ignored device tests)
+        if: matrix.name == 'linux-vulkan'
+        working-directory: logis-center/commerce/src-tauri
+        run: cargo test --test it --no-default-features --features vulkan -- vision_batch --ignored --nocapture --test-threads 1
+      - name: embed-cpu-kernels contract tests
+        if: matrix.kind == 'run' && matrix.features == ''
+        working-directory: logis-center/commerce
+        run: cargo test --release --manifest-path crates/embed-cpu-kernels/Cargo.toml
+      - name: embed mock (CPU, default policy: bit identity + speed)
+        if: matrix.name == 'linux-cpu' || matrix.name == 'windows-cpu'
+        working-directory: logis-center/commerce/src-tauri
+        env:
+          LOGIS_TEST_EMBED_DEVICE: cpu
+          LOGIS_TEST_MODELS: "1"
+          LOGIS_REQUIRE_MODELS: "1"
+        run: |
+          LOGIS_MODELS_DIR="$RUNNER_TEMP/mock-models" cargo test --test it --no-default-features -- app_embed::gpu_embed_many_matches_per_text_and_is_faster --ignored --nocapture --test-threads 1
+
+      # ── check: type check only ──
+      - name: type check (cargo check — not executed)
+        if: matrix.kind == 'check' || matrix.kind == 'cuda-check'
+        working-directory: logis-center/commerce/src-tauri
+        run: cargo check --no-default-features --features "${{ matrix.features }}" --lib --bins --test it
