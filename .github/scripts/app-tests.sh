@@ -4,7 +4,8 @@
 # Run inside logis-center/commerce.
 #   app-tests.sh cpu|metal|vulkan <out-dir> build|suite|embed|bench|real|accel
 # Env: MOCK_MODELS (gen_granite_mock.py output root), REAL_MODELS (Hugging Face download root, optional),
-#      EMBED_BACKENDS (backends whose embed / real phases run, default all), EMBED_COMPARE (0: default policy only)
+#      EMBED_BACKENDS (backends whose embed / real phases run, default all), EMBED_COMPARE (0: default policy only),
+#      ACCEL_TESTS (items of the accel phase: gdn,gpu-mem,vk-auto,fa,qwen4; default all but qwen4, which the suite runs)
 set -euo pipefail
 BACKEND="$1"; OUT="$(mkdir -p "$2" && cd "$2" && pwd)"; export OUT; PHASE="${3:-all}"
 . "$(dirname "$0")/lib.sh"
@@ -113,21 +114,30 @@ accel)
   fi
   # Mock / tiny-model checks of the acceleration paths (docs/mac-verify.md 3-5). Each test changes process-wide
   # state (GDN override, accel config) or measures device-wide memory, so each runs alone (--test-threads 1).
+  want() { case ",${ACCEL_TESTS:-gdn,gpu-mem,vk-auto,fa}," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+  if want qwen4; then
+    run qwen4-exp-gpu env LOGIS_REQUIRE_GPU=0 cargo test --test it "${FEAT[@]}" -- qwen4_exp_tiny_gpu_matches_hf --nocapture
+    require_measured qwen4-exp-gpu "QWEN4-EXP\\] +variant_a on (Metal|Vulkan)"
+  fi
   # Fused GDN (CPU kernel) vs the tensor path on CPU and on this build's GPU: numbers + time.
-  run gdn-path cargo test --test it "${FEAT[@]}" -- qwen4_exp::gdn_fused --ignored --nocapture --test-threads 1
-  require_measured gdn-path "\\[GDN-PATH\\] (Metal|Vulkan)"
+  want gdn && run gdn-path cargo test --test it "${FEAT[@]}" -- qwen4_exp::gdn_fused --ignored --nocapture --test-threads 1
+  want gdn && require_measured gdn-path "\\[GDN-PATH\\] (Metal|Vulkan)"
   # Device memory reported / returned (Metal: fork patch 0003), KV-PLAN inputs, KV tiers on the GPU.
-  run gpu-mem cargo test --test it "${FEAT[@]}" -- gpu_memory:: --ignored --nocapture --test-threads 1
-  require_measured gpu-mem "\\[GPU-MEM\\] .*total"
-  if [ "$BACKEND" = vulkan ]; then
+  if want gpu-mem; then
+    run gpu-mem cargo test --test it "${FEAT[@]}" -- gpu_memory:: --ignored --nocapture --test-threads 1
+    require_measured gpu-mem "\\[GPU-MEM\\] .*total"
+  fi
+  if [ "$BACKEND" = vulkan ] && want vk-auto; then
     # Auto (per-op GPU element-wise) vs the default Gpu mode: speed only — Auto is not batch-invariant.
     embed embed-vulkan-mock-auto "$MOCK_MODELS" compare LOGIS_EMBED_VK_MODE=auto LOGIS_EMBED_MEASURE_ONLY=1
   fi
   # FlashAttention / TurboQuant KV on/off teacher forcing on a seeded mock Qwen3 (KLD, top-1). The app ships with
   # both features on; this is a second build of the app with them.
-  run accel-build cargo test --test it "${ACCEL_FEAT[@]}" --no-run
-  run accel-acc cargo test --test it "${ACCEL_FEAT[@]}" -- accel_accuracy --ignored --nocapture --test-threads 1
-  require_measured accel-acc "\\[ACCEL-ACC\\]"
+  if want fa; then
+    run accel-build cargo test --test it "${ACCEL_FEAT[@]}" --no-run
+    run accel-acc cargo test --test it "${ACCEL_FEAT[@]}" -- accel_accuracy --ignored --nocapture --test-threads 1
+    require_measured accel-acc "\\[ACCEL-ACC\\]"
+  fi
   ;;
 *) echo "unknown phase $PHASE"; exit 2 ;;
 esac

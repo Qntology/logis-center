@@ -41,6 +41,9 @@ on:
       embed_compare:
         description: "1 = also the forced alternative embedding policies, 0 = default policy only"
         default: "1"
+      accel_tests:
+        description: "items of the accel phase (gdn,gpu-mem,vk-auto,fa,qwen4)"
+        default: "gdn,gpu-mem,vk-auto,fa"
 
 concurrency:
   group: mac-verify-${{ github.ref }}
@@ -157,6 +160,7 @@ jobs:
       RUSTFLAGS: "-C target-cpu=apple-m1"
       EMBED_BACKENDS: ${{ inputs.embed_backends || 'cpu,metal,vulkan' }}
       EMBED_COMPARE: ${{ inputs.embed_compare || '1' }}
+      ACCEL_TESTS: ${{ inputs.accel_tests || 'gdn,gpu-mem,vk-auto,fa' }}
     strategy:
       fail-fast: false
       matrix:

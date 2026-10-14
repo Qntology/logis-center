@@ -1,7 +1,7 @@
 From a08ba343b009f6acf5612fe4f22181ac875bf224 Mon Sep 17 00:00:00 2001
 From: sungu-che <127634415+sungu-che@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 23:05:34 +0000
-Subject: [PATCH 3/6] vulkan tests: GPU-resident Q8_0 matmul is exact W8A32;
+Subject: [PATCH 3/7] vulkan tests: GPU-resident Q8_0 matmul is exact W8A32;
  f16 forward_exact on Vulkan in f32
 
 MoltenVK (macos-15 runner) still failed vulkan_tests::quantized_dequantize_and_matmul with
