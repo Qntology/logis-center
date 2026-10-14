@@ -57,13 +57,26 @@ require_measured() {
 # Measurement lines and the summary table as a few long notices (annotations are readable through the
 # checks API; artifact / log blobs may not be reachable from where the results are read).
 publish_notices() {
+  # Key lines first (one-line summaries), each tagged with its run label, then the detail lines.
   local tmp="$OUT/.measure.txt"
-  grep -hE "\[(GPU-EQ|DECISION-EQ|EMBED-BATCHED-TEST|CPU-PACKED|EMBED-CPU-PACKED|[A-Za-z-]+-M-INV|[A-Za-z-]+-B-INV|UTF8-STREAM|CPU-3-2|KV-IO)\]|QWEN4-EXP\] +variant|DEVICE_PROBE|^- |^test result" "$OUT"/*.log 2>/dev/null | grep -v '^+ ' \
-    | cut -c1-600 > "$tmp" || true
-  echo "::notice title=summary::$(grep '^| ' "$SUMMARY" | tail -n +2 | sed 's/$/ ;;/' | tr -d '\n' | cut -c1-3900)"
+  local key="\[(EMBED-SUMMARY|DECISION-EQ)\]|\[KV-IO\] (write|best|cold read std)|QWEN4-EXP\] +variant_. on|-M-INV\] 측정 결과|-M-INV\] arch|\[CPU-3-2\]|DEVICE_PROBE|^test result: FAILED"
+  local detail="\[(GPU-EQ|UTF8-STREAM|KV-IO)\]|^- |^test result"
+  : > "$tmp"
+  for f in "$OUT"/*.log; do
+    [ -f "$f" ] || continue
+    local tag; tag="$(basename "$f" .log)"
+    grep -E "$key" "$f" 2>/dev/null | grep -v '^+ ' | cut -c1-500 | sed "s|^|<$tag> |" >> "$tmp" || true
+  done
+  for f in "$OUT"/*.log; do
+    [ -f "$f" ] || continue
+    local tag; tag="$(basename "$f" .log)"
+    grep -E "$detail" "$f" 2>/dev/null | grep -vE "$key" | grep -v '^+ ' | cut -c1-300 | sed "s|^|<$tag> |" >> "$tmp" || true
+  done
+  echo "::notice title=summary::$(grep '^| ' "$SUMMARY" | tail -n +2 | sed 's/$/ ;;/' | tr -d '\n' | cut -c1-1800)"
+  # Annotation messages are cut around 4 KB: keep each chunk well below that (Korean is 3 bytes/char).
   local chunk="" n=0
   while IFS= read -r line; do
-    if [ $(( ${#chunk} + ${#line} )) -gt 3800 ]; then
+    if [ $(( ${#chunk} + ${#line} )) -gt 1100 ] && [ -n "$chunk" ]; then
       echo "::notice title=measure-$n::$chunk"; n=$((n + 1)); chunk=""
       [ $n -ge 8 ] && break
     fi

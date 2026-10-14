@@ -58,9 +58,8 @@ if [ "$BACKEND" = cpu ]; then
 else
   embed "embed-$BACKEND-mock" "$MOCK_MODELS"
   if [ "$BACKEND" = metal ]; then
-    # Measurement: is the dynamic row count (CPU/Vulkan policy) composition-invariant on Metal too?
-    # FAIL here means "Metal needs the fixed shape", not a regression.
-    embed embed-metal-mock-dynamic "$MOCK_MODELS" LOGIS_EMBED_FIXED_SHAPE=0
+    # Comparison: the fixed shape (CUDA/ROCm policy) on Metal (measured 0.4x vs dynamic 2.7x).
+    embed embed-metal-mock-fixed "$MOCK_MODELS" LOGIS_EMBED_FIXED_SHAPE=1
   fi
   if [ "$BACKEND" = vulkan ]; then
     embed embed-vulkan-mock-host "$MOCK_MODELS" LOGIS_EMBED_VK_MODE=host

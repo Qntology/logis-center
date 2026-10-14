@@ -843,6 +843,22 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
         query_idx.len(), bank_idx.len(), agree_pb, query_idx.len(), agree_pr, query_idx.len(), agree_br, query_idx.len()
     );
 
+    // CI 주석(annotation) 한 줄 요약 — .github/scripts/lib.sh publish_notices 가 이 줄을 우선 싣습니다.
+    println!(
+        "[EMBED-SUMMARY] {} · {} · fixed_shape={} · 전체 {:.2}배 · 짧은 구 {:.2}배 · 단건 per-text {:.1}ms / embed_many {:.1}ms · 비트 동일 {}/{} · 구성 무관 {}/{} {}/{} {}/{} · 재현 {}/{} · F32 평균 코사인 Δ(embed_many−per-text) ≤64 {:+.1e} >64 {:+.1e} · 판정 {}/{} (F32 {}/{})",
+        if mock { "목업" } else { "실모델" },
+        tauri_app_lib::models::embedding::text_cache::device_class(&device),
+        opts.fixed_shape,
+        per_text_s / batched_s,
+        short_per_s / short_batch_s,
+        single_per_ms,
+        single_batch_ms,
+        identical, texts.len(),
+        single_identical, probe.len(), probe_identical, probe.len(), sub_identical, sub_idx.len(),
+        batched_repro, texts.len(),
+        bt_mean_s - pt_mean_s, bt_mean_l - pt_mean_l,
+        agree_pb, query_idx.len(), agree_br, query_idx.len()
+    );
     assert_eq!(single_identical, probe.len(), "단건 호출 벡터가 배치 안의 벡터와 달라졌습니다(호출 구성 의존)");
     assert_eq!(probe_identical, probe.len(), "표본끼리 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
     assert_eq!(sub_identical, sub_idx.len(), "역순 절반 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");

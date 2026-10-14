@@ -20,17 +20,18 @@ pub const EMBED_CHUNK_TOKENS: usize = 512;
 // =====================================================================
 // 🌟 [EMBED-BATCHED] 배치 순전파 사용 여부
 // ---------------------------------------------------------------------
-//   CUDA · ROCm(AMD) · CPU · Vulkan 에서 기본 ON 입니다. LOGIS_EMBED_BATCHED=0 이면 기존
+//   CUDA · ROCm(AMD) · CPU · Vulkan · Metal 에서 기본 ON 입니다. LOGIS_EMBED_BATCHED=0 이면 기존
 //   per-text 경로(embed_batch 의 embed())로 돌아갑니다.
 //   ROCm 은 AMD RX 6600(gfx1032) 실기기에서 검증했습니다(tests/it/app_embed.rs GPU 테스트):
 //   배치 구성과 무관하게 비트 동일, per-text 대비 최소 코사인 0.99976(≤64토큰)/1.0(>64토큰),
 //   F32 기준 평균 코사인은 두 경로 동일. 문제가 보이면 LOGIS_EMBED_BATCHED=0 으로 즉시 되돌릴 수 있습니다.
-//   CPU · Vulkan 은 고정 모양 대신 동적 행 수로 묶습니다(batched.rs ⑥, BatchOpts::for_device).
-//   Metal 은 실기기 검증 전이라 기본은 기존 per-text 경로이고, LOGIS_EMBED_BATCHED=1 이면 켭니다(opt-in).
-//   켜면 CUDA/ROCm 과 같은 고정 모양입니다(BatchOpts::for_device): candle 의 Metal GEMM(MLX 포트)은
-//   M==1·N==1 이면 gemv, M<16 이면 다른 타일, b·M·N ≥ 2^20 이면 큰 타일을 골라 같은 행도 M 에 따라
-//   k 누산 순서가 바뀔 수 있으므로, 행 수를 길이 L 만의 함수로 고정해야 구성 무관이 됩니다.
-//   (docs/mac-verify.md · 포크 tests/matmul_m_invariance_tests.rs 의 metal_ 측정)
+//   CPU · Vulkan · Metal 은 고정 모양 대신 동적 행 수로 묶습니다(batched.rs ⑥, BatchOpts::for_device).
+//   🌟 [MAC-VERIFY] Metal (GitHub macos-15, Apple Paravirtual device, docs/mac-verify.md): 동적 모드가
+//   per-text 와 320/320 비트 동일 · 구성 무관(단건 12/12 · 표본 12/12 · 역순 절반 160/160) · 전체 2.7배 ·
+//   짧은 구 4.6배 · 단건 13.4 vs 13.1 ms. 고정 모양은 0.4배(단건 346.6 vs 14.6 ms)였습니다. candle 의 Metal
+//   f32 GEMM(MLX 포트)은 M ≥ 2 에서 원소마다 k 를 순서대로 누산해 행 결과가 M 과 무관하고(포크
+//   matmul_m_invariance_tests: M 2..300 불일치 0, 배치 attention 불일치 0), M = 1(gemv)만 다른데
+//   임베딩은 [CLS]·[SEP] 로 최소 3토큰이라 M = 1 이 생기지 않습니다.
 //   값은 프로세스 안에서 한 번만 읽습니다. 캐시 공간(순전파 태그)이
 //   이 판정에 묶여 있어, 도중에 바뀌면 같은 텍스트가 두 공간에 섞이기 때문입니다.
 // =====================================================================
@@ -38,7 +39,7 @@ pub const EMBED_CHUNK_TOKENS: usize = 512;
 static EMBED_BATCHED_ENV: once_cell::sync::Lazy<Option<bool>> = once_cell::sync::Lazy::new(|| {
     let v = std::env::var("LOGIS_EMBED_BATCHED").ok().map(|v| v.trim() != "0");
     println!(
-        "[EMBED-BATCHED] LOGIS_EMBED_BATCHED → {} (CUDA/ROCm/CPU/Vulkan 기본 ON · Metal 은 =1 일 때만)",
+        "[EMBED-BATCHED] LOGIS_EMBED_BATCHED → {} (CUDA/ROCm/CPU/Vulkan/Metal 기본 ON)",
         match v { None => "미설정", Some(true) => "배치 순전파 ON", Some(false) => "per-text 순전파" }
     );
     v
@@ -46,11 +47,8 @@ static EMBED_BATCHED_ENV: once_cell::sync::Lazy<Option<bool>> = once_cell::sync:
 
 /// 이 장치에서 배치 순전파(embed_many)를 쓰는지 여부.
 pub fn batched_enabled(device: &Device) -> bool {
-    if device.is_cuda() || device.is_rocm() || device.is_cpu() || device.is_vulkan() {
+    if device.is_cuda() || device.is_rocm() || device.is_cpu() || device.is_vulkan() || device.is_metal() {
         EMBED_BATCHED_ENV.unwrap_or(true)
-    } else if device.is_metal() {
-        // 🌟 [MAC-VERIFY] Metal 은 opt-in (실행 검증 전). 고정 모양 정책은 BatchOpts::for_device.
-        EMBED_BATCHED_ENV.unwrap_or(false)
     } else {
         false
     }
