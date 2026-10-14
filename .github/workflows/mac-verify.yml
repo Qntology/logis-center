@@ -135,7 +135,7 @@ jobs:
       matrix:
         backend: [cpu, metal, vulkan]
     runs-on: macos-15
-    timeout-minutes: 150
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
         with: { path: logis-center }
@@ -193,12 +193,50 @@ jobs:
           brew install molten-vk vulkan-loader vulkan-tools >/dev/null 2>&1 || brew install molten-vk vulkan-loader vulkan-tools
           echo "VK_ICD_FILENAMES=$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json" >> "$GITHUB_ENV"
           echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix vulkan-loader)/lib:$(brew --prefix molten-vk)/lib" >> "$GITHUB_ENV"
-      - name: run
+      - name: build (cargo test --no-run)
+        id: build
+        timeout-minutes: 70
         working-directory: logis-center/commerce
         env:
           MOCK_MODELS: ${{ runner.temp }}/mock-models
           REAL_MODELS: ${{ runner.temp }}/real-models
-        run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out"
+        run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" build
+      - name: suite (it, non-ignored)
+        id: suite
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 30
+        working-directory: logis-center/commerce
+        env:
+          MOCK_MODELS: ${{ runner.temp }}/mock-models
+          REAL_MODELS: ${{ runner.temp }}/real-models
+        run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" suite
+      - name: embed (mock, default policy + comparisons)
+        id: embed
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 75
+        working-directory: logis-center/commerce
+        env:
+          MOCK_MODELS: ${{ runner.temp }}/mock-models
+          REAL_MODELS: ${{ runner.temp }}/real-models
+        run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" embed
+      - name: bench (CPU, SSD offload I/O + 3-2 kernels)
+        id: bench
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 30
+        working-directory: logis-center/commerce
+        env:
+          MOCK_MODELS: ${{ runner.temp }}/mock-models
+          REAL_MODELS: ${{ runner.temp }}/real-models
+        run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" bench
+      - name: real model (decision-level)
+        id: real
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 50
+        working-directory: logis-center/commerce
+        env:
+          MOCK_MODELS: ${{ runner.temp }}/mock-models
+          REAL_MODELS: ${{ runner.temp }}/real-models
+        run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" real
       - uses: actions/upload-artifact@v4
         if: always()
         with:

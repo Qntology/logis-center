@@ -7,8 +7,10 @@ FAILS=0
 [ -f "$SUMMARY" ] || printf '| step | result | log |\n|---|---|---|\n' > "$SUMMARY"
 
 # run <label> <cmd...> : runs the command, tees to $OUT/<label>.log, records PASS/FAIL.
+PHASE_LABELS=()
 run() {
   local label="$1"; shift
+  PHASE_LABELS+=("$label")
   local log="$OUT/$label.log"
   echo "::group::$label"
   echo "+ $*" | tee "$log"
@@ -62,14 +64,14 @@ publish_notices() {
   local key="\[(EMBED-SUMMARY|DECISION-EQ)\]|\[KV-IO\] (write|best|cold read std)|QWEN4-EXP\] +variant_. on|-M-INV\] 측정 결과|-M-INV\] arch|\[CPU-3-2\]|DEVICE_PROBE|^test result: FAILED"
   local detail="\[(GPU-EQ|UTF8-STREAM|KV-IO)\]|^- |^test result"
   : > "$tmp"
-  for f in "$OUT"/*.log; do
+  for tag in ${PHASE_LABELS[@]+"${PHASE_LABELS[@]}"}; do
+    local f="$OUT/$tag.log"
     [ -f "$f" ] || continue
-    local tag; tag="$(basename "$f" .log)"
     grep -E "$key" "$f" 2>/dev/null | grep -v '^+ ' | cut -c1-500 | sed "s|^|<$tag> |" >> "$tmp" || true
   done
-  for f in "$OUT"/*.log; do
+  for tag in ${PHASE_LABELS[@]+"${PHASE_LABELS[@]}"}; do
+    local f="$OUT/$tag.log"
     [ -f "$f" ] || continue
-    local tag; tag="$(basename "$f" .log)"
     grep -E "$detail" "$f" 2>/dev/null | grep -vE "$key" | grep -v '^+ ' | cut -c1-300 | sed "s|^|<$tag> |" >> "$tmp" || true
   done
   echo "::notice title=summary::$(grep '^| ' "$SUMMARY" | tail -n +2 | sed 's/$/ ;;/' | tr -d '\n' | cut -c1-1800)"
