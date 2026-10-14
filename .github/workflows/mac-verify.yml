@@ -20,6 +20,7 @@ name: mac-verify
 on:
   push:
     branches: ["claude/mac-verify", "claude/mac-*"]
+    paths-ignore: [".github/workflows/cross-verify.yml"]
   workflow_dispatch:
     inputs:
       phases:
