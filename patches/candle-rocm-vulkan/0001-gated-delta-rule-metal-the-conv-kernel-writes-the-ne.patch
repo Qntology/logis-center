@@ -1,9 +1,9 @@
 From a633c43658ce2ff50ec128a36c9a5ffcb04c1aa1 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 14 Oct 2026 04:43:10 +0000
-Subject: [PATCH 12/12] =?UTF-8?q?gated=20delta=20rule=20(metal):=20the=20c?=
- =?UTF-8?q?onv=20kernel=20writes=20the=20new=20conv=20state=20=E2=80=94=20?=
- =?UTF-8?q?two=20dispatches=20per=20step?=
+Subject: [PATCH] =?UTF-8?q?gated=20delta=20rule=20(metal):=20the=20conv=20?=
+ =?UTF-8?q?kernel=20writes=20the=20new=20conv=20state=20=E2=80=94=20two=20?=
+ =?UTF-8?q?dispatches=20per=20step?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

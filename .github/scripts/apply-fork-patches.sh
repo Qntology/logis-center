@@ -12,7 +12,19 @@ if [ ${#series[@]} -eq 0 ]; then
   echo "no fork patches; building fork master $(git -C "$FORK" rev-parse --short HEAD)"
   exit 0
 fi
-abs=(); for p in "${series[@]}"; do abs+=("$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"); done
-git -C "$FORK" am --3way "${abs[@]}"
-echo "fork: master + ${#series[@]} patches -> $(git -C "$FORK" rev-parse --short HEAD)"
-git -C "$FORK" log --oneline -n "${#series[@]}"
+# A patch whose commit is already in fork master (the working branch was merged) has the same
+# patch-id as a master commit: skip it instead of failing `git am`.
+in_master="$(git -C "$FORK" log -p --no-merges HEAD | git patch-id --stable | cut -d' ' -f1 | sort -u)"
+abs=(); merged=0
+for p in "${series[@]}"; do
+  a="$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
+  id="$(git patch-id --stable < "$a" | cut -d' ' -f1)"
+  if [ -n "$id" ] && grep -qx "$id" <<<"$in_master"; then
+    echo "skip $(basename "$p") (already in fork master)"; merged=$((merged + 1))
+  else
+    abs+=("$a")
+  fi
+done
+if [ ${#abs[@]} -gt 0 ]; then git -C "$FORK" am --3way "${abs[@]}"; fi
+echo "fork: master + ${#abs[@]} patches ($merged already merged) -> $(git -C "$FORK" rev-parse --short HEAD)"
+if [ ${#abs[@]} -gt 0 ]; then git -C "$FORK" log --oneline -n "${#abs[@]}"; fi
