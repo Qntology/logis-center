@@ -4,7 +4,7 @@
 # Run inside logis-center/commerce.
 #   app-tests.sh cpu|metal|vulkan <out-dir> build|suite|embed|bench|real|accel
 # Env: MOCK_MODELS (gen_granite_mock.py output root), REAL_MODELS (Hugging Face download root, optional),
-#      EMBED_BACKENDS (backends whose embed / real phases run, default all), EMBED_COMPARE (0: default policy only),
+#      EMBED_BACKENDS (backends whose embed / real phases run, default all), EMBED_COMPARE (0: default policy only; speed: default policy, speed / bit-identity test only — no decision test),
 #      ACCEL_TESTS (items of the accel phase: gdn,gpu-mem,kv35,vk-auto,fa,qwen4; default all but qwen4, which the suite runs)
 set -euo pipefail
 BACKEND="$1"; OUT="$(mkdir -p "$2" && cd "$2" && pwd)"; export OUT; PHASE="${3:-all}"
@@ -38,7 +38,7 @@ cd src-tauri
 embed() {
   local label="$1" root="$2" kind="$3"; shift 3
   local tests=(app_embed::gpu_embed_many_matches_per_text_and_is_faster)
-  [ "$kind" = main ] && tests+=(app_embed::embed_many_decisions_match_per_text)
+  [ "$kind" = main ] && [ "${EMBED_COMPARE:-1}" != speed ] && tests+=(app_embed::embed_many_decisions_match_per_text)
   run "$label" env LOGIS_TEST_MODELS=1 LOGIS_REQUIRE_MODELS=1 LOGIS_MODELS_DIR="$root" "$@" \
     cargo test --test it "${FEAT[@]}" -- "${tests[@]}" --ignored --nocapture --test-threads 1
   require_measured "$label" "\\[EMBED-SUMMARY\\]"
@@ -78,7 +78,7 @@ suite)
 embed)
   # [EMBED-BATCHED] mock model: default policy (main) + forced alternatives (compare)
   embed "embed-$BACKEND-mock" "$MOCK_MODELS" main ${CPU_ENV[@]+"${CPU_ENV[@]}"}
-  [ "${EMBED_COMPARE:-1}" = 0 ] && { finish; exit $?; }
+  case "${EMBED_COMPARE:-1}" in 0|speed) finish; exit $? ;; esac
   case "$BACKEND" in
     cpu)
       embed embed-cpu-mock-packed "$MOCK_MODELS" compare ${CPU_ENV[@]+"${CPU_ENV[@]}"} LOGIS_EMBED_CPU_KERNEL=packed
@@ -104,7 +104,7 @@ real)
   # real weights: decision-level checks (bank top-1 150 x 170) under the default policy
   if [ -f "${REAL_MODELS:-/nonexistent}/granite-embedding-97m-multilingual-r2/model.safetensors" ]; then
     embed "embed-$BACKEND-real" "$REAL_MODELS" main ${CPU_ENV[@]+"${CPU_ENV[@]}"}
-    if [ "$BACKEND" = cpu ] && [ "${EMBED_COMPARE:-1}" != 0 ]; then
+    if [ "$BACKEND" = cpu ] && [ "${EMBED_COMPARE:-1}" = 1 ]; then
       embed embed-cpu-real-packed "$REAL_MODELS" compare ${CPU_ENV[@]+"${CPU_ENV[@]}"} LOGIS_EMBED_CPU_KERNEL=packed
     fi
   else

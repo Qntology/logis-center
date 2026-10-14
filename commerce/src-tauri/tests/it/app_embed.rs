@@ -700,16 +700,31 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
     let _ = model.embed_many(&short_texts, &opts).unwrap();
     let short_batch_s = t4.elapsed().as_secs_f64();
     // 단건 호출 지연(검색 질의 1건): 고정 모양은 1건이어도 B(L) 행을 계산합니다.
+    // 같은 텍스트로 per-text · embed_many 를 번갈아(순서도 텍스트마다 바꿔) 3바퀴 재고 호출별 중앙값을 씁니다.
+    // 한쪽을 몰아서 재면 3코어 VM 의 순간 지연이 한쪽 평균에만 실려 단건 비교가 뒤집힙니다.
     let singles: Vec<&String> = short_texts.iter().step_by((short_texts.len() / 20).max(1)).take(20).collect();
-    let t5 = std::time::Instant::now();
-    for t in &singles { let _ = model.embed(t).unwrap(); }
-    let single_per_ms = t5.elapsed().as_secs_f64() * 1000.0 / singles.len() as f64;
-    let t6 = std::time::Instant::now();
-    for t in &singles { let _ = model.embed_many(std::slice::from_ref(*t), &opts).unwrap(); }
-    let single_batch_ms = t6.elapsed().as_secs_f64() * 1000.0 / singles.len() as f64;
+    let (mut per_ms, mut batch_ms) = (Vec::new(), Vec::new());
+    for round in 0..3 {
+        for (i, t) in singles.iter().enumerate() {
+            let time_per = || { let s = std::time::Instant::now(); let _ = model.embed(t).unwrap(); s.elapsed().as_secs_f64() * 1000.0 };
+            let time_batch = || { let s = std::time::Instant::now(); let _ = model.embed_many(std::slice::from_ref(*t), &opts).unwrap(); s.elapsed().as_secs_f64() * 1000.0 };
+            if (i + round) % 2 == 0 {
+                per_ms.push(time_per());
+                batch_ms.push(time_batch());
+            } else {
+                batch_ms.push(time_batch());
+                per_ms.push(time_per());
+            }
+        }
+    }
+    let median = |v: &mut Vec<f64>| { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] };
+    let mean = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
+    let (per_mean, batch_mean) = (mean(&per_ms), mean(&batch_ms));
+    let single_per_ms = median(&mut per_ms);
+    let single_batch_ms = median(&mut batch_ms);
     println!(
-        "[GPU-EQ] 단건 호출(짧은 구 {}건 평균): per-text {:.1}ms · embed_many {:.1}ms (token_budget {})",
-        singles.len(), single_per_ms, single_batch_ms, opts.token_budget
+        "[GPU-EQ] 단건 호출(짧은 구 {}건 × 3바퀴 번갈아, 중앙값): per-text {:.1}ms · embed_many {:.1}ms (평균 {:.1} / {:.1}ms, token_budget {})",
+        singles.len(), single_per_ms, single_batch_ms, per_mean, batch_mean, opts.token_budget
     );
 
     // ── 수치 대조 ──
