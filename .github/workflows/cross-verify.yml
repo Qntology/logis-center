@@ -181,13 +181,13 @@ jobs:
         run: sudo apt-get install -y -qq nvidia-cuda-toolkit
       - name: CUDA toolkit 13 (Windows; all components, names differ from 12)
         if: matrix.kind == 'cuda-check' && runner.os == 'Windows' && startsWith(matrix.cuda, '13.')
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: ${{ matrix.cuda }}
           method: network
       - name: CUDA toolkit 12 (Windows; nvcc, headers, libs — no GPU)
         if: matrix.kind == 'cuda-check' && runner.os == 'Windows' && startsWith(matrix.cuda, '12.')
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: ${{ matrix.cuda }}
           method: network
