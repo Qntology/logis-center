@@ -18,15 +18,8 @@
 name: mac-verify
 
 on:
-  push:
-    branches: ["claude/mac-verify", "claude/mac-*"]
-    # A push that only touches what cross-verify owns, or the fork patch series, does not start this 3-4 h macOS run
-    # (it is started on purpose with workflow_dispatch and the inputs below).
-    paths-ignore:
-      - ".github/workflows/cross-verify.yml"
-      - ".github/scripts/env-report.sh"
-      - ".github/scripts/cuda-arch-sweep.py"
-      - "patches/**"
+  # No push trigger: every push already runs cross-verify (which contains the Mac cpu / metal / vulkan jobs), so a push
+  # must not start this 3-4 h macOS run on top of it. Started on purpose with workflow_dispatch and the inputs below.
   workflow_dispatch:
     inputs:
       phases:
