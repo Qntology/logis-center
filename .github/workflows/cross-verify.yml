@@ -98,8 +98,14 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/annot.sh" <<'SH'
           # usage: annot LOGFILE — turn the first compiler / build-script errors into annotations
-          annot() { grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr' -A4 "$1" | head -40 | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-1500 | while read -r l; do echo "::error::$l"; done; }
+          annot() { grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr' -A4 "$1" | head -40 | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-1500 | while IFS= read -r l || [ -n "$l" ]; do echo "::error::$l"; done; }
           SH
+      - name: Tauri system libraries (Linux; macOS / Windows need none)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config libssl-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
       - name: protoc (lancedb / lance-encoding build script)
         run: |
           if [ "$RUNNER_OS" = Windows ]; then choco install protoc -y --no-progress; else sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler; fi
