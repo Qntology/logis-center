@@ -1,6 +1,7 @@
 # Linux / Windows verification of the same code the Mac run covers (docs/mac-verify.md).
 #
 # GitHub-hosted runners have no GPU. So only what can really run is run:
+#   mac (macos-15, M1 virtual): cpu / metal / vulkan(MoltenVK) — the real GPU path of the Mac verification
 #   cpu            : build + the non-ignored suite (+ the embed-cpu-kernels contract tests)
 #   vulkan (Linux) : lavapipe (software Vulkan, a CPU device): suite + the device tests of the vision batch path
 #   vulkan (Win)   : build only (no software Vulkan ICD is installed) — reported as "build only"
@@ -17,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "comma list of: linux-cpu, linux-vulkan, linux-cuda-check, linux-rocm-check, windows-cpu, windows-vulkan-build, windows-cuda-check, windows-rocm-check (all = every one)"
+        description: "comma list of: mac-cpu, mac-metal, mac-vulkan, linux-cpu, linux-vulkan, linux-cuda-check, linux-rocm-check, windows-cpu, windows-vulkan-build, windows-cuda-check, windows-rocm-check (all = every one)"
         default: "all"
 
 concurrency:
@@ -47,6 +48,9 @@ jobs:
           t = os.environ["TARGETS"].replace(" ", "")
           want = None if t == "all" else set(t.split(","))
           inc = [
+            dict(name="mac-cpu", os="macos-15", kind="run", features=""),
+            dict(name="mac-metal", os="macos-15", kind="run", features="metal"),
+            dict(name="mac-vulkan", os="macos-15", kind="run", features="vulkan"),
             dict(name="linux-cpu", os="ubuntu-latest", kind="run", features=""),
             dict(name="linux-vulkan", os="ubuntu-latest", kind="run", features="vulkan"),
             dict(name="linux-cuda-check", os="ubuntu-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant"),
@@ -116,7 +120,20 @@ jobs:
           mkdir -p src-tauri/dlls; [ -n "$(ls -A src-tauri/dlls)" ] || touch src-tauri/dlls/.gitkeep
       - name: protoc (lancedb / lance-encoding build script)
         run: |
-          if [ "$RUNNER_OS" = Windows ]; then choco install protoc -y --no-progress; else sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler; fi
+          case "$RUNNER_OS" in
+            Windows) choco install protoc -y --no-progress ;;
+            macOS)   brew install protobuf >/dev/null 2>&1 || brew install protobuf ;;
+            *)       sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler ;;
+          esac
+      - name: macOS — target CPU (the virtual M1 runner cannot name its CPU; same as mac-verify.yml)
+        if: runner.os == 'macOS'
+        run: echo "RUSTFLAGS=-C target-cpu=apple-m1" >> "$GITHUB_ENV"
+      - name: macOS — MoltenVK
+        if: matrix.name == 'mac-vulkan'
+        run: |
+          brew install molten-vk vulkan-loader vulkan-tools >/dev/null 2>&1 || brew install molten-vk vulkan-loader vulkan-tools
+          echo "VK_ICD_FILENAMES=$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json" >> "$GITHUB_ENV"
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix vulkan-loader)/lib:$(brew --prefix molten-vk)/lib" >> "$GITHUB_ENV"
       - name: software Vulkan (lavapipe)
         if: matrix.name == 'linux-vulkan'
         run: |
@@ -184,10 +201,12 @@ jobs:
           f="${{ matrix.features }}"
           cargo test --test it --no-default-features ${f:+--features $f} -- --test-threads 2 2>&1 | tee "$RUNNER_TEMP/suite.log" | tail -5
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { echo "suite exit code: $rc"; annot "$RUNNER_TEMP/suite.log"; exit 1; }
-      - name: vision batch + embed kernels (ignored device tests)
-        if: matrix.name == 'linux-vulkan'
+      - name: "vision batch (ignored device tests — phrase encoding invariance on the device)"
+        if: contains(fromJSON('["linux-vulkan","mac-metal","mac-vulkan"]'), matrix.name)
         working-directory: logis-center/commerce/src-tauri
-        run: cargo test --test it --no-default-features --features vulkan -- vision_batch --ignored --nocapture --test-threads 1
+        run: |
+          f="${{ matrix.features }}"
+          cargo test --test it --no-default-features ${f:+--features $f} -- vision_batch --ignored --nocapture --test-threads 1
       - name: embed-cpu-kernels contract tests
         if: matrix.kind == 'run' && matrix.features == ''
         working-directory: logis-center/commerce

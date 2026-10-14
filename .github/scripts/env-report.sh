@@ -32,6 +32,14 @@ g1="$(
     echo "cores: ${NUMBER_OF_PROCESSORS:-?}"
     line "disk-free" powershell -NoProfile -Command '(Get-PSDrive -Name (Get-Location).Drive.Name | % { [math]::Round($_.Free/1GB,1).ToString() + " GB free" })'
     line "long-paths" powershell -NoProfile -Command '(Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem").LongPathsEnabled'
+  elif [ "$os" = Darwin ]; then
+    line "os" sw_vers
+    line "cpu" sysctl -n machdep.cpu.brand_string
+    echo "cores: $(sysctl -n hw.ncpu 2>/dev/null)"
+    echo "memory-GB: $(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))"
+    line "disk-free" bash -c "df -h . | tail -1"
+    line "xcode" xcodebuild -version
+    line "metal-gpu" bash -c "system_profiler SPDisplaysDataType 2>/dev/null | grep -E 'Chipset Model|Metal' | head -2"
   else
     line "os" bash -c '. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME"'
     echo "cores: $(nproc 2>/dev/null)"
