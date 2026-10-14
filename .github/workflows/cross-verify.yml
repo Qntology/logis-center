@@ -12,12 +12,12 @@
 name: cross-verify
 
 on:
-  # Every push to main (and to the working branch) runs all targets. A workflow file that is not on the
+  # Every push to any branch runs all targets. A workflow file that is not on the
   # default branch cannot be dispatched, so the working branch is triggered by push as well.
   # `[skip ci]` in the head commit message skips it. `[targets: windows-cpu,windows-cuda]` in the head commit
   # message runs only those jobs (no duplicate runs of what did not change); workflow_dispatch takes the same list.
   push:
-    branches: ["main", "claude/mac-verify"]
+    branches: ["**"]
   workflow_dispatch:
     inputs:
       targets:
@@ -348,6 +348,9 @@ jobs:
           # the architecture the type-check step compiled is not compiled twice (only when that step passed)
           SWEEP_SKIP: ${{ steps.typecheck.outcome == 'success' && (matrix.cuda_cap || '80') || '' }}
           SWEEP_MINUTES: ${{ runner.os == 'Windows' && '75' || '60' }}
+          # lowest GPU generation the project supports (Volta). Below it a failure is reported (warning), not fatal:
+          # candle-kernels 0.11.0 has no half atomicAdd below sm_70 on CUDA 12.0, and CUDA 13 cannot target those at all.
+          SWEEP_MIN_SM: "70"
         run: |
           if [ "$RUNNER_OS" = Windows ]; then py=python; else py=python3; fi
           "$py" ../../.github/scripts/cuda-arch-sweep.py

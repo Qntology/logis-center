@@ -458,27 +458,41 @@ fn mock_phrases(n: usize) -> Vec<String> {
         .collect()
 }
 
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
 fn phrase_batch_invariance(dev: &Device) -> anyhow::Result<()> {
     let dir = TempDir::new("siglip_mock_tok");
     write_tokenizer(&dir.0);
     let model = mock_siglip_text(dev, &dir.0)?;
     let phrases = mock_phrases(PHRASE_BATCH_ROWS + 8); // 32 + 8: 묶음 2개, 마지막은 8행
+    // 1건씩은 첫 묶음 · 경계 · 마지막 묶음(8행)에서 표본만 (1건 호출 하나가 고정 모양이면 32행 순전파).
+    let probe = [0usize, 1, 17, PHRASE_BATCH_ROWS - 1, PHRASE_BATCH_ROWS, phrases.len() - 1];
     for fixed in [false, true] {
-        let t0 = std::time::Instant::now();
+        // 처음 한 번은 재지 않습니다: 장치에서 첫 순전파는 파이프라인 컴파일 · 버퍼 할당 비용을 지불합니다
+        // (한 번만 재면 먼저 재는 쪽이 그 비용을 떠안아 묶음이 느려 보입니다).
         let batch = encode_phrase_rows(&model, &phrases, fixed)?;
-        let batch_s = t0.elapsed().as_secs_f64();
-        // 1건씩은 첫 묶음 · 경계 · 마지막 묶음(8행)에서 표본만 (1건 호출 하나가 고정 모양이면 32행 순전파).
-        let probe = [0usize, 1, 17, PHRASE_BATCH_ROWS - 1, PHRASE_BATCH_ROWS, phrases.len() - 1];
-        let t1 = std::time::Instant::now();
+        let (mut batch_ms, mut single_ms) = (Vec::new(), Vec::new());
         let mut differ = 0usize;
-        for &i in probe.iter() {
-            let one = encode_phrase_rows(&model, std::slice::from_ref(&phrases[i]), fixed)?.remove(0);
-            differ += one.iter().zip(batch[i].iter()).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        // 묶음과 1건씩을 3바퀴 번갈아 재고 중앙값을 씁니다.
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            let again = encode_phrase_rows(&model, &phrases, fixed)?;
+            batch_ms.push(t0.elapsed().as_secs_f64() * 1e3 / phrases.len() as f64);
+            differ += again.iter().zip(batch.iter()).map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count()).sum::<usize>();
+            let t1 = std::time::Instant::now();
+            for &i in probe.iter() {
+                let one = encode_phrase_rows(&model, std::slice::from_ref(&phrases[i]), fixed)?.remove(0);
+                differ += one.iter().zip(batch[i].iter()).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            }
+            single_ms.push(t1.elapsed().as_secs_f64() * 1e3 / probe.len() as f64);
         }
-        let single_s = t1.elapsed().as_secs_f64() / probe.len() as f64;
+        let (single, batched) = (median(&mut single_ms), median(&mut batch_ms));
         println!(
-            "[VISION-BATCH] 구 인코딩 {:?} fixed_shape={} | 구 {}개 묶음 vs 1건씩(표본 {}): 다른 비트 {} | 구당 1건씩 {:.1} ms → 묶음 {:.1} ms",
-            dev, fixed, phrases.len(), probe.len(), differ, single_s * 1e3, batch_s * 1e3 / phrases.len() as f64
+            "[VISION-BATCH] 구 인코딩 {:?} fixed_shape={} | 구 {}개 묶음 vs 1건씩(표본 {}, 3바퀴 중앙값): 다른 비트 {} | 구당 1건씩 {:.1} ms → 묶음 {:.1} ms ({:.2}배)",
+            dev, fixed, phrases.len(), probe.len(), differ, single, batched, single / batched
         );
         assert_eq!(differ, 0, "{dev:?} fixed_shape={fixed}: 묶음 구성에 따라 구 벡터가 달라짐");
     }
