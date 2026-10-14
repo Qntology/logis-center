@@ -48,12 +48,15 @@ jobs:
           TARGETS: ${{ inputs.targets || '' }}
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          # stdout of the script = the matrix (GITHUB_OUTPUT); stderr = a human line, shown as an annotation either way
+          python3 - > "$RUNNER_TEMP/plan.out" 2> "$RUNNER_TEMP/plan.err" <<'PY' || { echo "::error title=plan::$(cat "$RUNNER_TEMP/plan.err")"; exit 1; }
           import json, os, re, sys
           t = os.environ.get("TARGETS", "").strip()
           if not t:
-              m = re.search(r"\[targets:\s*([^\]]+)\]", os.environ.get("COMMIT_MSG", ""))
-              t = m.group(1) if m else "all"
+              # Only a line that holds nothing but the token counts (prose that mentions `[targets: ...]` must not
+              # select anything); with several such lines the last one wins.
+              found = re.findall(r"(?m)^[ \t]*\[targets:[ \t]*([^\]\n]+)\][ \t]*$", os.environ.get("COMMIT_MSG", ""))
+              t = found[-1] if found else "all"
           t = t.replace(" ", "")
           want = None if t == "all" else set(t.split(","))
           inc = [
@@ -76,12 +79,14 @@ jobs:
           ]
           unknown = (want or set()) - {i["name"] for i in inc}
           if unknown:
-              print("unknown targets: " + ",".join(sorted(unknown)), file=sys.stderr)
+              print("unknown targets: " + ",".join(sorted(unknown)) + "  (valid: " + ",".join(i["name"] for i in inc) + ")", file=sys.stderr)
               sys.exit(1)
           inc = [i for i in inc if want is None or i["name"] in want]
-          print("::notice title=targets::" + ",".join(i["name"] for i in inc), file=sys.stderr)
+          print("targets: " + ",".join(i["name"] for i in inc), file=sys.stderr)
           print("matrix=" + json.dumps({"include": inc}))
           PY
+          cat "$RUNNER_TEMP/plan.out" >> "$GITHUB_OUTPUT"
+          echo "::notice title=targets::$(cat "$RUNNER_TEMP/plan.err")"
 
   cross:
     needs: plan
