@@ -30,7 +30,7 @@ on:
         type: boolean
         default: true
       app:
-        description: "app job backends (JSON list items)"
+        description: "app job backends (JSON list items, none = skip)"
         default: '"cpu","metal","vulkan"'
       fork:
         description: "fork job backends (JSON list items, none = skip)"
@@ -157,6 +157,7 @@ jobs:
 
   # ── 3. App (logis-center) build + tests (CPU · Metal · MoltenVK) ──
   app:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.app != 'none' }}
     # commerce/src-tauri/.cargo/config.toml builds with -C target-cpu=native. On the virtual
     # "Apple M1 (Virtual)" runner LLVM cannot name the host CPU and falls back to generic aarch64
     # (no aes/sha2), and ring 0.17.14's const assert on the static CPU features
@@ -169,7 +170,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: ${{ fromJSON(format('[{0}]', inputs.app || '"cpu","metal","vulkan"')) }}
+        backend: ${{ fromJSON(format('[{0}]', (inputs.app != 'none' && inputs.app) || '"cpu","metal","vulkan"')) }}
     runs-on: macos-15
     timeout-minutes: 330
     steps:
