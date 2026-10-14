@@ -194,7 +194,7 @@ jobs:
           echo "VK_ICD_FILENAMES=$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json" >> "$GITHUB_ENV"
           echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix vulkan-loader)/lib:$(brew --prefix molten-vk)/lib" >> "$GITHUB_ENV"
       - name: build (cargo test --no-run)
-        id: build
+        id: phase_build
         timeout-minutes: 70
         working-directory: logis-center/commerce
         env:
@@ -202,8 +202,8 @@ jobs:
           REAL_MODELS: ${{ runner.temp }}/real-models
         run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" build
       - name: suite (it, non-ignored)
-        id: suite
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        id: phase_suite
+        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' }}
         timeout-minutes: 30
         working-directory: logis-center/commerce
         env:
@@ -211,8 +211,8 @@ jobs:
           REAL_MODELS: ${{ runner.temp }}/real-models
         run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" suite
       - name: embed (mock, default policy + comparisons)
-        id: embed
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        id: phase_embed
+        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' }}
         timeout-minutes: 75
         working-directory: logis-center/commerce
         env:
@@ -220,8 +220,8 @@ jobs:
           REAL_MODELS: ${{ runner.temp }}/real-models
         run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" embed
       - name: bench (CPU, SSD offload I/O + 3-2 kernels)
-        id: bench
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        id: phase_bench
+        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' }}
         timeout-minutes: 30
         working-directory: logis-center/commerce
         env:
@@ -229,8 +229,8 @@ jobs:
           REAL_MODELS: ${{ runner.temp }}/real-models
         run: ../.github/scripts/app-tests.sh ${{ matrix.backend }} "$GITHUB_WORKSPACE/out" bench
       - name: real model (decision-level)
-        id: real
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        id: phase_real
+        if: ${{ !cancelled() && steps.phase_build.outcome == 'success' }}
         timeout-minutes: 50
         working-directory: logis-center/commerce
         env:
