@@ -1,7 +1,7 @@
 From c663a2320bba867a925d6731907fc7f156e86b64 Mon Sep 17 00:00:00 2001
 From: sungu-che <127634415+sungu-che@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 22:38:05 +0000
-Subject: [PATCH 1/9] vulkan: compile GLSL barrier() as a workgroup barrier
+Subject: [PATCH 01/10] vulkan: compile GLSL barrier() as a workgroup barrier
 
 naga 27's GLSL front end lowers barrier() to ControlBarrier(Barrier::all()); the SPIR-V back end
 then picks a *subgroup* execution scope because SUB_GROUP is among the flags. GLSL barrier() is a

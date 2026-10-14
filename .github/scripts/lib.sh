@@ -36,7 +36,7 @@ annotate_log() {
   # panic lines with their next lines, then the log tail, joined with " | ".
   local label="$1" log="$2"
   local body
-  body="$(grep -E -A4 "^error(\[|:)|panicked at|^failures:|assertion|FAILED" "$log" | grep -vE "^--$|^\s*[0-9]+: |^\s+at " | head -40 | sed 's/$/ |/' | tr -d '\n' | cut -c1-2800)"
+  body="$(grep -E -A4 "^error(\[|:)|^Error|panicked at|^failures:|assertion|FAILED| case [0-9]+[ :]" "$log" | grep -vE "^--$|^\s*[0-9]+: |^\s+at " | head -40 | sed 's/$/ |/' | tr -d '\n' | cut -c1-2800)"
   echo "::error title=$label::$body || tail: $(tail -n 8 "$log" | sed 's/$/ |/' | tr -d '\n' | cut -c1-1000)"
 }
 

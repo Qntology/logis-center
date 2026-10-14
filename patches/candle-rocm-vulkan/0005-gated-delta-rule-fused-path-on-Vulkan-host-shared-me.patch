@@ -1,7 +1,7 @@
 From f947435dbbb714a6ca42dc7cd06f74443b0d1bf2 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 14 Oct 2026 03:16:11 +0000
-Subject: [PATCH 5/9] gated delta rule: fused path on Vulkan (host-shared
+Subject: [PATCH 05/10] gated delta rule: fused path on Vulkan (host-shared
  memory) and Metal
 
 Vulkan and Metal had no fused Gated DeltaNet: callers ran the tensor path, one op per token

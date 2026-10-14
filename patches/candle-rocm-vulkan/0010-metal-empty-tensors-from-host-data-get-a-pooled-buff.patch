@@ -1,0 +1,35 @@
+From e4a7314cb3514d5657ffb921b7c36cd87f6f35e8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 14 Oct 2026 03:57:44 +0000
+Subject: [PATCH 10/10] metal: empty tensors from host data get a pooled buffer
+
+MetalDevice::new_buffer_with_data passed a zero length to newBufferWithBytes, which returns nil,
+so any empty tensor sent to Metal failed with FailedToCreateResource (e.g. the [B, C, 0] conv
+state of a width-1 conv in delta_rule_tests, the case that failed on macos-15). A zero length now
+takes allocate_buffer(0) like the other allocations (rounded up to one byte).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GcxyAs2y3NUizfXh9YWmxx
+---
+ candle-core/src/metal_backend/device.rs | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/candle-core/src/metal_backend/device.rs b/candle-core/src/metal_backend/device.rs
+index 9cae473..48955cb 100644
+--- a/candle-core/src/metal_backend/device.rs
++++ b/candle-core/src/metal_backend/device.rs
+@@ -252,6 +252,11 @@ impl MetalDevice {
+     /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
+     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
+         let size = core::mem::size_of_val(data);
++        if size == 0 {
++            // newBufferWithBytes returns nil for a zero length: an empty tensor gets a pooled
++            // buffer like the other allocations (allocate_buffer rounds 0 up to 1 byte).
++            return self.allocate_buffer(0);
++        }
+         let new_buffer = self
+             .device
+             .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
+-- 
+2.43.0
+
