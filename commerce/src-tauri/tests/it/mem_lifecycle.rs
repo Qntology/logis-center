@@ -111,21 +111,39 @@ fn vram_settle_returns_immediately_when_target_met() {
     assert!(!vram_settle_reached(None, target));
 }
 
+/// 고정 시드 표준정규 텐서 (Box-Muller). candle CPU `randn` 은 시드를 받지 않아 실행마다 값이 달라집니다.
+fn seeded_randn(rng: &mut rand_chacha::ChaCha8Rng, shape: (usize, usize, usize, usize)) -> anyhow::Result<Tensor> {
+    use rand::Rng;
+    let n = shape.0 * shape.1 * shape.2 * shape.3;
+    let v: Vec<f32> = (0..n)
+        .map(|_| {
+            let u1 = rng.gen::<f64>().max(f64::MIN_POSITIVE);
+            let u2 = rng.gen::<f64>();
+            ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32
+        })
+        .collect();
+    Ok(Tensor::from_vec(v, shape, &Device::Cpu)?)
+}
+
 /// F16 원본 KV 보관이 F32 대비 어텐션 출력에 주는 오차 (Qwen 류 큰 K 채널 흉내).
+/// 입력은 고정 시드입니다: 무작위 입력 2000개에서 이 오차는 중앙값 7.7e-4 · p99 1.8e-3 · 최대 2.6e-3 이라
+/// 시드 없는 입력은 약 0.5% 확률로 2e-3 을 넘었습니다 (macos-15 MoltenVK 잡 2.27e-3).
 #[test]
 fn half_kv_storage_error_is_small() -> anyhow::Result<()> {
+    use rand::SeedableRng;
     use tauri_app_lib::models::qwen3_5::model::half_kv_piece;
     let dev = Device::Cpu;
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0x4b56_4841_4c46);
     let (h, t, d) = (4usize, 512usize, 256usize);
-    let mut k = Tensor::randn(0f32, 1.0, (1, h, t, d), &dev)?;
+    let mut k = seeded_randn(&mut rng, (1, h, t, d))?;
     // 큰 채널 몇 개 (QK-norm 뒤에도 남는 큰 값)
     let mut boost = vec![1f32; d];
     for i in [3usize, 77, 130, 201] {
         boost[i] = 20.0;
     }
     k = k.broadcast_mul(&Tensor::from_vec(boost, (1, 1, 1, d), &dev)?)?;
-    let v = Tensor::randn(0f32, 1.0, (1, h, t, d), &dev)?;
-    let q = Tensor::randn(0f32, 1.0, (1, h, 1, d), &dev)?;
+    let v = seeded_randn(&mut rng, (1, h, t, d))?;
+    let q = seeded_randn(&mut rng, (1, h, 1, d))?;
     let attn = |k: &Tensor, v: &Tensor| -> anyhow::Result<Tensor> {
         let s = (q.matmul(&k.transpose(2, 3)?)? / (d as f64).sqrt())?;
         let p = candle_nn::ops::softmax_last_dim(&s)?;

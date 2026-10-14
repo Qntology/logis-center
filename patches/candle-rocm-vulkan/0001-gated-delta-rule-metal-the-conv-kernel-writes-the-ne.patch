@@ -1,0 +1,122 @@
+From a633c43658ce2ff50ec128a36c9a5ffcb04c1aa1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 14 Oct 2026 04:43:10 +0000
+Subject: [PATCH 1/3] =?UTF-8?q?gated=20delta=20rule=20(metal):=20the=20con?=
+ =?UTF-8?q?v=20kernel=20writes=20the=20new=20conv=20state=20=E2=80=94=20tw?=
+ =?UTF-8?q?o=20dispatches=20per=20step?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A decode step built the new conv state with tensor ops (cat, narrow, dtype, contiguous: 4-5
+dispatches) around the two GDN kernels; on macos-15 the Metal fused decode was 2.1-3.8 ms/step,
+dispatch-bound. The token-0 threads of gdn_conv_f32 now copy entries T .. T+K-2 of
+[conv_state ; tokens] into the new conv state (copies only, same values), so a step is the conv
+and scan dispatches plus at most two dtype casts for non-F32 models.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GcxyAs2y3NUizfXh9YWmxx
+---
+ candle-core/src/delta_rule/metal_gdn.rs | 44 +++++++++++++++++--------
+ 1 file changed, 31 insertions(+), 13 deletions(-)
+
+diff --git a/candle-core/src/delta_rule/metal_gdn.rs b/candle-core/src/delta_rule/metal_gdn.rs
+index 196640c..1694d58 100644
+--- a/candle-core/src/delta_rule/metal_gdn.rs
++++ b/candle-core/src/delta_rule/metal_gdn.rs
+@@ -3,7 +3,8 @@
+ //! error compounds through the per-token decay over a sequence):
+ //!
+ //! 1. `gdn_conv_f32`: causal depthwise conv over `[conv_state ; tokens]` (+ bias) and SiLU, one
+-//!    thread per (channel, token, batch).
++//!    thread per (channel, token, batch); the token-0 threads also write the new conv state (the
++//!    last K-1 entries), so a decode step is two dispatches and no tensor ops.
+ //! 2. `gdn_scan_f32`: per (value head, batch), one thread per value column holding the `[dk]`
+ //!    column of the recurrent state; the threadgroup stages q / k of the token, reduces their
+ //!    squared norms (L2 norm, q scale), and every thread runs the CPU kernel's update order:
+@@ -69,6 +70,7 @@ kernel void gdn_conv_f32(
+     device const float *w [[buffer(2)]],
+     device const float *bias [[buffer(3)]],
+     device float *y [[buffer(4)]],
++    device float *cs_out [[buffer(6)]],
+     constant GdnConvParams &p [[buffer(5)]],
+     uint3 tg [[threadgroup_position_in_grid]],
+     uint3 tl [[thread_position_in_threadgroup]],
+@@ -93,6 +95,19 @@ kernel void gdn_conv_f32(
+         acc += w[ulong(c) * p.kw + j] * xv;
+     }
+     y[(ulong(b) * p.t + t) * p.c + c] = acc * gdn_sigmoid(acc);
++    if (t == 0u) {
++        // New conv state: entries T .. T + K-2 of [conv_state ; tokens] (copies, no arithmetic).
++        for (uint m = 0u; m < km1; ++m) {
++            const uint i = p.t + m;
++            float xv;
++            if (i < km1) {
++                xv = p.has_cs != 0u ? cs[(ulong(b) * p.c + c) * km1 + i] : 0.0f;
++            } else {
++                xv = x[(ulong(b) * p.t + (i - km1)) * p.c + c];
++            }
++            cs_out[(ulong(b) * p.c + c) * km1 + m] = xv;
++        }
++    }
+ }
+ 
+ kernel void gdn_scan_f32(
+@@ -279,18 +294,6 @@ pub(super) fn gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOu
+         .map(f32c)
+         .transpose()?;
+     // New conv state: the last K-1 entries of [conv_state ; tokens] (copies only, no arithmetic).
+-    let conv_state = if km1 == 0 {
+-        Tensor::zeros((bsz, c, 0), dtype, &dev)?
+-    } else {
+-        let prev = match &cs {
+-            Some(cs) => cs.clone(),
+-            None => Tensor::zeros((bsz, c, km1), DType::F32, &dev)?,
+-        };
+-        Tensor::cat(&[&prev, &xf.transpose(1, 2)?], 2)?
+-            .narrow(2, t, km1)?
+-            .to_dtype(dtype)?
+-            .contiguous()?
+-    };
+     let w = f32c(inp.conv_weight)?;
+     let bias = inp.conv_bias.map(f32c).transpose()?;
+     let a = f32c(inp.a)?;
+@@ -307,6 +310,9 @@ pub(super) fn gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOu
+     let n_out = bsz * t * hv * dv;
+     let n_state = bsz * hv * dk * dv;
+     let conv_buf = m.new_buffer(n_conv, DType::F32, "gdn_conv")?;
++    let n_cs = bsz * c * km1;
++    // (width-1 conv: an empty state; the kernel never writes it, the binding still needs a buffer)
++    let cs_buf = m.new_buffer(n_cs.max(1), DType::F32, "gdn_conv_state")?;
+     let out_buf = m.new_buffer(n_out, DType::F32, "gdn_out")?;
+     let s_buf = m.new_buffer(n_state, DType::F32, "gdn_state")?;
+     let conv_params = GdnConvParams {
+@@ -348,6 +354,7 @@ pub(super) fn gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOu
+             e.set_input_buffer(i, Some(buf), *off);
+         }
+         e.set_output_buffer(4, Some(&conv_buf), 0);
++        e.set_output_buffer(6, Some(&cs_buf), 0);
+         e.set_bytes(5, &conv_params);
+         e.dispatch_thread_groups(
+             MTLSize {
+@@ -390,6 +397,17 @@ pub(super) fn gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOu
+             false,
+         )
+     };
++    let conv_state = if km1 == 0 {
++        Tensor::zeros((bsz, c, 0), dtype, &dev)?
++    } else {
++        Tensor::from_storage(
++            Storage::Metal(MetalStorage::new(cs_buf, m.clone(), n_cs, DType::F32)),
++            (bsz, c, km1),
++            BackpropOp::none(),
++            false,
++        )
++        .to_dtype(dtype)?
++    };
+     Ok(GdnOutput {
+         out: mk(out_buf, n_out, (bsz, t, hv, dv)).to_dtype(dtype)?,
+         conv_state,
+-- 
+2.43.0
+

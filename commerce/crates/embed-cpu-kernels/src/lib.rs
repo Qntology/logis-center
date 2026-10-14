@@ -253,6 +253,53 @@ pub fn rms_norm(x: &[f32], h: usize, w: &[f32], eps: f32, out: &mut [f32]) {
 }
 
 
+// ---------------------------------------------------------------------------------------------
+// 🌟 [EMBED-CPU-PAR] candle 의 원소별 연산과 **같은 식**을 여러 코어에서 계산합니다 (candle 경로용).
+// candle CPU 의 단항·이항 연산은 한 스레드에서 돌아, 순전파의 norm(powf) · GLU(silu · 곱)가
+// 3~4코어에서 25~30% 를 차지했습니다. 원소마다 같은 f32 식을 같은 순서로 계산하므로 결과 비트가
+// candle 연산과 같습니다 (스레드 분할은 원소 경계에서만, 리덕션 없음). 이 크레이트는 dev 프로필에서도
+// opt-level 3 이라 앱 크레이트(debug 테스트 빌드는 opt-level 0)에 두지 않습니다.
+// ---------------------------------------------------------------------------------------------
+
+/// 이보다 작은 입력은 한 스레드로 계산합니다(같은 식, 스레드 전환 비용만 아낌).
+pub const PAR_MIN_ELEMS: usize = 1 << 14;
+const PAR_CHUNK: usize = 1 << 12;
+
+/// `out[i] = src[i].powf(2.0)` — candle `Tensor::powf(2.0)` (CPU f32: `v.powf(e as f32)`, 지수가 실행 시간 값이라
+/// libm `powf` 호출) 와 같은 비트. 지수를 상수로 쓰면 LLVM 이 `pow(x, 2.0)` 을 `x * x` 로 바꾸는데, libm `powf` 는
+/// 드물게 1 ULP 다르므로(실측) `black_box` 로 같은 libm 호출을 유지합니다.
+pub fn powf2(src: &[f32], out: &mut [f32]) {
+    assert_eq!(src.len(), out.len());
+    let e = std::hint::black_box(2.0f32);
+    let f = |o: &mut [f32], s: &[f32]| {
+        for (o, v) in o.iter_mut().zip(s) {
+            *o = v.powf(e);
+        }
+    };
+    if src.len() < PAR_MIN_ELEMS {
+        f(out, src);
+    } else {
+        out.par_chunks_mut(PAR_CHUNK).zip(src.par_chunks(PAR_CHUNK)).for_each(|(o, s)| f(o, s));
+    }
+}
+
+/// GLU: 행마다 `x = [gate (i) | up (i)]` 에 대해 `out = silu(gate) * up`.
+/// candle `silu` (CPU f32: `v / (1.0 + (-v).exp())`) 뒤 곱 — 같은 비트, narrow 복사 없음.
+pub fn silu_mul_halves(src: &[f32], i: usize, out: &mut [f32]) {
+    assert!(i > 0 && src.len() % (2 * i) == 0 && out.len() * 2 == src.len());
+    let f = |o: &mut [f32], r: &[f32]| {
+        let (g, u) = r.split_at(i);
+        for ((o, g), u) in o.iter_mut().zip(g).zip(u) {
+            *o = (g / (1.0 + (-g).exp())) * u;
+        }
+    };
+    if src.len() < PAR_MIN_ELEMS {
+        out.chunks_mut(i).zip(src.chunks(2 * i)).for_each(|(o, r)| f(o, r));
+    } else {
+        out.par_chunks_mut(i).zip(src.par_chunks(2 * i)).for_each(|(o, r)| f(o, r));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

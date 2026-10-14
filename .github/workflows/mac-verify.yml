@@ -38,12 +38,18 @@ on:
       embed_backends:
         description: "backends whose embed / real phases run"
         default: "cpu,metal,vulkan"
+      real_backends:
+        description: "backends whose real-model phase runs (default: embed_backends)"
+        default: ""
       embed_compare:
         description: "1 = also the forced alternative embedding policies, 0 = default policy only"
         default: "1"
       accel_tests:
-        description: "items of the accel phase (gdn,gpu-mem,vk-auto,fa,qwen4)"
-        default: "gdn,gpu-mem,vk-auto,fa"
+        description: "items of the accel phase (gdn,gpu-mem,kv35,vk-auto,fa,qwen4)"
+        default: "gdn,gpu-mem,kv35,vk-auto,fa"
+      runner:
+        description: "runner label for the fork / app jobs (macos-15 = hosted VM with a paravirtual GPU; a self-hosted Apple Silicon label measures the real GPU)"
+        default: "macos-15"
       fork_tests:
         description: "fork test run labels (comma list, all = every test)"
         default: "all"
@@ -120,7 +126,7 @@ jobs:
       fail-fast: false
       matrix:
         backend: ${{ fromJSON(format('[{0}]', (inputs.fork != 'none' && inputs.fork) || '"cpu","metal","vulkan"')) }}
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     env:
       FORK_TESTS: ${{ inputs.fork_tests || 'all' }}
@@ -166,12 +172,13 @@ jobs:
       RUSTFLAGS: "-C target-cpu=apple-m1"
       EMBED_BACKENDS: ${{ inputs.embed_backends || 'cpu,metal,vulkan' }}
       EMBED_COMPARE: ${{ inputs.embed_compare || '1' }}
-      ACCEL_TESTS: ${{ inputs.accel_tests || 'gdn,gpu-mem,vk-auto,fa' }}
+      REAL_BACKENDS: ${{ inputs.real_backends || inputs.embed_backends || 'cpu,metal,vulkan' }}
+      ACCEL_TESTS: ${{ inputs.accel_tests || 'gdn,gpu-mem,kv35,vk-auto,fa' }}
     strategy:
       fail-fast: false
       matrix:
         backend: ${{ fromJSON(format('[{0}]', (inputs.app != 'none' && inputs.app) || '"cpu","metal","vulkan"')) }}
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4

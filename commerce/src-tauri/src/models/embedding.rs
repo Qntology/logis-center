@@ -8,6 +8,7 @@ use tokenizers::Tokenizer;
 use std::path::Path;
 
 pub mod text_cache;
+pub mod cpu_par;
 mod batched;
 pub(crate) mod cpu_packed;
 pub use batched::{BatchOpts, BatchRunStats};
@@ -82,7 +83,8 @@ impl RmsNorm {
         let x_dtype = x.dtype();
         let internal_dtype = if x_dtype == DType::BF16 { DType::BF16 } else { DType::F32 };
         let x = x.to_dtype(internal_dtype)?;
-        let variance = x.powf(2.0)?.mean_keepdim(candle_core::D::Minus1)?;
+        // [EMBED-CPU-PAR] CPU 는 같은 식을 여러 코어로 (같은 비트)
+        let variance = cpu_par::powf2(&x)?.mean_keepdim(candle_core::D::Minus1)?;
         let x_normed = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let x_normed = x_normed.to_dtype(x_dtype)?;
         x_normed.broadcast_mul(&self.weight)
@@ -158,12 +160,8 @@ impl Mlp {
 impl Module for Mlp {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let wi_out = self.wi.forward(x)?;
-        let last_dim = wi_out.dim(candle_core::D::Minus1)?;
-        // narrow 이후 메모리 연속성 보장
-        let gate = wi_out.narrow(candle_core::D::Minus1, 0, last_dim / 2)?.contiguous()?;
-        let up = wi_out.narrow(candle_core::D::Minus1, last_dim / 2, last_dim / 2)?.contiguous()?;
-        // 연산 결과에 대해 Linear 계층(matmul) 진입 전 연속성 보장
-        let act = (candle_nn::ops::silu(&gate)? * up)?.contiguous()?;
+        // silu(gate) * up — CPU 는 같은 식을 여러 코어로, gate/up 복사 없이 (cpu_par, 같은 비트)
+        let act = cpu_par::silu_mul_halves(&wi_out)?;
         Ok(self.wo.forward(&act)?)
     }
 }
@@ -194,16 +192,11 @@ impl Attention {
     fn attend(&self, qkv: &Tensor, cos: &Tensor, sin: &Tensor, mask: Option<&Tensor>) -> candle_core::Result<Tensor> {
         let (batch_size, seq_len, _) = qkv.dims3()?;
 
-        let hidden_size = self.num_heads * self.head_dim;
-        // narrow 이후 메모리 연속성 보장
-        let q_all = qkv.narrow(2, 0, hidden_size)?.contiguous()?;
-        let k_all = qkv.narrow(2, hidden_size, hidden_size)?.contiguous()?;
-        let v_all = qkv.narrow(2, 2 * hidden_size, hidden_size)?.contiguous()?;
-
-        // reshape 및 transpose 이후 메모리 연속성 보장
-        let q = q_all.reshape((batch_size, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
-        let k = k_all.reshape((batch_size, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
-        let v = v_all.reshape((batch_size, seq_len, self.num_heads, self.head_dim))?.transpose(1, 2)?.contiguous()?;
+        // [B, L, 3H] 를 [B, L, 3, heads, hd] 로 보고(복사 없음) q / k / v 를 각각 한 번만 [B, heads, L, hd] 로
+        // 복사합니다. 예전(narrow → contiguous → reshape → transpose → contiguous)과 같은 원소 배치입니다.
+        let qkv5 = qkv.reshape((batch_size, seq_len, 3, self.num_heads, self.head_dim))?;
+        let split = |i: usize| -> candle_core::Result<Tensor> { qkv5.narrow(2, i, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous() };
+        let (q, k, v) = (split(0)?, split(1)?, split(2)?);
 
         let q = RotaryEmbedding::apply(&q, cos, sin)?;
         let k = RotaryEmbedding::apply(&k, cos, sin)?;
@@ -218,7 +211,7 @@ impl Attention {
             Some(m) => att.broadcast_add(m)?,
             None => att,
         };
-        let att = candle_nn::ops::softmax(&att, candle_core::D::Minus1)?;
+        let att = cpu_par::softmax_last(&att)?;
 
         // 두 번째 matmul 진입 전 att와 v의 연속성 보장, 그리고 최종 reshape 전 transpose 결과의 연속성 보장
         att.contiguous()?.matmul(&v.contiguous()?)?.transpose(1, 2)?.contiguous()?.reshape((batch_size, seq_len, self.num_heads * self.head_dim))

@@ -1587,3 +1587,43 @@ fn float_embedding_model_tiny_forward() -> R {
     assert!(max_abs_diff(&model2.forward(&ids, &dev)?, &out)? > 1e-4);
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+//  [EMBED-CPU-PAR] 임베딩 CPU 순전파의 병렬 원소 연산 = candle 연산 (비트 단위)
+// ---------------------------------------------------------------------
+
+/// `models::embedding::cpu_par` 의 RmsNorm `powf(2)` · GLU `silu(gate) * up` · 마지막 축 softmax 가
+/// 원래 candle 연산과 비트 단위로 같은지 — 임베딩 순전파 모양(H 384, I 1536, 12 heads), 패딩 마스크 포함,
+/// 큰 값(exp 넘침)까지. 같아야 per-text · 배치 비트 동일과 기존 텍스트 캐시가 그대로 유효합니다.
+#[test]
+fn embedding_cpu_par_ops_match_candle_bits() -> anyhow::Result<()> {
+    use tauri_app_lib::models::embedding::cpu_par;
+    let dev = Device::Cpu;
+    let differ = |a: &Tensor, b: &Tensor| -> anyhow::Result<usize> {
+        assert_eq!(a.dims(), b.dims());
+        let a = a.flatten_all()?.to_vec1::<f32>()?;
+        let b = b.flatten_all()?.to_vec1::<f32>()?;
+        Ok(a.iter().zip(&b).filter(|(x, y)| x.to_bits() != y.to_bits()).count())
+    };
+    for (m, scale) in [(3usize, 1.0f64), (12, 2.0), (1020, 3.0), (64, 60.0)] {
+        let x = Tensor::randn(0f32, scale as f32, (m, 384), &dev)?;
+        assert_eq!(differ(&cpu_par::powf2(&x)?, &x.powf(2.0)?)?, 0, "powf2 m={m}");
+        let wi = Tensor::randn(0f32, scale as f32, (2, m, 3072), &dev)?;
+        let gate = wi.narrow(2, 0, 1536)?.contiguous()?;
+        let up = wi.narrow(2, 1536, 1536)?.contiguous()?;
+        let want = (candle_nn::ops::silu(&gate)? * up)?;
+        assert_eq!(differ(&cpu_par::silu_mul_halves(&wi)?, &want)?, 0, "silu_mul m={m}");
+    }
+    for (b, l) in [(1usize, 3usize), (85, 12), (2, 130), (1, 512)] {
+        let att = Tensor::randn(0f32, 4.0, (b, 12, l, l), &dev)?;
+        let keep = l - l / 4;
+        let mask: Vec<f32> = (0..b * l).map(|i| if i % l < keep { 0.0 } else { f32::NEG_INFINITY }).collect();
+        let mask = Tensor::from_vec(mask, (b, 1, 1, l), &dev)?;
+        for a in [att.clone(), att.broadcast_add(&mask)?] {
+            let want = candle_nn::ops::softmax(&a, D::Minus1)?;
+            assert_eq!(differ(&cpu_par::softmax_last(&a)?, &want)?, 0, "softmax b={b} l={l}");
+        }
+    }
+    println!("[EMBED-CPU-PAR] powf2 · silu_mul_halves · softmax_last == candle (비트 동일, 임베딩 모양)");
+    Ok(())
+}
