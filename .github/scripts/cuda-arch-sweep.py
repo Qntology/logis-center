@@ -14,7 +14,7 @@ at all (CUDA 13 dropped everything below Turing), so the set is derived, not wri
                  CUDA_COMPUTE_CAP, so two architectures must never share a target dir (or the cached main one).
 
 One line per architecture. A failure that matches a registered signature is KNOWN (warning + reason) and does not
-fail the job; any other failure does. Run from commerce/src-tauri (needs Cargo.lock).
+fail the job; any other failure does. Run from commerce/src-tauri.
 Env: SWEEP_MINUTES (budget, default 60), SWEEP_SKIP (comma list of sm numbers already verified elsewhere),
      SWEEP_CMD (compile command, default `cargo check -p candle-kernels`; tests replace it).
 """
@@ -28,15 +28,11 @@ import sys
 import tempfile
 import time
 
-# A failure is "known" when its log matches one of these. Keep the reason actionable.
-KNOWN = [
-    (
-        re.compile(r"(__hm(?:ax|in)_nan[^\n]*already been defined|already been defined[^\n]*__hm(?:ax|in)_nan)"),
-        "candle-kernels 0.11.0 compatibility.cuh defines __hmax_nan / __hmin_nan for __CUDA_ARCH__ < 800, and this "
-        "toolkit's cuda_fp16 headers define them for every architecture (seen with CUDA 13.2). The crate needs a "
-        "toolkit-version guard.",
-    ),
-]
+# A failure is "known" when its log matches one of these (warning with the reason instead of a red job).
+# Empty on purpose: the CUDA 13 + sm_<80 clash in candle-kernels' compatibility.cuh ("__hmax_nan ... has already been
+# defined") was fixed in the fork (candle-kernels/FORK-NOTES.md); keeping its signature here would hide a regression.
+# Entry shape:  (re.compile(r"<regex over the compiler output>"), "<why it fails and what would fix it>")
+KNOWN = []
 
 
 def annotate(level, title, lines):
@@ -45,15 +41,28 @@ def annotate(level, title, lines):
 
 
 def kernel_sources():
+    """Where the candle-kernels sources are, wherever cargo got them from (crates.io or a path inside the fork)."""
+    import json
+    for extra in (["--offline"], []):
+        r = subprocess.run(["cargo", "metadata", "--format-version", "1", *extra], capture_output=True, text=True)
+        if r.returncode == 0:
+            break
+    else:
+        r = None
+    if r is not None and r.returncode == 0:
+        for pkg in json.loads(r.stdout)["packages"]:
+            if pkg["name"] == "candle-kernels":
+                return pkg["version"], pathlib.Path(pkg["manifest_path"]).parent
+    # last resort: the registry copy named in Cargo.lock
     lock = pathlib.Path("Cargo.lock").read_text()
     m = re.search(r'name = "candle-kernels"\s*\nversion = "([^"]+)"', lock)
     if not m:
-        sys.exit("candle-kernels is not in Cargo.lock")
+        sys.exit("candle-kernels is not in the dependency graph")
     ver = m.group(1)
     home = pathlib.Path(os.environ.get("CARGO_HOME") or (pathlib.Path.home() / ".cargo"))
     found = sorted(glob.glob(str(home / "registry" / "src" / "*" / f"candle-kernels-{ver}")))
     if not found:
-        sys.exit(f"candle-kernels-{ver} sources not found under {home}/registry/src (run a cargo fetch first)")
+        sys.exit(f"candle-kernels-{ver} sources not found (cargo metadata failed and no registry copy)")
     return ver, pathlib.Path(found[-1])
 
 
