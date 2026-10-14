@@ -137,7 +137,7 @@ jobs:
           # annot LOGFILE : the first compiler / build-script / test errors + the last log lines, as one annotation
           annot() {
             local f="$1" msg
-            msg="$( { grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr|--- stdout|nvcc|fatal|^failures:|FAILED|exit code|STATUS_|not found' -A3 "$f" | cut -c1-300 | head -30; echo '--- last lines ---'; tail -25 "$f" | cut -c1-300; } | tr '\r' ' ' | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}' | cut -c1-3800 )"
+            msg="$( { grep -oE '\((exit (code|status)|signal)[^)]*\)' "$f" | head -3 | sed 's/^/rustc ended with /'; grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr|--- stdout|nvcc|fatal|^failures:|FAILED|exit code|STATUS_|not found' -A3 "$f" | cut -c1-300 | head -30; echo '--- last lines ---'; tail -25 "$f" | cut -c1-300; } | tr '\r' ' ' | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}' | cut -c1-3800 )"
             echo "::error title=log::$msg"
           }
           # notice_lines TITLE LOGFILE REGEX : matching lines as one notice (proof of what really ran)
