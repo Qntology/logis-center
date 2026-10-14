@@ -94,6 +94,12 @@ jobs:
             logis-center/commerce/src-tauri/target
           key: cross-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles('logis-center/commerce/src-tauri/Cargo.lock', 'logis-center/patches/candle-rocm-vulkan/*.patch') }}
           restore-keys: cross-${{ matrix.name }}-${{ runner.os }}-
+      - name: error-annotation helper
+        run: |
+          cat > "$RUNNER_TEMP/annot.sh" <<'SH'
+          # usage: annot LOGFILE — turn the first compiler / build-script errors into annotations
+          annot() { grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr' -A4 "$1" | head -40 | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-1500 | while read -r l; do echo "::error::$l"; done; }
+          SH
       - name: protoc (lancedb / lance-encoding build script)
         run: |
           if [ "$RUNNER_OS" = Windows ]; then choco install protoc -y --no-progress; else sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler; fi
@@ -127,8 +133,10 @@ jobs:
         if: matrix.kind == 'run' || matrix.kind == 'build'
         working-directory: logis-center/commerce/src-tauri
         run: |
+          . "$RUNNER_TEMP/annot.sh"
           f="${{ matrix.features }}"
-          cargo test --test it --no-default-features ${f:+--features $f} --no-run
+          cargo test --test it --no-default-features ${f:+--features $f} --no-run 2>&1 | tee "$RUNNER_TEMP/build.log" | tail -3
+          rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/build.log"; exit 1; }
       - name: suite (it, non-ignored)
         if: matrix.kind == 'run'
         working-directory: logis-center/commerce/src-tauri
@@ -157,4 +165,7 @@ jobs:
       - name: type check (cargo check — not executed)
         if: matrix.kind == 'check' || matrix.kind == 'cuda-check'
         working-directory: logis-center/commerce/src-tauri
-        run: cargo check --no-default-features --features "${{ matrix.features }}" --lib --bins --test it
+        run: |
+          . "$RUNNER_TEMP/annot.sh"
+          cargo check --no-default-features --features "${{ matrix.features }}" --lib --bins --test it 2>&1 | tee "$RUNNER_TEMP/check.log" | tail -3
+          rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/check.log"; exit 1; }
