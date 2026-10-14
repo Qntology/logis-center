@@ -124,7 +124,7 @@ impl BatchOpts {
 /// `LOGIS_EMBED_VK_MODE=host` 이면 전부 CPU 경로(CPU 백엔드와 같은 비트), `=auto` 는 비교 측정용
 /// (연산마다 크기 · 장치로 경로를 고르므로 배치 구성에 따라 비트가 달라질 수 있어 기본값이 될 수 없습니다).
 #[cfg(feature = "vulkan")]
-fn vulkan_exec_mode() -> candle_core::vulkan_backend::shaders::ExecMode {
+pub(crate) fn vulkan_exec_mode() -> candle_core::vulkan_backend::shaders::ExecMode {
     use candle_core::vulkan_backend::shaders::ExecMode;
     static MODE: std::sync::OnceLock<ExecMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {

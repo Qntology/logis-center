@@ -300,6 +300,65 @@ pub fn silu_mul_halves(src: &[f32], i: usize, out: &mut [f32]) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// 🌟 [VISION-SCORE] 패치 × 구 내적 행렬 (SigLIP2 비전 채점의 배치 경로)
+// 비전 파이프라인은 패치(≤256) × 앵커 구(수백) 쌍마다 1152차원 내적을 `a.iter().zip(b).map(|(x, y)| x * y)
+// .sum::<f32>()` 로 하나씩 계산했습니다. 이 합은 누산기 하나의 순차 체인이라 벡터화되지 않습니다.
+// 여기서는 원소마다 **같은 식**(시작값 -0.0 — `f32` 의 `Sum` 과 같음, k 오름차순, 곱을 반올림한 뒤 더하기,
+// FMA 아님)을 유지하고, 서로 독립인 열(구) 방향으로만 벡터화하고 행(패치) 방향으로 나눠 병렬 계산합니다.
+// 그래서 결과 비트가 기존 스칼라 내적과 같고, 장치(CPU · Metal · Vulkan · CUDA · ROCm)와 무관합니다.
+// ---------------------------------------------------------------------------------------------
+
+/// 열 타일 폭. 누산기 한 묶음이 레지스터에 남도록 작게 둡니다.
+const DOT_TILE: usize = 32;
+
+/// `out[i * m + j] = Σ_k a[i * d + k] * bt[k * m + j]` (k 오름차순, 시작값 -0.0, 곱 뒤 덧셈).
+/// `a` 는 [n, d] 행 우선, `bt` 는 [d, m] (열이 구 하나). 행마다 결과가 `a` 의 i 행과
+/// `bt` 의 j 열을 `iter().zip().map(|(x, y)| x * y).sum::<f32>()` 한 값과 비트 동일합니다.
+pub fn dot_rows_cols(a: &[f32], n: usize, d: usize, bt: &[f32], m: usize, out: &mut [f32]) {
+    assert_eq!(a.len(), n * d);
+    assert_eq!(bt.len(), d * m);
+    assert_eq!(out.len(), n * m);
+    if n == 0 || m == 0 {
+        return;
+    }
+    let row = |i: usize, o: &mut [f32]| {
+        let ar = &a[i * d..(i + 1) * d];
+        let mut j0 = 0;
+        while j0 < m {
+            let w = DOT_TILE.min(m - j0);
+            let mut acc = [-0.0f32; DOT_TILE];
+            if w == DOT_TILE {
+                for (k, &x) in ar.iter().enumerate() {
+                    let b = &bt[k * m + j0..k * m + j0 + DOT_TILE];
+                    for t in 0..DOT_TILE {
+                        acc[t] = acc[t] + x * b[t];
+                    }
+                }
+            } else {
+                for (k, &x) in ar.iter().enumerate() {
+                    let b = &bt[k * m + j0..k * m + j0 + w];
+                    for t in 0..w {
+                        acc[t] = acc[t] + x * b[t];
+                    }
+                }
+            }
+            o[j0..j0 + w].copy_from_slice(&acc[..w]);
+            j0 += w;
+        }
+    };
+    if n * m * d < PAR_MIN_ELEMS * 16 {
+        out.chunks_mut(m).enumerate().for_each(|(i, o)| row(i, o));
+    } else {
+        out.par_chunks_mut(m).enumerate().for_each(|(i, o)| row(i, o));
+    }
+}
+
+/// `v` 의 L2 노름을 `v.iter().map(|x| x * x).sum::<f32>().sqrt()` 와 같은 식으로.
+pub fn l2_norm_seq(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,6 +456,29 @@ mod tests {
             let mut one = vec![0f32; h];
             rms_norm(&x[r * h..(r + 1) * h], h, &w, 1e-5, &mut one);
             assert_eq!(bits(&one), bits(&all[r * h..(r + 1) * h]));
+        }
+    }
+
+    #[test]
+    fn dot_rows_cols_equals_scalar_sum_bits() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for &(n, d, m) in &[(1usize, 1usize, 1usize), (3, 7, 5), (17, 1152, 33), (64, 1152, 96), (256, 1152, 379), (2, 31, 64)] {
+            let mut a = det(n * d, (n * 31 + d) as u32);
+            let mut b = det(m * d, (m * 7 + d) as u32 + 99); // [m, d] 행 = 구 하나
+            // 0 · -0 · 큰 값 · 아주 작은 값 (부호 있는 0 과 넘침 경계)
+            if a.len() > 4 { a[0] = 0.0; a[1] = -0.0; a[2] = 1e30; a[3] = 1e-30; }
+            if b.len() > 4 { b[0] = -0.0; b[1] = 0.0; b[2] = 1e10; b[3] = -1e-30; }
+            if n > 1 { for k in 0..d { a[d + k] = -0.0; } } // 전부 -0 인 행
+            let mut bt = vec![0f32; d * m];
+            for j in 0..m { for k in 0..d { bt[k * m + j] = b[j * d + k]; } }
+            let mut out = vec![0f32; n * m];
+            pool.install(|| dot_rows_cols(&a, n, d, &bt, m, &mut out));
+            for i in 0..n {
+                for j in 0..m {
+                    let want: f32 = a[i * d..(i + 1) * d].iter().zip(b[j * d..(j + 1) * d].iter()).map(|(x, y)| x * y).sum();
+                    assert_eq!(out[i * m + j].to_bits(), want.to_bits(), "n={n} d={d} m={m} i={i} j={j}");
+                }
+            }
         }
     }
 }

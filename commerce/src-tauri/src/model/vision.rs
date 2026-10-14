@@ -3725,14 +3725,9 @@ impl crate::model::LogisModel {
                                         grid.orig_width,
                                         grid.orig_height,
                                         &legibility,
-                                        |t| {
-                                            crate::models::siglip2::vision_encoder::encode_phrases_ephemeral(
-                                                m,
-                                                &[t.to_string()],
-                                            )
-                                            .ok()
-                                            .and_then(|v| v.into_iter().next())
-                                            .unwrap_or_default()
+                                        |vals: &[String]| {
+                                            crate::models::siglip2::vision_encoder::encode_phrases_ephemeral(m, vals)
+                                                .unwrap_or_default()
                                         },
                                         &|_: &str| {},
                                     ))
