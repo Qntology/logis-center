@@ -5,7 +5,7 @@
 #   vulkan (Linux) : lavapipe (software Vulkan, a CPU device): suite + the device tests of the vision batch path
 #   vulkan (Win)   : build only (no software Vulkan ICD is installed) — reported as "build only"
 #   cuda / rocm    : type check only (`cargo check`); never executed, never reported as a pass of a run
-# Real CUDA / ROCm / Windows-GPU execution needs a self-hosted runner with that GPU.
+# Real CUDA / ROCm / Windows-GPU execution needs a self-hosted runner with that GPU (not covered here).
 name: cross-verify
 
 on:
