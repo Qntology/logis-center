@@ -12,6 +12,8 @@ pub mod cpu_par;
 mod batched;
 pub(crate) mod cpu_packed;
 pub use batched::{BatchOpts, BatchRunStats};
+#[cfg(feature = "vulkan")]
+pub(crate) use batched::vulkan_exec_mode;
 
 /// 임베딩 차원 (granite-embedding-97m-multilingual-r2 hidden_size).
 pub const EMBED_DIM: usize = 384;

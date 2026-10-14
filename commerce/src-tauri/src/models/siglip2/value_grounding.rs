@@ -1,5 +1,5 @@
 use crate::models::siglip2::legibility::LegibilityMap;
-use crate::utils::ai_utils::{cosine_similarity, gumbel_expected_z};
+use crate::utils::ai_utils::gumbel_expected_z;
 
 #[derive(Debug, Clone)]
 pub struct GroundingClaim {
@@ -67,19 +67,48 @@ pub fn verify_claims<F>(
     orig_w: u32,
     orig_h: u32,
     legibility: &crate::models::siglip2::legibility::LegibilityMap,
-    encode_fn: F,
+    encode_batch_fn: F,
     emit: &dyn Fn(&str),
 ) -> Vec<GroundingVerdict>
 where
-    F: Fn(&str) -> Vec<f32>,
+    F: FnOnce(&[String]) -> Vec<Vec<f32>>,
 {
     use crate::models::siglip2::legibility::PatchLegibility;
+    use crate::models::siglip2::vision_encoder::PatchPhraseDots;
 
     let n = patch_embs.len();
     let mut out: Vec<GroundingVerdict> = Vec::with_capacity(claims.len());
     if n == 0 || claims.is_empty() {
         return out;
     }
+
+    // 🌟 [VISION-BATCH] 값 문자열을 한 번에 인코딩합니다(예전: 값마다 텍스트 인코더 순전파 1회, 배치 1).
+    //    같은 값은 한 번만. 묶음은 encode_phrases 의 장치 정책(행 32 · CUDA/ROCm 고정 모양 · Vulkan 고정 실행
+    //    모드)을 따르고, 값 × 패치 코사인은 내적 행렬 한 번 + 노름으로 cosine_similarity 와 같은 식입니다.
+    let mut uniq: Vec<String> = Vec::new();
+    let mut uniq_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for claim in claims.iter() {
+        let v = claim.value.trim();
+        if !v.is_empty() && !uniq_idx.contains_key(v) {
+            uniq_idx.insert(v.to_string(), uniq.len());
+            uniq.push(v.to_string());
+        }
+    }
+    let embs: Vec<Vec<f32>> = if uniq.is_empty() { Vec::new() } else { encode_batch_fn(&uniq) };
+    let d = patch_embs[0].len();
+    let mut row_of: Vec<Option<usize>> = vec![None; uniq.len()];
+    let mut rows: Vec<&[f32]> = Vec::new();
+    for u in 0..uniq.len() {
+        if let Some(e) = embs.get(u) {
+            if e.len() == d && !e.iter().all(|&x| x == 0.0) {
+                row_of[u] = Some(rows.len());
+                rows.push(e.as_slice());
+            }
+        }
+    }
+    let cols: Vec<&[f32]> = patch_embs.iter().map(|p| p.as_slice()).collect();
+    let dots = PatchPhraseDots::compute(&rows, &cols);
+    let patch_norm: Vec<f32> = patch_embs.iter().map(|p| embed_cpu_kernels::l2_norm_seq(p)).collect();
 
     for claim in claims.iter() {
         let v = claim.value.trim();
@@ -88,8 +117,8 @@ where
             continue;
         }
 
-        let emb = encode_fn(v);
-        if emb.len() != patch_embs[0].len() || emb.iter().all(|&x| x == 0.0) {
+        let row = row_of[uniq_idx[v]];
+        if row.is_none() {
             out.push(GroundingVerdict {
                 category: claim.category.clone(),
                 field: claim.field.clone(),
@@ -105,8 +134,15 @@ where
             continue;
         }
 
-        // 전 패치 코사인
-        let sims: Vec<f32> = patch_embs.iter().map(|p| cosine_similarity(&emb, p)).collect();
+        // 전 패치 코사인 (cosine_similarity 와 같은 식: 내적 / (‖값‖ · ‖패치‖), 노름 0 이면 0)
+        let r = row.unwrap();
+        let na = embed_cpu_kernels::l2_norm_seq(rows[r]);
+        let sims: Vec<f32> = (0..n)
+            .map(|i| {
+                let nb = patch_norm[i];
+                if na == 0.0 || nb == 0.0 { 0.0 } else { dots.at(r, i) / (na * nb) }
+            })
+            .collect();
         let mean: f32 = sims.iter().sum::<f32>() / n as f32;
         let var: f32 = sims.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n as f32;
         let std = var.sqrt().max(1e-6);

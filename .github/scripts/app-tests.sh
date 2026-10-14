@@ -5,7 +5,7 @@
 #   app-tests.sh cpu|metal|vulkan <out-dir> build|suite|embed|bench|real|accel
 # Env: MOCK_MODELS (gen_granite_mock.py output root), REAL_MODELS (Hugging Face download root, optional),
 #      EMBED_BACKENDS (backends whose embed / real phases run, default all), EMBED_COMPARE (0: default policy only; speed: default policy, speed / bit-identity test only — no decision test),
-#      ACCEL_TESTS (items of the accel phase: gdn,gpu-mem,kv35,vk-auto,fa,qwen4; default all but qwen4, which the suite runs)
+#      ACCEL_TESTS (items of the accel phase: gdn,gpu-mem,kv35,vk-auto,fa,vision,qwen4; default all but qwen4, which the suite runs)
 set -euo pipefail
 BACKEND="$1"; OUT="$(mkdir -p "$2" && cd "$2" && pwd)"; export OUT; PHASE="${3:-all}"
 . "$(dirname "$0")/lib.sh"
@@ -132,6 +132,10 @@ accel)
   if want gpu-mem; then
     run gpu-mem cargo test --test it "${FEAT[@]}" -- gpu_memory:: --ignored --nocapture --test-threads 1
     require_measured gpu-mem "\\[GPU-MEM\\] .*total"
+  fi
+  if want vision; then
+    run vision-batch cargo test --test it "${FEAT[@]}" -- vision_batch --ignored --nocapture --test-threads 1
+    require_measured vision-batch "\\[VISION-BATCH\\] 구 인코딩"
   fi
   if want kv35; then
     # Qwen3.5 KV plan v2 on a mock Qwen3.5 (GGUF): Vram / Ram / Ssd tiers, GDN state on the device, kv_exact.

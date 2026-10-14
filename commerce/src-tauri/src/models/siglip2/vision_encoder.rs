@@ -8,6 +8,9 @@ use crate::utils::ai_utils::{split_bias_phrases_full, surprisal_dual_scores};
 
 pub const ERR_TEXT_ENCODER_REQUIRED: &str = "SIGLIP2_TEXT_ENCODER_REQUIRED";
 
+/// 텍스트 인코더 한 번에 묶는 구 수 (64토큰 × 1152 × 27층의 VRAM 안전선).
+pub const PHRASE_BATCH_ROWS: usize = 32;
+
 pub struct AnchorBank {
     /// bias 축: 이 개념을 설명하는 구
     pub bias: Vec<(String, String, std::sync::Arc<Vec<f32>>)>,
@@ -103,21 +106,15 @@ fn encode_phrases_persisted(
 
     let mut fresh: Vec<(String, std::sync::Arc<Vec<f32>>)> = Vec::with_capacity(miss_idx.len());
 
-    // 배치 크기는 VRAM 상한을 고려해 32 로 고정합니다.
-    // (64토큰 × 1152차원 × 27층이므로 32가 안전선입니다)
-    for chunk in miss_idx.chunks(32) {
-        let owned: Vec<String> = chunk.iter().map(|&i| phrases[i].clone()).collect();
-        let batch = tok.encode_batch(&owned)?;
-        let t = text.encode_batch(&batch, &model.device)?; // (b, D)
-        let t = t.to_dtype(DType::F32)?;
-        let rows: Vec<Vec<f32>> = t.to_vec2::<f32>()?;
-        for (bi, mut r) in rows.into_iter().enumerate() {
-            l2_normalize(&mut r);
-            let arc = std::sync::Arc::new(r);
-            let gi = chunk[bi];
-            slots[gi] = Some(arc.clone());
-            fresh.push((phrases[gi].clone(), arc));
-        }
+    // 🌟 [VISION-BATCH] 미스 구를 텍스트 임베딩(embed_many)과 같은 장치 정책으로 묶어 인코딩합니다.
+    let fixed_shape = crate::models::embedding::BatchOpts::for_device(&model.device).fixed_shape;
+    let owned: Vec<String> = miss_idx.iter().map(|&i| phrases[i].clone()).collect();
+    let rows = encode_phrase_rows_with(model, text, tok, &owned, fixed_shape)?;
+    for (bi, r) in rows.into_iter().enumerate() {
+        let arc = std::sync::Arc::new(r);
+        let gi = miss_idx[bi];
+        slots[gi] = Some(arc.clone());
+        fresh.push((phrases[gi].clone(), arc));
     }
 
     if persist {
@@ -133,6 +130,69 @@ fn encode_phrases_persisted(
         .into_iter()
         .map(|s| s.unwrap_or_else(|| std::sync::Arc::new(vec![0.0f32; model.config.text_hidden_size])))
         .collect())
+}
+
+/// 🌟 [VISION-BATCH] 구 목록 → L2 정규화된 공유공간 벡터 (입력 순서, 캐시 미사용).
+///
+///  텍스트 임베딩(embed_many, models/embedding/batched.rs)과 같은 장치 정책입니다.
+///   · 행 수는 VRAM 상한을 고려해 32 로 고정합니다(64토큰 × 1152차원 × 27층이므로 32가 안전선입니다).
+///     SigLIP2 텍스트는 항상 64토큰(패딩 포함, 마지막 토큰 풀링)이라 길이 버킷은 없습니다.
+///   · `fixed_shape` (CUDA/ROCm, `BatchOpts::for_device`): 마지막 묶음도 32행 모양으로 채워(첫 구 복사,
+///     출력 버림) GEMM 경로가 묶음 크기에 따라 바뀌지 않게 합니다 — 구 하나의 벡터가 같이 묶인 구 수와 무관합니다.
+///   · Vulkan: 포크의 고정 실행 모드(`LOGIS_EMBED_VK_MODE`, 기본 Gpu)로 연산 경로를 묶습니다.
+///   · CPU · Metal: 실제 행만 (행 수와 무관한 GEMM — macos-15 · 리눅스 M-불변성 실측). 단 1건이면 2행으로
+///     계산합니다: 헤드 행렬곱이 1행이면 gemv 경로라 비트가 달라집니다(측정: 1건씩 vs 40건 묶음 2104값 차이 → 0).
+///   · 결과는 장치에 모아 호출당 D2H 1회.
+pub fn encode_phrase_rows(
+    model: &Siglip2Model,
+    phrases: &[String],
+    fixed_shape: bool,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let text = model
+        .text
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("{}: text encoder is not loaded", ERR_TEXT_ENCODER_REQUIRED))?;
+    let tok = model
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("SigLIP2 tokenizer is not loaded"))?;
+    encode_phrase_rows_with(model, text, tok, phrases, fixed_shape)
+}
+
+fn encode_phrase_rows_with(
+    model: &Siglip2Model,
+    text: &super::text::Siglip2TextModel,
+    tok: &super::tokenizer::Siglip2Tokenizer,
+    phrases: &[String],
+    fixed_shape: bool,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    if phrases.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[cfg(feature = "vulkan")]
+    let _vk_mode = model.device.is_vulkan().then(|| {
+        candle_core::vulkan_backend::shaders::scoped_exec_mode(crate::models::embedding::vulkan_exec_mode())
+    });
+    let mut outs: Vec<Tensor> = Vec::new();
+    for chunk in phrases.chunks(PHRASE_BATCH_ROWS) {
+        let mut batch = tok.encode_batch(chunk)?;
+        let g = batch.len();
+        // 마지막 토큰 풀링 뒤 프로젝션 헤드는 [행, D] 행렬곱입니다. 1행이면 CPU gemm · Metal GEMM 이
+        // gemv 경로를 타 다른 비트가 나오므로(M=1 만 다름 — macos-15 · 리눅스 M-불변성 실측) 최소 2행으로 계산합니다.
+        let rows = if fixed_shape { PHRASE_BATCH_ROWS } else { 2 };
+        if g < rows {
+            let first = batch[0].clone();
+            batch.resize(rows, first);
+        }
+        let t = text.encode_batch(&batch, &model.device)?; // (rows, D)
+        outs.push(if t.dim(0)? > g { t.narrow(0, 0, g)? } else { t });
+    }
+    let all = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? };
+    let mut rows: Vec<Vec<f32>> = all.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+    for r in rows.iter_mut() {
+        l2_normalize(r);
+    }
+    Ok(rows)
 }
 
 /// 레거시 호환 래퍼. 소유 벡터가 필요한 호출부(encode_query_text)용입니다.
@@ -2179,6 +2239,78 @@ pub fn render_heatmap_ascii(hm: &CategoryHeatmap, grid: &PatchGrid) -> String {
 #[allow(dead_code)]
 fn _unused_marker(_d: &Device, _t: DType, _c: &Siglip2Config, _x: &Tensor) {}
 
+/// 🌟 [VISION-SCORE] 뱅크의 구 벡터를 열로 모읍니다. 같은 Arc(같은 구)는 한 열만 씁니다.
+#[derive(Default)]
+pub struct PhraseColumns {
+    pub vecs: Vec<std::sync::Arc<Vec<f32>>>,
+    index: std::collections::HashMap<*const Vec<f32>, usize>,
+}
+
+impl PhraseColumns {
+    pub fn col(&mut self, e: &std::sync::Arc<Vec<f32>>) -> usize {
+        let key = std::sync::Arc::as_ptr(e);
+        if let Some(&c) = self.index.get(&key) {
+            return c;
+        }
+        let c = self.vecs.len();
+        self.vecs.push(e.clone());
+        self.index.insert(key, c);
+        c
+    }
+}
+
+/// 🌟 [VISION-SCORE] 패치 n × 구 m 내적 행렬 (`embed_cpu_kernels::dot_rows_cols`).
+///
+///  ── 왜 호스트에서 ──
+///   패치 벡터는 비전 인코더를 반납한 뒤 이미 호스트에 있고, 행렬은 256 × 수백 × 1152 로 작습니다.
+///   GPU 로 올리면 백엔드마다 GEMM 의 누산 순서가 달라 같은 문서의 서식 판정 마진이 장치마다 달라집니다.
+///   이 커널은 원소마다 기존 스칼라 내적과 같은 식이라 Mac(Metal · CPU · Vulkan) · 리눅스 · Windows
+///   (CUDA · ROCm · Vulkan · CPU) 모두 같은 비트, 같은 판정입니다.
+pub struct PatchPhraseDots {
+    m: usize,
+    vals: Vec<f32>,
+}
+
+impl PatchPhraseDots {
+    /// `rows` (패치) × `cols` (구) — 행 i · 열 j 가 `rows[i] · cols[j]`.
+    pub fn compute(rows: &[&[f32]], cols: &[&[f32]]) -> Self {
+        let (patches, phrases) = (rows, cols);
+        let n = patches.len();
+        let m = phrases.len();
+        let d = patches.first().map_or(0, |p| p.len());
+        let uniform = d > 0
+            && patches.iter().all(|p| p.len() == d)
+            && phrases.iter().all(|q| q.len() == d);
+        let mut vals = vec![0f32; n * m];
+        if uniform {
+            let mut a = Vec::with_capacity(n * d);
+            for p in patches {
+                a.extend_from_slice(p);
+            }
+            let mut bt = vec![0f32; d * m];
+            for (j, q) in phrases.iter().enumerate() {
+                for (k, &x) in q.iter().enumerate() {
+                    bt[k * m + j] = x;
+                }
+            }
+            embed_cpu_kernels::dot_rows_cols(&a, n, d, &bt, m, &mut vals);
+        } else {
+            // 길이가 다른 벡터(있어서는 안 됨): 기존 스칼라 내적(zip = 짧은 쪽 길이)을 그대로.
+            for (i, p) in patches.iter().enumerate() {
+                for (j, q) in phrases.iter().enumerate() {
+                    vals[i * m + j] = p.iter().zip(q.iter()).map(|(x, y)| x * y).sum();
+                }
+            }
+        }
+        Self { m, vals }
+    }
+
+    #[inline]
+    pub fn at(&self, i: usize, j: usize) -> f32 {
+        self.vals[i * self.m + j]
+    }
+}
+
 pub fn score_patches_bank_neutral(
     grid: &PatchGrid,
     bank: &AnchorBank,
@@ -2210,19 +2342,25 @@ pub fn score_patches_bank_neutral(
         key_cat.entry(k.clone()).or_insert_with(|| c.clone());
     }
 
-    let dot = |a: &[f32], b: &[f32]| -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-    };
+    // 🌟 [VISION-SCORE] 패치 × 구 내적을 구마다 따로 돌지 않고 한 번에 계산합니다.
+    //    같은 구(같은 Arc)는 bias · prejudice 양쪽에 있어도 한 열입니다. 원소마다 기존 스칼라 내적과
+    //    같은 식이라 아래 Max-Pool · 기준선 · 센터링 결과가 비트 단위로 그대로입니다.
+    let mut cols = PhraseColumns::default();
+    let bias_col: Vec<usize> = bank.bias.iter().map(|(_, _, e)| cols.col(e)).collect();
+    let prej_col: Vec<usize> = bank.prejudice.iter().map(|(_, _, e)| cols.col(e)).collect();
+    let patch_rows: Vec<&[f32]> = grid.patches.iter().map(|p| p.as_slice()).collect();
+    let phrase_cols: Vec<&[f32]> = cols.vecs.iter().map(|v| v.as_slice()).collect();
+    let dots = PatchPhraseDots::compute(&patch_rows, &phrase_cols);
+    let zero_patch: Vec<bool> = grid.patches.iter().map(|p| p.iter().all(|&x| x == 0.0)).collect();
 
     let mut prej_pool: HashMap<String, Vec<f32>> = HashMap::new();
     for (gname, list) in prej_idx.iter() {
         let mut v = vec![f32::MIN; n];
         for i in 0..n {
-            let p = &grid.patches[i];
-            if p.iter().all(|&x| x == 0.0) { continue; }
+            if zero_patch[i] { continue; }
             let mut mp = f32::MIN;
             for &j in list {
-                let s = dot(p, &bank.prejudice[j].2);
+                let s = dots.at(i, prej_col[j]);
                 if s > mp { mp = s; }
             }
             v[i] = mp;
@@ -2244,11 +2382,10 @@ pub fn score_patches_bank_neutral(
             .or_else(|| key_cat.get(key).and_then(|c| prej_pool.get(c)));
         if pv.is_some() { resolved += 1; }
         for i in 0..n {
-            let p = &grid.patches[i];
-            if p.iter().all(|&v| v == 0.0) { continue; }
+            if zero_patch[i] { continue; }
             let mut mb = f32::MIN;
             for &j in bi {
-                let s = dot(p, &bank.bias[j].2);
+                let s = dots.at(i, bias_col[j]);
                 if s > mb { mb = s; }
             }
             raw_b[ki][i] = mb;
@@ -2261,7 +2398,7 @@ pub fn score_patches_bank_neutral(
     // ── ③ 판독 가능 패치만으로 기준선 산출 ──
     let usable: Vec<usize> = (0..n)
         .filter(|&i| legible.map_or(true, |l| l.is_legible(i)))
-        .filter(|&i| !grid.patches[i].iter().all(|&v| v == 0.0))
+        .filter(|&i| !zero_patch[i])
         .collect();
     let base: &[usize] = if usable.len() >= 8 {
         &usable

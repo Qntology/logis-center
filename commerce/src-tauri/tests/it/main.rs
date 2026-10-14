@@ -58,3 +58,5 @@ mod accel_accuracy;
 // GPU 메모리 보고 · 반환 · KV 계층 강제 (장치 공통: Metal · Vulkan · CUDA · ROCm)
 mod gpu_memory;
 mod qwen35_kv;
+// SigLIP2 비전 파이프라인 배치 경로 (패치 × 구 채점 · 값 접지 · 구 인코딩)
+mod vision_batch;
