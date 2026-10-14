@@ -118,7 +118,7 @@ jobs:
         if: matrix.kind == 'run' && matrix.features == ''
         working-directory: logis-center/commerce
         run: cargo test --release --manifest-path crates/embed-cpu-kernels/Cargo.toml
-      - name: embed mock (CPU, default policy: bit identity + speed)
+      - name: "embed mock (CPU, default policy — bit identity + speed)"
         if: matrix.name == 'linux-cpu' || matrix.name == 'windows-cpu'
         working-directory: logis-center/commerce/src-tauri
         env:
