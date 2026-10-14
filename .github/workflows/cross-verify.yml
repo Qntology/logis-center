@@ -129,15 +129,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             logis-center/commerce/src-tauri/target
-          key: cross-${{ matrix.name }}-${{ matrix.os }}-rust${{ env.RUST_VERSION }}${{ matrix.kind == 'cuda-check' && format('-cuda{0}-sm{1}', matrix.cuda || 'apt', matrix.cuda_cap || '80') || '' }}-${{ hashFiles('logis-center/commerce/src-tauri/Cargo.lock', 'logis-center/patches/candle-rocm-vulkan/*.patch') }}
-          restore-keys: cross-${{ matrix.name }}-${{ matrix.os }}-rust${{ env.RUST_VERSION }}${{ matrix.kind == 'cuda-check' && format('-cuda{0}-sm{1}', matrix.cuda || 'apt', matrix.cuda_cap || '80') || '' }}-
+          key: cross-cpuv2-${{ matrix.name }}-${{ matrix.os }}-rust${{ env.RUST_VERSION }}${{ matrix.kind == 'cuda-check' && format('-cuda{0}-sm{1}', matrix.cuda || 'apt', matrix.cuda_cap || '80') || '' }}-${{ hashFiles('logis-center/commerce/src-tauri/Cargo.lock', 'logis-center/patches/candle-rocm-vulkan/*.patch') }}
+          restore-keys: cross-cpuv2-${{ matrix.name }}-${{ matrix.os }}-rust${{ env.RUST_VERSION }}${{ matrix.kind == 'cuda-check' && format('-cuda{0}-sm{1}', matrix.cuda || 'apt', matrix.cuda_cap || '80') || '' }}-
       - name: error-annotation helper
         run: |
           cat > "$RUNNER_TEMP/annot.sh" <<'SH'
           # annot LOGFILE : the first compiler / build-script / test errors + the last log lines, as one annotation
           annot() {
             local f="$1" msg
-            msg="$( { grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr|--- stdout|nvcc|fatal|^failures:|FAILED|exit code|STATUS_|not found' -A3 "$f" | cut -c1-300 | head -30; echo '--- last lines ---'; tail -25 "$f" | cut -c1-300; } | tr '\r' ' ' | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}' | cut -c1-3800 )"
+            msg="$( { grep -oE '\((exit (code|status)|signal)[^)]*\)' "$f" | head -3 | sed 's/^/rustc ended with /'; grep -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr|--- stdout|nvcc|fatal|^failures:|FAILED|exit code|STATUS_|not found' -A3 "$f" | cut -c1-300 | head -30; echo '--- last lines ---'; tail -25 "$f" | cut -c1-300; } | tr '\r' ' ' | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}' | cut -c1-3800 )"
             echo "::error title=log::$msg"
           }
           # notice_lines TITLE LOGFILE REGEX : matching lines as one notice (proof of what really ran)
@@ -209,6 +209,14 @@ jobs:
       - name: macOS — target CPU (the virtual M1 runner cannot name its CPU; same as mac-verify.yml)
         if: runner.os == 'macOS'
         run: echo "RUSTFLAGS=-C target-cpu=apple-m1" >> "$GITHUB_ENV"
+
+      # commerce/src-tauri/.cargo/config.toml builds with -C target-cpu=native. A cached target dir (proc-macro DLLs included)
+      # built on one runner CPU is loaded by rustc on another runner: windows-cuda died with STATUS_ILLEGAL_INSTRUCTION
+      # (0xc000001d) in `rustc boa_string`. The runner pool mixes CPU models, so x86 jobs build for a baseline every one has.
+      - name: x86 — portable CPU target (a cache built on another runner CPU must stay loadable)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: echo "RUSTFLAGS=-C target-cpu=x86-64-v2" >> "$GITHUB_ENV"
       - name: macOS — MoltenVK
         if: matrix.name == 'mac-vulkan'
         run: |
