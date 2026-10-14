@@ -95,16 +95,20 @@ real)
   fi
   ;;
 accel)
+  if [ "$BACKEND" = cpu ]; then
+    # Skipped so nothing runs twice: every accel test also measures the CPU paths (CPU reference, CPU fused GDN) in the
+    # metal / vulkan jobs on the same runner type.
+    not_run accel-cpu "CPU parts run inside the metal / vulkan jobs (same runner)"
+    finish; exit $?
+  fi
   # Mock / tiny-model checks of the acceleration paths (docs/mac-verify.md 3-5). Each test changes process-wide
   # state (GDN override, accel config) or measures device-wide memory, so each runs alone (--test-threads 1).
   # Fused GDN (CPU kernel) vs the tensor path on CPU and on this build's GPU: numbers + time.
   run gdn-path cargo test --test it "${FEAT[@]}" -- qwen4_exp::gdn_fused --ignored --nocapture --test-threads 1
-  require_measured gdn-path "\\[GDN-PATH\\] CPU"
-  if [ "$BACKEND" != cpu ]; then
-    # Device memory reported / returned (Metal: fork patch 0003), KV-PLAN inputs, KV tiers on the GPU.
-    run gpu-mem cargo test --test it "${FEAT[@]}" -- gpu_memory:: --ignored --nocapture --test-threads 1
-    require_measured gpu-mem "\\[GPU-MEM\\] .*total"
-  fi
+  require_measured gdn-path "\\[GDN-PATH\\] (Metal|Vulkan)"
+  # Device memory reported / returned (Metal: fork patch 0003), KV-PLAN inputs, KV tiers on the GPU.
+  run gpu-mem cargo test --test it "${FEAT[@]}" -- gpu_memory:: --ignored --nocapture --test-threads 1
+  require_measured gpu-mem "\\[GPU-MEM\\] .*total"
   if [ "$BACKEND" = vulkan ]; then
     # Auto (per-op GPU element-wise) vs the default Gpu mode: speed only — Auto is not batch-invariant.
     embed embed-vulkan-mock-auto "$MOCK_MODELS" compare LOGIS_EMBED_VK_MODE=auto LOGIS_EMBED_MEASURE_ONLY=1

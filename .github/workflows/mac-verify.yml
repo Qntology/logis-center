@@ -208,6 +208,8 @@ jobs:
           echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix vulkan-loader)/lib:$(brew --prefix molten-vk)/lib" >> "$GITHUB_ENV"
       - name: build (cargo test --no-run)
         id: phase_build
+        # An accel-only run has nothing for the cpu job: the accel tests' CPU parts run inside the metal / vulkan jobs.
+        if: ${{ !(matrix.backend == 'cpu' && (inputs.phases || (contains(github.event.head_commit.message, '[accel-only]') && 'accel' || 'all')) == 'accel') }}
         timeout-minutes: 70
         working-directory: logis-center/commerce
         env:
