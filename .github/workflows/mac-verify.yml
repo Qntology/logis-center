@@ -38,6 +38,9 @@ on:
       embed_backends:
         description: "backends whose embed / real phases run"
         default: "cpu,metal,vulkan"
+      real_backends:
+        description: "backends whose real-model phase runs (default: embed_backends)"
+        default: ""
       embed_compare:
         description: "1 = also the forced alternative embedding policies, 0 = default policy only"
         default: "1"
@@ -169,6 +172,7 @@ jobs:
       RUSTFLAGS: "-C target-cpu=apple-m1"
       EMBED_BACKENDS: ${{ inputs.embed_backends || 'cpu,metal,vulkan' }}
       EMBED_COMPARE: ${{ inputs.embed_compare || '1' }}
+      REAL_BACKENDS: ${{ inputs.real_backends || inputs.embed_backends || 'cpu,metal,vulkan' }}
       ACCEL_TESTS: ${{ inputs.accel_tests || 'gdn,gpu-mem,kv35,vk-auto,fa' }}
     strategy:
       fail-fast: false

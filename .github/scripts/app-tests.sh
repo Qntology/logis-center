@@ -48,8 +48,14 @@ CPU_ENV=(); [ "$BACKEND" = cpu ] && CPU_ENV=(LOGIS_TEST_EMBED_DEVICE=cpu)
 # A targeted run re-measures only the backends a change touches (no duplicate runs of unchanged paths).
 case ",${EMBED_BACKENDS:-cpu,metal,vulkan}," in
   *",$BACKEND,"*) ;;
-  *) if [ "$PHASE" = embed ] || [ "$PHASE" = real ]; then
-       echo "$PHASE phase: $BACKEND not in EMBED_BACKENDS=$EMBED_BACKENDS (unchanged by this run's change)"; exit 0
+  *) if [ "$PHASE" = embed ]; then
+       echo "embed phase: $BACKEND not in EMBED_BACKENDS=$EMBED_BACKENDS (unchanged by this run's change)"; exit 0
+     fi ;;
+esac
+case ",${REAL_BACKENDS:-${EMBED_BACKENDS:-cpu,metal,vulkan}}," in
+  *",$BACKEND,"*) ;;
+  *) if [ "$PHASE" = real ]; then
+       echo "real phase: $BACKEND not in REAL_BACKENDS=${REAL_BACKENDS:-} (unchanged by this run's change)"; exit 0
      fi ;;
 esac
 
@@ -138,15 +144,19 @@ accel)
   fi
   # FlashAttention / TurboQuant KV on/off teacher forcing on a seeded mock Qwen3 (KLD, top-1). The app ships with
   # both features on; this is a second build of the app with them.
-  if want fa; then
+  # Compressed (TurboQuant) KV blocks exist on Vulkan only (no Metal kernels); they need the FA/TQ build too.
+  kv35_tq=false; [ "$BACKEND" = vulkan ] && want kv35 && kv35_tq=true
+  if want fa || $kv35_tq; then
     run accel-build cargo test --test it "${ACCEL_FEAT[@]}" --no-run
+  fi
+  if want fa; then
     run accel-acc cargo test --test it "${ACCEL_FEAT[@]}" -- accel_accuracy --ignored --nocapture --test-threads 1
     require_measured accel-acc "\\[ACCEL-ACC\\]"
-    if want kv35; then
-      # Compressed (TurboQuant) KV blocks: LOGIS_KV_PRECISION is read once per process, so its own run.
-      run qwen35-kv-compressed env LOGIS_KV_PRECISION=compressed cargo test --test it "${ACCEL_FEAT[@]}" -- qwen35_kv::qwen35_kv_compressed --ignored --nocapture --test-threads 1
-      require_measured qwen35-kv-compressed "\\[QWEN35-KV\\] 압축 KV"
-    fi
+  fi
+  if $kv35_tq; then
+    # LOGIS_KV_PRECISION is read once per process, so its own run.
+    run qwen35-kv-compressed env LOGIS_KV_PRECISION=compressed cargo test --test it "${ACCEL_FEAT[@]}" -- qwen35_kv::qwen35_kv_compressed --ignored --nocapture --test-threads 1
+    require_measured qwen35-kv-compressed "\\[QWEN35-KV\\] 압축 KV"
   fi
   ;;
 *) echo "unknown phase $PHASE"; exit 2 ;;
