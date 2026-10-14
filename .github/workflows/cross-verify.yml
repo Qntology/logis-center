@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "comma list of: mac-cpu, mac-metal, mac-vulkan, linux-cpu, linux-vulkan, linux-cuda-check, linux-rocm-check, windows-cpu, windows-vulkan-build, windows-cuda-check, windows-rocm-check (all = every one)"
+        description: "comma list of: mac-cpu, mac-metal, mac-vulkan, linux-cpu, linux-vulkan, linux-cuda, linux-rocm, windows-cpu, windows-vulkan, windows-cuda, windows-rocm (all = every one)"
         default: "all"
 
 concurrency:
@@ -53,12 +53,12 @@ jobs:
             dict(name="mac-vulkan", os="macos-15", kind="run", features="vulkan"),
             dict(name="linux-cpu", os="ubuntu-latest", kind="run", features=""),
             dict(name="linux-vulkan", os="ubuntu-latest", kind="run", features="vulkan"),
-            dict(name="linux-cuda-check", os="ubuntu-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant"),
-            dict(name="linux-rocm-check", os="ubuntu-latest", kind="check", features="rocm,flash-attn,turbo-quant"),
+            dict(name="linux-cuda", os="ubuntu-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant"),
+            dict(name="linux-rocm", os="ubuntu-latest", kind="check", features="rocm,flash-attn,turbo-quant"),
             dict(name="windows-cpu", os="windows-latest", kind="run", features=""),
-            dict(name="windows-vulkan-build", os="windows-latest", kind="build", features="vulkan"),
-            dict(name="windows-cuda-check", os="windows-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant"),
-            dict(name="windows-rocm-check", os="windows-latest", kind="check", features="rocm,flash-attn,turbo-quant"),
+            dict(name="windows-vulkan", os="windows-latest", kind="build", features="vulkan"),
+            dict(name="windows-cuda", os="windows-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant"),
+            dict(name="windows-rocm", os="windows-latest", kind="check", features="rocm,flash-attn,turbo-quant"),
           ]
           inc = [i for i in inc if want is None or i["name"] in want]
           print("matrix=" + json.dumps({"include": inc}))
@@ -141,21 +141,21 @@ jobs:
           echo "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json" >> "$GITHUB_ENV"
           echo "CANDLE_VULKAN_ALLOW_CPU=1" >> "$GITHUB_ENV"
       - name: CUDA toolkit (apt nvcc for the kernel build; no GPU)
-        if: matrix.name == 'linux-cuda-check'
+        if: matrix.name == 'linux-cuda'
         run: sudo apt-get install -y -qq nvidia-cuda-toolkit
       - name: CUDA toolkit (nvcc for the kernel build; no GPU)
-        if: matrix.name == 'windows-cuda-check'
+        if: matrix.name == 'windows-cuda'
         uses: Jimver/cuda-toolkit@v0.2.19
         with:
           cuda: "12.6.2"
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "nvrtc", "nvrtc_dev"]'
       - name: MSVC developer environment (nvcc needs cl.exe in PATH)
-        if: matrix.name == 'windows-cuda-check'
+        if: matrix.name == 'windows-cuda'
         uses: ilammy/msvc-dev-cmd@v1
         with: { arch: x64 }
       - name: NVCC_CCBIN = the cl.exe on PATH (cudaforge then passes -ccbin and -allow-unsupported-compiler)
-        if: matrix.name == 'windows-cuda-check'
+        if: matrix.name == 'windows-cuda'
         run: |
           cl_path="$(where.exe cl | head -1 | tr -d '\r')"
           echo "cl.exe: $cl_path"
