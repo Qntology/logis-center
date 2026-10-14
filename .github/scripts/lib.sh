@@ -58,7 +58,7 @@ require_measured() {
 # checks API; artifact / log blobs may not be reachable from where the results are read).
 publish_notices() {
   local tmp="$OUT/.measure.txt"
-  grep -hE "\[(GPU-EQ|DECISION-EQ|EMBED-BATCHED-TEST|CPU-PACKED|EMBED-CPU-PACKED|[A-Za-z-]+-M-INV|[A-Za-z-]+-B-INV|UTF8-STREAM|CPU-3-2)\]|QWEN4-EXP\] +variant|DEVICE_PROBE|^- |^test result" "$OUT"/*.log 2>/dev/null | grep -v '^+ ' \
+  grep -hE "\[(GPU-EQ|DECISION-EQ|EMBED-BATCHED-TEST|CPU-PACKED|EMBED-CPU-PACKED|[A-Za-z-]+-M-INV|[A-Za-z-]+-B-INV|UTF8-STREAM|CPU-3-2|KV-IO)\]|QWEN4-EXP\] +variant|DEVICE_PROBE|^- |^test result" "$OUT"/*.log 2>/dev/null | grep -v '^+ ' \
     | cut -c1-600 > "$tmp" || true
   echo "::notice title=summary::$(grep '^| ' "$SUMMARY" | tail -n +2 | sed 's/$/ ;;/' | tr -d '\n' | cut -c1-3900)"
   local chunk="" n=0

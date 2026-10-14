@@ -70,6 +70,9 @@ fi
 # ── 3-2: CPU profile + cache-blocked custom kernels (tools/cpu-embed-bench, mock weights) ──
 if [ "$BACKEND" = cpu ]; then
   sysctl -a 2>/dev/null | grep -E 'hw\.(perflevel|l1|l2|l3|cachelinesize|ncpu)' > "$OUT/cpu-caches.txt" || lscpu > "$OUT/cpu-caches.txt" || true
+  # [MAC-SSD-IO] KV 블록 SSD 오프로딩: 병렬 pread/pwrite + F_NOCACHE vs std::fs (차가운 읽기 · 파일 캐시 증가량)
+  run kv-io-bench env LOGIS_IO_BENCH_MB=512 cargo test --test it "${FEAT[@]}" -- direct_loader::kv_block_io_bench --ignored --nocapture --test-threads 1
+  require_measured kv-io-bench "\\[KV-IO\\] best"
   run cpu-kernel-contract cargo test --release --manifest-path ../crates/embed-cpu-kernels/Cargo.toml
   run cpu-kernel-bench cargo run --release --manifest-path ../tools/cpu-embed-bench/Cargo.toml -- \
     "$MOCK_MODELS/granite-embedding-97m-multilingual-r2"
