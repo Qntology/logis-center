@@ -1,5 +1,5 @@
 // =====================================================================
-// 🌟 [EMBED-BATCHED] 진짜 배치 순전파 (CUDA / ROCm / CPU / Vulkan)
+// 🌟 [EMBED-BATCHED] 진짜 배치 순전파 (CUDA / ROCm / CPU / Vulkan / Metal)
 // ---------------------------------------------------------------------
 //  ── 무엇이 문제였나 ──
 //   embed_batch 는 3스레드가 embed() 를 1건씩 돌리는 구조라,
@@ -83,12 +83,12 @@ impl Default for BatchOpts {
 }
 
 impl BatchOpts {
-    /// 장치별 정책: CUDA/ROCm · Metal 은 고정 모양, CPU · Vulkan 은 동적 행 수(⑥).
-    /// Metal 은 GEMM 커널(gemv · 타일)을 M 에 따라 바꾸므로 GPU 처럼 고정 모양입니다(embedding.rs 의 Metal 주석).
+    /// 장치별 정책: CUDA/ROCm 은 고정 모양, CPU · Vulkan · Metal 은 동적 행 수(⑥).
+    /// Metal 은 macos-15 러너 실측으로 동적이 비트 동일 · 구성 무관 · 2.7배, 고정 모양은 0.4배였습니다(embedding.rs 주석).
     /// `LOGIS_EMBED_FIXED_SHAPE=1|0` 이면 장치와 무관하게 강제합니다(진단용 · 캐시 공간 태그도 따라 바뀝니다).
     pub fn for_device(device: &Device) -> Self {
         let mut o = Self::default();
-        o.fixed_shape = !(device.is_cpu() || device.is_vulkan());
+        o.fixed_shape = !(device.is_cpu() || device.is_vulkan() || device.is_metal());
         if let Ok(v) = std::env::var("LOGIS_EMBED_FIXED_SHAPE") {
             o.fixed_shape = v.trim() != "0";
         }
@@ -121,17 +121,20 @@ impl BatchOpts {
 }
 
 /// Vulkan 배치 순전파의 고정 실행 모드. 기본 Gpu(가중치 행렬곱은 항상 GPU GEMM, 나머지는 CPU 경로),
-/// `LOGIS_EMBED_VK_MODE=host` 이면 전부 CPU 경로(CPU 백엔드와 같은 비트).
+/// `LOGIS_EMBED_VK_MODE=host` 이면 전부 CPU 경로(CPU 백엔드와 같은 비트), `=auto` 는 비교 측정용
+/// (연산마다 크기 · 장치로 경로를 고르므로 배치 구성에 따라 비트가 달라질 수 있어 기본값이 될 수 없습니다).
 #[cfg(feature = "vulkan")]
 fn vulkan_exec_mode() -> candle_core::vulkan_backend::shaders::ExecMode {
     use candle_core::vulkan_backend::shaders::ExecMode;
     static MODE: std::sync::OnceLock<ExecMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        let host = std::env::var("LOGIS_EMBED_VK_MODE")
-            .map(|v| v.trim().eq_ignore_ascii_case("host"))
-            .unwrap_or(false);
-        let m = if host { ExecMode::Host } else { ExecMode::Gpu };
-        println!("[EMBED-BATCHED] Vulkan 배치 순전파 실행 모드: {:?} (LOGIS_EMBED_VK_MODE=host|gpu)", m);
+        let v = std::env::var("LOGIS_EMBED_VK_MODE").unwrap_or_default();
+        let m = match v.trim().to_ascii_lowercase().as_str() {
+            "host" => ExecMode::Host,
+            "auto" => ExecMode::Auto,
+            _ => ExecMode::Gpu,
+        };
+        println!("[EMBED-BATCHED] Vulkan 배치 순전파 실행 모드: {:?} (LOGIS_EMBED_VK_MODE=host|gpu|auto)", m);
         m
     })
 }

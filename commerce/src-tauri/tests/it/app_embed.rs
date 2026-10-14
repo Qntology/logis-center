@@ -843,12 +843,36 @@ fn gpu_embed_many_matches_per_text_and_is_faster() {
         query_idx.len(), bank_idx.len(), agree_pb, query_idx.len(), agree_pr, query_idx.len(), agree_br, query_idx.len()
     );
 
-    assert_eq!(single_identical, probe.len(), "단건 호출 벡터가 배치 안의 벡터와 달라졌습니다(호출 구성 의존)");
-    assert_eq!(probe_identical, probe.len(), "표본끼리 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
-    assert_eq!(sub_identical, sub_idx.len(), "역순 절반 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
-    assert_eq!(batched_repro, texts.len(), "같은 입력의 embed_many 는 실행마다 비트 단위로 같아야 합니다");
-    if device.is_cpu() {
+    // CI 주석(annotation) 한 줄 요약 — .github/scripts/lib.sh publish_notices 가 이 줄을 우선 싣습니다.
+    println!(
+        "[EMBED-SUMMARY] {} · {} · fixed_shape={} · 전체 {:.2}배 · 짧은 구 {:.2}배 · 단건 per-text {:.1}ms / embed_many {:.1}ms · 비트 동일 {}/{} · 구성 무관 {}/{} {}/{} {}/{} · 재현 {}/{} · F32 평균 코사인 Δ(embed_many−per-text) ≤64 {:+.1e} >64 {:+.1e} · 판정 {}/{} (F32 {}/{})",
+        if mock { "목업" } else { "실모델" },
+        tauri_app_lib::models::embedding::text_cache::device_class(&device),
+        opts.fixed_shape,
+        per_text_s / batched_s,
+        short_per_s / short_batch_s,
+        single_per_ms,
+        single_batch_ms,
+        identical, texts.len(),
+        single_identical, probe.len(), probe_identical, probe.len(), sub_identical, sub_idx.len(),
+        batched_repro, texts.len(),
+        bt_mean_s - pt_mean_s, bt_mean_l - pt_mean_l,
+        agree_pb, query_idx.len(), agree_br, query_idx.len()
+    );
+    // LOGIS_EMBED_MEASURE_ONLY=1: 구성 무관성을 보장하지 않는 비교용 정책(예: Vulkan Auto 모드)의 측정 런 —
+    // 무관성 수치는 위 요약 줄에 남기고 단언만 생략합니다(정확도 · 코사인 단언은 그대로).
+    let measure_only = std::env::var("LOGIS_EMBED_MEASURE_ONLY").map(|v| v == "1").unwrap_or(false);
+    if measure_only {
+        println!("[GPU-EQ] 측정 전용 런(LOGIS_EMBED_MEASURE_ONLY=1): 구성 무관성 · 재현성 단언 생략");
+    } else {
+        assert_eq!(single_identical, probe.len(), "단건 호출 벡터가 배치 안의 벡터와 달라졌습니다(호출 구성 의존)");
+        assert_eq!(probe_identical, probe.len(), "표본끼리 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
+        assert_eq!(sub_identical, sub_idx.len(), "역순 절반 배치의 벡터가 전체 배치와 다릅니다(호출 구성 의존)");
+        assert_eq!(batched_repro, texts.len(), "같은 입력의 embed_many 는 실행마다 비트 단위로 같아야 합니다");
+    }
+    if device.is_cpu() && !opts.fixed_shape {
         // CPU 동적 배치(정확한 길이 묶음)는 per-text 와 같은 연산이라 모든 텍스트가 비트 동일해야 합니다.
+        // (LOGIS_EMBED_FIXED_SHAPE=1 비교 런은 긴 텍스트를 패딩하므로 해당 없음 — macos-15 CPU 304/320)
         assert_eq!(identical, texts.len(), "CPU embed_many 가 per-text 와 비트 단위로 다릅니다");
     }
     assert!(min_cos > 0.995, "최소 코사인 {} — 배치 경로 수치가 허용 범위를 벗어났습니다", min_cos);

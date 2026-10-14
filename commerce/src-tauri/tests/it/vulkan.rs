@@ -207,10 +207,21 @@ fn quantized_matmul_matches_cpu_for_app_gguf_types() -> R {
             let want = mm_cpu.forward(&x)?;
             let got = mm_vk.forward(&x.to_device(dev)?)?;
             assert!(got.device().is_vulkan(), "{dt:?}: result left the device");
-            assert_close(&got, &want, 1e-3, &format!("{dt:?} qmatmul"))?;
             // 양자화 오차 자체도 합리적인 범위인지 (역양자화 가중치 기준)
             let deq = QTensor::quantize(&w, dt)?.dequantize(&Device::Cpu)?;
             let reference = x.broadcast_matmul(&deq.t()?)?;
+            // [MAC-VERIFY] Q8_0 가중치가 GPU 에 상주하면(GpuQ8: 통합 메모리 장치 · MoltenVK 는 첫 사용부터)
+            // f32 활성을 그대로 곱합니다(= reference). CPU/호스트 경로는 활성을 Q8_0 으로 양자화한 뒤 곱하므로
+            // (llama.cpp vec_dot) 둘 다 맞는 결과이고, Vulkan 결과는 둘 중 하나와 맞아야 합니다.
+            let close_to = |r: &Tensor| -> anyhow::Result<bool> {
+                let (g, w) = (to_vec_f64(&got)?, to_vec_f64(r)?);
+                Ok(g.iter().zip(&w).all(|(a, b)| (a - b).abs() <= 1e-3 * a.abs().max(b.abs()).max(1.0)))
+            };
+            if dt == GgmlDType::Q8_0 && !close_to(&want)? && close_to(&reference)? {
+                eprintln!("{dt:?}: Vulkan GPU-resident path matches the exact f32-activation reference");
+            } else {
+                assert_close(&got, &want, 1e-3, &format!("{dt:?} qmatmul"))?;
+            }
             let r = to_vec_f64(&reference)?;
             let g = to_vec_f64(&got)?;
             let max = r.iter().fold(0f64, |m, v| m.max(v.abs()));
@@ -240,11 +251,18 @@ fn native_kernels_really_dispatch_on_the_device() -> R {
         Ok(r?)
     };
     let off = run(false)?;
+    let d0 = shaders::native_exec_count();
     let on = run(true)?;
+    let dispatched = shaders::native_exec_count() - d0;
     let bitwise_diff = |v: &[f32]| v.iter().zip(&want).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-    eprintln!("bitwise differences vs CPU: native=false {}, native=true {} (of {})", bitwise_diff(&off), bitwise_diff(&on), want.len());
+    eprintln!(
+        "bitwise differences vs CPU: native=false {}, native=true {} (of {}) · GPU dispatches for native=true: {}",
+        bitwise_diff(&off), bitwise_diff(&on), want.len(), dispatched
+    );
     assert_eq!(bitwise_diff(&off), 0, "default path should run the CPU gemm on mapped memory");
-    assert!(bitwise_diff(&on) > 0, "native=true produced CPU-identical bits: shaders did not run");
+    // [MAC-VERIFY] 실행 증거는 디스패치 카운터로 봅니다. 비트 차이는 증거가 될 수 없습니다: MoltenVK(Apple GPU)의
+    // 셰이더는 원소마다 k 를 CPU gemm 과 같은 순서로 FMA 누산해 CPU 와 비트 동일했습니다(macos-15 러너).
+    assert!(dispatched > 0, "native=true dispatched no GPU kernel: shaders did not run");
     let max_err = on.iter().zip(&want).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
     assert!(max_err < 1e-3, "shader matmul error {max_err}");
     Ok(())

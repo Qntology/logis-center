@@ -7,8 +7,10 @@ FAILS=0
 [ -f "$SUMMARY" ] || printf '| step | result | log |\n|---|---|---|\n' > "$SUMMARY"
 
 # run <label> <cmd...> : runs the command, tees to $OUT/<label>.log, records PASS/FAIL.
+PHASE_LABELS=()
 run() {
   local label="$1"; shift
+  PHASE_LABELS+=("$label")
   local log="$OUT/$label.log"
   echo "::group::$label"
   echo "+ $*" | tee "$log"
@@ -21,10 +23,21 @@ run() {
     echo "| $label | PASS | $label.log |" >> "$SUMMARY"
   else
     echo "| $label | FAIL (exit $rc) | $label.log |" >> "$SUMMARY"
-    echo "::error::$label failed (exit $rc)"
+    annotate_log "$label (exit $rc)" "$log"
     FAILS=$((FAILS + 1))
   fi
   return 0
+}
+
+# annotate_log <label> <log>: surface the important lines of a failed step as annotations
+# (readable through the checks API even where artifact / log downloads are blocked).
+annotate_log() {
+  # One annotation per failed step (GitHub keeps only 10 error annotations per step): the error /
+  # panic lines with their next lines, then the log tail, joined with " | ".
+  local label="$1" log="$2"
+  local body
+  body="$(grep -E -A4 "^error(\[|:)|^Error|panicked at|^failures:|assertion|FAILED| case [0-9]+[ :]" "$log" | grep -vE "^--$|^\s*[0-9]+: |^\s+at " | head -40 | sed 's/$/ |/' | tr -d '\n' | cut -c1-2800)"
+  echo "::error title=$label::$body || tail: $(tail -n 8 "$log" | sed 's/$/ |/' | tr -d '\n' | cut -c1-1000)"
 }
 
 # not_run <label> <reason>
@@ -43,7 +56,40 @@ require_measured() {
   fi
 }
 
+# Measurement lines and the summary table as a few long notices (annotations are readable through the
+# checks API; artifact / log blobs may not be reachable from where the results are read).
+publish_notices() {
+  # Key lines first (one-line summaries), each tagged with its run label, then the detail lines.
+  local tmp="$OUT/.measure.txt"
+  local key="\[(EMBED-SUMMARY|DECISION-EQ|ACCEL-ACC|GDN-PATH|GPU-MEM)\]|\[KV-IO\] (write|best|cold read std)|QWEN4-EXP\] +variant_. on|-M-INV\] 측정 결과|-M-INV\] arch|\[CPU-3-2\]|DEVICE_PROBE|^test result: FAILED"
+  local detail="\[(GPU-EQ|UTF8-STREAM|KV-IO|ACCEL-CHECK|VK-HOST-SMALL-M)\]|candle gated delta rule: Metal|candle flash-attn: fused kernel unavailable|^- |^test result"
+  : > "$tmp"
+  for tag in ${PHASE_LABELS[@]+"${PHASE_LABELS[@]}"}; do
+    local f="$OUT/$tag.log"
+    [ -f "$f" ] || continue
+    grep -E "$key" "$f" 2>/dev/null | grep -v '^+ ' | cut -c1-500 | sed "s|^|<$tag> |" >> "$tmp" || true
+  done
+  for tag in ${PHASE_LABELS[@]+"${PHASE_LABELS[@]}"}; do
+    local f="$OUT/$tag.log"
+    [ -f "$f" ] || continue
+    grep -E "$detail" "$f" 2>/dev/null | grep -vE "$key" | grep -v '^+ ' | cut -c1-300 | sed "s|^|<$tag> |" >> "$tmp" || true
+  done
+  echo "::notice title=summary::$(grep '^| ' "$SUMMARY" | tail -n +2 | sed 's/$/ ;;/' | tr -d '\n' | cut -c1-1800)"
+  # Annotation messages are cut around 4 KB: keep each chunk well below that (Korean is 3 bytes/char).
+  local chunk="" n=0
+  while IFS= read -r line; do
+    if [ $(( ${#chunk} + ${#line} )) -gt 1100 ] && [ -n "$chunk" ]; then
+      echo "::notice title=measure-$n::$chunk"; n=$((n + 1)); chunk=""
+      [ $n -ge 8 ] && break
+    fi
+    chunk="$chunk$line ;; "
+  done < "$tmp"
+  [ -n "$chunk" ] && [ $n -lt 8 ] && echo "::notice title=measure-$n::$chunk"
+  return 0
+}
+
 finish() {
+  publish_notices
   echo; cat "$SUMMARY"
   cat "$SUMMARY" >> "${GITHUB_STEP_SUMMARY:-/dev/null}" || true
   [ "$FAILS" -eq 0 ]
