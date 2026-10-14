@@ -1,7 +1,7 @@
 From 79534aa84e37814ef6ad949556cbec76b738c503 Mon Sep 17 00:00:00 2001
 From: mac-verify CI <mac-verify@users.noreply.github.com>
 Date: Wed, 14 Oct 2026 04:59:33 +0000
-Subject: [PATCH 2/2] =?UTF-8?q?docs:=20mac-verify=20=E2=80=94=20PR=20#11?=
+Subject: [PATCH 2/3] =?UTF-8?q?docs:=20mac-verify=20=E2=80=94=20PR=20#11?=
  =?UTF-8?q?=20merged;=20a633c43=20(Metal=20conv=20state=20in=20the=20kerne?=
  =?UTF-8?q?l)=20passes=20delta=5Frule=5Ftests=20on=20macos-15=20(385138421?=
  =?UTF-8?q?01)?=
