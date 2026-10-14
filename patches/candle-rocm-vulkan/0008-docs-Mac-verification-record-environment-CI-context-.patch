@@ -1,7 +1,7 @@
 From 454e15f3f80d7a003ee1e4c138e366f7d7265d63 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 14 Oct 2026 03:43:09 +0000
-Subject: [PATCH 08/10] docs: Mac verification record (environment, CI context,
+Subject: [PATCH 08/11] docs: Mac verification record (environment, CI context,
  macOS and Linux results)
 
 What the Apple Silicon work (logis-center docs/mac-verify-prompt.md) learned: the session and

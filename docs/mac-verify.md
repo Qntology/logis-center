@@ -29,6 +29,7 @@
 | [38499518771](https://github.com/sungu-che/logis-center/actions/runs/38499518771) | 전체: probe 2, fork 3, app 3 |
 | [38506246088](https://github.com/sungu-che/logis-center/actions/runs/38506246088) | 포크 개선 3건 검증: fork Metal/Vulkan, app Metal/Vulkan의 suite · embed · real · accel |
 | [38508388995](https://github.com/sungu-che/logis-center/actions/runs/38508388995) | Metal GDN 정밀화(`806aba6`)만 재확인: fork `delta_rule_tests`, app `gdn-path` · `qwen4-exp-gpu` |
+| [38508978460](https://github.com/sungu-che/logis-center/actions/runs/38508978460) | Metal 빈 버퍼 수정(`e4a7314`) 후 fork `delta_rule_tests`만 |
 
 - 결과는 잡 annotation으로 읽었습니다. 이 세션에서는 로그와 아티팩트 blob이 403이라서입니다.
 
@@ -201,9 +202,16 @@
     | MoltenVK 텐서 경로 (이전 기본) | 419.6 ms | 2.03 ms | 4.8e-7 |
     | **MoltenVK 융합 (`f947435`)** | **20.0 ms (20.9배)** | **1.22 ms (1.67배)** | **0 (CPU 커널 그대로)** |
     | Metal 텐서 경로 (이전 기본) | 167.6 ms | 7.60 ms | 6.6e-7 |
-    | Metal 융합 1차 커널 | 31.9 ms (5.26배) | 3.77 ms (2.02배) | 8.2e-7 |
+    | Metal 융합 1차 커널 (fast math) | 31.9 ms (5.26배) | 3.77 ms (2.02배) | 8.2e-7 |
+    | **Metal 융합 정밀화 (`806aba6`, run 38508388995)** | **27.0 ms (같은 잡 텐서 190.5 ms 대비 7.06배)** | **2.09 ms (10.81 ms 대비 5.18배)** | ≤ 7.3e-7 |
 
-  - 포크 테스트: MoltenVK `delta_rule_tests` GPU 케이스 7 pass. Metal 1차 커널은 `gpu_matches_f64_reference` · `half_inputs` 실패(허용치 2e-5, fast math) → `806aba6` 정밀화 → **run 38508388995에서 재확인**.
+  - 포크 테스트:
+    - MoltenVK `delta_rule_tests` GPU 케이스 7 pass.
+    - Metal 1차 커널은 `gpu_matches_f64_reference` · `half_inputs`가 실패했습니다.
+    - `806aba6` 정밀화 후에는 오차가 CPU 대비 0~1.2e-7로 줄었지만, 같은 두 테스트가 남았습니다.
+    - 원인은 conv 폭 1 케이스의 **빈 conv 상태 텐서를 Metal로 보낼 때 `newBufferWithBytes`(길이 0)가 nil을 돌려주는 백엔드 문제**였습니다.
+    - `e4a7314`로 고친 뒤 **Metal `delta_rule_tests` 7 pass**(run 38508978460)입니다.
+  - 앱: Qwen4-Exp tiny가 Metal GDN 커널 경로로 max |Δ| 2.9e-5 · 3.4e-5, argmax 100%.
   - 참고: 이 가상 GPU에서는 Metal 경로가 CPU 융합 커널보다 느립니다. 명령 버퍼 동기화 비용 때문입니다.
 - [x] **Vulkan FA/TurboQuant GLSL**: MoltenVK에서 `vulkan_accel_tests` 3/3, `accel_vulkan` 4/4.
 - [x] **W8A16 forward_exact**: CPU · Metal · MoltenVK 모두 통과(포크 f32 누산 수정 후).
@@ -244,7 +252,9 @@
   - fork Vulkan: 전부 통과.
   - app Metal · app Vulkan: 전부 통과(suite 195 / 213, Qwen4-Exp Metal 2.69e-5 · Vulkan 3.10e-5, argmax 100%).
   - fork Metal: GDN 테스트 2건 실패 → 수정 `806aba6`.
-- [ ] **Metal GDN 정밀화 재확인 run 38508388995**: 대기
+- [x] **Metal GDN 재확인**
+  - run 38508388995: app Metal `gdn-path` · `qwen4-exp-gpu` 통과, fork 테스트 2건 실패 → 빈 버퍼 수정.
+  - run 38508978460: fork Metal `delta_rule_tests` 7 pass.
 - [x] 기존 CPU 테스트: 리눅스 193 pass, macOS 194 pass.
 
 ## 5. 완료 기준 (장치마다)
@@ -272,6 +282,7 @@
   | `f947435` | gated delta rule: Vulkan(host 공유 메모리) · Metal 융합 경로 |
   | `51e2256` | vulkan: 고정 GPU 모드에서 작은 M 가중치 행렬곱을 host로 (비트 일치 시) |
   | `806aba6` | gated delta rule (metal): conv · norm · 게이트를 precise math 커널로 |
+  | `e4a7314` | metal: 빈 텐서를 host 데이터에서 만들 때 풀 버퍼 사용 (길이 0 `newBufferWithBytes` nil) |
   | `454e15f` · `1d746d8` | docs/mac-verify.md (개발 환경 · 진행 방식 · 결과 기록) |
 
-- 같은 내용의 패치 시리즈: `patches/candle-rocm-vulkan/0001–0009` (포크 master 기준, CI는 `git am --3way`로 적용).
+- 같은 내용의 패치 시리즈: `patches/candle-rocm-vulkan/` (포크 master 기준 전체 시리즈, CI는 `git am --3way`로 적용).
