@@ -32,21 +32,40 @@ env:
   GRANITE_REPO: ibm-granite/granite-embedding-97m-multilingual-r2
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        shell: bash
+        env:
+          TARGETS: ${{ inputs.targets || 'all' }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          t = os.environ["TARGETS"].replace(" ", "")
+          want = None if t == "all" else set(t.split(","))
+          inc = [
+            dict(name="linux-cpu", os="ubuntu-latest", kind="run", features=""),
+            dict(name="linux-vulkan", os="ubuntu-latest", kind="run", features="vulkan"),
+            dict(name="linux-cuda-check", os="ubuntu-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant"),
+            dict(name="linux-rocm-check", os="ubuntu-latest", kind="check", features="rocm,flash-attn,turbo-quant"),
+            dict(name="windows-cpu", os="windows-latest", kind="run", features=""),
+            dict(name="windows-vulkan-build", os="windows-latest", kind="build", features="vulkan"),
+            dict(name="windows-cuda-check", os="windows-latest", kind="cuda-check", features="cuda,flash-attn,turbo-quant"),
+            dict(name="windows-rocm-check", os="windows-latest", kind="check", features="rocm,flash-attn,turbo-quant"),
+          ]
+          inc = [i for i in inc if want is None or i["name"] in want]
+          print("matrix=" + json.dumps({"include": inc}))
+          PY
+
   cross:
+    needs: plan
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { name: linux-cpu, os: ubuntu-latest, kind: run, features: "" }
-          - { name: linux-vulkan, os: ubuntu-latest, kind: run, features: "vulkan" }
-          - { name: linux-cuda-check, os: ubuntu-latest, kind: cuda-check, features: "cuda,flash-attn,turbo-quant" }
-          - { name: linux-rocm-check, os: ubuntu-latest, kind: check, features: "rocm,flash-attn,turbo-quant" }
-          - { name: windows-cpu, os: windows-latest, kind: run, features: "" }
-          - { name: windows-vulkan-build, os: windows-latest, kind: build, features: "vulkan" }
-          - { name: windows-cuda-check, os: windows-latest, kind: cuda-check, features: "cuda,flash-attn,turbo-quant" }
-          - { name: windows-rocm-check, os: windows-latest, kind: check, features: "rocm,flash-attn,turbo-quant" }
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     name: ${{ matrix.name }}
-    if: ${{ (inputs.targets || 'all') == 'all' || contains(format(',{0},', inputs.targets), format(',{0},', matrix.name)) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     defaults:
