@@ -469,6 +469,8 @@ impl crate::model::LogisModel {
         use crate::models::embedding::text_cache::{is_cacheable, GRANITE_TEXT_CACHE};
         // 🌟 1. 전역 캐시부터 확인합니다 (중복된 텍스트면 GPU 연산·모델 로드 원천 차단)
         let space = self.embed_cache_space();
+        // 🌟 [DISK CHECKPOINT] 이 공간을 처음 볼 때 지난 실행의 뱅크 구를 한 번 복원합니다.
+        crate::models::embedding::text_cache::restore_pinned(space);
         if let Some(vector) = GRANITE_TEXT_CACHE.get(space, &text) {
             return Ok(vector.to_vec());
         }
@@ -590,6 +592,8 @@ impl crate::model::LogisModel {
         // ── ① 캐시 조회 + 배치 내 중복 제거 ──
         //    miss_texts[i] 를 계산하면 miss_slots[i] 의 모든 자리에 채워 넣습니다.
         let space = self.embed_cache_space();
+        // 🌟 [DISK CHECKPOINT] 이 공간을 처음 볼 때 지난 실행의 뱅크 구(고정 계층)를 한 번 복원합니다.
+        crate::models::embedding::text_cache::restore_pinned(space);
         let cached = GRANITE_TEXT_CACHE.get_many(space, &texts, pinned);
         let mut out: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
         let mut miss_texts: Vec<String> = Vec::new();
@@ -623,6 +627,13 @@ impl crate::model::LogisModel {
                 println!(
                     "[MODEL] ⚡ [EMBED CACHE] {}건 전부 캐시 적중. 모델 로드 없이 반환합니다.",
                     hit_count
+                );
+            }
+            if pinned {
+                // LRU 에서 고정 계층으로 승격된 뱅크 구도 디스크 체크포인트에 남깁니다.
+                crate::models::embedding::text_cache::persist_pinned(
+                    space,
+                    texts.iter().zip(out.iter()).filter_map(|(t, v)| v.as_ref().map(|v| (t.as_str(), v.as_slice()))),
                 );
             }
             return Ok(out.into_iter().map(|v| v.unwrap_or_else(|| vec![0.0; EMBED_DIM])).collect());
@@ -770,6 +781,13 @@ impl crate::model::LogisModel {
             }
         }
         GRANITE_TEXT_CACHE.insert_many(space, inserts, pinned);
+        if pinned {
+            // 🌟 [DISK CHECKPOINT] 뱅크 구(고정 계층)는 다음 실행에서 다시 임베딩하지 않도록 디스크에 덧붙입니다.
+            crate::models::embedding::text_cache::persist_pinned(
+                space,
+                texts.iter().zip(out.iter()).filter_map(|(t, v)| v.as_ref().map(|v| (t.as_str(), v.as_slice()))),
+            );
+        }
         if failed > 0 {
             println!(
                 "[MODEL] ⚠️ [EMBED FAIL] {}건이 0벡터로 반환되었습니다. 길이 계약을 위해 0벡터로 채우되 캐시에는 넣지 않습니다.",

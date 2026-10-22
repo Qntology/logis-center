@@ -1441,17 +1441,43 @@ pub fn bank_neutral_key_scores<V: AsRef<Vec<f32>>>(
 // =====================================================================
 /// 라벨 뱅크의 내부 응집도. 구끼리의 평균 코사인입니다.
 /// 뱅크가 1구면 응집도를 정의할 수 없으므로 0을 돌려줍니다.
+///
+/// 🌟 [EMB-BANK] 구마다 노름을 한 번만 계산합니다(예전에는 쌍마다 두 노름을 다시 계산).
+///   구가 많은 뱅크는 행 단위 코사인을 병렬로 구해 두고, 합은 예전과 같은 (i, j) 순서로 순차 누적하므로
+///   결과가 비트 단위로 같습니다. 병렬 버퍼는 n²/2 개라 COHESION_PAR_MAX 를 넘는 뱅크는 순차로 계산합니다.
 pub fn bank_internal_cohesion(bank: &[Vec<f32>]) -> f32 {
+    const COHESION_PAR_MIN: usize = 128;
+    const COHESION_PAR_MAX: usize = 4096;
     let valid: Vec<&Vec<f32>> = bank.iter().filter(|e| !e.iter().all(|&v| v == 0.0)).collect();
     if valid.len() < 2 {
         return 0.0;
     }
+    let n = valid.len();
+    let norms: Vec<f32> = valid.iter().map(|e| l2_norm_exact(e)).collect();
     let mut sum = 0.0f32;
     let mut cnt = 0usize;
-    for i in 0..valid.len() {
-        for j in (i + 1)..valid.len() {
-            sum += cosine_similarity(valid[i], valid[j]);
-            cnt += 1;
+    if (COHESION_PAR_MIN..=COHESION_PAR_MAX).contains(&n) {
+        use rayon::prelude::*;
+        let rows: Vec<Vec<f32>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                ((i + 1)..n)
+                    .map(|j| cosine_with_norms(valid[i], norms[i], valid[j], norms[j]))
+                    .collect()
+            })
+            .collect();
+        for row in rows.iter() {
+            for c in row.iter() {
+                sum += *c;
+                cnt += 1;
+            }
+        }
+    } else {
+        for i in 0..n {
+            for j in (i + 1)..n {
+                sum += cosine_with_norms(valid[i], norms[i], valid[j], norms[j]);
+                cnt += 1;
+            }
         }
     }
     if cnt == 0 { 0.0 } else { (sum / cnt as f32).max(0.0) }
@@ -3493,6 +3519,26 @@ pub fn detect_field_format(field_name: &str) -> FieldFormat {
         return FieldFormat::Numeric;
     }
     FieldFormat::Text
+}
+
+/// 🌟 [CONTACT FORMAT] 필드 이름까지 보고 값 형식을 판정합니다.
+///
+///  ── 실측 ──
+///   party_contact 의 스키마 정의는 'Phone, fax or email of this party' 인데, detect_field_format 은
+///   이름 완전일치('contact')만 Phone 으로 보므로 party_contact · emergency_contact 는 Text 가 됩니다.
+///   그래서 '+82-2-1234-5678' 같은 전화번호가 [TRADING VALUE FORMAT GATE] 에서 '형식 불일치' 로 떨어지고,
+///   연락처 라벨이 id,link · container_number 와의 동점 경쟁으로 밀려났습니다.
+///
+///  ── 무엇을 바꾸나 ──
+///   연락처 축(contact · *_contact)은 그 축의 형식(이메일·문구 = Text)이나 Phone 중 하나만 맞으면 통과합니다.
+///   한 형식으로 바꾸면 이메일이나 전화번호 한쪽을 잃으므로 둘 다 받습니다. 다른 축은 예전과 같습니다.
+pub fn field_value_matches(field_name: &str, fmt: FieldFormat, value: &str) -> bool {
+    if value_matches_format(fmt, value) {
+        return true;
+    }
+    let lower = field_name.to_lowercase();
+    let contact = lower.split(',').map(|s| s.trim()).any(|k| k == "contact" || k.ends_with("_contact"));
+    contact && value_matches_format(FieldFormat::Phone, value)
 }
 
 pub fn query_value_format(field_name: &str) -> FieldFormat {
@@ -6707,6 +6753,29 @@ pub fn host_region_end(link: &str) -> usize {
     0
 }
 
+/// 🌟 [LABEL SURFACE] 식별자 모양(snake_case) 라벨을 임베딩 전에 단어 표기로 펼칩니다.
+///
+///  ── 실측 ──
+///   YAML·JSON 키를 그대로 인쇄한 문서(합성 SR/SA, 시스템이 출력한 서식)는 라벨이 'measurement_cbm' ·
+///   'estimated_time_of_departure_etd' 처럼 밑줄로 이어져 있습니다. 토크나이저가 밑줄을 별도 조각으로
+///   자르므로 같은 단어끼리도 'issue_date' ↔ 'issue date' 0.9398, 'port_of_discharge' ↔ 'pod' 0.9006 으로
+///   코사인이 깎였고, 그 손실이 eta↔etd(+0.0395) · 총중량 동점처럼 1·2위 마진을 그대로 잡아먹었습니다.
+///   자기·참조 게이트는 이미 같은 이유로 표기를 정규화해서 봅니다(gate_surface).
+///
+///  ── 무엇을 바꾸나 ──
+///   공백 없이 밑줄로만 이어진 라벨만 밑줄을 공백으로 바꿉니다. 대소문자 · 숫자 · '/' 는 그대로라
+///   'B/L No.' · 'VAT/EORI' · 'Port of Loading' 처럼 사람이 인쇄한 라벨은 한 글자도 바뀌지 않습니다.
+pub fn label_embed_surface(label: &str) -> String {
+    let t = label.trim();
+    if t.contains('_') && !t.contains(char::is_whitespace) {
+        let words: Vec<&str> = t.split('_').filter(|s| !s.is_empty()).collect();
+        if !words.is_empty() {
+            return words.join(" ");
+        }
+    }
+    t.to_string()
+}
+
 pub fn humanize_url_token(raw: &str) -> String {
     let chars: Vec<char> = raw.chars().collect();
     let mut out = String::new();
@@ -8330,27 +8399,18 @@ pub fn contiguous_windows(words: &[&str], min_len: usize, max_len: usize) -> Vec
 }
 
 /// 🌟 [EMBED-PREFETCH] scheduler 의 필드 뱅크 루프가 필드마다 1건씩 요청하는 텍스트
-/// (bias_target · split_bias_phrases_weighted 구 · 결합 prejudice " , ")를 같은 규칙으로 모읍니다.
+/// (bias_target · split_bias_phrases_weighted 구)를 같은 규칙으로 모읍니다.
 /// `prej_bank` = Some((doc_lang, page_type)) 이면 필드별 prejudice_phrase_bank 구도 넣습니다.
+/// 결합 prejudice(" , " 로 이은 다른 필드 bias 전부)는 루프가 더 이상 임베딩하지 않으므로 넣지 않습니다([DEAD EMBED]).
 pub fn field_bank_prefetch_texts(fields: &[(String, String, String, String)], prej_bank: Option<(&str, &str)>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for (f_idx, (fname, _, bias_target, predefined_prej)) in fields.iter().enumerate() {
+    for (fname, _, bias_target, _) in fields.iter() {
         out.push(bias_target.clone());
         let (phrases, _) = split_bias_phrases_weighted(bias_target);
         out.extend(phrases);
         if let Some((doc_lang, page_type)) = prej_bank {
             out.extend(prejudice_phrase_bank(doc_lang, page_type, fname));
         }
-        let mut dynamic_prej_texts = Vec::new();
-        if !predefined_prej.trim().is_empty() {
-            dynamic_prej_texts.push(predefined_prej.clone());
-        }
-        for (other_idx, (_, _, other_bias, _)) in fields.iter().enumerate() {
-            if f_idx != other_idx {
-                dynamic_prej_texts.push(other_bias.clone());
-            }
-        }
-        out.push(dynamic_prej_texts.join(" , "));
     }
     out
 }
@@ -8368,4 +8428,38 @@ pub fn label_bank_prefetch_texts(fields: &[(String, String, String, String)], do
         out.extend(prejudice_phrase_bank(doc_lang, page_type, fname));
     }
     out
+}
+
+#[cfg(test)]
+mod label_surface_tests {
+    use super::*;
+
+    #[test]
+    fn identifier_labels_are_spread_into_words_and_printed_labels_stay_as_is() {
+        assert_eq!(label_embed_surface("measurement_cbm"), "measurement cbm");
+        assert_eq!(label_embed_surface("estimated_time_of_departure_etd"), "estimated time of departure etd");
+        assert_eq!(label_embed_surface("  issue_date "), "issue date");
+        assert_eq!(label_embed_surface("__total__gross_weight_kg"), "total gross weight kg");
+        // 사람이 인쇄한 라벨은 한 글자도 바꾸지 않습니다.
+        for s in ["B/L No.", "VAT/EORI", "Port of Loading", "INVOICE NUMBER", "발행일", "HS CODE", "a_b c"] {
+            assert_eq!(label_embed_surface(s), s.trim());
+        }
+        assert_eq!(label_embed_surface("___"), "___");
+    }
+
+    #[test]
+    fn contact_axes_accept_phone_numbers_and_emails() {
+        let fmt = detect_field_format("party_contact");
+        assert_eq!(fmt, FieldFormat::Text);
+        assert!(field_value_matches("party_contact", fmt, "+82-2-1234-5678"));
+        assert!(field_value_matches("party_contact", fmt, "ops@pacific-ocean.example"));
+        assert!(field_value_matches("emergency_contact", detect_field_format("emergency_contact"), "+1 (800) 424-9300"));
+        assert!(!field_value_matches("party_contact", fmt, "12"));
+        // 연락처가 아닌 축은 예전 판정 그대로입니다.
+        assert!(!field_value_matches("party_name", detect_field_format("party_name"), "+82-2-1234-5678"));
+        assert_eq!(
+            field_value_matches("issue_date", detect_field_format("issue_date"), "2026-08-20"),
+            value_matches_format(detect_field_format("issue_date"), "2026-08-20")
+        );
+    }
 }

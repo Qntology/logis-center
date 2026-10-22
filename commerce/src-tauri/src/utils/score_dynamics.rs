@@ -455,6 +455,54 @@ pub struct SdsFile {
     pub scopes: HashMap<String, ScopeStat>,
 }
 
+// 🌟 [MERGE / ENTRY] 항목 하나의 병합 규칙. absorb(스코프 전체)와 resolve_entry(질의한 항목 하나)가
+//    같은 규칙을 쓰도록 항목 타입마다 한 곳에 둡니다.
+impl DecayStat {
+    pub fn merge_from(&mut self, v: &DecayStat, ring: usize) {
+        self.margin.merge(&v.margin, ring);
+        self.top_gap_ratio.merge(&v.top_gap_ratio, ring);
+        self.tail_flatness.merge(&v.tail_flatness, ring);
+        self.entropy_norm.merge(&v.entropy_norm, ring);
+        self.positive_ratio.merge(&v.positive_ratio, ring);
+    }
+}
+
+impl FieldRejectStat {
+    pub fn merge_from(&mut self, v: &FieldRejectStat, ring: usize) {
+        self.seen += v.seen;
+        self.reject_format += v.reject_format;
+        self.reject_prejudice += v.reject_prejudice;
+        self.reject_enum += v.reject_enum;
+        self.reject_self_id += v.reject_self_id;
+        self.near_miss += v.near_miss;
+        self.assigned += v.assigned;
+        self.assign_margin.merge(&v.assign_margin, ring);
+    }
+}
+
+impl ConfusionStat {
+    pub fn merge_from(&mut self, v: &ConfusionStat, ring: usize) {
+        self.ties += v.ties;
+        self.a_wins += v.a_wins;
+        self.b_wins += v.b_wins;
+        self.margin.merge(&v.margin, ring);
+    }
+}
+
+impl CategoryStat {
+    pub fn merge_from(&mut self, v: &CategoryStat, ring: usize) {
+        if self.n_fields == 0 { self.n_fields = v.n_fields; }
+        self.realized_max.merge(&v.realized_max, ring);
+    }
+}
+
+impl SpatialStat {
+    pub fn merge_from(&mut self, v: &SpatialStat, ring: usize) {
+        self.active_ratio.merge(&v.active_ratio, ring);
+        self.coverage_loss.merge(&v.coverage_loss, ring);
+    }
+}
+
 impl ScopeStat {
     /// 🌟 [MERGE] 다른 스코프의 통계를 흡수합니다. (refine_primary 이관용)
     pub fn absorb(&mut self, other: ScopeStat, ring: usize) {
@@ -462,57 +510,28 @@ impl ScopeStat {
             self.baseline.entry(k).or_insert_with(Welford::default).merge(&v, ring);
         }
         for (k, v) in other.decay {
-            let d = self.decay.entry(k).or_insert_with(DecayStat::default);
-            d.margin.merge(&v.margin, ring);
-            d.top_gap_ratio.merge(&v.top_gap_ratio, ring);
-            d.tail_flatness.merge(&v.tail_flatness, ring);
-            d.entropy_norm.merge(&v.entropy_norm, ring);
-            d.positive_ratio.merge(&v.positive_ratio, ring);
+            self.decay.entry(k).or_insert_with(DecayStat::default).merge_from(&v, ring);
         }
         for (k, v) in other.axis_variance {
             self.axis_variance.entry(k).or_insert_with(Welford::default).merge(&v, ring);
         }
         for (k, v) in other.field {
-            let f = self.field.entry(k).or_insert_with(FieldRejectStat::default);
-            f.seen += v.seen;
-            f.reject_format += v.reject_format;
-            f.reject_prejudice += v.reject_prejudice;
-            f.reject_enum += v.reject_enum;
-            f.reject_self_id += v.reject_self_id;
-            f.near_miss += v.near_miss;
-            f.assigned += v.assigned;
-            f.assign_margin.merge(&v.assign_margin, ring);
+            self.field.entry(k).or_insert_with(FieldRejectStat::default).merge_from(&v, ring);
         }
         for (k, v) in other.confusion {
-            let c = self.confusion.entry(k).or_insert_with(ConfusionStat::default);
-            c.ties += v.ties;
-            c.a_wins += v.a_wins;
-            c.b_wins += v.b_wins;
-            c.margin.merge(&v.margin, ring);
+            self.confusion.entry(k).or_insert_with(ConfusionStat::default).merge_from(&v, ring);
         }
         for (k, v) in other.category {
-            let c = self.category.entry(k).or_insert_with(CategoryStat::default);
-            if c.n_fields == 0 { c.n_fields = v.n_fields; }
-            c.realized_max.merge(&v.realized_max, ring);
+            self.category.entry(k).or_insert_with(CategoryStat::default).merge_from(&v, ring);
         }
         for (k, v) in other.spatial {
-            let s = self.spatial.entry(k).or_insert_with(SpatialStat::default);
-            s.active_ratio.merge(&v.active_ratio, ring);
-            s.coverage_loss.merge(&v.coverage_loss, ring);
+            self.spatial.entry(k).or_insert_with(SpatialStat::default).merge_from(&v, ring);
         }
         for (k, v) in other.transition {
             *self.transition.entry(k).or_insert(0) += v;
         }
         for (k, v) in other.search_field {
-            let f = self.search_field.entry(k).or_insert_with(SearchFieldStat::default);
-            f.proposed += v.proposed;
-            f.hard += v.hard;
-            f.hint += v.hint;
-            f.evaluated += v.evaluated;
-            f.satisfied_any += v.satisfied_any;
-            f.killed_all += v.killed_all;
-            f.sole_blocker += v.sole_blocker;
-            f.demoted += v.demoted;
+            self.search_field.entry(k).or_insert_with(SearchFieldStat::default).merge_from(&v, ring);
         }
         self.updated_at = chrono::Utc::now().timestamp_millis();
     }
@@ -756,6 +775,7 @@ fn merged_file(l: Ledger) -> SdsFile {
 }
 
 pub fn load(team: &str) {
+    let _flush_guard = FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(mut w) = TEAM.write() { *w = team.to_string(); }
     let dir = sds_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -829,7 +849,7 @@ pub fn load(team: &str) {
         );
     }
     for l in Ledger::all() { mark_dirty(l); }
-    flush();
+    flush_locked();
     println!("[SDS] 📍 원장 디렉터리: {}", sds_dir().display());
     println!("[SDS] 📍 실행별 파일: {}", sds_dir().join("runs").join("<종류>").join("<시작시각>_<라벨>.json").display());
 }
@@ -927,8 +947,25 @@ fn presence_flush() {
     let txt = match serde_json::to_string_pretty(&snapshot) { Ok(t) => t, Err(_) => return };
     let path = presence_path();
     if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
-    if std::fs::write(&path, txt.as_bytes()).is_ok() {
+    if write_atomic(&path, txt.as_bytes()).is_ok() {
         if let Ok(mut d) = PRESENCE_DIRTY.write() { *d = false; }
+    }
+}
+
+/// 🌟 [SDS ATOMIC WRITE] 임시 파일에 다 쓴 뒤 이름을 바꿔 원장을 교체합니다.
+///   자동 저장이 백그라운드로 옮겨 가면서 앱 종료와 쓰기가 겹칠 수 있습니다. 덮어쓰기 도중 끊기면
+///   원장이 잘린 JSON 이 되고, 다음 load 가 '원장 파싱 실패 → 새로 시작' 으로 누적 통계 전체를 버립니다.
+///   이름 바꾸기가 실패하면(다른 프로세스가 파일을 연 경우 등) 예전처럼 직접 씁니다.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    match std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(path, bytes)
+        }
     }
 }
 
@@ -973,7 +1010,13 @@ pub fn rebind_team(team: &str) {
     load(team);
 }
 
+/// 원장·실행 파일을 지금 저장합니다. 진행 중인 백그라운드 저장이 있으면 끝날 때까지 기다립니다.
 pub fn flush() {
+    let _flush_guard = FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    flush_locked();
+}
+
+fn flush_locked() {
     presence_flush();
     let open: Vec<Ledger> = RUNS.read().map(|r| r.keys().cloned().collect()).unwrap_or_default();
     let mut targets: Vec<Ledger> = Vec::new();
@@ -1006,7 +1049,7 @@ pub fn flush() {
                 let dir = runs_dir(l);
                 let _ = std::fs::create_dir_all(&dir);
                 let file = dir.join(&run.file);
-                match std::fs::write(&file, txt.as_bytes()) {
+                match write_atomic(&file, txt.as_bytes()) {
                     Ok(_) => lines.push(format!(
                         "{}={}건→{}",
                         l.as_str(),
@@ -1044,7 +1087,7 @@ pub fn flush() {
 
         let path = ledger_path(l);
         if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
-        match std::fs::write(&path, txt.as_bytes()) {
+        match write_atomic(&path, txt.as_bytes()) {
             Ok(_) => {
                 if let Ok(mut d) = DIRTY.write() { d.insert(l, false); }
                 lines.push(format!("{}.json={}바이트", l.as_str(), txt.len()));
@@ -1083,6 +1126,7 @@ pub fn flush() {
 }
 
 pub fn purge() {
+    let _flush_guard = FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let team = TEAM.read().map(|t| t.clone()).unwrap_or_default();
     if let Ok(mut b) = BASES.write() { b.clear(); }
     if let Ok(mut r) = RUNS.write() { r.clear(); }
@@ -1123,6 +1167,39 @@ static LAST_FLUSH: Lazy<RwLock<Option<std::time::Instant>>> = Lazy::new(|| RwLoc
 const AUTO_FLUSH_EVERY: u32 = 8;
 const AUTO_FLUSH_MIN_GAP_MS: u128 = 5_000;
 
+// 🌟 [SDS ASYNC FLUSH] 자동 저장을 관측 경로 밖(백그라운드 스레드)으로 옮깁니다.
+//
+//  ── 무엇이 문제였나 ──
+//   자동 저장은 관측을 기록한 스레드에서 그대로 실행되었습니다. 저장 한 번이
+//   원장 전체 복제(merged_file) + pretty JSON 직렬화 2회 + 파일 쓰기 2회라, 쌍 라우팅 · 히트맵처럼
+//   관측이 몰리는 구간에서 5초마다 판정 루프가 디스크를 기다렸습니다(원장이 클수록 길어집니다).
+//
+//  ── 해결 ──
+//   관측 경로는 '저장 필요' 만 표시하고 저장은 백그라운드 스레드가 합니다. 이미 저장이 진행 중이면
+//   새로 띄우지 않고 합칩니다(그 사이 관측은 다음 저장에 실립니다).
+//   수동 flush · load · purge 는 FLUSH_LOCK 으로 백그라운드 저장과 직렬화되므로,
+//   작업 끝의 flush 는 진행 중인 백그라운드 저장이 끝난 뒤 최신 상태를 씁니다.
+static FLUSH_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
+static FLUSH_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn flush_in_background() {
+    use std::sync::atomic::Ordering;
+    if FLUSH_PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("sds-flush".to_string())
+        .spawn(|| {
+            flush();
+            FLUSH_PENDING.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        // 스레드를 못 띄우면 예전처럼 이 자리에서 저장합니다.
+        flush();
+        FLUSH_PENDING.store(false, Ordering::Release);
+    }
+}
+
 fn bump_and_maybe_flush() {
     let tick_ok = match WRITE_TICK.write() {
         Ok(mut t) => {
@@ -1143,7 +1220,7 @@ fn bump_and_maybe_flush() {
     if !time_ok { return; }
 
     if let Ok(mut g) = LAST_FLUSH.write() { *g = Some(std::time::Instant::now()); }
-    flush();
+    flush_in_background();
 }
 
 // =====================================================================
@@ -1318,14 +1395,32 @@ pub fn record_transition(from: &str, to: &str) {
     });
 }
 
-fn resolve<T, F>(pick: F) -> Option<T>
+/// 🌟 [SDS RESOLVE / ENTRY] 질의한 항목 하나만 병합해서 읽습니다.
+///
+///  ── 무엇이 문제였나 ──
+///   예전 resolve 는 스코프 키(세부 → 서식 → 트랙 → unscoped)마다 merged_scope 로
+///   원장 스코프와 실행 중 스코프를 '통째로' 복제·병합한 뒤 항목 하나만 읽었습니다.
+///   스코프에는 축 수백 개의 Welford(링 포함)와 필드·혼동 사전이 들어 있어, 쌍마다 혼동 사전
+///   (confusion_winner)이나 적응 기준선(adaptive_baseline)을 물을 때마다 스코프 전체가 최대 4번
+///   복제되었습니다. 관측이 쌓일수록 질의 한 번이 무거워지는 구조입니다.
+///
+///  ── 해결 ──
+///   absorb 는 항목끼리 독립으로 병합하므로(같은 merge 규칙), 질의한 항목만 그 규칙으로 병합하면
+///   결과가 같습니다. 두 쪽 중 한쪽에만 있으면 복제 없이 그 항목을 그대로 읽습니다.
+///   (한쪽에만 있는 항목은 absorb 에서 기본값에 병합되어 그 항목 그대로가 되므로 같은 값입니다)
+fn resolve_entry<E, T, G, M, P>(get: G, merge: M, pick: P) -> Option<T>
 where
-    F: Fn(&ScopeStat) -> Option<(T, u64)>,
+    E: Clone,
+    G: Fn(&ScopeStat) -> Option<&E>,
+    M: Fn(&mut E, &E, usize),
+    P: Fn(&E) -> Option<(T, u64)>,
 {
     let scope = current_scope()?;
     let track = current_track()?;
     let ledger = current_ledger();
     let (m2, m1, mg) = track.min_obs();
+    let bases = BASES.read().ok()?;
+    let runs = RUNS.read().ok()?;
     for (key, need) in [
         (scope.key_secondary(), m2),
         (scope.key_primary(), m1),
@@ -1333,10 +1428,19 @@ where
         ("unscoped||".to_string(), mg.max(m1)),
     ] {
         if need == 0 { continue; }
-        if let Some(st) = merged_scope(ledger, &key) {
-            if let Some((val, n)) = pick(&st) {
-                if n >= need { return Some(val); }
+        let base = bases.get(&ledger).and_then(|f| f.scopes.get(&key)).and_then(|s| get(s));
+        let run = runs.get(&ledger).and_then(|r| r.scopes.get(&key)).and_then(|s| get(s));
+        let picked = match (base, run) {
+            (Some(b), Some(r)) => {
+                let mut m = b.clone();
+                merge(&mut m, r, ring_for_key(&key));
+                pick(&m)
             }
+            (Some(e), None) | (None, Some(e)) => pick(e),
+            (None, None) => None,
+        };
+        if let Some((val, n)) = picked {
+            if n >= need { return Some(val); }
         }
     }
     None
@@ -1345,46 +1449,50 @@ where
 /// 적응형 베이스라인. (평균, 표준편차) 를 돌려줍니다.
 /// TITLE FLOOR / 잡음대 / dedup_floor 를 대체할 때 씁니다(Phase 1).
 pub fn adaptive_baseline(axis: &str) -> Option<(f32, f32)> {
-    resolve(|st| {
-        st.baseline
-            .get(axis)
-            .map(|w| ((w.mean as f32, w.sd() as f32), w.n))
-    })
+    resolve_entry(
+        |st| st.baseline.get(axis),
+        Welford::merge,
+        |w| Some(((w.mean as f32, w.sd() as f32), w.n)),
+    )
 }
 
 pub fn adaptive_baseline_n(axis: &str) -> Option<(f32, f32, u64)> {
-    resolve(|st| {
-        st.baseline
-            .get(axis)
-            .map(|w| ((w.mean as f32, w.sd() as f32, w.n), w.n))
-    })
+    resolve_entry(
+        |st| st.baseline.get(axis),
+        Welford::merge,
+        |w| Some(((w.mean as f32, w.sd() as f32, w.n), w.n)),
+    )
 }
 
 pub fn adaptive_recent(axis: &str) -> Option<(f32, f32, u64)> {
-    resolve(|st| {
-        st.baseline
-            .get(axis)
-            .map(|w| ((w.recent_mean() as f32, w.mean as f32, w.n), w.n))
-    })
+    resolve_entry(
+        |st| st.baseline.get(axis),
+        Welford::merge,
+        |w| Some(((w.recent_mean() as f32, w.mean as f32, w.n), w.n)),
+    )
 }
 
 /// 축 신뢰도. 역분산 융합의 가중치로 씁니다(Phase 1).
 /// 분산이 작을수록(변별력 없음) 낮은 값을 돌려줍니다.
 pub fn axis_confidence(axis: &str) -> Option<f32> {
-    resolve(|st| {
-        st.axis_variance.get(axis).map(|w| {
+    resolve_entry(
+        |st| st.axis_variance.get(axis),
+        Welford::merge,
+        |w| {
             let v = w.mean.max(1e-9);
-            ((1.0 / v) as f32, w.n)
-        })
-    })
+            Some(((1.0 / v) as f32, w.n))
+        },
+    )
 }
 
 /// 이 축의 통상 감쇠 형상. 적응형 마진 판정의 기준선입니다(Phase 1).
 /// (평탄도 평균, 평탄도 표준편차, 마진 평균, 마진 표준편차)
 pub fn decay_baseline(axis: &str) -> Option<(f32, f32, f32, f32)> {
-    resolve(|st| {
-        st.decay.get(axis).map(|d| {
-            (
+    resolve_entry(
+        |st| st.decay.get(axis),
+        DecayStat::merge_from,
+        |d| {
+            Some((
                 (
                     d.tail_flatness.mean as f32,
                     d.tail_flatness.sd() as f32,
@@ -1392,59 +1500,63 @@ pub fn decay_baseline(axis: &str) -> Option<(f32, f32, f32, f32)> {
                     d.margin.sd() as f32,
                 ),
                 d.margin.n,
-            )
-        })
-    })
+            ))
+        },
+    )
 }
 
 /// 학습형 특이도. prejudice 뱅크가 빈 필드의 대체 페널티입니다(Phase 2).
 /// 거절률이 높은 필드일수록 큰 값을 돌려줍니다.
 pub fn learned_specificity(field: &str) -> Option<f32> {
-    resolve(|st| {
-        st.field.get(field).map(|f| {
+    resolve_entry(
+        |st| st.field.get(field),
+        FieldRejectStat::merge_from,
+        |f| {
             let rejected = f.reject_format + f.reject_prejudice + f.reject_enum + f.reject_self_id;
             let denom = f.seen.max(rejected).max(1) as f64;
-            ((rejected as f64 / denom) as f32, f.seen)
-        })
-    })
+            Some(((rejected as f64 / denom) as f32, f.seen))
+        },
+    )
 }
 
 pub fn confusion_winner(a: &str, b: &str) -> Option<(String, f32)> {
     if a.is_empty() || b.is_empty() || a == b { return None; }
     let (x, y) = if a <= b { (a, b) } else { (b, a) };
     let key = format!("{}|{}", x, y);
-    let x_owned = x.to_string();
-    let y_owned = y.to_string();
-    resolve(move |st| {
-        st.confusion.get(&key).map(|c| {
+    resolve_entry(
+        |st| st.confusion.get(&key),
+        ConfusionStat::merge_from,
+        |c| {
             let total = c.ties.max(1) as f32;
             if c.a_wins >= c.b_wins {
-                ((x_owned.clone(), c.a_wins as f32 / total), c.ties)
+                Some(((x.to_string(), c.a_wins as f32 / total), c.ties))
             } else {
-                ((y_owned.clone(), c.b_wins as f32 / total), c.ties)
+                Some(((y.to_string(), c.b_wins as f32 / total), c.ties))
             }
-        })
-    })
+        },
+    )
 }
 
 pub fn effective_draws(category: &str) -> Option<f32> {
-    resolve(|st| {
-        st.category.get(category).map(|c| {
+    resolve_entry(
+        |st| st.category.get(category),
+        CategoryStat::merge_from,
+        |c| {
             let m = c.realized_max.mean.max(0.0);
             let n_eff = (m * m / 2.0).exp().max(1.0);
             let cap = c.n_fields.max(1) as f64;
-            (n_eff.min(cap) as f32, c.realized_max.n)
-        })
-    })
+            Some((n_eff.min(cap) as f32, c.realized_max.n))
+        },
+    )
 }
 
 /// 비전 확산도 드리프트. V-1 폴백 판정에 씁니다(Phase 1).
 pub fn spatial_drift(category: &str) -> Option<f32> {
-    resolve(|st| {
-        st.spatial
-            .get(category)
-            .map(|s| (s.active_ratio.drift_z() as f32, s.active_ratio.n))
-    })
+    resolve_entry(
+        |st| st.spatial.get(category),
+        SpatialStat::merge_from,
+        |s| Some((s.active_ratio.drift_z() as f32, s.active_ratio.n)),
+    )
 }
 
 /// 도메인 전이 확률. analytic 동적 사전(Phase 3).
@@ -1523,6 +1635,19 @@ pub struct SearchFieldStat {
     pub demoted: u64,
 }
 
+impl SearchFieldStat {
+    pub fn merge_from(&mut self, v: &SearchFieldStat, _ring: usize) {
+        self.proposed += v.proposed;
+        self.hard += v.hard;
+        self.hint += v.hint;
+        self.evaluated += v.evaluated;
+        self.satisfied_any += v.satisfied_any;
+        self.killed_all += v.killed_all;
+        self.sole_blocker += v.sole_blocker;
+        self.demoted += v.demoted;
+    }
+}
+
 pub fn search_scope_key(types: &[String]) -> String {
     let mut codes: Vec<String> = Vec::new();
     for t in types.iter() {
@@ -1564,11 +1689,11 @@ pub fn record_search_demotion(field: &str) {
 }
 
 pub fn search_kill_rate(field: &str) -> Option<f32> {
-    resolve(|st| {
-        st.search_field.get(field).map(|f| {
-            ((f.killed_all as f64 / f.evaluated.max(1) as f64) as f32, f.evaluated)
-        })
-    })
+    resolve_entry(
+        |st| st.search_field.get(field),
+        SearchFieldStat::merge_from,
+        |f| Some(((f.killed_all as f64 / f.evaluated.max(1) as f64) as f32, f.evaluated)),
+    )
 }
 
 pub fn storage_fill_prior(doc_types: &[String], field: &str) -> Option<(f32, u64, u64)> {
@@ -1601,4 +1726,138 @@ pub fn storage_doc_count(doc_types: &[String]) -> u64 {
         .read()
         .map(|p| p.docs.values().filter(|d| wanted.iter().any(|t| *t == d.doc_type)).count() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod entry_merge_tests {
+    //! 🌟 [SDS RESOLVE / ENTRY] 질의한 항목 하나만 병합한 값이 스코프 전체를 absorb 한 뒤 읽은 값과 같은지,
+    //! 🌟 [SDS ATOMIC WRITE] 임시 파일 교체가 내용을 바꾸고 임시 파일을 남기지 않는지 검증합니다.
+    //! (전역 원장 · 앱 디렉터리를 건드리지 않는 순수 검증입니다)
+    use super::*;
+
+    const RING: usize = 8;
+
+    fn welford(xs: &[f64]) -> Welford {
+        let mut w = Welford::default();
+        for x in xs {
+            w.push(*x, RING);
+        }
+        w
+    }
+
+    fn same_welford(a: &Welford, b: &Welford) -> bool {
+        a.n == b.n
+            && a.mean.to_bits() == b.mean.to_bits()
+            && a.m2.to_bits() == b.m2.to_bits()
+            && a.ring.len() == b.ring.len()
+            && a.ring.iter().zip(b.ring.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// resolve_entry 와 같은 규칙: 양쪽에 있으면 원장 항목을 복제해 실행 항목을 병합하고, 한쪽만 있으면 그대로.
+    fn entry<E: Clone>(b: Option<&E>, r: Option<&E>, merge: impl Fn(&mut E, &E, usize)) -> Option<E> {
+        match (b, r) {
+            (Some(b), Some(r)) => {
+                let mut m = b.clone();
+                merge(&mut m, r, RING);
+                Some(m)
+            }
+            (Some(e), None) | (None, Some(e)) => Some(e.clone()),
+            (None, None) => None,
+        }
+    }
+
+    fn scopes() -> (ScopeStat, ScopeStat) {
+        let mut base = ScopeStat::default();
+        let mut run = ScopeStat::default();
+        base.baseline.insert("both".into(), welford(&[0.1, 0.4, 0.2, 0.9, 1.3]));
+        run.baseline.insert("both".into(), welford(&[0.7, 0.3, 0.8, 0.2, 0.6, 0.5, 0.4]));
+        base.baseline.insert("base_only".into(), welford(&[1.0, 2.0, 4.0]));
+        run.baseline.insert("run_only".into(), welford(&[3.0, 5.0]));
+        for (st, salt) in [(&mut base, 1.0f64), (&mut run, 2.0)] {
+            let d = st.decay.entry("axis".into()).or_default();
+            for k in 0..6 {
+                let x = salt * 0.1 + k as f64 * 0.07;
+                d.margin.push(x, RING);
+                d.top_gap_ratio.push(x * 0.5, RING);
+                d.tail_flatness.push(1.0 - x, RING);
+                d.entropy_norm.push(x * x, RING);
+                d.positive_ratio.push(0.3 + x, RING);
+            }
+            let f = st.field.entry("doc_number".into()).or_default();
+            f.seen += 3 + salt as u64;
+            f.reject_format += 1;
+            f.near_miss += salt as u64;
+            f.assigned += 2;
+            f.assign_margin.push(0.2 * salt, RING);
+            let c = st.confusion.entry("amount|total_price".into()).or_default();
+            c.ties += 4;
+            c.a_wins += salt as u64;
+            c.b_wins += 4 - salt as u64;
+            c.margin.push(0.05 * salt, RING);
+            let s = st.spatial.entry("items".into()).or_default();
+            s.active_ratio.push(0.3 * salt, RING);
+            s.coverage_loss.push(0.1 * salt, RING);
+            let q = st.search_field.entry("amount".into()).or_default();
+            q.proposed += 5;
+            q.evaluated += salt as u64;
+            q.killed_all += 1;
+        }
+        base.category.insert("header".into(), CategoryStat { n_fields: 0, realized_max: welford(&[2.1, 2.4]) });
+        run.category.insert("header".into(), CategoryStat { n_fields: 12, realized_max: welford(&[2.9]) });
+        (base, run)
+    }
+
+    #[test]
+    fn entry_merge_matches_whole_scope_absorb() {
+        let (base, run) = scopes();
+        let mut merged = base.clone();
+        merged.absorb(run.clone(), RING);
+
+        for k in ["both", "base_only", "run_only"] {
+            let e = entry(base.baseline.get(k), run.baseline.get(k), Welford::merge).unwrap();
+            assert!(same_welford(&e, &merged.baseline[k]), "baseline {k}");
+        }
+        let d = entry(base.decay.get("axis"), run.decay.get("axis"), DecayStat::merge_from).unwrap();
+        let m = &merged.decay["axis"];
+        assert!(same_welford(&d.margin, &m.margin));
+        assert!(same_welford(&d.top_gap_ratio, &m.top_gap_ratio));
+        assert!(same_welford(&d.tail_flatness, &m.tail_flatness));
+        assert!(same_welford(&d.entropy_norm, &m.entropy_norm));
+        assert!(same_welford(&d.positive_ratio, &m.positive_ratio));
+
+        let f = entry(base.field.get("doc_number"), run.field.get("doc_number"), FieldRejectStat::merge_from).unwrap();
+        let mf = &merged.field["doc_number"];
+        assert_eq!((f.seen, f.reject_format, f.near_miss, f.assigned), (mf.seen, mf.reject_format, mf.near_miss, mf.assigned));
+        assert!(same_welford(&f.assign_margin, &mf.assign_margin));
+
+        let c = entry(base.confusion.get("amount|total_price"), run.confusion.get("amount|total_price"), ConfusionStat::merge_from).unwrap();
+        let mc = &merged.confusion["amount|total_price"];
+        assert_eq!((c.ties, c.a_wins, c.b_wins), (mc.ties, mc.a_wins, mc.b_wins));
+        assert!(same_welford(&c.margin, &mc.margin));
+
+        let cat = entry(base.category.get("header"), run.category.get("header"), CategoryStat::merge_from).unwrap();
+        assert_eq!(cat.n_fields, merged.category["header"].n_fields);
+        assert!(same_welford(&cat.realized_max, &merged.category["header"].realized_max));
+
+        let s = entry(base.spatial.get("items"), run.spatial.get("items"), SpatialStat::merge_from).unwrap();
+        assert!(same_welford(&s.active_ratio, &merged.spatial["items"].active_ratio));
+        assert!(same_welford(&s.coverage_loss, &merged.spatial["items"].coverage_loss));
+
+        let q = entry(base.search_field.get("amount"), run.search_field.get("amount"), SearchFieldStat::merge_from).unwrap();
+        let mq = &merged.search_field["amount"];
+        assert_eq!((q.proposed, q.evaluated, q.killed_all), (mq.proposed, mq.evaluated, mq.killed_all));
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_file_without_leaving_a_temp() {
+        let dir = std::env::temp_dir().join(format!("sds_atomic_{}_{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("extract.json");
+        write_atomic(&path, b"{\"a\":1}").unwrap();
+        write_atomic(&path, b"{\"a\":2}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":2}");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

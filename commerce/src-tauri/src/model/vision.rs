@@ -3,9 +3,6 @@ use std::sync::atomic::AtomicBool;
 use serde_json::{json, Value};
 use anyhow::anyhow;
 use image::DynamicImage;
-use std::io::Cursor;
-use base64::prelude::BASE64_STANDARD;
-use base64::Engine;
 use tauri::Emitter;
 use crate::openai_types::*;
 use crate::model::merge::{record_grounding_claims, collect_claimed, merge_extracted, apply_grounding_verdicts, record_claim_violations};
@@ -512,7 +509,7 @@ impl crate::model::LogisModel {
                         let mut sup_hit = 0usize;
                         let mut thin = 0usize;
                         for f in schema_fields.iter() {
-                            let (ph, wt) = crate::model::merge::owner_label_bank(&language, "shipping_doc", f);
+                            let (ph, wt) = crate::model::merge::owner_label_bank_for_doc(&language, "shipping_doc", f, &self_ref_field);
                             if sup_fields.iter().any(|s| *s == f.as_str()) { sup_hit += 1; }
                             if ph.len() <= 2 { thin += 1; }
                             for p in ph.iter() {
@@ -520,10 +517,12 @@ impl crate::model::LogisModel {
                             }
                             per_field.push((f.clone(), ph, wt));
                         }
+                        // 🌟 [EMBED-CACHE] 라벨 뱅크 구는 문서와 무관한 bias.json 뱅크 구라 고정 계층에 넣습니다.
+                        //    LRU 계층에 두면 RAM 비상 때 퇴출되어 다음 문서에서 2천여 구를 다시 임베딩합니다.
                         let mut embs: Vec<Vec<f32>> = Vec::with_capacity(phr_all.len());
                         for part in phr_all.chunks(200) {
                             let e = self
-                                .get_embedding_batch(part.to_vec())
+                                .get_embedding_batch_pinned(part.to_vec())
                                 .await
                                 .unwrap_or_else(|_| vec![Vec::new(); part.len()]);
                             embs.extend(e);
@@ -549,16 +548,20 @@ impl crate::model::LogisModel {
                         ));
                         banks
                     };
-                    let label_exact: crate::model::merge::LabelExactIndex = {
+                    let (label_exact, label_case): (crate::model::merge::LabelExactIndex, crate::model::merge::LabelCaseVocab) = {
                         let per_field: Vec<(String, Vec<String>)> = schema_fields
                             .iter()
                             .map(|f| {
                                 (
                                     f.clone(),
-                                    crate::model::merge::owner_label_bank(&language, "shipping_doc", f).0,
+                                    crate::model::merge::owner_label_bank_for_doc(&language, "shipping_doc", f, &self_ref_field).0,
                                 )
                             })
                             .collect();
+                        // 🌟 [LABEL CASE FOLD] 대문자 라벨을 접을 기준 표기도 같은 뱅크 구에서 뽑습니다.
+                        let case_vocab = crate::model::merge::build_label_case_vocab(
+                            per_field.iter().flat_map(|(_, p)| p.iter().map(|s| s.as_str())),
+                        );
                         let idx = crate::model::merge::build_label_exact_index(&per_field);
                         let unique = idx.values().filter(|v| v.len() == 1).count();
                         crate::utils::score_dynamics::record_baseline(
@@ -570,7 +573,7 @@ impl crate::model::LogisModel {
                             unique,
                             idx.len() - unique
                         ));
-                        idx
+                        (idx, case_vocab)
                     };
                     let mut pair_evidence: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
                     let mut pair_label: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -1240,7 +1243,25 @@ impl crate::model::LogisModel {
                                         pairs.iter().map(|(l, v)| format!("\"{}\"→\"{}\"", l, v)).take(10).collect::<Vec<_>>()
                                     ));
                                     crate::utils::score_dynamics::record_baseline("vision.pair_read_count", pairs.len() as f32);
-                                    let labels: Vec<String> = pairs.iter().map(|(l, _)| l.clone()).collect();
+                                    // 🌟 [LABEL CASE FOLD] 대문자로만 인쇄된 라벨은 뱅크 표기로 접어 임베딩합니다.
+                                    let labels: Vec<String> = pairs
+                                        .iter()
+                                        .map(|(l, _)| crate::model::merge::fold_label_case(l, &label_case))
+                                        .collect();
+                                    let folded: Vec<String> = pairs
+                                        .iter()
+                                        .zip(labels.iter())
+                                        .filter(|((l, _), f)| l != *f)
+                                        .map(|((l, _), f)| format!("\"{}\"→\"{}\"", l, f))
+                                        .collect();
+                                    if !folded.is_empty() {
+                                        emit_term(&format!(
+                                            "    🔡 [LABEL CASE FOLD] [{}] 대문자로만 인쇄된 라벨 {}개를 라벨 뱅크의 표기로 접어 임베딩합니다: {:?} — granite 토크나이저는 소문자 정규화가 없어 대문자 단어를 의미 없는 조각으로 자르고, 그 조각 벡터는 축마다 코사인이 비슷해 구 수 보정이 승패를 정합니다.",
+                                            plan.category,
+                                            folded.len(),
+                                            folded.iter().take(10).collect::<Vec<_>>()
+                                        ));
+                                    }
                                     let pair_embs = self
                                         .get_embedding_batch(labels)
                                         .await
@@ -2823,7 +2844,10 @@ impl crate::model::LogisModel {
                                             "vision.pair_read_count",
                                             pairs.len() as f32,
                                         );
-                                        let labels: Vec<String> = pairs.iter().map(|(l, _)| l.clone()).collect();
+                                        let labels: Vec<String> = pairs
+                                            .iter()
+                                            .map(|(l, _)| crate::model::merge::fold_label_case(l, &label_case))
+                                            .collect();
                                         let pair_embs = self
                                             .get_embedding_batch(labels)
                                             .await
@@ -3005,7 +3029,10 @@ impl crate::model::LogisModel {
                                     let (ok, own, rival, rival_field) = if blind_confirmed {
                                         (true, 0.0f32, 0.0f32, String::new())
                                     } else {
-                                        let label_emb = self.get_embedding(label.clone()).await.unwrap_or_default();
+                                        let label_emb = self
+                                            .get_embedding(crate::model::merge::fold_label_case(&label, &label_case))
+                                            .await
+                                            .unwrap_or_default();
                                         crate::model::merge::recovery_label_gate(&label_emb, field, &gate_banks)
                                     };
                                     let evidence = if blind_confirmed {
@@ -3360,7 +3387,10 @@ impl crate::model::LogisModel {
                         let label = pair_label.get("amount_tax").cloned().unwrap_or_default();
                         if let (Some(t), Some(b)) = (tax, base) {
                             if b > 0.0 && t > b && !label.is_empty() {
-                                let emb = self.get_embedding(label.clone()).await.unwrap_or_default();
+                                let emb = self
+                                    .get_embedding(crate::model::merge::fold_label_case(&label, &label_case))
+                                    .await
+                                    .unwrap_or_default();
                                 let ranking = crate::model::merge::label_axis_scores(&emb, &gate_banks);
                                 let target = ranking
                                     .iter()
@@ -5002,13 +5032,14 @@ impl crate::model::LogisModel {
         let gen = q35_gen_guard.as_mut().ok_or_else(|| anyhow!("Qwen 3.5 Generator is unloaded"))?;
         
         let mut content_parts = Vec::new();
-        
+        // 🌟 [IN-PROCESS IMAGE] 크롭을 PNG · base64 로 왕복시키지 않고 보관소 주소로 넘깁니다(화소 동일).
+        //    가드는 생성이 끝날 때까지 이 함수 안에 남아 있어야 합니다.
+        let mut _image_guard: Option<crate::utils::img_utils::MemImageGuard> = None;
+
         if let Some(img) = image {
-            let mut buf = Cursor::new(Vec::new());
-            img.write_to(&mut buf, image::ImageFormat::Png)?;
-            let b64 = BASE64_STANDARD.encode(buf.into_inner());
-            let url = format!("data:image/png;base64,{}", b64);
-            
+            let (url, guard) = crate::utils::img_utils::register_mem_image(img);
+            _image_guard = Some(guard);
+
             content_parts.push(ChatCompletionRequestMessageContentPart::ImageURL(
                 ChatCompletionRequestMessageContentPartImage {
                     image_url: ImageURL { url, detail: None }

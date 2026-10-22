@@ -4056,10 +4056,12 @@ pub async fn process_task(
                         dynamic_prej_texts.push(other_bias.clone());
                     }
                 }
+                // 🌟 [DEAD EMBED] 결합 prejudice 문자열은 Qwen 생성의 텍스트 prejudice 타깃으로만 씁니다.
+                //    예전에는 이 2~5천 자 문자열을 필드마다 임베딩해 두었지만 그 벡터를 읽는 곳이 없었습니다
+                //    (상세 페이지 프리패치 1회 425건 · 8.5만 토큰 · 8.9초의 대부분). 문자열만 넘깁니다.
                 let combined_prej = dynamic_prej_texts.join(" , ");
-                let prej_emb = model.get_embedding(combined_prej.clone()).await.unwrap_or(vec![0.0; 384]);
 
-                field_embeddings.push((bias_emb, prej_emb, combined_prej));
+                field_embeddings.push((bias_emb, combined_prej));
             }
 
 
@@ -5492,7 +5494,7 @@ pub async fn process_task(
                         }
                     }
 
-                    let (_bias_emb, _prej_emb, dynamic_prej_str) = &field_embeddings[f_idx];
+                    let (_bias_emb, dynamic_prej_str) = &field_embeddings[f_idx];
 
                     
                     let mut best_thead_idx = 0usize;
@@ -6956,10 +6958,12 @@ pub async fn process_task(
                         dynamic_prej_texts.push(other_bias.clone());
                     }
                 }
+                // 🌟 [DEAD EMBED] 결합 prejudice 문자열은 Qwen 생성의 텍스트 prejudice 타깃으로만 씁니다.
+                //    예전에는 이 2~5천 자 문자열을 필드마다 임베딩해 두었지만 그 벡터를 읽는 곳이 없었습니다
+                //    (상세 페이지 프리패치 1회 425건 · 8.5만 토큰 · 8.9초의 대부분). 문자열만 넘깁니다.
                 let combined_prej = dynamic_prej_texts.join(" , ");
-                let prej_emb = model.get_embedding(combined_prej.clone()).await.unwrap_or(vec![0.0; 384]);
 
-                field_embeddings.push((bias_emb, prej_emb, combined_prej));
+                field_embeddings.push((bias_emb, combined_prej));
             }
 
 
@@ -8396,7 +8400,7 @@ pub async fn process_task(
                     ));
                     continue;
                 }
-                let (_bias_emb, _prej_emb, dynamic_prej_str) = &field_embeddings[idx];
+                let (_bias_emb, dynamic_prej_str) = &field_embeddings[idx];
 
                 
                 let (best_idx, best_contrast, best_margin, has_vector_match) = match vector_assignment[idx] {
