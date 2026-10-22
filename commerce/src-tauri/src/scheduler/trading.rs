@@ -5937,12 +5937,12 @@ mod continuation_tests {
     #[test]
     #[ignore = "실모델: 로컬 granite 가중치 필요 (LOGIS_EMBED_MODEL_DIR 또는 앱 데이터 폴더)"]
     fn shipping_request_page_two_follows_page_one_rules() {
-        use crate::models::embedding::{EmbeddingModel, ForwardMode};
+        use crate::models::embedding::{forward_mode, EmbeddingModel};
         let model_dir = std::env::var("LOGIS_EMBED_MODEL_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| crate::utils::get_app_dir().join("models").join("granite-embedding-97m-multilingual-r2"));
         let device = candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu);
-        let m = EmbeddingModel::new_with_device_and_mode(&model_dir, &device, ForwardMode::Legacy).expect("모델 적재");
+        let m = EmbeddingModel::new_with_device_and_mode(&model_dir, &device, forward_mode()).expect("모델 적재");
         let embed = |texts: &[String]| -> Vec<Vec<f32>> { m.embed_many(texts, &m.batch_opts()).expect("embed_many") };
         let embed_groups = |groups: &[Vec<String>]| -> Vec<Vec<Vec<f32>>> {
             let flat: Vec<String> = groups.iter().flat_map(|g| g.iter().cloned()).collect();

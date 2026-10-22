@@ -824,7 +824,82 @@ impl VectorStore {
         // 🌟 [PHASE D] item_chunks 테이블 초기화 (변경 없음 — 순수 벡터 테이블)
         self.init_chunks_table().await?;
 
+        match self.migrate_embedding_space().await {
+            Ok(Some((from, to, pending))) => println!(
+                "[Store] 🔁 [EMBED SPACE] 저장 벡터 공간 '{}' → '{}': 문서 {}건을 재임베딩 대기열로 돌리고 청크를 비웠습니다. 벡터 검색은 다시 임베딩된 문서부터 돌아오고, 그동안 FTS 는 그대로 찾습니다.",
+                from, to, pending
+            ),
+            Ok(None) => {}
+            Err(e) => println!("[Store] ⚠️ [EMBED SPACE] 저장 벡터 공간 확인 실패: {}", e),
+        }
+
         Ok(())
+    }
+
+    /// 🌟 [EMBED SPACE MIGRATION] 저장된 granite 벡터의 공간(임베딩 순전파 판본)이 이 프로세스와 다르면 다시 만들게 합니다.
+    ///
+    ///  ── 무엇을 하나 ──
+    ///   ① items · users · pages 의 `"embed":1`(또는 true) 표식을 0 으로 돌립니다. 벡터 트랙은 `"embed":1`
+    ///      행만 보므로(search_items) 예전 공간 벡터는 그 순간 검색에서 빠지고, FTS 는 그대로 찾습니다.
+    ///      백그라운드 재색인(lib.rs reindex_pending_embeddings)이 대기 문서를 새 공간으로 다시 임베딩합니다.
+    ///   ② item_chunks 를 비웁니다. 재색인이 청크 없는 문서의 청크를 새로 만듭니다.
+    ///   ③ db/embed_space.json 에 현재 공간을 적습니다. 표식이 없는 DB 에 임베딩된 행이 있으면 그 벡터는
+    ///      예전 순전파('legacy')가 만든 것입니다(표식은 ModernBERT 판본 전환과 함께 생겼습니다).
+    ///  돌려주는 값: 공간을 옮겼으면 (이전 공간, 현재 공간, 대기열로 돌린 문서 수).
+    pub async fn migrate_embedding_space(&self) -> Result<Option<(String, String, usize)>> {
+        const EMBEDDED: &str = "data LIKE '%\"embed\":1%' OR data LIKE '%\"embed\":true%'";
+        const UNMARK: &str = "replace(replace(replace(replace(data, '\"embed\":1,', '\"embed\":0,'), '\"embed\":1}', '\"embed\":0}'), '\"embed\":true,', '\"embed\":0,'), '\"embed\":true}', '\"embed\":0}')";
+        let current = crate::models::embedding::forward_mode().space_tag();
+        let marker = std::path::Path::new(&self.base_path).join("embed_space.json");
+        let write_marker = |space: &str| -> Result<()> {
+            let tmp = marker.with_extension("json.tmp");
+            std::fs::write(&tmp, json!({ "space": space }).to_string())?;
+            std::fs::rename(&tmp, &marker)?;
+            Ok(())
+        };
+        let names = self.conn.table_names().execute().await?;
+        let doc_tables: Vec<&str> = ["items", "users", "pages"]
+            .into_iter()
+            .filter(|t| names.iter().any(|n| n == t))
+            .collect();
+        let stored = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.get("space").and_then(|x| x.as_str()).map(|x| x.to_string()));
+        let stored = match stored {
+            Some(s) => s,
+            None => {
+                let mut embedded = 0usize;
+                for t in doc_tables.iter() {
+                    let table = self.conn.open_table(*t).execute().await?;
+                    embedded += table.count_rows(Some(EMBEDDED.to_string())).await?;
+                }
+                if embedded == 0 {
+                    write_marker(current)?;
+                    return Ok(None);
+                }
+                "legacy".to_string()
+            }
+        };
+        if stored == current {
+            return Ok(None);
+        }
+        let mut pending = 0usize;
+        for t in doc_tables.iter() {
+            let table = self.conn.open_table(*t).execute().await?;
+            let n = table.count_rows(Some(EMBEDDED.to_string())).await?;
+            if n == 0 {
+                continue;
+            }
+            table.update().only_if(EMBEDDED).column("data", UNMARK).execute().await?;
+            pending += n;
+        }
+        if names.iter().any(|n| n == "item_chunks") {
+            let chunks = self.conn.open_table("item_chunks").execute().await?;
+            chunks.delete("chunk_id IS NOT NULL").await?;
+        }
+        write_marker(current)?;
+        Ok(Some((stored, current.to_string(), pending)))
     }
 
     fn canonicalize_data(mut v: Value, seed_defaults: bool) -> Value {
@@ -995,8 +1070,21 @@ impl VectorStore {
         };
         for b in batches {
             if b.num_rows() == 0 { continue; }
-            // 컬럼 순서: 12 = vector(384), 13 = vision_vec(1152)
-            return (read_fsl(&b, 12, 384), read_fsl(&b, 13, 1152));
+            // 컬럼 순서: 9 = data, 12 = vector(384), 13 = vision_vec(1152)
+            // 🌟 [EMBED SPACE] 텍스트 벡터는 저장 행이 embed=1 일 때만 승계합니다. 실벡터를 쓰는 행은 언제나
+            //    embed=1 로 기록되므로, embed=0 인데 벡터가 남은 행은 migrate_embedding_space 가 대기열로 돌린
+            //    예전 공간 벡터입니다. 그 벡터를 승계하면 동기화 한 번에 embed=1 로 되살아나 재색인에서 빠집니다.
+            //    비전 벡터(SigLIP2)는 임베딩 공간과 무관하므로 그대로 승계합니다.
+            let embedded = b
+                .column(9)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map_or(true, |d| {
+                    let s = d.value(0);
+                    s.contains("\"embed\":1") || s.contains("\"embed\":true")
+                });
+            let text_vec = if embedded { read_fsl(&b, 12, 384) } else { None };
+            return (text_vec, read_fsl(&b, 13, 1152));
         }
         (None, None)
     }
@@ -1973,7 +2061,10 @@ impl VectorStore {
             Arc::new(StringArray::from(vec![mode.unwrap_or("commerce").to_string()])),
             Arc::new(Int64Array::from(vec![now])),
             Arc::new(Int64Array::from(vec![now])),
-            Arc::new(StringArray::from(vec!["v3:format-aware(chunk+anchor+leafvalue)".to_string()])),
+            Arc::new(StringArray::from(vec![format!(
+                "v3:format-aware(chunk+anchor+leafvalue)/{}",
+                crate::models::embedding::forward_mode().space_tag()
+            )])),
         ])?;
 
         table.add(vec![batch]).execute().await?;
@@ -2036,8 +2127,9 @@ impl VectorStore {
             let distances = batch.column(dist_idx).as_any().downcast_ref::<Float32Array>();
 
             for i in 0..num_rows {
+                // 단위 벡터의 제곱 L2 거리 d = 2 − 2cos. 코사인은 다른 트랙과 같은 눈금(COS CALIBRATION)으로 옮깁니다.
                 let score = distances
-                    .map(|d| (1.0f32 - d.value(i) / 2.0f32).clamp(0.0f32, 1.0f32))
+                    .map(|d| crate::models::embedding::calibrate_cos(1.0f32 - d.value(i) / 2.0f32).clamp(0.0f32, 1.0f32))
                     .unwrap_or(0.0);
 
                 chunks.push((
@@ -2212,4 +2304,93 @@ pub struct TradeDocument {
     pub vector: Vec<f32>,
     #[serde(default)]
     pub vision_vec: Vec<f32>,
+}
+
+#[cfg(test)]
+mod embed_space_tests {
+    //! 🌟 [EMBED SPACE MIGRATION] 임시 LanceDB 에서 공간 전환을 검증합니다(사용자 DB 는 건드리지 않습니다).
+    use super::*;
+
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "logis-embed-space-{}-{}-{}",
+            tag,
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn unit(i: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; 384];
+        v[i % 384] = 1.0;
+        v
+    }
+
+    async fn embed_flag(store: &VectorStore, id: &str) -> Option<i64> {
+        let doc = store.get_item_by_id("items", id).await.unwrap()?;
+        let v: Value = serde_json::from_str(&doc.json_data).unwrap();
+        v.get("embed").and_then(|e| e.as_i64().or_else(|| e.as_bool().map(|b| b as i64)))
+    }
+
+    #[tokio::test]
+    async fn space_change_requeues_embedded_rows_and_clears_chunks() {
+        let dir = temp_db("change");
+        let store = VectorStore::new(dir.to_str().unwrap()).await.unwrap();
+        store.init_all_tables().await.unwrap();
+        let marker = dir.join("embed_space.json");
+        let current = crate::models::embedding::forward_mode().space_tag();
+        assert!(marker.exists(), "빈 DB 는 바로 현재 공간을 적습니다");
+
+        // 실벡터를 쓰는 행은 upsert 가 embed=1 로 기록합니다(a1 · a2). a3 는 벡터 없이 들어온 대기 문서입니다.
+        for (id, vector) in [("a1", Some(unit(1))), ("a2", Some(unit(2))), ("a3", None)] {
+            let data = json!({ "id": id, "type": "goods", "title": format!("title {}", id), "mode": "commerce" });
+            store
+                .upsert_item("items", id, "goods", data, vector, None, None, None, None, None, None, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(embed_flag(&store, "a1").await, Some(1));
+        assert_eq!(embed_flag(&store, "a3").await, Some(0));
+        store
+            .upsert_chunk("a1_0", "a1", "goods", "Its title is title a1", "title", "Text", "title a1", Some(unit(3)), None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(store.count_chunks_by_item("a1").await.unwrap(), 1);
+        assert_eq!(store.migrate_embedding_space().await.unwrap(), None, "같은 공간이면 아무것도 하지 않습니다");
+
+        // 예전 순전파로 만든 DB 라고 표지를 바꿔 둡니다.
+        std::fs::write(&marker, json!({ "space": "legacy" }).to_string()).unwrap();
+        let moved = store.migrate_embedding_space().await.unwrap();
+        assert_eq!(moved, Some(("legacy".to_string(), current.to_string(), 2)));
+        assert_eq!(embed_flag(&store, "a1").await, Some(0));
+        assert_eq!(embed_flag(&store, "a2").await, Some(0));
+        assert_eq!(embed_flag(&store, "a3").await, Some(0));
+        let a1: Value = serde_json::from_str(&store.get_item_by_id("items", "a1").await.unwrap().unwrap().json_data).unwrap();
+        assert_eq!(a1["title"], "title a1", "표식 말고는 그대로입니다");
+        assert_eq!(store.count_chunks_by_item("a1").await.unwrap(), 0, "청크는 재색인이 새 공간으로 다시 만듭니다");
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(saved["space"], current);
+        assert_eq!(store.migrate_embedding_space().await.unwrap(), None, "한 번 옮기면 다시 옮기지 않습니다");
+
+        // 재색인 전에 동기화가 같은 문서를 벡터 없이 다시 쓰면, 예전 공간 벡터를 승계해 embed=1 로 되살리지 않습니다.
+        let resync = json!({ "id": "a1", "type": "goods", "title": "title a1 (synced)", "mode": "commerce", "updated_at": 9 });
+        store.upsert_item("items", "a1", "goods", resync, None, None, None, None, None, None, None, None).await.unwrap();
+        assert_eq!(embed_flag(&store, "a1").await, Some(0), "예전 공간 벡터는 승계하지 않습니다");
+        // 새 공간 벡터로 다시 쓰면 다시 embed=1 이고, 그 뒤 동기화는 그 벡터를 승계합니다.
+        store.upsert_item("items", "a1", "goods", json!({ "id": "a1", "type": "goods", "title": "title a1 (synced)", "mode": "commerce" }), Some(unit(5)), None, None, None, None, None, None, None).await.unwrap();
+        store.upsert_item("items", "a1", "goods", json!({ "id": "a1", "type": "goods", "title": "title a1 (again)", "mode": "commerce", "updated_at": 10 }), None, None, None, None, None, None, None, None).await.unwrap();
+        assert_eq!(embed_flag(&store, "a1").await, Some(1), "새 공간 벡터는 그대로 승계합니다");
+
+        // 표지가 없는 예전 DB(임베딩된 행이 있음)는 예전 순전파 공간으로 봅니다.
+        std::fs::remove_file(&marker).unwrap();
+        let data = json!({ "id": "a4", "type": "goods", "title": "title a4", "mode": "commerce" });
+        store.upsert_item("items", "a4", "goods", data, Some(unit(7)), None, None, None, None, None, None, None).await.unwrap();
+        let moved = store.migrate_embedding_space().await.unwrap();
+        assert_eq!(moved.map(|m| (m.0, m.2)), Some(("legacy".to_string(), 2)), "a1 · a4 가 임베딩된 행입니다");
+        assert_eq!(embed_flag(&store, "a4").await, Some(0));
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

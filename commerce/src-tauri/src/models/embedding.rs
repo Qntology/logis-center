@@ -68,29 +68,48 @@ pub fn batched_enabled(device: &Device) -> bool {
 //   GPU 에서는 RoPE 표를 BF16 으로 만들어 256 을 넘는 위치가 짝수로 뭉개집니다.
 //   두 판본 벡터의 코사인은 0.79~0.89 입니다(로컬 가중치 재현).
 //
-//  ── 왜 기본값을 바꾸지 않는가 ──
-//   라벨 뱅크 · z 점수 바닥 · SDS 기준선 · LanceDB 에 이미 저장된 벡터가 전부 Legacy 공간입니다.
-//   같은 CI 문서 라벨 19개 라우팅 재현(대문자 접기 포함): Legacy 19/19, Exact(CLS) 17/19
-//   (INVOICE NUMBER→amount · TOTAL WEIGHT→item_gross_weight), Exact+평균 풀링 18/19.
-//   Exact 는 재색인 · 임계 재보정과 함께 옮겨야 하므로 LOGIS_EMBED_FORWARD 로만 켭니다.
-//   판본마다 캐시 공간(순전파 태그)이 달라 같은 텍스트의 두 벡터가 섞이지 않습니다.
+//  ── 기본값: ModernBERT 기준 순전파 + CLS 풀링 ──
+//   HF transformers 대비 코사인 CPU 1.00000 · CUDA ≥ 0.9999 (40개 텍스트, 4~423 토큰).
+//   Legacy 는 평균 0.923, 256 토큰을 넘으면 0.71~0.74 까지 벌어집니다.
+//   풀링은 두 재현으로 골랐습니다(로컬 가중치 · 순전파를 파이썬으로 재현한 오프라인 측정).
+//    · 라벨 뱅크 2,349구 자기 제외 라우팅(12개 언어, merge.rs z 점수 재현):
+//        Legacy 60.5% · CLS 63.4% · 평균 65.5%
+//    · 문서 제목 다국어 질의 471개 → 합성 무역 문서 45건(512 토큰) 검색 acc@1 / MRR:
+//        Legacy 0.125 / 0.241 · CLS 0.335 / 0.471 · 평균 0.221 / 0.338
+//   짧은 라벨끼리는 평균 풀링이 2점 높지만, 저장 벡터의 본업인 검색에서 CLS(모델이 학습한 공식 풀링)가
+//   평균보다 MRR 0.13 높아 CLS 로 둡니다.
+//
+//  ── 판본을 바꾸면 ──
+//   LanceDB 에 저장된 벡터 공간이 달라지므로 store.rs migrate_embedding_space 가 아이템 벡터를 대기열로
+//   돌리고 청크를 비운 뒤 백그라운드 재색인이 새 공간으로 다시 만듭니다. SDS 원장도 공간마다 따로 둡니다
+//   (score_dynamics.rs). 텍스트 캐시는 판본마다 공간(순전파 태그)이 달라 섞이지 않습니다.
+//   LOGIS_EMBED_FORWARD=legacy 로 되돌리면 같은 경로가 거꾸로 돕니다.
 // =====================================================================
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardMode {
-    /// 기존 순전파 (RmsNorm · 단일 θ · 전역 어텐션 · 평균 풀링). 기본값.
+    /// 예전 순전파 (RmsNorm · 단일 θ · 전역 어텐션 · 평균 풀링). LOGIS_EMBED_FORWARD=legacy 로만 씁니다.
     Legacy,
-    /// ModernBERT 기준 순전파 + CLS 풀링 (공식 문장 임베딩).
+    /// ModernBERT 기준 순전파 + CLS 풀링 (공식 문장 임베딩). 기본값.
     Exact,
-    /// ModernBERT 기준 순전파 + 평균 풀링 (이관 실험용).
+    /// ModernBERT 기준 순전파 + 평균 풀링 (비교 실험용).
     ExactMean,
 }
 
 impl ForwardMode {
     pub fn from_env_value(v: Option<&str>) -> Self {
         match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-            Some("exact") | Some("exact-cls") | Some("modernbert") => ForwardMode::Exact,
+            Some("legacy") => ForwardMode::Legacy,
             Some("exact-mean") => ForwardMode::ExactMean,
-            _ => ForwardMode::Legacy,
+            _ => ForwardMode::Exact,
+        }
+    }
+
+    /// 저장 벡터 공간의 이름(LanceDB 표지 · SDS 원장 폴더). 파일 이름에 그대로 씁니다.
+    pub fn space_tag(&self) -> &'static str {
+        match self {
+            ForwardMode::Legacy => "legacy",
+            ForwardMode::Exact => "modernbert-cls-v1",
+            ForwardMode::ExactMean => "modernbert-mean-v1",
         }
     }
 
@@ -120,22 +139,111 @@ static EMBED_FORWARD_ENV: once_cell::sync::Lazy<ForwardMode> = once_cell::sync::
         "[EMBED-FORWARD] LOGIS_EMBED_FORWARD → {} ({})",
         raw.as_deref().unwrap_or("미설정"),
         match mode {
-            ForwardMode::Legacy => "기존 순전파 · 평균 풀링 (기본)",
-            ForwardMode::Exact => "ModernBERT 기준 순전파 · CLS 풀링",
-            ForwardMode::ExactMean => "ModernBERT 기준 순전파 · 평균 풀링",
+            ForwardMode::Legacy => "예전 순전파 · 평균 풀링 (되돌림)",
+            ForwardMode::Exact => "ModernBERT 기준 순전파 · CLS 풀링 (기본)",
+            ForwardMode::ExactMean => "ModernBERT 기준 순전파 · 평균 풀링 (실험)",
         }
     );
-    if mode.is_exact() {
-        println!(
-            "[EMBED-FORWARD] ⚠️ LanceDB 에 이미 저장된 아이템·청크 벡터와 bias.json 뱅크 임계값은 기존 순전파 기준입니다. 이 판본으로 운영하려면 재색인과 임계 재보정이 함께 필요합니다 (캐시는 판본별 공간이라 섞이지 않습니다)."
-        );
-    }
     mode
 });
 
 /// 이 프로세스의 임베딩 순전파 판본.
 pub fn forward_mode() -> ForwardMode {
     *EMBED_FORWARD_ENV
+}
+
+// =====================================================================
+// 🌟 [COS CALIBRATION] CLS 공간 코사인 → 예전 순전파 눈금
+// ---------------------------------------------------------------------
+//  ── 왜 필요한가 ──
+//   CLS 벡터는 한쪽으로 몰려 있어(이방성) 코사인이 좁은 띠에 모입니다. 같은 텍스트 쌍 635만 개
+//   (라벨 뱅크 12개 언어 2,391구 × 레이아웃 긴 텍스트 포함)에서 예전 순전파는 평균 0.551 · 표준편차 0.076,
+//   CLS 는 평균 0.781 · 표준편차 0.034 였고, 같은 쌍의 상관은 0.58 이라 상수 하나씩 옮겨 적을 수 없습니다.
+//   코드 곳곳의 절대 문턱(pair_abs_floor 0.50 · 헤더 0.62 · 노이즈 0.35/0.55 · 상태 0.35 · 비율 ×0.85 …)과
+//   검색 융합 가중치, SDS 기준선은 전부 예전 눈금에서 맞춘 값입니다.
+//
+//  ── 무엇을 하나 ──
+//   granite(384차원) 코사인을 분위수 대응(같은 순위 → 같은 예전 값)으로 옮깁니다. 단조 함수라 순위
+//   · 최근접 검색 결과는 그대로이고, 각 문턱을 넘는 쌍의 비율이 예전과 같아집니다
+//   (0.50 초과 77.0% → 76.9% · 0.62 초과 16.8% → 16.7%). z 점수 라우팅은 오히려 좋아집니다:
+//   라벨 뱅크 자기 제외 라우팅 CLS 그대로 63.4% → 보정 66.1% (예전 60.5%).
+//   동일 텍스트(1.0)는 1.0 그대로입니다. 표는 위 635만 쌍의 두 판본 코사인 분위수(확률 0 · 1e-5 · 1e-4 · 1e-3 ·
+//   0.005 · 0.01 · 0.02 · 0.05 · 0.1 … 0.9 · 0.95 · 0.98 · 0.99 · 0.995 · 0.999 · 0.9999 · 0.99999 · 1)를 짝지은
+//   것에 (−1, −1) · (1, 1) 을 더한 것입니다. 모델 가중치나 라벨 뱅크(bias.json)가 바뀌면 다시 맞춰야 합니다.
+// =====================================================================
+const CLS_TO_LEGACY_COS: [(f32, f32); 27] = [
+    (-1.0000, -1.0000),
+    (0.6330, 0.1070),
+    (0.6540, 0.1710),
+    (0.6688, 0.2132),
+    (0.6869, 0.2716),
+    (0.7018, 0.3246),
+    (0.7091, 0.3520),
+    (0.7171, 0.3820),
+    (0.7291, 0.4234),
+    (0.7397, 0.4564),
+    (0.7527, 0.4921),
+    (0.7622, 0.5161),
+    (0.7705, 0.5359),
+    (0.7784, 0.5538),
+    (0.7865, 0.5714),
+    (0.7954, 0.5900),
+    (0.8065, 0.6117),
+    (0.8236, 0.6424),
+    (0.8394, 0.6692),
+    (0.8600, 0.7033),
+    (0.8755, 0.7300),
+    (0.8904, 0.7587),
+    (0.9259, 0.8304),
+    (0.9684, 0.9224),
+    (0.9915, 0.9710),
+    (0.9997, 0.9944),
+    (1.0000, 1.0000),
+];
+
+fn interp_knots(x: f32, knots: &[(f32, f32)]) -> f32 {
+    if !x.is_finite() {
+        return x;
+    }
+    if x <= knots[0].0 {
+        return knots[0].1;
+    }
+    for w in knots.windows(2) {
+        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
+        if x <= x1 {
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+        }
+    }
+    knots[knots.len() - 1].1
+}
+
+/// EmbeddingModel::forward_pieces 의 본체(모델 없이 검증할 수 있게 떼어 냈습니다).
+pub(crate) fn split_forward_pieces(ids: &[u32], special_mask: &[u32], rewrap: bool) -> Vec<Vec<u32>> {
+    let n = ids.len();
+    let wrapped = n >= 2 && special_mask.first() == Some(&1) && special_mask.last() == Some(&1);
+    if n <= EMBED_CHUNK_TOKENS || !rewrap || !wrapped {
+        return ids.chunks(EMBED_CHUNK_TOKENS).map(|c| c.to_vec()).collect();
+    }
+    let (head, tail) = (ids[0], ids[n - 1]);
+    ids[1..n - 1]
+        .chunks(EMBED_CHUNK_TOKENS - 2)
+        .map(|body| {
+            let mut piece = Vec::with_capacity(body.len() + 2);
+            piece.push(head);
+            piece.extend_from_slice(body);
+            piece.push(tail);
+            piece
+        })
+        .collect()
+}
+
+/// granite 벡터 사이의 코사인을 이 프로세스의 판본에서 예전 순전파 눈금으로 옮깁니다(예전 판본은 그대로).
+#[inline]
+pub fn calibrate_cos(raw: f32) -> f32 {
+    match forward_mode() {
+        ForwardMode::Exact => interp_knots(raw, &CLS_TO_LEGACY_COS),
+        ForwardMode::Legacy | ForwardMode::ExactMean => raw,
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -755,6 +863,15 @@ impl EmbeddingModel {
         Ok(self.tokenizer.encode(text, true).map_err(anyhow::Error::msg)?.get_ids().len())
     }
 
+    /// 🌟 [EXACT CHUNKS] 512 토큰을 넘는 입력을 순전파 조각으로 나눕니다(embed · embed_many 공용).
+    ///   Legacy 는 예전처럼 토큰을 512개씩 자릅니다(평균 풀링이라 조각의 첫 토큰이 무엇이든 같습니다).
+    ///   ModernBERT 판본은 조각마다 첫 토큰이 [CLS] 여야 CLS 풀링이 그 조각의 문장 벡터가 되므로, 앞뒤 특수
+    ///   토큰 사이의 본문을 510개씩 나눠 조각마다 [CLS] … [SEP] 로 다시 감쌉니다. 512 토큰 이하 입력은
+    ///   두 판본 모두 그대로 한 조각입니다.
+    pub(crate) fn forward_pieces(&self, ids: &[u32], special_mask: &[u32]) -> Vec<Vec<u32>> {
+        split_forward_pieces(ids, special_mask, self.model.mode.is_exact())
+    }
+
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let tokens = self.tokenizer.encode(text, true).map_err(anyhow::Error::msg)?;
         let token_ids = tokens.get_ids();
@@ -762,9 +879,9 @@ impl EmbeddingModel {
         if token_ids.is_empty() { return Ok(vec![0.0; EMBED_DIM]); }
 
         let mut chunk_vectors: Vec<Vec<f32>> = Vec::new();
-        for chunk in token_ids.chunks(EMBED_CHUNK_TOKENS) {
+        for chunk in self.forward_pieces(token_ids, tokens.get_special_tokens_mask()) {
             // 입력 텐서를 처음부터 타겟 디바이스(VRAM)로 올립니다.
-            let input_tensor = Tensor::new(chunk, &self.device).map_err(anyhow::Error::msg)?;
+            let input_tensor = Tensor::new(chunk.as_slice(), &self.device).map_err(anyhow::Error::msg)?;
             let hidden_states = self.model.forward(&input_tensor, &self.device).map_err(anyhow::Error::msg)?;
             let take = self.pooled_len(chunk.len());
             let hidden_states = if take == chunk.len() {
@@ -1048,6 +1165,118 @@ mod forward_parity_tests {
                 if mode.is_exact() && *dname == "cuda-bf16" {
                     assert!(min_pt > 0.995 && min_b > 0.995, "{dname} {:?}: BF16 기준 판본이 HF 와 크게 다릅니다", mode);
                 }
+            }
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod space_tests {
+    //! 🌟 [EMBED SPACE] 기본 판본 · 코사인 보정 · 512 토큰 초과 입력의 조각 나누기.
+    use super::*;
+
+    #[test]
+    fn modernbert_cls_is_the_default_and_legacy_is_opt_in() {
+        assert_eq!(ForwardMode::from_env_value(None), ForwardMode::Exact);
+        assert_eq!(ForwardMode::from_env_value(Some("")), ForwardMode::Exact);
+        assert_eq!(ForwardMode::from_env_value(Some(" Legacy ")), ForwardMode::Legacy);
+        assert_eq!(ForwardMode::from_env_value(Some("exact-mean")), ForwardMode::ExactMean);
+        assert_eq!(ForwardMode::Exact.space_tag(), "modernbert-cls-v1");
+        assert_eq!(ForwardMode::Legacy.space_tag(), "legacy");
+        assert_eq!(ForwardMode::Legacy.tag_suffix(), None, "예전 판본의 캐시 공간 id 는 그대로입니다");
+    }
+
+    #[test]
+    fn cls_calibration_is_monotone_and_keeps_identity() {
+        let k = &CLS_TO_LEGACY_COS;
+        assert!(k.windows(2).all(|w| w[1].0 > w[0].0 && w[1].1 > w[0].1), "표는 두 축 모두 증가해야 합니다");
+        assert_eq!(interp_knots(1.0, k), 1.0, "같은 텍스트는 1.0 그대로입니다");
+        assert_eq!(interp_knots(-1.0, k), -1.0);
+        assert_eq!(interp_knots(1.5, k), 1.0);
+        let mut prev = f32::MIN;
+        for i in 0..=2000 {
+            let x = -1.0 + i as f32 * 0.001;
+            let y = interp_knots(x, k);
+            assert!(y >= prev, "{x}: {y} < {prev}");
+            prev = y;
+        }
+        // 예전 눈금의 문턱을 넘는 비율이 같아지는 자리(분위수 대응): CLS 0.7527 ≈ 예전 0.4921
+        assert!((interp_knots(0.7527, k) - 0.4921).abs() < 1e-4);
+        assert!(interp_knots(f32::NAN, k).is_nan());
+    }
+
+    #[test]
+    fn cosine_primitives_calibrate_only_granite_vectors() {
+        use crate::utils::ai_utils::{cosine_similarity, cosine_with_norms, l2_norm_exact};
+        let mut a = vec![0.0f32; EMBED_DIM];
+        let mut b = vec![0.0f32; EMBED_DIM];
+        a[0] = 1.0;
+        b[0] = 0.8;
+        b[1] = 0.6;
+        let raw = 0.8f32;
+        let c = cosine_similarity(&a, &b);
+        assert_eq!(c.to_bits(), calibrate_cos(raw).to_bits());
+        assert_eq!(c.to_bits(), cosine_with_norms(&a, l2_norm_exact(&a), &b, l2_norm_exact(&b)).to_bits());
+        // 다른 차원(SigLIP2 1152 등)은 그대로입니다.
+        assert!((cosine_similarity(&[1.0, 0.0], &[0.8, 0.6]) - raw).abs() < 1e-6);
+        // 0벡터의 0.0 은 보정하지 않습니다.
+        assert_eq!(cosine_similarity(&a, &vec![0.0; EMBED_DIM]), 0.0);
+    }
+
+    #[test]
+    fn long_inputs_are_rewrapped_with_cls_and_sep_per_piece() {
+        let n = 1200usize;
+        let mut ids: Vec<u32> = vec![1];
+        ids.extend((0..n as u32 - 2).map(|i| 100 + i));
+        ids.push(2);
+        let mut mask = vec![0u32; n];
+        mask[0] = 1;
+        mask[n - 1] = 1;
+        let pieces = split_forward_pieces(&ids, &mask, true);
+        assert_eq!(pieces.len(), 3);
+        for p in pieces.iter() {
+            assert!(p.len() <= EMBED_CHUNK_TOKENS);
+            assert_eq!(p[0], 1, "조각마다 [CLS] 로 시작합니다");
+            assert_eq!(*p.last().unwrap(), 2, "조각마다 [SEP] 로 끝납니다");
+        }
+        let body: Vec<u32> = pieces.iter().flat_map(|p| p[1..p.len() - 1].to_vec()).collect();
+        assert_eq!(body, ids[1..n - 1].to_vec(), "본문 토큰은 빠짐없이 순서대로입니다");
+        // 예전 판본 · 512 이하 입력 · 특수 토큰 없는 입력은 예전처럼 512개씩 자릅니다.
+        assert_eq!(split_forward_pieces(&ids, &mask, false), ids.chunks(EMBED_CHUNK_TOKENS).map(|c| c.to_vec()).collect::<Vec<_>>());
+        assert_eq!(split_forward_pieces(&ids[..300], &mask[..300], true).len(), 1);
+        assert_eq!(split_forward_pieces(&ids, &vec![0u32; n], true).len(), 3);
+    }
+
+    #[test]
+    #[ignore = "실모델: 로컬 granite 가중치 필요 (LOGIS_EMBED_MODEL_DIR 또는 앱 데이터 폴더)"]
+    fn default_forward_batched_matches_per_text_on_long_inputs() {
+        let dir = std::env::var("LOGIS_EMBED_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate::utils::get_app_dir().join("models").join("granite-embedding-97m-multilingual-r2"));
+        let long_ko = "선하증권 송하인 수하인 통지처 선적항 양하항 컨테이너 번호 봉인 번호 품목 수량 총중량 용적 ".repeat(40);
+        let long_en = "Commercial invoice shipper consignee port of loading port of discharge description quantity gross weight measurement ".repeat(30);
+        let texts: Vec<String> = vec![
+            "INVOICE NUMBER".into(),
+            "총중량".into(),
+            long_ko,
+            long_en,
+            "Packing List".into(),
+        ];
+        let mut devices = vec![("cpu", candle_core::Device::Cpu)];
+        if let Ok(d) = candle_core::Device::new_cuda(0) {
+            devices.push(("cuda", d));
+        }
+        for (name, device) in devices {
+            let m = EmbeddingModel::new_with_device(&dir, &device).expect("모델 적재");
+            assert_eq!(m.forward_mode(), ForwardMode::Exact, "기본 판본은 ModernBERT · CLS 입니다");
+            let per: Vec<Vec<f32>> = texts.iter().map(|t| m.embed(t).unwrap()).collect();
+            let many = m.embed_many(&texts, &m.batch_opts()).unwrap();
+            for (i, t) in texts.iter().enumerate() {
+                let n = m.token_len(t).unwrap();
+                let d: f32 = per[i].iter().zip(many[i].iter()).map(|(a, b)| a * b).sum();
+                println!("[EMBED-SPACE] {name} {n}토큰 per-text · embed_many 코사인 {d:.6}");
+                assert!(d > 0.999, "{name} {n}토큰: 배치와 단건이 다릅니다 ({d})");
             }
         }
     }

@@ -2,7 +2,18 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { dot_product / (norm_a * norm_b) }
+    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { granite_scale(a.len(), dot_product / (norm_a * norm_b)) }
+}
+
+/// 🌟 [COS CALIBRATION] granite(384차원) 코사인만 예전 순전파 눈금으로 옮깁니다(models::embedding::calibrate_cos).
+///    SigLIP2(1152차원) 등 다른 공간의 코사인은 그대로입니다. 0벡터의 0.0 은 이 함수까지 오지 않습니다.
+#[inline]
+pub fn granite_scale(dim: usize, raw: f32) -> f32 {
+    if dim == crate::models::embedding::EMBED_DIM {
+        crate::models::embedding::calibrate_cos(raw)
+    } else {
+        raw
+    }
 }
 
 // =====================================================================
@@ -8029,7 +8040,7 @@ pub fn l2_norm_exact(v: &[f32]) -> f32 {
 #[inline]
 pub fn cosine_with_norms(a: &[f32], na: f32, b: &[f32], nb: f32) -> f32 {
     let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot_product / (na * nb) }
+    if na == 0.0 || nb == 0.0 { 0.0 } else { granite_scale(a.len(), dot_product / (na * nb)) }
 }
 
 /// 기존 코드의 `e.iter().all(|&v| v == 0.0)` 와 같은 판정.

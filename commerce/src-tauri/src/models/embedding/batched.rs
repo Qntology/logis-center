@@ -181,9 +181,9 @@ impl EmbeddingModel {
                 empty_text[ti] = true;
                 continue;
             }
-            for chunk in ids.chunks(EMBED_CHUNK_TOKENS) {
+            for chunk in self.forward_pieces(ids, enc.get_special_tokens_mask()) {
                 stats.real_tokens += chunk.len();
-                seqs.push(Seq { text_idx: ti, ids: chunk.to_vec() });
+                seqs.push(Seq { text_idx: ti, ids: chunk });
             }
         }
         stats.seqs = seqs.len();

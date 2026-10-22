@@ -308,6 +308,12 @@ let isReindexing = false;
 // 🌟 [EMBED DEBOUNCE] runLocalEmbeddingSync 중복 호출 방지를 위한 스케줄링 변수
 let reindexScheduled = false;
 let reindexDebounceTimer: number | null = null;
+// 🌟 [EMBED DRAIN] 한 회차는 트랙마다 20건씩만 임베딩합니다. 그 회차에 실제로 임베딩한 문서가 있으면
+//    대기열이 남았을 수 있으므로 곧바로 다음 회차를 예약합니다. 임베딩 공간이 바뀐 뒤(store.rs
+//    migrate_embedding_space) 전량 재임베딩이 다음 동기화 이벤트를 기다리지 않고 끝나게 하려는 것이고,
+//    연속 회차에는 상한을 두어 처리되지 않는 문서가 남아도 무한히 돌지 않습니다.
+let embedDrainRounds = 0;
+const EMBED_DRAIN_MAX_ROUNDS = 200;
 
 async function runLocalEmbeddingSync() {
     if (isReindexing || reindexScheduled) return;
@@ -321,11 +327,11 @@ async function runLocalEmbeddingSync() {
         
         if (isReindexing || isSearching || isExtracting || GlobalTaskManager.isBusy) return;
         isReindexing = true;
+        let totalProcessed = 0;
         try {
             const trackOrder = [currentSearchMode,
                 ...["commerce", "shipping", "analytic"].filter(m => m !== currentSearchMode)];
 
-            let totalProcessed = 0;
             for (const track of trackOrder) {
                 if (isSearching || isExtracting || GlobalTaskManager.isBusy) break;
 
@@ -353,6 +359,12 @@ async function runLocalEmbeddingSync() {
             console.warn("[EMBED] reindex_pending_embeddings failed:", e);
         } finally {
             isReindexing = false;
+        }
+        if (totalProcessed > 0 && embedDrainRounds < EMBED_DRAIN_MAX_ROUNDS) {
+            embedDrainRounds += 1;
+            runLocalEmbeddingSync();
+        } else {
+            embedDrainRounds = 0;
         }
     }, 2000);
 }
