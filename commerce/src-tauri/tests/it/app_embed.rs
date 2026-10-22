@@ -524,10 +524,13 @@ fn field_bank_prefetch_covers_every_loop_request() {
         for p in prejudice_phrase_bank("ko", "goods", fname) {
             assert!(pre.contains(&p));
         }
+        // [DEAD EMBED] 결합 prejudice 문자열은 생성용 텍스트 타깃일 뿐 루프가 임베딩하지 않으므로 프리패치하지 않습니다.
         let mut d = Vec::new();
         if !predefined_prej.trim().is_empty() { d.push(predefined_prej.clone()); }
         for (oi, (_, _, ob, _)) in fields.iter().enumerate() { if oi != f_idx { d.push(ob.clone()); } }
-        assert!(pre.contains(&d.join(" , ")));
+        if d.len() >= 2 {
+            assert!(!pre.contains(&d.join(" , ")), "결합 prejudice '{}' 는 프리패치 대상이 아닙니다", fname);
+        }
     }
     let lab: std::collections::HashSet<String> = label_bank_prefetch_texts(&fields, "ko", "goods").into_iter().collect();
     for (fname, _, _, _) in &fields {

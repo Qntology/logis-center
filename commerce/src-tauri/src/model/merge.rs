@@ -1076,6 +1076,37 @@ pub fn owner_label_bank(doc_lang: &str, bank_type: &str, field: &str) -> (Vec<St
     (ph, wt)
 }
 
+/// 🌟 [SELF-REFERENCE → IDENTITY BANK] 이 서식이 자기 자신을 가리키는 참조 축의 구를 doc_number 뱅크로 옮깁니다.
+///
+///  ── 실측 ──
+///   CI 문서는 reference_invoice 축을 스키마에서 뺍니다(자기 문서번호가 그 축으로 새는 경로 차단).
+///   그런데 12개 언어의 '송장 번호' 표기(Rechnungsnummer · N° de facture · インボイス番号 · 发票号 · 송장번호)는
+///   그 뱅크에만 있어서, 축을 빼는 순간 doc_number 가 이 표기들을 설명하지 못했습니다.
+///   (로컬 granite 재현: 비영어 송장 번호 라벨 24개 중 doc_number 1위 17 → 이 병합 후 22, 이 문서 회귀 없음)
+///  ── 무엇을 바꾸나 ──
+///   축은 계속 빼되, 그 축의 구는 대소문자만 다른 중복을 빼고 doc_number 뱅크 끝에 붙입니다.
+///   이 서식에서 '송장 번호' 라벨이 가리키는 것은 바로 자기 문서번호이기 때문입니다.
+pub fn owner_label_bank_for_doc(
+    doc_lang: &str,
+    bank_type: &str,
+    field: &str,
+    self_ref_field: &str,
+) -> (Vec<String>, Vec<f32>) {
+    let (mut ph, mut wt) = owner_label_bank(doc_lang, bank_type, field);
+    if field == crate::logic::TRADE_IDENTITY_FIELD && !self_ref_field.is_empty() && self_ref_field != field {
+        let (rp, rw) = owner_label_bank(doc_lang, bank_type, self_ref_field);
+        for (p, w) in rp.into_iter().zip(rw.into_iter()) {
+            let pl = p.to_lowercase();
+            if ph.iter().any(|e| e.to_lowercase() == pl) {
+                continue;
+            }
+            ph.push(p);
+            wt.push(w);
+        }
+    }
+    (ph, wt)
+}
+
 /// 🌟 [ANCHOR SELF-POISON] 다른 필드의 이름을 품은 앵커 구를 그 필드 뱅크에서 뺍니다.
 ///
 ///  ── 실측 사고 ──
@@ -1090,102 +1121,230 @@ pub fn owner_label_bank(doc_lang: &str, bank_type: &str, field: &str) -> (Vec<St
 ///   "day of month" 를 'day' 뱅크에서 끄는 것과 동일한 구조입니다.
 ///   그쪽은 '자기 단위 이름' 을 기준 벡터로 쓰므로, 여기서도 각 필드의
 ///   '대표 구'(뱅크 첫 구)를 기준으로 삼습니다.
-fn purge_self_poisoned_anchors(
-    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
-) -> Vec<(String, Vec<Vec<f32>>, Vec<f32>)> {
-    use crate::utils::ai_utils::cosine_similarity;
+///
+/// 🌟 [PURGE MEMO] 정화 결과를 뱅크 내용 지문으로 기억해 두고 재사용합니다.
+///
+///  ── 실측 사고 ──
+///   쌍 라우팅(route_pairs_to_fields_exact)은 라벨 하나마다 label_axis_scores 와
+///   recovery_label_gate_guarded 를 부르고, 행 복원(rows_from_pair_sequence)은 열마다
+///   label_axis_scores 를 부릅니다. 예전에는 그 호출마다 이 정화를 처음부터 다시 했습니다.
+///   정화는 구마다 모든 필드 대표와의 코사인 + 필드마다 O(n²) 응집도라 라벨 뱅크
+///   (87축 · 2391구) 한 번에 수억 번의 곱셈이고, 노름도 코사인마다 다시 계산했습니다.
+///   items 크롭 한 장(쌍 24건 + 열 8개)에서 같은 뱅크의 정화가 약 40번 반복되어
+///   [SDS] 저장 사이가 수 초씩 비고 [PAIR ROW AXIS] 뒤 [ARRAY PAIRS → ROWS] 까지 멈춘 것처럼
+///   보였습니다. (최적화가 꺼진 dev 빌드에서는 더 깁니다)
+///   뱅크는 크롭 루프 앞에서 한 번 세워진 뒤 회차 내내 바뀌지 않습니다.
+///
+///  ── 해결 ──
+///   ① 정화 결과(필드마다 남길 구의 인덱스)와 구 노름을 뱅크 내용 지문으로 기억합니다.
+///      지문은 필드 이름 · 구 수 · 구 벡터의 모든 비트 · 가중치를 해싱하므로, 한 비트라도
+///      다른 뱅크(미뤄진 쌍 재라우팅의 스칼라 뱅크 등)는 따로 정화됩니다.
+///   ② 정화 자체도 노름을 구마다 한 번만 계산하고 필드 단위로 병렬화합니다.
+///   ③ 라벨 채점도 미리 계산한 노름을 쓰고, 행이 많으면 코사인을 병렬로 구한 뒤 원래 순서로 모읍니다.
+///   cosine_with_norms 는 cosine_similarity 와 같은 식·같은 순서라([EMB-BANK]) 남는 구와 채점 결과가
+///   예전 구현과 비트 단위로 같습니다. 바뀌는 것은 SDS 의 vision.anchor_self_poison 관측이
+///   '호출마다' 가 아니라 '정화를 실제로 계산할 때마다' 한 번 남는다는 점뿐입니다.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PurgeView {
+    /// 필드 이름 (지문이 우연히 같아도 모양이 다르면 재사용하지 않습니다)
+    pub fields: Vec<String>,
+    /// 필드마다 원래 구 수
+    pub lens: Vec<usize>,
+    /// 필드마다 남긴 구의 원래 인덱스(원래 순서). 대표가 없거나 정화가 뱅크를 비우면 원래 구 전부(0벡터 포함).
+    pub kept: Vec<Vec<usize>>,
+    /// 모든 구의 l2_norm_exact
+    pub norms: Vec<Vec<f32>>,
+    /// 모든 구의 0벡터 여부 (빈 벡터 포함 — 채점의 `e.is_empty() || 전부 0` 과 같은 판정)
+    pub zero: Vec<Vec<bool>>,
+    /// 끈 구의 진단 문구 (필드 순 · 구 순)
+    pub dropped: Vec<String>,
+    /// (필드, 끈 구 수, 뱅크 구 수) — 끈 구가 있는 필드만
+    pub per_field: Vec<(String, usize, usize)>,
+}
 
+impl PurgeView {
+    fn matches(&self, banks: &[(String, Vec<Vec<f32>>, Vec<f32>)]) -> bool {
+        self.fields.len() == banks.len()
+            && banks
+                .iter()
+                .enumerate()
+                .all(|(i, (f, b, _))| self.fields[i] == *f && self.lens[i] == b.len())
+    }
+
+    /// banks[fi] 의 정화본(남긴 구 복제). 변별 재측정처럼 벡터 자체가 필요할 때만 씁니다.
+    pub fn purged_bank(&self, banks: &[(String, Vec<Vec<f32>>, Vec<f32>)], fi: usize) -> Vec<Vec<f32>> {
+        self.kept[fi].iter().map(|&pi| banks[fi].1[pi].clone()).collect()
+    }
+}
+
+/// 정화 계산 본체(기억 · 로그 · SDS 없음). 예전 purge_self_poisoned_anchors 와 같은 구를 남깁니다.
+pub fn compute_purge_view(banks: &[(String, Vec<Vec<f32>>, Vec<f32>)]) -> PurgeView {
+    use crate::utils::ai_utils::{cosine_with_norms, is_zero_vec, l2_norm_exact};
+    use rayon::prelude::*;
+
+    let norms: Vec<Vec<f32>> = banks
+        .par_iter()
+        .map(|(_, b, _)| b.iter().map(|e| l2_norm_exact(e)).collect())
+        .collect();
+    let zero: Vec<Vec<bool>> = banks
+        .par_iter()
+        .map(|(_, b, _)| b.iter().map(|e| is_zero_vec(e)).collect())
+        .collect();
     // 각 필드의 대표 벡터 = 그 필드 뱅크 전체의 중심
     let heads: Vec<Option<Vec<f32>>> = banks
-        .iter()
+        .par_iter()
         .map(|(_, b, _)| {
             let c = bank_centroid(b);
             if c.is_empty() { None } else { Some(c) }
         })
         .collect();
+    let head_norms: Vec<f32> = heads
+        .iter()
+        .map(|h| h.as_deref().map(l2_norm_exact).unwrap_or(0.0))
+        .collect();
     // 중심에 가장 가까운 구가 그 뱅크를 가장 잘 대표합니다. 이 구만 정화에서 면제합니다.
     // 인덱스 0(영어)을 무조건 면제하면 다국어 뱅크에서 영어만 특권을 갖습니다.
-    let anchors: Vec<usize> = banks
-        .iter()
-        .enumerate()
-        .map(|(fi, (_, b, _))| {
+    let anchors: Vec<usize> = (0..banks.len())
+        .into_par_iter()
+        .map(|fi| {
             let h = match heads[fi].as_ref() { Some(h) => h, None => return 0usize };
             let mut best = (0usize, f32::MIN);
-            for (pi, e) in b.iter().enumerate() {
-                if e.iter().all(|&v| v == 0.0) { continue; }
-                let s = cosine_similarity(e, h);
+            for (pi, e) in banks[fi].1.iter().enumerate() {
+                if zero[fi][pi] { continue; }
+                let s = cosine_with_norms(e, norms[fi][pi], h, head_norms[fi]);
                 if s > best.1 { best = (pi, s); }
             }
             best.0
         })
         .collect();
 
-    let mut out: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = Vec::with_capacity(banks.len());
-    let mut dropped: Vec<String> = Vec::new();
+    // 필드마다 (남긴 구, 끈 구 진단 문구). 필드끼리는 독립이라 병렬로 계산하고 필드 순서대로 모읍니다.
+    let per: Vec<(Vec<usize>, Vec<String>)> = (0..banks.len())
+        .into_par_iter()
+        .map(|fi| {
+            let (fname, bank, _) = &banks[fi];
+            let all = || (0..bank.len()).collect::<Vec<usize>>();
+            let own_head = match heads[fi].as_ref() { Some(h) => h, None => return (all(), Vec::new()) };
+            // 🌟 [COHESION RELIEF] 절대 대소(rival > own)는 여유가 0이라,
+            //    동의어가 촘촘한 뱅크일수록 구조적으로 더 많이 잘립니다.
+            //    편견 게이트가 이미 같은 문제를 bank_internal_cohesion 여유로 풀었으므로
+            //    그 판정기를 그대로 씁니다. 새 상수가 생기지 않고 정화가 보수적으로 바뀝니다.
+            let own_cohesion = crate::utils::ai_utils::bank_internal_cohesion(bank);
+            let mut kept: Vec<usize> = Vec::with_capacity(bank.len());
+            let mut dropped: Vec<String> = Vec::new();
+            for (pi, e) in bank.iter().enumerate() {
+                if zero[fi][pi] { continue; }
+                // 중심에 가장 가까운 구는 항상 유지합니다. 빼면 뱅크가 소멸합니다.
+                if pi == anchors[fi] {
+                    kept.push(pi);
+                    continue;
+                }
+                let ne = norms[fi][pi];
+                let own = cosine_with_norms(e, ne, own_head, head_norms[fi]);
+                let mut rival_name: &str = "";
+                let mut rival = f32::MIN;
+                for (gi, h) in heads.iter().enumerate() {
+                    if gi == fi { continue; }
+                    let h = match h.as_ref() { Some(h) => h, None => continue };
+                    let s = cosine_with_norms(e, ne, h, head_norms[gi]);
+                    if s > rival { rival = s; rival_name = banks[gi].0.as_str(); }
+                }
+                if rival > f32::MIN
+                    && crate::utils::ai_utils::prejudice_dominates(own, rival, own_cohesion)
+                {
+                    dropped.push(format!(
+                        "{}←구{} (자기 '{}' {:.4} × (1+{:.3}) < '{}' {:.4})",
+                        fname, pi, fname, own, own_cohesion.clamp(0.0, 0.5), rival_name, rival
+                    ));
+                    continue;
+                }
+                kept.push(pi);
+            }
+            if kept.is_empty() { (all(), dropped) } else { (kept, dropped) }
+        })
+        .collect();
+
+    let mut kept_all: Vec<Vec<usize>> = Vec::with_capacity(banks.len());
+    let mut dropped_all: Vec<String> = Vec::new();
     // 🌟 [OVER-PURGE DIAGNOSTIC] 필드별 제거 비율을 남깁니다.
     //    SDS 의 vision.anchor_self_poison 은 총합만 기록하므로
     //    '어느 필드가 뱅크를 잃었는가' 를 로그로 복원할 수 없었습니다.
     //    D-4(총중량이 순중량에 밀림)의 원인이 이 정화인지 아닌지를
     //    다음 회차에서 판정하려면 필드 단위 수치가 반드시 있어야 합니다.
     let mut per_field: Vec<(String, usize, usize)> = Vec::new();
-
-    for (fi, (fname, bank, weights)) in banks.iter().enumerate() {
-        let own_head = match heads[fi].as_ref() { Some(h) => h, None => {
-            out.push((fname.clone(), bank.clone(), weights.clone()));
-            continue;
-        }};
-        // 🌟 [COHESION RELIEF] 절대 대소(rival > own)는 여유가 0이라,
-        //    동의어가 촘촘한 뱅크일수록 구조적으로 더 많이 잘립니다.
-        //    편견 게이트가 이미 같은 문제를 bank_internal_cohesion 여유로 풀었으므로
-        //    그 판정기를 그대로 씁니다. 새 상수가 생기지 않고 정화가 보수적으로 바뀝니다.
-        let own_cohesion = crate::utils::ai_utils::bank_internal_cohesion(bank);
-        let mut kept_bank: Vec<Vec<f32>> = Vec::with_capacity(bank.len());
-        let mut kept_w: Vec<f32> = Vec::with_capacity(weights.len());
-        let mut cut = 0usize;
-
-        for (pi, e) in bank.iter().enumerate() {
-            if e.iter().all(|&v| v == 0.0) { continue; }
-            // 중심에 가장 가까운 구는 항상 유지합니다. 빼면 뱅크가 소멸합니다.
-            if pi == anchors[fi] {
-                kept_bank.push(e.clone());
-                kept_w.push(weights.get(pi).copied().unwrap_or(1.0));
-                continue;
-            }
-            let own = cosine_similarity(e, own_head);
-            let mut rival_name = String::new();
-            let mut rival = f32::MIN;
-            for (gi, h) in heads.iter().enumerate() {
-                if gi == fi { continue; }
-                let h = match h.as_ref() { Some(h) => h, None => continue };
-                let s = cosine_similarity(e, h);
-                if s > rival { rival = s; rival_name = banks[gi].0.clone(); }
-            }
-            if rival > f32::MIN
-                && crate::utils::ai_utils::prejudice_dominates(own, rival, own_cohesion)
-            {
-                cut += 1;
-                dropped.push(format!(
-                    "{}←구{} (자기 '{}' {:.4} × (1+{:.3}) < '{}' {:.4})",
-                    fname, pi, fname, own, own_cohesion.clamp(0.0, 0.5), rival_name, rival
-                ));
-                continue;
-            }
-            kept_bank.push(e.clone());
-            kept_w.push(weights.get(pi).copied().unwrap_or(1.0));
+    for (fi, (kept, dropped)) in per.into_iter().enumerate() {
+        if !dropped.is_empty() {
+            per_field.push((banks[fi].0.clone(), dropped.len(), banks[fi].1.len()));
         }
-        if cut > 0 { per_field.push((fname.clone(), cut, bank.len())); }
+        dropped_all.extend(dropped);
+        kept_all.push(kept);
+    }
+    PurgeView {
+        fields: banks.iter().map(|(f, _, _)| f.clone()).collect(),
+        lens: banks.iter().map(|(_, b, _)| b.len()).collect(),
+        kept: kept_all,
+        norms,
+        zero,
+        dropped: dropped_all,
+        per_field,
+    }
+}
 
-        if kept_bank.is_empty() {
-            out.push((fname.clone(), bank.clone(), weights.clone()));
-        } else {
-            out.push((fname.clone(), kept_bank, kept_w));
+/// 뱅크 내용 지문. 필드 이름 · 구 수 · 구 벡터의 모든 비트 · 가중치를 필드 단위로 병렬 해싱합니다.
+fn banks_fingerprint(banks: &[(String, Vec<Vec<f32>>, Vec<f32>)]) -> u64 {
+    use rayon::prelude::*;
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    fn mix(h: u64, x: u64) -> u64 {
+        let h = (h ^ x).wrapping_mul(PRIME);
+        h ^ (h >> 29)
+    }
+    let parts: Vec<u64> = banks
+        .par_iter()
+        .map(|(name, bank, w)| {
+            let mut h = OFFSET;
+            for b in name.as_bytes() { h = mix(h, *b as u64); }
+            h = mix(h, bank.len() as u64);
+            for e in bank.iter() {
+                h = mix(h, e.len() as u64);
+                for x in e.iter() { h = mix(h, x.to_bits() as u64); }
+            }
+            h = mix(h, w.len() as u64);
+            for x in w.iter() { h = mix(h, x.to_bits() as u64); }
+            h
+        })
+        .collect();
+    let mut h = mix(OFFSET, banks.len() as u64);
+    for p in parts { h = mix(h, p); }
+    h
+}
+
+/// 최근 정화 결과. 라벨 뱅크 · 스칼라 뱅크처럼 한 회차에 쓰는 뱅크는 몇 개뿐입니다.
+const PURGE_MEMO_CAP: usize = 4;
+static PURGE_MEMO: once_cell::sync::Lazy<std::sync::Mutex<Vec<(u64, std::sync::Arc<PurgeView>)>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// 정화 결과를 기억에서 꺼내거나, 처음 보는 뱅크면 한 번 계산해 기억합니다.
+fn purge_view(banks: &[(String, Vec<Vec<f32>>, Vec<f32>)]) -> std::sync::Arc<PurgeView> {
+    let key = banks_fingerprint(banks);
+    {
+        let mut memo = PURGE_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = memo.iter().position(|(k, v)| *k == key && v.matches(banks)) {
+            let hit = memo.remove(pos);
+            let view = hit.1.clone();
+            memo.insert(0, hit);
+            return view;
         }
     }
+    let started = std::time::Instant::now();
+    let view = std::sync::Arc::new(compute_purge_view(banks));
+    let ms = started.elapsed().as_secs_f64() * 1000.0;
 
-    if !dropped.is_empty() {
+    if !view.dropped.is_empty() {
         use std::sync::atomic::{AtomicBool, Ordering};
         static LOGGED: AtomicBool = AtomicBool::new(false);
         if !LOGGED.swap(true, Ordering::Relaxed) {
+            let mut per_field = view.per_field.clone();
             per_field.sort_by(|a, b| {
                 (b.1 as f32 / b.2.max(1) as f32)
                     .partial_cmp(&(a.1 as f32 / a.2.max(1) as f32))
@@ -1193,8 +1352,8 @@ fn purge_self_poisoned_anchors(
             });
             println!(
                 "      🧹 [ANCHOR SELF-POISON] 자기 필드 대표 구보다 다른 필드 대표 구가 응집도 여유까지 넘어서 설명하는 앵커 구 {}개를 그 필드 뱅크에서 끕니다: {:?} — Max-Pool 은 뱅크 안의 어느 한 구만 반응해도 그 필드가 이기므로, 다른 필드의 이름을 품은 구는 그 필드를 대신 설명해 1·2위를 뒤집습니다. (뱅크는 회차 내 불변이므로 첫 정화만 출력합니다)",
-                dropped.len(),
-                dropped.iter().take(8).collect::<Vec<_>>()
+                view.dropped.len(),
+                view.dropped.iter().take(8).collect::<Vec<_>>()
             );
             println!(
                 "      📉 [SELF-POISON BY FIELD] 제거 비율이 높은 필드: {:?} — 한 필드가 자기 뱅크의 절반 이상을 잃으면 그 축은 이후 모든 라벨 경쟁에서 구조적으로 불리해집니다. 총합만 보면 이 편향이 보이지 않습니다.",
@@ -1205,10 +1364,65 @@ fn purge_self_poisoned_anchors(
         }
         crate::utils::score_dynamics::record_baseline(
             "vision.anchor_self_poison",
-            dropped.len() as f32,
+            view.dropped.len() as f32,
         );
     }
-    out
+    println!(
+        "      🧠 [PURGE MEMO] 라벨 뱅크 {}축 · 구 {}개의 앵커 정화를 {:.0}ms 에 한 번 계산해 기억합니다 (끈 구 {}개). 같은 뱅크로 오는 라벨 채점(쌍 라우팅 · 행 복원 · 복구 게이트)은 라벨마다 정화를 다시 하지 않고 이 결과를 씁니다.",
+        view.fields.len(),
+        view.lens.iter().sum::<usize>(),
+        ms,
+        view.dropped.len()
+    );
+
+    let mut memo = PURGE_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    memo.retain(|(k, _)| *k != key);
+    memo.insert(0, (key, view.clone()));
+    memo.truncate(PURGE_MEMO_CAP);
+    view
+}
+
+/// 라벨 × 정화본 채점: (풀, 필드별 (이름, 최댓값, 살아 있는 구 수)).
+/// 예전 루프(`cosine_similarity(label, e) * w`, 필드 순 · 남긴 구 순)와 같은 값 · 같은 순서입니다.
+fn label_pool(
+    label_emb: &[f32],
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+    view: &PurgeView,
+) -> (Vec<f32>, Vec<(String, f32, usize)>) {
+    use crate::utils::ai_utils::{cosine_with_norms, l2_norm_exact, PAR_MIN_ROWS};
+    let qn = l2_norm_exact(label_emb);
+    let rows: Vec<(usize, usize)> = view
+        .kept
+        .iter()
+        .enumerate()
+        .flat_map(|(fi, kept)| kept.iter().filter(move |&&pi| !view.zero[fi][pi]).map(move |&pi| (fi, pi)))
+        .collect();
+    let cos_of = |&(fi, pi): &(usize, usize)| cosine_with_norms(label_emb, qn, &banks[fi].1[pi], view.norms[fi][pi]);
+    let sims: Vec<f32> = if rows.len() >= PAR_MIN_ROWS {
+        use rayon::prelude::*;
+        rows.par_iter().map(cos_of).collect()
+    } else {
+        rows.iter().map(cos_of).collect()
+    };
+
+    let mut pool: Vec<f32> = Vec::with_capacity(rows.len());
+    let mut per: Vec<(String, f32, usize)> = Vec::new();
+    let mut r = 0usize;
+    for (fi, (f, _, w)) in banks.iter().enumerate() {
+        let mut mx = f32::MIN;
+        let mut live = 0usize;
+        while r < rows.len() && rows[r].0 == fi {
+            let s = sims[r] * w.get(rows[r].1).copied().unwrap_or(1.0);
+            pool.push(s);
+            live += 1;
+            if s > mx { mx = s; }
+            r += 1;
+        }
+        if live > 0 {
+            per.push((f.clone(), mx, live));
+        }
+    }
+    (pool, per)
 }
 
 /// 🌟 [NAME CONTAINMENT] 한 필드 이름이 다른 필드 이름을 토큰 단위로 품는지 봅니다.
@@ -1245,23 +1459,20 @@ pub fn label_axis_scores(
     if label_emb.is_empty() || banks.is_empty() {
         return Vec::new();
     }
-    let purged = purge_self_poisoned_anchors(banks);
-    let mut pool: Vec<f32> = Vec::new();
-    let mut per: Vec<(String, f32, usize)> = Vec::new();
-    for (f, bank, w) in purged.iter() {
-        let mut mx = f32::MIN;
-        let mut live = 0usize;
-        for (i, e) in bank.iter().enumerate() {
-            if e.is_empty() || e.iter().all(|&x| x == 0.0) { continue; }
-            let s = crate::utils::ai_utils::cosine_similarity(label_emb, e) * w.get(i).copied().unwrap_or(1.0);
-            pool.push(s);
-            live += 1;
-            if s > mx { mx = s; }
-        }
-        if live > 0 {
-            per.push((f.clone(), mx, live));
-        }
+    let view = purge_view(banks);
+    label_axis_scores_with_view(label_emb, banks, &view)
+}
+
+/// label_axis_scores 의 채점 본체. 정화 결과를 직접 받습니다(기억 · 로그 · SDS 없음).
+pub fn label_axis_scores_with_view(
+    label_emb: &[f32],
+    banks: &[(String, Vec<Vec<f32>>, Vec<f32>)],
+    view: &PurgeView,
+) -> Vec<(String, f32)> {
+    if label_emb.is_empty() || banks.is_empty() || !view.matches(banks) {
+        return Vec::new();
     }
+    let (pool, per) = label_pool(label_emb, banks, view);
     if per.len() < 2 || pool.len() < 2 {
         return Vec::new();
     }
@@ -1388,24 +1599,8 @@ pub fn recovery_label_gate_guarded(
     if label_emb.is_empty() || banks.is_empty() {
         return (true, 0.0, 0.0, String::new());
     }
-    let purged = purge_self_poisoned_anchors(banks);
-    let banks: &[(String, Vec<Vec<f32>>, Vec<f32>)] = &purged;
-    let mut pool: Vec<f32> = Vec::new();
-    let mut per: Vec<(String, f32, usize)> = Vec::new();
-    for (f, bank, w) in banks.iter() {
-        let mut mx = f32::MIN;
-        let mut live = 0usize;
-        for (i, e) in bank.iter().enumerate() {
-            if e.is_empty() || e.iter().all(|&x| x == 0.0) { continue; }
-            let s = crate::utils::ai_utils::cosine_similarity(label_emb, e)
-                * w.get(i).copied().unwrap_or(1.0);
-            pool.push(s);
-            live += 1;
-            if s > mx { mx = s; }
-        }
-        if live == 0 { continue; }
-        per.push((f.clone(), mx, live));
-    }
+    let view = purge_view(banks);
+    let (pool, per) = label_pool(label_emb, banks, &view);
     if per.is_empty() {
         return (false, 0.0, 0.0, String::new());
     }
@@ -1452,8 +1647,8 @@ pub fn recovery_label_gate_guarded(
         let a = scored[0].0.clone();
         let b = scored[1].0.clone();
         let nested = field_name_contains(&a, &b);
-        let ab = banks.iter().find(|(f, _, _)| *f == a).map(|(_, x, _)| x.clone());
-        let bb = banks.iter().find(|(f, _, _)| *f == b).map(|(_, x, _)| x.clone());
+        let ab = banks.iter().position(|(f, _, _)| *f == a).map(|fi| view.purged_bank(banks, fi));
+        let bb = banks.iter().position(|(f, _, _)| *f == b).map(|fi| view.purged_bank(banks, fi));
         if !nested {
             crate::utils::score_dynamics::record_baseline("vision.discriminative_skip", 1.0);
             println!(
@@ -1586,6 +1781,97 @@ pub fn build_label_exact_index(per_field: &[(String, Vec<String>)]) -> LabelExac
         }
     }
     idx
+}
+
+/// 🌟 [LABEL CASE FOLD] 전부 대문자로 인쇄된 라벨을 라벨 뱅크 자신의 표기로 접어서 임베딩합니다.
+///
+///  ── 실측 사고 ──
+///   granite 토크나이저는 소문자 정규화가 없습니다(tokenizer.json normalizer: null).
+///   대문자 라벨은 BPE 가 "TOTAL WEIGHT" → [TOTAL, ĠWE, IGHT], "CONSIGNEE" → [CON, SIG, NE, E] 처럼
+///   의미 없는 조각으로 잘라, 소문자로 쓰인 뱅크 구와의 코사인이 축마다 0.80 언저리로 뭉개졌습니다.
+///     TOTAL WEIGHT → weight_gross 0.803 ≈ volume 0.802 ≈ weight_net 0.800
+///     CONSIGNEE    → sender 0.807 ≈ amount_tax 0.806 ≈ recipient 0.805
+///   그 동점을 구 수 보정(√(2 ln N))이 갈라 TOTAL WEIGHT 는 item_gross_weight 로, CONSIGNEE VAT/EORI 는
+///   amount_tax 로 갔고, 완전일치 구조(PAIR EXACT LABEL)가 있을 때만 정답으로 되돌아왔습니다.
+///   SigLIP2 경로와 완전일치 색인은 이미 소문자로 비교하는데 이 경로만 원문 대소문자를 그대로 썼습니다.
+///
+///  ── 무엇을 바꾸나 ──
+///   대소문자가 있는 글자가 전부 대문자인 라벨만 접습니다. 글자 덩어리마다 라벨 뱅크에서 가장 많이 쓴
+///   표기로 바꾸고(뱅크가 'VAT' · 'EORI' · 'HS' 처럼 대문자로 쓰는 약어는 대문자 그대로), 뱅크에 없는
+///   단어는 소문자로 접습니다. 소문자가 하나라도 섞인 라벨 · 한글 · 한자 라벨은 그대로입니다.
+///   새 상수는 없습니다 — 기준은 뱅크 자신의 표기입니다.
+///   같은 CI 문서 라벨 19개를 로컬 granite 가중치 + bias.json 으로 재현한 결과: 정답 14 → 19,
+///   1·2위 마진 중앙값 +0.78 → +1.41.
+pub type LabelCaseVocab = std::collections::HashMap<String, String>;
+
+/// 글자(alphabetic) 덩어리의 바이트 범위.
+fn letter_runs(s: &str) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        if c.is_alphabetic() {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(st) = start.take() {
+            out.push((st, i));
+        }
+    }
+    if let Some(st) = start {
+        out.push((st, s.len()));
+    }
+    out
+}
+
+/// 뱅크 구의 단어마다 '가장 많이 쓴 표기' 를 고릅니다(동률이면 먼저 나온 표기).
+pub fn build_label_case_vocab<'a, I>(phrases: I) -> LabelCaseVocab
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut forms: std::collections::HashMap<String, Vec<(String, usize)>> = std::collections::HashMap::new();
+    for p in phrases {
+        for (a, b) in letter_runs(p) {
+            let w = &p[a..b];
+            let slot = forms.entry(w.to_lowercase()).or_default();
+            match slot.iter_mut().find(|(s, _)| s == w) {
+                Some(e) => e.1 += 1,
+                None => slot.push((w.to_string(), 1)),
+            }
+        }
+    }
+    forms
+        .into_iter()
+        .map(|(k, v)| {
+            let mut best = (String::new(), 0usize);
+            for (s, c) in v.into_iter() {
+                if c > best.1 {
+                    best = (s, c);
+                }
+            }
+            (k, best.0)
+        })
+        .collect()
+}
+
+/// 대문자로만 인쇄된 라벨을 뱅크 표기로 접습니다. 그 밖의 라벨은 그대로 돌려줍니다.
+pub fn fold_label_case(label: &str, vocab: &LabelCaseVocab) -> String {
+    let mut cased = label.chars().filter(|c| c.is_alphabetic() && (c.is_lowercase() || c.is_uppercase())).peekable();
+    if cased.peek().is_none() || label.chars().any(|c| c.is_alphabetic() && c.is_lowercase()) {
+        return label.to_string();
+    }
+    let mut out = String::with_capacity(label.len());
+    let mut last = 0usize;
+    for (a, b) in letter_runs(label) {
+        out.push_str(&label[last..a]);
+        let lower = label[a..b].to_lowercase();
+        match vocab.get(&lower) {
+            Some(form) => out.push_str(form),
+            None => out.push_str(&lower),
+        }
+        last = b;
+    }
+    out.push_str(&label[last..]);
+    out
 }
 
 pub fn label_exact_field(
@@ -1784,7 +2070,7 @@ pub fn route_pairs_to_fields_exact(
             continue;
         }
         let fmt = crate::utils::ai_utils::query_value_format(&rf);
-        if !crate::utils::ai_utils::value_matches_format(fmt, value) {
+        if !crate::utils::ai_utils::field_value_matches(&rf, fmt, value) {
             logs.push(format!(
                 "      🚫 [PAIR FORMAT] \"{}\" → \"{}\" | 최강 축 '{}' 가 요구하는 값 형식({:?})과 맞지 않습니다.",
                 label, value, rf, fmt
@@ -3110,5 +3396,376 @@ pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) 
                 }
             }
         }
+    }
+}
+#[cfg(test)]
+mod purge_memo_tests {
+    //! 🌟 [PURGE MEMO] 정화 기억 · 노름 캐시 채점이 예전 구현과 비트 단위로 같은지 검증합니다.
+    //! (예전 purge_self_poisoned_anchors · label_axis_scores 루프를 그대로 옮긴 참조 구현과 대조)
+    use super::*;
+    use crate::utils::ai_utils::{cosine_similarity, gumbel_expected_z, prejudice_dominates};
+
+    type Banks = Vec<(String, Vec<Vec<f32>>, Vec<f32>)>;
+
+    /// 시드 고정 의사난수 (xorshift) — 플랫폼 무관.
+    fn det(n: usize, salt: u64) -> Vec<f32> {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ salt.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    fn unit(mut v: Vec<f32>) -> Vec<f32> {
+        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in v.iter_mut() {
+            *x /= n;
+        }
+        v
+    }
+
+    fn near(dir: &[f32], noise: f32, salt: u64) -> Vec<f32> {
+        let e = det(dir.len(), salt);
+        unit(dir.iter().zip(e.iter()).map(|(d, n)| d + noise * n).collect())
+    }
+
+    const D: usize = 48;
+
+    /// 필드 14개(그중 하나는 응집도 병렬 경로를 타는 150구) + 다른 필드 방향의 '오염 구' ·
+    /// 0벡터 · 빈 뱅크 · 가중치가 모자란 뱅크.
+    fn mock_banks() -> Banks {
+        let n_fields = 14usize;
+        let dirs: Vec<Vec<f32>> = (0..n_fields).map(|f| unit(det(D, 7_000 + f as u64))).collect();
+        let mut banks: Banks = Vec::new();
+        for f in 0..n_fields {
+            let size = if f == 3 { 150 } else { 6 + (f * 5) % 23 };
+            let mut b: Vec<Vec<f32>> = (0..size).map(|p| near(&dirs[f], 0.9, (f * 1000 + p) as u64)).collect();
+            // 다른 필드의 이름을 품은 구: 그 필드 대표에 더 가깝습니다.
+            let g = (f + 1) % n_fields;
+            b.push(near(&dirs[g], 0.2, (f * 1000 + 900) as u64));
+            b.push(near(&dirs[g], 0.3, (f * 1000 + 901) as u64));
+            if f % 4 == 0 {
+                b.insert(1, vec![0.0; D]); // 인코딩 실패 자리(0벡터)
+            }
+            let mut w: Vec<f32> = (0..b.len()).map(|i| 0.8 + 0.05 * (i % 5) as f32).collect();
+            if f == 5 {
+                w.truncate(3); // 가중치가 모자라면 1.0
+            }
+            banks.push((format!("field_{f}"), b, w));
+        }
+        banks.push(("empty_field".to_string(), Vec::new(), Vec::new()));
+        banks.push(("zero_field".to_string(), vec![vec![0.0; D]; 2], vec![1.0, 1.0]));
+        banks
+    }
+
+    /// 예전 bank_internal_cohesion 그대로.
+    fn cohesion_reference(bank: &[Vec<f32>]) -> f32 {
+        let valid: Vec<&Vec<f32>> = bank.iter().filter(|e| !e.iter().all(|&v| v == 0.0)).collect();
+        if valid.len() < 2 {
+            return 0.0;
+        }
+        let mut sum = 0.0f32;
+        let mut cnt = 0usize;
+        for i in 0..valid.len() {
+            for j in (i + 1)..valid.len() {
+                sum += cosine_similarity(valid[i], valid[j]);
+                cnt += 1;
+            }
+        }
+        if cnt == 0 { 0.0 } else { (sum / cnt as f32).max(0.0) }
+    }
+
+    /// 예전 purge_self_poisoned_anchors 그대로 (로그 · SDS 기록만 뺐습니다).
+    pub(super) fn purge_reference(banks: &[(String, Vec<Vec<f32>>, Vec<f32>)]) -> (Banks, Vec<String>) {
+        let heads: Vec<Option<Vec<f32>>> = banks
+            .iter()
+            .map(|(_, b, _)| {
+                let c = bank_centroid(b);
+                if c.is_empty() { None } else { Some(c) }
+            })
+            .collect();
+        let anchors: Vec<usize> = banks
+            .iter()
+            .enumerate()
+            .map(|(fi, (_, b, _))| {
+                let h = match heads[fi].as_ref() { Some(h) => h, None => return 0usize };
+                let mut best = (0usize, f32::MIN);
+                for (pi, e) in b.iter().enumerate() {
+                    if e.iter().all(|&v| v == 0.0) { continue; }
+                    let s = cosine_similarity(e, h);
+                    if s > best.1 { best = (pi, s); }
+                }
+                best.0
+            })
+            .collect();
+        let mut out: Banks = Vec::with_capacity(banks.len());
+        let mut dropped: Vec<String> = Vec::new();
+        for (fi, (fname, bank, weights)) in banks.iter().enumerate() {
+            let own_head = match heads[fi].as_ref() { Some(h) => h, None => {
+                out.push((fname.clone(), bank.clone(), weights.clone()));
+                continue;
+            }};
+            let own_cohesion = cohesion_reference(bank);
+            let mut kept_bank: Vec<Vec<f32>> = Vec::with_capacity(bank.len());
+            let mut kept_w: Vec<f32> = Vec::with_capacity(weights.len());
+            for (pi, e) in bank.iter().enumerate() {
+                if e.iter().all(|&v| v == 0.0) { continue; }
+                if pi == anchors[fi] {
+                    kept_bank.push(e.clone());
+                    kept_w.push(weights.get(pi).copied().unwrap_or(1.0));
+                    continue;
+                }
+                let own = cosine_similarity(e, own_head);
+                let mut rival_name = String::new();
+                let mut rival = f32::MIN;
+                for (gi, h) in heads.iter().enumerate() {
+                    if gi == fi { continue; }
+                    let h = match h.as_ref() { Some(h) => h, None => continue };
+                    let s = cosine_similarity(e, h);
+                    if s > rival { rival = s; rival_name = banks[gi].0.clone(); }
+                }
+                if rival > f32::MIN && prejudice_dominates(own, rival, own_cohesion) {
+                    dropped.push(format!(
+                        "{}←구{} (자기 '{}' {:.4} × (1+{:.3}) < '{}' {:.4})",
+                        fname, pi, fname, own, own_cohesion.clamp(0.0, 0.5), rival_name, rival
+                    ));
+                    continue;
+                }
+                kept_bank.push(e.clone());
+                kept_w.push(weights.get(pi).copied().unwrap_or(1.0));
+            }
+            if kept_bank.is_empty() {
+                out.push((fname.clone(), bank.clone(), weights.clone()));
+            } else {
+                out.push((fname.clone(), kept_bank, kept_w));
+            }
+        }
+        (out, dropped)
+    }
+
+    /// 예전 label_axis_scores 그대로 (정화본 위 채점).
+    fn scores_reference(label_emb: &[f32], banks: &[(String, Vec<Vec<f32>>, Vec<f32>)]) -> Vec<(String, f32)> {
+        let (purged, _) = purge_reference(banks);
+        let mut pool: Vec<f32> = Vec::new();
+        let mut per: Vec<(String, f32, usize)> = Vec::new();
+        for (f, bank, w) in purged.iter() {
+            let mut mx = f32::MIN;
+            let mut live = 0usize;
+            for (i, e) in bank.iter().enumerate() {
+                if e.is_empty() || e.iter().all(|&x| x == 0.0) { continue; }
+                let s = cosine_similarity(label_emb, e) * w.get(i).copied().unwrap_or(1.0);
+                pool.push(s);
+                live += 1;
+                if s > mx { mx = s; }
+            }
+            if live > 0 {
+                per.push((f.clone(), mx, live));
+            }
+        }
+        if per.len() < 2 || pool.len() < 2 {
+            return Vec::new();
+        }
+        let n = pool.len() as f32;
+        let mean = pool.iter().sum::<f32>() / n;
+        let sd = (pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / n).sqrt().max(1e-6);
+        let mut scored: Vec<(String, f32)> = per
+            .into_iter()
+            .map(|(f, mx, cnt)| (f, (mx - mean) / sd - gumbel_expected_z(cnt)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored
+    }
+
+    #[test]
+    fn purge_view_keeps_the_same_phrases_as_the_old_purge() {
+        let banks = mock_banks();
+        let (reference, ref_dropped) = purge_reference(&banks);
+        let view = compute_purge_view(&banks);
+        assert!(!ref_dropped.is_empty(), "오염 구가 정화 경로를 실제로 타야 합니다");
+        assert_eq!(view.dropped, ref_dropped);
+        assert_eq!(reference.len(), banks.len());
+        for (fi, (f, rb, rw)) in reference.iter().enumerate() {
+            assert_eq!(*f, banks[fi].0);
+            assert_eq!(&view.purged_bank(&banks, fi), rb, "{f}: 남은 구가 다릅니다");
+            // 채점이 쓰는 가중치: 정화본 i 번째 자리 ↔ 원래 인덱스 kept[i]
+            let ref_w: Vec<u32> = (0..rb.len()).map(|i| rw.get(i).copied().unwrap_or(1.0).to_bits()).collect();
+            let new_w: Vec<u32> = view.kept[fi]
+                .iter()
+                .map(|&pi| banks[fi].2.get(pi).copied().unwrap_or(1.0).to_bits())
+                .collect();
+            assert_eq!(new_w, ref_w, "{f}: 가중치가 다릅니다");
+        }
+    }
+
+    #[test]
+    fn label_scores_are_bit_identical_to_the_old_scoring() {
+        let banks = mock_banks();
+        let view = compute_purge_view(&banks);
+        let rows: usize = view.kept.iter().map(|k| k.len()).sum();
+        assert!(rows >= crate::utils::ai_utils::PAR_MIN_ROWS, "병렬 채점 경로도 검증합니다 ({rows}행)");
+        for k in 0..12u64 {
+            let dir = &banks[(k as usize * 3) % 14].1[0];
+            let label = near(dir, 0.4 + 0.1 * k as f32, 50_000 + k);
+            let reference = scores_reference(&label, &banks);
+            let fast = label_axis_scores_with_view(&label, &banks, &view);
+            assert_eq!(fast.len(), reference.len());
+            for (a, b) in fast.iter().zip(reference.iter()) {
+                assert_eq!(a.0, b.0);
+                assert_eq!(a.1.to_bits(), b.1.to_bits(), "{}: {} vs {}", a.0, a.1, b.1);
+            }
+        }
+        // 다른 뱅크(모양이 다른)의 정화본은 쓰지 않습니다.
+        let mut other = banks.clone();
+        other.pop();
+        assert!(label_axis_scores_with_view(&banks[0].1[0], &other, &view).is_empty());
+    }
+
+    #[test]
+    fn bank_cohesion_is_bit_identical_on_both_paths() {
+        for (size, salt) in [(0usize, 1u64), (1, 2), (2, 3), (40, 4), (127, 5), (128, 6), (300, 7)] {
+            let dir = unit(det(D, 90_000 + salt));
+            let mut bank: Vec<Vec<f32>> = (0..size).map(|p| near(&dir, 0.7, salt * 10_000 + p as u64)).collect();
+            if size > 3 {
+                bank[2] = vec![0.0; D];
+            }
+            let a = crate::utils::ai_utils::bank_internal_cohesion(&bank);
+            let b = cohesion_reference(&bank);
+            assert_eq!(a.to_bits(), b.to_bits(), "size {size}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn purge_memo_reuses_one_view_per_bank_content() {
+        // 서로 직교에 가까운 필드라 끌 구가 없습니다 (SDS 관측을 남기지 않는 뱅크).
+        let mk = |salt: u64| -> Banks {
+            (0..6)
+                .map(|f| {
+                    let mut dir = vec![0.0f32; D];
+                    dir[f] = 1.0;
+                    let b: Vec<Vec<f32>> = (0..5).map(|p| near(&dir, 0.05, salt + (f * 10 + p) as u64)).collect();
+                    (format!("axis_{f}"), b, vec![1.0; 5])
+                })
+                .collect()
+        };
+        let a = mk(1);
+        let v1 = purge_view(&a);
+        assert!(v1.dropped.is_empty());
+        let v2 = purge_view(&a.clone());
+        assert!(std::sync::Arc::ptr_eq(&v1, &v2), "같은 내용의 뱅크는 같은 정화본을 재사용합니다");
+        let mut b = a.clone();
+        b[2].1[3][7] += 1e-3; // 한 구의 한 성분만 바꿔도 다른 뱅크입니다.
+        let v3 = purge_view(&b);
+        assert!(!std::sync::Arc::ptr_eq(&v1, &v3));
+        assert_eq!(*v3, compute_purge_view(&b));
+        // 기억된 정화본으로 채점해도 직접 계산한 정화본과 같습니다.
+        let label = near(&a[1].1[0], 0.3, 77);
+        assert_eq!(label_axis_scores(&label, &a), label_axis_scores_with_view(&label, &a, &compute_purge_view(&a)));
+    }
+}
+
+#[cfg(test)]
+mod label_case_tests {
+    //! 🌟 [LABEL CASE FOLD] · [SELF-REFERENCE → IDENTITY BANK] 검증.
+    use super::*;
+
+    #[test]
+    fn all_caps_labels_fold_to_the_bank_spelling() {
+        let vocab = build_label_case_vocab(
+            ["total weight", "Total Weight", "gross weight", "VAT number", "VAT No.", "EORI", "consignee"]
+                .iter()
+                .copied(),
+        );
+        assert_eq!(vocab["total"], "total", "동률이면 먼저 나온 표기");
+        assert_eq!(vocab["weight"], "weight");
+        assert_eq!(vocab["vat"], "VAT", "뱅크가 대문자로 쓰는 약어는 대문자 그대로");
+        assert_eq!(fold_label_case("TOTAL WEIGHT", &vocab), "total weight");
+        assert_eq!(fold_label_case("CONSIGNEE VAT/EORI", &vocab), "consignee VAT/EORI");
+        assert_eq!(fold_label_case("SIGNATORY NAME\"", &vocab), "signatory name\"", "뱅크에 없는 단어는 소문자로");
+        assert_eq!(fold_label_case("UNIT WEIGHT (KG) 2", &vocab), "unit weight (kg) 2");
+        // 소문자가 섞인 라벨 · 대소문자가 없는 문자 · 숫자만인 라벨은 그대로입니다.
+        for s in ["Total Weight", "B/L No.", "총중량", "総重量", "123-45", "", "Invoice NUMBER"] {
+            assert_eq!(fold_label_case(s, &vocab), s);
+        }
+    }
+
+    #[test]
+    fn self_reference_phrases_join_the_identity_bank_without_case_duplicates() {
+        let (base, _) = owner_label_bank("ko", "shipping_doc", "doc_number");
+        let (selfref, _) = owner_label_bank("ko", "shipping_doc", "reference_invoice");
+        let (merged, w) = owner_label_bank_for_doc("ko", "shipping_doc", "doc_number", "reference_invoice");
+        assert_eq!(merged.len(), w.len());
+        assert_eq!(&merged[..base.len()], &base[..], "원래 doc_number 구는 앞에 그대로");
+        let lowered: Vec<String> = merged.iter().map(|p| p.to_lowercase()).collect();
+        for p in selfref.iter() {
+            assert!(lowered.contains(&p.to_lowercase()), "참조 축 구 '{p}' 가 doc_number 뱅크에 있어야 합니다");
+        }
+        let unique: std::collections::HashSet<&String> = lowered[base.len()..].iter().collect();
+        assert_eq!(unique.len(), merged.len() - base.len(), "덧붙인 구에 대소문자 중복이 없어야 합니다");
+        // 다른 축 · 자기 참조 축이 없는 서식은 예전 뱅크 그대로입니다.
+        assert_eq!(owner_label_bank_for_doc("ko", "shipping_doc", "amount", "reference_invoice"), owner_label_bank("ko", "shipping_doc", "amount"));
+        assert_eq!(owner_label_bank_for_doc("ko", "shipping_doc", "doc_number", ""), owner_label_bank("ko", "shipping_doc", "doc_number"));
+    }
+}
+
+#[cfg(test)]
+mod purge_timing_tests {
+    //! 🌟 [PURGE MEMO] 라벨 뱅크 실측 크기에서 예전 정화(라벨마다) vs 기억 정화(한 번)의 비용.
+    //! 실행: cargo test --lib -- purge_timing --ignored --nocapture
+    use super::*;
+
+    fn det(n: usize, salt: u64) -> Vec<f32> {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ salt.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "timing: 87축 · 약 2.4천 구 · 384차원 라벨 뱅크의 정화 비용"]
+    fn purge_timing_at_label_bank_scale() {
+        const DIM: usize = 384;
+        let mut banks: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = Vec::new();
+        let mut total = 0usize;
+        for f in 0..87usize {
+            let size = 6 + (f * 37) % 49;
+            total += size;
+            let dir = det(DIM, 1_000 + f as u64);
+            let b: Vec<Vec<f32>> = (0..size)
+                .map(|p| {
+                    let e = det(DIM, (f * 10_000 + p) as u64);
+                    dir.iter().zip(e.iter()).map(|(d, n)| d + 0.8 * n).collect()
+                })
+                .collect();
+            banks.push((format!("field_{f}"), b, vec![1.0; size]));
+        }
+        let label = det(DIM, 424_242);
+
+        let t0 = std::time::Instant::now();
+        let reference = compute_purge_view(&banks);
+        let one_view_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
+        let (_, dropped) = super::purge_memo_tests::purge_reference(&banks);
+        let old_purge_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        let t2 = std::time::Instant::now();
+        for _ in 0..24 {
+            let _ = label_axis_scores_with_view(&label, &banks, &reference);
+        }
+        let score24_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "[PURGE TIMING] 축 {} · 구 {} · {}차원 | 예전 정화 1회(코사인마다 노름 재계산) {:.0}ms | 새 정화 1회(노름 캐시 · 필드 병렬) {:.0}ms | 기억된 정화로 라벨 24개 채점 {:.0}ms | 끈 구 {}개 (참고: 예전 경로는 items 크롭 한 장에서 정화를 약 40번 반복)",
+            banks.len(), total, DIM, old_purge_ms, one_view_ms, score24_ms, dropped.len()
+        );
     }
 }

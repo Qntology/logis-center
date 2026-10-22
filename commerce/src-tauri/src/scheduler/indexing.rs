@@ -338,48 +338,67 @@ pub async fn index_item_chunks(
     //    exclusive_assign_for_indexing 의 position() 은 첫 인덱스만 찾으므로
     //    중복 열은 배정 불가능한 '유령 열' 이 되어 행렬만 부풀립니다.
     let mut seen_field_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // 🌟 [BANK BATCH] 필드마다 get_embedding_batch 를 따로 부르던 것을 한 번의 고정 계층 배치로 묶습니다.
+    //
+    //  ── 실측 ──
+    //   무역 서식 87필드면 호출이 87번이고, 대부분 '요청 11건 | 캐시 적중 10건 | 실연산 1건' 처럼
+    //   한두 구만 새로 계산합니다. CUDA 의 고정 모양 배치는 1건이라도 마이크로배치 하나(약 1천 토큰)를
+    //   통째로 돌리므로, 실토큰 12개에 연산토큰 1020개 · 호출당 30~150ms 가 필드 수만큼 쌓였습니다.
+    //
+    //  ── 해결 ──
+    //   필드별 구 목록을 먼저 다 만든 뒤 한 번에 임베딩하고(배치 안 중복은 한 벌로 접힘) 필드별로 다시 나눕니다.
+    //   이 구들은 bias.json 다국어 라벨 · 브리지 구라 문서와 무관하므로 고정 계층에 둡니다.
+    //   필드 순서 · 구 순서 · 가중치 · 빈 뱅크의 0벡터 자리 표시는 예전 루프와 같습니다.
+    let mut field_phrases: Vec<(String, Vec<String>, Vec<f32>)> = Vec::new();
     for (fname, _, bias_target, _) in &fields {
         if !seen_field_names.insert(fname.clone()) {
             continue;
         }
+        if !needs_discovery_bank {
+            field_phrases.push((fname.clone(), Vec::new(), Vec::new()));
+            continue;
+        }
+        let (mut phrases, mut weights_inner) =
+            crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
+        let (ml_ph, ml_wt) =
+            crate::utils::ai_utils::label_phrase_bank_multilingual(doc_lang, page_type, fname);
+        for (p, w) in ml_ph.into_iter().zip(ml_wt.into_iter()) {
+            if phrases.iter().any(|e| e.eq_ignore_ascii_case(&p)) { continue; }
+            phrases.push(p);
+            weights_inner.push(w);
+        }
+        let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
+        for p in bridge_ph {
+            if phrases.iter().any(|e| e == &p) { continue; }
+            phrases.push(p);
+            weights_inner.push(1.0);
+        }
+        field_phrases.push((fname.clone(), phrases, weights_inner));
+    }
+    let all_phrases: Vec<String> = field_phrases.iter().flat_map(|(_, p, _)| p.iter().cloned()).collect();
+    let mut all_embs: std::collections::VecDeque<Vec<f32>> = if all_phrases.is_empty() {
+        std::collections::VecDeque::new()
+    } else {
+        model.get_embedding_batch_pinned(all_phrases.clone()).await
+            .unwrap_or_else(|_| vec![vec![0.0; 384]; all_phrases.len()])
+            .into()
+    };
+    for (fname, phrases, weights_inner) in field_phrases.into_iter() {
         let phrase_embs = if !needs_discovery_bank {
             Vec::new()
+        } else if phrases.is_empty() {
+            vec![vec![0.0f32; 384]]
         } else {
-            let (mut phrases, mut weights_inner) =
-                crate::utils::ai_utils::split_bias_phrases_weighted_full(bias_target);
-            let (ml_ph, ml_wt) =
-                crate::utils::ai_utils::label_phrase_bank_multilingual(doc_lang, page_type, fname);
-            for (p, w) in ml_ph.into_iter().zip(ml_wt.into_iter()) {
-                if phrases.iter().any(|e| e.eq_ignore_ascii_case(&p)) { continue; }
-                phrases.push(p);
-                weights_inner.push(w);
-            }
-            let bridge_ph = crate::utils::ai_utils::abstract_bridge_field_phrases(fname);
-            for p in bridge_ph {
-                if phrases.iter().any(|e| e == &p) { continue; }
-                phrases.push(p);
-                weights_inner.push(1.0);
-            }
-            let embs = if phrases.is_empty() {
-                vec![vec![0.0f32; 384]]
-            } else {
-                model.get_embedding_batch(phrases.clone()).await
-                    .unwrap_or_else(|_| vec![vec![0.0; 384]; phrases.len()])
-            };
-            idx_field_phrase_weights.push(weights_inner);
-            embs
+            (0..phrases.len()).map(|_| all_embs.pop_front().unwrap_or_else(|| vec![0.0; 384])).collect()
         };
-        if !needs_discovery_bank {
-            idx_field_phrase_weights.push(Vec::new());
-        }
+        // 🌟 weights 는 names 와 같은 인덱스로 하나씩만 넣습니다. 어긋나면 weighted_max_pool_sim 이
+        //    다른 필드의 가중치를 읽게 됩니다. (발견 모드 청크가 없으면 빈 가중치)
+        idx_field_phrase_weights.push(weights_inner);
 
-        let fmt_str = crate::nl_convert::field_format_to_string(fname);
+        let fmt_str = crate::nl_convert::field_format_to_string(&fname);
 
-        idx_field_names.push(fname.clone());
+        idx_field_names.push(fname);
         idx_field_phrase_embs.push(phrase_embs);
-        // 🌟 weights 는 위 분기에서 이미 push 되었습니다. 여기서 다시 push 하면
-        //    names 와 weights 의 인덱스가 어긋나 weighted_max_pool_sim 이
-        //    다른 필드의 가중치를 읽게 됩니다.
         idx_field_formats.push(fmt_str);
     }
 

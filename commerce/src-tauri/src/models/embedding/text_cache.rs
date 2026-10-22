@@ -460,3 +460,286 @@ pub fn forward_tag(device: &Device) -> &'static str {
 pub fn space_for(dir: &Path, device: &Device) -> u64 {
     space_id(fingerprint_for(dir, device_class(device)), forward_tag(device))
 }
+
+// =====================================================================
+// 🌟 [EMBED-CACHE / DISK CHECKPOINT] 고정 계층(뱅크 구)을 공간별 파일로 남겨 다음 실행에서 복원합니다.
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   SigLIP2 구(anchors.bin) · ViT 임베딩(VISION-CACHE) · 음역은 디스크에 남는데 granite 텍스트
+//   임베딩은 프로세스 안에서만 살아서, 앱을 켤 때마다 bias.json 뱅크를 처음부터 다시 임베딩했습니다.
+//   (무역 라벨 뱅크 2391구 = 200건 × 12회 ≈ 3.5초, 커머스 속성·필터·동사·프로브 뱅크 수 초)
+//
+//  ── 해결 ──
+//   고정 계층에 새로 들어간 엔트리를 공간 id(모델 지문 + 순전파 태그) 별 파일에 덧붙이고, 그 공간을
+//   처음 조회할 때 한 번 복원합니다. 고정 계층은 '질의와 무관한 bias.json 뱅크 구 전용' 이라는 계약이라
+//   문서 내용이 디스크에 남지 않습니다. 공간 id 에 모델 파일 크기·수정시각 · 장치 계열 · 순전파 경로가
+//   들어 있어 모델이나 경로가 바뀌면 다른 파일을 보므로 옛 벡터가 섞이지 않습니다.
+//   복원한 벡터는 '같은 공간에서 처음 계산된 벡터' 이므로 프로세스 안 캐시와 의미가 같습니다.
+//
+//  ── 파일 형식 (덧붙이기 전용) ──
+//   머리: magic "GTXT" u32 · version u32 · 0 u64
+//   레코드: 텍스트 길이 u32 · 텍스트 UTF-8 · 차원 u32 · f32 × 차원 · 검사합 u64(텍스트 + 벡터 바이트 FNV-1a)
+//   검사합이 어긋나거나 잘린 꼬리를 만나면 거기서 멈추고, 성한 앞부분만으로 파일을 다시 씁니다.
+// =====================================================================
+
+const DISK_MAGIC: u32 = 0x4754_5854; // "GTXT"
+const DISK_VERSION: u32 = 1;
+const DISK_HEAD: usize = 16;
+
+/// `LOGIS_EMBED_DISK_CACHE=0` 이면 디스크 체크포인트를 쓰지 않습니다(프로세스 안 캐시만).
+fn disk_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("LOGIS_EMBED_DISK_CACHE") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        Err(_) => true,
+    })
+}
+
+#[derive(Default)]
+struct DiskSpace {
+    restored: bool,
+    keys: std::collections::HashSet<String>,
+}
+
+static DISK: Lazy<Mutex<HashMap<u64, DiskSpace>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn disk_path(space: u64) -> PathBuf {
+    crate::utils::get_app_dir()
+        .join("cache")
+        .join("granite_text")
+        .join(format!("{:016x}.bin", space))
+}
+
+fn record_checksum(text: &[u8], vec: &[f32]) -> u64 {
+    let mut h = fnv1a(FNV_OFFSET, text);
+    for x in vec {
+        h = fnv1a(h, &x.to_le_bytes());
+    }
+    h
+}
+
+/// 파일의 성한 레코드를 읽습니다. (레코드들, 성한 바이트 길이, 꼬리가 깨졌는지)
+pub fn read_disk_records(path: &Path) -> (Vec<(String, Vec<f32>)>, usize, bool) {
+    let buf = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return (Vec::new(), 0, false),
+    };
+    if buf.len() < DISK_HEAD {
+        return (Vec::new(), 0, !buf.is_empty());
+    }
+    let u32_at = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+    if u32_at(0) != DISK_MAGIC || u32_at(4) != DISK_VERSION {
+        return (Vec::new(), 0, true);
+    }
+    let mut out: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut off = DISK_HEAD;
+    let mut broken = false;
+    while off < buf.len() {
+        let parsed = (|| -> Option<(String, Vec<f32>, usize)> {
+            let mut o = off;
+            if o + 4 > buf.len() { return None; }
+            let tl = u32_at(o) as usize;
+            o += 4;
+            if o + tl > buf.len() { return None; }
+            let text = std::str::from_utf8(&buf[o..o + tl]).ok()?.to_string();
+            o += tl;
+            if o + 4 > buf.len() { return None; }
+            let dim = u32_at(o) as usize;
+            o += 4;
+            if dim == 0 || dim > 65_536 || o + dim * 4 + 8 > buf.len() { return None; }
+            let vec: Vec<f32> = (0..dim)
+                .map(|k| {
+                    let p = o + k * 4;
+                    f32::from_le_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]])
+                })
+                .collect();
+            o += dim * 4;
+            let mut ck = [0u8; 8];
+            ck.copy_from_slice(&buf[o..o + 8]);
+            o += 8;
+            if u64::from_le_bytes(ck) != record_checksum(text.as_bytes(), &vec) { return None; }
+            Some((text, vec, o))
+        })();
+        match parsed {
+            Some((text, vec, next)) => {
+                out.push((text, vec));
+                off = next;
+            }
+            None => {
+                broken = true;
+                break;
+            }
+        }
+    }
+    (out, off, broken)
+}
+
+fn encode_disk_records(items: &[(String, Arc<[f32]>)]) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    for (text, vec) in items {
+        let t = text.as_bytes();
+        buf.extend_from_slice(&(t.len() as u32).to_le_bytes());
+        buf.extend_from_slice(t);
+        buf.extend_from_slice(&(vec.len() as u32).to_le_bytes());
+        for x in vec.iter() {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+        buf.extend_from_slice(&record_checksum(t, vec).to_le_bytes());
+    }
+    buf
+}
+
+fn disk_head() -> Vec<u8> {
+    let mut h = Vec::with_capacity(DISK_HEAD);
+    h.extend_from_slice(&DISK_MAGIC.to_le_bytes());
+    h.extend_from_slice(&DISK_VERSION.to_le_bytes());
+    h.extend_from_slice(&0u64.to_le_bytes());
+    h
+}
+
+/// 레코드를 파일 끝에 덧붙입니다(파일이 없으면 머리부터 씁니다).
+pub fn append_disk_records(path: &Path, items: &[(String, Arc<[f32]>)]) -> std::io::Result<()> {
+    use std::io::Write;
+    if items.is_empty() {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let is_new = std::fs::metadata(path).map(|m| m.len() == 0).unwrap_or(true);
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut buf = if is_new { disk_head() } else { Vec::new() };
+    buf.extend_from_slice(&encode_disk_records(items));
+    f.write_all(&buf)
+}
+
+/// 이 공간의 고정 계층을 디스크에서 한 번 복원합니다. 복원해 넣은 건수를 돌려줍니다.
+pub fn restore_pinned(space: u64) -> usize {
+    if !disk_enabled() {
+        return 0;
+    }
+    let mut disk = DISK.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = disk.entry(space).or_default();
+    if entry.restored {
+        return 0;
+    }
+    entry.restored = true;
+    let path = disk_path(space);
+    let (records, good_len, broken) = read_disk_records(&path);
+    if broken {
+        // 잘린 꼬리 뒤에 덧붙이면 그 뒤 레코드는 영영 읽히지 않으므로 성한 앞부분만으로 다시 씁니다.
+        let items: Vec<(String, Arc<[f32]>)> = records
+            .iter()
+            .map(|(t, v)| (t.clone(), Arc::from(v.as_slice())))
+            .collect();
+        let mut bytes = disk_head();
+        bytes.extend_from_slice(&encode_disk_records(&items));
+        let tmp = path.with_extension("bin.tmp");
+        let ok = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)).is_ok();
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&path);
+        }
+        println!(
+            "[EMBED-CACHE] 🩹 [DISK CHECKPOINT] {} 의 꼬리가 깨져 있어 성한 레코드 {}건({}바이트)만 남겼습니다.",
+            path.display(),
+            records.len(),
+            good_len
+        );
+    }
+    if records.is_empty() {
+        return 0;
+    }
+    let mut items: Vec<(String, Arc<[f32]>)> = Vec::with_capacity(records.len());
+    for (t, v) in records.into_iter() {
+        entry.keys.insert(t.clone());
+        items.push((t, Arc::from(v.as_slice())));
+    }
+    drop(disk);
+    let n = items.len();
+    let inserted = GRANITE_TEXT_CACHE.insert_many(space, items, true);
+    println!(
+        "[EMBED-CACHE] 💽 [DISK CHECKPOINT] 뱅크 구 {}건을 디스크에서 복원했습니다 (새로 적재 {}건) | {}",
+        n,
+        inserted,
+        path.display()
+    );
+    inserted
+}
+
+/// 고정 계층에 있는 뱅크 구 중 디스크에 아직 없는 것을 덧붙입니다.
+/// (새로 계산된 구뿐 아니라 LRU 에서 고정으로 승격된 구도 함께 남깁니다)
+pub fn persist_pinned<'a, I>(space: u64, items: I)
+where
+    I: IntoIterator<Item = (&'a str, &'a [f32])>,
+{
+    if !disk_enabled() {
+        return;
+    }
+    let fresh: Vec<(String, Arc<[f32]>)> = {
+        let mut disk = DISK.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = disk.entry(space).or_default();
+        let mut fresh: Vec<(String, Arc<[f32]>)> = Vec::new();
+        for (t, v) in items {
+            if entry.keys.len() >= DEFAULT_PINNED_CAP {
+                break;
+            }
+            if entry.keys.contains(t) || !is_cacheable(v) || !GRANITE_TEXT_CACHE.is_pinned(space, t) {
+                continue;
+            }
+            entry.keys.insert(t.to_string());
+            fresh.push((t.to_string(), Arc::from(v)));
+        }
+        fresh
+    };
+    if fresh.is_empty() {
+        return;
+    }
+    if let Err(e) = append_disk_records(&disk_path(space), &fresh) {
+        println!("[EMBED-CACHE] ⚠️ [DISK CHECKPOINT] 뱅크 구 {}건 기록 실패(메모리 캐시는 유지): {}", fresh.len(), e);
+    }
+}
+
+#[cfg(test)]
+mod disk_checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn records_roundtrip_and_a_torn_tail_is_cut() {
+        let dir = std::env::temp_dir().join(format!("gtxt_{}_{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+        let path = dir.join("space.bin");
+        let a: Vec<(String, Arc<[f32]>)> = vec![
+            ("issue date".to_string(), Arc::from(vec![0.25f32, -1.5, 3.0].as_slice())),
+            ("발행일".to_string(), Arc::from(vec![1.0f32, 0.0, -0.125].as_slice())),
+        ];
+        append_disk_records(&path, &a).unwrap();
+        append_disk_records(&path, &[("B/L No.".to_string(), Arc::from(vec![9.0f32, 8.0, 7.0].as_slice()))]).unwrap();
+        let (recs, good, broken) = read_disk_records(&path);
+        assert!(!broken);
+        assert_eq!(good as u64, std::fs::metadata(&path).unwrap().len());
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[1].0, "발행일");
+        assert_eq!(recs[2].1, vec![9.0f32, 8.0, 7.0]);
+
+        // 쓰다 끊긴 레코드(꼬리 5바이트만)는 성한 앞부분까지만 읽습니다.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[7, 0, 0, 0, b'x']).unwrap();
+        }
+        let (recs2, good2, broken2) = read_disk_records(&path);
+        assert!(broken2);
+        assert_eq!(recs2.len(), 3);
+        assert_eq!(good2, good);
+
+        // 검사합이 어긋난 레코드도 받아들이지 않습니다.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last_f32 = good - 8 - 4;
+        bytes[last_f32] ^= 0x01;
+        std::fs::write(&path, &bytes[..good]).unwrap();
+        let (recs3, _, broken3) = read_disk_records(&path);
+        assert!(broken3);
+        assert_eq!(recs3.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

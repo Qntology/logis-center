@@ -21,7 +21,51 @@ pub fn load_image_from_base64(base64_data: &str) -> Result<DynamicImage> {
     Ok(img)
 }
 
+// 🌟 [IN-PROCESS IMAGE] 같은 프로세스 안에서 크롭을 생성기로 넘길 때 PNG 왕복을 생략합니다.
+//
+//  ── 실측 ──
+//   비전 크롭 호출은 크롭을 PNG 로 인코딩 → base64 → data URL 로 감싸 넘기고, 프로세서가 다시
+//   base64 → PNG 를 풀었습니다. dev 프로필은 png · miniz_oxide · base64 를 최적화하지 않으므로
+//   2048x1108 크롭 한 장에 인코딩 545ms + 디코딩 93ms (png_roundtrip_tests 실측)가 LLM 호출마다
+//   (문서 1장 약 20회) 들었습니다. PNG 는 무손실이라 화소를 바꾸지도 않는 왕복입니다.
+//
+//  ── 해결 ──
+//   크롭을 프로세스 안 보관소에 맡기고 'mem://<번호>' 주소만 넘깁니다. get_image 는 그 주소면 보관소의
+//   이미지를 그대로 꺼냅니다. 같은 DynamicImage(같은 화소 · 같은 색 형식)라 pixel_values 와
+//   VISION-CACHE 키가 예전과 같습니다. 보관 기간은 호출 하나이며, 가드가 사라지면 함께 지웁니다.
+static MEM_IMAGES: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<u64, DynamicImage>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static MEM_IMAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+const MEM_IMAGE_SCHEME: &str = "mem://";
+
+/// 보관소에서 이미지를 지우는 가드. 생성 호출이 끝날 때까지 들고 있어야 합니다.
+pub struct MemImageGuard {
+    id: u64,
+}
+
+impl Drop for MemImageGuard {
+    fn drop(&mut self) {
+        MEM_IMAGES.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+    }
+}
+
+/// 이미지를 보관소에 맡기고 (get_image 가 읽는 주소, 가드) 를 돌려줍니다.
+pub fn register_mem_image(img: DynamicImage) -> (String, MemImageGuard) {
+    let id = MEM_IMAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    MEM_IMAGES.lock().unwrap_or_else(|e| e.into_inner()).insert(id, img);
+    (format!("{}{}", MEM_IMAGE_SCHEME, id), MemImageGuard { id })
+}
+
 pub fn get_image(file: &str) -> Result<DynamicImage> {
+    if let Some(id) = file.strip_prefix(MEM_IMAGE_SCHEME) {
+        let id: u64 = id.parse().map_err(|_| anyhow!(format!("bad in-process image id: {}", id)))?;
+        return MEM_IMAGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!(format!("in-process image {} is no longer registered", id)));
+    }
     let mut img = None;
     if file.starts_with("http://") || file.starts_with("https://") {
         return Err(anyhow!("HTTP URLs not supported in local mode".to_string()));
@@ -270,5 +314,91 @@ pub fn float_tensor_to_dynamic_image(tensor: &Tensor) -> Result<DynamicImage> {
             Ok(DynamicImage::ImageRgb8(img))
         }
         _ => Err(anyhow!(format!("Unsupported number of channels: {}", c))),
+    }
+}
+#[cfg(test)]
+mod png_roundtrip_tests {
+    //! 🌟 [CROP PNG ROUNDTRIP] 크롭 전송(PNG 인코딩 → base64 → 디코딩)의 비용과 무손실성을 잽니다.
+    //! dev 프로필은 png · miniz_oxide · image 를 최적화하지 않으므로 이 경로가 크롭 호출마다 반복됩니다.
+    //! 실행: cargo test --lib -- png_roundtrip --ignored --nocapture
+    use super::*;
+    use base64::engine::general_purpose::STANDARD;
+
+    /// 흰 바탕에 글자 획 같은 검은 띠가 있는 문서 크롭 모양 이미지 (2048x1108, 실측 header 크롭 크기).
+    fn doc_like(w: u32, h: u32) -> DynamicImage {
+        let mut img = RgbImage::from_pixel(w, h, Rgb([255, 255, 255]));
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for row in (40..h.saturating_sub(40)).step_by(56) {
+            let mut col = 40u32;
+            while col + 30 < w {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let glyph_w = 10 + (x % 18) as u32;
+                for yy in row..(row + 22).min(h) {
+                    for xx in col..(col + glyph_w).min(w) {
+                        if (xx + yy + (x as u32 % 5)) % 3 != 0 {
+                            img.put_pixel(xx, yy, Rgb([20, 20, 30]));
+                        }
+                    }
+                }
+                col += glyph_w + 6 + (x % 11) as u32;
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    fn roundtrip(img: &DynamicImage, fast: bool) -> (f64, f64, usize, DynamicImage) {
+        let t0 = std::time::Instant::now();
+        let mut buf = Cursor::new(Vec::new());
+        if fast {
+            let enc = image::codecs::png::PngEncoder::new_with_quality(
+                &mut buf,
+                image::codecs::png::CompressionType::Fast,
+                image::codecs::png::FilterType::Adaptive,
+            );
+            img.write_with_encoder(enc).unwrap();
+        } else {
+            img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        }
+        let b64 = STANDARD.encode(buf.into_inner());
+        let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        let back = load_image_from_base64(&b64).unwrap();
+        let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        (enc_ms, dec_ms, b64.len(), back)
+    }
+
+    #[test]
+    fn in_process_image_handoff_returns_the_same_pixels_until_the_guard_drops() {
+        let img = doc_like(320, 180);
+        let (url, guard) = register_mem_image(img.clone());
+        assert!(url.starts_with("mem://"));
+        let t0 = std::time::Instant::now();
+        let back = get_image(&url).unwrap();
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(back.color(), img.color());
+        assert_eq!(back.to_rgb8().as_raw(), img.to_rgb8().as_raw());
+        println!("[IN-PROCESS IMAGE] 보관소 조회 {:.2}ms (PNG 왕복 대신)", ms);
+        drop(guard);
+        assert!(get_image(&url).is_err(), "가드가 사라지면 보관소에서도 지워집니다");
+        assert!(get_image("mem://not-a-number").is_err());
+    }
+
+    #[test]
+    #[ignore = "timing: dev 프로필의 크롭 PNG 왕복 비용 측정"]
+    fn png_roundtrip_cost_and_losslessness() {
+        let img = doc_like(2048, 1108);
+        for fast in [false, true] {
+            let (enc, dec, bytes, back) = roundtrip(&img, fast);
+            assert_eq!(back.to_rgb8().as_raw(), img.to_rgb8().as_raw(), "PNG 는 무손실이어야 합니다");
+            println!(
+                "[CROP PNG ROUNDTRIP] {} | 인코딩+base64 {:.0}ms | base64+디코딩 {:.0}ms | {:.1} MB",
+                if fast { "Fast 압축" } else { "기본 압축(현행)" },
+                enc,
+                dec,
+                bytes as f64 / 1e6
+            );
+        }
     }
 }

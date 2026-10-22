@@ -2078,7 +2078,9 @@ async fn extract_continuation_page(
     if labels.is_empty() {
         return Ok(out);
     }
-    let leaf_embs = model.get_embedding_batch(leafs.clone()).await
+    // 🌟 [LABEL SURFACE] 'measurement_cbm' 같은 식별자 라벨은 단어 표기로 펼쳐 임베딩합니다.
+    let leaf_surfaces: Vec<String> = leafs.iter().map(|l| crate::utils::ai_utils::label_embed_surface(l)).collect();
+    let leaf_embs = model.get_embedding_batch(leaf_surfaces).await
         .unwrap_or_else(|_| vec![vec![0.0; 384]; leafs.len()]);
     let row_index_section: Vec<bool> = sections
         .iter()
@@ -3474,7 +3476,9 @@ pub async fn process_trading_task(
     let mut party_evidence: Option<PartySectionEvidence> = None;
 
     if !unique_labels.is_empty() && !t_field_names.is_empty() {
-        let leaf_embs = model.get_embedding_batch(unique_leaf.clone()).await
+        // 🌟 [LABEL SURFACE] 'measurement_cbm' 같은 식별자 라벨은 단어 표기로 펼쳐 임베딩합니다.
+        let leaf_surfaces: Vec<String> = unique_leaf.iter().map(|l| crate::utils::ai_utils::label_embed_surface(l)).collect();
+        let leaf_embs = model.get_embedding_batch(leaf_surfaces).await
             .unwrap_or_else(|_| vec![vec![0.0; 384]; unique_leaf.len()]);
         let section_texts: Vec<String> = unique_section.iter()
             .map(|s| if s.is_empty() { " ".to_string() } else { s.clone() })
@@ -3869,7 +3873,7 @@ pub async fn process_trading_task(
                 }
                 let pair_val = if f_multi { &phrase_multi[h] } else { &phrase_single[h] };
                 if pair_val.trim().is_empty()
-                    || !crate::utils::ai_utils::value_matches_format(f_fmt, pair_val) {
+                    || !crate::utils::ai_utils::field_value_matches(&t_field_names[f], f_fmt, pair_val) {
                     emit_term(&format!("    🚫 [TRADING VALUE FORMAT GATE] '{}' → '{}' ({:?}) | 값 \"{}\" 형식 불일치",
                         unique_labels[h], t_field_names[f], f_fmt, pair_val));
                     crate::utils::score_dynamics::record_field_reject(
