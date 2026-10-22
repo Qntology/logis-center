@@ -22,7 +22,7 @@ pub mod relay_ledger;
 pub mod trading;
 pub mod list_census;
 
-use crate::scheduler::translit::{generate_transliteration_aliases, transliterate_cross_language};
+use crate::scheduler::translit::generate_transliteration_aliases;
 use crate::scheduler::indexing::{upsert_alias_chunks, index_item_chunks, save_item};
 use crate::scheduler::trading::process_trading_task;
 use crate::utils::logger::log_task_progress;
@@ -9370,7 +9370,7 @@ pub async fn process_task(
 
         log_task_progress(app_handle, &task.id, &json!({ "category": "Handover", "summary": "Switching to Embedding model...", "spinner": "⠋" }));
 
-        let kept_lang = if crate::model::lang_llm::translit_demand(&extracted_data) > 0 {
+        let kept_lang = if crate::model::lang_llm::translit_demand(&extracted_data, &doc_lang) > 0 {
             model.deep_purge_keep_lang(&doc_lang).await
         } else {
             model.deep_purge_resources().await;
@@ -9394,7 +9394,7 @@ pub async fn process_task(
 
     {
         emit_term("[Scheduler] 🔤 Preparing crossover for synonym expansion...");
-        let translit_demand = crate::model::lang_llm::translit_demand(&extracted_data);
+        let translit_demand = crate::model::lang_llm::translit_demand(&extracted_data, &doc_lang);
         let (translit_engine, translit_status) = crate::model::lang_llm::await_engine(
             &doc_lang,
             app_handle,
@@ -10337,7 +10337,7 @@ pub async fn process_task(
                 }
             }
             if !translit_pending.is_empty() && !cancellation_token.load(Ordering::Relaxed) {
-                let read = crate::scheduler::translit::run_deferred_second_reads(
+                let read = crate::scheduler::translit::run_multilingual_reads(
                     &model,
                     &translit_pending,
                     &doc_lang,
@@ -10387,7 +10387,7 @@ pub async fn process_task(
                 }
                 crate::utils::score_dynamics::record_baseline("indexing.translit_deferred_alias", late_saved as f32);
                 emit_term(&format!(
-                    "  🧩 [TRANSLIT SECOND READ / LATE ALIAS] 대기열 값 {}건 · 대상 청크 {}개 → 별칭 {}개를 아이템 {}개에 더 저장했습니다. 원본 청크와 1차 별칭은 아이템마다 이미 저장되어 있고, 여기서는 Qwen3.5-2B 가 읽은 문서 언어 표기만 더합니다.",
+                    "  🧩 [TRANSLIT MULTILINGUAL / LATE ALIAS] 다국어 대기열 값 {}건 · 대상 청크 {}개 → 별칭 {}개를 아이템 {}개에 더 저장했습니다. 원본 청크와 1차 별칭(any_ascii 로마자)은 아이템마다 이미 저장되어 있고, 여기서는 Qwen3.5-2B 가 읽은 문서 언어 표기만 더합니다.",
                     translit_pending.len(),
                     translit_slots.len(),
                     late_saved,

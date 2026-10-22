@@ -283,8 +283,11 @@ impl EmbeddingModel {
         if exact {
             // ① 정확한 길이 버킷(L ≤ exact_len_max): 마스크 없음, 배치 풀링.
             let hidden = self.model.forward_batch(&input, rows, l, None)?;
+            // 🌟 [EMBED-FORWARD] CLS 풀링 판본은 첫 토큰만 풉니다(Legacy 는 l 그대로라 예전과 같은 연산).
+            let take = self.pooled_len(l);
+            let hidden = if take == l { hidden } else { hidden.narrow(1, 0, take)? };
             let sum = hidden.sum(1)?; // [rows, H]
-            let mean = (sum / (l as f64))?;
+            let mean = (sum / (take as f64))?;
             let norm = mean.sqr()?.sum_keepdim(1)?.sqrt()?; // [rows, 1]
             let pooled = mean.broadcast_div(&norm)?;
             return Ok(if g == rows { pooled } else { pooled.narrow(0, 0, g)? });
@@ -303,7 +306,7 @@ impl EmbeddingModel {
         // 풀링은 실제 구성원 행마다 실제 길이만큼만 (per-text 와 같은 리덕션 길이).
         let mut out = Vec::with_capacity(g);
         for (r, &si) in group.iter().enumerate() {
-            let len = seqs[si].ids.len();
+            let len = self.pooled_len(seqs[si].ids.len());
             let h = hidden.narrow(0, r, 1)?.narrow(1, 0, len)?.contiguous()?;
             out.push(Self::pool_single(&h)?);
         }

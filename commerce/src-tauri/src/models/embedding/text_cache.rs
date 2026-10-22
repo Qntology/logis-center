@@ -433,9 +433,9 @@ pub fn refresh_fingerprint(dir: &Path, class: &'static str) -> u64 {
         .insert((dir.to_path_buf(), class), fp);
     if let Some(old) = old {
         if old != fp {
-            let n = GRANITE_TEXT_CACHE.forget_space(space_id(old, FORWARD_TAG_PER_TEXT))
-                + GRANITE_TEXT_CACHE.forget_space(space_id(old, FORWARD_TAG_BATCHED))
-                + GRANITE_TEXT_CACHE.forget_space(space_id(old, FORWARD_TAG_BATCHED_DYN));
+            let n = GRANITE_TEXT_CACHE.forget_space(space_id_for_mode(old, FORWARD_TAG_PER_TEXT))
+                + GRANITE_TEXT_CACHE.forget_space(space_id_for_mode(old, FORWARD_TAG_BATCHED))
+                + GRANITE_TEXT_CACHE.forget_space(space_id_for_mode(old, FORWARD_TAG_BATCHED_DYN));
             println!(
                 "[EMBED-CACHE] ♻️ 임베딩 모델 파일이 바뀌어 지문이 달라졌습니다. 옛 벡터 {}건을 버립니다.",
                 n
@@ -456,9 +456,18 @@ pub fn forward_tag(device: &Device) -> &'static str {
     }
 }
 
+/// 순전파 판본까지 포함한 태그로 공간 id 를 만듭니다. Legacy 는 예전 태그 그대로라 예전 공간 id 와 같습니다.
+fn space_id_for_mode(fingerprint: u64, tag: &str) -> u64 {
+    match super::forward_mode().tag_suffix() {
+        None => space_id(fingerprint, tag),
+        Some(sfx) => space_id(fingerprint, &format!("{}{}", tag, sfx)),
+    }
+}
+
 /// (모델 디렉터리, 장치) 의 캐시 공간 id.
+/// 🌟 [EMBED-FORWARD] LOGIS_EMBED_FORWARD 로 고른 판본마다 다른 공간입니다(같은 텍스트의 두 벡터가 섞이지 않게).
 pub fn space_for(dir: &Path, device: &Device) -> u64 {
-    space_id(fingerprint_for(dir, device_class(device)), forward_tag(device))
+    space_id_for_mode(fingerprint_for(dir, device_class(device)), forward_tag(device))
 }
 
 // =====================================================================

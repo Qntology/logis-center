@@ -1017,6 +1017,11 @@ pub fn flush() {
 }
 
 fn flush_locked() {
+    // 단위 테스트(cfg(test))는 사용자 앱 데이터 폴더의 원장을 쓰지 않습니다. 테스트 프로세스는 load() 를 거치지 않아
+    // 원장 바탕이 비어 있으므로, 여기서 쓰면 누적된 원장을 테스트 관측만으로 덮어씁니다.
+    if cfg!(test) {
+        return;
+    }
     presence_flush();
     let open: Vec<Ledger> = RUNS.read().map(|r| r.keys().cloned().collect()).unwrap_or_default();
     let mut targets: Vec<Ledger> = Vec::new();
