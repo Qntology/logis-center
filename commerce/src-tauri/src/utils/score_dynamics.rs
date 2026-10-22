@@ -594,12 +594,48 @@ fn legacy_sds_path() -> std::path::PathBuf {
     crate::utils::get_app_dir().join("score_dynamics.json")
 }
 
+/// 🌟 [EMBED SPACE] 원장은 임베딩 공간(granite 순전파 판본)마다 따로 쌓습니다.
+///   예전 순전파 원장은 예전 자리(score_dynamics/*.json)에 그대로 두어 LOGIS_EMBED_FORWARD=legacy 로
+///   되돌려도 그 학습이 남아 있고, 다른 공간은 score_dynamics/spaces/<공간>/ 에 둡니다.
+///   보유 현황(presence.json)은 임베딩과 무관해 공간과 상관없이 하나입니다.
+fn ledger_root() -> std::path::PathBuf {
+    match crate::models::embedding::forward_mode() {
+        crate::models::embedding::ForwardMode::Legacy => sds_dir(),
+        mode => sds_dir().join("spaces").join(mode.space_tag()),
+    }
+}
+
 fn ledger_path(l: Ledger) -> std::path::PathBuf {
-    sds_dir().join(l.file_name())
+    ledger_root().join(l.file_name())
 }
 
 fn runs_dir(l: Ledger) -> std::path::PathBuf {
-    sds_dir().join("runs").join(l.as_str())
+    ledger_root().join("runs").join(l.as_str())
+}
+
+/// 새 공간의 원장이 아직 없으면 예전 순전파 원장을 한 번 복사해 씨앗으로 씁니다. 코사인은 COS CALIBRATION 으로
+/// 예전 눈금에 맞춰 두었으니 기준선이 그대로 쓸 만하고, 혼동 사전의 승자는 텍스트의 뜻에서 나온 사실이라
+/// 공간과 무관합니다. 이후로는 두 공간이 따로 자랍니다.
+fn seed_space_ledgers() {
+    let root = ledger_root();
+    if root == sds_dir() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&root);
+    for l in Ledger::all() {
+        let (src, dst) = (sds_dir().join(l.file_name()), root.join(l.file_name()));
+        if dst.exists() || !src.exists() {
+            continue;
+        }
+        match std::fs::copy(&src, &dst) {
+            Ok(_) => println!(
+                "[SDS] 🌱 [EMBED SPACE SEED] '{}' 원장을 예전 순전파 원장에서 복사해 시작합니다 ({}).",
+                l.as_str(),
+                dst.display()
+            ),
+            Err(e) => println!("[SDS] ⚠️ [EMBED SPACE SEED] '{}' 원장 복사 실패({}). 빈 원장으로 시작합니다.", l.as_str(), e),
+        }
+    }
 }
 
 fn presence_path() -> std::path::PathBuf {
@@ -780,6 +816,7 @@ pub fn load(team: &str) {
     let dir = sds_dir();
     let _ = std::fs::create_dir_all(&dir);
     archive_legacy_ledger(team);
+    seed_space_ledgers();
 
     let mut loaded = 0usize;
     let mut scopes_total = 0usize;
@@ -850,8 +887,8 @@ pub fn load(team: &str) {
     }
     for l in Ledger::all() { mark_dirty(l); }
     flush_locked();
-    println!("[SDS] 📍 원장 디렉터리: {}", sds_dir().display());
-    println!("[SDS] 📍 실행별 파일: {}", sds_dir().join("runs").join("<종류>").join("<시작시각>_<라벨>.json").display());
+    println!("[SDS] 📍 원장 디렉터리: {}", ledger_root().display());
+    println!("[SDS] 📍 실행별 파일: {}", ledger_root().join("runs").join("<종류>").join("<시작시각>_<라벨>.json").display());
 }
 
 fn archive_legacy_ledger(team: &str) {
