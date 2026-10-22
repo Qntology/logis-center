@@ -565,7 +565,58 @@ pub fn prefetch(doc_lang: &str, app: &tauri::AppHandle, task_id: &str) -> Option
     Some(line)
 }
 
-pub fn translit_demand(item: &Value) -> usize {
+/// 🌟 [TRANSLIT ENGINE / VALUE] 음차할 값 하나를 언어별 4B 로 읽을지, 다국어 2B 로 읽을지 가립니다.
+///
+///  ── 왜 값마다 가르나 ──
+///   언어별 4B(alphaedge-ai · 어휘 16,384)는 영어 기반에 문서 언어 하나를 더한 모델이라, 영어 단어를 문서 언어로
+///   옮기는 두 언어 음차는 2B 보다 가볍고(임베딩 84MB vs 1,017MB) 정확합니다. 예전에는 모든 값을 4B 로 읽고
+///   게이트를 못 넘은 값만 2B 로 다시 읽었는데(SECOND READ), 그 2B 적재가 이미지 문서 한 건에 11초를 넘겼고
+///   단일 언어 값에서는 2B 가 4B 보다 낫다는 근거가 없었습니다('Shorts' → 2B '스카우트' 도 발음 게이트에서 폐기).
+///   그래서 엔진은 '4B 가 틀렸는가' 가 아니라 '값에 몇 개 언어가 섞였는가' 로 정합니다.
+///
+///  ── 무엇을 제3 언어로 보나 (LLM 이 실제로 읽는 글자만) ──
+///   ① 문서 언어로 옮길 라틴 단어에 영어 알파벳 밖의 라틴 글자(é ü ñ ß ø …)가 있음 — 영어가 아닌 라틴 언어의 발음입니다.
+///      문서 언어가 라틴 문자이면 그 글자는 문서 언어 자신의 것일 수 있어 보지 않습니다.
+///   ② 비라틴 단어 중 any_ascii 로 읽지 못해 LLM 에 맡길 단어가 문서 언어도 라틴도 아닌 문자 체계입니다.
+///      any_ascii 로 읽히는 비라틴 단어(키릴 · 가나 …)는 LLM 이 보지 않으므로 4B 를 막지 않습니다.
+///   돌려주는 값은 2B 로 보내는 이유이고, None 이면 4B 하나로 끝냅니다.
+pub fn translit_third_language(src: &str, doc_lang: &str) -> Option<String> {
+    let native = native_scripts(doc_lang);
+    let (non_latin, latin) = crate::nl_convert::split_words_by_script(src);
+    if !native.contains(&ScriptKind::Latin) {
+        let mut accented: Vec<char> = Vec::new();
+        for c in latin.iter().flat_map(|w| w.chars()) {
+            if !c.is_ascii() && script_kind(c) == Some(ScriptKind::Latin) && !accented.contains(&c) {
+                accented.push(c);
+            }
+        }
+        if !accented.is_empty() {
+            return Some(format!(
+                "영어 알파벳 밖의 라틴 글자 '{}' 가 있어 영어가 아닌 라틴 언어의 발음입니다",
+                accented.iter().collect::<String>()
+            ));
+        }
+    }
+    if !non_latin.is_empty()
+        && crate::nl_convert::try_any_ascii_transliteration(&non_latin.join(" ")).is_none()
+        && crate::nl_convert::try_any_ascii_transliteration_words(&non_latin).is_none()
+    {
+        let foreign: std::collections::BTreeSet<ScriptKind> = non_latin
+            .iter()
+            .flat_map(|w| w.chars())
+            .filter_map(script_kind)
+            .filter(|k| *k != ScriptKind::Latin && !native.contains(k))
+            .collect();
+        if !foreign.is_empty() {
+            return Some(format!("any_ascii 로 읽지 못한 제3 문자 체계 {:?} 가 있습니다", foreign));
+        }
+    }
+    None
+}
+
+/// 이 아이템에서 언어별 4B 가 음차할 값의 수. 제3 언어가 섞인 값은 다국어 2B 가 맡으므로 세지 않습니다
+/// (그런 값만 있는 문서는 4B 다운로드를 기다리거나 4B 를 음차 단계까지 붙잡아 둘 이유가 없습니다).
+pub fn translit_demand(item: &Value, doc_lang: &str) -> usize {
     fn skip_key(k: &str) -> bool {
         let l = k.to_lowercase();
         l == "id" || l == "link" || l == "index" || l == "type" || l == "detail" || l == "digest"
@@ -574,7 +625,7 @@ pub fn translit_demand(item: &Value) -> usize {
             || l.starts_with("rel_") || l.starts_with("reference_") || l.starts_with('_')
             || l.contains("insight") || l.contains("summary") || l.contains("analysis")
     }
-    fn walk(v: &Value, out: &mut usize) {
+    fn walk(v: &Value, doc_lang: &str, out: &mut usize) {
         match v {
             Value::Object(m) => {
                 for (k, x) in m.iter() {
@@ -593,25 +644,27 @@ pub fn translit_demand(item: &Value) -> usize {
                                 continue;
                             }
                             let (_, latin) = crate::nl_convert::split_words_by_script(t);
-                            if latin.iter().any(|w| w.chars().filter(|c| c.is_ascii_alphabetic()).count() >= 2) {
+                            if latin.iter().any(|w| w.chars().filter(|c| c.is_ascii_alphabetic()).count() >= 2)
+                                && translit_third_language(t, doc_lang).is_none()
+                            {
                                 *out += 1;
                             }
                         }
-                        Value::Array(_) | Value::Object(_) => walk(x, out),
+                        Value::Array(_) | Value::Object(_) => walk(x, doc_lang, out),
                         _ => {}
                     }
                 }
             }
             Value::Array(a) => {
                 for x in a.iter() {
-                    walk(x, out);
+                    walk(x, doc_lang, out);
                 }
             }
             _ => {}
         }
     }
     let mut n = 0usize;
-    walk(item, &mut n);
+    walk(item, doc_lang, &mut n);
     n
 }
 
@@ -1952,4 +2005,46 @@ pub fn normalize_lang_json(raw: &str, expected: &[String]) -> (String, Vec<(Stri
     let fixed = if expected.is_empty() { Vec::new() } else { repair_json_keys(&mut v, expected) };
     let text = serde_json::to_string(&v).unwrap_or_else(|_| raw.to_string());
     (text, fixed)
+}
+
+
+#[cfg(test)]
+mod translit_engine_tests {
+    //! 🌟 [TRANSLIT ENGINE / VALUE] 값마다 언어별 4B · 다국어 2B 를 가르는 규칙.
+    use super::*;
+
+    #[test]
+    fn english_and_the_document_language_stay_on_the_language_model() {
+        for (v, lang) in [
+            ("Goods Sold", "ko"),
+            ("360 Footwear", "ko"),
+            ("T-Shirt", "korean"),
+            ("삼성 Electronics", "ko"),
+            ("John Smith", "ja"),
+        ] {
+            assert_eq!(translit_third_language(v, lang), None, "'{}' ({})", v, lang);
+        }
+    }
+
+    #[test]
+    fn a_third_language_goes_to_the_multilingual_model() {
+        for (v, lang) in [("Müller GmbH", "ko"), ("Nestlé Korea", "korean"), ("Société Générale", "ja")] {
+            assert!(translit_third_language(v, lang).is_some(), "'{}' ({})", v, lang);
+        }
+        // 문서 언어가 라틴 문자면 악센트는 그 언어 자신의 글자일 수 있습니다.
+        assert_eq!(translit_third_language("Société Générale", "fr"), None);
+        // any_ascii 로 읽히는 키릴 단어는 LLM 이 보지 않으므로 4B 를 막지 않습니다(LLM 은 'Trading' 만 읽습니다).
+        assert_eq!(translit_third_language("Москва Trading", "ko"), None);
+    }
+
+    #[test]
+    fn demand_counts_only_values_the_language_model_reads() {
+        let item = json!({
+            "description": "T-Shirt",
+            "maker": "Müller GmbH",
+            "origin": "독일",
+            "hs_code": "6109100000"
+        });
+        assert_eq!(translit_demand(&item, "ko"), 1);
+    }
 }

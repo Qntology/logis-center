@@ -1600,8 +1600,31 @@ fn merge_trading_page_map(
         folded
     }
 
+    // 🌟 [SECTION CARRY] 연속 페이지 첫머리 줄(앞 페이지 마지막 섹션의 값)은 지금까지 쌓인 마지막 행의 빈 칸을 채웁니다.
+    //    새 행으로 붙이면 한 품목의 값이 두 행으로 갈라지고, 다른 품목 행에 섞이면 값이 틀립니다.
+    if let Some(carry) = source.get(CARRY_ROWS_KEY).and_then(|v| v.as_object()) {
+        for (arr_key, row) in carry.iter() {
+            let row = match row.as_object() { Some(r) => r, None => continue };
+            let entry = target.entry(arr_key.clone()).or_insert_with(|| json!([]));
+            if !entry.is_array() { *entry = json!([]); }
+            if let Some(arr) = entry.as_array_mut() {
+                match arr.last_mut().and_then(|v| v.as_object_mut()) {
+                    Some(last) => {
+                        for (k, v) in row.iter() {
+                            if is_empty_val(v) { continue; }
+                            let need = last.get(k).map_or(true, |cur| is_empty_val(cur));
+                            if need { last.insert(k.clone(), v.clone()); }
+                        }
+                    }
+                    None => arr.push(Value::Object(row.clone())),
+                }
+            }
+        }
+    }
+
     for (cat, src_val) in source {
-        
+        if cat == CARRY_ROWS_KEY { continue; }
+
         if let Some(src_arr) = src_val.as_array() {
             let entry = target.entry(cat.clone()).or_insert_with(|| json!([]));
             if !entry.is_array() { *entry = json!([]); }
@@ -1978,6 +2001,137 @@ fn pdf_page_to_structured_html(page_text: &str) -> (String, usize) {
     (format!("<table>\n{}</table>", rows), pair_cnt)
 }
 
+/// 🌟 [TRADE LABEL BANKS] 첫 페이지 PLINKO 와 연속 페이지가 같은 라벨 · 편견 뱅크를 쓰도록 한 곳에서 만듭니다.
+struct TradeLabelBanks {
+    names: Vec<String>,
+    label_texts: Vec<Vec<String>>,
+    label_weights: Vec<Vec<f32>>,
+    label_embs: Vec<Vec<Vec<f32>>>,
+    prej_raw: Vec<Vec<Vec<f32>>>,
+    prej_embs: Vec<Vec<Vec<f32>>>,
+}
+
+/// 뱅크의 텍스트 부분(필드 · 라벨 구 · 가중치 · 편견 구 · 보강표 적용 필드 수).
+struct TradeLabelBankTexts {
+    names: Vec<String>,
+    label_texts: Vec<Vec<String>>,
+    label_weights: Vec<Vec<f32>>,
+    prej_texts: Vec<Vec<String>>,
+    supplemented: usize,
+}
+
+fn trade_label_bank_texts(
+    doc_lang: &str,
+    doc_type: &str,
+    trade_fields: &[(String, String, String, String)],
+) -> TradeLabelBankTexts {
+    let mut t = TradeLabelBankTexts {
+        names: Vec::new(),
+        label_texts: Vec::new(),
+        label_weights: Vec::new(),
+        prej_texts: Vec::new(),
+        supplemented: 0,
+    };
+    for (fname, _, _, _) in trade_fields {
+        let (lp, lw) = crate::model::merge::owner_label_bank(doc_lang, doc_type, fname);
+        if lp.is_empty() { continue; }
+        if !crate::logic::trade_label_supplement(fname).is_empty() { t.supplemented += 1; }
+        let pp = crate::utils::ai_utils::prejudice_phrase_bank_multilingual(doc_lang, doc_type, fname);
+        t.names.push(fname.clone());
+        t.label_texts.push(lp);
+        t.label_weights.push(lw);
+        t.prej_texts.push(pp);
+    }
+    t
+}
+
+async fn build_trade_label_banks(
+    model: &LogisModel,
+    doc_lang: &str,
+    doc_type: &str,
+    trade_fields: &[(String, String, String, String)],
+    emit_term: &(dyn Fn(&str) + Send + Sync),
+    verbose: bool,
+) -> TradeLabelBanks {
+    let texts = trade_label_bank_texts(doc_lang, doc_type, trade_fields);
+    let label_embs: Vec<Vec<Vec<f32>>> = model.ship_embed_phrase_groups(&texts.label_texts).await;
+    let prej_raw: Vec<Vec<Vec<f32>>> = model.ship_embed_phrase_groups(&texts.prej_texts).await;
+    finish_trade_label_banks(texts, label_embs, prej_raw, emit_term, verbose)
+}
+
+/// 임베딩된 뱅크에서 편견 구의 자기오염(자기 대표보다 다른 필드 대표에 가까운 구)을 걸러 마무리합니다.
+fn finish_trade_label_banks(
+    texts: TradeLabelBankTexts,
+    label_embs: Vec<Vec<Vec<f32>>>,
+    prej_raw: Vec<Vec<Vec<f32>>>,
+    emit_term: &(dyn Fn(&str) + Send + Sync),
+    verbose: bool,
+) -> TradeLabelBanks {
+    let TradeLabelBankTexts { names, label_texts, label_weights, prej_texts, supplemented } = texts;
+    emit_term(&format!(
+        "  📖 [TRADING LABEL BANK / ML] 필드 {}개 | 12개 언어 라벨 구 {}개 + 편견 구 {}개를 배치 2회로 임베딩 (다국어 보강표 적용 {}축)",
+        names.len(),
+        label_texts.iter().map(|v| v.len()).sum::<usize>(),
+        prej_texts.iter().map(|v| v.len()).sum::<usize>(),
+        supplemented
+    ));
+
+    let label_heads: Vec<Vec<Vec<f32>>> = label_embs
+        .iter()
+        .map(|bank| {
+            let c = crate::model::merge::bank_centroid(bank);
+            if c.is_empty() { Vec::new() } else { vec![c] }
+        })
+        .collect();
+
+    let mut prej_embs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(names.len());
+    for f in 0..names.len() {
+        let mask = crate::utils::ai_utils::self_poisoned_prejudice_mask(
+            &label_heads[f], &prej_raw[f], &label_heads, f
+        );
+        let mut kept: Vec<Vec<f32>> = Vec::new();
+        let mut dropped = 0usize;
+        for (pi, poisoned) in mask.iter().enumerate() {
+            if *poisoned {
+                dropped += 1;
+                if verbose && dropped <= 4 {
+                    emit_term(&format!("    🧪 [SELF-POISON DROP] '{}' 의 편견 구 '{}' 박탈",
+                        names[f], prej_texts[f].get(pi).cloned().unwrap_or_default()));
+                }
+            } else {
+                kept.push(prej_raw[f][pi].clone());
+            }
+        }
+        if verbose {
+            emit_term(&format!("  🏷️ [TRADING LABEL BANK] '{}' | 라벨 구 {}개 | 편견 구 {}개 (자기오염 {}개 제거)",
+                names[f], label_embs[f].len(), kept.len(), dropped));
+        }
+        prej_embs.push(kept);
+    }
+    TradeLabelBanks { names, label_texts, label_weights, label_embs, prej_raw, prej_embs }
+}
+
+/// 🌟 [CONTINUATION PARITY] 연속 페이지를 첫 페이지 PLINKO 와 같은 규칙으로 배정합니다.
+///
+///  ── 실측 (SR-2026-0820 2페이지) ──
+///   예전 경로는 행렬을 이중 센터링(필드별 페이지 평균 차감)해 여러 라벨에 고르게 맞는 필드를 깎았고,
+///   첫 페이지에 있는 편견 · 열거형 수치 게이트와 수량-단위 분해가 없었습니다. 그 결과
+///   SKU-B200(item_code↔hs_code +0.0071) · 품목 총중량 1000.0 · 문서 총중량 2500.0 이 동률 보류로 사라지고,
+///   total_measurement_cbm "15.0" 은 열거형 payment_terms 로 밀렸다가 폐기됐으며, measurement_cbm "6.0" 은
+///   품목 unit 으로, "20 PLTS" · "2000 PCS" · "50 PLTS" 는 분해 없이 저장됐습니다.
+///   쪽 첫 줄의 measurement_cbm 9.0 은 앞 페이지 [ Item 1 ] 의 값인데 섹션이 없어 문서 수준 라벨로 겨뤘습니다.
+///
+///  ── 무엇을 맞췄나 ──
+///   ① 첫 페이지와 같은 원점수(가중 max-pool) · 바닥 0.50 · 편견 · 형식 · 열거형 수치 게이트 · 중복 라벨의 섹션 보정
+///   ② 행 섹션([ Item N ])마다 따로 배타 배정합니다. 한 품목 행 안에서만 필드가 겹치지 않으면 되기 때문입니다.
+///      동률은 첫 페이지와 같이 혼동 사전의 역사 승자만 받아들입니다.
+///   ③ 이탈 검사를 '행 범위 밖 원시 1위' 까지 넣어 봅니다. 행 섹션 라벨인데 가장 잘 맞는 축이 행 축이 아니면
+///      (measurement_cbm → volume) 그 품목 행에는 맞는 축이 없는 것이므로 억지로 넣지 않고 버립니다.
+///   ④ 수량-단위 분해와 짝 기록(첫 페이지와 같은 규칙)
+///   ⑤ 쪽 첫머리의 섹션 없는 줄은 앞 페이지 마지막 섹션을 이어받고, 그 행 값은 앞 페이지 마지막 행을 채웁니다.
+///   ⑥ 행 섹션 밖 총계 라벨(total · 합계 · 総計 …)은 같은 양의 문서 축이 후보에 있으면 행 축과 겨루지 않습니다.
+///      첫 페이지는 이 동률을 LLM 패스로 넘기지만, 연속 페이지에는 그 패스가 없어 값이 사라졌기 때문입니다.
+///   LLM 호출은 예전처럼 없습니다.
 async fn extract_continuation_page(
     model: &LogisModel,
     clean_html: &str,
@@ -1986,10 +2140,11 @@ async fn extract_continuation_page(
     doc_lang: &str,
     task_id: &str,
     page_idx: usize,
+    carry_section: &str,
     cancellation_token: &Arc<AtomicBool>,
     app_handle: &tauri::AppHandle,
     emit_term: &(dyn Fn(&str) + Send + Sync),
-) -> anyhow::Result<serde_json::Map<String, Value>> {
+) -> anyhow::Result<(serde_json::Map<String, Value>, String)> {
     let _ = (task_id, app_handle);
     let mut out = serde_json::Map::new();
     out.insert("header".to_string(), json!({}));
@@ -2000,8 +2155,9 @@ async fn extract_continuation_page(
     out.insert("cargo".to_string(), json!({}));
     out.insert("line_items".to_string(), json!([]));
     out.insert("containers".to_string(), json!([]));
+    let carry_section = carry_section.trim();
     if cancellation_token.load(Ordering::Relaxed) {
-        return Ok(out);
+        return Ok((out, carry_section.to_string()));
     }
     let content_pug = {
         let full_pug =
@@ -2030,64 +2186,136 @@ async fn extract_continuation_page(
             ));
         }
     }
+    // ⑤ 쪽 첫머리의 섹션 없는 줄은 앞 페이지의 마지막 섹션에 속합니다.
+    let mut carried_pair: Vec<bool> = vec![false; detail_pairs.len()];
+    if !carry_section.is_empty() {
+        let mut n = 0usize;
+        for (i, p) in detail_pairs.iter_mut().enumerate() {
+            if !p.section.trim().is_empty() { break; }
+            p.section = carry_section.to_string();
+            carried_pair[i] = true;
+            n += 1;
+        }
+        if n > 0 {
+            emit_term(&format!(
+                "  🧷 [SECTION CARRY / CONTINUATION] {}페이지 첫머리의 섹션 없는 줄 {}개가 앞 페이지 마지막 섹션 '{}' 를 이어받습니다. 행 섹션이면 그 값은 앞 페이지 마지막 행을 채웁니다.",
+                page_idx + 1, n, carry_section
+            ));
+        }
+    }
+    let last_section = detail_pairs
+        .iter()
+        .rev()
+        .map(|p| p.section.trim().to_string())
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| carry_section.to_string());
     emit_term(&format!(
         "  🧷 [CONTINUATION PAIR] {}페이지 구조적 라벨-값 페어 {}개 확보 (doc_type='{}')",
         page_idx + 1, detail_pairs.len(), doc_type
     ));
     if detail_pairs.is_empty() {
-        return Ok(out);
+        return Ok((out, last_section));
     }
     let trade_fields = crate::parsing::get_detail_schema_fields(doc_type, url, doc_lang);
-    let mut f_names: Vec<String> = Vec::new();
-    let mut f_label_texts: Vec<Vec<String>> = Vec::new();
-    let mut f_weight: Vec<Vec<f32>> = Vec::new();
-    for (fname, _, _, _) in &trade_fields {
-        let (lp, lw) = crate::model::merge::owner_label_bank(doc_lang, doc_type, fname);
-        if lp.is_empty() { continue; }
-        f_names.push(fname.clone());
-        f_label_texts.push(lp);
-        f_weight.push(lw);
+    let banks = build_trade_label_banks(model, doc_lang, doc_type, &trade_fields, emit_term, false).await;
+    if banks.names.is_empty() {
+        return Ok((out, last_section));
     }
-    if f_names.is_empty() {
-        return Ok(out);
-    }
-    let f_label: Vec<Vec<Vec<f32>>> = model.ship_embed_phrase_groups(&f_label_texts).await;
-    emit_term(&format!(
-        "  📖 [CONTINUATION LABEL BANK / ML] 필드 {}개 · 12개 언어 라벨 구 {}개를 배치 1회로 임베딩했습니다.",
-        f_names.len(),
-        f_label_texts.iter().map(|v| v.len()).sum::<usize>()
-    ));
-    // 라벨/값 준비
+
+    // 라벨/값 준비 (같은 라벨·값이라도 섹션이 다르면 다른 품목의 값입니다)
     let mut labels: Vec<String> = Vec::new();
-    let mut leafs: Vec<String> = Vec::new();
     let mut vals: Vec<String> = Vec::new();
     let mut lines: Vec<usize> = Vec::new();
     let mut sections: Vec<String> = Vec::new();
-    for p in detail_pairs.iter() {
+    let mut carried: Vec<bool> = Vec::new();
+    for (pi, p) in detail_pairs.iter().enumerate() {
         if p.value.trim().is_empty() { continue; }
-        let key = format!("{}\u{1}{}", p.label, p.value);
-        if labels.iter().zip(vals.iter()).any(|(l, v)| format!("{}\u{1}{}", l, v) == key) {
+        let sec = p.section.trim().to_string();
+        if labels.iter().zip(vals.iter()).zip(sections.iter()).any(|((l, v), s)| *l == p.label && *v == p.value && *s == sec) {
             continue;
         }
         labels.push(p.label.clone());
-        leafs.push(p.label.clone());
         vals.push(p.value.clone());
         lines.push(p.primary_line);
-        sections.push(p.section.trim().to_string());
+        sections.push(sec);
+        carried.push(carried_pair[pi]);
     }
     if labels.is_empty() {
-        return Ok(out);
+        return Ok((out, last_section));
     }
+    let nl = labels.len();
     // 🌟 [LABEL SURFACE] 'measurement_cbm' 같은 식별자 라벨은 단어 표기로 펼쳐 임베딩합니다.
-    let leaf_surfaces: Vec<String> = leafs.iter().map(|l| crate::utils::ai_utils::label_embed_surface(l)).collect();
+    let leaf_surfaces: Vec<String> = labels.iter().map(|l| crate::utils::ai_utils::label_embed_surface(l)).collect();
     let leaf_embs = model.get_embedding_batch(leaf_surfaces).await
-        .unwrap_or_else(|_| vec![vec![0.0; 384]; leafs.len()]);
-    let row_index_section: Vec<bool> = sections
-        .iter()
-        .map(|s| is_row_index_section(s))
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; nl]);
+    let section_texts: Vec<String> = sections.iter()
+        .map(|s| if s.is_empty() { " ".to_string() } else { s.clone() })
         .collect();
+    let section_embs = model.get_embedding_batch(section_texts).await
+        .unwrap_or_else(|_| vec![vec![0.0; 384]; nl]);
+    let assigned = assign_continuation_pairs(
+        &banks, &labels, &vals, &lines, &sections, &carried, &leaf_embs, &section_embs, &mut out, emit_term,
+    );
+    emit_term(&format!(
+        "  ✅ [CONTINUATION] {}페이지에서 {}개 필드를 앞 문서 '{}' 에 병합합니다. (LLM 호출 0회)",
+        page_idx + 1, assigned, doc_type
+    ));
+    Ok((out, last_section))
+}
+
+/// 🌟 [CONTINUATION PARITY] 연속 페이지 라벨-값 쌍의 축 배정 본체(임베딩은 호출부가 준비합니다).
+/// 배정한 필드 수를 돌려주고, 결과는 `out` 의 카테고리 · 행 배열 · CARRY_ROWS_KEY 에 씁니다.
+/// 🌟 [LABEL TOKEN EVIDENCE] 라벨 낱말 중 `band` 후보 하나의 라벨 뱅크에만 있는 낱말이 있고, 그런 낱말이 모두 같은
+/// 후보를 가리키면 그 후보의 band 안 위치와 근거 낱말을 돌려줍니다. 숫자 · 짧은 낱말(kg 같은 단위 약어)은 근거로 쓰지 않고,
+/// '/' · ',' 로 나뉘는 다중 속성 라벨은 다루지 않습니다.
+fn label_token_evidence(label: &str, band: &[usize], label_texts: &[Vec<String>]) -> Option<(usize, Vec<String>)> {
+    if band.len() < 2 || crate::utils::ai_utils::split_bias_phrases_full(label).len() >= 2 { return None; }
+    let words = |s: &str| -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.chars().all(|c| c.is_ascii_digit()))
+            .filter(|t| {
+                let min = if t.is_ascii() { 3 } else { 2 };
+                t.chars().count() >= min
+            })
+            .map(|t| t.to_string())
+            .collect()
+    };
+    let vocab: Vec<std::collections::HashSet<String>> = band
+        .iter()
+        .map(|&g| label_texts.get(g).map_or_else(Default::default, |ps| ps.iter().flat_map(|p| words(p)).collect()))
+        .collect();
+    let mut owner: Option<usize> = None;
+    let mut hits: Vec<String> = Vec::new();
+    for t in words(label) {
+        let owners: Vec<usize> = (0..band.len()).filter(|&i| vocab[i].contains(&t)).collect();
+        if owners.len() != 1 { continue; }
+        if owner.map_or(false, |o| o != owners[0]) { return None; }
+        owner = Some(owners[0]);
+        if !hits.contains(&t) { hits.push(t); }
+    }
+    owner.map(|o| (o, hits))
+}
+
+fn assign_continuation_pairs(
+    banks: &TradeLabelBanks,
+    labels: &[String],
+    vals: &[String],
+    lines: &[usize],
+    sections: &[String],
+    carried: &[bool],
+    leaf_embs: &[Vec<f32>],
+    section_embs: &[Vec<f32>],
+    out: &mut serde_json::Map<String, Value>,
+    emit_term: &(dyn Fn(&str) + Send + Sync),
+) -> usize {
+    let nf = banks.names.len();
+    let nl = labels.len();
+    let mut label_count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for l in labels.iter() { *label_count.entry(l.as_str()).or_insert(0) += 1; }
+    let row_index_section: Vec<bool> = sections.iter().map(|s| is_row_index_section(s)).collect();
     {
-        let hits: Vec<String> = (0..labels.len())
+        let hits: Vec<String> = (0..nl)
             .filter(|&h| row_index_section[h])
             .map(|h| format!("{}('{}')", labels[h], sections[h]))
             .collect();
@@ -2098,143 +2326,406 @@ async fn extract_continuation_page(
             ));
         }
     }
-    let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; labels.len()]; f_names.len()];
-    for f in 0..f_names.len() {
-        let fmt = crate::utils::ai_utils::detect_field_format(&f_names[f]);
+
+    // ① 첫 페이지와 같은 원점수 · 게이트. unscoped 는 행 범위 제한 전(이탈 검사용)입니다.
+    let pair_abs_floor = 0.50f32;
+    let mut unscoped: Vec<Vec<f32>> = vec![vec![-1.0f32; nl]; nf];
+    let mut leaf_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; nl]; nf];
+    let mut sec_raw: Vec<Vec<f32>> = vec![vec![-1.0f32; nl]; nf];
+    for f in 0..nf {
+        let fname = &banks.names[f];
+        let f_fmt = crate::utils::ai_utils::detect_field_format(fname);
         let f_row_cat = {
-            let c = crate::logic::trade_field_category(&f_names[f]);
+            let c = crate::logic::trade_field_category(fname);
             c == "items" || c == "containers"
         };
-        for h in 0..labels.len() {
+        let f_cohesion = crate::utils::ai_utils::bank_internal_cohesion(&banks.label_embs[f]);
+        for h in 0..nl {
             if leaf_embs[h].iter().all(|&v| v == 0.0) { continue; }
-            if row_index_section[h] && !f_row_cat { continue; }
-            if !crate::utils::ai_utils::value_matches_format(fmt, &vals[h]) {
+            let own = crate::utils::ai_utils::weighted_max_pool_sim(
+                &leaf_embs[h], &banks.label_embs[f], &banks.label_weights[f]
+            );
+            if own < pair_abs_floor { continue; }
+            let prej = if banks.prej_embs[f].is_empty() {
+                0.0
+            } else {
+                crate::utils::ai_utils::max_pool_sim(&leaf_embs[h], &banks.prej_embs[f])
+            };
+            if crate::utils::ai_utils::prejudice_dominates(own, prej, f_cohesion) { continue; }
+            if !crate::utils::ai_utils::field_value_matches(fname, f_fmt, &vals[h]) { continue; }
+            if f_fmt == crate::utils::ai_utils::FieldFormat::Enum
+                && crate::utils::ai_utils::is_pure_numeric_value(&vals[h]) {
                 continue;
             }
-            matrix[f][h] = crate::utils::ai_utils::weighted_max_pool_sim(
-                &leaf_embs[h], &f_label[f], &f_weight[f],
+            unscoped[f][h] = own;
+            // 🌟 [ROW SECTION SCOPE] '[ Item N ]' 안의 라벨은 문서 수준 축과 겨루지 않습니다.
+            if row_index_section[h] && !f_row_cat { continue; }
+            leaf_raw[f][h] = own;
+            if sections[h].is_empty() || section_embs[h].iter().all(|&v| v == 0.0) { continue; }
+            sec_raw[f][h] = crate::utils::ai_utils::weighted_max_pool_sim(
+                &section_embs[h], &banks.label_embs[f], &banks.label_weights[f]
             );
         }
     }
-    let centered = crate::utils::ai_utils::double_center_matrix(&matrix);
-    // 🌟 [T-2] 배열 행 배정에도 잡음 마진 게이트를 적용합니다.
-    //
-    //  ── 실측 표적 ──
-    //   SR-2026-0820 의 line_items 에서
-    //     unit: "6.0"        ← B200 의 volume 6.0 이 유출
-    //     total_price: 15    ← 전체 volume 15.0 이 유출
-    //   두 사고 모두 '순수 수치 셀' 이 여러 수치 필드와 비슷한 점수를 내는
-    //   평탄 분포에서 발생했습니다. 즉 Flat 동률이며,
-    //   지금은 마진 임계 0.0 이라 그대로 확정됩니다.
-    //
-    //  ── 배열 행에서는 혼동 사전을 쓰지 않습니다 ──
-    //   행 내부 필드는 unit / quantity / total_price 처럼 수치 축이 몰려 있어,
-    //   같은 쌍이 반복 충돌하는 것이 '역사적 승자가 있다' 는 뜻이 아니라
-    //   '구조적으로 구분 불가' 라는 뜻입니다.
-    //   따라서 동률은 종류를 불문하고 보류하고 LLM 에 맡깁니다.
-    let (assign, arr_diags) = crate::utils::ai_utils::exclusive_assign_by_score_adaptive(
-        &centered,
-        0.0,
-        0.0,
-        |_f: usize, _rival: usize, _kind: crate::utils::ai_utils::TieKind| -> bool { false },
-    );
-    for d in arr_diags.iter() {
-        if d.tie == crate::utils::ai_utils::TieKind::Decisive { continue; }
-        let fname = f_names.get(d.field).cloned().unwrap_or_default();
-        let rname = f_names.get(d.rival).cloned().unwrap_or_default();
-        emit_term(&format!(
-            "    ⚖️ [ARRAY TIE HOLD] '{}' vs '{}' | 마진 {:+.4} < 잡음 마진 {:.4} ({:?}) → 보류. 수치 축이 몰린 행에서는 결정론으로 가릴 근거가 없습니다.",
-            fname, rname, d.margin, d.noise_margin, d.tie
-        ));
-        crate::utils::score_dynamics::record_confusion_tie(&fname, &rname, d.margin);
+    const SECTION_WEIGHT: f32 = 0.5f32;
+    let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; nl]; nf];
+    for h in 0..nl {
+        let qualified = label_count.get(labels[h].as_str()).copied().unwrap_or(0) > 1;
+        let (mut sec_sum, mut sec_cnt) = (0.0f32, 0usize);
+        for f in 0..nf {
+            if leaf_raw[f][h] < 0.0 || sec_raw[f][h] < 0.0 { continue; }
+            sec_sum += sec_raw[f][h];
+            sec_cnt += 1;
+        }
+        let sec_mean = if sec_cnt > 0 { sec_sum / (sec_cnt as f32) } else { 0.0 };
+        for f in 0..nf {
+            if leaf_raw[f][h] < 0.0 { continue; }
+            let sec_term = if qualified && sec_cnt > 1 && sec_raw[f][h] >= 0.0 { sec_raw[f][h] - sec_mean } else { 0.0 };
+            matrix[f][h] = leaf_raw[f][h] + SECTION_WEIGHT * sec_term;
+        }
     }
+
+    // 🌟 [AGGREGATE LABEL SCOPE] 행 섹션 밖에서 총계 표지(total · 합계 · 総計 …)를 단 라벨은 문서 총계입니다.
+    //    그 라벨이 행 축(item_gross_weight)과 같은 양의 문서 축(weight_gross)에 함께 걸리면 행 축은 겨루지 않습니다.
+    //    첫 페이지는 이 평탄 동률을 보류해 LLM 패스로 넘기지만, 연속 페이지에는 LLM 패스가 없어 값이 그대로
+    //    사라졌습니다(SR 2페이지 'total_gross_weight_kg 2500.0'). 이미지 경로의 미뤄진 쌍 재라우팅
+    //    ([DEFERRED PAIR / ROW LABEL])과 같은 규칙으로, 표 열이 argmax 를 가져가 막힌 문서 총계만 되살립니다.
+    let mut closed_row: Vec<Vec<bool>> = vec![vec![false; nl]; nf];
+    {
+        let row_cat: Vec<bool> = banks
+            .names
+            .iter()
+            .map(|n| matches!(crate::logic::trade_field_category(n), "items" | "containers"))
+            .collect();
+        for h in 0..nl {
+            if row_index_section[h] || !crate::model::merge::label_has_aggregate_marker(&labels[h]) { continue; }
+            let mut closed: Vec<String> = Vec::new();
+            for f in 0..nf {
+                if !row_cat[f] || matrix[f][h] < 0.0 { continue; }
+                let has_total_axis = (0..nf).any(|s| {
+                    !row_cat[s]
+                        && matrix[s][h] >= 0.0
+                        && crate::model::merge::row_axis_aggregate_related(&banks.names[f], &banks.names[s])
+                });
+                if !has_total_axis { continue; }
+                closed_row[f][h] = true;
+                matrix[f][h] = -1.0;
+                closed.push(banks.names[f].clone());
+            }
+            if !closed.is_empty() {
+                crate::utils::score_dynamics::record_baseline("trading.continuation_aggregate_scope", closed.len() as f32);
+                emit_term(&format!(
+                    "  🧮 [AGGREGATE LABEL SCOPE] 행 섹션 밖 총계 라벨 '{}' 은 같은 양의 문서 축이 후보에 있으므로 행 축 {:?} 과 겨루지 않습니다.",
+                    labels[h], closed
+                ));
+            }
+        }
+    }
+
+    // ② 행 섹션마다(문서 수준 라벨은 한 묶음) 따로 배타 배정합니다.
+    let mut group_keys: Vec<(String, bool)> = Vec::new();
+    let mut group_of: Vec<usize> = vec![0; nl];
+    for h in 0..nl {
+        let key = if row_index_section[h] { (sections[h].clone(), carried[h]) } else { (String::new(), false) };
+        group_of[h] = match group_keys.iter().position(|k| *k == key) {
+            Some(g) => g,
+            None => {
+                group_keys.push(key);
+                group_keys.len() - 1
+            }
+        };
+    }
+    let tie_names = banks.names.clone();
+    let allow_tie = move |f: usize, rival: usize, kind: crate::utils::ai_utils::TieKind| -> bool {
+        if kind == crate::utils::ai_utils::TieKind::Flat { return false; }
+        let (a, b) = match (tie_names.get(f), tie_names.get(rival)) {
+            (Some(x), Some(y)) => (x.as_str(), y.as_str()),
+            _ => return false,
+        };
+        match crate::utils::score_dynamics::confusion_winner(a, b) {
+            Some((winner, rate)) => winner == a && rate > 0.5,
+            None => false,
+        }
+    };
+
     use crate::logic::trade_field_category;
     let mut assigned = 0usize;
-    let mut item_row = serde_json::Map::new();
-    let mut container_row = serde_json::Map::new();
-    for (f, a) in assign.iter().enumerate() {
-        let (h, own, margin) = match a { Some(v) => *v, None => continue };
-        let fname = f_names[f].clone();
-        if crate::utils::ai_utils::is_id_link_field(&fname) { continue; }
-        {
-            let mut best_f = usize::MAX;
-            let mut best_raw = f32::MIN;
-            let mut sum = 0.0f64;
-            let mut sq = 0.0f64;
-            let mut cnt = 0usize;
-            for ff in 0..f_names.len() {
-                let v = matrix[ff][h];
-                if v < 0.0 { continue; }
-                sum += v as f64;
-                sq += (v as f64) * (v as f64);
-                cnt += 1;
-                if v > best_raw { best_raw = v; best_f = ff; }
+    // (행 묶음 키, 앞 페이지에서 이어받았는지, items 행, containers 행)
+    let mut rows: Vec<(bool, serde_json::Map<String, Value>, serde_json::Map<String, Value>)> = Vec::new();
+    for (gi, (gkey, gcarried)) in group_keys.iter().enumerate() {
+        let members: Vec<usize> = (0..nl).filter(|&h| group_of[h] == gi).collect();
+        // 🌟 [ROW TABLE VOTE] 행 섹션 하나는 한 표의 한 행입니다. 섹션 라벨마다 가장 잘 맞는 행 축의 표(items /
+        //    containers)를 세어 다수인 표로 정하고, 다른 표의 열은 이 행에서 겨루지 않게 합니다.
+        //    품목 행의 'gross_weight_kg' 는 첫 페이지에서도 item_gross_weight ↔ container_gross_weight 평탄 동률이라
+        //    LLM 패스로 넘기는 값인데, 연속 페이지에는 LLM 패스가 없어 그대로 사라졌습니다. 같은 섹션의
+        //    item_code · description · quantity 가 이 행이 품목 표의 행이라는 것을 이미 말해 줍니다.
+        let mut row_is_items: Option<bool> = None;
+        if !gkey.is_empty() {
+            let (mut item_votes, mut container_votes) = (0usize, 0usize);
+            for &h in members.iter() {
+                let mut best: Option<(f32, bool)> = None;
+                for f in 0..nf {
+                    if matrix[f][h] < 0.0 { continue; }
+                    let is_items = match trade_field_category(&banks.names[f]) {
+                        "items" => true,
+                        "containers" => false,
+                        _ => continue,
+                    };
+                    if best.map_or(true, |(v, _)| matrix[f][h] > v) { best = Some((matrix[f][h], is_items)); }
+                }
+                match best {
+                    Some((_, true)) => item_votes += 1,
+                    Some((_, false)) => container_votes += 1,
+                    None => {}
+                }
             }
-            if cnt >= 2 && best_f != f && matrix[f][h] >= 0.0 {
-                let mu = sum / cnt as f64;
-                let sd = ((sq / cnt as f64 - mu * mu).max(0.0)).sqrt() as f32;
-                let gap = best_raw - matrix[f][h];
-                if gap > sd {
+            if item_votes != container_votes {
+                row_is_items = Some(item_votes > container_votes);
+                emit_term(&format!(
+                    "    🧾 [ROW TABLE VOTE] '{}' 섹션 라벨 {}개 중 품목 표 {}표 · 컨테이너 표 {}표 → 이 행은 {} 표의 행으로 배정합니다.",
+                    gkey, members.len(), item_votes, container_votes,
+                    if item_votes > container_votes { "items" } else { "containers" }
+                ));
+            }
+        }
+        let sub: Vec<Vec<f32>> = (0..nf)
+            .map(|f| {
+                let other_table = match (row_is_items, trade_field_category(&banks.names[f])) {
+                    (Some(true), "containers") | (Some(false), "items") => true,
+                    _ => false,
+                };
+                members.iter().map(|&h| if other_table { -1.0 } else { matrix[f][h] }).collect()
+            })
+            .collect();
+        let (mut assign, diags) = crate::utils::ai_utils::exclusive_assign_by_score_adaptive(&sub, 0.0, 0.0, &allow_tie);
+        for d in diags.iter() {
+            if d.tie == crate::utils::ai_utils::TieKind::Decisive { continue; }
+            let fname = banks.names.get(d.field).cloned().unwrap_or_default();
+            let rname = banks.names.get(d.rival).cloned().unwrap_or_default();
+            emit_term(&format!(
+                "    ⚖️ [CONTINUATION TIE] {}'{}' | '{}' vs '{}' | 마진 {:+.4} < 잡음 마진 {:.4} ({:?}) → {}",
+                if gkey.is_empty() { String::new() } else { format!("[{}] ", gkey) },
+                members.get(d.line).map(|&h| labels[h].clone()).unwrap_or_default(),
+                fname, rname, d.margin, d.noise_margin, d.tie,
+                if d.accepted { "혼동 사전의 역사 승자로 확정" } else { "보류" }
+            ));
+            if d.tie == crate::utils::ai_utils::TieKind::PairConfusion && !d.accepted && d.margin > f32::EPSILON {
+                crate::utils::score_dynamics::record_confusion(&fname, &rname, d.margin);
+            } else if !d.accepted {
+                crate::utils::score_dynamics::record_confusion_tie(&fname, &rname, d.margin);
+            }
+        }
+        // 🌟 [LABEL TOKEN EVIDENCE] 보류된 동률에서, 라벨의 낱말이 잡음 폭 안 후보 하나의 라벨 뱅크에만 있으면 그 후보로 둡니다.
+        //    첫 페이지는 동률을 LLM 패스로 넘기지만 연속 페이지에는 그 패스가 없어 값이 사라집니다.
+        //    'total_gross_weight_kg' 은 weight_gross ↔ weight_net 이 코사인으로는 평탄하지만 'gross' 는 weight_gross
+        //    뱅크에만 있는 낱말입니다. 이미지 경로 [PAIR EXACT LABEL] 의 근거(인쇄된 글자)를 낱말 단위로 쓴 것이고,
+        //    낱말들이 서로 다른 후보를 가리키거나 아무 후보도 가리키지 않으면 그대로 보류합니다.
+        let mut token_assigned: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for d in diags.iter() {
+            if d.accepted { continue; }
+            let line = d.line;
+            if assign.iter().any(|a| a.map_or(false, |(l, _, _)| l == line)) { continue; }
+            let h = members[line];
+            let band: Vec<usize> = (0..nf)
+                .filter(|&g| sub[g][line] >= 0.0 && sub[g][line] >= d.own - d.noise_margin)
+                .collect();
+            let (bi, words) = match label_token_evidence(&labels[h], &band, &banks.label_texts) {
+                Some(v) => v,
+                None => continue,
+            };
+            let c = band[bi];
+            if assign[c].is_some() { continue; }
+            let next = band.iter().filter(|&&g| g != c).map(|&g| sub[g][line]).fold(f32::MIN, f32::max);
+            let margin = sub[c][line] - next;
+            emit_term(&format!(
+                "    🔤 [LABEL TOKEN EVIDENCE] {}'{}' | 잡음 폭 안 후보 {:?} 중 라벨 낱말 {:?} 를 라벨 뱅크에 가진 축은 '{}' 하나뿐 → 그 축으로 둡니다 (코사인 {:+.4}, 다음 후보 대비 {:+.4}).",
+                if gkey.is_empty() { String::new() } else { format!("[{}] ", gkey) },
+                labels[h],
+                band.iter().map(|&g| banks.names[g].as_str()).collect::<Vec<_>>(),
+                words, banks.names[c], sub[c][line], margin
+            ));
+            assign[c] = Some((line, sub[c][line], margin));
+            token_assigned.insert(c);
+        }
+        let mut item_row = serde_json::Map::new();
+        let mut container_row = serde_json::Map::new();
+        let mut row_written: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (f, a) in assign.iter().enumerate() {
+            let (lh, score, margin) = match a { Some(v) => *v, None => continue };
+            let h = members[lh];
+            let fname = banks.names[f].clone();
+            if crate::utils::ai_utils::is_id_link_field(&fname) { continue; }
+            // ③ 이탈 검사: 행 범위 밖까지 포함한 원시 1위와 비교합니다.
+            {
+                let mut best_f = usize::MAX;
+                let mut best_v = f32::MIN;
+                let (mut sum, mut sq, mut cnt) = (0.0f64, 0.0f64, 0usize);
+                for ff in 0..nf {
+                    let v = unscoped[ff][h];
+                    if v < 0.0 { continue; }
+                    sum += v as f64;
+                    sq += (v as f64) * (v as f64);
+                    cnt += 1;
+                    if v > best_v { best_v = v; best_f = ff; }
+                }
+                if cnt >= 2 && best_f != f && unscoped[f][h] >= 0.0 {
+                    let mu = sum / cnt as f64;
+                    let sd = ((sq / cnt as f64 - mu * mu).max(0.0)).sqrt() as f32;
+                    let gap = best_v - unscoped[f][h];
+                    let best_other_table = match (row_is_items, trade_field_category(&banks.names[best_f])) {
+                        (Some(true), "containers") | (Some(false), "items") => true,
+                        _ => false,
+                    };
+                    let out_of_scope = leaf_raw[best_f][h] < 0.0 || best_other_table || closed_row[best_f][h];
+                    // 행 섹션 라벨의 원시 1위가 범위 밖 축이어도, 배정된 행 축이 그 축의 행 판본이면
+                    // (weight_gross ↔ item_gross_weight · package_count ↔ item_package_count) 행 안의 값이 맞습니다.
+                    // 섹션 밖 총계 라벨은 거꾸로, 닫힌 행 축의 문서 총계 판본이 맞습니다.
+                    let row_counterpart = out_of_scope
+                        && crate::model::merge::row_axis_aggregate_related(&fname, &banks.names[best_f]);
+                    if gap > sd && row_counterpart {
+                        if row_index_section[h] {
+                            emit_term(&format!(
+                                "    🔗 [ROW COUNTERPART] Label '{}' ('{}') 의 원시 1위는 범위 밖 '{}'({:.4}) 이지만, 이 행에는 같은 양을 가리키는 행 축 '{}'({:.4}) 가 있어 그 축으로 둡니다.",
+                                labels[h], sections[h], banks.names[best_f], best_v, fname, unscoped[f][h]
+                            ));
+                        } else {
+                            emit_term(&format!(
+                                "    🔗 [AGGREGATE COUNTERPART] Label '{}' 의 원시 1위는 행 축 '{}'({:.4}) 이지만, 행 섹션 밖 총계 라벨이라 같은 양의 문서 축 '{}'({:.4}) 로 둡니다.",
+                                labels[h], banks.names[best_f], best_v, fname, unscoped[f][h]
+                            ));
+                        }
+                    } else if gap > sd {
+                        if out_of_scope && !row_index_section[h] {
+                            emit_term(&format!(
+                                "    🚫 [CONTINUATION DRIFT] 총계 라벨 '{}' 의 원시 1위는 행 축 '{}'({:.4}) 이고, 배정된 문서 축 '{}'({:.4}) 는 같은 양이 아닙니다. 격차 {:+.4} > 표준편차 {:.4} → 배정을 폐기합니다.",
+                                labels[h], banks.names[best_f], best_v, fname, unscoped[f][h], gap, sd
+                            ));
+                        } else if out_of_scope {
+                            emit_term(&format!(
+                                "    🚫 [CONTINUATION NO ROW AXIS] Label '{}' ('{}') 의 원시 1위는 행 축이 아닌 '{}'({:.4}) 이고, 행 축 '{}'({:.4}) 는 격차 {:+.4} > 표준편차 {:.4} 로 밀립니다. 이 품목 행에는 맞는 축이 없으므로 넣지 않습니다.",
+                                labels[h], sections[h], banks.names[best_f], best_v, fname, unscoped[f][h], gap, sd
+                            ));
+                        } else {
+                            emit_term(&format!(
+                                "    🚫 [CONTINUATION DRIFT] Label '{}' 의 원시 1위는 '{}'({:.4}) 인데 '{}'({:.4}) 로 밀렸습니다. 격차 {:+.4} > 분포 표준편차 {:.4} → 배정을 폐기합니다.",
+                                labels[h], banks.names[best_f], best_v, fname, unscoped[f][h], gap, sd
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            }
+            // ④ 수량-단위 분해 (첫 페이지와 같은 규칙)
+            let mut val = vals[h].clone();
+            let mut companion: Option<(String, String)> = None;
+            if let Some((cnt_f, unit_f)) = crate::utils::ai_utils::count_unit_pair_of(&fname) {
+                if let Some((num, unit)) = crate::utils::ai_utils::split_count_and_unit(&val) {
+                    if fname == unit_f && !unit_f.is_empty() {
+                        emit_term(&format!(
+                            "    ✂️ [COUNT-UNIT SPLIT] '{}' 값 \"{}\" 을 분해합니다 → {}={} / {}={}",
+                            fname, val, cnt_f, num, unit_f, unit
+                        ));
+                        companion = Some((cnt_f.to_string(), num));
+                        val = unit;
+                    } else if fname == cnt_f {
+                        emit_term(&format!(
+                            "    ✂️ [COUNT-UNIT SPLIT] '{}' 값 \"{}\" 을 분해합니다 → {}={} / {}={}",
+                            fname, val, cnt_f, num, if unit_f.is_empty() { "(단위축 없음)" } else { unit_f }, unit
+                        ));
+                        if !unit_f.is_empty() {
+                            companion = Some((unit_f.to_string(), unit));
+                        }
+                        val = num;
+                    }
+                }
+            }
+            let mut writes: Vec<(String, String)> = vec![(fname.clone(), val.clone())];
+            if let Some((cf, cv)) = companion {
+                if banks.names.iter().any(|n| *n == cf) && !cv.trim().is_empty() {
+                    writes.push((cf, cv));
+                }
+            }
+            for (wi, (wf, wv)) in writes.into_iter().enumerate() {
+                let cat = trade_field_category(&wf);
+                if cat.is_empty() { continue; }
+                // 짝은 이미 이 행·문서에 그 축이 있으면 덮지 않습니다.
+                let taken = match cat {
+                    "items" | "containers" => row_written.contains(&wf),
+                    _ => out.get(cat).and_then(|v| v.get(&wf)).map_or(false, |v| !v.is_null()),
+                };
+                if wi > 0 && taken { continue; }
+                let wrote = match cat {
+                    "items" => { item_row.insert(wf.clone(), json!(wv.clone())); row_written.insert(wf.clone()); true }
+                    "containers" => { container_row.insert(wf.clone(), json!(wv.clone())); row_written.insert(wf.clone()); true }
+                    _ => match out.get_mut(cat).and_then(|v| v.as_object_mut()) {
+                        Some(slot) => { slot.insert(wf.clone(), json!(wv.clone())); true }
+                        None => false,
+                    },
+                };
+                if !wrote {
                     emit_term(&format!(
-                        "    🚫 [CONTINUATION DRIFT] Label '{}' 의 원시 argmax 는 '{}'({:.4}) 인데 '{}'({:.4}) 로 밀렸습니다. 격차 {:+.4} > 분포 표준편차 {:.4} → 배정을 폐기합니다.",
-                        labels[h], f_names[best_f], best_raw, fname, matrix[f][h], gap, sd
+                        "    ⚠️ [CONTINUATION WRITE MISS] Label '{}' → Field '{}' (cat: '{}') 를 기록할 슬롯이 없어 폐기합니다.",
+                        labels[h], wf, cat
                     ));
                     continue;
                 }
+                assigned += 1;
+                if wi == 0 {
+                    emit_term(&format!(
+                        "    ✨ [CONTINUATION ASSIGN] Label '{}' → Field '{}' (cat: {}) | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"{}",
+                        labels[h], wf, cat, score, margin, lines[h] + 1, wv,
+                        if *gcarried { format!(" | 앞 페이지 '{}' 행", gkey) } else { String::new() }
+                    ));
+                    crate::utils::score_dynamics::record_field_seen(&wf);
+                    if token_assigned.contains(&f) {
+                        // 코사인 순위가 아니라 낱말 근거로 둔 배정이라 마진 분포에는 넣지 않습니다.
+                        crate::utils::score_dynamics::record_field_assigned(&wf, 0.0);
+                        crate::utils::score_dynamics::record_baseline("trading.continuation_token_evidence", 1.0);
+                    } else {
+                        crate::utils::score_dynamics::record_field_assigned(&wf, margin);
+                        crate::utils::score_dynamics::record_baseline("trading.continuation_margin", margin);
+                    }
+                } else {
+                    crate::utils::score_dynamics::record_baseline("trading.count_unit_companion", 1.0);
+                    emit_term(&format!(
+                        "    ✨ [COUNT-UNIT COMPANION] '{}' 를 분해한 짝 '{}' = \"{}\" 도 같은 라벨 칸의 값으로 확정합니다 (Line {}).",
+                        fname, wf, wv, lines[h] + 1
+                    ));
+                }
             }
         }
-        let cat = trade_field_category(&fname);
-        if cat.is_empty() { continue; }
-        let wrote = match cat {
-            "items" => { item_row.insert(fname.clone(), json!(vals[h].clone())); true }
-            "containers" => { container_row.insert(fname.clone(), json!(vals[h].clone())); true }
-            _ => match out.get_mut(cat).and_then(|v| v.as_object_mut()) {
-                Some(slot) => { slot.insert(fname.clone(), json!(vals[h].clone())); true }
-                None => false,
-            },
-        };
-        if !wrote {
-            // 🌟 구버전은 이 경로에서도 ASSIGN 로그를 찍어 소실을 감췄습니다.
-            emit_term(&format!(
-                "    ⚠️ [CONTINUATION WRITE MISS] Label '{}' → Field '{}' (cat: '{}') 를 기록할 슬롯이 없어 폐기합니다.",
-                labels[h], fname, cat
-            ));
-            continue;
-        }
-        assigned += 1;
-        emit_term(&format!(
-            "    ✨ [CONTINUATION ASSIGN] Label '{}' → Field '{}' (cat: {}) | Score: {:+.4} | Margin: {:+.4} | Line {} | Value: \"{}\"",
-            labels[h], fname, cat, own, margin, lines[h] + 1, vals[h]
-        ));
-        crate::utils::score_dynamics::record_field_seen(&fname);
-        crate::utils::score_dynamics::record_field_assigned(&fname, margin);
-        crate::utils::score_dynamics::record_baseline("trading.continuation_margin", margin);
+        rows.push((*gcarried, item_row, container_row));
     }
-    // 🌟 [COUNT] 행 필드는 위 루프에서 이미 assigned 에 반영되었습니다. 여기서 다시 더하지 않습니다.
-    if !item_row.is_empty() {
-        let n = item_row.len();
-        if let Some(arr) = out.get_mut("line_items").and_then(|v| v.as_array_mut()) {
-            arr.push(Value::Object(item_row));
-            emit_term(&format!(
-                "    🧾 [CONTINUATION ROW] items 행 1개(필드 {}개)를 line_items 에 추가했습니다.", n
-            ));
+    // 행 출력: 이어받은 행은 '__carry_rows' 로 따로 넘겨 앞 페이지 마지막 행을 채웁니다(merge_trading_page_map).
+    let mut carry_rows = serde_json::Map::new();
+    for (is_carry, item_row, container_row) in rows.into_iter() {
+        for (arr_key, row) in [("line_items", item_row), ("containers", container_row)] {
+            if row.is_empty() { continue; }
+            let n = row.len();
+            if is_carry {
+                let slot = carry_rows.entry(arr_key.to_string()).or_insert_with(|| json!({}));
+                if let Some(o) = slot.as_object_mut() {
+                    for (k, v) in row.into_iter() { o.entry(k).or_insert(v); }
+                }
+                emit_term(&format!(
+                    "    🧾 [CONTINUATION CARRY ROW] {} 필드 {}개를 앞 페이지 마지막 행에 채웁니다.", arr_key, n
+                ));
+            } else if let Some(arr) = out.get_mut(arr_key).and_then(|v| v.as_array_mut()) {
+                arr.push(Value::Object(row));
+                emit_term(&format!(
+                    "    🧾 [CONTINUATION ROW] {} 행 1개(필드 {}개)를 추가했습니다.", arr_key, n
+                ));
+            }
         }
     }
-    if !container_row.is_empty() {
-        let n = container_row.len();
-        if let Some(arr) = out.get_mut("containers").and_then(|v| v.as_array_mut()) {
-            arr.push(Value::Object(container_row));
-            emit_term(&format!(
-                "    🧾 [CONTINUATION ROW] containers 행 1개(필드 {}개)를 추가했습니다.", n
-            ));
-        }
+    if !carry_rows.is_empty() {
+        out.insert(CARRY_ROWS_KEY.to_string(), Value::Object(carry_rows));
     }
-    emit_term(&format!(
-        "  ✅ [CONTINUATION] {}페이지에서 {}개 필드를 앞 문서 '{}' 에 병합합니다. (LLM 호출 0회)",
-        page_idx + 1, assigned, doc_type
-    ));
-    Ok(out)
+    assigned
 }
+
+/// 연속 페이지 맵에서 '앞 페이지 마지막 행을 채울 값' 을 담는 키입니다(merge_trading_page_map 이 소비).
+const CARRY_ROWS_KEY: &str = "__carry_rows";
 pub async fn process_trading_task(
     task: Task,
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
@@ -2447,6 +2938,8 @@ pub async fn process_trading_task(
 
     let total_pages = page_htmls.len();
     let mut page_results: Vec<(String, String, serde_json::Map<String, Value>)> = Vec::new();
+    // 🌟 [SECTION CARRY] 앞 페이지의 마지막 섹션. 다음 페이지가 연속이면 첫머리 줄이 이 섹션을 이어받습니다.
+    let mut carry_section: String = String::new();
 
     
     
@@ -2682,10 +3175,11 @@ pub async fn process_trading_task(
             ));
             let carry_type = prev_type.clone();
             let carry_lang = prev_lang.clone();
-            let cont_map = extract_continuation_page(
+            let (cont_map, cont_last_section) = extract_continuation_page(
                 &model, &clean_html_content, &url, &carry_type, &carry_lang,
-                &task.id, page_idx, cancellation_token, app_handle, &emit_term,
+                &task.id, page_idx, &carry_section, cancellation_token, app_handle, &emit_term,
             ).await?;
+            carry_section = cont_last_section;
             page_results.push((carry_type, carry_lang, cont_map));
             continue;
         }
@@ -3379,63 +3873,14 @@ pub async fn process_trading_task(
     let trade_fields = crate::parsing::get_detail_schema_fields(&doc_type, &url, &doc_lang);
     emit_term(&format!("  📐 [TRADING SCHEMA] doc_type '{}' 에 대응하는 스키마 필드 {}개 로드", doc_type, trade_fields.len()));
 
-    let mut t_field_names: Vec<String> = Vec::new();
-    let mut t_label_texts: Vec<Vec<String>> = Vec::new();
-    let mut t_label_weights: Vec<Vec<f32>> = Vec::new();
-    let mut t_prej_texts: Vec<Vec<String>> = Vec::new();
-    let mut t_supplemented = 0usize;
-
-    for (fname, _, _, _) in &trade_fields {
-        let (lp, lw) = crate::model::merge::owner_label_bank(&doc_lang, &doc_type, fname);
-        if lp.is_empty() { continue; }
-        if !crate::logic::trade_label_supplement(fname).is_empty() { t_supplemented += 1; }
-        let pp = crate::utils::ai_utils::prejudice_phrase_bank_multilingual(&doc_lang, &doc_type, fname);
-        t_field_names.push(fname.clone());
-        t_label_texts.push(lp);
-        t_label_weights.push(lw);
-        t_prej_texts.push(pp);
-    }
-
-    let t_label_embs: Vec<Vec<Vec<f32>>> = model.ship_embed_phrase_groups(&t_label_texts).await;
-    let t_prej_raw: Vec<Vec<Vec<f32>>> = model.ship_embed_phrase_groups(&t_prej_texts).await;
-    emit_term(&format!(
-        "  📖 [TRADING LABEL BANK / ML] 필드 {}개 | 12개 언어 라벨 구 {}개 + 편견 구 {}개를 배치 2회로 임베딩 (다국어 보강표 적용 {}축)",
-        t_field_names.len(),
-        t_label_texts.iter().map(|v| v.len()).sum::<usize>(),
-        t_prej_texts.iter().map(|v| v.len()).sum::<usize>(),
-        t_supplemented
-    ));
-
-    let t_label_heads: Vec<Vec<Vec<f32>>> = t_label_embs
-        .iter()
-        .map(|bank| {
-            let c = crate::model::merge::bank_centroid(bank);
-            if c.is_empty() { Vec::new() } else { vec![c] }
-        })
-        .collect();
-
-    let mut t_prej_embs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(t_field_names.len());
-    for f in 0..t_field_names.len() {
-        let mask = crate::utils::ai_utils::self_poisoned_prejudice_mask(
-            &t_label_heads[f], &t_prej_raw[f], &t_label_heads, f
-        );
-        let mut kept: Vec<Vec<f32>> = Vec::new();
-        let mut dropped = 0usize;
-        for (pi, poisoned) in mask.iter().enumerate() {
-            if *poisoned {
-                dropped += 1;
-                if dropped <= 4 {
-                    emit_term(&format!("    🧪 [SELF-POISON DROP] '{}' 의 편견 구 '{}' 박탈",
-                        t_field_names[f], t_prej_texts[f].get(pi).cloned().unwrap_or_default()));
-                }
-            } else {
-                kept.push(t_prej_raw[f][pi].clone());
-            }
-        }
-        emit_term(&format!("  🏷️ [TRADING LABEL BANK] '{}' | 라벨 구 {}개 | 편견 구 {}개 (자기오염 {}개 제거)",
-            t_field_names[f], t_label_embs[f].len(), kept.len(), dropped));
-        t_prej_embs.push(kept);
-    }
+    let TradeLabelBanks {
+        names: t_field_names,
+        label_texts: t_label_texts,
+        label_weights: t_label_weights,
+        label_embs: t_label_embs,
+        prej_raw: t_prej_raw,
+        prej_embs: t_prej_embs,
+    } = build_trade_label_banks(&model, &doc_lang, &doc_type, &trade_fields, &emit_term, true).await;
 
     
     let mut unique_labels: Vec<String> = Vec::new();
@@ -4625,6 +5070,12 @@ pub async fn process_trading_task(
         "[TRADING PAGE {}/{}] ✅ 페이지 추출 완료 (doc_type='{}', lang='{}')",
         page_idx + 1, total_pages, doc_type, doc_lang
     ));
+    carry_section = detail_pairs
+        .iter()
+        .rev()
+        .map(|p| p.section.trim().to_string())
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
     page_results.push((doc_type.clone(), doc_lang.clone(), final_data_map));
     }
 
@@ -5170,7 +5621,7 @@ pub async fn process_trading_task(
         &from_addr, &team_id, &cc_val, &bcc, &ref_val, Some(&item_digest)).await;
 
     {
-        let translit_demand = crate::model::lang_llm::translit_demand(&extracted_data);
+        let translit_demand = crate::model::lang_llm::translit_demand(&extracted_data, &doc_lang);
         let (_translit_engine, translit_status) = crate::model::lang_llm::await_engine(
             &doc_lang,
             app_handle,
@@ -5337,4 +5788,219 @@ fn hoist_array_identifiers(data: &mut serde_json::Value) -> usize {
         }
     }
     hoisted
+}
+#[cfg(test)]
+mod continuation_tests {
+    //! 🌟 [CONTINUATION PARITY] 연속 페이지 배정 · 앞 페이지 행 채우기 검증.
+    use super::*;
+
+    #[test]
+    fn carried_rows_fill_the_previous_last_row_without_overwriting() {
+        let mut target = serde_json::Map::new();
+        target.insert(
+            "line_items".to_string(),
+            json!([{ "item_code": "SKU-A100", "description": "Industrial Microcontrollers", "unit": "" }]),
+        );
+        let mut source = serde_json::Map::new();
+        source.insert(
+            CARRY_ROWS_KEY.to_string(),
+            json!({ "line_items": { "item_gross_weight": "1500.0", "description": "다른 값", "unit": "PCS" } }),
+        );
+        source.insert("line_items".to_string(), json!([{ "item_code": "SKU-B200", "description": "Sensor Modules" }]));
+        merge_trading_page_map(&mut target, &source);
+        assert!(target.get(CARRY_ROWS_KEY).is_none(), "이어받기 키는 문서에 남지 않습니다");
+        let rows = target["line_items"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["item_gross_weight"], "1500.0", "앞 페이지 마지막 행의 빈 축을 채웁니다");
+        assert_eq!(rows[0]["description"], "Industrial Microcontrollers", "있는 값은 덮지 않습니다");
+        assert_eq!(rows[0]["unit"], "PCS", "빈 문자열 칸도 채웁니다");
+        assert_eq!(rows[1]["item_code"], "SKU-B200");
+
+        // 앞 페이지에 행이 없으면 이어받은 값으로 새 행을 만듭니다.
+        let mut empty = serde_json::Map::new();
+        let mut src2 = serde_json::Map::new();
+        src2.insert(CARRY_ROWS_KEY.to_string(), json!({ "containers": { "seal_number": "SL-1" } }));
+        merge_trading_page_map(&mut empty, &src2);
+        assert_eq!(empty["containers"][0]["seal_number"], "SL-1");
+    }
+
+    /// (필드, 라벨 구, 라벨(e0)과의 코사인) 으로 만든 단일 벡터 뱅크들.
+    fn synthetic_banks(spec: &[(&str, &[&str], f32)]) -> TradeLabelBanks {
+        let dim = spec.len() + 1;
+        let axis = |k: usize, c: f32| -> Vec<f32> {
+            let mut v = vec![0.0f32; dim];
+            v[0] = c;
+            v[k + 1] = (1.0 - c * c).max(0.0).sqrt();
+            v
+        };
+        TradeLabelBanks {
+            names: spec.iter().map(|s| s.0.to_string()).collect(),
+            label_texts: spec.iter().map(|s| s.1.iter().map(|p| p.to_string()).collect()).collect(),
+            label_weights: spec.iter().map(|_| vec![1.0]).collect(),
+            label_embs: spec.iter().enumerate().map(|(k, s)| vec![axis(k, s.2)]).collect(),
+            prej_raw: spec.iter().map(|_| Vec::new()).collect(),
+            prej_embs: spec.iter().map(|_| Vec::new()).collect(),
+        }
+    }
+
+    /// 섹션 밖 라벨 하나를 배정해 (배정 수, 결과 맵) 을 돌려줍니다. 라벨 임베딩은 e0 입니다.
+    fn assign_one(banks: &TradeLabelBanks, label: &str, value: &str) -> (usize, serde_json::Map<String, Value>) {
+        let dim = banks.names.len() + 1;
+        let mut leaf = vec![0.0f32; dim];
+        leaf[0] = 1.0;
+        let mut out = serde_json::Map::new();
+        out.insert("cargo".to_string(), json!({}));
+        out.insert("line_items".to_string(), json!([]));
+        out.insert("containers".to_string(), json!([]));
+        let emit = |s: &str| println!("{}", s);
+        let n = assign_continuation_pairs(
+            banks,
+            &[label.to_string()],
+            &[value.to_string()],
+            &[0],
+            &[String::new()],
+            &[false],
+            &[leaf],
+            &[vec![0.0f32; dim]],
+            &mut out,
+            &emit,
+        );
+        (n, out)
+    }
+
+    #[test]
+    fn aggregate_label_outside_row_sections_takes_the_document_axis() {
+        // 문서 총중량 · 품목 총중량이 붙고(1·2위 +0.01) 3위 이하는 떨어진 PairConfusion 형상.
+        let banks = synthetic_banks(&[
+            ("weight_gross", &["gross weight"], 0.80),
+            ("item_gross_weight", &["item gross weight"], 0.79),
+            ("container_gross_weight", &["container gross weight"], 0.70),
+            ("weight_net", &["net weight"], 0.60),
+        ]);
+        let (n, total) = assign_one(&banks, "total_gross_weight_kg", "2500.0");
+        assert_eq!(n, 1);
+        assert_eq!(total["cargo"].get("weight_gross").cloned(), Some(json!("2500.0")));
+        assert!(total["line_items"].as_array().unwrap().is_empty());
+        assert!(total["containers"].as_array().unwrap().is_empty());
+
+        // 총계 표지가 없고 낱말도 두 후보 모두에 있으면 고를 근거가 없으므로 첫 페이지처럼 보류합니다.
+        let (n, plain) = assign_one(&banks, "gross_weight_kg", "2500.0");
+        assert_eq!(n, 0);
+        assert!(plain["cargo"].as_object().unwrap().is_empty());
+        assert!(plain["line_items"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn label_words_break_a_held_tie_only_when_they_name_one_candidate() {
+        // 문서 총중량 · 순중량이 코사인으로 붙은 동률(코사인 1위는 weight_gross).
+        let banks = synthetic_banks(&[
+            ("weight_gross", &["gross weight", "total gross weight"], 0.80),
+            ("weight_net", &["net weight", "total net weight"], 0.79),
+            ("volume", &["volume", "measurement"], 0.70),
+            ("chargeable_weight", &["chargeable weight"], 0.60),
+        ]);
+        let (n, gross) = assign_one(&banks, "total_gross_weight_kg", "2500.0");
+        assert_eq!(n, 1);
+        assert_eq!(gross["cargo"].get("weight_gross").cloned(), Some(json!("2500.0")));
+
+        // 'net' 은 weight_net 뱅크에만 있으므로 코사인 2위여도 잡음 폭 안이면 그 축입니다.
+        let (n, net) = assign_one(&banks, "Total Net Weight (KG)", "2300.0");
+        assert_eq!(n, 1);
+        assert_eq!(net["cargo"].get("weight_net").cloned(), Some(json!("2300.0")));
+        assert!(net["cargo"].get("weight_gross").is_none());
+
+        // 낱말이 서로 다른 후보를 가리키면 보류합니다.
+        let (n, mixed) = assign_one(&banks, "gross_net_weight", "2500.0");
+        assert_eq!(n, 0);
+        assert!(mixed["cargo"].as_object().unwrap().is_empty());
+
+        // 순수 함수: 숫자 · 2글자 단위 약어는 근거가 아닙니다.
+        let texts: Vec<Vec<String>> = vec![vec!["kg 10".to_string()], vec!["net weight".to_string()]];
+        assert_eq!(label_token_evidence("kg 10", &[0, 1], &texts), None);
+        assert_eq!(label_token_evidence("net kg", &[0, 1], &texts), Some((1, vec!["net".to_string()])));
+    }
+
+    /// SR-2026-0820 2페이지(pdftotext). 첫 줄은 앞 페이지 [ Item 1 ] 의 값입니다.
+    const SR_PAGE2: [(&str, &str, &str, bool); 10] = [
+        ("measurement_cbm", "9.0", "[ Item 1 ]", true),
+        ("item_code", "SKU-B200", "[ Item 2 ]", false),
+        ("description", "Sensor Modules", "[ Item 2 ]", false),
+        ("quantity", "2000 PCS", "[ Item 2 ]", false),
+        ("packages", "20 PLTS", "[ Item 2 ]", false),
+        ("gross_weight_kg", "1000.0", "[ Item 2 ]", false),
+        ("measurement_cbm", "6.0", "[ Item 2 ]", false),
+        ("total_packages", "50 PLTS", "summary", false),
+        ("total_gross_weight_kg", "2500.0", "summary", false),
+        ("total_measurement_cbm", "15.0", "summary", false),
+    ];
+
+    #[test]
+    #[ignore = "실모델: 로컬 granite 가중치 필요 (LOGIS_EMBED_MODEL_DIR 또는 앱 데이터 폴더)"]
+    fn shipping_request_page_two_follows_page_one_rules() {
+        use crate::models::embedding::{EmbeddingModel, ForwardMode};
+        let model_dir = std::env::var("LOGIS_EMBED_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate::utils::get_app_dir().join("models").join("granite-embedding-97m-multilingual-r2"));
+        let device = candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu);
+        let m = EmbeddingModel::new_with_device_and_mode(&model_dir, &device, ForwardMode::Legacy).expect("모델 적재");
+        let embed = |texts: &[String]| -> Vec<Vec<f32>> { m.embed_many(texts, &m.batch_opts()).expect("embed_many") };
+        let embed_groups = |groups: &[Vec<String>]| -> Vec<Vec<Vec<f32>>> {
+            let flat: Vec<String> = groups.iter().flat_map(|g| g.iter().cloned()).collect();
+            let mut vecs = embed(&flat).into_iter();
+            groups.iter().map(|g| (0..g.len()).map(|_| vecs.next().unwrap()).collect()).collect()
+        };
+
+        let fields = crate::parsing::get_detail_schema_fields("SR", "", "en");
+        let texts = trade_label_bank_texts("en", "SR", &fields);
+        let label_embs = embed_groups(&texts.label_texts);
+        let prej_raw = embed_groups(&texts.prej_texts);
+        let emit = |s: &str| println!("{}", s);
+        let banks = finish_trade_label_banks(texts, label_embs, prej_raw, &emit, false);
+
+        let labels: Vec<String> = SR_PAGE2.iter().map(|p| p.0.to_string()).collect();
+        let vals: Vec<String> = SR_PAGE2.iter().map(|p| p.1.to_string()).collect();
+        let sections: Vec<String> = SR_PAGE2.iter().map(|p| p.2.to_string()).collect();
+        let carried: Vec<bool> = SR_PAGE2.iter().map(|p| p.3).collect();
+        let lines: Vec<usize> = (0..SR_PAGE2.len()).collect();
+        let surfaces: Vec<String> = labels.iter().map(|l| crate::utils::ai_utils::label_embed_surface(l)).collect();
+        let leaf_embs = embed(&surfaces);
+        let section_embs = embed(&sections);
+
+        let mut out = serde_json::Map::new();
+        for c in ["header", "parties", "logistics", "conditions", "financials", "cargo"] {
+            out.insert(c.to_string(), json!({}));
+        }
+        out.insert("line_items".to_string(), json!([]));
+        out.insert("containers".to_string(), json!([]));
+        let assigned = assign_continuation_pairs(
+            &banks, &labels, &vals, &lines, &sections, &carried, &leaf_embs, &section_embs, &mut out, &emit,
+        );
+        println!("{}", serde_json::to_string_pretty(&Value::Object(out.clone())).unwrap());
+        assert!(assigned > 0);
+
+        let rows = out["line_items"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "[ Item 2 ] 는 한 행입니다");
+        let r = &rows[0];
+        assert_eq!(r["item_code"], "SKU-B200");
+        assert_eq!(r["description"], "Sensor Modules");
+        assert_eq!(r["quantity"], "2000");
+        assert_eq!(r["unit"], "PCS", "measurement_cbm 6.0 이 단위 축으로 새지 않습니다");
+        assert_eq!(r["item_package_count"], "20");
+        assert_eq!(r["item_package_type"], "PLTS");
+        assert_eq!(r["item_gross_weight"], "1000.0");
+        let carry = out.get(CARRY_ROWS_KEY).cloned().unwrap_or(json!({}));
+        assert!(
+            carry.get("line_items").map_or(true, |row| row.get("unit").is_none()),
+            "[ Item 1 ] 의 measurement_cbm 9.0 은 맞는 품목 축이 없어 넣지 않습니다: {carry}"
+        );
+        let cargo = out["cargo"].as_object().unwrap();
+        assert_eq!(cargo.get("volume").cloned(), Some(json!("15.0")));
+        assert_eq!(cargo.get("weight_gross").cloned(), Some(json!("2500.0")));
+        assert_eq!(cargo.get("package_count").cloned(), Some(json!("50")));
+        assert_eq!(cargo.get("package_unit").cloned(), Some(json!("PLTS")));
+        assert!(
+            out["conditions"].as_object().unwrap().values().all(|v| v != "15.0"),
+            "수치는 열거형 조건 축(payment_terms 등)으로 가지 않습니다"
+        );
+    }
 }

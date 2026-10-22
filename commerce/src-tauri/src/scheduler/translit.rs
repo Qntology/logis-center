@@ -193,23 +193,22 @@ fn save_translit_cache(
     }));
 }
 
-pub async fn transliterate_cross_language(
-    model: &LogisModel,
-    text: &str,
-    doc_lang: &str,
-    cancel: &Arc<AtomicBool>,
-    app_handle: &tauri::AppHandle,
-    task_id: &str,
-) -> (String, String) {
-    let _ = (app_handle, task_id);
+/// 교차 언어 음차 계획. LLM 없이 끝나는 값은 결과를, LLM 이 필요한 값은 프롬프트를 돌려줍니다.
+/// 호출부가 LLM 호출을 모아 엔진(언어별 4B · 다국어 2B)을 한 번씩만 올릴 수 있게 둘로 나눴습니다.
+pub enum CrossTranslit {
+    Done((String, String)),
+    Llm { src: String, prompt: String, to_native: bool },
+}
+
+pub fn plan_cross_language(text: &str, doc_lang: &str) -> CrossTranslit {
     let src = text.trim().to_string();
-    if src.is_empty() { return (String::new(), String::new()); }
+    if src.is_empty() { return CrossTranslit::Done((String::new(), String::new())); }
     if let Some((native, roman, code)) = crate::nl_convert::canonical_entity_alias(&src, doc_lang) {
         println!(
             "[ANALYTIC] 🌐 [CANONICAL ALIAS] '{}' → native='{}' | roman='{}' (국가 코드 {}) — 국가명은 언어마다 정해진 이름이 있는 닫힌 어휘라 음차 대신 국가명 표의 표기를 씁니다.",
             src, native, roman, code
         );
-        return (native, roman);
+        return CrossTranslit::Done((native, roman));
     }
 
     let src_is_latin = crate::nl_convert::is_latin_dominant(&src);
@@ -219,10 +218,8 @@ pub async fn transliterate_cross_language(
     // 동일 문자 체계 → 음차 불필요
     if src_is_latin == target_is_latin && !src_is_latin {
         // 한글→한글: 무의미. 로마자 역방향만 시도.
-        if let Some(roman) = crate::nl_convert::try_any_ascii_transliteration(&src) {
-            return (String::new(), roman);
-        }
-        return (String::new(), String::new());
+        let roman = crate::nl_convert::try_any_ascii_transliteration(&src).unwrap_or_default();
+        return CrossTranslit::Done((String::new(), roman));
     }
 
     // 🌟 [PROMPT / SANITIZE FIX]
@@ -241,37 +238,72 @@ pub async fn transliterate_cross_language(
     // 영어 원문 → 문서 언어(비라틴) 방향
     if src_is_latin && !target_is_latin {
         let prompt = crate::nl_convert::build_transliteration_prompt(&src, doc_lang);
-        let res = model
-            .call_qwen3_5_transliteration(&prompt, Some(cancel.clone()))
-            .await
-            .unwrap_or_default();
-        let (_t, native) = crate::nl_convert::sanitize_transliteration_dual(&res, &src);
-        let native = crate::nl_convert::gate_native_alias(&src, native, "ANALYTIC");
-        let roman = crate::nl_convert::try_any_ascii_transliteration(&src).unwrap_or_default();
-        if native.is_empty() {
-            println!("[ANALYTIC] ⚪ [TRANSLIT REJECT] '{}' 의 문서언어 음차가 게이트를 통과하지 못해 폐기했습니다.", src);
-        }
-        return (native, roman);
+        return CrossTranslit::Llm { src, prompt, to_native: true };
     }
 
     // 비라틴 원문 → 로마자(라틴) 역방향
     if !src_is_latin && target_is_latin {
         if let Some(roman) = crate::nl_convert::try_any_ascii_transliteration(&src) {
-            return (String::new(), roman);
+            return CrossTranslit::Done((String::new(), roman));
         }
         let prompt = crate::nl_convert::build_transliteration_prompt(&src, "en");
-        let res = model
-            .call_qwen3_5_transliteration(&prompt, Some(cancel.clone()))
-            .await
-            .unwrap_or_default();
-        let (_t, roman) = crate::nl_convert::sanitize_transliteration_dual(&res, &src);
+        return CrossTranslit::Llm { src, prompt, to_native: false };
+    }
+
+    CrossTranslit::Done((String::new(), String::new()))
+}
+
+/// LLM 이 필요한 교차 언어 음차를 마칩니다. 값에 제3 언어가 섞였으면 다국어 2B 로, 아니면 호출부가 묶어 둔
+/// 언어별 4B(묶여 있지 않으면 2B)로 읽습니다 (lang_llm::translit_third_language).
+pub async fn finish_cross_language(
+    model: &LogisModel,
+    src: &str,
+    prompt: &str,
+    to_native: bool,
+    doc_lang: &str,
+    cancel: &Arc<AtomicBool>,
+) -> (String, String) {
+    let res = if crate::model::lang_llm::translit_third_language(src, doc_lang).is_some() {
+        model.call_base_transliteration(prompt, Some(cancel.clone())).await
+    } else {
+        model.call_qwen3_5_transliteration(prompt, Some(cancel.clone())).await
+    }
+    .unwrap_or_default();
+    if to_native {
+        let (_t, native) = crate::nl_convert::sanitize_transliteration_dual(&res, src);
+        let native = crate::nl_convert::gate_native_alias(src, native, "ANALYTIC");
+        let roman = crate::nl_convert::try_any_ascii_transliteration(src).unwrap_or_default();
+        if native.is_empty() {
+            println!("[ANALYTIC] ⚪ [TRANSLIT REJECT] '{}' 의 문서언어 음차가 게이트를 통과하지 못해 폐기했습니다.", src);
+        }
+        (native, roman)
+    } else {
+        let (_t, roman) = crate::nl_convert::sanitize_transliteration_dual(&res, src);
         if roman.is_empty() {
             println!("[ANALYTIC] ⚪ [TRANSLIT REJECT] '{}' 의 로마자 음차가 게이트를 통과하지 못해 폐기했습니다.", src);
         }
-        return (String::new(), roman);
+        (String::new(), roman)
     }
+}
 
-    (String::new(), String::new())
+/// 다국어 대기열에 넣는 값의 1차 별칭. 비라틴 단어를 any_ascii 로 읽은 로마자 쪽만 미리 만들어 둡니다
+/// (4B 경로 혼용 값의 언어 통일 roman 과 같은 모양). 문서 언어 표기는 다국어 2B 가 읽은 뒤 채웁니다.
+fn multilingual_base_pair(src: &str) -> (String, String) {
+    let (non_latin, latin) = crate::nl_convert::split_words_by_script(src);
+    if non_latin.is_empty() || non_latin.iter().all(|w| crate::nl_convert::is_digit_word(w)) {
+        return (String::new(), String::new());
+    }
+    let read = crate::nl_convert::try_any_ascii_transliteration(&non_latin.join(" "))
+        .or_else(|| crate::nl_convert::try_any_ascii_transliteration_words(&non_latin));
+    let roman = match read {
+        Some(r) => std::iter::once(r).chain(latin.iter().cloned()).collect::<Vec<_>>().join(" "),
+        None => String::new(),
+    };
+    if roman.is_empty() || roman.eq_ignore_ascii_case(src) {
+        (String::new(), String::new())
+    } else {
+        (String::new(), roman)
+    }
 }
 /// 🌟 [SYNONYM EXPANSION] 청크 배열에 대해 2-pass 음차 별칭을 생성합니다.
 /// 반환값은 입력 청크와 같은 길이의 (native, roman) 배열입니다.
@@ -296,7 +328,7 @@ pub async fn generate_transliteration_aliases(
     if pending.is_empty() {
         return out;
     }
-    let read = run_deferred_second_reads(model, &pending, doc_lang, cancel, app_handle, task_id).await;
+    let read = run_multilingual_reads(model, &pending, doc_lang, cancel, app_handle, task_id).await;
     for (j, cm) in chunks.iter().enumerate() {
         if let Some(pair) = read.get(cm.value_part.trim()) {
             out[j] = pair.clone();
@@ -346,8 +378,8 @@ pub async fn generate_transliteration_aliases_deferred(
 
     let mut generation_ready = false;
     let mut engine_label = String::from("Qwen3.5-2B");
-    let mut lang_engine_used = false;
-    let mut second_read: Vec<String> = Vec::new();
+    // 제3 언어가 섞여 다국어 2B 가 읽을 값(이 아이템에서 처음 본 값과 앞 아이템이 대기열에 넣은 값).
+    let mut multilingual: Vec<String> = Vec::new();
     let mut _translit_binding = crate::model::lang_llm::TranslitBinding::none();
     macro_rules! ensure_generation {
         () => {
@@ -363,7 +395,6 @@ pub async fn generate_transliteration_aliases_deferred(
                 {
                     Ok((engine, binding)) => {
                         engine_label = engine.label();
-                        lang_engine_used = engine.is_lang();
                         _translit_binding = binding;
                         generation_ready = true;
                         emit(&format!("  🔤 [TRANSLIT ENGINE] 이번 아이템의 음차 엔진: {}", engine_label));
@@ -399,8 +430,8 @@ pub async fn generate_transliteration_aliases_deferred(
         if let Some(hit) = memo.get(&src).cloned() {
             cache.insert(src.clone(), hit.clone());
             out[i] = hit;
-            if !second_read.contains(&src) {
-                second_read.push(src.clone());
+            if !multilingual.contains(&src) {
+                multilingual.push(src.clone());
             }
             reused += 1;
             continue;
@@ -429,8 +460,15 @@ pub async fn generate_transliteration_aliases_deferred(
             continue;
         }
 
+        // 🌟 [TRANSLIT ENGINE / VALUE] 4B 를 쓸 수 있는 문서에서 이 값이 다국어 2B 몫인지 미리 가립니다.
+        //    다국어 값의 빈 캐시 별칭은 4B 가 생겨도 다시 만들 이유가 없으므로 4B 재확인에서도 뺍니다.
+        let third = if lang_engine_ready {
+            crate::model::lang_llm::translit_third_language(&src, doc_lang)
+        } else {
+            None
+        };
         let cached_hit = query_translit_cache(app_handle, &src, doc_lang).await.filter(|hit| {
-            match crate::nl_convert::cached_translit_recheck(&src, &hit.0, doc_lang, lang_engine_ready)
+            match crate::nl_convert::cached_translit_recheck(&src, &hit.0, doc_lang, lang_engine_ready && third.is_none())
                 .filter(|_| first_recheck(&src, doc_lang, &recheck_key))
             {
                 Some(why) => {
@@ -488,6 +526,29 @@ pub async fn generate_transliteration_aliases_deferred(
                 skipped += 1;
                 continue;
             }
+        }
+
+        // 🌟 [TRANSLIT ENGINE / MULTILINGUAL] 제3 언어가 섞인 값은 언어별 4B(영어 + 문서 언어)에 보내지 않고
+        //    다국어 2B 대기열로 바로 보냅니다. 예전에는 모든 값을 4B 로 읽고 실패한 값만 2B 로 다시 읽었지만(SECOND READ),
+        //    이제 단일 언어 값은 4B 한 번으로 끝나고 2B 는 다국어 값에만 올라갑니다. 2B 를 올리는 비용은
+        //    값마다가 아니라 대기열 전체에 한 번입니다(run_multilingual_reads).
+        if let Some(why) = third.as_ref() {
+            let base = multilingual_base_pair(&src);
+            emit(&format!(
+                "  🌐 [TRANSLIT ENGINE / MULTILINGUAL] '{}' (property='{}') | {} → 언어별 4B 대신 다국어 Qwen3.5-2B 대기열로 보냅니다.",
+                src, cm.property, why
+            ));
+            crate::utils::score_dynamics::record_baseline("indexing.translit_multilingual_route", 1.0);
+            memo.insert(src.clone(), base.clone());
+            if !multilingual.contains(&src) {
+                multilingual.push(src.clone());
+            }
+            cache.insert(src.clone(), base.clone());
+            out[i] = base;
+            continue;
+        }
+        if lang_engine_ready {
+            crate::utils::score_dynamics::record_baseline("indexing.translit_multilingual_route", 0.0);
         }
 
         println!(" 🔄 [SYNONYM PASS-1] '{}' (property='{}')", src, cm.property);
@@ -569,7 +630,7 @@ pub async fn generate_transliteration_aliases_deferred(
             //    Track B 는 라틴 → 문서 언어(비라틴) 음차입니다.
             //    결과가 여전히 라틴 문자를 포함하면 음차 실패입니다.
             //    (로그 실측: "RITMO" → " ritmo" → trim 후 "ritmo" = 라틴 잔존)
-            //    실패 단어만 추출하여 Qwen3.5 2B 로 1회 재음차합니다.
+            //    실패 단어만 추출하여 같은 음차 엔진으로 1회 재음차합니다.
             //    재음차도 라틴이면 원본 라틴 단어를 그대로 유지합니다.
             if !track_b_transliteration.is_empty() && !latin_words.is_empty() {
                 let track_b_words: Vec<String> = track_b_transliteration
@@ -891,13 +952,8 @@ pub async fn generate_transliteration_aliases_deferred(
             }
         }
         cache.insert(src.clone(), final_pair.clone());
-        let latin_left = !crate::nl_convert::split_words_by_script(&src).1.is_empty();
-        if lang_engine_used && final_pair.0.is_empty() && latin_left && !second_read.contains(&src) {
-            second_read.push(src.clone());
-            memo.insert(src.clone(), final_pair.clone());
-        } else {
-            save_translit_cache(app_handle, &src, doc_lang, &final_pair.0, &final_pair.1);
-        }
+        // 단일 언어 값은 이 엔진의 결과가 최종입니다. 게이트를 못 넘은 값도 2B 로 다시 읽지 않고 그 판정을 저장합니다.
+        save_translit_cache(app_handle, &src, doc_lang, &final_pair.0, &final_pair.1);
         out[i] = final_pair;
     }
 
@@ -920,14 +976,13 @@ pub async fn generate_transliteration_aliases_deferred(
         emit("  ⚡ [CROSSOVER] 음차가 전부 캐시로 해결되어 Qwen3.5 를 올리지 않았습니다. (전환 0회)");
     }
 
-    let pending: Vec<(String, (String, String))> = second_read
+    let pending: Vec<(String, (String, String))> = multilingual
         .iter()
         .filter_map(|s| memo.get(s).map(|p| (s.clone(), p.clone())))
         .collect();
     if !pending.is_empty() {
         emit(&format!(
-            "  ⏳ [TRANSLIT SECOND READ / QUEUED] {} 이(가) 원문 라틴 단어를 게이트를 통과하는 문서 언어 표기로 옮기지 못한 값 {}건을 Qwen3.5-2B(다국어 어휘) 읽기 대기열에 넣습니다: {:?}",
-            if generation_ready { engine_label.clone() } else { "앞선 아이템의 문서 언어 모델".to_string() },
+            "  ⏳ [TRANSLIT MULTILINGUAL / QUEUED] 제3 언어가 섞여 언어별 4B(영어 + 문서 언어) 밖인 값 {}건을 Qwen3.5-2B(다국어 어휘) 대기열에 넣습니다: {:?}",
             pending.len(),
             pending.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>()
         ));
@@ -935,7 +990,10 @@ pub async fn generate_transliteration_aliases_deferred(
     (out, pending)
 }
 
-pub async fn run_deferred_second_reads(
+/// 🌟 [TRANSLIT MULTILINGUAL] 제3 언어가 섞인 값들을 다국어 Qwen3.5-2B 로 한 번에 읽습니다.
+///    값마다 엔진을 바꾸면 2B 적재와 언어별 4B 재적재가 값 수만큼 반복되므로, 언어별 4B 작업을 먼저 끝내고
+///    다국어 값만 모아 2B 를 한 번 올립니다. 결과는 4B 경로와 같은 발음 · 글자 읽기 게이트를 지납니다.
+pub async fn run_multilingual_reads(
     model: &LogisModel,
     pending: &[(String, (String, String))],
     doc_lang: &str,
@@ -962,7 +1020,7 @@ pub async fn run_deferred_second_reads(
         return done;
     }
     emit(&format!(
-        "  🔁 [TRANSLIT SECOND READ / BATCH] 문서 언어 전용 모델이 게이트를 통과하는 표기로 옮기지 못한 값 {}건을 Qwen3.5-2B(다국어 어휘)로 한 번에 읽습니다: {:?} | 값마다 모델을 바꾸면 2B 적재와 문서 언어 모델 재적재가 값 수만큼 반복되므로, 문서 언어 모델 작업을 먼저 끝내고 다국어 작업을 모아 2B 를 한 번만 올립니다.",
+        "  🔁 [TRANSLIT MULTILINGUAL / BATCH] 제3 언어가 섞인 값 {}건을 Qwen3.5-2B(다국어 어휘)로 한 번에 읽습니다: {:?} | 언어별 4B 는 영어와 문서 언어 두 언어만 다루므로 그 밖의 언어가 섞인 값은 처음부터 2B 가 맡고, 2B 는 값마다가 아니라 이 묶음에 한 번만 올립니다.",
         order.len(),
         order.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>()
     ));
@@ -995,16 +1053,16 @@ pub async fn run_deferred_second_reads(
                 if first_call_ms.is_none() {
                     first_call_ms = Some(t0.elapsed().as_millis() as f32);
                 }
-                println!("    SECOND-READ RAW (Qwen3.5-2B) = '{}'", raw.trim());
+                println!("    MULTILINGUAL RAW (Qwen3.5-2B) = '{}'", raw.trim());
                 let (_t, tr) = if non_latin.is_empty() {
                     crate::nl_convert::sanitize_transliteration_dual(&raw, src)
                 } else {
                     crate::nl_convert::sanitize_transliteration_dual_for_words(&raw, &latin)
                 };
-                let g = crate::nl_convert::gate_native_alias(&latin_src, tr, "SECOND-READ");
+                let g = crate::nl_convert::gate_native_alias(&latin_src, tr, "MULTILINGUAL");
                 if !g.trim().is_empty() {
                     if let Some(sim) = crate::nl_convert::phonetic_similarity(&latin_src, &g) {
-                        crate::utils::score_dynamics::record_baseline("indexing.translit_second_read_sim", sim);
+                        crate::utils::score_dynamics::record_baseline("indexing.translit_multilingual_sim", sim);
                     }
                 }
                 readings.insert(reading_key.clone(), g.clone());
@@ -1034,15 +1092,15 @@ pub async fn run_deferred_second_reads(
             } else {
                 pair.0 = native;
             }
-            crate::utils::score_dynamics::record_baseline("indexing.translit_second_read", 1.0);
+            crate::utils::score_dynamics::record_baseline("indexing.translit_multilingual", 1.0);
             emit(&format!(
-                "      🔤 [SYNONYM EXPANSION / SECOND READ] '{}' → native='{}' | roman='{}' | Qwen3.5-2B 가 읽은 표기가 발음·글자읽기 게이트를 통과했습니다.",
+                "      🔤 [SYNONYM EXPANSION / MULTILINGUAL] '{}' → native='{}' | roman='{}' | Qwen3.5-2B 가 읽은 표기가 발음·글자읽기 게이트를 통과했습니다.",
                 src, pair.0, pair.1
             ));
         } else {
-            crate::utils::score_dynamics::record_baseline("indexing.translit_second_read", 0.0);
+            crate::utils::score_dynamics::record_baseline("indexing.translit_multilingual", 0.0);
             emit(&format!(
-                "      ⚪ [TRANSLIT SECOND READ / NONE] '{}' | Qwen3.5-2B 의 표기도 게이트를 통과하지 못해 지금 결과(native='{}' · roman='{}')를 저장합니다.",
+                "      ⚪ [TRANSLIT MULTILINGUAL / NONE] '{}' | Qwen3.5-2B 의 표기가 게이트를 통과하지 못해 지금 결과(native='{}' · roman='{}')를 저장합니다.",
                 src, pair.0, pair.1
             ));
         }
@@ -1050,15 +1108,47 @@ pub async fn run_deferred_second_reads(
         done.insert(src.clone(), pair);
     }
     if let Some(ms) = first_call_ms {
-        crate::utils::score_dynamics::record_baseline("indexing.translit_second_read_first_ms", ms);
+        crate::utils::score_dynamics::record_baseline("indexing.translit_multilingual_first_ms", ms);
     }
-    crate::utils::score_dynamics::record_baseline("indexing.translit_second_read_batch", done.len() as f32);
+    crate::utils::score_dynamics::record_baseline("indexing.translit_multilingual_batch", done.len() as f32);
     emit(&format!(
-        "  🔁 [TRANSLIT SECOND READ / BATCH DONE] {}건 처리 · 2B 호출 {}회 (같은 라틴 단어 묶음은 한 번만 읽습니다) · 첫 호출 {:.0}ms (2B 적재 포함) · 전체 {}ms",
+        "  🔁 [TRANSLIT MULTILINGUAL / BATCH DONE] {}건 처리 · 2B 호출 {}회 (같은 라틴 단어 묶음은 한 번만 읽습니다) · 첫 호출 {:.0}ms (2B 적재 포함) · 전체 {}ms",
         done.len(),
         calls,
         first_call_ms.unwrap_or(0.0),
         started.elapsed().as_millis()
     ));
     done
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multilingual_base_pair_keeps_only_the_romanized_side() {
+        assert_eq!(multilingual_base_pair("Müller GmbH"), (String::new(), String::new()));
+        assert_eq!(multilingual_base_pair("360 Café"), (String::new(), String::new()));
+        let (native, roman) = multilingual_base_pair("서울 Café");
+        assert!(native.is_empty(), "문서 언어 표기는 2B 가 읽은 뒤 채웁니다");
+        assert!(roman.to_lowercase().starts_with("seoul") && roman.ends_with("Café"), "{}", roman);
+    }
+
+    #[test]
+    fn plan_cross_language_defers_only_llm_work() {
+        match plan_cross_language("Goods Sold", "ko") {
+            CrossTranslit::Llm { src, to_native, .. } => {
+                assert_eq!(src, "Goods Sold");
+                assert!(to_native);
+            }
+            CrossTranslit::Done(p) => panic!("영어 → 한국어는 LLM 음차입니다: {:?}", p),
+        }
+        match plan_cross_language("구매 완료", "ko") {
+            CrossTranslit::Done((native, roman)) => {
+                assert!(native.is_empty());
+                assert!(!roman.is_empty(), "같은 문자 체계는 any_ascii 로마자만 만듭니다");
+            }
+            CrossTranslit::Llm { .. } => panic!("한국어 → 한국어는 LLM 이 필요 없습니다"),
+        }
+    }
 }

@@ -57,6 +57,87 @@ pub fn batched_enabled(device: &Device) -> bool {
     }
 }
 
+// =====================================================================
+// 🌟 [EMBED-FORWARD] granite-embedding-97m-multilingual-r2 순전파 판본
+// ---------------------------------------------------------------------
+//  ── 무엇이 다른가 ──
+//   모델 config.json 은 ModernBertModel 입니다: LayerNorm(norm_bias=false), 전역 층(3층마다)
+//   RoPE θ 150000 · 지역 층 θ 160000 + ±64 슬라이딩 창(local_attention 128), 공식 문장 임베딩은
+//   CLS 풀링(1_Pooling: pooling_mode_cls_token) + 정규화입니다.
+//   이 파일의 기존 순전파(Legacy)는 RmsNorm · 모든 층 θ 150000 · 전역 어텐션 · 평균 풀링이고,
+//   GPU 에서는 RoPE 표를 BF16 으로 만들어 256 을 넘는 위치가 짝수로 뭉개집니다.
+//   두 판본 벡터의 코사인은 0.79~0.89 입니다(로컬 가중치 재현).
+//
+//  ── 왜 기본값을 바꾸지 않는가 ──
+//   라벨 뱅크 · z 점수 바닥 · SDS 기준선 · LanceDB 에 이미 저장된 벡터가 전부 Legacy 공간입니다.
+//   같은 CI 문서 라벨 19개 라우팅 재현(대문자 접기 포함): Legacy 19/19, Exact(CLS) 17/19
+//   (INVOICE NUMBER→amount · TOTAL WEIGHT→item_gross_weight), Exact+평균 풀링 18/19.
+//   Exact 는 재색인 · 임계 재보정과 함께 옮겨야 하므로 LOGIS_EMBED_FORWARD 로만 켭니다.
+//   판본마다 캐시 공간(순전파 태그)이 달라 같은 텍스트의 두 벡터가 섞이지 않습니다.
+// =====================================================================
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardMode {
+    /// 기존 순전파 (RmsNorm · 단일 θ · 전역 어텐션 · 평균 풀링). 기본값.
+    Legacy,
+    /// ModernBERT 기준 순전파 + CLS 풀링 (공식 문장 임베딩).
+    Exact,
+    /// ModernBERT 기준 순전파 + 평균 풀링 (이관 실험용).
+    ExactMean,
+}
+
+impl ForwardMode {
+    pub fn from_env_value(v: Option<&str>) -> Self {
+        match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("exact") | Some("exact-cls") | Some("modernbert") => ForwardMode::Exact,
+            Some("exact-mean") => ForwardMode::ExactMean,
+            _ => ForwardMode::Legacy,
+        }
+    }
+
+    /// 캐시 공간을 나누는 순전파 태그 접미사. Legacy 는 예전 태그 그대로입니다.
+    pub fn tag_suffix(&self) -> Option<&'static str> {
+        match self {
+            ForwardMode::Legacy => None,
+            ForwardMode::Exact => Some("+modernbert-cls/v1"),
+            ForwardMode::ExactMean => Some("+modernbert-mean/v1"),
+        }
+    }
+
+    pub fn is_exact(&self) -> bool {
+        !matches!(self, ForwardMode::Legacy)
+    }
+
+    fn cls_pooling(&self) -> bool {
+        matches!(self, ForwardMode::Exact)
+    }
+}
+
+/// 값은 프로세스 안에서 한 번만 읽습니다(캐시 공간이 이 판정에 묶여 있습니다).
+static EMBED_FORWARD_ENV: once_cell::sync::Lazy<ForwardMode> = once_cell::sync::Lazy::new(|| {
+    let raw = std::env::var("LOGIS_EMBED_FORWARD").ok();
+    let mode = ForwardMode::from_env_value(raw.as_deref());
+    println!(
+        "[EMBED-FORWARD] LOGIS_EMBED_FORWARD → {} ({})",
+        raw.as_deref().unwrap_or("미설정"),
+        match mode {
+            ForwardMode::Legacy => "기존 순전파 · 평균 풀링 (기본)",
+            ForwardMode::Exact => "ModernBERT 기준 순전파 · CLS 풀링",
+            ForwardMode::ExactMean => "ModernBERT 기준 순전파 · 평균 풀링",
+        }
+    );
+    if mode.is_exact() {
+        println!(
+            "[EMBED-FORWARD] ⚠️ LanceDB 에 이미 저장된 아이템·청크 벡터와 bias.json 뱅크 임계값은 기존 순전파 기준입니다. 이 판본으로 운영하려면 재색인과 임계 재보정이 함께 필요합니다 (캐시는 판본별 공간이라 섞이지 않습니다)."
+        );
+    }
+    mode
+});
+
+/// 이 프로세스의 임베딩 순전파 판본.
+pub fn forward_mode() -> ForwardMode {
+    *EMBED_FORWARD_ENV
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Config {
     pub hidden_size: usize,
@@ -66,9 +147,70 @@ pub struct Config {
     pub norm_eps: f64,
     pub vocab_size: usize,
     pub pad_token_id: Option<usize>,
+    #[serde(default)]
+    pub global_rope_theta: Option<f64>,
+    #[serde(default)]
+    pub local_rope_theta: Option<f64>,
+    #[serde(default)]
+    pub local_attention: Option<usize>,
+    #[serde(default)]
+    pub global_attn_every_n_layers: Option<usize>,
 }
 
 // --- Common Layers ---
+
+/// ModernBERT 의 LayerNorm(bias=False). 평균·분산은 F32 로 계산합니다.
+struct LayerNormNoBias {
+    weight_f32: Tensor,
+    eps: f64,
+}
+
+impl LayerNormNoBias {
+    fn new(dim: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<Self> {
+        let weight_f32 = vb.get(dim, "weight")?.to_dtype(DType::F32)?;
+        Ok(Self { weight_f32, eps })
+    }
+
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let x_dtype = x.dtype();
+        let x = x.to_dtype(DType::F32)?;
+        let mean = x.mean_keepdim(candle_core::D::Minus1)?;
+        let xc = x.broadcast_sub(&mean)?;
+        let var = xc.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+        let y = xc.broadcast_div(&(var + self.eps)?.sqrt()?)?;
+        y.broadcast_mul(&self.weight_f32)?.to_dtype(x_dtype)
+    }
+}
+
+/// 층 정규화: Legacy 는 RmsNorm, Exact 는 LayerNorm.
+enum Norm {
+    Rms(RmsNorm),
+    Layer(LayerNormNoBias),
+}
+
+impl Norm {
+    fn new(mode: ForwardMode, dim: usize, eps: f64, vb: VarBuilder) -> candle_core::Result<Self> {
+        if mode.is_exact() {
+            Ok(Norm::Layer(LayerNormNoBias::new(dim, eps, vb)?))
+        } else {
+            Ok(Norm::Rms(RmsNorm::new(dim, eps, vb)?))
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Norm::Rms(n) => n.forward(x),
+            Norm::Layer(n) => n.forward(x),
+        }
+    }
+
+    fn rms(&self) -> Option<&RmsNorm> {
+        match self {
+            Norm::Rms(n) => Some(n),
+            Norm::Layer(_) => None,
+        }
+    }
+}
 
 struct RmsNorm {
     weight: Tensor,
@@ -114,6 +256,18 @@ impl RotaryEmbedding {
         Ok(Self { cos, sin })
     }
 
+    /// 🌟 [EMBED-FORWARD] F32 RoPE 표. BF16 표는 256 을 넘는 위치(정수)를 정확히 담지 못합니다.
+    fn new_f32(dim: usize, max_seq_len: usize, theta: f64, device: &Device) -> candle_core::Result<Self> {
+        let inv_freq: Vec<f32> = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / (theta.powf(i as f64 / dim as f64) as f32))
+            .collect();
+        let inv_freq = Tensor::new(inv_freq.as_slice(), device)?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, device)?.to_dtype(DType::F32)?.unsqueeze(1)?;
+        let freqs = t.matmul(&inv_freq.unsqueeze(0)?)?;
+        Ok(Self { cos: freqs.cos()?, sin: freqs.sin()? })
+    }
+
     // 🌟 [ROPE-HOIST] 기존에는 12개 층이 매번 cos/sin 을 narrow → cat → unsqueeze →
     //    contiguous 로 다시 만들었고(q·k 각각), 순전파당 ~48개의 복사 커널이 쓰였습니다.
     //    값은 seq_len 에만 의존하므로 순전파당 한 번 만들고 모든 층이 공유합니다.
@@ -130,7 +284,11 @@ impl RotaryEmbedding {
     }
 
     /// x * cos + rotate_half(x) * sin (기존 apply_rotary 와 같은 연산 순서).
+    /// 표가 x 와 다른 dtype(Exact 의 F32 표)이면 표의 dtype 에서 회전한 뒤 x 의 dtype 으로 돌려줍니다.
     fn apply(x: &Tensor, cos: &Tensor, sin: &Tensor) -> candle_core::Result<Tensor> {
+        if x.dtype() != cos.dtype() {
+            return Self::apply(&x.to_dtype(cos.dtype())?, cos, sin)?.to_dtype(x.dtype());
+        }
         let last_dim = x.dim(candle_core::D::Minus1)?;
         // narrow 이후 메모리 연속성 보장
         let x1 = x.narrow(candle_core::D::Minus1, 0, last_dim / 2)?.contiguous()?;
@@ -223,53 +381,103 @@ impl Attention {
 struct DecoderLayer {
     self_attn: Attention,
     mlp: Mlp,
-    attn_norm: Option<RmsNorm>,
-    mlp_norm: RmsNorm,
+    attn_norm: Option<Norm>,
+    mlp_norm: Norm,
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, vb: VarBuilder) -> candle_core::Result<Self> {
+    fn new(cfg: &Config, mode: ForwardMode, vb: VarBuilder) -> candle_core::Result<Self> {
         let self_attn = Attention::new(cfg, vb.pp("attn"))?;
         let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
         // 🌟 [CRITICAL FIX] Granite(ModernBERT)는 layers.0에서 attn_norm을 생략하므로 Option(.ok())으로 안전하게 받습니다.
-        let attn_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("attn_norm")).ok();
-        let mlp_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("mlp_norm"))?;
+        let attn_norm = Norm::new(mode, cfg.hidden_size, cfg.norm_eps, vb.pp("attn_norm")).ok();
+        let mlp_norm = Norm::new(mode, cfg.hidden_size, cfg.norm_eps, vb.pp("mlp_norm"))?;
         Ok(Self { self_attn, mlp, attn_norm, mlp_norm })
+    }
+}
+
+/// 🌟 [EMBED-FORWARD] Exact 판본의 층별 RoPE · 지역 창.
+struct ExactAttention {
+    /// 전역 층(layer % every_n == 0) RoPE (θ = global_rope_theta, F32 표)
+    global: RotaryEmbedding,
+    /// 지역 층 RoPE (θ = local_rope_theta, F32 표)
+    local: RotaryEmbedding,
+    every_n: usize,
+    /// 지역 층이 볼 수 있는 거리 (local_attention / 2)
+    window_half: usize,
+}
+
+impl ExactAttention {
+    /// 지역 층의 슬라이딩 창 가산 마스크 [1, 1, L, L]. 창이 전 길이를 덮으면 None.
+    /// HF 와 같이 창 밖은 -inf 대신 큰 음수로 둡니다(패딩 질의 행이 전부 -inf 가 되어 NaN 이 생기지 않게).
+    fn window_mask(&self, seq_len: usize, device: &Device, dtype: DType) -> candle_core::Result<Option<Tensor>> {
+        if seq_len <= self.window_half + 1 {
+            return Ok(None);
+        }
+        let mut m = vec![0f32; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                if i.abs_diff(j) > self.window_half {
+                    m[i * seq_len + j] = -1e30;
+                }
+            }
+        }
+        Ok(Some(Tensor::from_vec(m, (1, 1, seq_len, seq_len), device)?.to_dtype(dtype)?))
     }
 }
 
 pub struct FloatModel {
     tok_embeddings: candle_nn::Embedding,
-    embeddings_norm: RmsNorm,
+    embeddings_norm: Norm,
     layers: Vec<DecoderLayer>,
-    final_norm: RmsNorm,
+    final_norm: Norm,
     rotary: Arc<RotaryEmbedding>,
+    /// 🌟 [EMBED-FORWARD] Exact 판본에서만 Some.
+    exact: Option<ExactAttention>,
+    mode: ForwardMode,
     /// 🌟 [EMBED-CPU-PACKED] CPU + LOGIS_EMBED_CPU_KERNEL=packed 일 때만 (embedding/cpu_packed.rs).
     packed: Option<cpu_packed::PackedModel>,
 }
 
 impl FloatModel {
     pub fn new(cfg: &Config, vb: VarBuilder, device: &Device) -> candle_core::Result<Self> {
+        Self::new_with_mode(cfg, vb, device, ForwardMode::Legacy)
+    }
+
+    pub fn new_with_mode(cfg: &Config, vb: VarBuilder, device: &Device, mode: ForwardMode) -> candle_core::Result<Self> {
         // CPU 강제 할당을 제거하고 전달받은 디바이스(VRAM)와 데이터 타입(BF16)을 그대로 사용합니다.
         let tok_embeddings = candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embeddings.tok_embeddings"))?;
-        let embeddings_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("embeddings.norm"))?;
+        let embeddings_norm = Norm::new(mode, cfg.hidden_size, cfg.norm_eps, vb.pp("embeddings.norm"))?;
 
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         let rotary = Arc::new(RotaryEmbedding::new(head_dim, 32768, 150000.0, device)?);
+        let exact = if mode.is_exact() {
+            let global_theta = cfg.global_rope_theta.unwrap_or(150000.0);
+            let local_theta = cfg.local_rope_theta.unwrap_or(global_theta);
+            Some(ExactAttention {
+                global: RotaryEmbedding::new_f32(head_dim, 8192, global_theta, device)?,
+                local: RotaryEmbedding::new_f32(head_dim, 8192, local_theta, device)?,
+                every_n: cfg.global_attn_every_n_layers.unwrap_or(1).max(1),
+                window_half: cfg.local_attention.map(|w| w / 2).unwrap_or(usize::MAX / 2),
+            })
+        } else {
+            None
+        };
 
         let mut layers = Vec::new();
         for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(cfg, vb.pp(format!("layers.{}", i)))?);
+            layers.push(DecoderLayer::new(cfg, mode, vb.pp(format!("layers.{}", i)))?);
         }
-        let final_norm = RmsNorm::new(cfg.hidden_size, cfg.norm_eps, vb.pp("final_norm"))?;
-        let mut model = Self { tok_embeddings, embeddings_norm, layers, final_norm, rotary, packed: None };
-        if device.is_cpu() && cpu_packed::enabled() {
+        let final_norm = Norm::new(mode, cfg.hidden_size, cfg.norm_eps, vb.pp("final_norm"))?;
+        let mut model = Self { tok_embeddings, embeddings_norm, layers, final_norm, rotary, exact, mode, packed: None };
+        if device.is_cpu() && cpu_packed::enabled() && !mode.is_exact() {
             model.packed = model.build_packed(cfg)?;
         }
         Ok(model)
     }
 
     /// Linear 가중치를 NR 열 패널로 한 번 다시 배치합니다. 모양이 NR 배수가 아니면 None(기존 경로).
+    /// 패킹 커널은 Legacy(RmsNorm) 판본만 구현합니다.
     fn build_packed(&self, cfg: &Config) -> candle_core::Result<Option<cpu_packed::PackedModel>> {
         use cpu_packed::{PackedW, NR};
         let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
@@ -277,25 +485,31 @@ impl FloatModel {
             println!("[EMBED-CPU-PACKED] hidden {h} / intermediate {i} 가 {NR} 의 배수가 아니라 기존 경로를 씁니다.");
             return Ok(None);
         }
+        let (emb_norm, final_norm) = match (self.embeddings_norm.rms(), self.final_norm.rms()) {
+            (Some(e), Some(f)) => (e, f),
+            _ => return Ok(None),
+        };
         let v = |t: &Tensor| -> candle_core::Result<Vec<f32>> { t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>() };
         let mut layers = Vec::with_capacity(self.layers.len());
         for l in &self.layers {
+            let mlp_norm = match l.mlp_norm.rms() { Some(n) => n, None => return Ok(None) };
             layers.push(cpu_packed::PackedLayer {
                 wqkv: PackedW::pack(&v(l.self_attn.wqkv.weight())?, 3 * h, h),
                 attn_wo: PackedW::pack(&v(l.self_attn.wo.weight())?, h, h),
                 wi: PackedW::pack_glu(&v(l.mlp.wi.weight())?, i, h),
                 mlp_wo: PackedW::pack(&v(l.mlp.wo.weight())?, h, i),
-                attn_norm: match &l.attn_norm {
-                    Some(n) => Some(v(&n.weight)?),
+                attn_norm: match l.attn_norm.as_ref().map(|n| n.rms()) {
+                    Some(Some(n)) => Some(v(&n.weight)?),
+                    Some(None) => return Ok(None),
                     None => None,
                 },
-                mlp_norm: v(&l.mlp_norm.weight)?,
+                mlp_norm: v(&mlp_norm.weight)?,
             });
         }
         Ok(Some(cpu_packed::PackedModel {
             layers,
-            emb_norm: v(&self.embeddings_norm.weight)?,
-            final_norm: v(&self.final_norm.weight)?,
+            emb_norm: v(&emb_norm.weight)?,
+            final_norm: v(&final_norm.weight)?,
             eps: cfg.norm_eps as f32,
         }))
     }
@@ -361,15 +575,36 @@ impl FloatModel {
         }
         let mut x = self.embeddings_norm.forward(&x)?;
         let (cos, sin) = self.rotary.cos_sin(seq_len)?;
+        // 🌟 [EMBED-FORWARD] Exact: 전역 층과 지역 층이 서로 다른 RoPE 표를 쓰고, 지역 층은 ±창 밖을 보지 않습니다.
+        let exact_tables = match &self.exact {
+            Some(ex) => {
+                let (cg, sg) = ex.global.cos_sin(seq_len)?;
+                let (cl, sl) = ex.local.cos_sin(seq_len)?;
+                let window = ex.window_mask(seq_len, x.device(), x.dtype())?;
+                let local_mask = match (mask, window) {
+                    (Some(m), Some(w)) => Some(m.broadcast_add(&w)?),
+                    (None, Some(w)) => Some(w),
+                    (m, None) => m.cloned(),
+                };
+                Some((cg, sg, cl, sl, local_mask, ex.every_n))
+            }
+            None => None,
+        };
 
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
+            let (c, s, m) = match &exact_tables {
+                None => (&cos, &sin, mask),
+                Some((cg, sg, cl, sl, local_mask, every_n)) => {
+                    if li % every_n == 0 { (cg, sg, mask) } else { (cl, sl, local_mask.as_ref()) }
+                }
+            };
             let residual = &x;
             // 🌟 [CRITICAL FIX] attn_norm이 없는 레이어(layers.0)는 직전의 x를 그대로 사용합니다.
             let x_norm = match &layer.attn_norm {
                 Some(norm) => norm.forward(&x)?,
                 None => x.clone(),
             };
-            let attn_out = layer.self_attn.forward(&x_norm, &cos, &sin, mask)?;
+            let attn_out = layer.self_attn.forward(&x_norm, c, s, m)?;
             x = (residual + attn_out)?;
 
             let residual = &x;
@@ -458,6 +693,11 @@ impl EmbeddingModel {
     }
 
     pub fn new_with_device<P: AsRef<Path>>(model_path: P, device: &Device) -> Result<Self> {
+        Self::new_with_device_and_mode(model_path, device, forward_mode())
+    }
+
+    /// 🌟 [EMBED-FORWARD] 순전파 판본을 직접 고릅니다(검증 · 이관 실험용). 앱 경로는 new_with_device 를 씁니다.
+    pub fn new_with_device_and_mode<P: AsRef<Path>>(model_path: P, device: &Device, mode: ForwardMode) -> Result<Self> {
         let model_path = model_path.as_ref();
         let config_path = model_path.join("config.json");
         let tokenizer_path = model_path.join("tokenizer.json");
@@ -474,7 +714,7 @@ impl EmbeddingModel {
         let model = if weights_path.exists() {
              println!("[EmbeddingModel] Loading Safetensors model from {:?}", weights_path);
              let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], dtype, device).map_err(anyhow::Error::msg)? };
-             FloatModel::new(&config, vb, device).map_err(anyhow::Error::msg)?
+             FloatModel::new_with_mode(&config, vb, device, mode).map_err(anyhow::Error::msg)?
         } else {
             return Err(anyhow!("No valid model found (looked for model.safetensors)"));
         };
@@ -488,6 +728,16 @@ impl EmbeddingModel {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// 이 인스턴스의 순전파 판본.
+    pub fn forward_mode(&self) -> ForwardMode {
+        self.model.mode
+    }
+
+    /// 풀링할 토큰 범위: CLS 풀링이면 첫 토큰([CLS]) 하나, 아니면 실제 길이 전체.
+    fn pooled_len(&self, len: usize) -> usize {
+        if self.model.mode.cls_pooling() { len.min(1) } else { len }
     }
 
     /// 이 모델 인스턴스가 배치 순전파를 쓰는지 여부.
@@ -516,6 +766,12 @@ impl EmbeddingModel {
             // 입력 텐서를 처음부터 타겟 디바이스(VRAM)로 올립니다.
             let input_tensor = Tensor::new(chunk, &self.device).map_err(anyhow::Error::msg)?;
             let hidden_states = self.model.forward(&input_tensor, &self.device).map_err(anyhow::Error::msg)?;
+            let take = self.pooled_len(chunk.len());
+            let hidden_states = if take == chunk.len() {
+                hidden_states
+            } else {
+                hidden_states.narrow(1, 0, take).map_err(anyhow::Error::msg)?
+            };
             let normalized = Self::pool_single(&hidden_states)?;
 
             // 🌟 [CRITICAL FIX] VRAM(GPU)에 존재하는 최종 연산 결과 텐서를 시스템 메모리(CPU)로 안전하게 명시적 복사한 뒤, F32 배열로 캐스팅합니다.
@@ -705,3 +961,94 @@ impl EmbeddingModel {
 ///   model.rs 의 크로스오버 원장이 이미 같은 선례입니다.
 static EMBED_UNIT_ACTIVATION_MB: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod forward_parity_tests {
+    //! 🌟 [EMBED-FORWARD] 순전파 판본별 벡터를 HF transformers 기준 벡터와 대조합니다.
+    //! 기준 벡터: scratch 스크립트(granite_ref.py)가 ModernBertModel(F32 · eager)로 만든 JSON
+    //!   [{text, n_tokens, cls, mean}] (모두 L2 정규화, 512 토큰 이하).
+    //! 실행: LOGIS_EMBED_PARITY_JSON=<json> cargo test --lib -- embed_forward_parity --ignored --nocapture
+    //! 모델 폴더는 LOGIS_EMBED_MODEL_DIR, 없으면 앱 데이터 폴더의 models/granite-embedding-97m-multilingual-r2.
+    use super::*;
+
+    fn cos(a: &[f32], b: &[f32]) -> f32 {
+        let d: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 { 0.0 } else { d / (na * nb) }
+    }
+
+    fn summary(label: &str, sims: &[(usize, f32)]) -> (f32, f32) {
+        let bucket = |lo: usize, hi: usize| -> String {
+            let v: Vec<f32> = sims.iter().filter(|(n, _)| *n >= lo && *n <= hi).map(|(_, s)| *s).collect();
+            if v.is_empty() {
+                return "-".to_string();
+            }
+            let mean = v.iter().sum::<f32>() / v.len() as f32;
+            let min = v.iter().cloned().fold(f32::INFINITY, f32::min);
+            format!("평균 {:.5} 최소 {:.5} ({}건)", mean, min, v.len())
+        };
+        let all: Vec<f32> = sims.iter().map(|(_, s)| *s).collect();
+        let mean = all.iter().sum::<f32>() / all.len().max(1) as f32;
+        let min = all.iter().cloned().fold(f32::INFINITY, f32::min);
+        println!(
+            "[EMBED-PARITY] {label} | 전체 평균 {:.5} 최소 {:.5} | ≤64토큰 {} | 65~256 {} | >256 {}",
+            mean,
+            min,
+            bucket(0, 64),
+            bucket(65, 256),
+            bucket(257, usize::MAX)
+        );
+        (mean, min)
+    }
+
+    #[test]
+    #[ignore = "실모델 대조: 로컬 granite 가중치 + HF 기준 벡터 JSON(LOGIS_EMBED_PARITY_JSON) 필요"]
+    fn embed_forward_parity_against_reference() {
+        let json_path = match std::env::var("LOGIS_EMBED_PARITY_JSON") {
+            Ok(p) => p,
+            Err(_) => {
+                println!("LOGIS_EMBED_PARITY_JSON 이 없어 건너뜁니다.");
+                return;
+            }
+        };
+        let model_dir = std::env::var("LOGIS_EMBED_MODEL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate::utils::get_app_dir().join("models").join("granite-embedding-97m-multilingual-r2"));
+        let refs: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).expect("기준 JSON 읽기")).expect("기준 JSON 파싱");
+        let texts: Vec<String> = refs.iter().map(|r| r["text"].as_str().unwrap().to_string()).collect();
+        let lens: Vec<usize> = refs.iter().map(|r| r["n_tokens"].as_u64().unwrap() as usize).collect();
+        let vec_of = |r: &serde_json::Value, k: &str| -> Vec<f32> {
+            r[k].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()
+        };
+
+        let mut devices: Vec<(&str, Device)> = vec![("cpu-f32", Device::Cpu)];
+        if let Ok(d) = Device::new_cuda(0) {
+            devices.push(("cuda-bf16", d));
+        }
+        for (dname, dev) in devices.iter() {
+            for mode in [ForwardMode::Legacy, ForwardMode::Exact, ForwardMode::ExactMean] {
+                let m = EmbeddingModel::new_with_device_and_mode(&model_dir, dev, mode).expect("모델 적재");
+                let key = if mode == ForwardMode::Exact { "cls" } else { "mean" };
+                let per_text: Vec<Vec<f32>> = texts.iter().map(|t| m.embed(t).expect("embed")).collect();
+                let batched = m.embed_many(&texts, &m.batch_opts()).expect("embed_many");
+                for (tok_len, t) in lens.iter().zip(texts.iter()) {
+                    assert_eq!(m.token_len(t).unwrap(), *tok_len, "HF 와 같은 토큰화여야 합니다: {t}");
+                }
+                let sims_pt: Vec<(usize, f32)> =
+                    refs.iter().zip(per_text.iter()).zip(lens.iter()).map(|((r, v), n)| (*n, cos(v, &vec_of(r, key)))).collect();
+                let sims_b: Vec<(usize, f32)> =
+                    refs.iter().zip(batched.iter()).zip(lens.iter()).map(|((r, v), n)| (*n, cos(v, &vec_of(r, key)))).collect();
+                let (_, min_pt) = summary(&format!("{dname} {:?} per-text vs HF({key})", mode), &sims_pt);
+                let (_, min_b) = summary(&format!("{dname} {:?} batched vs HF({key})", mode), &sims_b);
+                if mode.is_exact() && *dname == "cpu-f32" {
+                    assert!(min_pt > 0.9999 && min_b > 0.9999, "{dname} {:?}: F32 기준 판본은 HF 와 같아야 합니다", mode);
+                }
+                if mode.is_exact() && *dname == "cuda-bf16" {
+                    assert!(min_pt > 0.995 && min_b > 0.995, "{dname} {:?}: BF16 기준 판본이 HF 와 크게 다릅니다", mode);
+                }
+            }
+        }
+    }
+}

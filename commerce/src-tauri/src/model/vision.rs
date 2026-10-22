@@ -4400,7 +4400,7 @@ impl crate::model::LogisModel {
                         .clone()
                         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
                     let chunk_bcc = crate::utils::hash::hash_id(&format!("{}{}", doc_type, hashed_cc));
-                    let translit_demand = crate::model::lang_llm::translit_demand(&final_data);
+                    let translit_demand = crate::model::lang_llm::translit_demand(&final_data, &language);
                     let (_translit_engine, translit_status) = crate::model::lang_llm::await_engine(
                         &language,
                         app_handle,

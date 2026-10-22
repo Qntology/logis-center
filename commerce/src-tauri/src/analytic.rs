@@ -480,6 +480,116 @@ pub fn recency_weight(age_ms: i64, half_life_ms: f64) -> f32 {
     let w = 0.5f64.powf(a / half_life_ms);
     (w as f32).clamp(0.0, 1.0)
 }
+
+/// LLM 음차를 기다리는 구조화 결과. 음차를 마친 뒤에 저장합니다.
+struct AnalyticTranslitJob {
+    doc: crate::store::TradeDocument,
+    data: Value,
+    lang: String,
+    src: String,
+    prompt: String,
+    to_native: bool,
+}
+
+/// 🌟 [ANALYTIC TRANSLIT ENGINE] 구조화 루프가 모아 둔 LLM 음차를 엔진별로 묶어 한 번에 읽고 저장합니다.
+///    제3 언어가 섞인 값은 흐름 합성이 상주시켜 둔 다국어 2B 로 먼저 읽고, 단일 언어 값(영어 + 문서 언어)은
+///    문서 언어별 4B 를 언어마다 한 번 올려 읽습니다(lang_llm::translit_third_language). 이미지 · 웹 문서 음차와
+///    같은 엔진 규칙입니다. 취소되거나 전경 작업이 시작되면 남은 문서는 저장하지 않고 draft 로 두어 다음 폴링이 다시 처리합니다.
+async fn finish_analytic_translit(
+    store: &VectorStore,
+    model: &LogisModel,
+    jobs: Vec<AnalyticTranslitJob>,
+    cancel: &Arc<AtomicBool>,
+    task_id: &str,
+    emit_term: &(dyn Fn(&str) + Send + Sync),
+) {
+    let multi: Vec<bool> = jobs
+        .iter()
+        .map(|j| crate::model::lang_llm::translit_third_language(&j.src, &j.lang).is_some())
+        .collect();
+    let mut order: Vec<usize> = (0..jobs.len()).collect();
+    order.sort_by(|&a, &b| (!multi[a], jobs[a].lang.as_str()).cmp(&(!multi[b], jobs[b].lang.as_str())));
+    emit_term(&format!(
+        "[ANALYTIC] 🔤 [TRANSLIT ENGINE] 행동 문장 음차 {}건 | 언어별 4B {}건 · 다국어 2B {}건 (요약 루프가 끝난 뒤 엔진마다 한 번씩 올립니다)",
+        jobs.len(),
+        multi.iter().filter(|m| !**m).count(),
+        multi.iter().filter(|m| **m).count()
+    ));
+    let mut bound: Option<(String, crate::model::lang_llm::TranslitBinding)> = None;
+    let (mut saved, mut left) = (0usize, 0usize);
+    for (k, &j) in order.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed)
+            || crate::IS_SEARCHING.load(Ordering::SeqCst)
+            || crate::ACTIVE_TASK_MEM.read().map(|m| m.is_some()).unwrap_or(false)
+        {
+            left = order.len() - k;
+            break;
+        }
+        let job = &jobs[j];
+        if multi[j] {
+            bound = None;
+        } else if bound.as_ref().map_or(true, |(lang, _)| *lang != job.lang) {
+            bound = None;
+            match model
+                .enter_translit_generation(&job.lang, Some(cancel.clone()), "analytic action transliteration", task_id)
+                .await
+            {
+                Ok((engine, binding)) => {
+                    emit_term(&format!("  🔤 [ANALYTIC TRANSLIT ENGINE] '{}' 행동 문장 음차 엔진: {}", job.lang, engine.label()));
+                    bound = Some((job.lang.clone(), binding));
+                }
+                Err(e) => {
+                    emit_term(&format!(
+                        "  ⚠️ [ANALYTIC TRANSLIT ENGINE] '{}' 음차 엔진 전환 실패: {}. 이번 값은 2B 로 읽습니다.",
+                        job.lang, e
+                    ));
+                }
+            }
+        }
+        let (native, roman) = crate::scheduler::translit::finish_cross_language(
+            model, &job.src, &job.prompt, job.to_native, &job.lang, cancel,
+        )
+        .await;
+        let mut data = job.data.clone();
+        if let Some(o) = data.as_object_mut() {
+            if !native.is_empty() {
+                o.insert("translit_native".to_string(), json!(native));
+            }
+            if !roman.is_empty() {
+                o.insert("translit_roman".to_string(), json!(roman));
+            }
+        }
+        let doc = &job.doc;
+        let _ = store
+            .upsert_item(
+                "items",
+                &doc.id,
+                &doc.r#type,
+                data,
+                None,
+                None,
+                Some(&doc.from),
+                Some(&doc.to),
+                Some(&doc.cc),
+                Some(&doc.bcc),
+                Some(&doc.r#ref),
+                None,
+            )
+            .await;
+        saved += 1;
+    }
+    drop(bound);
+    emit_term(&format!(
+        "[ANALYTIC] 🔤 [TRANSLIT ENGINE] 행동 문장 음차 후 저장 {}건{}",
+        saved,
+        if left > 0 {
+            format!(" · 중단으로 남은 {}건은 draft 로 두어 다음 폴링에서 다시 구조화합니다", left)
+        } else {
+            String::new()
+        }
+    ));
+}
+
 ///  반환값 = 구조화에 성공한 이벤트 건수
 pub async fn run_analytic_structuring(
     store: &VectorStore,
@@ -582,6 +692,7 @@ pub async fn run_analytic_structuring(
 
     let now_ts = chrono::Utc::now().timestamp_millis();
     let mut processed = 0usize;
+    let mut translit_jobs: Vec<AnalyticTranslitJob> = Vec::new();
 
     // 흐름(report) 합성을 위해 (from, ref) 로 묶어 둡니다.
     let mut flow_groups: std::collections::HashMap<String, Vec<Value>> =
@@ -780,21 +891,23 @@ pub async fn run_analytic_structuring(
         }
 
         // 🌟 [TRANSLIT IN STRUCTURIZATION] 전처리 단계에서 음차를 수행합니다.
-        //    Qwen3.5 가 이미 로드되어 있으므로 별도 모델 로딩이 불필요합니다.
         //    방향: 영어 단어 → 문서 언어(한글/일어/중어 등) 로 음차.
         //    한글→한글 같은 동일 언어 음차는 수행하지 않습니다.
-        let translit_native;
-        let translit_roman;
-        if !action.is_empty() {
-            let (tn, tr) = crate::scheduler::translit::transliterate_cross_language(
-                model, &action, &doc_lang, cancel, app_handle, task_id,
-            ).await;
-            translit_native = tn;
-            translit_roman = tr;
+        //    LLM 없이 끝나는 음차(국가명 표 · any_ascii)는 여기서 확정하고, LLM 이 필요한 값은 루프가 끝난 뒤
+        //    한 번에 읽습니다(finish_analytic_translit). 이 루프는 요약용 2B 를 상주시킨 채 돌기 때문에, 여기서
+        //    단일 언어 값을 언어별 4B 로 읽으면 문서마다 2B ↔ 4B 교체가 일어납니다.
+        let mut translit_llm: Option<(String, String, bool)> = None;
+        let (translit_native, translit_roman) = if action.is_empty() {
+            (String::new(), String::new())
         } else {
-            translit_native = String::new();
-            translit_roman = String::new();
-        }
+            match crate::scheduler::translit::plan_cross_language(&action, &doc_lang) {
+                crate::scheduler::translit::CrossTranslit::Done(pair) => pair,
+                crate::scheduler::translit::CrossTranslit::Llm { src, prompt, to_native } => {
+                    translit_llm = Some((src, prompt, to_native));
+                    (String::new(), String::new())
+                }
+            }
+        };
 
         let mut new_data = data.clone();
         if let Some(o) = new_data.as_object_mut() {
@@ -836,22 +949,36 @@ pub async fn run_analytic_structuring(
             ));
         }
 
-        let _ = store
-            .upsert_item(
-                "items",
-                &doc.id,
-                &doc.r#type,
-                new_data.clone(),
-                None,
-                None, // 🌟 vision_vec: analytic 구조화 경로는 비전 벡터 없음
-                Some(&doc.from),
-                Some(&doc.to),
-                Some(&doc.cc),
-                Some(&doc.bcc),
-                Some(&doc.r#ref),
-                None,
-            )
-            .await;
+        match translit_llm {
+            // 음차가 끝날 때까지 저장하지 않습니다. 이 문서는 그때까지 draft(updated_at = 0)로 남으므로
+            // 음차 패스가 취소·전경 작업으로 끊겨도 다음 폴링이 다시 잡아 음차까지 마칩니다.
+            Some((src, prompt, to_native)) => translit_jobs.push(AnalyticTranslitJob {
+                doc: doc.clone(),
+                data: new_data.clone(),
+                lang: doc_lang.clone(),
+                src,
+                prompt,
+                to_native,
+            }),
+            None => {
+                let _ = store
+                    .upsert_item(
+                        "items",
+                        &doc.id,
+                        &doc.r#type,
+                        new_data.clone(),
+                        None,
+                        None, // 🌟 vision_vec: analytic 구조화 경로는 비전 벡터 없음
+                        Some(&doc.from),
+                        Some(&doc.to),
+                        Some(&doc.cc),
+                        Some(&doc.bcc),
+                        Some(&doc.r#ref),
+                        None,
+                    )
+                    .await;
+            }
+        }
 
         // 🌟 [SDS / analytic 구조화 관측]
         //  Phase 0 이므로 판정에는 전혀 개입하지 않고 사실만 남깁니다.
@@ -1250,6 +1377,10 @@ pub async fn run_analytic_structuring(
         ));
         } // for (ep_idx, (seg_start, seg_end)) in segments
     }
+    if !translit_jobs.is_empty() {
+        finish_analytic_translit(store, model, translit_jobs, cancel, task_id, &emit_term).await;
+    }
+
     // 🌟 [SDS] 구조화 태스크 경계에서 관측을 확정합니다.
     //
     //  ── 왜 여기인가 ──
