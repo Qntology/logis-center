@@ -638,7 +638,7 @@ impl LogisModel {
         //    오염되지 않은 기준선이므로 생성 비용을 실측으로 확정할 수 있습니다.
         let gen_empty_before = !self.generation_resident().await;
         let embed_held = self.embedding_resident().await;
-        let vision_held = self.siglip2_model.lock().await.is_some();
+        let vision_held = self.siglip2_resident().await;
         let before = self.get_free_vram_mb();
 
         if coexist_ok {
@@ -658,7 +658,7 @@ impl LogisModel {
         }
 
         let embed_after = self.embedding_resident().await;
-        let vision_after = self.siglip2_model.lock().await.is_some();
+        let vision_after = self.siglip2_resident().await;
         let clean = gen_empty_before && embed_after == embed_held && vision_after == vision_held;
         let measured = self.observe_generation_cost(Self::gen_kind(size), before, clean);
         let phase = self.sync_crossover_phase().await;
