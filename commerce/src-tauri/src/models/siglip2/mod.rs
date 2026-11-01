@@ -1,3 +1,4 @@
+pub mod gguf;
 pub mod vision;
 pub mod text;
 pub mod preprocessor;
@@ -80,6 +81,60 @@ impl Siglip2Config {
     }
 }
 
+/// logit_scale / logit_bias 는 루트 스칼라입니다. 없으면 기본값.
+fn root_scalar(vb: &VarBuilder, name: &str) -> f32 {
+    vb.get(1, name)
+        .ok()
+        .and_then(|t| t.to_dtype(DType::F32).ok())
+        .and_then(|t| t.to_vec1::<f32>().ok())
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0.0)
+}
+
+/// 🌟 [SPLIT-GGUF] 비전 타워를 읽을 VarBuilder. 타워별 GGUF 가 있으면 매핑에서 바로 올리고, 아니면 safetensors 를 읽습니다.
+fn vision_builder(model_dir: &Path, device: &Device, dtype: DType) -> anyhow::Result<VarBuilder<'static>> {
+    if gguf::usable(model_dir, dtype) {
+        match gguf::open_cached(&gguf::vision_path(model_dir)).and_then(|f| f.var_builder(&[], device)) {
+            Ok(vb) => return Ok(vb),
+            Err(e) => println!("[SigLIP2] mmproj 를 읽지 못해 safetensors 로 읽습니다: {}", e),
+        }
+    }
+    let path = model_dir.join("model.safetensors");
+    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&[path], dtype, device)? })
+}
+
+/// 🌟 [SPLIT-GGUF] 텍스트 타워를 읽을 VarBuilder 와 토큰 표의 위치.
+fn text_builder(model_dir: &Path, device: &Device, dtype: DType) -> anyhow::Result<(VarBuilder<'static>, text::TokenSource<'static>)> {
+    if gguf::usable(model_dir, dtype) {
+        let opened = gguf::open_cached(&gguf::text_path(model_dir)).and_then(|f| {
+            let vb = f.var_builder(&[gguf::TOKEN_TABLE], device)?;
+            Ok((vb, text::TokenSource::Mapped(f.rows(gguf::TOKEN_TABLE)?)))
+        });
+        match opened {
+            Ok(parts) => return Ok(parts),
+            Err(e) => println!("[SigLIP2] 텍스트 GGUF 를 읽지 못해 safetensors 로 읽습니다: {}", e),
+        }
+    }
+    let safetensors_path = model_dir.join("model.safetensors");
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, device)? };
+    // 🌟 [CPU EMBEDDING] 590MB 를 VRAM 에서 뺍니다.
+    let tokens = if device.is_cpu() {
+        text::TokenSource::Inline
+    } else {
+        match unsafe { VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, &Device::Cpu) } {
+            Ok(v) => text::TokenSource::Host(v.pp("text_model")),
+            Err(e) => {
+                println!(
+                    "[SigLIP2] CPU 임베딩 VarBuilder 생성 실패({}). token_embedding 을 VRAM 에 유지합니다.",
+                    e
+                );
+                text::TokenSource::Inline
+            }
+        }
+    };
+    Ok((vb, tokens))
+}
+
 impl Siglip2Model {
     pub fn load_vision_only(
         safetensors_path: &Path,
@@ -87,27 +142,13 @@ impl Siglip2Model {
         device: &Device,
         dtype: DType,
     ) -> anyhow::Result<Self> {
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[safetensors_path], dtype, device)?
-        };
+        let model_dir = safetensors_path.parent().unwrap_or_else(|| Path::new("."));
+        let vb = vision_builder(model_dir, device, dtype)?;
 
         let vision_model = vision::Siglip2VisionModel::new(config, vb.pp("vision_model"))?;
 
-        // logit_scale / logit_bias 는 루트 스칼라입니다. 없으면 기본값.
-        let logit_scale = vb
-            .get(1, "logit_scale")
-            .ok()
-            .and_then(|t| t.to_dtype(DType::F32).ok())
-            .and_then(|t| t.to_vec1::<f32>().ok())
-            .and_then(|v| v.first().copied())
-            .unwrap_or(0.0);
-        let logit_bias = vb
-            .get(1, "logit_bias")
-            .ok()
-            .and_then(|t| t.to_dtype(DType::F32).ok())
-            .and_then(|t| t.to_vec1::<f32>().ok())
-            .and_then(|v| v.first().copied())
-            .unwrap_or(0.0);
+        let logit_scale = root_scalar(&vb, "logit_scale");
+        let logit_bias = root_scalar(&vb, "logit_bias");
 
         println!(
             "[SigLIP2] Vision encoder loaded (layers={}, hidden={}, patch={}, max_patches={}, logit_scale={:.4})",
@@ -136,42 +177,11 @@ impl Siglip2Model {
         device: &Device,
         dtype: DType,
     ) -> anyhow::Result<Self> {
-        let safetensors_path = model_dir.join("model.safetensors");
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, device)?
-        };
-        let embed_vb = if device.is_cpu() {
-            None
-        } else {
-            match unsafe {
-                VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, &Device::Cpu)
-            } {
-                Ok(v) => Some(v.pp("text_model")),
-                Err(e) => {
-                    println!(
-                        "[SigLIP2] CPU 임베딩 VarBuilder 생성 실패({}). token_embedding 을 VRAM 에 유지합니다.",
-                        e
-                    );
-                    None
-                }
-            }
-        };
-        let text_model = text::Siglip2TextModel::new(config, vb.pp("text_model"), embed_vb)?;
+        let (vb, tokens) = text_builder(model_dir, device, dtype)?;
+        let text_model = text::Siglip2TextModel::new(config, vb.pp("text_model"), tokens)?;
 
-        let logit_scale = vb
-            .get(1, "logit_scale")
-            .ok()
-            .and_then(|t| t.to_dtype(DType::F32).ok())
-            .and_then(|t| t.to_vec1::<f32>().ok())
-            .and_then(|v| v.first().copied())
-            .unwrap_or(0.0);
-        let logit_bias = vb
-            .get(1, "logit_bias")
-            .ok()
-            .and_then(|t| t.to_dtype(DType::F32).ok())
-            .and_then(|t| t.to_vec1::<f32>().ok())
-            .and_then(|v| v.first().copied())
-            .unwrap_or(0.0);
+        let logit_scale = root_scalar(&vb, "logit_scale");
+        let logit_bias = root_scalar(&vb, "logit_bias");
 
         let tok = tokenizer::Siglip2Tokenizer::from_dir(
             model_dir,
@@ -202,10 +212,7 @@ impl Siglip2Model {
         if self.vision.is_some() {
             return Ok(());
         }
-        let safetensors_path = model_dir.join("model.safetensors");
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&safetensors_path], self.dtype, &self.device)?
-        };
+        let vb = vision_builder(model_dir, &self.device, self.dtype)?;
         let vision_model = vision::Siglip2VisionModel::new(&self.config, vb.pp("vision_model"))?;
         self.vision = Some(vision_model);
         println!(
@@ -216,29 +223,8 @@ impl Siglip2Model {
     }
 
     pub fn load_text_encoder(&mut self, model_dir: &Path) -> anyhow::Result<()> {
-        let safetensors_path = model_dir.join("model.safetensors");
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[&safetensors_path], self.dtype, &self.device)?
-        };
-
-        // 🌟 [CPU EMBEDDING] load_text_only 와 동일 정책. 590MB 를 VRAM 에서 뺍니다.
-        let embed_vb = if self.device.is_cpu() {
-            None
-        } else {
-            match unsafe {
-                VarBuilder::from_mmaped_safetensors(&[&safetensors_path], self.dtype, &Device::Cpu)
-            } {
-                Ok(v) => Some(v.pp("text_model")),
-                Err(e) => {
-                    println!(
-                        "[SigLIP2] CPU 임베딩 VarBuilder 생성 실패({}). token_embedding 을 VRAM 에 유지합니다.",
-                        e
-                    );
-                    None
-                }
-            }
-        };
-        let text_model = text::Siglip2TextModel::new(&self.config, vb.pp("text_model"), embed_vb)?;
+        let (vb, tokens) = text_builder(model_dir, &self.device, self.dtype)?;
+        let text_model = text::Siglip2TextModel::new(&self.config, vb.pp("text_model"), tokens)?;
         self.text = Some(text_model);
 
         let tok = tokenizer::Siglip2Tokenizer::from_dir(
