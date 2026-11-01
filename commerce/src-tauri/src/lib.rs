@@ -5115,6 +5115,8 @@ async fn get_lang_llm_status(language: Option<String>) -> Result<serde_json::Val
 async fn delete_all_models() -> Result<String, String> {
     let app_dir = crate::utils::get_app_dir();
     let models_dir = app_dir.join("models");
+    // 매핑 중인 파일은 Windows 에서 지울 수 없습니다.
+    crate::models::siglip2::gguf::close_handles(None);
     if models_dir.exists() {
         std::fs::remove_dir_all(&models_dir).map_err(|e| e.to_string())?;
     }

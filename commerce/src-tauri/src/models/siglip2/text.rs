@@ -3,15 +3,29 @@ use candle_nn::{Embedding, Linear, Module, VarBuilder};
 
 use super::Siglip2Config;
 
+/// 토큰 임베딩 표를 어디에 둘지
+pub enum TokenSource<'a> {
+    /// 다른 가중치와 같은 장치에 둡니다.
+    Inline,
+    /// 호스트 메모리에 둡니다.
+    Host(VarBuilder<'a>),
+    /// 🌟 [SPLIT-GGUF] 어디에도 올리지 않고 쓰는 행만 GGUF 매핑에서 읽습니다.
+    Mapped(super::gguf::MappedRows),
+}
+
+enum TokenTable {
+    Dense { table: Embedding, on_cpu: bool },
+    Mapped(super::gguf::MappedRows),
+}
+
 pub struct Siglip2TextModel {
-    token_embedding: Embedding,
+    token_embedding: TokenTable,
     position_embedding: Embedding,
     layers: Vec<TextEncoderLayer>,
     final_layernorm: candle_nn::LayerNorm,
     head: Linear,
     hidden_size: usize,
     max_seq_len: usize,
-    embed_on_cpu: bool,
     device: candle_core::Device,
     dtype: candle_core::DType,
 }
@@ -42,29 +56,30 @@ impl Siglip2TextModel {
     pub fn new(
         config: &Siglip2Config,
         vb: VarBuilder,
-        embed_vb: Option<VarBuilder>,
+        tokens: TokenSource,
     ) -> Result<Self> {
         let hidden = config.text_hidden_size;
         let device = vb.device().clone();
         let dtype = vb.dtype();
-        let (token_embedding, embed_on_cpu) = match embed_vb {
-            Some(evb) => {
+        let token_embedding = match tokens {
+            TokenSource::Host(evb) => {
                 let on_cpu = evb.device().is_cpu();
-                let e = candle_nn::embedding(
+                let table = candle_nn::embedding(
                     config.text_vocab_size,
                     hidden,
                     evb.pp("embeddings").pp("token_embedding"),
                 )?;
-                (e, on_cpu)
+                TokenTable::Dense { table, on_cpu }
             }
-            None => {
-                let e = candle_nn::embedding(
+            TokenSource::Inline => {
+                let table = candle_nn::embedding(
                     config.text_vocab_size,
                     hidden,
                     vb.pp("embeddings").pp("token_embedding"),
                 )?;
-                (e, false)
+                TokenTable::Dense { table, on_cpu: false }
             }
+            TokenSource::Mapped(rows) => TokenTable::Mapped(rows),
         };
 
         // 27층 인코더
@@ -90,13 +105,20 @@ impl Siglip2TextModel {
 
         let head = candle_nn::linear(hidden, hidden, vb.pp("head"))?;
 
-        if embed_on_cpu {
-            println!(
+        match &token_embedding {
+            TokenTable::Dense { on_cpu: true, .. } => println!(
                 "[SigLIP2] token_embedding({}x{}) 을 호스트 메모리에 배치했습니다. VRAM 약 {:.0}MB 절감.",
                 config.text_vocab_size,
                 hidden,
                 (config.text_vocab_size * hidden * 2) as f64 / 1e6
-            );
+            ),
+            TokenTable::Mapped(_) => println!(
+                "[SigLIP2] token_embedding({}x{}) 은 GGUF 매핑에서 행만 읽습니다. RAM 약 {:.0}MB 절감.",
+                config.text_vocab_size,
+                hidden,
+                (config.text_vocab_size * hidden * 2) as f64 / 1e6
+            ),
+            TokenTable::Dense { .. } => {}
         }
 
         Ok(Self {
@@ -107,7 +129,6 @@ impl Siglip2TextModel {
             head,
             hidden_size: hidden,
             max_seq_len: config.text_max_positions,
-            embed_on_cpu,
             device,
             dtype,
         })
@@ -119,12 +140,14 @@ impl Siglip2TextModel {
 
     pub fn forward(&self, token_ids: &Tensor, attn_mask: Option<&Tensor>) -> Result<Tensor> {
         let (b, seq_len) = token_ids.dims2()?;
-        let mut x = if self.embed_on_cpu {
-            let ids_cpu = token_ids.to_device(&candle_core::Device::Cpu)?;
-            let gathered = self.token_embedding.forward(&ids_cpu)?;
-            gathered.to_device(&self.device)?.to_dtype(self.dtype)?
-        } else {
-            self.token_embedding.forward(token_ids)?
+        let mut x = match &self.token_embedding {
+            TokenTable::Mapped(rows) => rows.gather(token_ids, &self.device)?.to_dtype(self.dtype)?,
+            TokenTable::Dense { table, on_cpu: true } => {
+                let ids_cpu = token_ids.to_device(&candle_core::Device::Cpu)?;
+                let gathered = table.forward(&ids_cpu)?;
+                gathered.to_device(&self.device)?.to_dtype(self.dtype)?
+            }
+            TokenTable::Dense { table, on_cpu: false } => table.forward(token_ids)?,
         };
 
         let pos_ids: Vec<u32> = (0..seq_len as u32).collect();

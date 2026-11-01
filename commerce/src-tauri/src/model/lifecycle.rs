@@ -196,7 +196,7 @@ impl LogisModel {
         let _purge_hold = self.hold_generation();
         let task_end = scope == PurgeScope::TaskEnd;
         let gen_resident = self.generation_resident().await;
-        let vis_resident = self.siglip2_model.lock().await.is_some();
+        let vis_resident = self.siglip2_resident().await;
         let emb_resident = self.embedding_resident().await;
 
         // ── 1. 내릴 것이 없으면 퍼지 전체를 건너뜁니다 (작업 종료는 풀·작업 버퍼 반환만 수행) ──
@@ -926,7 +926,7 @@ impl LogisModel {
                     || self.qwen3_5_generator.lock().await.is_some()
                     || self.qwen4_exp_generator.lock().await.is_some()
             };
-            let vision_resident = { self.siglip2_model.lock().await.is_some() };
+            let vision_resident = self.siglip2_resident().await;
             let keep_embedding = embed_resident
                 && !other_resident
                 && !vision_resident
@@ -1291,7 +1291,7 @@ impl LogisModel {
 
         let gen_empty_before = !self.generation_resident().await;
         let embed_held = self.embedding_resident().await;
-        let vision_held = self.siglip2_model.lock().await.is_some();
+        let vision_held = self.siglip2_resident().await;
         let before = self.get_free_vram_mb();
         {
             *self.current_size.lock().await = Some(ModelSize::Qwen3_5);
@@ -1339,7 +1339,7 @@ impl LogisModel {
         }
         lang_llm::set_resident_variant(Some(code.to_string()));
         let embed_after = self.embedding_resident().await;
-        let vision_after = self.siglip2_model.lock().await.is_some();
+        let vision_after = self.siglip2_resident().await;
         let clean = gen_empty_before && embed_after == embed_held && vision_after == vision_held;
         self.observe_generation_cost(super::GEN_KIND_LANG4B, before, clean);
         let load_ms = started.elapsed().as_millis() as f32;
@@ -1849,38 +1849,68 @@ impl LogisModel {
     }
     pub async fn ensure_siglip2_ext(&self, needs_vision: bool, needs_text: bool) -> anyhow::Result<()> {
         let dir = std::path::PathBuf::from(&self.siglip2_model_path);
-
-        // ── ① 이미 상주 중이면 부족한 부분만 부착합니다 ──
-        {
-            let mut guard = self.siglip2_model.lock().await;
-            if let Some(model) = guard.as_mut() {
-                let want_v = needs_vision && !model.has_vision();
-                let want_t = needs_text && !model.has_text();
-                if !want_v && !want_t {
-                    return Ok(());
-                }
-                if want_v {
-                    model.load_vision_encoder(&dir)?;
-                }
-                if want_t {
-                    model.load_text_encoder(&dir)?;
-                }
-                println!(
-                    "[MODEL] SigLIP2 upgraded in place (vision: {}, text: {}). No full reload.",
-                    model.has_vision(), model.has_text()
-                );
-                return Ok(());
-            }
-        }
-
-        // ── ② 신규 로드 ──
-        let path = self.siglip2_model_path.clone();
         let dev = self.device_config.device.clone();
         let dtype = if self.is_cpu_mode || dev.is_vulkan() {
             candle_core::DType::F32
         } else {
             candle_core::DType::BF16
         };
+
+        // 🌟 [SPLIT-GGUF] BF16 으로 올리는 장치는 타워별 GGUF 를 한 번 만들어 둡니다. 실패해도 safetensors 로 계속합니다.
+        //    다음 타워의 페이지도 배경에서 읽어 둡니다. 비전 → 텍스트 전환이 페이지 폴트를 기다리지 않게 하려는 것입니다.
+        if dtype == candle_core::DType::BF16 {
+            let source = dir.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                crate::models::siglip2::gguf::prepare(&source)?;
+                crate::models::siglip2::gguf::announce(&source);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            match prepared {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => println!("[MODEL] SigLIP2 타워별 GGUF 를 만들지 못해 safetensors 로 읽습니다: {}", e),
+                Err(e) => println!("[MODEL] SigLIP2 GGUF 변환 작업이 비정상 종료했습니다: {}", e),
+            }
+        }
+
+        // ── ① 이미 상주 중이면 부족한 부분만 부착합니다 ──
+        //    타워를 올리는 동안 비동기 작업자를 막지 않도록 블로킹 스레드에서 올립니다. 잠금은 끝까지 쥐고 있어 두 번 올리는 일은 없습니다.
+        {
+            let mut guard = self.siglip2_model.lock().await;
+            if let Some(mut model) = guard.take() {
+                let want_v = needs_vision && !model.has_vision();
+                let want_t = needs_text && !model.has_text();
+                if !want_v && !want_t {
+                    *guard = Some(model);
+                    return Ok(());
+                }
+                let attach_dir = dir.clone();
+                let (model, attached) = tokio::task::spawn_blocking(move || {
+                    let t0 = std::time::Instant::now();
+                    let mut attach = || -> anyhow::Result<()> {
+                        if want_v {
+                            model.load_vision_encoder(&attach_dir)?;
+                        }
+                        if want_t {
+                            model.load_text_encoder(&attach_dir)?;
+                        }
+                        Ok(())
+                    };
+                    let attached = attach();
+                    println!(
+                        "[MODEL] SigLIP2 upgraded in place (vision: {}, text: {}) in {} ms. No full reload.",
+                        model.has_vision(), model.has_text(), t0.elapsed().as_millis()
+                    );
+                    (model, attached)
+                })
+                .await?;
+                *guard = Some(model);
+                return attached;
+            }
+        }
+
+        // ── ② 신규 로드 ──
+        let path = self.siglip2_model_path.clone();
 
         println!(
             "[MODEL] Loading SigLIP2 ({:?}) | vision: {} | text: {}",
@@ -1925,6 +1955,10 @@ impl LogisModel {
         println!("[MODEL] SigLIP2 loaded successfully.");
         Ok(())
     }
+    /// SigLIP2 타워가 장치에 있는가. 타워를 모두 내린 빈 객체는 VRAM 을 쓰지 않으므로 치지 않습니다.
+    pub(crate) async fn siglip2_resident(&self) -> bool {
+        self.siglip2_model.lock().await.as_ref().is_some_and(|m| m.has_vision() || m.has_text())
+    }
     pub async fn ensure_siglip2(&self, needs_text: bool) -> anyhow::Result<()> {
         self.ensure_siglip2_ext(true, needs_text).await
     }
@@ -1933,21 +1967,14 @@ impl LogisModel {
         let released = {
             let mut guard = self.siglip2_model.lock().await;
             println!("[VRAM] lock acquired. Dropping SigLIP2 model (cudaFree implicit sync may happen here)...");
-            if guard.is_some() {
-                *guard = None;
-                true
-            } else {
-                false
-            }
+            guard.take().map(|model| (model.has_vision(), model.has_text()))
         };
-        if !released {
+        let Some((vision, text)) = released else {
             println!("[VRAM] release_siglip2: already released. skip.");
             return;
-        }
-        println!(
-            "[VRAM] SigLIP2 fully released ({}). vision ~820MB + text ~1.4GB returned.",
-            reason
-        );
+        };
+        // 타워를 내려도 파일 매핑은 남습니다. 다음 장에서 다시 올릴 때 복사만 하면 됩니다.
+        println!("[VRAM] SigLIP2 released ({}). 내린 타워 — 비전: {}, 텍스트: {}.", reason, vision, text);
         if !self.is_cpu_mode {
             self.settle_device("release_siglip2", utils::phase_pool_keep_bytes(), false).await;
             println!("[VRAM] 장치 동기화 + 메모리 풀 반환 완료. Proceeding to STAGE-5.");

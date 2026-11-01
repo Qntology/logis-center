@@ -1,7 +1,26 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use once_cell::sync::Lazy;
+
+/// 🌟 [SPLIT-GGUF] 파싱한 토크나이저. 텍스트 타워를 다시 붙일 때마다 34 MB 짜리 tokenizer.json 을 다시 읽지 않습니다.
+/// 장치 메모리와 관계없는 값이라 타워를 내려도 남겨 둡니다. 파일 크기가 달라지면 다시 읽습니다.
+static PARSED: Lazy<Mutex<HashMap<(PathBuf, u64), Arc<tokenizers::Tokenizer>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn parsed(path: &Path) -> anyhow::Result<Arc<tokenizers::Tokenizer>> {
+    let key = (path.to_path_buf(), std::fs::metadata(path)?.len());
+    let mut cache = PARSED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(found) = cache.get(&key) {
+        return Ok(Arc::clone(found));
+    }
+    let tokenizer = Arc::new(tokenizers::Tokenizer::from_file(path).map_err(|e| anyhow::anyhow!("Failed to load SigLIP2 tokenizer: {}", e))?);
+    cache.insert(key, Arc::clone(&tokenizer));
+    Ok(tokenizer)
+}
 
 pub struct Siglip2Tokenizer {
-    inner: tokenizers::Tokenizer,
+    inner: Arc<tokenizers::Tokenizer>,
     pad_id: u32,
     max_len: usize,
 }
@@ -15,10 +34,8 @@ impl Siglip2Tokenizer {
                 path
             ));
         }
-        let inner = tokenizers::Tokenizer::from_file(&path)
-            .map_err(|e| anyhow::anyhow!("Failed to load SigLIP2 tokenizer: {}", e))?;
         Ok(Self {
-            inner,
+            inner: parsed(&path)?,
             pad_id,
             max_len: max_len.max(1),
         })

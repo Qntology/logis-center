@@ -12,7 +12,7 @@ pub const RUNTIME_DIR: &str = "runtime-q4km";
 pub const RUNTIME_FILE: &str = "model-q4km.gguf";
 const READY_FILE: &str = "READY";
 const RECIPE: &str = "qwen35-q4km/1";
-const ALIGN: u64 = 32;
+pub(crate) const ALIGN: u64 = 32;
 const ROUND_ELEMS: usize = 16 * 1024 * 1024;
 
 pub const CHAT_TEMPLATE: &str = "{%- for message in messages -%}{{- '<|im_start|>' + message.role + '\\n' -}}{%- if message.content is string -%}{{- message.content -}}{%- else -%}{%- for part in message.content -%}{%- if part.text is defined -%}{{- part.text -}}{%- endif -%}{%- endfor -%}{%- endif -%}{{- '<|im_end|>\\n' -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' -}}{%- endif -%}";
@@ -54,21 +54,22 @@ struct Item {
     vperm: Option<VPerm>,
 }
 
-struct StEntry {
-    dtype: DType,
-    shape: Vec<usize>,
+pub(crate) struct StEntry {
+    pub(crate) dtype: DType,
+    pub(crate) shape: Vec<usize>,
     begin: u64,
     end: u64,
 }
 
-struct StFile {
-    path: PathBuf,
+pub(crate) struct StFile {
     data_start: u64,
-    entries: HashMap<String, StEntry>,
+    pub(crate) entries: HashMap<String, StEntry>,
+    /// 파일 전체의 읽기 전용 매핑. 텐서마다 파일을 다시 열어 힙에 복사하지 않습니다.
+    map: memmap2::Mmap,
 }
 
 impl StFile {
-    fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         let mut f = std::fs::File::open(path).with_context(|| format!("{:?} 를 열 수 없습니다", path))?;
         let mut len = [0u8; 8];
         f.read_exact(&mut len)?;
@@ -105,25 +106,32 @@ impl StFile {
             }
             entries.insert(name.clone(), StEntry { dtype, shape, begin: offs[0], end: offs[1] });
         }
-        Ok(Self { path: path.to_path_buf(), data_start: 8 + n, entries })
+        f.seek(SeekFrom::Start(0))?;
+        let map = unsafe { memmap2::Mmap::map(&f) }.with_context(|| format!("{:?} 를 매핑할 수 없습니다", path))?;
+        Ok(Self { data_start: 8 + n, entries, map })
     }
 
-    fn load(&self, name: &str) -> Result<Tensor> {
+    /// 텐서의 저장 바이트. 매핑을 그대로 빌려 줍니다.
+    pub(crate) fn bytes(&self, name: &str) -> Result<&[u8]> {
         let e = self.entries.get(name).ok_or_else(|| anyhow!("model.safetensors 에 {} 가 없습니다", name))?;
-        let mut f = std::fs::File::open(&self.path)?;
-        f.seek(SeekFrom::Start(self.data_start + e.begin))?;
-        let mut buf = vec![0u8; (e.end - e.begin) as usize];
-        f.read_exact(&mut buf).with_context(|| {
-            format!(
+        let (start, end) = ((self.data_start + e.begin) as usize, (self.data_start + e.end) as usize);
+        let raw = self.map.get(start..end).ok_or_else(|| {
+            anyhow!(
                 "model.safetensors 에서 {} 를 읽지 못했습니다. 파일이 잘렸거나 손상된 것으로 보이며, 모델 폴더를 지우면 다음 실행에서 다시 받습니다",
                 name
             )
         })?;
         let expect = e.shape.iter().product::<usize>() * e.dtype.size_in_bytes();
-        if buf.len() != expect {
-            bail!("{} 의 바이트 수 {} 가 형상 {:?} 와 맞지 않습니다", name, buf.len(), e.shape);
+        if raw.len() != expect {
+            bail!("{} 의 바이트 수 {} 가 형상 {:?} 와 맞지 않습니다", name, raw.len(), e.shape);
         }
-        Ok(Tensor::from_raw_buffer(&buf, e.dtype, &e.shape, &Device::Cpu)?)
+        Ok(raw)
+    }
+
+    fn load(&self, name: &str) -> Result<Tensor> {
+        let raw = self.bytes(name)?;
+        let e = &self.entries[name];
+        Ok(Tensor::from_raw_buffer(raw, e.dtype, &e.shape, &Device::Cpu)?)
     }
 }
 
@@ -148,7 +156,7 @@ struct TextCfg {
     tied: bool,
 }
 
-enum Meta {
+pub(crate) enum Meta {
     U32(u32),
     F32(f32),
     Str(String),
@@ -670,13 +678,13 @@ fn read_tokenizer_meta(model_dir: &Path, vocab: usize) -> Result<(Vec<String>, V
     Ok((tokens, types, eos, pad))
 }
 
-fn put_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
+pub(crate) fn put_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
     w.write_all(&(s.len() as u64).to_le_bytes())?;
     w.write_all(s.as_bytes())?;
     Ok(())
 }
 
-fn put_meta<W: Write>(w: &mut W, key: &str, v: &Meta) -> Result<()> {
+pub(crate) fn put_meta<W: Write>(w: &mut W, key: &str, v: &Meta) -> Result<()> {
     put_str(w, key)?;
     match v {
         Meta::U32(x) => {
@@ -711,7 +719,7 @@ fn put_meta<W: Write>(w: &mut W, key: &str, v: &Meta) -> Result<()> {
     Ok(())
 }
 
-fn pad_to<W: Write>(w: &mut W, written: u64) -> Result<u64> {
+pub(crate) fn pad_to<W: Write>(w: &mut W, written: u64) -> Result<u64> {
     let pad = (ALIGN - written % ALIGN) % ALIGN;
     if pad > 0 {
         w.write_all(&vec![0u8; pad as usize])?;
