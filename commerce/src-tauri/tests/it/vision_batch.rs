@@ -421,12 +421,12 @@ fn write_tokenizer(dir: &std::path::Path) {
 
 fn mock_siglip_text(dev: &Device, dir: &std::path::Path) -> anyhow::Result<Siglip2Model> {
     use candle_nn::{VarBuilder, VarMap};
-    use tauri_app_lib::models::siglip2::{text::Siglip2TextModel, tokenizer::Siglip2Tokenizer};
+    use tauri_app_lib::models::siglip2::{text::{Siglip2TextModel, TokenSource}, tokenizer::Siglip2Tokenizer};
     let cfg = mock_config();
     // 가중치는 CPU 에서 한 번 만들고(VarMap 무작위 초기화) 장치로 옮깁니다.
     let varmap = VarMap::new();
     let vb_cpu = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
-    let _ = Siglip2TextModel::new(&cfg, vb_cpu, None)?;
+    let _ = Siglip2TextModel::new(&cfg, vb_cpu, TokenSource::Inline)?;
     let tensors: std::collections::HashMap<String, Tensor> = varmap
         .data()
         .lock()
@@ -435,7 +435,7 @@ fn mock_siglip_text(dev: &Device, dir: &std::path::Path) -> anyhow::Result<Sigli
         .map(|(k, v)| (k.clone(), v.as_tensor().to_device(dev).unwrap()))
         .collect();
     let vb = VarBuilder::from_tensors(tensors, DType::F32, dev);
-    let text = Siglip2TextModel::new(&cfg, vb, None)?;
+    let text = Siglip2TextModel::new(&cfg, vb, TokenSource::Inline)?;
     let tok = Siglip2Tokenizer::from_dir(dir, cfg.text_pad_token_id, cfg.text_max_positions)?;
     Ok(Siglip2Model {
         vision: None,
