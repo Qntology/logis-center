@@ -1,0 +1,30 @@
+page_id: harbor-goods-detail-HP10074
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/goods/view?id=HP10074
+page_type: goods
+layout: detail
+fields:
+  id,link: HP10074
+  title: Vacuum insulated tumbler
+  status: Active
+  category: Kitchen
+  sale_price: 16.9
+  quantity: 18
+  registration_date: '2026-05-01'
+  brand_name: Oakfern
+  code: HP-OUT-102
+  stock_keeping_unit: HPOU1002
+  model_name: OU-470
+  manufacturer: 하람제작소
+  origin_country: Portugal
+  color: Sky blue
+  barcode: '8810138397786'
+  supply_price: 9.31
+  low_stock_threshold: 20
+  shipping_fee: 2.3
+  description: A double wall keeps drinks at temperature for hours.
+title: Product details

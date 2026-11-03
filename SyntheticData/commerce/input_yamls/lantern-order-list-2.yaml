@@ -1,0 +1,138 @@
+page_id: lantern-order-list-2
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/orders?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20260402-100689
+  registration_date: '2026-04-02'
+  status: Delivered
+  goods: Ventilated sandals
+  tracking_number: '415750184809'
+  sender_name: Riley Holloway
+  recipient_name: Riley Holloway
+  quantity: 7
+  amount: 121.77
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260608-100742
+  registration_date: '2026-06-08'
+  status: Awaiting payment
+  goods: Sherpa fleece jacket
+  sender_name: Rowan Marsh
+  recipient_name: Morgan Langley
+  quantity: 5
+  amount: 216.45
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260411-100795
+  registration_date: '2026-04-11'
+  status: Awaiting payment
+  goods: Mineral sunscreen
+  sender_name: Quinn Mercer
+  recipient_name: Quinn Mercer
+  quantity: 2
+  amount: 33.71
+  shipping_fee: 2.3
+  payment_method: Credit card
+- id,link: 20260713-100848
+  registration_date: '2026-07-13'
+  status: Awaiting payment
+  goods: Rechargeable hand warmer
+  sender_name: Taylor Kendrick
+  recipient_name: Riley Dorsey
+  quantity: 7
+  amount: 141.08
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260923-100901
+  registration_date: '2026-09-23'
+  status: Cancelled
+  goods: Stainless steel frying pan
+  sender_name: Avery Ashby
+  recipient_name: Sawyer Ashby
+  quantity: 1
+  amount: 41.54
+  shipping_fee: 0.0
+  payment_method: Digital wallet
+- id,link: 20260606-100954
+  registration_date: '2026-06-06'
+  status: Processing
+  goods: UV-blocking parasol
+  sender_name: Harper Mercer
+  recipient_name: Riley Whitfield
+  quantity: 5
+  amount: 142.34
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260729-101007
+  registration_date: '2026-07-29'
+  status: Shipped
+  goods: Pet grooming brush
+  tracking_number: '638173840375'
+  sender_name: Casey Dorsey
+  recipient_name: Casey Dorsey
+  quantity: 9
+  amount: 197.8
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260627-101060
+  registration_date: '2026-06-27'
+  status: Returned
+  goods: Folding trekking poles
+  tracking_number: '610956861348'
+  sender_name: Riley Holloway
+  recipient_name: Riley Holloway
+  quantity: 5
+  amount: 164.6
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260514-101113
+  registration_date: '2026-05-14'
+  status: Delivered
+  goods: Barrier moisture cream
+  tracking_number: '108360243698'
+  sender_name: Taylor Kendrick
+  recipient_name: Taylor Kendrick
+  quantity: 4
+  amount: 44.73
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260802-101166
+  registration_date: '2026-08-02'
+  status: Shipped
+  goods: Silicone utensil set
+  tracking_number: '998567970598'
+  sender_name: Casey Marsh
+  recipient_name: Casey Holloway
+  quantity: 2
+  amount: 41.5
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260628-101219
+  registration_date: '2026-06-28'
+  status: Shipped
+  goods: 65W fast charger
+  tracking_number: '926733941691'
+  sender_name: Riley Kendrick
+  recipient_name: Riley Kendrick
+  quantity: 4
+  amount: 94.55
+  shipping_fee: 0.0
+  payment_method: Wire transfer
+- id,link: 20260924-101272
+  registration_date: '2026-09-24'
+  status: Delivered
+  goods: Cooling neck band
+  tracking_number: '271463445321'
+  sender_name: Emerson Ashby
+  recipient_name: Emerson Ashby
+  quantity: 5
+  amount: 201.45
+  shipping_fee: 0.0
+  payment_method: Credit card
+title: Orders

@@ -1,0 +1,21 @@
+page_id: soop-coupon-detail-CP4007
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/coupons/CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: SOO848
+  title: 첫 구매 환영 혜택 1차
+  type: 정액
+  discount: 5,000원
+  started_at: '2026-05-02'
+  expired_at: '2026-06-01'
+  status: 진행중
+  quantity: 300
+  min_order_amount: 10000
+title: 쿠폰 정보

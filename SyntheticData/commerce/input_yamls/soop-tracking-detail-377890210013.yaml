@@ -1,0 +1,30 @@
+page_id: soop-tracking-detail-377890210013
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/shipments/377890210013
+page_type: tracking
+layout: detail
+fields:
+  id,link: '377890210013'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 기모 후드집업
+  shipping_date: '2026-04-09'
+  recipient_name: 임주원
+  registration_date: '2026-04-06'
+  sender_name: 숲속잡화 협동조합
+  sender_address: 제주특별자치도 제주시 첨단로 213
+  sender_phone: 1877-0221
+  recipient_address: 서울특별시 마포구 합정로 284
+  recipient_phone: 010-7303-4828
+  weight: 3.1
+  width: 42
+  height: 44
+  length: 23
+  shipping_method: 방문수령
+  shipping_duration: 4
+  shipping_fee: 0
+title: 배송 상세 정보

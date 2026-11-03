@@ -1,0 +1,91 @@
+page_id: ttukbaegi-coupon-list-1
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/coupons?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: TTU308
+  title: 앱 전용 혜택 1차
+  type: 정액
+  discount: ₩3,000
+  started_at: '2026-08-01'
+  expired_at: '2026-08-15'
+  status: 대기중
+- id,link: CP4014
+  code: TTU889
+  title: 주말 한정 할인 2차
+  type: 정액
+  discount: ₩2,000
+  started_at: '2026-05-03'
+  expired_at: '2026-05-10'
+  status: 대기중
+- id,link: CP4021
+  code: TTU560
+  title: 첫 구매 환영 혜택 3차
+  type: 정액
+  discount: ₩2,000
+  started_at: '2026-04-19'
+  expired_at: '2026-04-26'
+  status: 종료
+- id,link: CP4028
+  code: TTU377
+  title: 가을 맞이 감사제 4차
+  type: 정률
+  discount: 15%
+  started_at: '2026-08-06'
+  expired_at: '2026-08-13'
+  status: 진행중
+- id,link: CP4035
+  code: TTU717
+  title: 앱 전용 혜택 5차
+  type: 정률
+  discount: 20%
+  started_at: '2026-05-12'
+  expired_at: '2026-06-11'
+  status: 종료
+- id,link: CP4042
+  code: TTU927
+  title: 앱 전용 혜택 6차
+  type: 정액
+  discount: ₩5,000
+  started_at: '2026-04-14'
+  expired_at: '2026-04-21'
+  status: 대기중
+- id,link: CP4049
+  code: TTU527
+  title: 첫 구매 환영 혜택 7차
+  type: 정액
+  discount: ₩3,000
+  started_at: '2026-05-05'
+  expired_at: '2026-06-04'
+  status: 대기중
+- id,link: CP4056
+  code: TTU426
+  title: 가을 맞이 감사제 8차
+  type: 정률
+  discount: 5%
+  started_at: '2026-07-03'
+  expired_at: '2026-07-17'
+  status: 대기중
+- id,link: CP4063
+  code: TTU382
+  title: 재구매 고객 감사 9차
+  type: 정률
+  discount: 20%
+  started_at: '2026-06-21'
+  expired_at: '2026-07-05'
+  status: 대기중
+- id,link: CP4070
+  code: TTU453
+  title: 첫 구매 환영 혜택 10차
+  type: 정액
+  discount: ₩3,000
+  started_at: '2026-06-09'
+  expired_at: '2026-06-23'
+  status: 진행중
+title: 쿠폰 관리

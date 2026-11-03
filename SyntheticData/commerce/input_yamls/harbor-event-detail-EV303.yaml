@@ -1,0 +1,17 @@
+page_id: harbor-event-detail-EV303
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/event/view?id=EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: Spring stroll showcase
+  type: Sweepstakes
+  started_at: '2026-08-03'
+  expired_at: '2026-08-23'
+  status: Scheduled
+title: Campaign

@@ -1,0 +1,28 @@
+page_id: haneul-order-detail-20260625-100159
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/order/view?id=20260625-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260625-100159
+  registration_date: '2026-06-25'
+  status: 상품준비중
+  goods: 제주 감귤 주스
+  sender_name: 권서연
+  recipient_name: 권서연
+  quantity: 6
+  amount: 230300
+  shipping_fee: 0
+  payment_method: 무통장입금
+  sender_phone: 010-4766-1150
+  sender_address: 강원특별자치도 춘천시 공지로 171
+  recipient_phone: 010-4766-1150
+  recipient_address: 강원특별자치도 춘천시 공지로 171
+  payment_origin: 바로결제
+  payment_date: '2026-06-25'
+  bank: 누리은행
+title: 주문 상세내역

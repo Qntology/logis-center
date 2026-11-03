@@ -1,0 +1,30 @@
+page_id: haneul-tracking-detail-144638439415
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/shipping/view?id=144638439415
+page_type: tracking
+layout: detail
+fields:
+  id,link: '144638439415'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 코딩 로봇 키트
+  shipping_date: '2026-10-01'
+  recipient_name: 신현우
+  registration_date: '2026-09-28'
+  sender_name: (주)하늘커머스
+  sender_address: 서울특별시 금천구 가산디지털2로 77 9층
+  sender_phone: 1800-0119
+  recipient_address: 광주광역시 서구 상무대로 65
+  recipient_phone: 010-6990-9801
+  weight: 6.4
+  width: 22
+  height: 16
+  length: 22
+  shipping_method: 화물배송
+  shipping_duration: 3
+  shipping_fee: 0
+title: 배송 상세 정보

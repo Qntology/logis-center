@@ -1,0 +1,30 @@
+page_id: soop-tracking-detail-548218378892
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/shipments/548218378892
+page_type: tracking
+layout: detail
+fields:
+  id,link: '548218378892'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 무향 바디 로션
+  shipping_date: '2026-10-12'
+  recipient_name: 권은호
+  registration_date: '2026-10-08'
+  sender_name: 숲속잡화 협동조합
+  sender_address: 제주특별자치도 제주시 첨단로 213
+  sender_phone: 1877-0221
+  recipient_address: 광주광역시 서구 상무대로 155 4층
+  recipient_phone: 010-5792-6681
+  weight: 1.9
+  width: 58
+  height: 42
+  length: 34
+  shipping_method: 화물배송
+  shipping_duration: 3
+  shipping_fee: 3000
+title: 배송 상세 정보

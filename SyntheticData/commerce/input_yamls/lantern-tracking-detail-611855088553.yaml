@@ -1,0 +1,30 @@
+page_id: lantern-tracking-detail-611855088553
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/shipments/611855088553
+page_type: tracking
+layout: detail
+fields:
+  id,link: '611855088553'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Pet grooming brush
+  shipping_date: '2026-05-16'
+  recipient_name: Quinn Whitfield
+  registration_date: '2026-05-14'
+  sender_name: Blue Lantern Supply Co.
+  sender_address: 88 Quarry Road, Duluth, MN 55802
+  sender_phone: +1-218-555-0177
+  recipient_address: 5069 Cedar Ln, Madison, WI 53703
+  recipient_phone: +1-582-555-0172
+  weight: 1.8
+  width: 54
+  height: 13
+  length: 27
+  shipping_method: Freight
+  shipping_duration: 2
+  shipping_fee: 2.3
+title: Shipment details

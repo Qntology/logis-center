@@ -1,0 +1,4387 @@
+- key: haneul:goods:HN10037
+  shop: haneul
+  type: goods
+  id: HN10037
+  title: 펫 빗 브러시
+  concept: pet
+  status: 품절
+  price: 13900
+  date: '2026-06-07'
+- key: haneul:goods:HN10074
+  shop: haneul
+  type: goods
+  id: HN10074
+  title: 제주 감귤 주스
+  concept: snack_food
+  status: 판매중
+  price: 17100
+  date: '2026-05-11'
+- key: haneul:goods:HN10111
+  shop: haneul
+  type: goods
+  id: HN10111
+  title: 스마트 밴드
+  concept: audio_power
+  status: 품절
+  price: 51500
+  date: '2026-02-26'
+- key: haneul:goods:HN10148
+  shop: haneul
+  type: goods
+  id: HN10148
+  title: 65W 고속 충전기
+  concept: audio_power
+  status: 판매중
+  price: 36300
+  date: '2026-02-14'
+- key: haneul:goods:HN10185
+  shop: haneul
+  type: goods
+  id: HN10185
+  title: 아이스 쿨매트
+  concept: hot_weather
+  status: 판매중
+  price: 42700
+  date: '2026-02-19'
+- key: haneul:goods:HN10222
+  shop: haneul
+  type: goods
+  id: HN10222
+  title: 자외선 차단 양산
+  concept: hot_weather
+  status: 판매중
+  price: 27700
+  date: '2026-05-16'
+- key: haneul:goods:HN10259
+  shop: haneul
+  type: goods
+  id: HN10259
+  title: 저소음 기계식 키보드
+  concept: desk_work
+  status: 판매중
+  price: 85100
+  date: '2026-06-19'
+- key: haneul:goods:HN10296
+  shop: haneul
+  type: goods
+  id: HN10296
+  title: 구운 아몬드
+  concept: snack_food
+  status: 판매중
+  price: 11900
+  date: '2026-01-30'
+- key: haneul:goods:HN10333
+  shop: haneul
+  type: goods
+  id: HN10333
+  title: 저알러지 사료
+  concept: pet
+  status: 판매중
+  price: 32400
+  date: '2026-04-27'
+- key: haneul:goods:HN10370
+  shop: haneul
+  type: goods
+  id: HN10370
+  title: 핸드 블렌더
+  concept: cooking
+  status: 진열안함
+  price: 45900
+  date: '2026-02-04'
+- key: haneul:goods:HN10407
+  shop: haneul
+  type: goods
+  id: HN10407
+  title: 스테인리스 프라이팬
+  concept: cooking
+  status: 품절
+  price: 57400
+  date: '2026-08-18'
+- key: haneul:goods:HN10444
+  shop: haneul
+  type: goods
+  id: HN10444
+  title: 무향 바디 로션
+  concept: skincare
+  status: 판매중
+  price: 18100
+  date: '2026-09-02'
+- key: haneul:goods:HN10481
+  shop: haneul
+  type: goods
+  id: HN10481
+  title: 경량 패딩 조끼
+  concept: cold_weather
+  status: 품절
+  price: 64000
+  date: '2026-08-22'
+- key: haneul:goods:HN10518
+  shop: haneul
+  type: goods
+  id: HN10518
+  title: 저당 단백질바
+  concept: snack_food
+  status: 판매중
+  price: 22000
+  date: '2026-08-20'
+- key: haneul:goods:HN10555
+  shop: haneul
+  type: goods
+  id: HN10555
+  title: 비타민 C 세럼
+  concept: skincare
+  status: 판매중
+  price: 40300
+  date: '2026-07-07'
+- key: haneul:goods:HN10592
+  shop: haneul
+  type: goods
+  id: HN10592
+  title: 기모 후드집업
+  concept: cold_weather
+  status: 판매중
+  price: 48200
+  date: '2026-01-28'
+- key: haneul:goods:HN10629
+  shop: haneul
+  type: goods
+  id: HN10629
+  title: 대용량 보조배터리
+  concept: audio_power
+  status: 판매중
+  price: 37500
+  date: '2026-05-26'
+- key: haneul:goods:HN10666
+  shop: haneul
+  type: goods
+  id: HN10666
+  title: 토끼 봉제 인형
+  concept: kids
+  status: 판매중
+  price: 21000
+  date: '2026-08-03'
+- key: haneul:goods:HN10703
+  shop: haneul
+  type: goods
+  id: HN10703
+  title: 유기농 그래놀라
+  concept: snack_food
+  status: 품절
+  price: 14900
+  date: '2026-07-23'
+- key: haneul:goods:HN10740
+  shop: haneul
+  type: goods
+  id: HN10740
+  title: 어린이 킥보드
+  concept: kids
+  status: 품절
+  price: 67700
+  date: '2026-03-30'
+- key: haneul:goods:HN10777
+  shop: haneul
+  type: goods
+  id: HN10777
+  title: 방수 블루투스 스피커
+  concept: audio_power
+  status: 품절
+  price: 58800
+  date: '2026-08-14'
+- key: haneul:goods:HN10814
+  shop: haneul
+  type: goods
+  id: HN10814
+  title: 진공 보온 텀블러
+  concept: outdoor
+  status: 판매중
+  price: 25200
+  date: '2026-07-01'
+- key: haneul:goods:HN10851
+  shop: haneul
+  type: goods
+  id: HN10851
+  title: 자동 급식기
+  concept: pet
+  status: 진열안함
+  price: 68400
+  date: '2026-02-04'
+- key: haneul:goods:HN10888
+  shop: haneul
+  type: goods
+  id: HN10888
+  title: 충전식 손난로
+  concept: cold_weather
+  status: 판매중
+  price: 22000
+  date: '2026-06-19'
+- key: haneul:order:20260409-100053
+  shop: haneul
+  type: order
+  id: 20260409-100053
+  title: 비타민 C 세럼
+  status: 결제완료
+  amount: 297540
+  date: '2026-04-09'
+  buyer: 임서연
+  tracking: null
+  goods_ids:
+  - HN10555
+  - HN11110
+- key: haneul:order:20260502-100106
+  shop: haneul
+  type: order
+  id: 20260502-100106
+  title: 기모 후드집업
+  status: 배송완료
+  amount: 95040
+  date: '2026-05-02'
+  buyer: 임현우
+  tracking: '944787807166'
+  goods_ids:
+  - HN10592
+  - HN10407
+- key: haneul:order:20260625-100159
+  shop: haneul
+  type: order
+  id: 20260625-100159
+  title: 제주 감귤 주스
+  status: 상품준비중
+  amount: 230300
+  date: '2026-06-25'
+  buyer: 권서연
+  tracking: null
+  goods_ids:
+  - HN10074
+  - HN11258
+  - HN10777
+- key: haneul:order:20260923-100212
+  shop: haneul
+  type: order
+  id: 20260923-100212
+  title: 어린이 킥보드
+  status: 반품
+  amount: 237100
+  date: '2026-09-23'
+  buyer: 오건우
+  tracking: '871729019834'
+  goods_ids:
+  - HN10740
+  - HN11554
+  - HN10888
+- key: haneul:order:20260427-100265
+  shop: haneul
+  type: order
+  id: 20260427-100265
+  title: 어린이 킥보드
+  status: 배송중
+  amount: 338500
+  date: '2026-04-27'
+  buyer: 한시우
+  tracking: '737868485118'
+  goods_ids:
+  - HN10740
+- key: haneul:order:20260928-100318
+  shop: haneul
+  type: order
+  id: 20260928-100318
+  title: 코딩 로봇 키트
+  status: 배송완료
+  amount: 278500
+  date: '2026-09-28'
+  buyer: 신현우
+  tracking: '144638439415'
+  goods_ids:
+  - HN11554
+  - HN11258
+- key: haneul:order:20260628-100371
+  shop: haneul
+  type: order
+  id: 20260628-100371
+  title: 65W 고속 충전기
+  status: 배송중
+  amount: 104700
+  date: '2026-06-28'
+  buyer: 박민준
+  tracking: '449819227060'
+  goods_ids:
+  - HN10148
+  - HN10851
+- key: haneul:order:20260611-100424
+  shop: haneul
+  type: order
+  id: 20260611-100424
+  title: 토끼 봉제 인형
+  status: 취소
+  amount: 24000
+  date: '2026-06-11'
+  buyer: 박시우
+  tracking: null
+  goods_ids:
+  - HN10666
+- key: haneul:order:20261002-100477
+  shop: haneul
+  type: order
+  id: 20261002-100477
+  title: 기모 후드집업
+  status: 배송완료
+  amount: 345690
+  date: '2026-10-02'
+  buyer: 서하은
+  tracking: '949201983244'
+  goods_ids:
+  - HN10592
+  - HN10999
+  - HN11369
+- key: haneul:order:20260627-100530
+  shop: haneul
+  type: order
+  id: 20260627-100530
+  title: 기모 후드집업
+  status: 배송완료
+  amount: 179900
+  date: '2026-06-27'
+  buyer: 서도윤
+  tracking: '154999338813'
+  goods_ids:
+  - HN10592
+  - HN11184
+- key: haneul:order:20260403-100583
+  shop: haneul
+  type: order
+  id: 20260403-100583
+  title: 대용량 보조배터리
+  status: 배송중
+  amount: 52400
+  date: '2026-04-03'
+  buyer: 윤유진
+  tracking: '365556517003'
+  goods_ids:
+  - HN10629
+  - HN10296
+- key: haneul:order:20260522-100636
+  shop: haneul
+  type: order
+  id: 20260522-100636
+  title: 비타민 C 세럼
+  status: 배송완료
+  amount: 297540
+  date: '2026-05-22'
+  buyer: 장소율
+  tracking: '312694597279'
+  goods_ids:
+  - HN10555
+  - HN11110
+- key: haneul:order:20260417-100689
+  shop: haneul
+  type: order
+  id: 20260417-100689
+  title: 유기농 그래놀라
+  status: 배송완료
+  amount: 162900
+  date: '2026-04-17'
+  buyer: 이하은
+  tracking: '625857926103'
+  goods_ids:
+  - HN10703
+  - HN11036
+- key: haneul:order:20260907-100742
+  shop: haneul
+  type: order
+  id: 20260907-100742
+  title: 토끼 봉제 인형
+  status: 입금대기
+  amount: 234500
+  date: '2026-09-07'
+  buyer: 이민준
+  tracking: null
+  goods_ids:
+  - HN10666
+  - HN10185
+- key: haneul:order:20260916-100795
+  shop: haneul
+  type: order
+  id: 20260916-100795
+  title: 토끼 봉제 인형
+  status: 취소
+  amount: 136170
+  date: '2026-09-16'
+  buyer: 이도윤
+  tracking: null
+  goods_ids:
+  - HN10666
+  - HN11332
+  - HN10999
+- key: haneul:order:20260829-100848
+  shop: haneul
+  type: order
+  id: 20260829-100848
+  title: 접이식 등산 스틱
+  status: 취소
+  amount: 101070
+  date: '2026-08-29'
+  buyer: 김서연
+  tracking: null
+  goods_ids:
+  - HN11443
+  - HN10999
+  - HN11147
+- key: haneul:order:20260519-100901
+  shop: haneul
+  type: order
+  id: 20260519-100901
+  title: 무향 바디 로션
+  status: 입금대기
+  amount: 39200
+  date: '2026-05-19'
+  buyer: 최채원
+  tracking: null
+  goods_ids:
+  - HN10444
+- key: haneul:order:20260415-100954
+  shop: haneul
+  type: order
+  id: 20260415-100954
+  title: 충전식 손난로
+  status: 배송완료
+  amount: 25000
+  date: '2026-04-15'
+  buyer: 한예준
+  tracking: '279400440756'
+  goods_ids:
+  - HN10888
+- key: haneul:order:20260624-101007
+  shop: haneul
+  type: order
+  id: 20260624-101007
+  title: 약산성 클렌징 폼
+  status: 취소
+  amount: 17300
+  date: '2026-06-24'
+  buyer: 조유진
+  tracking: null
+  goods_ids:
+  - HN11369
+- key: haneul:order:20260822-101060
+  shop: haneul
+  type: order
+  id: 20260822-101060
+  title: LED 충전 랜턴
+  status: 배송완료
+  amount: 169600
+  date: '2026-08-22'
+  buyer: 이도윤
+  tracking: '521111791809'
+  goods_ids:
+  - HN11332
+  - HN10999
+  - HN10370
+- key: haneul:order:20260607-101113
+  shop: haneul
+  type: order
+  id: 20260607-101113
+  title: 자외선 차단 양산
+  status: 취소
+  amount: 686200
+  date: '2026-06-07'
+  buyer: 임건우
+  tracking: null
+  goods_ids:
+  - HN10222
+  - HN11184
+- key: haneul:order:20260531-101166
+  shop: haneul
+  type: order
+  id: 20260531-101166
+  title: 어린이 킥보드
+  status: 배송중
+  amount: 329800
+  date: '2026-05-31'
+  buyer: 서은호
+  tracking: '959170073566'
+  goods_ids:
+  - HN10740
+  - HN11443
+  - HN10962
+- key: haneul:order:20260925-101219
+  shop: haneul
+  type: order
+  id: 20260925-101219
+  title: 2인용 돔 텐트
+  status: 결제완료
+  amount: 234720
+  date: '2026-09-25'
+  buyer: 최유진
+  tracking: null
+  goods_ids:
+  - HN11480
+- key: haneul:order:20260716-101272
+  shop: haneul
+  type: order
+  id: 20260716-101272
+  title: 펫 빗 브러시
+  status: 배송중
+  amount: 15510
+  date: '2026-07-16'
+  buyer: 임은호
+  tracking: '991093348982'
+  goods_ids:
+  - HN10037
+- key: haneul:tracking:944787807166
+  shop: haneul
+  type: tracking
+  id: '944787807166'
+  title: 기모 후드집업
+  status: 배송완료
+  date: '2026-05-03'
+  carrier: 한빛로지스
+  order_id: 20260502-100106
+- key: haneul:tracking:871729019834
+  shop: haneul
+  type: tracking
+  id: '871729019834'
+  title: 어린이 킥보드
+  status: 반품
+  date: '2026-09-27'
+  carrier: 새길운송
+  order_id: 20260923-100212
+- key: haneul:tracking:737868485118
+  shop: haneul
+  type: tracking
+  id: '737868485118'
+  title: 어린이 킥보드
+  status: 배송중
+  date: '2026-04-28'
+  carrier: 온누리익스프레스
+  order_id: 20260427-100265
+- key: haneul:tracking:144638439415
+  shop: haneul
+  type: tracking
+  id: '144638439415'
+  title: 코딩 로봇 키트
+  status: 배송완료
+  date: '2026-10-01'
+  carrier: 한빛로지스
+  order_id: 20260928-100318
+- key: haneul:tracking:449819227060
+  shop: haneul
+  type: tracking
+  id: '449819227060'
+  title: 65W 고속 충전기
+  status: 배송중
+  date: '2026-06-30'
+  carrier: 새길운송
+  order_id: 20260628-100371
+- key: haneul:tracking:949201983244
+  shop: haneul
+  type: tracking
+  id: '949201983244'
+  title: 기모 후드집업
+  status: 배송완료
+  date: '2026-10-04'
+  carrier: 바른택배
+  order_id: 20261002-100477
+- key: haneul:tracking:154999338813
+  shop: haneul
+  type: tracking
+  id: '154999338813'
+  title: 기모 후드집업
+  status: 배송완료
+  date: '2026-07-01'
+  carrier: 바른택배
+  order_id: 20260627-100530
+- key: haneul:tracking:365556517003
+  shop: haneul
+  type: tracking
+  id: '365556517003'
+  title: 대용량 보조배터리
+  status: 배송중
+  date: '2026-04-06'
+  carrier: 한빛로지스
+  order_id: 20260403-100583
+- key: haneul:tracking:312694597279
+  shop: haneul
+  type: tracking
+  id: '312694597279'
+  title: 비타민 C 세럼
+  status: 배송완료
+  date: '2026-05-24'
+  carrier: 한빛로지스
+  order_id: 20260522-100636
+- key: haneul:tracking:625857926103
+  shop: haneul
+  type: tracking
+  id: '625857926103'
+  title: 유기농 그래놀라
+  status: 배송완료
+  date: '2026-04-19'
+  carrier: 새길운송
+  order_id: 20260417-100689
+- key: haneul:tracking:279400440756
+  shop: haneul
+  type: tracking
+  id: '279400440756'
+  title: 충전식 손난로
+  status: 배송완료
+  date: '2026-04-17'
+  carrier: 온누리익스프레스
+  order_id: 20260415-100954
+- key: haneul:tracking:521111791809
+  shop: haneul
+  type: tracking
+  id: '521111791809'
+  title: LED 충전 랜턴
+  status: 배송완료
+  date: '2026-08-26'
+  carrier: 한빛로지스
+  order_id: 20260822-101060
+- key: haneul:tracking:959170073566
+  shop: haneul
+  type: tracking
+  id: '959170073566'
+  title: 어린이 킥보드
+  status: 배송중
+  date: '2026-06-02'
+  carrier: 바른택배
+  order_id: 20260531-101166
+- key: haneul:tracking:991093348982
+  shop: haneul
+  type: tracking
+  id: '991093348982'
+  title: 펫 빗 브러시
+  status: 배송중
+  date: '2026-07-19'
+  carrier: 새길운송
+  order_id: 20260716-101272
+- key: haneul:tracking:212464131436
+  shop: haneul
+  type: tracking
+  id: '212464131436'
+  title: 충전식 손난로
+  status: 배송중
+  date: '2026-06-07'
+  carrier: 온누리익스프레스
+  order_id: 20260605-101325
+- key: haneul:tracking:985470131264
+  shop: haneul
+  type: tracking
+  id: '985470131264'
+  title: 접이식 등산 스틱
+  status: 배송완료
+  date: '2026-09-01'
+  carrier: 새길운송
+  order_id: 20260831-101378
+- key: haneul:tracking:470479123713
+  shop: haneul
+  type: tracking
+  id: '470479123713'
+  title: 코딩 로봇 키트
+  status: 배송완료
+  date: '2026-06-09'
+  carrier: 바른택배
+  order_id: 20260608-101537
+- key: haneul:tracking:751710420375
+  shop: haneul
+  type: tracking
+  id: '751710420375'
+  title: 노이즈캔슬링 무선 이어폰
+  status: 배송중
+  date: '2026-07-22'
+  carrier: 바른택배
+  order_id: 20260719-101643
+- key: haneul:tracking:210974147045
+  shop: haneul
+  type: tracking
+  id: '210974147045'
+  title: 진공 보온 텀블러
+  status: 배송중
+  date: '2026-08-07'
+  carrier: 새길운송
+  order_id: 20260805-101696
+- key: haneul:tracking:669755300642
+  shop: haneul
+  type: tracking
+  id: '669755300642'
+  title: 서류 정리함
+  status: 배송완료
+  date: '2026-05-24'
+  carrier: 온누리익스프레스
+  order_id: 20260522-101749
+- key: haneul:tracking:651639973093
+  shop: haneul
+  type: tracking
+  id: '651639973093'
+  title: 유아 식기 세트
+  status: 배송중
+  date: '2026-10-07'
+  carrier: 한빛로지스
+  order_id: 20261004-101908
+- key: haneul:tracking:594426284960
+  shop: haneul
+  type: tracking
+  id: '594426284960'
+  title: 어린이 킥보드
+  status: 반품
+  date: '2026-09-27'
+  carrier: 바른택배
+  order_id: 20260926-101961
+- key: haneul:tracking:373522434708
+  shop: haneul
+  type: tracking
+  id: '373522434708'
+  title: 경량 패딩 조끼
+  status: 배송중
+  date: '2026-06-27'
+  carrier: 새길운송
+  order_id: 20260624-102014
+- key: haneul:tracking:370344139646
+  shop: haneul
+  type: tracking
+  id: '370344139646'
+  title: 유아 식기 세트
+  status: 배송중
+  date: '2026-07-07'
+  carrier: 바른택배
+  order_id: 20260704-102067
+- key: moa:goods:MA10037
+  shop: moa
+  type: goods
+  id: MA10037
+  title: 경량 패딩 조끼
+  concept: cold_weather
+  status: 품절
+  price: 69500
+  date: '2026-01-22'
+- key: moa:goods:MA10074
+  shop: moa
+  type: goods
+  id: MA10074
+  title: 고양이 스크래처
+  concept: pet
+  status: 진열안함
+  price: 19500
+  date: '2026-09-07'
+- key: moa:goods:MA10111
+  shop: moa
+  type: goods
+  id: MA10111
+  title: 비타민 C 세럼
+  concept: skincare
+  status: 판매중
+  price: 38800
+  date: '2026-03-21'
+- key: moa:goods:MA10148
+  shop: moa
+  type: goods
+  id: MA10148
+  title: 통풍 샌들
+  concept: hot_weather
+  status: 판매중
+  price: 31700
+  date: '2026-01-05'
+- key: moa:goods:MA10185
+  shop: moa
+  type: goods
+  id: MA10185
+  title: 저소음 기계식 키보드
+  concept: desk_work
+  status: 판매중
+  price: 96500
+  date: '2026-04-29'
+- key: moa:goods:MA10222
+  shop: moa
+  type: goods
+  id: MA10222
+  title: USB-C 멀티 허브
+  concept: audio_power
+  status: 품절
+  price: 37000
+  date: '2026-01-13'
+- key: moa:goods:MA10259
+  shop: moa
+  type: goods
+  id: MA10259
+  title: 콜드브루 원액
+  concept: snack_food
+  status: 판매중
+  price: 16200
+  date: '2026-04-05'
+- key: moa:goods:MA10296
+  shop: moa
+  type: goods
+  id: MA10296
+  title: 무기자차 선크림
+  concept: skincare
+  status: 품절
+  price: 24800
+  date: '2026-05-26'
+- key: moa:goods:MA10333
+  shop: moa
+  type: goods
+  id: MA10333
+  title: 스테인리스 프라이팬
+  concept: cooking
+  status: 판매중
+  price: 58600
+  date: '2026-02-16'
+- key: moa:goods:MA10370
+  shop: moa
+  type: goods
+  id: MA10370
+  title: 수분 장벽 크림
+  concept: skincare
+  status: 판매중
+  price: 32800
+  date: '2026-02-21'
+- key: moa:goods:MA10407
+  shop: moa
+  type: goods
+  id: MA10407
+  title: 털 슬리퍼
+  concept: cold_weather
+  status: 판매중
+  price: 18700
+  date: '2026-05-05'
+- key: moa:goods:MA10444
+  shop: moa
+  type: goods
+  id: MA10444
+  title: 서류 정리함
+  concept: desk_work
+  status: 품절
+  price: 14500
+  date: '2026-03-29'
+- key: moa:goods:MA10481
+  shop: moa
+  type: goods
+  id: MA10481
+  title: 휴대용 코펠 세트
+  concept: outdoor
+  status: 판매중
+  price: 40700
+  date: '2026-07-30'
+- key: moa:goods:MA10518
+  shop: moa
+  type: goods
+  id: MA10518
+  title: 진공 보온 텀블러
+  concept: outdoor
+  status: 판매중
+  price: 23000
+  date: '2026-05-11'
+- key: moa:goods:MA10555
+  shop: moa
+  type: goods
+  id: MA10555
+  title: 기모 후드집업
+  concept: cold_weather
+  status: 판매중
+  price: 46500
+  date: '2026-03-20'
+- key: moa:goods:MA10592
+  shop: moa
+  type: goods
+  id: MA10592
+  title: 구운 아몬드
+  concept: snack_food
+  status: 판매중
+  price: 12400
+  date: '2026-09-05'
+- key: moa:goods:MA10629
+  shop: moa
+  type: goods
+  id: MA10629
+  title: 노이즈캔슬링 무선 이어폰
+  concept: audio_power
+  status: 판매중
+  price: 118600
+  date: '2026-03-01'
+- key: moa:goods:MA10666
+  shop: moa
+  type: goods
+  id: MA10666
+  title: 인체공학 버티컬 마우스
+  concept: desk_work
+  status: 진열안함
+  price: 45200
+  date: '2026-07-21'
+- key: moa:goods:MA10703
+  shop: moa
+  type: goods
+  id: MA10703
+  title: 충전식 손난로
+  concept: cold_weather
+  status: 판매중
+  price: 23000
+  date: '2026-04-03'
+- key: moa:goods:MA10740
+  shop: moa
+  type: goods
+  id: MA10740
+  title: LED 충전 랜턴
+  concept: outdoor
+  status: 판매중
+  price: 29800
+  date: '2026-08-28'
+- key: moa:goods:MA10777
+  shop: moa
+  type: goods
+  id: MA10777
+  title: 원목 블록 세트
+  concept: kids
+  status: 판매중
+  price: 36600
+  date: '2026-04-19'
+- key: moa:goods:MA10814
+  shop: moa
+  type: goods
+  id: MA10814
+  title: 색칠놀이 스케치북
+  concept: kids
+  status: 품절
+  price: 9600
+  date: '2026-07-15'
+- key: moa:goods:MA10851
+  shop: moa
+  type: goods
+  id: MA10851
+  title: 케이블 정리함
+  concept: desk_work
+  status: 판매중
+  price: 14800
+  date: '2026-03-03'
+- key: moa:goods:MA10888
+  shop: moa
+  type: goods
+  id: MA10888
+  title: 65W 고속 충전기
+  concept: audio_power
+  status: 품절
+  price: 36000
+  date: '2026-01-19'
+- key: moa:order:20260707-100053
+  shop: moa
+  type: order
+  id: 20260707-100053
+  title: 노트북 거치대
+  status: 배송중
+  amount: 34700
+  date: '2026-07-07'
+  buyer: 장건우
+  tracking: '886177832427'
+  goods_ids:
+  - MA11110
+- key: moa:order:20260602-100106
+  shop: moa
+  type: order
+  id: 20260602-100106
+  title: 원목 블록 세트
+  status: 배송완료
+  amount: 73200
+  date: '2026-06-02'
+  buyer: 오하은
+  tracking: '572403973922'
+  goods_ids:
+  - MA10777
+- key: moa:order:20260819-100159
+  shop: moa
+  type: order
+  id: 20260819-100159
+  title: 저소음 기계식 키보드
+  status: 상품준비중
+  amount: 161640
+  date: '2026-08-19'
+  buyer: 박다은
+  tracking: null
+  goods_ids:
+  - MA10185
+  - MA11221
+  - MA11369
+- key: moa:order:20260501-100212
+  shop: moa
+  type: order
+  id: 20260501-100212
+  title: 털 슬리퍼
+  status: 배송중
+  amount: 155500
+  date: '2026-05-01'
+  buyer: 서도윤
+  tracking: '330500692791'
+  goods_ids:
+  - MA10407
+  - MA10592
+- key: moa:order:20260613-100265
+  shop: moa
+  type: order
+  id: 20260613-100265
+  title: 비타민 C 세럼
+  status: 배송완료
+  amount: 99720
+  date: '2026-06-13'
+  buyer: 최채원
+  tracking: '913794300012'
+  goods_ids:
+  - MA10111
+  - MA10888
+- key: moa:order:20260607-100318
+  shop: moa
+  type: order
+  id: 20260607-100318
+  title: 진공 보온 텀블러
+  status: 취소
+  amount: 70800
+  date: '2026-06-07'
+  buyer: 윤도윤
+  tracking: null
+  goods_ids:
+  - MA10518
+  - MA10296
+- key: moa:order:20260627-100371
+  shop: moa
+  type: order
+  id: 20260627-100371
+  title: 핸드 블렌더
+  status: 입금대기
+  amount: 48200
+  date: '2026-06-27'
+  buyer: 신지우
+  tracking: null
+  goods_ids:
+  - MA10962
+- key: moa:order:20260520-100424
+  shop: moa
+  type: order
+  id: 20260520-100424
+  title: 노이즈캔슬링 무선 이어폰
+  status: 반품
+  amount: 285200
+  date: '2026-05-20'
+  buyer: 조은호
+  tracking: '759830694554'
+  goods_ids:
+  - MA10629
+  - MA10999
+- key: moa:order:20260411-100477
+  shop: moa
+  type: order
+  id: 20260411-100477
+  title: LED 충전 랜턴
+  status: 결제완료
+  amount: 230300
+  date: '2026-04-11'
+  buyer: 장다은
+  tracking: null
+  goods_ids:
+  - MA10740
+  - MA11073
+- key: moa:order:20260617-100530
+  shop: moa
+  type: order
+  id: 20260617-100530
+  title: 비타민 C 세럼
+  status: 반품
+  amount: 37920
+  date: '2026-06-17'
+  buyer: 신채원
+  tracking: '429626620594'
+  goods_ids:
+  - MA10111
+- key: moa:order:20260709-100583
+  shop: moa
+  type: order
+  id: 20260709-100583
+  title: 무기자차 선크림
+  status: 배송중
+  amount: 196000
+  date: '2026-07-09'
+  buyer: 장주원
+  tracking: '504192449610'
+  goods_ids:
+  - MA10296
+  - MA10888
+- key: moa:order:20260408-100636
+  shop: moa
+  type: order
+  id: 20260408-100636
+  title: 코딩 로봇 키트
+  status: 반품
+  amount: 151000
+  date: '2026-04-08'
+  buyer: 임수아
+  tracking: '997689028990'
+  goods_ids:
+  - MA11184
+- key: moa:order:20260818-100689
+  shop: moa
+  type: order
+  id: 20260818-100689
+  title: 노트북 거치대
+  status: 상품준비중
+  amount: 223600
+  date: '2026-08-18'
+  buyer: 서유진
+  tracking: null
+  goods_ids:
+  - MA11110
+  - MA10925
+  - MA11036
+- key: moa:order:20260731-100742
+  shop: moa
+  type: order
+  id: 20260731-100742
+  title: 65W 고속 충전기
+  status: 배송완료
+  amount: 202000
+  date: '2026-07-31'
+  buyer: 권유진
+  tracking: '290539531496'
+  goods_ids:
+  - MA10888
+  - MA10333
+  - MA10925
+- key: moa:order:20260514-100795
+  shop: moa
+  type: order
+  id: 20260514-100795
+  title: 스테인리스 프라이팬
+  status: 상품준비중
+  amount: 142300
+  date: '2026-05-14'
+  buyer: 서은호
+  tracking: null
+  goods_ids:
+  - MA10333
+  - MA10555
+  - MA10592
+- key: moa:order:20260901-100848
+  shop: moa
+  type: order
+  id: 20260901-100848
+  title: 강아지 하네스
+  status: 반품
+  amount: 340000
+  date: '2026-09-01'
+  buyer: 권예준
+  tracking: '785356489847'
+  goods_ids:
+  - MA11480
+  - MA11517
+- key: moa:order:20260617-100901
+  shop: moa
+  type: order
+  id: 20260617-100901
+  title: 휴대용 코펠 세트
+  status: 상품준비중
+  amount: 547500
+  date: '2026-06-17'
+  buyer: 이예준
+  tracking: null
+  goods_ids:
+  - MA10481
+  - MA10888
+  - MA10370
+- key: moa:order:20260407-100954
+  shop: moa
+  type: order
+  id: 20260407-100954
+  title: 온도조절 전기포트
+  status: 결제완료
+  amount: 278400
+  date: '2026-04-07'
+  buyer: 강다은
+  tracking: null
+  goods_ids:
+  - MA11332
+  - MA11036
+- key: moa:order:20260716-101007
+  shop: moa
+  type: order
+  id: 20260716-101007
+  title: 손상모 헤어 에센스
+  status: 배송완료
+  amount: 39540
+  date: '2026-07-16'
+  buyer: 장민준
+  tracking: '917334219994'
+  goods_ids:
+  - MA11258
+- key: moa:order:20261011-101060
+  shop: moa
+  type: order
+  id: 20261011-101060
+  title: 자외선 차단 양산
+  status: 반품
+  amount: 417690
+  date: '2026-10-11'
+  buyer: 강수아
+  tracking: '493010304115'
+  goods_ids:
+  - MA11406
+  - MA11110
+  - MA11443
+- key: moa:order:20260918-101113
+  shop: moa
+  type: order
+  id: 20260918-101113
+  title: 코딩 로봇 키트
+  status: 상품준비중
+  amount: 67950
+  date: '2026-09-18'
+  buyer: 조주원
+  tracking: null
+  goods_ids:
+  - MA11184
+- key: moa:order:20260524-101166
+  shop: moa
+  type: order
+  id: 20260524-101166
+  title: 자외선 차단 양산
+  status: 반품
+  amount: 85200
+  date: '2026-05-24'
+  buyer: 권건우
+  tracking: '134838649493'
+  goods_ids:
+  - MA11406
+- key: moa:order:20260826-101219
+  shop: moa
+  type: order
+  id: 20260826-101219
+  title: 손상모 헤어 에센스
+  status: 입금대기
+  amount: 280530
+  date: '2026-08-26'
+  buyer: 임은호
+  tracking: null
+  goods_ids:
+  - MA11258
+  - MA11517
+  - MA10296
+- key: moa:order:20260813-101272
+  shop: moa
+  type: order
+  id: 20260813-101272
+  title: LED 충전 랜턴
+  status: 입금대기
+  amount: 59600
+  date: '2026-08-13'
+  buyer: 이건우
+  tracking: null
+  goods_ids:
+  - MA10740
+- key: moa:tracking:886177832427
+  shop: moa
+  type: tracking
+  id: '886177832427'
+  title: 노트북 거치대
+  status: 배송중
+  date: '2026-07-10'
+  carrier: 한빛로지스
+  order_id: 20260707-100053
+- key: moa:tracking:572403973922
+  shop: moa
+  type: tracking
+  id: '572403973922'
+  title: 원목 블록 세트
+  status: 배송완료
+  date: '2026-06-04'
+  carrier: 온누리익스프레스
+  order_id: 20260602-100106
+- key: moa:tracking:330500692791
+  shop: moa
+  type: tracking
+  id: '330500692791'
+  title: 털 슬리퍼
+  status: 배송중
+  date: '2026-05-02'
+  carrier: 온누리익스프레스
+  order_id: 20260501-100212
+- key: moa:tracking:913794300012
+  shop: moa
+  type: tracking
+  id: '913794300012'
+  title: 비타민 C 세럼
+  status: 배송완료
+  date: '2026-06-14'
+  carrier: 새길운송
+  order_id: 20260613-100265
+- key: moa:tracking:759830694554
+  shop: moa
+  type: tracking
+  id: '759830694554'
+  title: 노이즈캔슬링 무선 이어폰
+  status: 반품
+  date: '2026-05-22'
+  carrier: 온누리익스프레스
+  order_id: 20260520-100424
+- key: moa:tracking:429626620594
+  shop: moa
+  type: tracking
+  id: '429626620594'
+  title: 비타민 C 세럼
+  status: 반품
+  date: '2026-06-18'
+  carrier: 온누리익스프레스
+  order_id: 20260617-100530
+- key: moa:tracking:504192449610
+  shop: moa
+  type: tracking
+  id: '504192449610'
+  title: 무기자차 선크림
+  status: 배송중
+  date: '2026-07-12'
+  carrier: 온누리익스프레스
+  order_id: 20260709-100583
+- key: moa:tracking:997689028990
+  shop: moa
+  type: tracking
+  id: '997689028990'
+  title: 코딩 로봇 키트
+  status: 반품
+  date: '2026-04-10'
+  carrier: 온누리익스프레스
+  order_id: 20260408-100636
+- key: moa:tracking:290539531496
+  shop: moa
+  type: tracking
+  id: '290539531496'
+  title: 65W 고속 충전기
+  status: 배송완료
+  date: '2026-08-03'
+  carrier: 온누리익스프레스
+  order_id: 20260731-100742
+- key: moa:tracking:785356489847
+  shop: moa
+  type: tracking
+  id: '785356489847'
+  title: 강아지 하네스
+  status: 반품
+  date: '2026-09-04'
+  carrier: 온누리익스프레스
+  order_id: 20260901-100848
+- key: moa:tracking:917334219994
+  shop: moa
+  type: tracking
+  id: '917334219994'
+  title: 손상모 헤어 에센스
+  status: 배송완료
+  date: '2026-07-18'
+  carrier: 바른택배
+  order_id: 20260716-101007
+- key: moa:tracking:493010304115
+  shop: moa
+  type: tracking
+  id: '493010304115'
+  title: 자외선 차단 양산
+  status: 반품
+  date: '2026-10-12'
+  carrier: 바른택배
+  order_id: 20261011-101060
+- key: moa:tracking:134838649493
+  shop: moa
+  type: tracking
+  id: '134838649493'
+  title: 자외선 차단 양산
+  status: 반품
+  date: '2026-05-28'
+  carrier: 온누리익스프레스
+  order_id: 20260524-101166
+- key: moa:tracking:724796057003
+  shop: moa
+  type: tracking
+  id: '724796057003'
+  title: 2인용 돔 텐트
+  status: 배송중
+  date: '2026-09-20'
+  carrier: 바른택배
+  order_id: 20260916-101325
+- key: moa:tracking:747603647873
+  shop: moa
+  type: tracking
+  id: '747603647873'
+  title: 실리콘 조리도구 세트
+  status: 배송완료
+  date: '2026-05-07'
+  carrier: 새길운송
+  order_id: 20260504-101378
+- key: moa:tracking:807259324063
+  shop: moa
+  type: tracking
+  id: '807259324063'
+  title: 기모 후드집업
+  status: 배송완료
+  date: '2026-08-05'
+  carrier: 새길운송
+  order_id: 20260803-101431
+- key: moa:tracking:734746399945
+  shop: moa
+  type: tracking
+  id: '734746399945'
+  title: 온도조절 전기포트
+  status: 배송중
+  date: '2026-09-05'
+  carrier: 온누리익스프레스
+  order_id: 20260902-101590
+- key: moa:tracking:361383503857
+  shop: moa
+  type: tracking
+  id: '361383503857'
+  title: 케이블 정리함
+  status: 배송완료
+  date: '2026-07-16'
+  carrier: 새길운송
+  order_id: 20260715-101749
+- key: moa:tracking:363866387455
+  shop: moa
+  type: tracking
+  id: '363866387455'
+  title: 노트북 거치대
+  status: 반품
+  date: '2026-04-23'
+  carrier: 새길운송
+  order_id: 20260422-101802
+- key: moa:tracking:609847373628
+  shop: moa
+  type: tracking
+  id: '609847373628'
+  title: 밀폐 유리 용기 세트
+  status: 배송완료
+  date: '2026-08-04'
+  carrier: 바른택배
+  order_id: 20260801-101855
+- key: moa:tracking:460797149981
+  shop: moa
+  type: tracking
+  id: '460797149981'
+  title: 경량 패딩 조끼
+  status: 배송완료
+  date: '2026-10-07'
+  carrier: 한빛로지스
+  order_id: 20261006-101908
+- key: moa:tracking:719124666459
+  shop: moa
+  type: tracking
+  id: '719124666459'
+  title: 세라믹 식칼
+  status: 배송중
+  date: '2026-05-07'
+  carrier: 새길운송
+  order_id: 20260505-101961
+- key: moa:tracking:189712840103
+  shop: moa
+  type: tracking
+  id: '189712840103'
+  title: 강아지 하네스
+  status: 배송중
+  date: '2026-06-21'
+  carrier: 한빛로지스
+  order_id: 20260618-102014
+- key: moa:tracking:923551521267
+  shop: moa
+  type: tracking
+  id: '923551521267'
+  title: 세라믹 식칼
+  status: 배송완료
+  date: '2026-09-30'
+  carrier: 바른택배
+  order_id: 20260927-102067
+- key: soop:goods:SP10037
+  shop: soop
+  type: goods
+  id: SP10037
+  title: 극세사 담요
+  concept: cold_weather
+  status: 판매중
+  price: 24400
+  date: '2026-07-24'
+- key: soop:goods:SP10074
+  shop: soop
+  type: goods
+  id: SP10074
+  title: 고양이 스크래처
+  concept: pet
+  status: 판매중
+  price: 18000
+  date: '2026-07-23'
+- key: soop:goods:SP10111
+  shop: soop
+  type: goods
+  id: SP10111
+  title: 저알러지 사료
+  concept: pet
+  status: 판매중
+  price: 33800
+  date: '2026-04-13'
+- key: soop:goods:SP10148
+  shop: soop
+  type: goods
+  id: SP10148
+  title: 반려동물 이동장
+  concept: pet
+  status: 품절
+  price: 45300
+  date: '2026-01-11'
+- key: soop:goods:SP10185
+  shop: soop
+  type: goods
+  id: SP10185
+  title: 제주 감귤 주스
+  concept: snack_food
+  status: 품절
+  price: 17900
+  date: '2026-04-14'
+- key: soop:goods:SP10222
+  shop: soop
+  type: goods
+  id: SP10222
+  title: 휴대용 코펠 세트
+  concept: outdoor
+  status: 품절
+  price: 41100
+  date: '2026-04-12'
+- key: soop:goods:SP10259
+  shop: soop
+  type: goods
+  id: SP10259
+  title: 진공 보온 텀블러
+  concept: outdoor
+  status: 진열안함
+  price: 25200
+  date: '2026-06-20'
+- key: soop:goods:SP10296
+  shop: soop
+  type: goods
+  id: SP10296
+  title: 2인용 돔 텐트
+  concept: outdoor
+  status: 진열안함
+  price: 143300
+  date: '2026-07-23'
+- key: soop:goods:SP10333
+  shop: soop
+  type: goods
+  id: SP10333
+  title: 색칠놀이 스케치북
+  concept: kids
+  status: 판매중
+  price: 8500
+  date: '2026-08-23'
+- key: soop:goods:SP10370
+  shop: soop
+  type: goods
+  id: SP10370
+  title: 수분 장벽 크림
+  concept: skincare
+  status: 판매중
+  price: 30700
+  date: '2026-02-15'
+- key: soop:goods:SP10407
+  shop: soop
+  type: goods
+  id: SP10407
+  title: 자동 급식기
+  concept: pet
+  status: 판매중
+  price: 71900
+  date: '2026-06-10'
+- key: soop:goods:SP10444
+  shop: soop
+  type: goods
+  id: SP10444
+  title: 냉감 넥밴드
+  concept: hot_weather
+  status: 품절
+  price: 12800
+  date: '2026-07-04'
+- key: soop:goods:SP10481
+  shop: soop
+  type: goods
+  id: SP10481
+  title: 세라믹 식칼
+  concept: cooking
+  status: 판매중
+  price: 33800
+  date: '2026-03-17'
+- key: soop:goods:SP10518
+  shop: soop
+  type: goods
+  id: SP10518
+  title: 손상모 헤어 에센스
+  concept: skincare
+  status: 판매중
+  price: 20500
+  date: '2026-05-08'
+- key: soop:goods:SP10555
+  shop: soop
+  type: goods
+  id: SP10555
+  title: 무기자차 선크림
+  concept: skincare
+  status: 판매중
+  price: 23000
+  date: '2026-09-11'
+- key: soop:goods:SP10592
+  shop: soop
+  type: goods
+  id: SP10592
+  title: 서류 정리함
+  concept: desk_work
+  status: 품절
+  price: 13000
+  date: '2026-05-08'
+- key: soop:goods:SP10629
+  shop: soop
+  type: goods
+  id: SP10629
+  title: 모니터 받침대
+  concept: desk_work
+  status: 판매중
+  price: 35100
+  date: '2026-03-07'
+- key: soop:goods:SP10666
+  shop: soop
+  type: goods
+  id: SP10666
+  title: 65W 고속 충전기
+  concept: audio_power
+  status: 품절
+  price: 34600
+  date: '2026-08-04'
+- key: soop:goods:SP10703
+  shop: soop
+  type: goods
+  id: SP10703
+  title: 무향 바디 로션
+  concept: skincare
+  status: 판매중
+  price: 16100
+  date: '2026-01-05'
+- key: soop:goods:SP10740
+  shop: soop
+  type: goods
+  id: SP10740
+  title: 펫 빗 브러시
+  concept: pet
+  status: 판매중
+  price: 12600
+  date: '2026-07-07'
+- key: soop:goods:SP10777
+  shop: soop
+  type: goods
+  id: SP10777
+  title: 유기농 그래놀라
+  concept: snack_food
+  status: 품절
+  price: 13400
+  date: '2026-05-10'
+- key: soop:goods:SP10814
+  shop: soop
+  type: goods
+  id: SP10814
+  title: 경량 패딩 조끼
+  concept: cold_weather
+  status: 판매중
+  price: 75500
+  date: '2026-08-26'
+- key: soop:goods:SP10851
+  shop: soop
+  type: goods
+  id: SP10851
+  title: 강아지 하네스
+  concept: pet
+  status: 판매중
+  price: 26600
+  date: '2026-05-16'
+- key: soop:goods:SP10888
+  shop: soop
+  type: goods
+  id: SP10888
+  title: 스마트 밴드
+  concept: audio_power
+  status: 품절
+  price: 49300
+  date: '2026-04-09'
+- key: soop:order:20260716-100053
+  shop: soop
+  type: order
+  id: 20260716-100053
+  title: 무기자차 선크림
+  status: 상품준비중
+  amount: 53300
+  date: '2026-07-16'
+  buyer: 권예준
+  tracking: null
+  goods_ids:
+  - SP10555
+  - SP11295
+- key: soop:order:20260614-100106
+  shop: soop
+  type: order
+  id: 20260614-100106
+  title: 펫 빗 브러시
+  status: 상품준비중
+  amount: 105800
+  date: '2026-06-14'
+  buyer: 김지우
+  tracking: null
+  goods_ids:
+  - SP10740
+  - SP10999
+- key: soop:order:20260514-100159
+  shop: soop
+  type: order
+  id: 20260514-100159
+  title: 세라믹 식칼
+  status: 결제완료
+  amount: 67600
+  date: '2026-05-14'
+  buyer: 박하은
+  tracking: null
+  goods_ids:
+  - SP10481
+- key: soop:order:20260527-100212
+  shop: soop
+  type: order
+  id: 20260527-100212
+  title: 원목 블록 세트
+  status: 상품준비중
+  amount: 68040
+  date: '2026-05-27'
+  buyer: 김소율
+  tracking: null
+  goods_ids:
+  - SP11036
+  - SP10925
+- key: soop:order:20260925-100265
+  shop: soop
+  type: order
+  id: 20260925-100265
+  title: LED 충전 랜턴
+  status: 상품준비중
+  amount: 192870
+  date: '2026-09-25'
+  buyer: 조건우
+  tracking: null
+  goods_ids:
+  - SP11406
+  - SP10999
+  - SP10666
+- key: soop:order:20260406-100318
+  shop: soop
+  type: order
+  id: 20260406-100318
+  title: 기모 후드집업
+  status: 배송완료
+  amount: 108360
+  date: '2026-04-06'
+  buyer: 임주원
+  tracking: '377890210013'
+  goods_ids:
+  - SP11184
+  - SP10555
+- key: soop:order:20260606-100371
+  shop: soop
+  type: order
+  id: 20260606-100371
+  title: 색칠놀이 스케치북
+  status: 배송중
+  amount: 11500
+  date: '2026-06-06'
+  buyer: 정시우
+  tracking: '442048660228'
+  goods_ids:
+  - SP10333
+- key: soop:order:20260624-100424
+  shop: soop
+  type: order
+  id: 20260624-100424
+  title: 저당 단백질바
+  status: 입금대기
+  amount: 115020
+  date: '2026-06-24'
+  buyer: 권수아
+  tracking: null
+  goods_ids:
+  - SP11369
+  - SP10666
+- key: soop:order:20260421-100477
+  shop: soop
+  type: order
+  id: 20260421-100477
+  title: 경량 캠핑 의자
+  status: 반품
+  amount: 40170
+  date: '2026-04-21'
+  buyer: 장시우
+  tracking: '300213061856'
+  goods_ids:
+  - SP11073
+- key: soop:order:20260603-100530
+  shop: soop
+  type: order
+  id: 20260603-100530
+  title: 반려동물 이동장
+  status: 입금대기
+  amount: 122310
+  date: '2026-06-03'
+  buyer: 신예준
+  tracking: null
+  goods_ids:
+  - SP10148
+- key: soop:order:20260622-100583
+  shop: soop
+  type: order
+  id: 20260622-100583
+  title: 2인용 돔 텐트
+  status: 결제완료
+  amount: 143300
+  date: '2026-06-22'
+  buyer: 윤은호
+  tracking: null
+  goods_ids:
+  - SP10296
+- key: soop:order:20260405-100636
+  shop: soop
+  type: order
+  id: 20260405-100636
+  title: 65W 고속 충전기
+  status: 상품준비중
+  amount: 103800
+  date: '2026-04-05'
+  buyer: 임건우
+  tracking: null
+  goods_ids:
+  - SP10666
+- key: soop:order:20261008-100689
+  shop: soop
+  type: order
+  id: 20261008-100689
+  title: 무향 바디 로션
+  status: 배송완료
+  amount: 46470
+  date: '2026-10-08'
+  buyer: 권은호
+  tracking: '548218378892'
+  goods_ids:
+  - SP10703
+- key: soop:order:20260527-100742
+  shop: soop
+  type: order
+  id: 20260527-100742
+  title: 핸드 블렌더
+  status: 입금대기
+  amount: 352260
+  date: '2026-05-27'
+  buyer: 임주원
+  tracking: null
+  goods_ids:
+  - SP11147
+  - SP10666
+  - SP10370
+- key: soop:order:20261011-100795
+  shop: soop
+  type: order
+  id: 20261011-100795
+  title: 저당 단백질바
+  status: 반품
+  amount: 27000
+  date: '2026-10-11'
+  buyer: 장건우
+  tracking: '952548712763'
+  goods_ids:
+  - SP11369
+- key: soop:order:20260809-100848
+  shop: soop
+  type: order
+  id: 20260809-100848
+  title: 콜드브루 원액
+  status: 결제완료
+  amount: 75600
+  date: '2026-08-09'
+  buyer: 김소율
+  tracking: null
+  goods_ids:
+  - SP11443
+- key: soop:order:20260923-100901
+  shop: soop
+  type: order
+  id: 20260923-100901
+  title: 휴대용 코펠 세트
+  status: 입금대기
+  amount: 123300
+  date: '2026-09-23'
+  buyer: 윤주원
+  tracking: null
+  goods_ids:
+  - SP10222
+- key: soop:order:20260414-100954
+  shop: soop
+  type: order
+  id: 20260414-100954
+  title: 저알러지 사료
+  status: 배송중
+  amount: 60840
+  date: '2026-04-14'
+  buyer: 김소율
+  tracking: '305504018645'
+  goods_ids:
+  - SP10111
+- key: soop:order:20260622-101007
+  shop: soop
+  type: order
+  id: 20260622-101007
+  title: 핸드 블렌더
+  status: 배송중
+  amount: 110880
+  date: '2026-06-22'
+  buyer: 이다은
+  tracking: '309323361982'
+  goods_ids:
+  - SP11147
+  - SP10111
+- key: soop:order:20260505-101060
+  shop: soop
+  type: order
+  id: 20260505-101060
+  title: 2인용 돔 텐트
+  status: 결제완료
+  amount: 163800
+  date: '2026-05-05'
+  buyer: 강다은
+  tracking: null
+  goods_ids:
+  - SP10296
+  - SP10518
+- key: soop:order:20260906-101113
+  shop: soop
+  type: order
+  id: 20260906-101113
+  title: 경량 캠핑 의자
+  status: 배송중
+  amount: 165100
+  date: '2026-09-06'
+  buyer: 조민준
+  tracking: '205381259317'
+  goods_ids:
+  - SP11073
+  - SP11221
+- key: soop:order:20260527-101166
+  shop: soop
+  type: order
+  id: 20260527-101166
+  title: 모니터 받침대
+  status: 입금대기
+  amount: 125100
+  date: '2026-05-27'
+  buyer: 정소율
+  tracking: null
+  goods_ids:
+  - SP10629
+  - SP10074
+- key: soop:order:20260523-101219
+  shop: soop
+  type: order
+  id: 20260523-101219
+  title: 수분 장벽 크림
+  status: 입금대기
+  amount: 33700
+  date: '2026-05-23'
+  buyer: 임채원
+  tracking: null
+  goods_ids:
+  - SP10370
+- key: soop:order:20260418-101272
+  shop: soop
+  type: order
+  id: 20260418-101272
+  title: 양털 플리스 자켓
+  status: 취소
+  amount: 51390
+  date: '2026-04-18'
+  buyer: 서건우
+  tracking: null
+  goods_ids:
+  - SP10962
+- key: soop:tracking:377890210013
+  shop: soop
+  type: tracking
+  id: '377890210013'
+  title: 기모 후드집업
+  status: 배송완료
+  date: '2026-04-09'
+  carrier: 온누리익스프레스
+  order_id: 20260406-100318
+- key: soop:tracking:442048660228
+  shop: soop
+  type: tracking
+  id: '442048660228'
+  title: 색칠놀이 스케치북
+  status: 배송중
+  date: '2026-06-09'
+  carrier: 온누리익스프레스
+  order_id: 20260606-100371
+- key: soop:tracking:300213061856
+  shop: soop
+  type: tracking
+  id: '300213061856'
+  title: 경량 캠핑 의자
+  status: 반품
+  date: '2026-04-23'
+  carrier: 온누리익스프레스
+  order_id: 20260421-100477
+- key: soop:tracking:548218378892
+  shop: soop
+  type: tracking
+  id: '548218378892'
+  title: 무향 바디 로션
+  status: 배송완료
+  date: '2026-10-12'
+  carrier: 온누리익스프레스
+  order_id: 20261008-100689
+- key: soop:tracking:952548712763
+  shop: soop
+  type: tracking
+  id: '952548712763'
+  title: 저당 단백질바
+  status: 반품
+  date: '2026-10-14'
+  carrier: 온누리익스프레스
+  order_id: 20261011-100795
+- key: soop:tracking:305504018645
+  shop: soop
+  type: tracking
+  id: '305504018645'
+  title: 저알러지 사료
+  status: 배송중
+  date: '2026-04-16'
+  carrier: 한빛로지스
+  order_id: 20260414-100954
+- key: soop:tracking:309323361982
+  shop: soop
+  type: tracking
+  id: '309323361982'
+  title: 핸드 블렌더
+  status: 배송중
+  date: '2026-06-24'
+  carrier: 온누리익스프레스
+  order_id: 20260622-101007
+- key: soop:tracking:205381259317
+  shop: soop
+  type: tracking
+  id: '205381259317'
+  title: 경량 캠핑 의자
+  status: 배송중
+  date: '2026-09-08'
+  carrier: 온누리익스프레스
+  order_id: 20260906-101113
+- key: soop:tracking:546409437053
+  shop: soop
+  type: tracking
+  id: '546409437053'
+  title: 케이블 정리함
+  status: 배송중
+  date: '2026-06-28'
+  carrier: 바른택배
+  order_id: 20260627-101537
+- key: soop:tracking:347176262433
+  shop: soop
+  type: tracking
+  id: '347176262433'
+  title: 양털 플리스 자켓
+  status: 배송완료
+  date: '2026-05-06'
+  carrier: 새길운송
+  order_id: 20260504-101590
+- key: soop:tracking:983838166948
+  shop: soop
+  type: tracking
+  id: '983838166948'
+  title: 유아 식기 세트
+  status: 배송중
+  date: '2026-07-16'
+  carrier: 바른택배
+  order_id: 20260715-101643
+- key: soop:tracking:261873904940
+  shop: soop
+  type: tracking
+  id: '261873904940'
+  title: 케이블 정리함
+  status: 배송완료
+  date: '2026-06-01'
+  carrier: 온누리익스프레스
+  order_id: 20260530-101749
+- key: soop:tracking:559777950333
+  shop: soop
+  type: tracking
+  id: '559777950333'
+  title: 원목 블록 세트
+  status: 배송완료
+  date: '2026-07-02'
+  carrier: 온누리익스프레스
+  order_id: 20260629-101855
+- key: soop:tracking:861963712164
+  shop: soop
+  type: tracking
+  id: '861963712164'
+  title: 기모 후드집업
+  status: 반품
+  date: '2026-10-10'
+  carrier: 새길운송
+  order_id: 20261009-101908
+- key: soop:tracking:816534818222
+  shop: soop
+  type: tracking
+  id: '816534818222'
+  title: 휴대용 코펠 세트
+  status: 반품
+  date: '2026-05-07'
+  carrier: 한빛로지스
+  order_id: 20260504-101961
+- key: soop:tracking:958283862822
+  shop: soop
+  type: tracking
+  id: '958283862822'
+  title: 스마트 밴드
+  status: 배송완료
+  date: '2026-07-13'
+  carrier: 새길운송
+  order_id: 20260711-102014
+- key: soop:tracking:570804450737
+  shop: soop
+  type: tracking
+  id: '570804450737'
+  title: 코딩 로봇 키트
+  status: 배송완료
+  date: '2026-09-19'
+  carrier: 새길운송
+  order_id: 20260917-102067
+- key: soop:tracking:841919062603
+  shop: soop
+  type: tracking
+  id: '841919062603'
+  title: 스테인리스 프라이팬
+  status: 배송중
+  date: '2026-06-30'
+  carrier: 온누리익스프레스
+  order_id: 20260629-102226
+- key: soop:tracking:531308239861
+  shop: soop
+  type: tracking
+  id: '531308239861'
+  title: 휴대용 코펠 세트
+  status: 반품
+  date: '2026-08-27'
+  carrier: 한빛로지스
+  order_id: 20260826-102279
+- key: soop:tracking:704311002504
+  shop: soop
+  type: tracking
+  id: '704311002504'
+  title: 스마트 밴드
+  status: 반품
+  date: '2026-04-18'
+  carrier: 새길운송
+  order_id: 20260415-102438
+- key: harbor:goods:HP10037
+  shop: harbor
+  type: goods
+  id: HP10037
+  title: Scorched brown rice crisps
+  concept: snack_food
+  status: Sold out
+  price: 9.1
+  date: '2026-01-16'
+- key: harbor:goods:HP10074
+  shop: harbor
+  type: goods
+  id: HP10074
+  title: Vacuum insulated tumbler
+  concept: outdoor
+  status: Active
+  price: 16.9
+  date: '2026-05-01'
+- key: harbor:goods:HP10111
+  shop: harbor
+  type: goods
+  id: HP10111
+  title: Hypoallergenic kibble
+  concept: pet
+  status: Sold out
+  price: 24.15
+  date: '2026-02-22'
+- key: harbor:goods:HP10148
+  shop: harbor
+  type: goods
+  id: HP10148
+  title: Silent mechanical keyboard
+  concept: desk_work
+  status: Sold out
+  price: 71.6
+  date: '2026-04-28'
+- key: harbor:goods:HP10185
+  shop: harbor
+  type: goods
+  id: HP10185
+  title: Linen short-sleeve shirt
+  concept: hot_weather
+  status: Active
+  price: 36.15
+  date: '2026-02-14'
+- key: harbor:goods:HP10222
+  shop: harbor
+  type: goods
+  id: HP10222
+  title: Low-sugar protein bar
+  concept: snack_food
+  status: Active
+  price: 16.7
+  date: '2026-02-11'
+- key: harbor:goods:HP10259
+  shop: harbor
+  type: goods
+  id: HP10259
+  title: Ceramic chef knife
+  concept: cooking
+  status: Active
+  price: 25.55
+  date: '2026-02-13'
+- key: harbor:goods:HP10296
+  shop: harbor
+  type: goods
+  id: HP10296
+  title: Waterproof Bluetooth speaker
+  concept: audio_power
+  status: Active
+  price: 46.9
+  date: '2026-03-29'
+- key: harbor:goods:HP10333
+  shop: harbor
+  type: goods
+  id: HP10333
+  title: Cat scratching post
+  concept: pet
+  status: Sold out
+  price: 16.15
+  date: '2026-05-10'
+- key: harbor:goods:HP10370
+  shop: harbor
+  type: goods
+  id: HP10370
+  title: Smart fitness band
+  concept: audio_power
+  status: Active
+  price: 38.45
+  date: '2026-06-13'
+- key: harbor:goods:HP10407
+  shop: harbor
+  type: goods
+  id: HP10407
+  title: Vitamin C serum
+  concept: skincare
+  status: Active
+  price: 28.3
+  date: '2026-07-11'
+- key: harbor:goods:HP10444
+  shop: harbor
+  type: goods
+  id: HP10444
+  title: Sherpa fleece jacket
+  concept: cold_weather
+  status: Draft
+  price: 47.4
+  date: '2026-02-07'
+- key: harbor:goods:HP10481
+  shop: harbor
+  type: goods
+  id: HP10481
+  title: Low-pH cleansing foam
+  concept: skincare
+  status: Draft
+  price: 12.45
+  date: '2026-08-02'
+- key: harbor:goods:HP10518
+  shop: harbor
+  type: goods
+  id: HP10518
+  title: Handheld mini fan
+  concept: hot_weather
+  status: Sold out
+  price: 13.9
+  date: '2026-02-14'
+- key: harbor:goods:HP10555
+  shop: harbor
+  type: goods
+  id: HP10555
+  title: Jeju tangerine juice
+  concept: snack_food
+  status: Sold out
+  price: 15.4
+  date: '2026-03-14'
+- key: harbor:goods:HP10592
+  shop: harbor
+  type: goods
+  id: HP10592
+  title: Mineral sunscreen
+  concept: skincare
+  status: Active
+  price: 17.45
+  date: '2026-08-04'
+- key: harbor:goods:HP10629
+  shop: harbor
+  type: goods
+  id: HP10629
+  title: Fleece-lined zip hoodie
+  concept: cold_weather
+  status: Draft
+  price: 40.4
+  date: '2026-01-06'
+- key: harbor:goods:HP10666
+  shop: harbor
+  type: goods
+  id: HP10666
+  title: Plush bunny doll
+  concept: kids
+  status: Sold out
+  price: 15.3
+  date: '2026-08-15'
+- key: harbor:goods:HP10703
+  shop: harbor
+  type: goods
+  id: HP10703
+  title: Folding trekking poles
+  concept: outdoor
+  status: Sold out
+  price: 41.85
+  date: '2026-01-20'
+- key: harbor:goods:HP10740
+  shop: harbor
+  type: goods
+  id: HP10740
+  title: Organic granola
+  concept: snack_food
+  status: Sold out
+  price: 10.6
+  date: '2026-01-13'
+- key: harbor:goods:HP10777
+  shop: harbor
+  type: goods
+  id: HP10777
+  title: Pet travel carrier
+  concept: pet
+  status: Sold out
+  price: 36.6
+  date: '2026-01-15'
+- key: harbor:goods:HP10814
+  shop: harbor
+  type: goods
+  id: HP10814
+  title: Noise-cancelling wireless earbuds
+  concept: audio_power
+  status: Active
+  price: 96.3
+  date: '2026-03-18'
+- key: harbor:goods:HP10851
+  shop: harbor
+  type: goods
+  id: HP10851
+  title: Portable cookware set
+  concept: outdoor
+  status: Active
+  price: 30.55
+  date: '2026-09-04'
+- key: harbor:goods:HP10888
+  shop: harbor
+  type: goods
+  id: HP10888
+  title: Fragrance-free body lotion
+  concept: skincare
+  status: Active
+  price: 14.6
+  date: '2026-01-30'
+- key: harbor:order:20260711-100053
+  shop: harbor
+  type: order
+  id: 20260711-100053
+  title: Waterproof Bluetooth speaker
+  status: Processing
+  amount: 173.6
+  date: '2026-07-11'
+  buyer: Quinn Ashby
+  tracking: null
+  goods_ids:
+  - HP10296
+  - HP10962
+  - HP10925
+- key: harbor:order:20260412-100106
+  shop: harbor
+  type: order
+  id: 20260412-100106
+  title: Lightweight camp chair
+  status: Paid
+  amount: 29.21
+  date: '2026-04-12'
+  buyer: Quinn Dorsey
+  tracking: null
+  goods_ids:
+  - HP11073
+- key: harbor:order:20260408-100159
+  shop: harbor
+  type: order
+  id: 20260408-100159
+  title: Pet grooming brush
+  status: Cancelled
+  amount: 49.5
+  date: '2026-04-08'
+  buyer: Taylor Prescott
+  tracking: null
+  goods_ids:
+  - HP10962
+- key: harbor:order:20260808-100212
+  shop: harbor
+  type: order
+  id: 20260808-100212
+  title: Plush bunny doll
+  status: Cancelled
+  amount: 68.85
+  date: '2026-08-08'
+  buyer: Riley Mercer
+  tracking: null
+  goods_ids:
+  - HP10666
+- key: harbor:order:20260613-100265
+  shop: harbor
+  type: order
+  id: 20260613-100265
+  title: Repair hair essence
+  status: Processing
+  amount: 15.75
+  date: '2026-06-13'
+  buyer: Morgan Holloway
+  tracking: null
+  goods_ids:
+  - HP11258
+- key: harbor:order:20260816-100318
+  shop: harbor
+  type: order
+  id: 20260816-100318
+  title: Jeju tangerine juice
+  status: Processing
+  amount: 17.7
+  date: '2026-08-16'
+  buyer: Taylor Marsh
+  tracking: null
+  goods_ids:
+  - HP10555
+- key: harbor:order:20260506-100371
+  shop: harbor
+  type: order
+  id: 20260506-100371
+  title: Ventilated sandals
+  status: Awaiting payment
+  amount: 179.6
+  date: '2026-05-06'
+  buyer: Jordan Whitfield
+  tracking: null
+  goods_ids:
+  - HP11295
+  - HP10444
+  - HP11258
+- key: harbor:order:20260425-100424
+  shop: harbor
+  type: order
+  id: 20260425-100424
+  title: Lightweight padded vest
+  status: Cancelled
+  amount: 126.3
+  date: '2026-04-25'
+  buyer: Taylor Sinclair
+  tracking: null
+  goods_ids:
+  - HP11554
+  - HP10888
+- key: harbor:order:20260516-100477
+  shop: harbor
+  type: order
+  id: 20260516-100477
+  title: Low-pH cleansing foam
+  status: Delivered
+  amount: 27.2
+  date: '2026-05-16'
+  buyer: Quinn Mercer
+  tracking: '543189543185'
+  goods_ids:
+  - HP10481
+- key: harbor:order:20260730-100530
+  shop: harbor
+  type: order
+  id: 20260730-100530
+  title: Hypoallergenic kibble
+  status: Shipped
+  amount: 77.31
+  date: '2026-07-30'
+  buyer: Quinn Langley
+  tracking: '182854223606'
+  goods_ids:
+  - HP10111
+  - HP11258
+- key: harbor:order:20260607-100583
+  shop: harbor
+  type: order
+  id: 20260607-100583
+  title: Ceramic chef knife
+  status: Shipped
+  amount: 76.65
+  date: '2026-06-07'
+  buyer: Finley Dorsey
+  tracking: '232531792143'
+  goods_ids:
+  - HP10259
+- key: harbor:order:20260802-100636
+  shop: harbor
+  type: order
+  id: 20260802-100636
+  title: Rechargeable LED lantern
+  status: Delivered
+  amount: 41.1
+  date: '2026-08-02'
+  buyer: Riley Sinclair
+  tracking: '470699340482'
+  goods_ids:
+  - HP11443
+- key: harbor:order:20260508-100689
+  shop: harbor
+  type: order
+  id: 20260508-100689
+  title: Hypoallergenic kibble
+  status: Awaiting payment
+  amount: 168.15
+  date: '2026-05-08'
+  buyer: Jordan Mercer
+  tracking: null
+  goods_ids:
+  - HP10111
+  - HP11147
+  - HP11332
+- key: harbor:order:20260710-100742
+  shop: harbor
+  type: order
+  id: 20260710-100742
+  title: Mineral sunscreen
+  status: Returned
+  amount: 19.75
+  date: '2026-07-10'
+  buyer: Sawyer Mercer
+  tracking: '607410130932'
+  goods_ids:
+  - HP10592
+- key: harbor:order:20260818-100795
+  shop: harbor
+  type: order
+  id: 20260818-100795
+  title: Lightweight camp chair
+  status: Shipped
+  amount: 164.1
+  date: '2026-08-18'
+  buyer: Casey Kendrick
+  tracking: '113077849144'
+  goods_ids:
+  - HP11073
+  - HP10888
+- key: harbor:order:20260801-100848
+  shop: harbor
+  type: order
+  id: 20260801-100848
+  title: Jeju tangerine juice
+  status: Cancelled
+  amount: 66.95
+  date: '2026-08-01'
+  buyer: Harper Dorsey
+  tracking: null
+  goods_ids:
+  - HP10555
+  - HP10185
+- key: harbor:order:20260819-100901
+  shop: harbor
+  type: order
+  id: 20260819-100901
+  title: Ceramic chef knife
+  status: Delivered
+  amount: 127.75
+  date: '2026-08-19'
+  buyer: Quinn Langley
+  tracking: '719547899303'
+  goods_ids:
+  - HP10259
+- key: harbor:order:20261009-100954
+  shop: harbor
+  type: order
+  id: 20261009-100954
+  title: Kids kick scooter
+  status: Delivered
+  amount: 199.45
+  date: '2026-10-09'
+  buyer: Rowan Prescott
+  tracking: '831378491353'
+  goods_ids:
+  - HP11517
+  - HP11369
+- key: harbor:order:20260708-101007
+  shop: harbor
+  type: order
+  id: 20260708-101007
+  title: Portable cookware set
+  status: Processing
+  amount: 77.25
+  date: '2026-07-08'
+  buyer: Harper Ashby
+  tracking: null
+  goods_ids:
+  - HP10851
+  - HP10333
+- key: harbor:order:20260720-101060
+  shop: harbor
+  type: order
+  id: 20260720-101060
+  title: Cold brew concentrate
+  status: Delivered
+  amount: 61.65
+  date: '2026-07-20'
+  buyer: Finley Marsh
+  tracking: '852600838892'
+  goods_ids:
+  - HP11110
+- key: harbor:order:20260516-101113
+  shop: harbor
+  type: order
+  id: 20260516-101113
+  title: Stainless steel frying pan
+  status: Shipped
+  amount: 109.1
+  date: '2026-05-16'
+  buyer: Sawyer Holloway
+  tracking: '862331718450'
+  goods_ids:
+  - HP11332
+  - HP10925
+- key: harbor:order:20261013-101166
+  shop: harbor
+  type: order
+  id: 20261013-101166
+  title: Silent mechanical keyboard
+  status: Awaiting payment
+  amount: 206.46
+  date: '2026-10-13'
+  buyer: Casey Prescott
+  tracking: null
+  goods_ids:
+  - HP10148
+  - HP10888
+- key: harbor:order:20260629-101219
+  shop: harbor
+  type: order
+  id: 20260629-101219
+  title: Cat scratching post
+  status: Processing
+  amount: 238.25
+  date: '2026-06-29'
+  buyer: Riley Mercer
+  tracking: null
+  goods_ids:
+  - HP10333
+  - HP11443
+  - HP11184
+- key: harbor:order:20260924-101272
+  shop: harbor
+  type: order
+  id: 20260924-101272
+  title: Mineral sunscreen
+  status: Processing
+  amount: 136.05
+  date: '2026-09-24'
+  buyer: Casey Langley
+  tracking: null
+  goods_ids:
+  - HP10592
+  - HP10703
+- key: harbor:tracking:543189543185
+  shop: harbor
+  type: tracking
+  id: '543189543185'
+  title: Low-pH cleansing foam
+  status: Delivered
+  date: '2026-05-18'
+  carrier: Harbor Courier
+  order_id: 20260516-100477
+- key: harbor:tracking:182854223606
+  shop: harbor
+  type: tracking
+  id: '182854223606'
+  title: Hypoallergenic kibble
+  status: Shipped
+  date: '2026-07-31'
+  carrier: Pinewood Express
+  order_id: 20260730-100530
+- key: harbor:tracking:232531792143
+  shop: harbor
+  type: tracking
+  id: '232531792143'
+  title: Ceramic chef knife
+  status: Shipped
+  date: '2026-06-11'
+  carrier: Swiftline Parcel
+  order_id: 20260607-100583
+- key: harbor:tracking:470699340482
+  shop: harbor
+  type: tracking
+  id: '470699340482'
+  title: Rechargeable LED lantern
+  status: Delivered
+  date: '2026-08-06'
+  carrier: BlueRoute Freight
+  order_id: 20260802-100636
+- key: harbor:tracking:607410130932
+  shop: harbor
+  type: tracking
+  id: '607410130932'
+  title: Mineral sunscreen
+  status: Returned
+  date: '2026-07-12'
+  carrier: Pinewood Express
+  order_id: 20260710-100742
+- key: harbor:tracking:113077849144
+  shop: harbor
+  type: tracking
+  id: '113077849144'
+  title: Lightweight camp chair
+  status: Shipped
+  date: '2026-08-20'
+  carrier: Swiftline Parcel
+  order_id: 20260818-100795
+- key: harbor:tracking:719547899303
+  shop: harbor
+  type: tracking
+  id: '719547899303'
+  title: Ceramic chef knife
+  status: Delivered
+  date: '2026-08-22'
+  carrier: Pinewood Express
+  order_id: 20260819-100901
+- key: harbor:tracking:831378491353
+  shop: harbor
+  type: tracking
+  id: '831378491353'
+  title: Kids kick scooter
+  status: Delivered
+  date: '2026-10-12'
+  carrier: BlueRoute Freight
+  order_id: 20261009-100954
+- key: harbor:tracking:852600838892
+  shop: harbor
+  type: tracking
+  id: '852600838892'
+  title: Cold brew concentrate
+  status: Delivered
+  date: '2026-07-24'
+  carrier: Pinewood Express
+  order_id: 20260720-101060
+- key: harbor:tracking:862331718450
+  shop: harbor
+  type: tracking
+  id: '862331718450'
+  title: Stainless steel frying pan
+  status: Shipped
+  date: '2026-05-17'
+  carrier: Harbor Courier
+  order_id: 20260516-101113
+- key: harbor:tracking:270242494338
+  shop: harbor
+  type: tracking
+  id: '270242494338'
+  title: Dog harness
+  status: Returned
+  date: '2026-07-12'
+  carrier: Harbor Courier
+  order_id: 20260710-101431
+- key: harbor:tracking:494640201406
+  shop: harbor
+  type: tracking
+  id: '494640201406'
+  title: Repair hair essence
+  status: Delivered
+  date: '2026-10-08'
+  carrier: Pinewood Express
+  order_id: 20261006-101484
+- key: harbor:tracking:107961324273
+  shop: harbor
+  type: tracking
+  id: '107961324273'
+  title: Vitamin C serum
+  status: Delivered
+  date: '2026-08-10'
+  carrier: Swiftline Parcel
+  order_id: 20260807-101696
+- key: harbor:tracking:451066067808
+  shop: harbor
+  type: tracking
+  id: '451066067808'
+  title: Waterproof Bluetooth speaker
+  status: Delivered
+  date: '2026-06-16'
+  carrier: Swiftline Parcel
+  order_id: 20260612-101749
+- key: harbor:tracking:306436897960
+  shop: harbor
+  type: tracking
+  id: '306436897960'
+  title: Low-pH cleansing foam
+  status: Delivered
+  date: '2026-09-13'
+  carrier: Harbor Courier
+  order_id: 20260909-101908
+- key: harbor:tracking:629016526039
+  shop: harbor
+  type: tracking
+  id: '629016526039'
+  title: Cat scratching post
+  status: Shipped
+  date: '2026-07-27'
+  carrier: Swiftline Parcel
+  order_id: 20260723-101961
+- key: harbor:tracking:265069181227
+  shop: harbor
+  type: tracking
+  id: '265069181227'
+  title: Low-sugar protein bar
+  status: Returned
+  date: '2026-08-03'
+  carrier: BlueRoute Freight
+  order_id: 20260731-102014
+- key: harbor:tracking:419229047465
+  shop: harbor
+  type: tracking
+  id: '419229047465'
+  title: Rechargeable LED lantern
+  status: Shipped
+  date: '2026-07-14'
+  carrier: Pinewood Express
+  order_id: 20260713-102067
+- key: harbor:tracking:518219184574
+  shop: harbor
+  type: tracking
+  id: '518219184574'
+  title: Organic granola
+  status: Delivered
+  date: '2026-09-24'
+  carrier: Swiftline Parcel
+  order_id: 20260921-102120
+- key: harbor:tracking:781201316723
+  shop: harbor
+  type: tracking
+  id: '781201316723'
+  title: Dog harness
+  status: Shipped
+  date: '2026-07-30'
+  carrier: Swiftline Parcel
+  order_id: 20260728-102332
+- key: harbor:tracking:461775815205
+  shop: harbor
+  type: tracking
+  id: '461775815205'
+  title: Fragrance-free body lotion
+  status: Delivered
+  date: '2026-05-11'
+  carrier: Pinewood Express
+  order_id: 20260509-102385
+- key: harbor:tracking:847960538658
+  shop: harbor
+  type: tracking
+  id: '847960538658'
+  title: Folding trekking poles
+  status: Delivered
+  date: '2026-10-06'
+  carrier: Swiftline Parcel
+  order_id: 20261004-102438
+- key: harbor:tracking:119491683610
+  shop: harbor
+  type: tracking
+  id: '119491683610'
+  title: Ceramic chef knife
+  status: Delivered
+  date: '2026-07-26'
+  carrier: Harbor Courier
+  order_id: 20260722-102544
+- key: ttukbaegi:goods:TB10037
+  shop: ttukbaegi
+  type: goods
+  id: TB10037
+  title: 방수 블루투스 스피커
+  concept: audio_power
+  status: 품절
+  price: 53700
+  date: '2026-07-16'
+- key: ttukbaegi:goods:TB10074
+  shop: ttukbaegi
+  type: goods
+  id: TB10074
+  title: 냉감 넥밴드
+  concept: hot_weather
+  status: 판매중
+  price: 11400
+  date: '2026-03-27'
+- key: ttukbaegi:goods:TB10111
+  shop: ttukbaegi
+  type: goods
+  id: TB10111
+  title: 노트북 거치대
+  concept: desk_work
+  status: 품절
+  price: 31800
+  date: '2026-03-26'
+- key: ttukbaegi:goods:TB10148
+  shop: ttukbaegi
+  type: goods
+  id: TB10148
+  title: 케이블 정리함
+  concept: desk_work
+  status: 품절
+  price: 16400
+  date: '2026-06-11'
+- key: ttukbaegi:goods:TB10185
+  shop: ttukbaegi
+  type: goods
+  id: TB10185
+  title: 휴대용 코펠 세트
+  concept: outdoor
+  status: 품절
+  price: 45600
+  date: '2026-01-28'
+- key: ttukbaegi:goods:TB10222
+  shop: ttukbaegi
+  type: goods
+  id: TB10222
+  title: LED 충전 랜턴
+  concept: outdoor
+  status: 판매중
+  price: 27300
+  date: '2026-05-22'
+- key: ttukbaegi:goods:TB10259
+  shop: ttukbaegi
+  type: goods
+  id: TB10259
+  title: 토끼 봉제 인형
+  concept: kids
+  status: 품절
+  price: 20000
+  date: '2026-04-12'
+- key: ttukbaegi:goods:TB10296
+  shop: ttukbaegi
+  type: goods
+  id: TB10296
+  title: 무향 바디 로션
+  concept: skincare
+  status: 품절
+  price: 18300
+  date: '2026-06-13'
+- key: ttukbaegi:goods:TB10333
+  shop: ttukbaegi
+  type: goods
+  id: TB10333
+  title: 온도조절 전기포트
+  concept: cooking
+  status: 진열안함
+  price: 44900
+  date: '2026-09-02'
+- key: ttukbaegi:goods:TB10370
+  shop: ttukbaegi
+  type: goods
+  id: TB10370
+  title: 스마트 밴드
+  concept: audio_power
+  status: 진열안함
+  price: 49100
+  date: '2026-03-30'
+- key: ttukbaegi:goods:TB10407
+  shop: ttukbaegi
+  type: goods
+  id: TB10407
+  title: 접이식 등산 스틱
+  concept: outdoor
+  status: 판매중
+  price: 57200
+  date: '2026-07-20'
+- key: ttukbaegi:goods:TB10444
+  shop: ttukbaegi
+  type: goods
+  id: TB10444
+  title: 코딩 로봇 키트
+  concept: kids
+  status: 판매중
+  price: 77200
+  date: '2026-05-09'
+- key: ttukbaegi:goods:TB10481
+  shop: ttukbaegi
+  type: goods
+  id: TB10481
+  title: 현미 누룽지
+  concept: snack_food
+  status: 품절
+  price: 10700
+  date: '2026-04-01'
+- key: ttukbaegi:goods:TB10518
+  shop: ttukbaegi
+  type: goods
+  id: TB10518
+  title: 고양이 스크래처
+  concept: pet
+  status: 판매중
+  price: 20800
+  date: '2026-09-07'
+- key: ttukbaegi:goods:TB10555
+  shop: ttukbaegi
+  type: goods
+  id: TB10555
+  title: 콜드브루 원액
+  concept: snack_food
+  status: 품절
+  price: 15400
+  date: '2026-04-23'
+- key: ttukbaegi:goods:TB10592
+  shop: ttukbaegi
+  type: goods
+  id: TB10592
+  title: 아이스 쿨매트
+  concept: hot_weather
+  status: 품절
+  price: 41900
+  date: '2026-01-19'
+- key: ttukbaegi:goods:TB10629
+  shop: ttukbaegi
+  type: goods
+  id: TB10629
+  title: 세라믹 식칼
+  concept: cooking
+  status: 진열안함
+  price: 37200
+  date: '2026-04-03'
+- key: ttukbaegi:goods:TB10666
+  shop: ttukbaegi
+  type: goods
+  id: TB10666
+  title: 반려동물 이동장
+  concept: pet
+  status: 품절
+  price: 44800
+  date: '2026-06-20'
+- key: ttukbaegi:goods:TB10703
+  shop: ttukbaegi
+  type: goods
+  id: TB10703
+  title: 핸드 블렌더
+  concept: cooking
+  status: 판매중
+  price: 41200
+  date: '2026-07-05'
+- key: ttukbaegi:goods:TB10740
+  shop: ttukbaegi
+  type: goods
+  id: TB10740
+  title: 대용량 보조배터리
+  concept: audio_power
+  status: 판매중
+  price: 38100
+  date: '2026-09-07'
+- key: ttukbaegi:goods:TB10777
+  shop: ttukbaegi
+  type: goods
+  id: TB10777
+  title: 자외선 차단 양산
+  concept: hot_weather
+  status: 판매중
+  price: 30500
+  date: '2026-06-05'
+- key: ttukbaegi:goods:TB10814
+  shop: ttukbaegi
+  type: goods
+  id: TB10814
+  title: 모니터 받침대
+  concept: desk_work
+  status: 판매중
+  price: 32200
+  date: '2026-03-22'
+- key: ttukbaegi:goods:TB10851
+  shop: ttukbaegi
+  type: goods
+  id: TB10851
+  title: 인체공학 버티컬 마우스
+  concept: desk_work
+  status: 판매중
+  price: 41300
+  date: '2026-02-23'
+- key: ttukbaegi:goods:TB10888
+  shop: ttukbaegi
+  type: goods
+  id: TB10888
+  title: 충전식 손난로
+  concept: cold_weather
+  status: 판매중
+  price: 23000
+  date: '2026-07-07'
+- key: ttukbaegi:order:20260923-100053
+  shop: ttukbaegi
+  type: order
+  id: 20260923-100053
+  title: 통풍 샌들
+  status: 배송완료
+  amount: 337100
+  date: '2026-09-23'
+  buyer: 강소율
+  tracking: '633694505390'
+  goods_ids:
+  - TB11480
+  - TB10037
+- key: ttukbaegi:order:20260704-100106
+  shop: ttukbaegi
+  type: order
+  id: 20260704-100106
+  title: 실리콘 조리도구 세트
+  status: 배송완료
+  amount: 33000
+  date: '2026-07-04'
+  buyer: 권소율
+  tracking: '382022382852'
+  goods_ids:
+  - TB11332
+- key: ttukbaegi:order:20260625-100159
+  shop: ttukbaegi
+  type: order
+  id: 20260625-100159
+  title: 경량 패딩 조끼
+  status: 배송완료
+  amount: 128520
+  date: '2026-06-25'
+  buyer: 한현우
+  tracking: '127860933381'
+  goods_ids:
+  - TB11036
+  - TB11110
+  - TB10555
+- key: ttukbaegi:order:20260503-100212
+  shop: ttukbaegi
+  type: order
+  id: 20260503-100212
+  title: LED 충전 랜턴
+  status: 배송완료
+  amount: 136500
+  date: '2026-05-03'
+  buyer: 정건우
+  tracking: '948726214877'
+  goods_ids:
+  - TB10222
+- key: ttukbaegi:order:20261004-100265
+  shop: ttukbaegi
+  type: order
+  id: 20261004-100265
+  title: USB-C 멀티 허브
+  status: 입금대기
+  amount: 35580
+  date: '2026-10-04'
+  buyer: 김채원
+  tracking: null
+  goods_ids:
+  - TB11554
+- key: ttukbaegi:order:20260728-100318
+  shop: ttukbaegi
+  type: order
+  id: 20260728-100318
+  title: 실리콘 조리도구 세트
+  status: 취소
+  amount: 90000
+  date: '2026-07-28'
+  buyer: 서건우
+  tracking: null
+  goods_ids:
+  - TB11332
+- key: ttukbaegi:order:20260919-100371
+  shop: ttukbaegi
+  type: order
+  id: 20260919-100371
+  title: 자외선 차단 양산
+  status: 상품준비중
+  amount: 61000
+  date: '2026-09-19'
+  buyer: 박예준
+  tracking: null
+  goods_ids:
+  - TB10777
+- key: ttukbaegi:order:20260409-100424
+  shop: ttukbaegi
+  type: order
+  id: 20260409-100424
+  title: 밀폐 유리 용기 세트
+  status: 배송완료
+  amount: 80200
+  date: '2026-04-09'
+  buyer: 신다은
+  tracking: '403471162970'
+  goods_ids:
+  - TB11221
+  - TB10666
+- key: ttukbaegi:order:20260506-100477
+  shop: ttukbaegi
+  type: order
+  id: 20260506-100477
+  title: 경량 캠핑 의자
+  status: 반품
+  amount: 128400
+  date: '2026-05-06'
+  buyer: 권도윤
+  tracking: '293476699685'
+  goods_ids:
+  - TB11295
+  - TB10925
+- key: ttukbaegi:order:20260929-100530
+  shop: ttukbaegi
+  type: order
+  id: 20260929-100530
+  title: 코딩 로봇 키트
+  status: 배송완료
+  amount: 83520
+  date: '2026-09-29'
+  buyer: 신예준
+  tracking: '558916847703'
+  goods_ids:
+  - TB10444
+  - TB11517
+- key: ttukbaegi:order:20260818-100583
+  shop: ttukbaegi
+  type: order
+  id: 20260818-100583
+  title: 토끼 봉제 인형
+  status: 배송완료
+  amount: 94600
+  date: '2026-08-18'
+  buyer: 박주원
+  tracking: '258190560107'
+  goods_ids:
+  - TB10259
+  - TB10222
+- key: ttukbaegi:order:20260621-100636
+  shop: ttukbaegi
+  type: order
+  id: 20260621-100636
+  title: 코딩 로봇 키트
+  status: 배송완료
+  amount: 132800
+  date: '2026-06-21'
+  buyer: 최시우
+  tracking: '778942350872'
+  goods_ids:
+  - TB10444
+  - TB11184
+- key: ttukbaegi:order:20260605-100689
+  shop: ttukbaegi
+  type: order
+  id: 20260605-100689
+  title: 밀폐 유리 용기 세트
+  status: 배송중
+  amount: 239200
+  date: '2026-06-05'
+  buyer: 이채원
+  tracking: '902513893818'
+  goods_ids:
+  - TB11221
+  - TB10074
+  - TB11443
+- key: ttukbaegi:order:20260715-100742
+  shop: ttukbaegi
+  type: order
+  id: 20260715-100742
+  title: 고양이 스크래처
+  status: 결제완료
+  amount: 222390
+  date: '2026-07-15'
+  buyer: 김서연
+  tracking: null
+  goods_ids:
+  - TB10518
+  - TB10444
+  - TB11406
+- key: ttukbaegi:order:20260526-100795
+  shop: ttukbaegi
+  type: order
+  id: 20260526-100795
+  title: 저소음 기계식 키보드
+  status: 상품준비중
+  amount: 203580
+  date: '2026-05-26'
+  buyer: 정하은
+  tracking: null
+  goods_ids:
+  - TB10925
+  - TB11110
+  - TB11443
+- key: ttukbaegi:order:20260707-100848
+  shop: ttukbaegi
+  type: order
+  id: 20260707-100848
+  title: 대용량 보조배터리
+  status: 배송완료
+  amount: 41100
+  date: '2026-07-07'
+  buyer: 서도윤
+  tracking: '296402183519'
+  goods_ids:
+  - TB10740
+- key: ttukbaegi:order:20261003-100901
+  shop: ttukbaegi
+  type: order
+  id: 20261003-100901
+  title: 실리콘 조리도구 세트
+  status: 배송완료
+  amount: 33000
+  date: '2026-10-03'
+  buyer: 박서연
+  tracking: '626585636413'
+  goods_ids:
+  - TB11332
+- key: ttukbaegi:order:20260909-100954
+  shop: ttukbaegi
+  type: order
+  id: 20260909-100954
+  title: 자외선 차단 양산
+  status: 입금대기
+  amount: 142900
+  date: '2026-09-09'
+  buyer: 정건우
+  tracking: null
+  goods_ids:
+  - TB10777
+  - TB10222
+- key: ttukbaegi:order:20260625-101007
+  shop: ttukbaegi
+  type: order
+  id: 20260625-101007
+  title: 케이블 정리함
+  status: 배송완료
+  amount: 47280
+  date: '2026-06-25'
+  buyer: 조다은
+  tracking: '666672609279'
+  goods_ids:
+  - TB10148
+- key: ttukbaegi:order:20260906-101060
+  shop: ttukbaegi
+  type: order
+  id: 20260906-101060
+  title: 스테인리스 프라이팬
+  status: 취소
+  amount: 473800
+  date: '2026-09-06'
+  buyer: 이서연
+  tracking: null
+  goods_ids:
+  - TB11369
+  - TB10777
+  - TB10740
+- key: ttukbaegi:order:20260626-101113
+  shop: ttukbaegi
+  type: order
+  id: 20260626-101113
+  title: 자외선 차단 양산
+  status: 배송완료
+  amount: 152500
+  date: '2026-06-26'
+  buyer: 오건우
+  tracking: '378061530697'
+  goods_ids:
+  - TB10777
+- key: ttukbaegi:order:20260407-101166
+  shop: ttukbaegi
+  type: order
+  id: 20260407-101166
+  title: 스마트 밴드
+  status: 배송완료
+  amount: 132570
+  date: '2026-04-07'
+  buyer: 서예준
+  tracking: '190867869231'
+  goods_ids:
+  - TB10370
+- key: ttukbaegi:order:20260423-101219
+  shop: ttukbaegi
+  type: order
+  id: 20260423-101219
+  title: 접이식 등산 스틱
+  status: 상품준비중
+  amount: 225900
+  date: '2026-04-23'
+  buyer: 오은호
+  tracking: null
+  goods_ids:
+  - TB10407
+  - TB10259
+  - TB10296
+- key: ttukbaegi:order:20260714-101272
+  shop: ttukbaegi
+  type: order
+  id: 20260714-101272
+  title: 현미 누룽지
+  status: 결제완료
+  amount: 75100
+  date: '2026-07-14'
+  buyer: 신서연
+  tracking: null
+  goods_ids:
+  - TB10481
+  - TB10037
+- key: ttukbaegi:tracking:633694505390
+  shop: ttukbaegi
+  type: tracking
+  id: '633694505390'
+  title: 통풍 샌들
+  status: 배송완료
+  date: '2026-09-25'
+  carrier: 바른택배
+  order_id: 20260923-100053
+- key: ttukbaegi:tracking:382022382852
+  shop: ttukbaegi
+  type: tracking
+  id: '382022382852'
+  title: 실리콘 조리도구 세트
+  status: 배송완료
+  date: '2026-07-05'
+  carrier: 한빛로지스
+  order_id: 20260704-100106
+- key: ttukbaegi:tracking:127860933381
+  shop: ttukbaegi
+  type: tracking
+  id: '127860933381'
+  title: 경량 패딩 조끼
+  status: 배송완료
+  date: '2026-06-27'
+  carrier: 온누리익스프레스
+  order_id: 20260625-100159
+- key: ttukbaegi:tracking:948726214877
+  shop: ttukbaegi
+  type: tracking
+  id: '948726214877'
+  title: LED 충전 랜턴
+  status: 배송완료
+  date: '2026-05-05'
+  carrier: 바른택배
+  order_id: 20260503-100212
+- key: ttukbaegi:tracking:403471162970
+  shop: ttukbaegi
+  type: tracking
+  id: '403471162970'
+  title: 밀폐 유리 용기 세트
+  status: 배송완료
+  date: '2026-04-11'
+  carrier: 온누리익스프레스
+  order_id: 20260409-100424
+- key: ttukbaegi:tracking:293476699685
+  shop: ttukbaegi
+  type: tracking
+  id: '293476699685'
+  title: 경량 캠핑 의자
+  status: 반품
+  date: '2026-05-07'
+  carrier: 온누리익스프레스
+  order_id: 20260506-100477
+- key: ttukbaegi:tracking:558916847703
+  shop: ttukbaegi
+  type: tracking
+  id: '558916847703'
+  title: 코딩 로봇 키트
+  status: 배송완료
+  date: '2026-09-30'
+  carrier: 온누리익스프레스
+  order_id: 20260929-100530
+- key: ttukbaegi:tracking:258190560107
+  shop: ttukbaegi
+  type: tracking
+  id: '258190560107'
+  title: 토끼 봉제 인형
+  status: 배송완료
+  date: '2026-08-22'
+  carrier: 바른택배
+  order_id: 20260818-100583
+- key: ttukbaegi:tracking:778942350872
+  shop: ttukbaegi
+  type: tracking
+  id: '778942350872'
+  title: 코딩 로봇 키트
+  status: 배송완료
+  date: '2026-06-24'
+  carrier: 온누리익스프레스
+  order_id: 20260621-100636
+- key: ttukbaegi:tracking:902513893818
+  shop: ttukbaegi
+  type: tracking
+  id: '902513893818'
+  title: 밀폐 유리 용기 세트
+  status: 배송중
+  date: '2026-06-07'
+  carrier: 한빛로지스
+  order_id: 20260605-100689
+- key: ttukbaegi:tracking:296402183519
+  shop: ttukbaegi
+  type: tracking
+  id: '296402183519'
+  title: 대용량 보조배터리
+  status: 배송완료
+  date: '2026-07-09'
+  carrier: 새길운송
+  order_id: 20260707-100848
+- key: ttukbaegi:tracking:626585636413
+  shop: ttukbaegi
+  type: tracking
+  id: '626585636413'
+  title: 실리콘 조리도구 세트
+  status: 배송완료
+  date: '2026-10-04'
+  carrier: 바른택배
+  order_id: 20261003-100901
+- key: ttukbaegi:tracking:666672609279
+  shop: ttukbaegi
+  type: tracking
+  id: '666672609279'
+  title: 케이블 정리함
+  status: 배송완료
+  date: '2026-06-28'
+  carrier: 온누리익스프레스
+  order_id: 20260625-101007
+- key: ttukbaegi:tracking:378061530697
+  shop: ttukbaegi
+  type: tracking
+  id: '378061530697'
+  title: 자외선 차단 양산
+  status: 배송완료
+  date: '2026-06-28'
+  carrier: 바른택배
+  order_id: 20260626-101113
+- key: ttukbaegi:tracking:190867869231
+  shop: ttukbaegi
+  type: tracking
+  id: '190867869231'
+  title: 스마트 밴드
+  status: 배송완료
+  date: '2026-04-08'
+  carrier: 온누리익스프레스
+  order_id: 20260407-101166
+- key: ttukbaegi:tracking:723294439675
+  shop: ttukbaegi
+  type: tracking
+  id: '723294439675'
+  title: 유아 식기 세트
+  status: 배송중
+  date: '2026-05-19'
+  carrier: 한빛로지스
+  order_id: 20260515-101325
+- key: ttukbaegi:tracking:613797585921
+  shop: ttukbaegi
+  type: tracking
+  id: '613797585921'
+  title: 극세사 담요
+  status: 배송완료
+  date: '2026-07-17'
+  carrier: 한빛로지스
+  order_id: 20260715-101378
+- key: ttukbaegi:tracking:854291860486
+  shop: ttukbaegi
+  type: tracking
+  id: '854291860486'
+  title: 통풍 샌들
+  status: 배송중
+  date: '2026-07-25'
+  carrier: 새길운송
+  order_id: 20260724-101431
+- key: ttukbaegi:tracking:692647138913
+  shop: ttukbaegi
+  type: tracking
+  id: '692647138913'
+  title: 펫 빗 브러시
+  status: 배송완료
+  date: '2026-04-05'
+  carrier: 한빛로지스
+  order_id: 20260403-101484
+- key: ttukbaegi:tracking:896897404308
+  shop: ttukbaegi
+  type: tracking
+  id: '896897404308'
+  title: 펫 빗 브러시
+  status: 배송완료
+  date: '2026-09-12'
+  carrier: 온누리익스프레스
+  order_id: 20260910-101590
+- key: ttukbaegi:tracking:333292053102
+  shop: ttukbaegi
+  type: tracking
+  id: '333292053102'
+  title: 온도조절 전기포트
+  status: 배송완료
+  date: '2026-04-20'
+  carrier: 새길운송
+  order_id: 20260418-101643
+- key: ttukbaegi:tracking:948665022047
+  shop: ttukbaegi
+  type: tracking
+  id: '948665022047'
+  title: 스마트 밴드
+  status: 배송완료
+  date: '2026-05-11'
+  carrier: 바른택배
+  order_id: 20260510-101908
+- key: ttukbaegi:tracking:739545141747
+  shop: ttukbaegi
+  type: tracking
+  id: '739545141747'
+  title: 자외선 차단 양산
+  status: 배송완료
+  date: '2026-07-06'
+  carrier: 온누리익스프레스
+  order_id: 20260705-102014
+- key: ttukbaegi:tracking:248366978727
+  shop: ttukbaegi
+  type: tracking
+  id: '248366978727'
+  title: 유기농 그래놀라
+  status: 배송완료
+  date: '2026-07-24'
+  carrier: 새길운송
+  order_id: 20260722-102067
+- key: lantern:goods:BL10037
+  shop: lantern
+  type: goods
+  id: BL10037
+  title: Automatic pet feeder
+  concept: pet
+  status: Active
+  price: 53.15
+  date: '2026-04-24'
+- key: lantern:goods:BL10074
+  shop: lantern
+  type: goods
+  id: BL10074
+  title: Airtight glass container set
+  concept: cooking
+  status: Sold out
+  price: 24.85
+  date: '2026-04-13'
+- key: lantern:goods:BL10111
+  shop: lantern
+  type: goods
+  id: BL10111
+  title: Colouring sketchbook
+  concept: kids
+  status: Active
+  price: 7.75
+  date: '2026-06-09'
+- key: lantern:goods:BL10148
+  shop: lantern
+  type: goods
+  id: BL10148
+  title: 65W fast charger
+  concept: audio_power
+  status: Active
+  price: 28.85
+  date: '2026-07-24'
+- key: lantern:goods:BL10185
+  shop: lantern
+  type: goods
+  id: BL10185
+  title: Organic granola
+  concept: snack_food
+  status: Active
+  price: 11.45
+  date: '2026-07-11'
+- key: lantern:goods:BL10222
+  shop: lantern
+  type: goods
+  id: BL10222
+  title: Pet travel carrier
+  concept: pet
+  status: Active
+  price: 37.15
+  date: '2026-08-07'
+- key: lantern:goods:BL10259
+  shop: lantern
+  type: goods
+  id: BL10259
+  title: Ventilated sandals
+  concept: hot_weather
+  status: Draft
+  price: 23.9
+  date: '2026-04-05'
+- key: lantern:goods:BL10296
+  shop: lantern
+  type: goods
+  id: BL10296
+  title: Stainless steel frying pan
+  concept: cooking
+  status: Draft
+  price: 46.15
+  date: '2026-05-21'
+- key: lantern:goods:BL10333
+  shop: lantern
+  type: goods
+  id: BL10333
+  title: UV-blocking parasol
+  concept: hot_weather
+  status: Sold out
+  price: 22.75
+  date: '2026-08-26'
+- key: lantern:goods:BL10370
+  shop: lantern
+  type: goods
+  id: BL10370
+  title: Toddler tableware set
+  concept: kids
+  status: Active
+  price: 18.85
+  date: '2026-05-29'
+- key: lantern:goods:BL10407
+  shop: lantern
+  type: goods
+  id: BL10407
+  title: Plush bunny doll
+  concept: kids
+  status: Active
+  price: 15.55
+  date: '2026-03-05'
+- key: lantern:goods:BL10444
+  shop: lantern
+  type: goods
+  id: BL10444
+  title: Scorched brown rice crisps
+  concept: snack_food
+  status: Active
+  price: 7.9
+  date: '2026-03-02'
+- key: lantern:goods:BL10481
+  shop: lantern
+  type: goods
+  id: BL10481
+  title: Barrier moisture cream
+  concept: skincare
+  status: Sold out
+  price: 26.45
+  date: '2026-05-15'
+- key: lantern:goods:BL10518
+  shop: lantern
+  type: goods
+  id: BL10518
+  title: Vitamin C serum
+  concept: skincare
+  status: Active
+  price: 27.3
+  date: '2026-02-09'
+- key: lantern:goods:BL10555
+  shop: lantern
+  type: goods
+  id: BL10555
+  title: Fragrance-free body lotion
+  concept: skincare
+  status: Draft
+  price: 13.75
+  date: '2026-04-17'
+- key: lantern:goods:BL10592
+  shop: lantern
+  type: goods
+  id: BL10592
+  title: Silent mechanical keyboard
+  concept: desk_work
+  status: Active
+  price: 71.0
+  date: '2026-06-23'
+- key: lantern:goods:BL10629
+  shop: lantern
+  type: goods
+  id: BL10629
+  title: Monitor riser stand
+  concept: desk_work
+  status: Active
+  price: 25.1
+  date: '2026-07-14'
+- key: lantern:goods:BL10666
+  shop: lantern
+  type: goods
+  id: BL10666
+  title: Jeju tangerine juice
+  concept: snack_food
+  status: Active
+  price: 14.1
+  date: '2026-07-13'
+- key: lantern:goods:BL10703
+  shop: lantern
+  type: goods
+  id: BL10703
+  title: Rechargeable LED lantern
+  concept: outdoor
+  status: Active
+  price: 21.9
+  date: '2026-04-11'
+- key: lantern:goods:BL10740
+  shop: lantern
+  type: goods
+  id: BL10740
+  title: Fleece-lined zip hoodie
+  concept: cold_weather
+  status: Active
+  price: 39.9
+  date: '2026-01-15'
+- key: lantern:goods:BL10777
+  shop: lantern
+  type: goods
+  id: BL10777
+  title: Cold brew concentrate
+  concept: snack_food
+  status: Draft
+  price: 13.25
+  date: '2026-06-23'
+- key: lantern:goods:BL10814
+  shop: lantern
+  type: goods
+  id: BL10814
+  title: Linen short-sleeve shirt
+  concept: hot_weather
+  status: Active
+  price: 32.85
+  date: '2026-04-14'
+- key: lantern:goods:BL10851
+  shop: lantern
+  type: goods
+  id: BL10851
+  title: Low-sugar protein bar
+  concept: snack_food
+  status: Sold out
+  price: 15.7
+  date: '2026-04-19'
+- key: lantern:goods:BL10888
+  shop: lantern
+  type: goods
+  id: BL10888
+  title: Wooden building blocks
+  concept: kids
+  status: Sold out
+  price: 30.85
+  date: '2026-05-22'
+- key: lantern:order:20260620-100053
+  shop: lantern
+  type: order
+  id: 20260620-100053
+  title: Low-sugar protein bar
+  status: Processing
+  amount: 16.43
+  date: '2026-06-20'
+  buyer: Casey Ashby
+  tracking: null
+  goods_ids:
+  - BL10851
+- key: lantern:order:20260711-100106
+  shop: lantern
+  type: order
+  id: 20260711-100106
+  title: Organic granola
+  status: Delivered
+  amount: 44.91
+  date: '2026-07-11'
+  buyer: Harper Marsh
+  tracking: '237628677867'
+  goods_ids:
+  - BL10185
+  - BL10407
+- key: lantern:order:20260928-100159
+  shop: lantern
+  type: order
+  id: 20260928-100159
+  title: Lightweight camp chair
+  status: Delivered
+  amount: 138.2
+  date: '2026-09-28'
+  buyer: Avery Whitfield
+  tracking: '117050997136'
+  goods_ids:
+  - BL11406
+  - BL11036
+  - BL11110
+- key: lantern:order:20260927-100212
+  shop: lantern
+  type: order
+  id: 20260927-100212
+  title: Folding trekking poles
+  status: Paid
+  amount: 191.5
+  date: '2026-09-27'
+  buyer: Harper Mercer
+  tracking: null
+  goods_ids:
+  - BL10925
+- key: lantern:order:20260501-100265
+  shop: lantern
+  type: order
+  id: 20260501-100265
+  title: Sherpa fleece jacket
+  status: Returned
+  amount: 43.29
+  date: '2026-05-01'
+  buyer: Riley Kendrick
+  tracking: '435066256648'
+  goods_ids:
+  - BL10962
+- key: lantern:order:20260514-100318
+  shop: lantern
+  type: order
+  id: 20260514-100318
+  title: Pet grooming brush
+  status: Delivered
+  amount: 12.2
+  date: '2026-05-14'
+  buyer: Morgan Dorsey
+  tracking: '611855088553'
+  goods_ids:
+  - BL11554
+- key: lantern:order:20260603-100371
+  shop: lantern
+  type: order
+  id: 20260603-100371
+  title: Monitor riser stand
+  status: Delivered
+  amount: 50.2
+  date: '2026-06-03'
+  buyer: Riley Whitfield
+  tracking: '197273780600'
+  goods_ids:
+  - BL10629
+- key: lantern:order:20260601-100424
+  shop: lantern
+  type: order
+  id: 20260601-100424
+  title: Automatic pet feeder
+  status: Paid
+  amount: 106.3
+  date: '2026-06-01'
+  buyer: Taylor Langley
+  tracking: null
+  goods_ids:
+  - BL10037
+- key: lantern:order:20261002-100477
+  shop: lantern
+  type: order
+  id: 20261002-100477
+  title: Mineral sunscreen
+  status: Delivered
+  amount: 38.6
+  date: '2026-10-02'
+  buyer: Morgan Kendrick
+  tracking: '599950030479'
+  goods_ids:
+  - BL11258
+  - BL11480
+- key: lantern:order:20260512-100530
+  shop: lantern
+  type: order
+  id: 20260512-100530
+  title: Organic granola
+  status: Returned
+  amount: 57.25
+  date: '2026-05-12'
+  buyer: Harper Marsh
+  tracking: '330383358752'
+  goods_ids:
+  - BL10185
+- key: lantern:order:20260813-100583
+  shop: lantern
+  type: order
+  id: 20260813-100583
+  title: Low-sugar protein bar
+  status: Cancelled
+  amount: 72.95
+  date: '2026-08-13'
+  buyer: Casey Mercer
+  tracking: null
+  goods_ids:
+  - BL10851
+  - BL10185
+- key: lantern:order:20260413-100636
+  shop: lantern
+  type: order
+  id: 20260413-100636
+  title: Lightweight camp chair
+  status: Returned
+  amount: 28.0
+  date: '2026-04-13'
+  buyer: Rowan Marsh
+  tracking: '885034212845'
+  goods_ids:
+  - BL11406
+- key: lantern:order:20260402-100689
+  shop: lantern
+  type: order
+  id: 20260402-100689
+  title: Ventilated sandals
+  status: Delivered
+  amount: 121.77
+  date: '2026-04-02'
+  buyer: Riley Holloway
+  tracking: '415750184809'
+  goods_ids:
+  - BL10259
+  - BL10444
+- key: lantern:order:20260608-100742
+  shop: lantern
+  type: order
+  id: 20260608-100742
+  title: Sherpa fleece jacket
+  status: Awaiting payment
+  amount: 216.45
+  date: '2026-06-08'
+  buyer: Rowan Marsh
+  tracking: null
+  goods_ids:
+  - BL10962
+- key: lantern:order:20260411-100795
+  shop: lantern
+  type: order
+  id: 20260411-100795
+  title: Mineral sunscreen
+  status: Awaiting payment
+  amount: 33.71
+  date: '2026-04-11'
+  buyer: Quinn Mercer
+  tracking: null
+  goods_ids:
+  - BL11258
+  - BL11332
+- key: lantern:order:20260713-100848
+  shop: lantern
+  type: order
+  id: 20260713-100848
+  title: Rechargeable hand warmer
+  status: Awaiting payment
+  amount: 141.08
+  date: '2026-07-13'
+  buyer: Taylor Kendrick
+  tracking: null
+  goods_ids:
+  - BL11147
+  - BL11073
+- key: lantern:order:20260923-100901
+  shop: lantern
+  type: order
+  id: 20260923-100901
+  title: Stainless steel frying pan
+  status: Cancelled
+  amount: 41.54
+  date: '2026-09-23'
+  buyer: Avery Ashby
+  tracking: null
+  goods_ids:
+  - BL10296
+- key: lantern:order:20260606-100954
+  shop: lantern
+  type: order
+  id: 20260606-100954
+  title: UV-blocking parasol
+  status: Processing
+  amount: 142.34
+  date: '2026-06-06'
+  buyer: Harper Mercer
+  tracking: null
+  goods_ids:
+  - BL10333
+  - BL11443
+  - BL11258
+- key: lantern:order:20260729-101007
+  shop: lantern
+  type: order
+  id: 20260729-101007
+  title: Pet grooming brush
+  status: Shipped
+  amount: 197.8
+  date: '2026-07-29'
+  buyer: Casey Dorsey
+  tracking: '638173840375'
+  goods_ids:
+  - BL11554
+  - BL11184
+  - BL10518
+- key: lantern:order:20260627-101060
+  shop: lantern
+  type: order
+  id: 20260627-101060
+  title: Folding trekking poles
+  status: Returned
+  amount: 164.6
+  date: '2026-06-27'
+  buyer: Riley Holloway
+  tracking: '610956861348'
+  goods_ids:
+  - BL10925
+  - BL10074
+- key: lantern:order:20260514-101113
+  shop: lantern
+  type: order
+  id: 20260514-101113
+  title: Barrier moisture cream
+  status: Delivered
+  amount: 44.73
+  date: '2026-05-14'
+  buyer: Taylor Kendrick
+  tracking: '108360243698'
+  goods_ids:
+  - BL10481
+  - BL10111
+- key: lantern:order:20260802-101166
+  shop: lantern
+  type: order
+  id: 20260802-101166
+  title: Silicone utensil set
+  status: Shipped
+  amount: 41.5
+  date: '2026-08-02'
+  buyer: Casey Marsh
+  tracking: '998567970598'
+  goods_ids:
+  - BL11184
+- key: lantern:order:20260628-101219
+  shop: lantern
+  type: order
+  id: 20260628-101219
+  title: 65W fast charger
+  status: Shipped
+  amount: 94.55
+  date: '2026-06-28'
+  buyer: Riley Kendrick
+  tracking: '926733941691'
+  goods_ids:
+  - BL10148
+  - BL10703
+- key: lantern:order:20260924-101272
+  shop: lantern
+  type: order
+  id: 20260924-101272
+  title: Cooling neck band
+  status: Delivered
+  amount: 201.45
+  date: '2026-09-24'
+  buyer: Emerson Ashby
+  tracking: '271463445321'
+  goods_ids:
+  - BL11480
+  - BL11369
+- key: lantern:tracking:237628677867
+  shop: lantern
+  type: tracking
+  id: '237628677867'
+  title: Organic granola
+  status: Delivered
+  date: '2026-07-13'
+  carrier: Swiftline Parcel
+  order_id: 20260711-100106
+- key: lantern:tracking:117050997136
+  shop: lantern
+  type: tracking
+  id: '117050997136'
+  title: Lightweight camp chair
+  status: Delivered
+  date: '2026-09-30'
+  carrier: Harbor Courier
+  order_id: 20260928-100159
+- key: lantern:tracking:435066256648
+  shop: lantern
+  type: tracking
+  id: '435066256648'
+  title: Sherpa fleece jacket
+  status: Returned
+  date: '2026-05-03'
+  carrier: BlueRoute Freight
+  order_id: 20260501-100265
+- key: lantern:tracking:611855088553
+  shop: lantern
+  type: tracking
+  id: '611855088553'
+  title: Pet grooming brush
+  status: Delivered
+  date: '2026-05-16'
+  carrier: Pinewood Express
+  order_id: 20260514-100318
+- key: lantern:tracking:197273780600
+  shop: lantern
+  type: tracking
+  id: '197273780600'
+  title: Monitor riser stand
+  status: Delivered
+  date: '2026-06-04'
+  carrier: Harbor Courier
+  order_id: 20260603-100371
+- key: lantern:tracking:599950030479
+  shop: lantern
+  type: tracking
+  id: '599950030479'
+  title: Mineral sunscreen
+  status: Delivered
+  date: '2026-10-05'
+  carrier: Swiftline Parcel
+  order_id: 20261002-100477
+- key: lantern:tracking:330383358752
+  shop: lantern
+  type: tracking
+  id: '330383358752'
+  title: Organic granola
+  status: Returned
+  date: '2026-05-15'
+  carrier: Pinewood Express
+  order_id: 20260512-100530
+- key: lantern:tracking:885034212845
+  shop: lantern
+  type: tracking
+  id: '885034212845'
+  title: Lightweight camp chair
+  status: Returned
+  date: '2026-04-15'
+  carrier: BlueRoute Freight
+  order_id: 20260413-100636
+- key: lantern:tracking:415750184809
+  shop: lantern
+  type: tracking
+  id: '415750184809'
+  title: Ventilated sandals
+  status: Delivered
+  date: '2026-04-05'
+  carrier: BlueRoute Freight
+  order_id: 20260402-100689
+- key: lantern:tracking:638173840375
+  shop: lantern
+  type: tracking
+  id: '638173840375'
+  title: Pet grooming brush
+  status: Shipped
+  date: '2026-07-31'
+  carrier: Swiftline Parcel
+  order_id: 20260729-101007
+- key: lantern:tracking:610956861348
+  shop: lantern
+  type: tracking
+  id: '610956861348'
+  title: Folding trekking poles
+  status: Returned
+  date: '2026-06-29'
+  carrier: Pinewood Express
+  order_id: 20260627-101060
+- key: lantern:tracking:108360243698
+  shop: lantern
+  type: tracking
+  id: '108360243698'
+  title: Barrier moisture cream
+  status: Delivered
+  date: '2026-05-15'
+  carrier: Harbor Courier
+  order_id: 20260514-101113
+- key: lantern:tracking:998567970598
+  shop: lantern
+  type: tracking
+  id: '998567970598'
+  title: Silicone utensil set
+  status: Shipped
+  date: '2026-08-04'
+  carrier: Swiftline Parcel
+  order_id: 20260802-101166
+- key: lantern:tracking:926733941691
+  shop: lantern
+  type: tracking
+  id: '926733941691'
+  title: 65W fast charger
+  status: Shipped
+  date: '2026-07-01'
+  carrier: Pinewood Express
+  order_id: 20260628-101219
+- key: lantern:tracking:271463445321
+  shop: lantern
+  type: tracking
+  id: '271463445321'
+  title: Cooling neck band
+  status: Delivered
+  date: '2026-09-26'
+  carrier: Harbor Courier
+  order_id: 20260924-101272
+- key: lantern:tracking:592531481550
+  shop: lantern
+  type: tracking
+  id: '592531481550'
+  title: Folding trekking poles
+  status: Delivered
+  date: '2026-05-10'
+  carrier: BlueRoute Freight
+  order_id: 20260509-101325
+- key: lantern:tracking:302158032902
+  shop: lantern
+  type: tracking
+  id: '302158032902'
+  title: Sherpa fleece jacket
+  status: Delivered
+  date: '2026-05-30'
+  carrier: Pinewood Express
+  order_id: 20260528-101378
+- key: lantern:tracking:412268893260
+  shop: lantern
+  type: tracking
+  id: '412268893260'
+  title: Barrier moisture cream
+  status: Delivered
+  date: '2026-05-27'
+  carrier: Harbor Courier
+  order_id: 20260525-101484
+- key: lantern:tracking:218850256007
+  shop: lantern
+  type: tracking
+  id: '218850256007'
+  title: Fragrance-free body lotion
+  status: Returned
+  date: '2026-04-29'
+  carrier: Pinewood Express
+  order_id: 20260426-101537
+- key: lantern:tracking:586301179339
+  shop: lantern
+  type: tracking
+  id: '586301179339'
+  title: Plush bunny doll
+  status: Shipped
+  date: '2026-05-02'
+  carrier: Pinewood Express
+  order_id: 20260501-101590
+- key: lantern:tracking:471012538581
+  shop: lantern
+  type: tracking
+  id: '471012538581'
+  title: Silent mechanical keyboard
+  status: Delivered
+  date: '2026-06-25'
+  carrier: BlueRoute Freight
+  order_id: 20260624-101643
+- key: lantern:tracking:487877026977
+  shop: lantern
+  type: tracking
+  id: '487877026977'
+  title: Document file organizer
+  status: Shipped
+  date: '2026-06-03'
+  carrier: Swiftline Parcel
+  order_id: 20260602-101696
+- key: lantern:tracking:784605216627
+  shop: lantern
+  type: tracking
+  id: '784605216627'
+  title: Scorched brown rice crisps
+  status: Returned
+  date: '2026-08-02'
+  carrier: Harbor Courier
+  order_id: 20260731-101749
+- key: lantern:tracking:557892737706
+  shop: lantern
+  type: tracking
+  id: '557892737706'
+  title: Airtight glass container set
+  status: Shipped
+  date: '2026-09-04'
+  carrier: Harbor Courier
+  order_id: 20260901-101855

@@ -1,0 +1,83 @@
+page_id: haneul-tracking-list-2
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '959170073566'
+  carrier: 바른택배
+  status: 배송중
+  title: 어린이 킥보드
+  shipping_date: '2026-06-02'
+  recipient_name: 신소율
+- id,link: '991093348982'
+  carrier: 새길운송
+  status: 배송중
+  title: 펫 빗 브러시
+  shipping_date: '2026-07-19'
+  recipient_name: 임은호
+- id,link: '212464131436'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 충전식 손난로
+  shipping_date: '2026-06-07'
+  recipient_name: 강시우
+- id,link: '985470131264'
+  carrier: 새길운송
+  status: 배송완료
+  title: 접이식 등산 스틱
+  shipping_date: '2026-09-01'
+  recipient_name: 윤수아
+- id,link: '470479123713'
+  carrier: 바른택배
+  status: 배송완료
+  title: 코딩 로봇 키트
+  shipping_date: '2026-06-09'
+  recipient_name: 강채원
+- id,link: '751710420375'
+  carrier: 바른택배
+  status: 배송중
+  title: 노이즈캔슬링 무선 이어폰
+  shipping_date: '2026-07-22'
+  recipient_name: 조은호
+- id,link: '210974147045'
+  carrier: 새길운송
+  status: 배송중
+  title: 진공 보온 텀블러
+  shipping_date: '2026-08-07'
+  recipient_name: 최현우
+- id,link: '669755300642'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 서류 정리함
+  shipping_date: '2026-05-24'
+  recipient_name: 강현우
+- id,link: '651639973093'
+  carrier: 한빛로지스
+  status: 배송중
+  title: 유아 식기 세트
+  shipping_date: '2026-10-07'
+  recipient_name: 조채원
+- id,link: '594426284960'
+  carrier: 바른택배
+  status: 반품
+  title: 어린이 킥보드
+  shipping_date: '2026-09-27'
+  recipient_name: 이채원
+- id,link: '373522434708'
+  carrier: 새길운송
+  status: 배송중
+  title: 경량 패딩 조끼
+  shipping_date: '2026-06-27'
+  recipient_name: 서하은
+- id,link: '370344139646'
+  carrier: 바른택배
+  status: 배송중
+  title: 유아 식기 세트
+  shipping_date: '2026-07-07'
+  recipient_name: 윤민준
+title: 배송 조회

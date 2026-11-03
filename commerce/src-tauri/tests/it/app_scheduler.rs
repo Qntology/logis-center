@@ -373,3 +373,148 @@ fn harvest_titles_prefers_parsed_json_then_raw_brackets() -> anyhow::Result<()> 
     assert_eq!(harvest_titles(&json!({"order": ["Shirt"]}), r#"["Other"]"#), ["Shirt"]);
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+//  구조 판정 (list_census::layout_evidence)
+// ---------------------------------------------------------------------
+
+fn evidence(html: &str) -> list_census::LayoutEvidence {
+    list_census::run(html).layout_evidence()
+}
+
+#[test]
+fn layout_evidence_reads_record_rows_as_a_list() {
+    let rows: String = (1..=8)
+        .map(|i| format!("<tr><td>{i}</td><td>Item {i}</td><td>{}</td><td>Paid</td></tr>", i * 10))
+        .collect();
+    let html = format!("<html><body><main><table><tbody>{rows}</tbody></table></main></body></html>");
+    let ev = evidence(&html);
+    assert_eq!(ev.verdict, list_census::StructuralLayout::List, "{ev:?}");
+    assert_eq!(ev.rows, 8);
+}
+
+#[test]
+fn layout_evidence_reads_label_value_rows_as_a_detail() {
+    let rows: String = (1..=8).map(|i| format!("<tr><th>Label {i}</th><td>Value {i}</td></tr>")).collect();
+    let html = format!("<html><body><main><table>{rows}</table></main></body></html>");
+    let ev = evidence(&html);
+    assert_eq!(ev.verdict, list_census::StructuralLayout::Detail, "{ev:?}");
+    assert_eq!(ev.pairs, 8);
+}
+
+#[test]
+fn layout_evidence_counts_definition_lists_as_pairs() {
+    let pairs: String = (1..=6).map(|i| format!("<dt>Label {i}</dt><dd>Value {i}</dd>")).collect();
+    let html = format!("<html><body><main><article><dl>{pairs}</dl></article></main></body></html>");
+    assert_eq!(evidence(&html).verdict, list_census::StructuralLayout::Detail);
+}
+
+/// 주문 상세의 상품 표처럼 상세 안의 작은 반복은 목록이 아닙니다.
+#[test]
+fn layout_evidence_keeps_a_detail_with_a_small_item_table() {
+    let kv: String = (1..=12).map(|i| format!("<tr><th>Label {i}</th><td>Value number {i}</td></tr>")).collect();
+    let items: String = (1..=5).map(|i| format!("<tr><td>Thing {i}</td><td>{i}</td><td>{}</td></tr>", i * 100)).collect();
+    let html = format!("<html><body><main><table>{kv}</table><table><tbody>{items}</tbody></table></main></body></html>");
+    assert_eq!(evidence(&html).verdict, list_census::StructuralLayout::Detail);
+}
+
+/// 레코드가 없고 값이 서너 쌍뿐인 기획전 · 후기 상세도 상세입니다.
+#[test]
+fn layout_evidence_reads_sparse_pairs_without_records_as_a_detail() {
+    let html = "<html><body><main><article><h1>Spring</h1><dl><dt>Period</dt><dd>3/1 ~ 3/31</dd><dt>Status</dt><dd>Open</dd><dt>Goods</dt><dd>12</dd></dl><p>Long body text here.</p></article></main></body></html>";
+    assert_eq!(evidence(html).verdict, list_census::StructuralLayout::Detail);
+}
+
+/// 필터 양식만 남은 빈 목록은 라벨-값 쌍이 있어도 상세가 아닙니다.
+#[test]
+fn layout_evidence_does_not_call_an_empty_list_a_detail() {
+    let html = "<html><body><main><form><label>From<input name=\"a\"></label><label>To<input name=\"b\"></label><label>State<select name=\"c\"><option>All</option></select></label></form><table><thead><tr><th>No</th><th>Title</th><th>Date</th></tr></thead><tbody></tbody></table></main></body></html>";
+    assert_ne!(evidence(html).verdict, list_census::StructuralLayout::Detail);
+}
+
+/// 구획마다 '라벨: 값' 줄이 있는 상세입니다. 구획이 닮았어도 라벨이 겹치지 않으면 레코드가 아닙니다.
+#[test]
+fn layout_evidence_reads_labelled_sections_as_a_detail() {
+    let labels = ["Product", "Status", "Price", "Brand", "SKU", "Model", "Color", "Barcode", "Stock", "Origin"];
+    let sections: String = labels
+        .chunks(2)
+        .map(|c| format!("<section><p><strong>{}:</strong> One {}</p><p><strong>{}:</strong> Two {}</p></section>", c[0], c[0], c[1], c[1]))
+        .collect();
+    let html = format!("<html><body><main><h1>Details</h1>{sections}</main></body></html>");
+    assert_eq!(evidence(&html).verdict, list_census::StructuralLayout::Detail);
+}
+
+/// 카드마다 같은 라벨이 반복되면 목록입니다.
+#[test]
+fn layout_evidence_keeps_cards_with_repeated_labels_as_a_list() {
+    let cards: String = (1..=8)
+        .map(|i| format!("<section><p><strong>Name:</strong> Item {i}</p><p><strong>Price:</strong> {}</p><p><strong>Stock:</strong> {}</p></section>", i * 10, i))
+        .collect();
+    let html = format!("<html><body><main>{cards}</main></body></html>");
+    assert_eq!(evidence(&html).verdict, list_census::StructuralLayout::List);
+}
+
+/// 행이 둘뿐이면 구조만으로 정하지 않고 임베딩 근거에 맡깁니다.
+#[test]
+fn layout_evidence_stays_silent_on_a_tiny_page() {
+    let html = "<html><body><main><table><tr><td>a</td><td>b</td><td>c</td></tr><tr><td>d</td><td>e</td><td>f</td></tr></table></main></body></html>";
+    assert_eq!(evidence(html).verdict, list_census::StructuralLayout::Unknown);
+}
+
+#[test]
+fn landmark_lists_do_not_count_as_records() {
+    let links: String = (1..=10).map(|i| format!("<li><a href=\"/{i}\">A{i}</a><span>B{i}</span><em>C{i}</em></li>")).collect();
+    let html = format!("<html><body><aside><ul>{links}</ul></aside><main><p>Hello</p></main></body></html>");
+    assert_eq!(evidence(&html).rows, 0);
+}
+
+/// 합성 쇼핑몰 페이지에서 구조 판정이 목록과 상세를 뒤바꾸지 않습니다. 말을 아끼는 것(Unknown)은 괜찮습니다.
+#[test]
+fn layout_evidence_never_swaps_synthetic_pages() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SyntheticData/commerce/output_html");
+    let mut seen = 0usize;
+    for entry in std::fs::read_dir(&dir).expect("합성 페이지 폴더").flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let html = std::fs::read_to_string(entry.path()).expect("html");
+        let verdict = evidence(&tauri_app_lib::parsing::pre_clean_html(&html)).verdict;
+        let wrong = if name.contains("-list-") {
+            list_census::StructuralLayout::Detail
+        } else {
+            list_census::StructuralLayout::List
+        };
+        assert_ne!(verdict, wrong, "{name}");
+        seen += 1;
+    }
+    assert!(seen >= 144, "{seen}");
+}
+
+// ---------------------------------------------------------------------
+//  뒷장 판정과 자기 문서번호 (scheduler::trading)
+// ---------------------------------------------------------------------
+
+#[test]
+fn twin_trade_codes_are_the_same_document() {
+    assert!(tauri_app_lib::logic::same_trade_doc("CA", "COA"));
+    assert!(tauri_app_lib::logic::same_trade_doc("bk", "BC"));
+    assert!(!tauri_app_lib::logic::same_trade_doc("CI", "PL"));
+}
+
+#[test]
+fn only_a_doc_code_prefix_marks_a_new_document() {
+    use tauri_app_lib::scheduler::trading::carries_doc_code;
+    assert!(carries_doc_code("BL-55432219"));
+    assert!(carries_doc_code("CI-2026-08001"));
+    for v in ["2500.0", "78500.0", "1102-9983-4401", "SEAL88990", "2026-09-08", ""] {
+        assert!(!carries_doc_code(v), "{v}");
+    }
+}
+
+#[test]
+fn measures_and_contacts_are_not_self_numbers() {
+    use tauri_app_lib::scheduler::trading::self_id_value_possible as possible;
+    assert!(!possible("gross_weight_kg", "2500.0"));
+    assert!(!possible("quantity", "2000"));
+    assert!(!possible("invoice_value", "78500.0"));
+    assert!(!possible("contact_number", "+82-2-1234-5690"));
+    assert!(possible("reference_no", "20261103"));
+}

@@ -1,0 +1,30 @@
+page_id: harbor-tracking-detail-232531792143
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/shipping/view?id=232531792143
+page_type: tracking
+layout: detail
+fields:
+  id,link: '232531792143'
+  carrier: Swiftline Parcel
+  status: Shipped
+  title: Ceramic chef knife
+  shipping_date: '2026-06-11'
+  recipient_name: Finley Dorsey
+  registration_date: '2026-06-07'
+  sender_name: Harbor & Pine Trading LLC
+  sender_address: 410 Foundry Way, Tacoma, WA 98402
+  sender_phone: +1-253-555-0142
+  recipient_address: 9300 Cedar Ln, Asheville, NC 28801
+  recipient_phone: +1-743-555-0108
+  weight: 5.7
+  width: 54
+  height: 41
+  length: 25
+  shipping_method: Store pickup
+  shipping_duration: 5
+  shipping_fee: 0.0
+title: Shipment details

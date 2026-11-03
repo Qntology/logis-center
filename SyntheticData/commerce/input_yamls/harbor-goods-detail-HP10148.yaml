@@ -1,0 +1,29 @@
+page_id: harbor-goods-detail-HP10148
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/goods/view?id=HP10148
+page_type: goods
+layout: detail
+fields:
+  id,link: HP10148
+  title: Silent mechanical keyboard
+  status: Sold out
+  category: Electronics
+  sale_price: 71.6
+  quantity: 0
+  registration_date: '2026-04-28'
+  brand_name: 다온랩
+  code: HP-DES-104
+  stock_keeping_unit: HPDE1004
+  model_name: DE-621
+  manufacturer: 솔빛리빙
+  origin_country: Korea
+  color: Light grey
+  barcode: '8899205760305'
+  supply_price: 48.99
+  low_stock_threshold: 20
+  description: An 87-key board with quiet switches.
+title: Product details

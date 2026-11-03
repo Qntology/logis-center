@@ -468,6 +468,8 @@ async fn run_synthesis_pass(
     Ok(())
 }
 
+const CHROME_RIVAL_MARGIN: f32 = 0.04;
+
 async fn prejudice_pair(model: &LogisModel, en_text: &str, doc_lang: &str) -> Vec<Vec<f32>> {
     let mut out: Vec<Vec<f32>> = Vec::new();
     if let Ok(e) = model.get_embedding(en_text.to_string()).await {
@@ -1746,7 +1748,37 @@ pub async fn process_task(
                 let title_only_emb = model.get_embedding(title_only_bias).await.unwrap_or(vec![0.0; 384]);
                 category_title_only_embs.push((cat.to_string(), title_only_emb));
             }
-            
+
+            let chrome_prejudice_text = "admin page, administrator page, management page, admin home, admin main menu, main menu, dashboard, control panel, back office, console, site name, shopping mall, welcome, home, index, search, basic search, search form, filter, login, logout, settings, configuration, my page, notice, banner, footer, copyright";
+            let chrome_prej_embs = prejudice_pair(&model, chrome_prejudice_text, &doc_lang).await;
+            // 🌟 [CHROME RIVAL] 앵커는 낱말로 쪼개져 'admin memo' 가 'admin' 을 남깁니다. 이런 낱말은 어떤 유형의 근거도 아닌데
+            //    주문 뱅크에만 있어서 '/admin/shipments' 같은 모든 관리자 주소를 주문으로 끌어갔습니다.
+            let chrome_phrases: Vec<String> = chrome_prejudice_text
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .chain(crate::logic::site_chrome_sentence(&doc_lang).into_iter().flat_map(|l| l.split(',').map(|p| p.trim().to_string()).collect::<Vec<_>>()))
+                .filter(|p| !p.is_empty())
+                .collect();
+            let chrome_phrase_embs: Vec<Vec<f32>> = model
+                .get_embedding_batch(chrome_phrases.clone())
+                .await
+                .unwrap_or_default();
+
+            // 🌟 [SHARED PHRASE OWNER] 유형 이름은 영어 배송처럼 'tracking tracking' 으로 약할 수 있어, 그 유형만 쓰는 구의 중심을 정체성으로 봅니다.
+            let category_centroids: Vec<Vec<f32>> = (0..categories.len())
+                .map(|ci| {
+                    let mut sum = vec![0.0f32; category_title_only_embs[ci].1.len()];
+                    let mut used = 0usize;
+                    for (pi, pe) in category_phrase_embs[ci].1.iter().enumerate() {
+                        let text = &category_phrase_texts[ci][pi];
+                        if (0..categories.len()).any(|cj| cj != ci && category_phrase_texts[cj].contains(text)) { continue; }
+                        for (s, v) in sum.iter_mut().zip(pe.iter()) { *s += *v; }
+                        used += 1;
+                    }
+                    if used == 0 { category_title_only_embs[ci].1.clone() } else { sum }
+                })
+                .collect();
+
             {
                 let mut rebuilt: Vec<(String, Vec<Vec<f32>>)> = Vec::with_capacity(categories.len());
                 let mut total_dropped = 0usize;
@@ -1761,6 +1793,26 @@ pub async fn process_task(
                             kept.push(pe.clone());
                             continue;
                         }
+                        // 🌟 [SHARED PHRASE OWNER] 같은 글자의 구가 다른 뱅크에도 있으면 코사인 비교가 항상 1.0 이라 양쪽에서 함께
+                        //    지워졌습니다. 'shipment' · 'delivery' 가 주문과 배송 뱅크에서 모두 사라져 tracking 뱅크가 42구 중 3구만 남았고,
+                        //    'Shipments' 페이지가 goods 로 판정되었습니다. 세 뱅크 이상이 쓰는 구('list' · 'table')는 변별력이 없어 지우고,
+                        //    두 뱅크가 쓰는 구는 그 유형만 쓰는 구들에 더 가까운 쪽에 남깁니다.
+                        let text = category_phrase_texts[ci][pi].as_str();
+                        let sharers: Vec<usize> = (0..categories.len())
+                            .filter(|&cj| cj != ci && category_phrase_texts[cj].iter().any(|t| t == text))
+                            .collect();
+                        if sharers.len() >= 2 {
+                            dropped.push(format!("{}(뱅크 {}개 공유)", text, sharers.len() + 1));
+                            continue;
+                        }
+                        if let Some(&other) = sharers.first() {
+                            let own_id = cosine_similarity(pe, &category_centroids[ci]);
+                            let other_id = cosine_similarity(pe, &category_centroids[other]);
+                            if other_id > own_id {
+                                dropped.push(format!("{}('{}' 쪽에 남김 {:.3} < {:.3})", text, categories[other], own_id, other_id));
+                                continue;
+                            }
+                        }
                         let mut own_best = 0.0f32;
                         for pj in 0..bank.len() {
                             if pj == pi { continue; }
@@ -1771,13 +1823,25 @@ pub async fn process_task(
                         let mut rival_best = 0.0f32;
                         for cj in 0..categories.len() {
                             if cj == ci { continue; }
-                            let s = max_pool_sim(pe, &category_phrase_embs[cj].1);
-                            if s > rival_best { rival_best = s; }
+                            for (pj, q) in category_phrase_embs[cj].1.iter().enumerate() {
+                                // 양쪽 뱅크에 모두 있는 구는 어느 쪽 편도 아닙니다.
+                                if category_phrase_texts[ci].iter().any(|t| *t == category_phrase_texts[cj][pj]) { continue; }
+                                let s = cosine_similarity(pe, q);
+                                if s > rival_best { rival_best = s; }
+                            }
                         }
                         if rival_best >= own_best {
                             dropped.push(format!(
                                 "{}(own {:.3} <= rival {:.3})",
                                 category_phrase_texts[ci][pi], own_best, rival_best
+                            ));
+                            continue;
+                        }
+                        let chrome_best = max_pool_sim(pe, &chrome_phrase_embs);
+                        if chrome_best > own_best + CHROME_RIVAL_MARGIN {
+                            dropped.push(format!(
+                                "{}(사이트 공통 낱말 {:.3} > own {:.3})",
+                                category_phrase_texts[ci][pi], chrome_best, own_best
                             ));
                             continue;
                         }
@@ -1810,9 +1874,6 @@ pub async fn process_task(
                 ));
                 category_phrase_embs = rebuilt;
             }
-
-            let chrome_prejudice_text = "admin page, administrator page, management page, admin home, admin main menu, main menu, dashboard, control panel, back office, console, site name, shopping mall, welcome, home, index, search, basic search, search form, filter, login, logout, settings, configuration, my page, notice, banner, footer, copyright";
-            let chrome_prej_embs = prejudice_pair(&model, chrome_prejudice_text, &doc_lang).await;
 
             {
                 if !title_candidates.is_empty() {
@@ -2702,6 +2763,8 @@ pub async fn process_task(
                     for (tier, tag) in ["h1", "h2"].iter().enumerate() {
                         if let Ok(sel_h) = scraper::Selector::parse(tag) {
                             for el in doc.select(&sel_h) {
+                                // 헤더의 로고(h1)와 사이드 메뉴 제목(h2)은 이 페이지의 제목이 아닙니다.
+                                if crate::scheduler::list_census::in_landmark(&el) { continue; }
                                 let txt = el.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
                                 if !txt.is_empty() && txt.chars().count() <= 60 { temp.push((tier, txt)); }
                             }
@@ -2943,6 +3006,30 @@ pub async fn process_task(
                 emit_term(&format!("  📊 [FALLBACK SCORE] FormMaxPool: {:.4} | ListMaxPool: {:.4} | PrejSim: {:.4} | FormFinal: {:.4} | ListFinal: {:.4} | is_detail: {}", fallback_form_sim, fallback_list_sim, fallback_prej_sim, fallback_form_final, fallback_list_final, is_detail));
             } else {
                 is_detail = form_final > list_final;
+            }
+            // 🌟 [STRUCT LAYOUT] DOM 구조가 뚜렷하면 구조로 정하고, 위의 임베딩 판정은 구조가 말이 없을 때만 씁니다.
+            {
+                use crate::scheduler::list_census::StructuralLayout;
+                let ev = crate::scheduler::list_census::run(&clean_html_content).layout_evidence();
+                let embed_detail = is_detail;
+                match ev.verdict {
+                    StructuralLayout::List => is_detail = false,
+                    StructuralLayout::Detail => is_detail = true,
+                    StructuralLayout::Unknown => {}
+                }
+                emit_term(&format!(
+                    "  🧱 [STRUCT LAYOUT] {:?} | 레코드 {}행 · 본문 비중 {:.2} · 라벨-값 {}쌍 | 임베딩 판정 is_detail={} → 최종 {}",
+                    ev.verdict, ev.rows, ev.share, ev.pairs, embed_detail, is_detail
+                ));
+                crate::utils::score_dynamics::record_baseline("commerce.struct_rows", ev.rows as f32);
+                crate::utils::score_dynamics::record_baseline("commerce.struct_share", ev.share);
+                crate::utils::score_dynamics::record_baseline("commerce.struct_pairs", ev.pairs as f32);
+                if ev.verdict != StructuralLayout::Unknown {
+                    crate::utils::score_dynamics::record_baseline(
+                        "commerce.struct_embed_agree",
+                        if embed_detail == is_detail { 1.0 } else { 0.0 },
+                    );
+                }
             }
             println!("[Scheduler] Classified is_detail as: {} (Form: {:.4}, List: {:.4})", is_detail, form_final, list_final);
             emit_term(&format!("  ✅ Determined Detail Page: {}", is_detail));

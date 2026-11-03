@@ -1,0 +1,31 @@
+page_id: ttukbaegi-goods-detail-TB10148
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/products/TB10148
+page_type: goods
+layout: detail
+fields:
+  id,link: TB10148
+  title: 케이블 정리함
+  status: 품절
+  category: 사무
+  sale_price: 16400
+  compare_at_price: 19680
+  quantity: 0
+  registration_date: '2026-06-11'
+  brand_name: Oakfern
+  code: TB-DES-104
+  stock_keeping_unit: TBDE1004
+  model_name: DE-702
+  manufacturer: 솔빛리빙
+  origin_country: 포르투갈
+  color: 연회색
+  barcode: '8896272091411'
+  supply_price: 9160
+  low_stock_threshold: 10
+  shipping_fee: 3000
+  description: 멀티탭과 전선을 상자 안에 숨겨 줍니다.
+title: 상품 정보

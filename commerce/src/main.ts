@@ -635,6 +635,8 @@ interface DexiePlan {
     /** 🌟 v4 : 확정 도메인 + 교차 후보 도메인. LanceDB 의 IN 절과 동일한 집합입니다. */
     types?: string[];
     mode?: string;
+    /** 🌟 [PLAN TENANT SCOPE] 이 사이트의 문서만 통과시킵니다. 조건 리콜은 표 전체를 훑습니다. */
+    cc?: string;
     conditions?: DexieCondition[];
     keywords?: string[];
     alternates?: Record<string, string[]>;
@@ -836,6 +838,9 @@ async function executeDexiePlan(
     }
     if (plan.mode) {
         rows = rows.filter(r => (r.mode || 'commerce') === plan.mode);
+    }
+    if (plan.cc) {
+        rows = rows.filter(r => r.cc === plan.cc);
     }
 
     // ── 정밀 조건 전량 적용 ──

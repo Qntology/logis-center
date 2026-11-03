@@ -739,6 +739,8 @@ fn in_period(iso: &str, start: Option<&str>, end: Option<&str>) -> bool {
     true
 }
 
+const OWN_DATE_PATH: &str = "data.registration_date";
+
 pub async fn relay_join(
     store: &VectorStore,
     results: &mut Vec<Value>,
@@ -872,8 +874,22 @@ pub async fn relay_join(
                     "[AI-SEARCH] ⚪ [RELAY PERIOD / HOLD] '{}' 의 기간 {:?} ~ {:?} 는 질의에 판매·거래 관계 근거가 없어 연결 타입의 날짜 축으로 옮기지 않습니다. '등록된 상품' 처럼 자기 날짜를 뜻하는 질의를 주문 날짜로 잘못 좁히지 않기 위해서입니다. 결과는 줄이지 않습니다.",
                     primary, start, end
                 ));
+                // 🌟 [OWN PERIOD] '2026년 5월 주문' 처럼 문서 자체가 거래이면 기간은 연결 타입이 아니라 자기 날짜 칸의 조건입니다.
+                //    주문에는 유효기간 칸이 없어 기간이 어디에도 걸리지 않았고, 다른 달의 주문까지 그대로 나왔습니다.
+                let own = period.get("via").and_then(|v| v.as_str()).map_or(false, |v| relay_type_family(v) == primary_family);
                 if let Some(o) = plan.as_object_mut() {
                     o.insert("relay".to_string(), json!({ "period": period, "key": key, "applied": false, "reason": "no_relation_intent" }));
+                    if own {
+                        if let Some(conds) = o.get_mut("conditions").and_then(|c| c.as_array_mut()) {
+                            if let Some(s) = start.as_ref() {
+                                let day: String = s.chars().take(10).collect();
+                                conds.push(json!({ "path": OWN_DATE_PATH, "op": "gte", "value": day, "kind": "string" }));
+                            }
+                            if let Some(e) = end.as_ref() {
+                                conds.push(json!({ "path": OWN_DATE_PATH, "op": "lte", "value": e, "kind": "string" }));
+                            }
+                        }
+                    }
                 }
                 continue;
             }

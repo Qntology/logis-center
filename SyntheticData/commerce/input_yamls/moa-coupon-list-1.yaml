@@ -1,0 +1,91 @@
+page_id: moa-coupon-list-1
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: MOA827
+  title: 가을 맞이 감사제 1차
+  type: 정액
+  discount: 5,000
+  started_at: '2026-09-13'
+  expired_at: '2026-09-27'
+  status: 종료
+- id,link: CP4014
+  code: MOA529
+  title: 가을 맞이 감사제 2차
+  type: 정액
+  discount: 2,000
+  started_at: '2026-04-08'
+  expired_at: '2026-04-22'
+  status: 진행중
+- id,link: CP4021
+  code: MOA785
+  title: 앱 전용 혜택 3차
+  type: 정액
+  discount: 5,000
+  started_at: '2026-06-28'
+  expired_at: '2026-07-05'
+  status: 종료
+- id,link: CP4028
+  code: MOA515
+  title: 첫 구매 환영 혜택 4차
+  type: 정률
+  discount: 10%
+  started_at: '2026-03-14'
+  expired_at: '2026-04-13'
+  status: 대기중
+- id,link: CP4035
+  code: MOA587
+  title: 주말 한정 할인 5차
+  type: 정액
+  discount: 3,000
+  started_at: '2026-09-14'
+  expired_at: '2026-09-21'
+  status: 진행중
+- id,link: CP4042
+  code: MOA276
+  title: 가을 맞이 감사제 6차
+  type: 정액
+  discount: 2,000
+  started_at: '2026-05-11'
+  expired_at: '2026-06-10'
+  status: 진행중
+- id,link: CP4049
+  code: MOA165
+  title: 가을 맞이 감사제 7차
+  type: 정률
+  discount: 10%
+  started_at: '2026-05-05'
+  expired_at: '2026-05-19'
+  status: 진행중
+- id,link: CP4056
+  code: MOA456
+  title: 가을 맞이 감사제 8차
+  type: 정률
+  discount: 10%
+  started_at: '2026-08-18'
+  expired_at: '2026-08-25'
+  status: 대기중
+- id,link: CP4063
+  code: MOA889
+  title: 앱 전용 혜택 9차
+  type: 정액
+  discount: 2,000
+  started_at: '2026-07-18'
+  expired_at: '2026-08-01'
+  status: 진행중
+- id,link: CP4070
+  code: MOA426
+  title: 재구매 고객 감사 10차
+  type: 정액
+  discount: 5,000
+  started_at: '2026-03-22'
+  expired_at: '2026-03-29'
+  status: 종료
+title: 쿠폰 관리

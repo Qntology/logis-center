@@ -1,0 +1,28 @@
+page_id: soop-order-detail-20260716-100053
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/orders/20260716-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260716-100053
+  registration_date: '2026-07-16'
+  status: 상품준비중
+  goods: 무기자차 선크림
+  sender_name: 권예준
+  recipient_name: 오소율
+  quantity: 2
+  amount: 53300
+  shipping_fee: 0
+  payment_method: 신용카드
+  sender_phone: 010-3398-9995
+  sender_address: 강원특별자치도 춘천시 공지로 292
+  recipient_phone: 010-7771-2190
+  recipient_address: 경기도 고양시 일산동구 중앙로 147 4층
+  payment_origin: 스마트PG
+  payment_date: '2026-07-16'
+  card: 한결카드
+title: 주문 상세내역

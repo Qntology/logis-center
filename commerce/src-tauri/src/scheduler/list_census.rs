@@ -14,6 +14,12 @@ const MIRROR_SAMPLE: usize = 12;
 const FALLBACK_MIN_ROWS: usize = 3;
 const FALLBACK_MIN_CELLS: f32 = 4.0;
 const FALLBACK_DOMINANCE: f32 = 2.0;
+const LAYOUT_MIN_ROWS: usize = 5;
+const LAYOUT_MIN_SHARE: f32 = 0.35;
+const LAYOUT_SPARSE_PAIRS: usize = 3;
+const SECTION_MAX_MEMBERS: usize = 3;
+const SECTION_DISTINCT_LABELS: f32 = 0.8;
+const SECTION_LABEL_CHARS: usize = 40;
 const MAX_KEPT: usize = 12;
 const EMPTY_MAX_BODY_ROWS: usize = 2;
 const SAMPLE_CHARS: usize = 160;
@@ -67,10 +73,39 @@ impl CensusGroup {
         })
     }
 
+    /// '라벨: 값' 행의 라벨. 콜론이 없는 행은 첫 낱말이 값이라 라벨로 세지 않습니다.
+    fn member_labels(&self) -> Vec<String> {
+        self.member_texts
+            .iter()
+            .filter_map(|t| t.split_once(':').map(|(label, _)| label.trim().to_lowercase()))
+            .filter(|l| !l.is_empty() && l.chars().count() <= SECTION_LABEL_CHARS)
+            .collect()
+    }
+
     fn envelope(&self) -> (usize, usize) {
         let lo = self.ranges.iter().map(|r| r.0).min().unwrap_or(0);
         let hi = self.ranges.iter().map(|r| r.1).max().unwrap_or(0);
         (lo, hi)
+    }
+
+    fn text_chars(&self) -> usize {
+        self.member_texts.iter().map(|t| t.chars().filter(|c| !c.is_whitespace()).count()).sum()
+    }
+
+    /// 행이 '라벨 + 값' 한 쌍(또는 몇 쌍)인 묶음이면 그 쌍의 수. 상세 페이지의 뼈대입니다.
+    ///   `<tr><th>라벨</th><td>값</td></tr>` · `<li><span/><span/></li>` · `<p><b>라벨</b> 값</p>` 은 칸이 둘이고,
+    ///   `<dl>` 은 dt 와 dd 가 형제라 dt 하나가 한 쌍입니다. 링크 · 버튼 줄은 라벨과 값이 아닙니다.
+    fn label_value_pairs(&self) -> usize {
+        if self.mirror_copy() || matches!(self.tag.as_str(), "a" | "button" | "span" | "td" | "th" | "dd") {
+            return 0;
+        }
+        if self.tag == "dt" {
+            return self.members;
+        }
+        if self.form_like {
+            return self.members * ((self.avg_cells / 2.0).round() as usize).max(1);
+        }
+        if (1.5..2.5).contains(&self.avg_cells) { self.members } else { 0 }
     }
 }
 
@@ -88,6 +123,31 @@ pub struct ListCensus {
     pub suppressed: usize,
     pub landmark_dropped: usize,
     pub empty_tables: Vec<EmptyTable>,
+    /// 랜드마크 밖 본문 글자 수.
+    pub main_chars: usize,
+    /// 구획 묶음에 가려진 라벨-값 쌍의 수.
+    pub section_pairs: usize,
+    /// 묶음이 레코드가 아니라 한 레코드를 나눈 구획인가. 표 두세 개이거나, 안쪽 라벨이 거의 겹치지 않습니다.
+    pub sectioned: bool,
+}
+
+/// 🌟 [STRUCT LAYOUT] 페이지가 목록인지 상세인지 DOM 구조만으로 본 판정.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralLayout {
+    List,
+    Detail,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LayoutEvidence {
+    pub verdict: StructuralLayout,
+    /// 가장 큰 레코드 묶음의 행 수
+    pub rows: usize,
+    /// 그 묶음이 본문 글자에서 차지하는 비율
+    pub share: f32,
+    /// 라벨-값 쌍 수
+    pub pairs: usize,
 }
 
 struct Probe {
@@ -252,7 +312,7 @@ fn effective_cells(el: &ElementRef, probe: &Probe) -> usize {
     n
 }
 
-fn in_landmark(el: &ElementRef) -> bool {
+pub fn in_landmark(el: &ElementRef) -> bool {
     let mut cur = Some(*el);
     while let Some(e) = cur {
         let name = e.value().name();
@@ -411,9 +471,21 @@ pub fn run(html: &str) -> ListCensus {
     raw.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     let mut kept: Vec<CensusGroup> = Vec::new();
     let mut suppressed = 0usize;
+    let mut section_pairs = 0usize;
+    let mut nested_pairs = 0usize;
+    let mut nested_labels: Vec<String> = Vec::new();
     for c in raw.into_iter() {
-        if kept.iter().any(|k| nested(k, &c)) {
+        if let Some(k) = kept.iter().find(|k| nested(k, &c)) {
             suppressed += 1;
+            // 주문 정보 표와 상품 표가 닮으면 표 묶음이 먼저 뽑혀 안쪽 행이 빠집니다.
+            let pairs = c.label_value_pairs();
+            if pairs > 0 {
+                if k.members <= SECTION_MAX_MEMBERS {
+                    section_pairs += pairs;
+                }
+                nested_pairs += pairs;
+                nested_labels.extend(c.member_labels());
+            }
             continue;
         }
         kept.push(c);
@@ -422,8 +494,36 @@ pub fn run(html: &str) -> ListCensus {
         }
     }
 
+    // 카드 목록은 카드마다 같은 라벨이 반복되고, 구획으로 나눈 상세는 라벨이 한 번씩만 나옵니다.
+    let distinct: HashSet<&String> = nested_labels.iter().collect();
+    let sectioned = nested_labels.len() >= LAYOUT_MIN_ROWS
+        && nested_labels.len() * 2 >= nested_pairs
+        && distinct.len() as f32 / nested_labels.len() as f32 >= SECTION_DISTINCT_LABELS;
+    if sectioned {
+        section_pairs = nested_pairs;
+    }
+
     let empty_tables = find_empty_tables(&doc, &probe);
-    ListCensus { groups: kept, suppressed, landmark_dropped, empty_tables }
+    let main_chars = main_text_chars(&doc);
+    ListCensus { groups: kept, suppressed, landmark_dropped, empty_tables, main_chars, section_pairs, sectioned }
+}
+
+/// 랜드마크(nav · header · footer · aside)와 스크립트를 뺀 본문 글자 수.
+fn main_text_chars(doc: &Html) -> usize {
+    let mut total = 0usize;
+    for n in doc.tree.root().descendants() {
+        let Some(t) = n.value().as_text() else { continue };
+        let chars = t.chars().filter(|c| !c.is_whitespace()).count();
+        if chars == 0 {
+            continue;
+        }
+        let Some(parent) = n.parent().and_then(ElementRef::wrap) else { continue };
+        if matches!(parent.value().name(), "script" | "style" | "title" | "option") || in_landmark(&parent) {
+            continue;
+        }
+        total += chars;
+    }
+    total
 }
 
 fn build_group(
@@ -598,6 +698,40 @@ fn find_empty_tables(doc: &Html, probe: &Probe) -> Vec<EmptyTable> {
 }
 
 impl ListCensus {
+    /// 🌟 [STRUCT LAYOUT] 반복 레코드와 라벨-값 쌍 중 무엇이 본문의 뼈대인지 봅니다.
+    ///
+    ///  ── 왜 구조인가 ──
+    ///   임베딩 판정은 제목 한 줄과 레이아웃 구의 코사인 차이에 크게 기대는데, 그 값은 합성 96페이지에서 0.05 안팎이고
+    ///   목록과 상세가 구별되지 않았습니다(상세의 21.7% 만 상세로 판정). 반면 DOM 에서는 목록의 레코드가 6~20행, 상세는 0~4행으로
+    ///   갈립니다. 목록이냐 상세냐는 뜻이 아니라 모양의 문제이므로 모양으로 먼저 정합니다.
+    ///
+    ///  ── 상세에도 반복이 있습니다 ──
+    ///   주문 상세의 상품 표, 상품 상세의 추천 상품은 레코드처럼 생겼습니다. 그래서 행 수만 보지 않고, 그 묶음이 본문 글자의
+    ///   상당 부분을 차지하고 라벨-값 쌍보다 넓을 때만 목록으로 봅니다. 어느 쪽도 뚜렷하지 않으면 Unknown 을 돌려주고
+    ///   임베딩 근거에 맡깁니다(행이 한두 개뿐인 목록 등).
+    ///
+    ///  ── 값이 몇 개뿐인 상세 ──
+    ///   기획전이나 후기 상세는 라벨-값이 서너 쌍뿐입니다. 레코드가 하나도 없는데 표시된 값 쌍이 있으면 상세로 봅니다.
+    ///   빈 목록은 필터 양식(form_like)과 빈 표가 남으므로 이 판정에 들어오지 않습니다.
+    pub fn layout_evidence(&self) -> LayoutEvidence {
+        let top = self.groups.iter().filter(|g| g.structural_grade()).max_by_key(|g| g.members);
+        let rows = top.map_or(0, |g| g.members);
+        let cells = top.filter(|g| g.members > SECTION_MAX_MEMBERS && !self.sectioned).map_or(0.0, |g| g.members as f32 * g.avg_cells);
+        let share = top.map_or(0.0, |g| g.text_chars() as f32 / self.main_chars.max(1) as f32).min(1.0);
+        let pairs: usize = self.groups.iter().map(|g| g.label_value_pairs()).sum::<usize>() + self.section_pairs;
+        let shown_pairs: usize = self.groups.iter().filter(|g| !g.form_like).map(|g| g.label_value_pairs()).sum();
+        let verdict = if rows >= LAYOUT_MIN_ROWS && share >= LAYOUT_MIN_SHARE && cells > (pairs * 2) as f32 {
+            StructuralLayout::List
+        } else if pairs >= LAYOUT_MIN_ROWS && (pairs * 2) as f32 >= cells {
+            StructuralLayout::Detail
+        } else if rows == 0 && shown_pairs >= LAYOUT_SPARSE_PAIRS && self.empty_tables.is_empty() {
+            StructuralLayout::Detail
+        } else {
+            StructuralLayout::Unknown
+        };
+        LayoutEvidence { verdict, rows, share, pairs }
+    }
+
     pub fn data_grade_count(&self) -> usize {
         self.groups.iter().filter(|g| g.data_grade()).count()
     }

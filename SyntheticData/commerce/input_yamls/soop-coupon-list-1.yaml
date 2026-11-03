@@ -1,0 +1,91 @@
+page_id: soop-coupon-list-1
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/coupons?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: SOO848
+  title: 첫 구매 환영 혜택 1차
+  type: 정액
+  discount: 5,000원
+  started_at: '2026-05-02'
+  expired_at: '2026-06-01'
+  status: 진행중
+- id,link: CP4014
+  code: SOO963
+  title: 주말 한정 할인 2차
+  type: 정률
+  discount: 5%
+  started_at: '2026-06-27'
+  expired_at: '2026-07-11'
+  status: 대기중
+- id,link: CP4021
+  code: SOO126
+  title: 앱 전용 혜택 3차
+  type: 정률
+  discount: 15%
+  started_at: '2026-08-27'
+  expired_at: '2026-09-26'
+  status: 대기중
+- id,link: CP4028
+  code: SOO427
+  title: 장바구니 응원 4차
+  type: 정률
+  discount: 20%
+  started_at: '2026-05-28'
+  expired_at: '2026-06-11'
+  status: 대기중
+- id,link: CP4035
+  code: SOO858
+  title: 앱 전용 혜택 5차
+  type: 정률
+  discount: 20%
+  started_at: '2026-07-05'
+  expired_at: '2026-07-19'
+  status: 진행중
+- id,link: CP4042
+  code: SOO613
+  title: 주말 한정 할인 6차
+  type: 정률
+  discount: 10%
+  started_at: '2026-05-10'
+  expired_at: '2026-06-09'
+  status: 진행중
+- id,link: CP4049
+  code: SOO958
+  title: 앱 전용 혜택 7차
+  type: 정률
+  discount: 20%
+  started_at: '2026-04-03'
+  expired_at: '2026-04-10'
+  status: 대기중
+- id,link: CP4056
+  code: SOO561
+  title: 장바구니 응원 8차
+  type: 정률
+  discount: 5%
+  started_at: '2026-07-12'
+  expired_at: '2026-07-26'
+  status: 진행중
+- id,link: CP4063
+  code: SOO478
+  title: 첫 구매 환영 혜택 9차
+  type: 정률
+  discount: 5%
+  started_at: '2026-08-07'
+  expired_at: '2026-08-21'
+  status: 대기중
+- id,link: CP4070
+  code: SOO843
+  title: 주말 한정 할인 10차
+  type: 정률
+  discount: 10%
+  started_at: '2026-09-12'
+  expired_at: '2026-09-19'
+  status: 진행중
+title: 쿠폰 관리

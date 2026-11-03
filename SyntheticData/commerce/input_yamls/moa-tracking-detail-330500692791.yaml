@@ -1,0 +1,30 @@
+page_id: moa-tracking-detail-330500692791
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/shipping/view?id=330500692791
+page_type: tracking
+layout: detail
+fields:
+  id,link: '330500692791'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 털 슬리퍼
+  shipping_date: '2026-05-02'
+  recipient_name: 서도윤
+  registration_date: '2026-05-01'
+  sender_name: 모아리테일 주식회사
+  sender_address: 경기도 성남시 수정구 창업로 42
+  sender_phone: 1811-0345
+  recipient_address: 경기도 수원시 영통구 매탄로 143 16층
+  recipient_phone: 010-5486-8573
+  weight: 3.3
+  width: 47
+  height: 38
+  length: 28
+  shipping_method: 화물배송
+  shipping_duration: 2
+  shipping_fee: 0
+title: 배송 상세 정보

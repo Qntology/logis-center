@@ -1,0 +1,28 @@
+page_id: harbor-order-detail-20260711-100053
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/order/view?id=20260711-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260711-100053
+  registration_date: '2026-07-11'
+  status: Processing
+  goods: Waterproof Bluetooth speaker
+  sender_name: Quinn Ashby
+  recipient_name: Rowan Sinclair
+  quantity: 9
+  amount: 173.6
+  shipping_fee: 0.0
+  payment_method: Credit card
+  sender_phone: +1-487-555-0182
+  sender_address: 1452 Birch Ave, Burlington, VT 05401
+  recipient_phone: +1-449-555-0187
+  recipient_address: 2838 Birch Ave, Boise, ID 83702
+  payment_origin: SwiftTender
+  payment_date: '2026-07-11'
+  card: Harbor Visa
+title: Order details

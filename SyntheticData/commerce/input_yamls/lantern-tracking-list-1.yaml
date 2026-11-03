@@ -1,0 +1,83 @@
+page_id: lantern-tracking-list-1
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/shipments?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '237628677867'
+  carrier: Swiftline Parcel
+  status: Delivered
+  title: Organic granola
+  shipping_date: '2026-07-13'
+  recipient_name: Harper Marsh
+- id,link: '117050997136'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Lightweight camp chair
+  shipping_date: '2026-09-30'
+  recipient_name: Avery Whitfield
+- id,link: '435066256648'
+  carrier: BlueRoute Freight
+  status: Returned
+  title: Sherpa fleece jacket
+  shipping_date: '2026-05-03'
+  recipient_name: Riley Kendrick
+- id,link: '611855088553'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Pet grooming brush
+  shipping_date: '2026-05-16'
+  recipient_name: Quinn Whitfield
+- id,link: '197273780600'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Monitor riser stand
+  shipping_date: '2026-06-04'
+  recipient_name: Riley Whitfield
+- id,link: '599950030479'
+  carrier: Swiftline Parcel
+  status: Delivered
+  title: Mineral sunscreen
+  shipping_date: '2026-10-05'
+  recipient_name: Morgan Kendrick
+- id,link: '330383358752'
+  carrier: Pinewood Express
+  status: Returned
+  title: Organic granola
+  shipping_date: '2026-05-15'
+  recipient_name: Rowan Kendrick
+- id,link: '885034212845'
+  carrier: BlueRoute Freight
+  status: Returned
+  title: Lightweight camp chair
+  shipping_date: '2026-04-15'
+  recipient_name: Casey Langley
+- id,link: '415750184809'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Ventilated sandals
+  shipping_date: '2026-04-05'
+  recipient_name: Riley Holloway
+- id,link: '638173840375'
+  carrier: Swiftline Parcel
+  status: Shipped
+  title: Pet grooming brush
+  shipping_date: '2026-07-31'
+  recipient_name: Casey Dorsey
+- id,link: '610956861348'
+  carrier: Pinewood Express
+  status: Returned
+  title: Folding trekking poles
+  shipping_date: '2026-06-29'
+  recipient_name: Riley Holloway
+- id,link: '108360243698'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Barrier moisture cream
+  shipping_date: '2026-05-15'
+  recipient_name: Taylor Kendrick
+title: Shipments

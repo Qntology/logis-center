@@ -1,0 +1,16 @@
+page_id: soop-review-detail-RV7011
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/reviews/RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: 승인
+  title: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+  name: 오주원
+  registration_date: '2026-06-01'
+title: 후기 보기

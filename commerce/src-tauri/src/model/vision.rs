@@ -190,12 +190,12 @@ impl crate::model::LogisModel {
                         "  🗂️ [LAYOUT CACHE / VERDICT] 신뢰 템플릿 '{}' 의 확정 서식 '{}' 을 그대로 씁니다. 이 서식에서 LLM 재판정이 필요했던 경우에도 그 결과가 템플릿에 들어 있으므로 다시 묻지 않습니다.",
                         t.template_id, t.detected_type
                     ));
-                } else if verdict.title_confirmed && !conflict && leads && (tie_candidates.len() <= 1 || tie_margin >= 0.15) {
+                } else if verdict.title_confirmed && !conflict && leads && (tie_candidates.len() <= 1 || tie_margin >= crate::models::siglip2::vision_encoder::TITLE_TRUST_MARGIN) {
                     emit_term(&format!(
                         "  🪪 [TITLE VERDICT TRUSTED] 판정 '{}' 은 상단 제목 행에 인쇄된 서식 전문의 선두이고 바디 축과 충돌하지 않습니다. 제목 행 밴드 안 1·2위 마진 {:+.4}. 밴드 밖 코드는 이미 후보가 아니므로 재판정 여부는 밴드 안 마진으로 정합니다. LLM 재판정을 열지 않습니다.",
                         verdict.code, tie_margin
                     ));
-                } else if tie_candidates.len() > 1 && (conflict || !leads || tie_margin < 0.15) {
+                } else if tie_candidates.len() > 1 && (conflict || !leads || tie_margin < crate::models::siglip2::vision_encoder::TITLE_TRUST_MARGIN) {
                     if conflict || !leads {
                         emit_term(&format!(
                             "  ⚔️ [TIE BREAK / TITLE-BODY CONFLICT] 판정 '{}' 이 제목 행 밴드의 선두가 아니거나, 바디 축이 결정 기준을 넘어 다른 서식을 가리킵니다. 제목 행 밴드와 두 축의 1위를 합친 후보 {}개로 LLM 재판정 1회 수행: {:?}",

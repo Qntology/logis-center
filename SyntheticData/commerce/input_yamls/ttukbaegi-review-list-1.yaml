@@ -1,0 +1,71 @@
+page_id: ttukbaegi-review-list-1
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/reviews?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: 승인
+  title: 포장이 꼼꼼했고 마감이 좋아서 괜찮습니다.
+  name: 조은호
+  registration_date: '2026-09-10'
+- id,link: RV7022
+  status: 대기중
+  title: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+  name: 서민준
+  registration_date: '2026-05-28'
+- id,link: RV7033
+  status: 승인
+  title: 두 번째 구매인데 역시 튼튼해서 좋네요.
+  name: 서시우
+  registration_date: '2026-05-29'
+- id,link: RV7044
+  status: 승인
+  title: 포장이 꼼꼼했고 마감이 좋아서 괜찮습니다.
+  name: 이채원
+  registration_date: '2026-09-26'
+- id,link: RV7055
+  status: 승인
+  title: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+  name: 이주원
+  registration_date: '2026-05-26'
+- id,link: RV7066
+  status: 승인
+  title: 생각보다 색이 예뻐서 만족합니다.
+  name: 이건우
+  registration_date: '2026-08-18'
+- id,link: RV7077
+  status: 숨김
+  title: 두 번째 구매인데 역시 가벼워서 좋네요.
+  name: 박유진
+  registration_date: '2026-05-25'
+- id,link: RV7088
+  status: 대기중
+  title: 생각보다 마감이 좋아서 만족합니다.
+  name: 정현우
+  registration_date: '2026-05-31'
+- id,link: RV7099
+  status: 숨김
+  title: 두 번째 구매인데 역시 색이 예뻐서 좋네요.
+  name: 강소율
+  registration_date: '2026-08-27'
+- id,link: RV7110
+  status: 숨김
+  title: 두 번째 구매인데 역시 튼튼해서 좋네요.
+  name: 한수아
+  registration_date: '2026-07-18'
+- id,link: RV7121
+  status: 승인
+  title: 생각보다 가벼워서 만족합니다.
+  name: 강주원
+  registration_date: '2026-09-08'
+- id,link: RV7132
+  status: 승인
+  title: 두 번째 구매인데 역시 튼튼해서 좋네요.
+  name: 윤건우
+  registration_date: '2026-05-08'
+title: 상품후기 관리

@@ -1,0 +1,83 @@
+page_id: lantern-tracking-list-2
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/shipments?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '998567970598'
+  carrier: Swiftline Parcel
+  status: Shipped
+  title: Silicone utensil set
+  shipping_date: '2026-08-04'
+  recipient_name: Casey Holloway
+- id,link: '926733941691'
+  carrier: Pinewood Express
+  status: Shipped
+  title: 65W fast charger
+  shipping_date: '2026-07-01'
+  recipient_name: Riley Kendrick
+- id,link: '271463445321'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Cooling neck band
+  shipping_date: '2026-09-26'
+  recipient_name: Emerson Ashby
+- id,link: '592531481550'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Folding trekking poles
+  shipping_date: '2026-05-10'
+  recipient_name: Finley Prescott
+- id,link: '302158032902'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Sherpa fleece jacket
+  shipping_date: '2026-05-30'
+  recipient_name: Taylor Langley
+- id,link: '412268893260'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Barrier moisture cream
+  shipping_date: '2026-05-27'
+  recipient_name: Quinn Dorsey
+- id,link: '218850256007'
+  carrier: Pinewood Express
+  status: Returned
+  title: Fragrance-free body lotion
+  shipping_date: '2026-04-29'
+  recipient_name: Taylor Mercer
+- id,link: '586301179339'
+  carrier: Pinewood Express
+  status: Shipped
+  title: Plush bunny doll
+  shipping_date: '2026-05-02'
+  recipient_name: Jordan Prescott
+- id,link: '471012538581'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Silent mechanical keyboard
+  shipping_date: '2026-06-25'
+  recipient_name: Taylor Prescott
+- id,link: '487877026977'
+  carrier: Swiftline Parcel
+  status: Shipped
+  title: Document file organizer
+  shipping_date: '2026-06-03'
+  recipient_name: Quinn Whitfield
+- id,link: '784605216627'
+  carrier: Harbor Courier
+  status: Returned
+  title: Scorched brown rice crisps
+  shipping_date: '2026-08-02'
+  recipient_name: Avery Langley
+- id,link: '557892737706'
+  carrier: Harbor Courier
+  status: Shipped
+  title: Airtight glass container set
+  shipping_date: '2026-09-04'
+  recipient_name: Quinn Ashby
+title: Shipments

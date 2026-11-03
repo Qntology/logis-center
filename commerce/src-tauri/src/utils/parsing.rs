@@ -71,7 +71,10 @@ pub fn pre_clean_html(html: &str) -> String {
     let html = re_tags.replace_all(&html, "");
 
     // 3. 단일 태그 및 불필요한 메타 태그 정리 (input은 제외하고 보존)
-    let re_single = Regex::new(r"(?is)<(meta|link|br|hr|source)\b[^>]*>").unwrap();
+    // 🌟 [BR WORD GAP] <br> 은 화면에서 낱말을 가르므로 공백으로 바꿉니다. 지우기만 하면 '마포구<br>합정로' 가 '마포구합정로' 가 됩니다.
+    let re_break = Regex::new(r"(?is)<(br|hr)\b[^>]*>").unwrap();
+    let html = re_break.replace_all(&html, " ");
+    let re_single = Regex::new(r"(?is)<(meta|link|source)\b[^>]*>").unwrap();
     let clean = re_single.replace_all(&html, "");
 
     // 4. 허용된 속성 외 모두 제거 (지정된 16개 속성만 보존)

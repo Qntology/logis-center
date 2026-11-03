@@ -1,0 +1,83 @@
+page_id: moa-tracking-list-1
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '886177832427'
+  carrier: 한빛로지스
+  status: 배송중
+  title: 노트북 거치대
+  shipping_date: '2026-07-10'
+  recipient_name: 임예준
+- id,link: '572403973922'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 원목 블록 세트
+  shipping_date: '2026-06-04'
+  recipient_name: 오하은
+- id,link: '330500692791'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 털 슬리퍼
+  shipping_date: '2026-05-02'
+  recipient_name: 서도윤
+- id,link: '913794300012'
+  carrier: 새길운송
+  status: 배송완료
+  title: 비타민 C 세럼
+  shipping_date: '2026-06-14'
+  recipient_name: 최채원
+- id,link: '759830694554'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: 노이즈캔슬링 무선 이어폰
+  shipping_date: '2026-05-22'
+  recipient_name: 신예준
+- id,link: '429626620594'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: 비타민 C 세럼
+  shipping_date: '2026-06-18'
+  recipient_name: 신채원
+- id,link: '504192449610'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 무기자차 선크림
+  shipping_date: '2026-07-12'
+  recipient_name: 장주원
+- id,link: '997689028990'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: 코딩 로봇 키트
+  shipping_date: '2026-04-10'
+  recipient_name: 임수아
+- id,link: '290539531496'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 65W 고속 충전기
+  shipping_date: '2026-08-03'
+  recipient_name: 권유진
+- id,link: '785356489847'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: 강아지 하네스
+  shipping_date: '2026-09-04'
+  recipient_name: 임소율
+- id,link: '917334219994'
+  carrier: 바른택배
+  status: 배송완료
+  title: 손상모 헤어 에센스
+  shipping_date: '2026-07-18'
+  recipient_name: 신민준
+- id,link: '493010304115'
+  carrier: 바른택배
+  status: 반품
+  title: 자외선 차단 양산
+  shipping_date: '2026-10-12'
+  recipient_name: 오유진
+title: 배송 조회

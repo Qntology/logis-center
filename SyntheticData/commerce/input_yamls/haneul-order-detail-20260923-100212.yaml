@@ -1,0 +1,28 @@
+page_id: haneul-order-detail-20260923-100212
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/order/view?id=20260923-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260923-100212
+  registration_date: '2026-09-23'
+  status: 반품
+  goods: 어린이 킥보드
+  tracking_number: '871729019834'
+  sender_name: 오건우
+  recipient_name: 오건우
+  quantity: 4
+  amount: 237100
+  shipping_fee: 0
+  payment_method: 간편결제
+  sender_phone: 010-5685-6112
+  sender_address: 경기도 고양시 일산동구 중앙로 381
+  recipient_phone: 010-5685-6112
+  recipient_address: 경기도 고양시 일산동구 중앙로 381
+  payment_origin: 온페이먼츠
+  payment_date: '2026-09-23'
+title: 주문 상세내역

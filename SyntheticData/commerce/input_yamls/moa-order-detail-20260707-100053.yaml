@@ -1,0 +1,28 @@
+page_id: moa-order-detail-20260707-100053
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/order/view?id=20260707-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260707-100053
+  registration_date: '2026-07-07'
+  status: 배송중
+  goods: 노트북 거치대
+  tracking_number: '886177832427'
+  sender_name: 장건우
+  recipient_name: 임예준
+  quantity: 1
+  amount: 34700
+  shipping_fee: 3000
+  payment_method: 간편결제
+  sender_phone: 010-9460-5900
+  sender_address: 서울특별시 성동구 왕십리로 261 12층
+  recipient_phone: 010-8673-9475
+  recipient_address: 서울특별시 마포구 합정로 284 2층
+  payment_origin: 온페이먼츠
+  payment_date: '2026-07-07'
+title: 주문 상세내역

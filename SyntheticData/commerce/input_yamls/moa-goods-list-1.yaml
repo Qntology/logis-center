@@ -1,0 +1,111 @@
+page_id: moa-goods-list-1
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/goods/list?page=1
+page_type: goods
+layout: list
+items:
+- id,link: MA10037
+  title: 경량 패딩 조끼
+  status: 품절
+  category: 의류
+  sale_price: 69500
+  quantity: 0
+  registration_date: '2026-01-22'
+  brand_name: Oakfern
+- id,link: MA10074
+  title: 고양이 스크래처
+  status: 진열안함
+  category: 반려
+  sale_price: 19500
+  quantity: 350
+  registration_date: '2026-09-07'
+  brand_name: Oakfern
+- id,link: MA10111
+  title: 비타민 C 세럼
+  status: 판매중
+  category: 뷰티
+  sale_price: 38800
+  compare_at_price: 46560
+  quantity: 18
+  registration_date: '2026-03-21'
+  brand_name: Marlow & Finch
+- id,link: MA10148
+  title: 통풍 샌들
+  status: 판매중
+  category: 의류
+  sale_price: 31700
+  quantity: 350
+  registration_date: '2026-01-05'
+  brand_name: Tidewell
+- id,link: MA10185
+  title: 저소음 기계식 키보드
+  status: 판매중
+  category: 디지털
+  sale_price: 96500
+  quantity: 18
+  registration_date: '2026-04-29'
+  brand_name: Kestrel Lane
+- id,link: MA10222
+  title: USB-C 멀티 허브
+  status: 품절
+  category: 디지털
+  sale_price: 37000
+  compare_at_price: 44400
+  quantity: 0
+  registration_date: '2026-01-13'
+  brand_name: 버들
+- id,link: MA10259
+  title: 콜드브루 원액
+  status: 판매중
+  category: 식품
+  sale_price: 16200
+  compare_at_price: 19440
+  quantity: 350
+  registration_date: '2026-04-05'
+  brand_name: Marlow & Finch
+- id,link: MA10296
+  title: 무기자차 선크림
+  status: 품절
+  category: 뷰티
+  sale_price: 24800
+  quantity: 0
+  registration_date: '2026-05-26'
+  brand_name: Marlow & Finch
+- id,link: MA10333
+  title: 스테인리스 프라이팬
+  status: 판매중
+  category: 주방
+  sale_price: 58600
+  quantity: 42
+  registration_date: '2026-02-16'
+  brand_name: 버들
+- id,link: MA10370
+  title: 수분 장벽 크림
+  status: 판매중
+  category: 뷰티
+  sale_price: 32800
+  compare_at_price: 39360
+  quantity: 350
+  registration_date: '2026-02-21'
+  brand_name: 하람
+- id,link: MA10407
+  title: 털 슬리퍼
+  status: 판매중
+  category: 생활
+  sale_price: 18700
+  quantity: 120
+  registration_date: '2026-05-05'
+  brand_name: Marlow & Finch
+- id,link: MA10444
+  title: 서류 정리함
+  status: 품절
+  category: 사무
+  sale_price: 14500
+  quantity: 0
+  registration_date: '2026-03-29'
+  brand_name: Oakfern
+title: 상품 관리

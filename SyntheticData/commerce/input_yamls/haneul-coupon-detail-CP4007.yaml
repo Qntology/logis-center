@@ -1,0 +1,21 @@
+page_id: haneul-coupon-detail-CP4007
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/coupon/view?id=CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: HAN372
+  title: 앱 전용 혜택 1차
+  type: 정액
+  discount: 2,000원
+  started_at: '2026-05-13'
+  expired_at: '2026-05-27'
+  status: 진행중
+  quantity: 500
+  min_order_amount: 10000
+title: 쿠폰 정보

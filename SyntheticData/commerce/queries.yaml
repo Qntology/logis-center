@@ -1,0 +1,3517 @@
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 추운 날 몸을 따뜻하게 해 줄 물건
+  relevant:
+  - haneul:goods:HN10481
+  - haneul:goods:HN10592
+  - haneul:goods:HN10888
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - haneul:goods:HN10481
+  - haneul:goods:HN10592
+  - haneul:goods:HN10888
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 더위를 식히는 데 도움이 되는 제품
+  relevant:
+  - haneul:goods:HN10185
+  - haneul:goods:HN10222
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - haneul:goods:HN10185
+  - haneul:goods:HN10222
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 재택근무 책상을 정돈하고 편하게 만드는 용품
+  relevant:
+  - haneul:goods:HN10259
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - haneul:goods:HN10259
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 요리할 때 쓰는 주방 도구
+  relevant:
+  - haneul:goods:HN10370
+  - haneul:goods:HN10407
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - haneul:goods:HN10370
+  - haneul:goods:HN10407
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 어린아이에게 줄 선물
+  relevant:
+  - haneul:goods:HN10666
+  - haneul:goods:HN10740
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - haneul:goods:HN10666
+  - haneul:goods:HN10740
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 강아지나 고양이를 키울 때 필요한 것
+  relevant:
+  - haneul:goods:HN10037
+  - haneul:goods:HN10333
+  - haneul:goods:HN10851
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - haneul:goods:HN10037
+  - haneul:goods:HN10333
+  - haneul:goods:HN10851
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 주말 야영에 챙겨 갈 장비
+  relevant:
+  - haneul:goods:HN10814
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - haneul:goods:HN10814
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 건조하고 민감한 피부 관리 제품
+  relevant:
+  - haneul:goods:HN10444
+  - haneul:goods:HN10555
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - haneul:goods:HN10444
+  - haneul:goods:HN10555
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 출출할 때 먹을 간식이나 마실 것
+  relevant:
+  - haneul:goods:HN10074
+  - haneul:goods:HN10296
+  - haneul:goods:HN10518
+  - haneul:goods:HN10703
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - haneul:goods:HN10074
+  - haneul:goods:HN10296
+  - haneul:goods:HN10518
+  - haneul:goods:HN10703
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 이동 중에 음악을 듣거나 전자기기를 충전하는 물건
+  relevant:
+  - haneul:goods:HN10111
+  - haneul:goods:HN10148
+  - haneul:goods:HN10629
+  - haneul:goods:HN10777
+- split: dev
+  shop: haneul
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - haneul:goods:HN10111
+  - haneul:goods:HN10148
+  - haneul:goods:HN10629
+  - haneul:goods:HN10777
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260625-100159 내역 알려줘
+  relevant:
+  - haneul:order:20260625-100159
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260403-100583 내역 알려줘
+  relevant:
+  - haneul:order:20260403-100583
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260522-100636 내역 알려줘
+  relevant:
+  - haneul:order:20260522-100636
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260916-100795 내역 알려줘
+  relevant:
+  - haneul:order:20260916-100795
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260415-100954 내역 알려줘
+  relevant:
+  - haneul:order:20260415-100954
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 365556517003 어디까지 왔어
+  relevant:
+  - haneul:tracking:365556517003
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 985470131264 어디까지 왔어
+  relevant:
+  - haneul:tracking:985470131264
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 669755300642 어디까지 왔어
+  relevant:
+  - haneul:tracking:669755300642
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 651639973093 어디까지 왔어
+  relevant:
+  - haneul:tracking:651639973093
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 991093348982 어디까지 왔어
+  relevant:
+  - haneul:tracking:991093348982
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 HN10740 재고 알려줘
+  relevant:
+  - haneul:goods:HN10740
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 HN10370 재고 알려줘
+  relevant:
+  - haneul:goods:HN10370
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 HN10629 재고 알려줘
+  relevant:
+  - haneul:goods:HN10629
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 HN10592 재고 알려줘
+  relevant:
+  - haneul:goods:HN10592
+- split: dev
+  shop: haneul
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 HN10481 재고 알려줘
+  relevant:
+  - haneul:goods:HN10481
+- split: dev
+  shop: haneul
+  kind: status
+  lang: ko
+  domain: order
+  query: 결제완료 상태인 주문 목록
+  relevant:
+  - haneul:order:20260409-100053
+  - haneul:order:20260925-101219
+- split: dev
+  shop: haneul
+  kind: status
+  lang: ko
+  domain: order
+  query: 반품 상태인 주문 목록
+  relevant:
+  - haneul:order:20260923-100212
+- split: dev
+  shop: haneul
+  kind: status
+  lang: ko
+  domain: order
+  query: 배송완료 상태인 주문 목록
+  relevant:
+  - haneul:order:20260415-100954
+  - haneul:order:20260417-100689
+  - haneul:order:20260502-100106
+  - haneul:order:20260522-100636
+  - haneul:order:20260627-100530
+  - haneul:order:20260822-101060
+  - haneul:order:20260928-100318
+  - haneul:order:20261002-100477
+- split: dev
+  shop: haneul
+  kind: status
+  lang: ko
+  domain: order
+  query: 배송중 상태인 주문 목록
+  relevant:
+  - haneul:order:20260403-100583
+  - haneul:order:20260427-100265
+  - haneul:order:20260531-101166
+  - haneul:order:20260628-100371
+  - haneul:order:20260716-101272
+- split: dev
+  shop: haneul
+  kind: status
+  lang: ko
+  domain: order
+  query: 상품준비중 상태인 주문 목록
+  relevant:
+  - haneul:order:20260625-100159
+- split: dev
+  shop: haneul
+  kind: status
+  lang: ko
+  domain: order
+  query: 입금대기 상태인 주문 목록
+  relevant:
+  - haneul:order:20260519-100901
+  - haneul:order:20260907-100742
+- split: dev
+  shop: haneul
+  kind: status
+  lang: ko
+  domain: order
+  query: 취소 상태인 주문 목록
+  relevant:
+  - haneul:order:20260607-101113
+  - haneul:order:20260611-100424
+  - haneul:order:20260624-101007
+  - haneul:order:20260829-100848
+  - haneul:order:20260916-100795
+- split: dev
+  shop: haneul
+  kind: person
+  lang: ko
+  domain: order
+  query: 이도윤 고객 주문 찾아줘
+  relevant:
+  - haneul:order:20260822-101060
+  - haneul:order:20260916-100795
+- split: dev
+  shop: haneul
+  kind: person
+  lang: ko
+  domain: order
+  query: 한시우 고객 주문 찾아줘
+  relevant:
+  - haneul:order:20260427-100265
+- split: dev
+  shop: haneul
+  kind: person
+  lang: ko
+  domain: order
+  query: 권서연 고객 주문 찾아줘
+  relevant:
+  - haneul:order:20260625-100159
+- split: dev
+  shop: haneul
+  kind: person
+  lang: ko
+  domain: order
+  query: 박민준 고객 주문 찾아줘
+  relevant:
+  - haneul:order:20260628-100371
+- split: dev
+  shop: haneul
+  kind: person
+  lang: ko
+  domain: order
+  query: 최채원 고객 주문 찾아줘
+  relevant:
+  - haneul:order:20260519-100901
+- split: dev
+  shop: haneul
+  kind: amount
+  lang: ko
+  domain: order
+  query: 결제금액 329,800원 이상 주문
+  relevant:
+  - haneul:order:20260427-100265
+  - haneul:order:20260531-101166
+  - haneul:order:20260607-101113
+  - haneul:order:20261002-100477
+- split: dev
+  shop: haneul
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 5월 주문
+  relevant:
+  - haneul:order:20260502-100106
+  - haneul:order:20260519-100901
+  - haneul:order:20260522-100636
+  - haneul:order:20260531-101166
+- split: dev
+  shop: haneul
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 7월 주문
+  relevant:
+  - haneul:order:20260716-101272
+- split: dev
+  shop: haneul
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 9월 주문
+  relevant:
+  - haneul:order:20260907-100742
+  - haneul:order:20260916-100795
+  - haneul:order:20260923-100212
+  - haneul:order:20260925-101219
+  - haneul:order:20260928-100318
+- split: dev
+  shop: haneul
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 경량 패딩 조끼
+  relevant:
+  - haneul:goods:HN10481
+- split: dev
+  shop: haneul
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Lightweight padded vest
+  relevant:
+  - haneul:goods:HN10481
+- split: dev
+  shop: haneul
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 진공 보온 텀블러
+  relevant:
+  - haneul:goods:HN10814
+- split: dev
+  shop: haneul
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Vacuum insulated tumbler
+  relevant:
+  - haneul:goods:HN10814
+- split: dev
+  shop: haneul
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 유기농 그래놀라 들어간 주문
+  relevant:
+  - haneul:order:20260417-100689
+- split: dev
+  shop: haneul
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 유기농 그래놀라
+  relevant:
+  - haneul:goods:HN10703
+- split: dev
+  shop: haneul
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Organic granola
+  relevant:
+  - haneul:goods:HN10703
+- split: dev
+  shop: haneul
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 자외선 차단 양산 들어간 주문
+  relevant:
+  - haneul:order:20260607-101113
+- split: dev
+  shop: haneul
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 자외선 차단 양산
+  relevant:
+  - haneul:goods:HN10222
+- split: dev
+  shop: haneul
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: UV-blocking parasol
+  relevant:
+  - haneul:goods:HN10222
+- split: dev
+  shop: haneul
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 핸드 블렌더 들어간 주문
+  relevant:
+  - haneul:order:20260822-101060
+- split: dev
+  shop: haneul
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 핸드 블렌더
+  relevant:
+  - haneul:goods:HN10370
+- split: dev
+  shop: haneul
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Immersion hand blender
+  relevant:
+  - haneul:goods:HN10370
+- split: dev
+  shop: haneul
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 비타민 C 세럼 들어간 주문
+  relevant:
+  - haneul:order:20260409-100053
+  - haneul:order:20260522-100636
+- split: dev
+  shop: haneul
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 비타민 C 세럼
+  relevant:
+  - haneul:goods:HN10555
+- split: dev
+  shop: haneul
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Vitamin C serum
+  relevant:
+  - haneul:goods:HN10555
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 추운 날 몸을 따뜻하게 해 줄 물건
+  relevant:
+  - moa:goods:MA10037
+  - moa:goods:MA10407
+  - moa:goods:MA10555
+  - moa:goods:MA10703
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - moa:goods:MA10037
+  - moa:goods:MA10407
+  - moa:goods:MA10555
+  - moa:goods:MA10703
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 더위를 식히는 데 도움이 되는 제품
+  relevant:
+  - moa:goods:MA10148
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - moa:goods:MA10148
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 재택근무 책상을 정돈하고 편하게 만드는 용품
+  relevant:
+  - moa:goods:MA10185
+  - moa:goods:MA10444
+  - moa:goods:MA10666
+  - moa:goods:MA10851
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - moa:goods:MA10185
+  - moa:goods:MA10444
+  - moa:goods:MA10666
+  - moa:goods:MA10851
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 요리할 때 쓰는 주방 도구
+  relevant:
+  - moa:goods:MA10333
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - moa:goods:MA10333
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 어린아이에게 줄 선물
+  relevant:
+  - moa:goods:MA10777
+  - moa:goods:MA10814
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - moa:goods:MA10777
+  - moa:goods:MA10814
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 강아지나 고양이를 키울 때 필요한 것
+  relevant:
+  - moa:goods:MA10074
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - moa:goods:MA10074
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 주말 야영에 챙겨 갈 장비
+  relevant:
+  - moa:goods:MA10481
+  - moa:goods:MA10518
+  - moa:goods:MA10740
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - moa:goods:MA10481
+  - moa:goods:MA10518
+  - moa:goods:MA10740
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 건조하고 민감한 피부 관리 제품
+  relevant:
+  - moa:goods:MA10111
+  - moa:goods:MA10296
+  - moa:goods:MA10370
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - moa:goods:MA10111
+  - moa:goods:MA10296
+  - moa:goods:MA10370
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 출출할 때 먹을 간식이나 마실 것
+  relevant:
+  - moa:goods:MA10259
+  - moa:goods:MA10592
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - moa:goods:MA10259
+  - moa:goods:MA10592
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 이동 중에 음악을 듣거나 전자기기를 충전하는 물건
+  relevant:
+  - moa:goods:MA10222
+  - moa:goods:MA10629
+  - moa:goods:MA10888
+- split: dev
+  shop: moa
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - moa:goods:MA10222
+  - moa:goods:MA10629
+  - moa:goods:MA10888
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260411-100477 내역 알려줘
+  relevant:
+  - moa:order:20260411-100477
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260613-100265 내역 알려줘
+  relevant:
+  - moa:order:20260613-100265
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260707-100053 내역 알려줘
+  relevant:
+  - moa:order:20260707-100053
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260627-100371 내역 알려줘
+  relevant:
+  - moa:order:20260627-100371
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260524-101166 내역 알려줘
+  relevant:
+  - moa:order:20260524-101166
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 609847373628 어디까지 왔어
+  relevant:
+  - moa:tracking:609847373628
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 913794300012 어디까지 왔어
+  relevant:
+  - moa:tracking:913794300012
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 460797149981 어디까지 왔어
+  relevant:
+  - moa:tracking:460797149981
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 747603647873 어디까지 왔어
+  relevant:
+  - moa:tracking:747603647873
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 759830694554 어디까지 왔어
+  relevant:
+  - moa:tracking:759830694554
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 MA10851 재고 알려줘
+  relevant:
+  - moa:goods:MA10851
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 MA10259 재고 알려줘
+  relevant:
+  - moa:goods:MA10259
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 MA10148 재고 알려줘
+  relevant:
+  - moa:goods:MA10148
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 MA10592 재고 알려줘
+  relevant:
+  - moa:goods:MA10592
+- split: dev
+  shop: moa
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 MA10111 재고 알려줘
+  relevant:
+  - moa:goods:MA10111
+- split: dev
+  shop: moa
+  kind: status
+  lang: ko
+  domain: order
+  query: 결제완료 상태인 주문 목록
+  relevant:
+  - moa:order:20260407-100954
+  - moa:order:20260411-100477
+- split: dev
+  shop: moa
+  kind: status
+  lang: ko
+  domain: order
+  query: 반품 상태인 주문 목록
+  relevant:
+  - moa:order:20260408-100636
+  - moa:order:20260520-100424
+  - moa:order:20260524-101166
+  - moa:order:20260617-100530
+  - moa:order:20260901-100848
+  - moa:order:20261011-101060
+- split: dev
+  shop: moa
+  kind: status
+  lang: ko
+  domain: order
+  query: 배송완료 상태인 주문 목록
+  relevant:
+  - moa:order:20260602-100106
+  - moa:order:20260613-100265
+  - moa:order:20260716-101007
+  - moa:order:20260731-100742
+- split: dev
+  shop: moa
+  kind: status
+  lang: ko
+  domain: order
+  query: 배송중 상태인 주문 목록
+  relevant:
+  - moa:order:20260501-100212
+  - moa:order:20260707-100053
+  - moa:order:20260709-100583
+- split: dev
+  shop: moa
+  kind: status
+  lang: ko
+  domain: order
+  query: 상품준비중 상태인 주문 목록
+  relevant:
+  - moa:order:20260514-100795
+  - moa:order:20260617-100901
+  - moa:order:20260818-100689
+  - moa:order:20260819-100159
+  - moa:order:20260918-101113
+- split: dev
+  shop: moa
+  kind: status
+  lang: ko
+  domain: order
+  query: 입금대기 상태인 주문 목록
+  relevant:
+  - moa:order:20260627-100371
+  - moa:order:20260813-101272
+  - moa:order:20260826-101219
+- split: dev
+  shop: moa
+  kind: status
+  lang: ko
+  domain: order
+  query: 취소 상태인 주문 목록
+  relevant:
+  - moa:order:20260607-100318
+- split: dev
+  shop: moa
+  kind: person
+  lang: ko
+  domain: order
+  query: 조은호 고객 주문 찾아줘
+  relevant:
+  - moa:order:20260520-100424
+- split: dev
+  shop: moa
+  kind: person
+  lang: ko
+  domain: order
+  query: 서도윤 고객 주문 찾아줘
+  relevant:
+  - moa:order:20260501-100212
+- split: dev
+  shop: moa
+  kind: person
+  lang: ko
+  domain: order
+  query: 장건우 고객 주문 찾아줘
+  relevant:
+  - moa:order:20260707-100053
+- split: dev
+  shop: moa
+  kind: person
+  lang: ko
+  domain: order
+  query: 권예준 고객 주문 찾아줘
+  relevant:
+  - moa:order:20260901-100848
+- split: dev
+  shop: moa
+  kind: person
+  lang: ko
+  domain: order
+  query: 최채원 고객 주문 찾아줘
+  relevant:
+  - moa:order:20260613-100265
+- split: dev
+  shop: moa
+  kind: amount
+  lang: ko
+  domain: order
+  query: 결제금액 285,200 이상 주문
+  relevant:
+  - moa:order:20260520-100424
+  - moa:order:20260617-100901
+  - moa:order:20260901-100848
+  - moa:order:20261011-101060
+- split: dev
+  shop: moa
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 5월 주문
+  relevant:
+  - moa:order:20260501-100212
+  - moa:order:20260514-100795
+  - moa:order:20260520-100424
+  - moa:order:20260524-101166
+- split: dev
+  shop: moa
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 7월 주문
+  relevant:
+  - moa:order:20260707-100053
+  - moa:order:20260709-100583
+  - moa:order:20260716-101007
+  - moa:order:20260731-100742
+- split: dev
+  shop: moa
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 9월 주문
+  relevant:
+  - moa:order:20260901-100848
+  - moa:order:20260918-101113
+- split: dev
+  shop: moa
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 서류 정리함
+  relevant:
+  - moa:goods:MA10444
+- split: dev
+  shop: moa
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Document file organizer
+  relevant:
+  - moa:goods:MA10444
+- split: dev
+  shop: moa
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 기모 후드집업 들어간 주문
+  relevant:
+  - moa:order:20260514-100795
+- split: dev
+  shop: moa
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 기모 후드집업
+  relevant:
+  - moa:goods:MA10555
+- split: dev
+  shop: moa
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Fleece-lined zip hoodie
+  relevant:
+  - moa:goods:MA10555
+- split: dev
+  shop: moa
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 수분 장벽 크림 들어간 주문
+  relevant:
+  - moa:order:20260617-100901
+- split: dev
+  shop: moa
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 수분 장벽 크림
+  relevant:
+  - moa:goods:MA10370
+- split: dev
+  shop: moa
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Barrier moisture cream
+  relevant:
+  - moa:goods:MA10370
+- split: dev
+  shop: moa
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 노이즈캔슬링 무선 이어폰 들어간 주문
+  relevant:
+  - moa:order:20260520-100424
+- split: dev
+  shop: moa
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 노이즈캔슬링 무선 이어폰
+  relevant:
+  - moa:goods:MA10629
+- split: dev
+  shop: moa
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Noise-cancelling wireless earbuds
+  relevant:
+  - moa:goods:MA10629
+- split: dev
+  shop: moa
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 케이블 정리함
+  relevant:
+  - moa:goods:MA10851
+- split: dev
+  shop: moa
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Cable management box
+  relevant:
+  - moa:goods:MA10851
+- split: dev
+  shop: moa
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: USB-C 멀티 허브
+  relevant:
+  - moa:goods:MA10222
+- split: dev
+  shop: moa
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: USB-C multiport hub
+  relevant:
+  - moa:goods:MA10222
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 추운 날 몸을 따뜻하게 해 줄 물건
+  relevant:
+  - soop:goods:SP10037
+  - soop:goods:SP10814
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - soop:goods:SP10037
+  - soop:goods:SP10814
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 더위를 식히는 데 도움이 되는 제품
+  relevant:
+  - soop:goods:SP10444
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - soop:goods:SP10444
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 재택근무 책상을 정돈하고 편하게 만드는 용품
+  relevant:
+  - soop:goods:SP10592
+  - soop:goods:SP10629
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - soop:goods:SP10592
+  - soop:goods:SP10629
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 요리할 때 쓰는 주방 도구
+  relevant:
+  - soop:goods:SP10481
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - soop:goods:SP10481
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 어린아이에게 줄 선물
+  relevant:
+  - soop:goods:SP10333
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - soop:goods:SP10333
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 강아지나 고양이를 키울 때 필요한 것
+  relevant:
+  - soop:goods:SP10074
+  - soop:goods:SP10111
+  - soop:goods:SP10148
+  - soop:goods:SP10407
+  - soop:goods:SP10740
+  - soop:goods:SP10851
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - soop:goods:SP10074
+  - soop:goods:SP10111
+  - soop:goods:SP10148
+  - soop:goods:SP10407
+  - soop:goods:SP10740
+  - soop:goods:SP10851
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 주말 야영에 챙겨 갈 장비
+  relevant:
+  - soop:goods:SP10222
+  - soop:goods:SP10259
+  - soop:goods:SP10296
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - soop:goods:SP10222
+  - soop:goods:SP10259
+  - soop:goods:SP10296
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 건조하고 민감한 피부 관리 제품
+  relevant:
+  - soop:goods:SP10370
+  - soop:goods:SP10518
+  - soop:goods:SP10555
+  - soop:goods:SP10703
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - soop:goods:SP10370
+  - soop:goods:SP10518
+  - soop:goods:SP10555
+  - soop:goods:SP10703
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 출출할 때 먹을 간식이나 마실 것
+  relevant:
+  - soop:goods:SP10185
+  - soop:goods:SP10777
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - soop:goods:SP10185
+  - soop:goods:SP10777
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 이동 중에 음악을 듣거나 전자기기를 충전하는 물건
+  relevant:
+  - soop:goods:SP10666
+  - soop:goods:SP10888
+- split: dev
+  shop: soop
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - soop:goods:SP10666
+  - soop:goods:SP10888
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260418-101272 내역 알려줘
+  relevant:
+  - soop:order:20260418-101272
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20261011-100795 내역 알려줘
+  relevant:
+  - soop:order:20261011-100795
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260906-101113 내역 알려줘
+  relevant:
+  - soop:order:20260906-101113
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260622-101007 내역 알려줘
+  relevant:
+  - soop:order:20260622-101007
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260716-100053 내역 알려줘
+  relevant:
+  - soop:order:20260716-100053
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 704311002504 어디까지 왔어
+  relevant:
+  - soop:tracking:704311002504
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 347176262433 어디까지 왔어
+  relevant:
+  - soop:tracking:347176262433
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 261873904940 어디까지 왔어
+  relevant:
+  - soop:tracking:261873904940
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 958283862822 어디까지 왔어
+  relevant:
+  - soop:tracking:958283862822
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 309323361982 어디까지 왔어
+  relevant:
+  - soop:tracking:309323361982
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 SP10666 재고 알려줘
+  relevant:
+  - soop:goods:SP10666
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 SP10481 재고 알려줘
+  relevant:
+  - soop:goods:SP10481
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 SP10222 재고 알려줘
+  relevant:
+  - soop:goods:SP10222
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 SP10185 재고 알려줘
+  relevant:
+  - soop:goods:SP10185
+- split: dev
+  shop: soop
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 SP10148 재고 알려줘
+  relevant:
+  - soop:goods:SP10148
+- split: dev
+  shop: soop
+  kind: status
+  lang: ko
+  domain: order
+  query: 결제완료 상태인 주문 목록
+  relevant:
+  - soop:order:20260505-101060
+  - soop:order:20260514-100159
+  - soop:order:20260622-100583
+  - soop:order:20260809-100848
+- split: dev
+  shop: soop
+  kind: status
+  lang: ko
+  domain: order
+  query: 반품 상태인 주문 목록
+  relevant:
+  - soop:order:20260421-100477
+  - soop:order:20261011-100795
+- split: dev
+  shop: soop
+  kind: status
+  lang: ko
+  domain: order
+  query: 배송완료 상태인 주문 목록
+  relevant:
+  - soop:order:20260406-100318
+  - soop:order:20261008-100689
+- split: dev
+  shop: soop
+  kind: status
+  lang: ko
+  domain: order
+  query: 배송중 상태인 주문 목록
+  relevant:
+  - soop:order:20260414-100954
+  - soop:order:20260606-100371
+  - soop:order:20260622-101007
+  - soop:order:20260906-101113
+- split: dev
+  shop: soop
+  kind: status
+  lang: ko
+  domain: order
+  query: 상품준비중 상태인 주문 목록
+  relevant:
+  - soop:order:20260405-100636
+  - soop:order:20260527-100212
+  - soop:order:20260614-100106
+  - soop:order:20260716-100053
+  - soop:order:20260925-100265
+- split: dev
+  shop: soop
+  kind: status
+  lang: ko
+  domain: order
+  query: 입금대기 상태인 주문 목록
+  relevant:
+  - soop:order:20260523-101219
+  - soop:order:20260527-100742
+  - soop:order:20260527-101166
+  - soop:order:20260603-100530
+  - soop:order:20260624-100424
+  - soop:order:20260923-100901
+- split: dev
+  shop: soop
+  kind: status
+  lang: ko
+  domain: order
+  query: 취소 상태인 주문 목록
+  relevant:
+  - soop:order:20260418-101272
+- split: dev
+  shop: soop
+  kind: person
+  lang: ko
+  domain: order
+  query: 신예준 고객 주문 찾아줘
+  relevant:
+  - soop:order:20260603-100530
+- split: dev
+  shop: soop
+  kind: person
+  lang: ko
+  domain: order
+  query: 윤주원 고객 주문 찾아줘
+  relevant:
+  - soop:order:20260923-100901
+- split: dev
+  shop: soop
+  kind: person
+  lang: ko
+  domain: order
+  query: 이다은 고객 주문 찾아줘
+  relevant:
+  - soop:order:20260622-101007
+- split: dev
+  shop: soop
+  kind: person
+  lang: ko
+  domain: order
+  query: 정시우 고객 주문 찾아줘
+  relevant:
+  - soop:order:20260606-100371
+- split: dev
+  shop: soop
+  kind: person
+  lang: ko
+  domain: order
+  query: 장시우 고객 주문 찾아줘
+  relevant:
+  - soop:order:20260421-100477
+- split: dev
+  shop: soop
+  kind: amount
+  lang: ko
+  domain: order
+  query: 결제금액 163,800원 이상 주문
+  relevant:
+  - soop:order:20260505-101060
+  - soop:order:20260527-100742
+  - soop:order:20260906-101113
+  - soop:order:20260925-100265
+- split: dev
+  shop: soop
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 5월 주문
+  relevant:
+  - soop:order:20260505-101060
+  - soop:order:20260514-100159
+  - soop:order:20260523-101219
+  - soop:order:20260527-100212
+  - soop:order:20260527-100742
+  - soop:order:20260527-101166
+- split: dev
+  shop: soop
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 7월 주문
+  relevant:
+  - soop:order:20260716-100053
+- split: dev
+  shop: soop
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 9월 주문
+  relevant:
+  - soop:order:20260906-101113
+  - soop:order:20260923-100901
+  - soop:order:20260925-100265
+- split: dev
+  shop: soop
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 스마트 밴드
+  relevant:
+  - soop:goods:SP10888
+- split: dev
+  shop: soop
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Smart fitness band
+  relevant:
+  - soop:goods:SP10888
+- split: dev
+  shop: soop
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 65W 고속 충전기 들어간 주문
+  relevant:
+  - soop:order:20260405-100636
+  - soop:order:20260527-100742
+  - soop:order:20260624-100424
+  - soop:order:20260925-100265
+- split: dev
+  shop: soop
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 65W 고속 충전기
+  relevant:
+  - soop:goods:SP10666
+- split: dev
+  shop: soop
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: 65W fast charger
+  relevant:
+  - soop:goods:SP10666
+- split: dev
+  shop: soop
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 극세사 담요
+  relevant:
+  - soop:goods:SP10037
+- split: dev
+  shop: soop
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Microfiber throw blanket
+  relevant:
+  - soop:goods:SP10037
+- split: dev
+  shop: soop
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 2인용 돔 텐트 들어간 주문
+  relevant:
+  - soop:order:20260505-101060
+  - soop:order:20260622-100583
+- split: dev
+  shop: soop
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 2인용 돔 텐트
+  relevant:
+  - soop:goods:SP10296
+- split: dev
+  shop: soop
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Two-person dome tent
+  relevant:
+  - soop:goods:SP10296
+- split: dev
+  shop: soop
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 경량 패딩 조끼
+  relevant:
+  - soop:goods:SP10814
+- split: dev
+  shop: soop
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Lightweight padded vest
+  relevant:
+  - soop:goods:SP10814
+- split: dev
+  shop: soop
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 고양이 스크래처 들어간 주문
+  relevant:
+  - soop:order:20260527-101166
+- split: dev
+  shop: soop
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 고양이 스크래처
+  relevant:
+  - soop:goods:SP10074
+- split: dev
+  shop: soop
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Cat scratching post
+  relevant:
+  - soop:goods:SP10074
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 추운 날 몸을 따뜻하게 해 줄 물건
+  relevant:
+  - harbor:goods:HP10444
+  - harbor:goods:HP10629
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - harbor:goods:HP10444
+  - harbor:goods:HP10629
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 더위를 식히는 데 도움이 되는 제품
+  relevant:
+  - harbor:goods:HP10185
+  - harbor:goods:HP10518
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - harbor:goods:HP10185
+  - harbor:goods:HP10518
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 재택근무 책상을 정돈하고 편하게 만드는 용품
+  relevant:
+  - harbor:goods:HP10148
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - harbor:goods:HP10148
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 요리할 때 쓰는 주방 도구
+  relevant:
+  - harbor:goods:HP10259
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - harbor:goods:HP10259
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 어린아이에게 줄 선물
+  relevant:
+  - harbor:goods:HP10666
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - harbor:goods:HP10666
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 강아지나 고양이를 키울 때 필요한 것
+  relevant:
+  - harbor:goods:HP10111
+  - harbor:goods:HP10333
+  - harbor:goods:HP10777
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - harbor:goods:HP10111
+  - harbor:goods:HP10333
+  - harbor:goods:HP10777
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 주말 야영에 챙겨 갈 장비
+  relevant:
+  - harbor:goods:HP10074
+  - harbor:goods:HP10703
+  - harbor:goods:HP10851
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - harbor:goods:HP10074
+  - harbor:goods:HP10703
+  - harbor:goods:HP10851
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 건조하고 민감한 피부 관리 제품
+  relevant:
+  - harbor:goods:HP10407
+  - harbor:goods:HP10481
+  - harbor:goods:HP10592
+  - harbor:goods:HP10888
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - harbor:goods:HP10407
+  - harbor:goods:HP10481
+  - harbor:goods:HP10592
+  - harbor:goods:HP10888
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 출출할 때 먹을 간식이나 마실 것
+  relevant:
+  - harbor:goods:HP10037
+  - harbor:goods:HP10222
+  - harbor:goods:HP10555
+  - harbor:goods:HP10740
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - harbor:goods:HP10037
+  - harbor:goods:HP10222
+  - harbor:goods:HP10555
+  - harbor:goods:HP10740
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 이동 중에 음악을 듣거나 전자기기를 충전하는 물건
+  relevant:
+  - harbor:goods:HP10296
+  - harbor:goods:HP10370
+  - harbor:goods:HP10814
+- split: dev
+  shop: harbor
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - harbor:goods:HP10296
+  - harbor:goods:HP10370
+  - harbor:goods:HP10814
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: order
+  query: look up order 20260408-100159
+  relevant:
+  - harbor:order:20260408-100159
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: order
+  query: look up order 20261013-101166
+  relevant:
+  - harbor:order:20261013-101166
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: order
+  query: look up order 20260516-101113
+  relevant:
+  - harbor:order:20260516-101113
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: order
+  query: look up order 20260801-100848
+  relevant:
+  - harbor:order:20260801-100848
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: order
+  query: look up order 20260730-100530
+  relevant:
+  - harbor:order:20260730-100530
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: tracking
+  query: where is tracking number 461775815205
+  relevant:
+  - harbor:tracking:461775815205
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: tracking
+  query: where is tracking number 781201316723
+  relevant:
+  - harbor:tracking:781201316723
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: tracking
+  query: where is tracking number 270242494338
+  relevant:
+  - harbor:tracking:270242494338
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: tracking
+  query: where is tracking number 119491683610
+  relevant:
+  - harbor:tracking:119491683610
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: tracking
+  query: where is tracking number 719547899303
+  relevant:
+  - harbor:tracking:719547899303
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: goods
+  query: stock for product HP10148
+  relevant:
+  - harbor:goods:HP10148
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: goods
+  query: stock for product HP10666
+  relevant:
+  - harbor:goods:HP10666
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: goods
+  query: stock for product HP10555
+  relevant:
+  - harbor:goods:HP10555
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: goods
+  query: stock for product HP10333
+  relevant:
+  - harbor:goods:HP10333
+- split: dev
+  shop: harbor
+  kind: identifier
+  lang: en
+  domain: goods
+  query: stock for product HP10370
+  relevant:
+  - harbor:goods:HP10370
+- split: dev
+  shop: harbor
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Awaiting payment
+  relevant:
+  - harbor:order:20260506-100371
+  - harbor:order:20260508-100689
+  - harbor:order:20261013-101166
+- split: dev
+  shop: harbor
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Cancelled
+  relevant:
+  - harbor:order:20260408-100159
+  - harbor:order:20260425-100424
+  - harbor:order:20260801-100848
+  - harbor:order:20260808-100212
+- split: dev
+  shop: harbor
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Delivered
+  relevant:
+  - harbor:order:20260516-100477
+  - harbor:order:20260720-101060
+  - harbor:order:20260802-100636
+  - harbor:order:20260819-100901
+  - harbor:order:20261009-100954
+- split: dev
+  shop: harbor
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Paid
+  relevant:
+  - harbor:order:20260412-100106
+- split: dev
+  shop: harbor
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Processing
+  relevant:
+  - harbor:order:20260613-100265
+  - harbor:order:20260629-101219
+  - harbor:order:20260708-101007
+  - harbor:order:20260711-100053
+  - harbor:order:20260816-100318
+  - harbor:order:20260924-101272
+- split: dev
+  shop: harbor
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Returned
+  relevant:
+  - harbor:order:20260710-100742
+- split: dev
+  shop: harbor
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Shipped
+  relevant:
+  - harbor:order:20260516-101113
+  - harbor:order:20260607-100583
+  - harbor:order:20260730-100530
+  - harbor:order:20260818-100795
+- split: dev
+  shop: harbor
+  kind: person
+  lang: en
+  domain: order
+  query: find orders from Jordan Mercer
+  relevant:
+  - harbor:order:20260508-100689
+- split: dev
+  shop: harbor
+  kind: person
+  lang: en
+  domain: order
+  query: find orders from Quinn Langley
+  relevant:
+  - harbor:order:20260730-100530
+  - harbor:order:20260819-100901
+- split: dev
+  shop: harbor
+  kind: person
+  lang: en
+  domain: order
+  query: find orders from Quinn Ashby
+  relevant:
+  - harbor:order:20260711-100053
+- split: dev
+  shop: harbor
+  kind: person
+  lang: en
+  domain: order
+  query: find orders from Jordan Whitfield
+  relevant:
+  - harbor:order:20260506-100371
+- split: dev
+  shop: harbor
+  kind: person
+  lang: en
+  domain: order
+  query: find orders from Quinn Mercer
+  relevant:
+  - harbor:order:20260516-100477
+- split: dev
+  shop: harbor
+  kind: amount
+  lang: en
+  domain: order
+  query: orders of $179.60 or more
+  relevant:
+  - harbor:order:20260506-100371
+  - harbor:order:20260629-101219
+  - harbor:order:20261009-100954
+  - harbor:order:20261013-101166
+- split: dev
+  shop: harbor
+  kind: period
+  lang: en
+  domain: order
+  query: orders placed in May 2026
+  relevant:
+  - harbor:order:20260506-100371
+  - harbor:order:20260508-100689
+  - harbor:order:20260516-100477
+  - harbor:order:20260516-101113
+- split: dev
+  shop: harbor
+  kind: period
+  lang: en
+  domain: order
+  query: orders placed in July 2026
+  relevant:
+  - harbor:order:20260708-101007
+  - harbor:order:20260710-100742
+  - harbor:order:20260711-100053
+  - harbor:order:20260720-101060
+  - harbor:order:20260730-100530
+- split: dev
+  shop: harbor
+  kind: period
+  lang: en
+  domain: order
+  query: orders placed in September 2026
+  relevant:
+  - harbor:order:20260924-101272
+- split: dev
+  shop: harbor
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Smart fitness band
+  relevant:
+  - harbor:goods:HP10370
+- split: dev
+  shop: harbor
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 스마트 밴드
+  relevant:
+  - harbor:goods:HP10370
+- split: dev
+  shop: harbor
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Vacuum insulated tumbler
+  relevant:
+  - harbor:goods:HP10074
+- split: dev
+  shop: harbor
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 진공 보온 텀블러
+  relevant:
+  - harbor:goods:HP10074
+- split: dev
+  shop: harbor
+  kind: goods_in_order
+  lang: en
+  domain: order
+  query: orders containing Ceramic chef knife
+  relevant:
+  - harbor:order:20260607-100583
+  - harbor:order:20260819-100901
+- split: dev
+  shop: harbor
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Ceramic chef knife
+  relevant:
+  - harbor:goods:HP10259
+- split: dev
+  shop: harbor
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 세라믹 식칼
+  relevant:
+  - harbor:goods:HP10259
+- split: dev
+  shop: harbor
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Organic granola
+  relevant:
+  - harbor:goods:HP10740
+- split: dev
+  shop: harbor
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 유기농 그래놀라
+  relevant:
+  - harbor:goods:HP10740
+- split: dev
+  shop: harbor
+  kind: goods_in_order
+  lang: en
+  domain: order
+  query: orders containing Fragrance-free body lotion
+  relevant:
+  - harbor:order:20260425-100424
+  - harbor:order:20260818-100795
+  - harbor:order:20261013-101166
+- split: dev
+  shop: harbor
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Fragrance-free body lotion
+  relevant:
+  - harbor:goods:HP10888
+- split: dev
+  shop: harbor
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 무향 바디 로션
+  relevant:
+  - harbor:goods:HP10888
+- split: dev
+  shop: harbor
+  kind: goods_in_order
+  lang: en
+  domain: order
+  query: orders containing Hypoallergenic kibble
+  relevant:
+  - harbor:order:20260508-100689
+  - harbor:order:20260730-100530
+- split: dev
+  shop: harbor
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Hypoallergenic kibble
+  relevant:
+  - harbor:goods:HP10111
+- split: dev
+  shop: harbor
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 저알러지 사료
+  relevant:
+  - harbor:goods:HP10111
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 추운 날 몸을 따뜻하게 해 줄 물건
+  relevant:
+  - ttukbaegi:goods:TB10888
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - ttukbaegi:goods:TB10888
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 더위를 식히는 데 도움이 되는 제품
+  relevant:
+  - ttukbaegi:goods:TB10074
+  - ttukbaegi:goods:TB10592
+  - ttukbaegi:goods:TB10777
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - ttukbaegi:goods:TB10074
+  - ttukbaegi:goods:TB10592
+  - ttukbaegi:goods:TB10777
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 재택근무 책상을 정돈하고 편하게 만드는 용품
+  relevant:
+  - ttukbaegi:goods:TB10111
+  - ttukbaegi:goods:TB10148
+  - ttukbaegi:goods:TB10814
+  - ttukbaegi:goods:TB10851
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - ttukbaegi:goods:TB10111
+  - ttukbaegi:goods:TB10148
+  - ttukbaegi:goods:TB10814
+  - ttukbaegi:goods:TB10851
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 요리할 때 쓰는 주방 도구
+  relevant:
+  - ttukbaegi:goods:TB10333
+  - ttukbaegi:goods:TB10629
+  - ttukbaegi:goods:TB10703
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - ttukbaegi:goods:TB10333
+  - ttukbaegi:goods:TB10629
+  - ttukbaegi:goods:TB10703
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 어린아이에게 줄 선물
+  relevant:
+  - ttukbaegi:goods:TB10259
+  - ttukbaegi:goods:TB10444
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - ttukbaegi:goods:TB10259
+  - ttukbaegi:goods:TB10444
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 강아지나 고양이를 키울 때 필요한 것
+  relevant:
+  - ttukbaegi:goods:TB10518
+  - ttukbaegi:goods:TB10666
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - ttukbaegi:goods:TB10518
+  - ttukbaegi:goods:TB10666
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 주말 야영에 챙겨 갈 장비
+  relevant:
+  - ttukbaegi:goods:TB10185
+  - ttukbaegi:goods:TB10222
+  - ttukbaegi:goods:TB10407
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - ttukbaegi:goods:TB10185
+  - ttukbaegi:goods:TB10222
+  - ttukbaegi:goods:TB10407
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 건조하고 민감한 피부 관리 제품
+  relevant:
+  - ttukbaegi:goods:TB10296
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - ttukbaegi:goods:TB10296
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 출출할 때 먹을 간식이나 마실 것
+  relevant:
+  - ttukbaegi:goods:TB10481
+  - ttukbaegi:goods:TB10555
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - ttukbaegi:goods:TB10481
+  - ttukbaegi:goods:TB10555
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 이동 중에 음악을 듣거나 전자기기를 충전하는 물건
+  relevant:
+  - ttukbaegi:goods:TB10037
+  - ttukbaegi:goods:TB10370
+  - ttukbaegi:goods:TB10740
+- split: test
+  shop: ttukbaegi
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - ttukbaegi:goods:TB10037
+  - ttukbaegi:goods:TB10370
+  - ttukbaegi:goods:TB10740
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260506-100477 내역 알려줘
+  relevant:
+  - ttukbaegi:order:20260506-100477
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260621-100636 내역 알려줘
+  relevant:
+  - ttukbaegi:order:20260621-100636
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260728-100318 내역 알려줘
+  relevant:
+  - ttukbaegi:order:20260728-100318
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20260923-100053 내역 알려줘
+  relevant:
+  - ttukbaegi:order:20260923-100053
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: order
+  query: 주문번호 20261004-100265 내역 알려줘
+  relevant:
+  - ttukbaegi:order:20261004-100265
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 190867869231 어디까지 왔어
+  relevant:
+  - ttukbaegi:tracking:190867869231
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 633694505390 어디까지 왔어
+  relevant:
+  - ttukbaegi:tracking:633694505390
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 723294439675 어디까지 왔어
+  relevant:
+  - ttukbaegi:tracking:723294439675
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 258190560107 어디까지 왔어
+  relevant:
+  - ttukbaegi:tracking:258190560107
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: tracking
+  query: 운송장 403471162970 어디까지 왔어
+  relevant:
+  - ttukbaegi:tracking:403471162970
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 TB10555 재고 알려줘
+  relevant:
+  - ttukbaegi:goods:TB10555
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 TB10185 재고 알려줘
+  relevant:
+  - ttukbaegi:goods:TB10185
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 TB10259 재고 알려줘
+  relevant:
+  - ttukbaegi:goods:TB10259
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 TB10444 재고 알려줘
+  relevant:
+  - ttukbaegi:goods:TB10444
+- split: test
+  shop: ttukbaegi
+  kind: identifier
+  lang: ko
+  domain: goods
+  query: 상품번호 TB10111 재고 알려줘
+  relevant:
+  - ttukbaegi:goods:TB10111
+- split: test
+  shop: ttukbaegi
+  kind: status
+  lang: ko
+  domain: order
+  query: 결제완료 상태인 주문 목록
+  relevant:
+  - ttukbaegi:order:20260714-101272
+  - ttukbaegi:order:20260715-100742
+- split: test
+  shop: ttukbaegi
+  kind: status
+  lang: ko
+  domain: order
+  query: 반품 상태인 주문 목록
+  relevant:
+  - ttukbaegi:order:20260506-100477
+- split: test
+  shop: ttukbaegi
+  kind: status
+  lang: ko
+  domain: order
+  query: 배송완료 상태인 주문 목록
+  relevant:
+  - ttukbaegi:order:20260407-101166
+  - ttukbaegi:order:20260409-100424
+  - ttukbaegi:order:20260503-100212
+  - ttukbaegi:order:20260621-100636
+  - ttukbaegi:order:20260625-100159
+  - ttukbaegi:order:20260625-101007
+  - ttukbaegi:order:20260626-101113
+  - ttukbaegi:order:20260704-100106
+  - ttukbaegi:order:20260707-100848
+  - ttukbaegi:order:20260818-100583
+  - ttukbaegi:order:20260923-100053
+  - ttukbaegi:order:20260929-100530
+  - ttukbaegi:order:20261003-100901
+- split: test
+  shop: ttukbaegi
+  kind: status
+  lang: ko
+  domain: order
+  query: 배송중 상태인 주문 목록
+  relevant:
+  - ttukbaegi:order:20260605-100689
+- split: test
+  shop: ttukbaegi
+  kind: status
+  lang: ko
+  domain: order
+  query: 상품준비중 상태인 주문 목록
+  relevant:
+  - ttukbaegi:order:20260423-101219
+  - ttukbaegi:order:20260526-100795
+  - ttukbaegi:order:20260919-100371
+- split: test
+  shop: ttukbaegi
+  kind: status
+  lang: ko
+  domain: order
+  query: 입금대기 상태인 주문 목록
+  relevant:
+  - ttukbaegi:order:20260909-100954
+  - ttukbaegi:order:20261004-100265
+- split: test
+  shop: ttukbaegi
+  kind: status
+  lang: ko
+  domain: order
+  query: 취소 상태인 주문 목록
+  relevant:
+  - ttukbaegi:order:20260728-100318
+  - ttukbaegi:order:20260906-101060
+- split: test
+  shop: ttukbaegi
+  kind: person
+  lang: ko
+  domain: order
+  query: 서도윤 고객 주문 찾아줘
+  relevant:
+  - ttukbaegi:order:20260707-100848
+- split: test
+  shop: ttukbaegi
+  kind: person
+  lang: ko
+  domain: order
+  query: 신예준 고객 주문 찾아줘
+  relevant:
+  - ttukbaegi:order:20260929-100530
+- split: test
+  shop: ttukbaegi
+  kind: person
+  lang: ko
+  domain: order
+  query: 정하은 고객 주문 찾아줘
+  relevant:
+  - ttukbaegi:order:20260526-100795
+- split: test
+  shop: ttukbaegi
+  kind: person
+  lang: ko
+  domain: order
+  query: 정건우 고객 주문 찾아줘
+  relevant:
+  - ttukbaegi:order:20260503-100212
+  - ttukbaegi:order:20260909-100954
+- split: test
+  shop: ttukbaegi
+  kind: person
+  lang: ko
+  domain: order
+  query: 한현우 고객 주문 찾아줘
+  relevant:
+  - ttukbaegi:order:20260625-100159
+- split: test
+  shop: ttukbaegi
+  kind: amount
+  lang: ko
+  domain: order
+  query: 결제금액 ₩225,900 이상 주문
+  relevant:
+  - ttukbaegi:order:20260423-101219
+  - ttukbaegi:order:20260605-100689
+  - ttukbaegi:order:20260906-101060
+  - ttukbaegi:order:20260923-100053
+- split: test
+  shop: ttukbaegi
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 5월 주문
+  relevant:
+  - ttukbaegi:order:20260503-100212
+  - ttukbaegi:order:20260506-100477
+  - ttukbaegi:order:20260526-100795
+- split: test
+  shop: ttukbaegi
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 7월 주문
+  relevant:
+  - ttukbaegi:order:20260704-100106
+  - ttukbaegi:order:20260707-100848
+  - ttukbaegi:order:20260714-101272
+  - ttukbaegi:order:20260715-100742
+  - ttukbaegi:order:20260728-100318
+- split: test
+  shop: ttukbaegi
+  kind: period
+  lang: ko
+  domain: order
+  query: 2026년 9월 주문
+  relevant:
+  - ttukbaegi:order:20260906-101060
+  - ttukbaegi:order:20260909-100954
+  - ttukbaegi:order:20260919-100371
+  - ttukbaegi:order:20260923-100053
+  - ttukbaegi:order:20260929-100530
+- split: test
+  shop: ttukbaegi
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 휴대용 코펠 세트
+  relevant:
+  - ttukbaegi:goods:TB10185
+- split: test
+  shop: ttukbaegi
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Portable cookware set
+  relevant:
+  - ttukbaegi:goods:TB10185
+- split: test
+  shop: ttukbaegi
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 온도조절 전기포트
+  relevant:
+  - ttukbaegi:goods:TB10333
+- split: test
+  shop: ttukbaegi
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Temperature control kettle
+  relevant:
+  - ttukbaegi:goods:TB10333
+- split: test
+  shop: ttukbaegi
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 반려동물 이동장 들어간 주문
+  relevant:
+  - ttukbaegi:order:20260409-100424
+- split: test
+  shop: ttukbaegi
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 반려동물 이동장
+  relevant:
+  - ttukbaegi:goods:TB10666
+- split: test
+  shop: ttukbaegi
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Pet travel carrier
+  relevant:
+  - ttukbaegi:goods:TB10666
+- split: test
+  shop: ttukbaegi
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 아이스 쿨매트
+  relevant:
+  - ttukbaegi:goods:TB10592
+- split: test
+  shop: ttukbaegi
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Ice gel cooling mat
+  relevant:
+  - ttukbaegi:goods:TB10592
+- split: test
+  shop: ttukbaegi
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 냉감 넥밴드 들어간 주문
+  relevant:
+  - ttukbaegi:order:20260605-100689
+- split: test
+  shop: ttukbaegi
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 냉감 넥밴드
+  relevant:
+  - ttukbaegi:goods:TB10074
+- split: test
+  shop: ttukbaegi
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Cooling neck band
+  relevant:
+  - ttukbaegi:goods:TB10074
+- split: test
+  shop: ttukbaegi
+  kind: goods_in_order
+  lang: ko
+  domain: order
+  query: 콜드브루 원액 들어간 주문
+  relevant:
+  - ttukbaegi:order:20260625-100159
+- split: test
+  shop: ttukbaegi
+  kind: goods_exact
+  lang: ko
+  domain: goods
+  query: 콜드브루 원액
+  relevant:
+  - ttukbaegi:goods:TB10555
+- split: test
+  shop: ttukbaegi
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Cold brew concentrate
+  relevant:
+  - ttukbaegi:goods:TB10555
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 추운 날 몸을 따뜻하게 해 줄 물건
+  relevant:
+  - lantern:goods:BL10740
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - lantern:goods:BL10740
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 더위를 식히는 데 도움이 되는 제품
+  relevant:
+  - lantern:goods:BL10259
+  - lantern:goods:BL10333
+  - lantern:goods:BL10814
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - lantern:goods:BL10259
+  - lantern:goods:BL10333
+  - lantern:goods:BL10814
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 재택근무 책상을 정돈하고 편하게 만드는 용품
+  relevant:
+  - lantern:goods:BL10592
+  - lantern:goods:BL10629
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - lantern:goods:BL10592
+  - lantern:goods:BL10629
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 요리할 때 쓰는 주방 도구
+  relevant:
+  - lantern:goods:BL10074
+  - lantern:goods:BL10296
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - lantern:goods:BL10074
+  - lantern:goods:BL10296
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 어린아이에게 줄 선물
+  relevant:
+  - lantern:goods:BL10111
+  - lantern:goods:BL10370
+  - lantern:goods:BL10407
+  - lantern:goods:BL10888
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - lantern:goods:BL10111
+  - lantern:goods:BL10370
+  - lantern:goods:BL10407
+  - lantern:goods:BL10888
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 강아지나 고양이를 키울 때 필요한 것
+  relevant:
+  - lantern:goods:BL10037
+  - lantern:goods:BL10222
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - lantern:goods:BL10037
+  - lantern:goods:BL10222
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 주말 야영에 챙겨 갈 장비
+  relevant:
+  - lantern:goods:BL10703
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - lantern:goods:BL10703
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 건조하고 민감한 피부 관리 제품
+  relevant:
+  - lantern:goods:BL10481
+  - lantern:goods:BL10518
+  - lantern:goods:BL10555
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - lantern:goods:BL10481
+  - lantern:goods:BL10518
+  - lantern:goods:BL10555
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 출출할 때 먹을 간식이나 마실 것
+  relevant:
+  - lantern:goods:BL10185
+  - lantern:goods:BL10444
+  - lantern:goods:BL10666
+  - lantern:goods:BL10777
+  - lantern:goods:BL10851
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - lantern:goods:BL10185
+  - lantern:goods:BL10444
+  - lantern:goods:BL10666
+  - lantern:goods:BL10777
+  - lantern:goods:BL10851
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: ko
+  domain: goods
+  query: 이동 중에 음악을 듣거나 전자기기를 충전하는 물건
+  relevant:
+  - lantern:goods:BL10148
+- split: test
+  shop: lantern
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - lantern:goods:BL10148
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: order
+  query: look up order 20260514-100318
+  relevant:
+  - lantern:order:20260514-100318
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: order
+  query: look up order 20260402-100689
+  relevant:
+  - lantern:order:20260402-100689
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: order
+  query: look up order 20260411-100795
+  relevant:
+  - lantern:order:20260411-100795
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: order
+  query: look up order 20260928-100159
+  relevant:
+  - lantern:order:20260928-100159
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: order
+  query: look up order 20260501-100265
+  relevant:
+  - lantern:order:20260501-100265
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: tracking
+  query: where is tracking number 557892737706
+  relevant:
+  - lantern:tracking:557892737706
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: tracking
+  query: where is tracking number 592531481550
+  relevant:
+  - lantern:tracking:592531481550
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: tracking
+  query: where is tracking number 926733941691
+  relevant:
+  - lantern:tracking:926733941691
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: tracking
+  query: where is tracking number 415750184809
+  relevant:
+  - lantern:tracking:415750184809
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: tracking
+  query: where is tracking number 998567970598
+  relevant:
+  - lantern:tracking:998567970598
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: goods
+  query: stock for product BL10111
+  relevant:
+  - lantern:goods:BL10111
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: goods
+  query: stock for product BL10296
+  relevant:
+  - lantern:goods:BL10296
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: goods
+  query: stock for product BL10407
+  relevant:
+  - lantern:goods:BL10407
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: goods
+  query: stock for product BL10222
+  relevant:
+  - lantern:goods:BL10222
+- split: test
+  shop: lantern
+  kind: identifier
+  lang: en
+  domain: goods
+  query: stock for product BL10444
+  relevant:
+  - lantern:goods:BL10444
+- split: test
+  shop: lantern
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Awaiting payment
+  relevant:
+  - lantern:order:20260411-100795
+  - lantern:order:20260608-100742
+  - lantern:order:20260713-100848
+- split: test
+  shop: lantern
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Cancelled
+  relevant:
+  - lantern:order:20260813-100583
+  - lantern:order:20260923-100901
+- split: test
+  shop: lantern
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Delivered
+  relevant:
+  - lantern:order:20260402-100689
+  - lantern:order:20260514-100318
+  - lantern:order:20260514-101113
+  - lantern:order:20260603-100371
+  - lantern:order:20260711-100106
+  - lantern:order:20260924-101272
+  - lantern:order:20260928-100159
+  - lantern:order:20261002-100477
+- split: test
+  shop: lantern
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Paid
+  relevant:
+  - lantern:order:20260601-100424
+  - lantern:order:20260927-100212
+- split: test
+  shop: lantern
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Processing
+  relevant:
+  - lantern:order:20260606-100954
+  - lantern:order:20260620-100053
+- split: test
+  shop: lantern
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Returned
+  relevant:
+  - lantern:order:20260413-100636
+  - lantern:order:20260501-100265
+  - lantern:order:20260512-100530
+  - lantern:order:20260627-101060
+- split: test
+  shop: lantern
+  kind: status
+  lang: en
+  domain: order
+  query: orders with status Shipped
+  relevant:
+  - lantern:order:20260628-101219
+  - lantern:order:20260729-101007
+  - lantern:order:20260802-101166
+- split: test
+  shop: lantern
+  kind: person
+  lang: en
+  domain: order
+  query: find orders from Quinn Mercer
+  relevant:
+  - lantern:order:20260411-100795
+- split: test
+  shop: lantern
+  kind: person
+  lang: en
+  domain: order
+  query: find orders from Harper Marsh
+  relevant:
+  - lantern:order:20260512-100530
+  - lantern:order:20260711-100106
+- split: test
+  shop: lantern
+  kind: person
+  lang: en
+  domain: order
+  query: find orders from Riley Whitfield
+  relevant:
+  - lantern:order:20260603-100371
+- split: test
+  shop: lantern
+  kind: person
+  lang: en
+  domain: order
+  query: find orders from Harper Mercer
+  relevant:
+  - lantern:order:20260606-100954
+  - lantern:order:20260927-100212
+- split: test
+  shop: lantern
+  kind: person
+  lang: en
+  domain: order
+  query: find orders from Riley Kendrick
+  relevant:
+  - lantern:order:20260501-100265
+  - lantern:order:20260628-101219
+- split: test
+  shop: lantern
+  kind: amount
+  lang: en
+  domain: order
+  query: orders of $191.50 or more
+  relevant:
+  - lantern:order:20260608-100742
+  - lantern:order:20260729-101007
+  - lantern:order:20260924-101272
+  - lantern:order:20260927-100212
+- split: test
+  shop: lantern
+  kind: period
+  lang: en
+  domain: order
+  query: orders placed in May 2026
+  relevant:
+  - lantern:order:20260501-100265
+  - lantern:order:20260512-100530
+  - lantern:order:20260514-100318
+  - lantern:order:20260514-101113
+- split: test
+  shop: lantern
+  kind: period
+  lang: en
+  domain: order
+  query: orders placed in July 2026
+  relevant:
+  - lantern:order:20260711-100106
+  - lantern:order:20260713-100848
+  - lantern:order:20260729-101007
+- split: test
+  shop: lantern
+  kind: period
+  lang: en
+  domain: order
+  query: orders placed in September 2026
+  relevant:
+  - lantern:order:20260923-100901
+  - lantern:order:20260924-101272
+  - lantern:order:20260927-100212
+  - lantern:order:20260928-100159
+- split: test
+  shop: lantern
+  kind: goods_in_order
+  lang: en
+  domain: order
+  query: orders containing UV-blocking parasol
+  relevant:
+  - lantern:order:20260606-100954
+- split: test
+  shop: lantern
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: UV-blocking parasol
+  relevant:
+  - lantern:goods:BL10333
+- split: test
+  shop: lantern
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 자외선 차단 양산
+  relevant:
+  - lantern:goods:BL10333
+- split: test
+  shop: lantern
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Toddler tableware set
+  relevant:
+  - lantern:goods:BL10370
+- split: test
+  shop: lantern
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 유아 식기 세트
+  relevant:
+  - lantern:goods:BL10370
+- split: test
+  shop: lantern
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Fleece-lined zip hoodie
+  relevant:
+  - lantern:goods:BL10740
+- split: test
+  shop: lantern
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 기모 후드집업
+  relevant:
+  - lantern:goods:BL10740
+- split: test
+  shop: lantern
+  kind: goods_in_order
+  lang: en
+  domain: order
+  query: orders containing Automatic pet feeder
+  relevant:
+  - lantern:order:20260601-100424
+- split: test
+  shop: lantern
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Automatic pet feeder
+  relevant:
+  - lantern:goods:BL10037
+- split: test
+  shop: lantern
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 자동 급식기
+  relevant:
+  - lantern:goods:BL10037
+- split: test
+  shop: lantern
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Pet travel carrier
+  relevant:
+  - lantern:goods:BL10222
+- split: test
+  shop: lantern
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 반려동물 이동장
+  relevant:
+  - lantern:goods:BL10222
+- split: test
+  shop: lantern
+  kind: goods_exact
+  lang: en
+  domain: goods
+  query: Cold brew concentrate
+  relevant:
+  - lantern:goods:BL10777
+- split: test
+  shop: lantern
+  kind: goods_crosslang
+  lang: ko
+  domain: goods
+  query: 콜드브루 원액
+  relevant:
+  - lantern:goods:BL10777

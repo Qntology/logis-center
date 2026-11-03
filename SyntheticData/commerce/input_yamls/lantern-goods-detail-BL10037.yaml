@@ -1,0 +1,30 @@
+page_id: lantern-goods-detail-BL10037
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/products/BL10037
+page_type: goods
+layout: detail
+fields:
+  id,link: BL10037
+  title: Automatic pet feeder
+  status: Active
+  category: Pets
+  sale_price: 53.15
+  compare_at_price: 63.78
+  quantity: 7
+  registration_date: '2026-04-24'
+  brand_name: 하람
+  code: BL-PET-101
+  stock_keeping_unit: BLPE1001
+  model_name: PE-961
+  manufacturer: 누리온산업
+  origin_country: Malaysia
+  color: Cream
+  barcode: '8828008795036'
+  supply_price: 34.09
+  low_stock_threshold: 10
+  description: Dispenses kibble at set times.
+title: Product details

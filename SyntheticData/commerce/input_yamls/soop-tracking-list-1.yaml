@@ -1,0 +1,83 @@
+page_id: soop-tracking-list-1
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/shipments?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '377890210013'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 기모 후드집업
+  shipping_date: '2026-04-09'
+  recipient_name: 임주원
+- id,link: '442048660228'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 색칠놀이 스케치북
+  shipping_date: '2026-06-09'
+  recipient_name: 정시우
+- id,link: '300213061856'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: 경량 캠핑 의자
+  shipping_date: '2026-04-23'
+  recipient_name: 김시우
+- id,link: '548218378892'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 무향 바디 로션
+  shipping_date: '2026-10-12'
+  recipient_name: 권은호
+- id,link: '952548712763'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: 저당 단백질바
+  shipping_date: '2026-10-14'
+  recipient_name: 강현우
+- id,link: '305504018645'
+  carrier: 한빛로지스
+  status: 배송중
+  title: 저알러지 사료
+  shipping_date: '2026-04-16'
+  recipient_name: 김소율
+- id,link: '309323361982'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 핸드 블렌더
+  shipping_date: '2026-06-24'
+  recipient_name: 강시우
+- id,link: '205381259317'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 경량 캠핑 의자
+  shipping_date: '2026-09-08'
+  recipient_name: 조민준
+- id,link: '546409437053'
+  carrier: 바른택배
+  status: 배송중
+  title: 케이블 정리함
+  shipping_date: '2026-06-28'
+  recipient_name: 이현우
+- id,link: '347176262433'
+  carrier: 새길운송
+  status: 배송완료
+  title: 양털 플리스 자켓
+  shipping_date: '2026-05-06'
+  recipient_name: 한서연
+- id,link: '983838166948'
+  carrier: 바른택배
+  status: 배송중
+  title: 유아 식기 세트
+  shipping_date: '2026-07-16'
+  recipient_name: 임현우
+- id,link: '261873904940'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 케이블 정리함
+  shipping_date: '2026-06-01'
+  recipient_name: 오다은
+title: 배송 조회

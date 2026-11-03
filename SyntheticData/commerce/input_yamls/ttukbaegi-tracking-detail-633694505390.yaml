@@ -1,0 +1,30 @@
+page_id: ttukbaegi-tracking-detail-633694505390
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/shipments/633694505390
+page_type: tracking
+layout: detail
+fields:
+  id,link: '633694505390'
+  carrier: 바른택배
+  status: 배송완료
+  title: 통풍 샌들
+  shipping_date: '2026-09-25'
+  recipient_name: 강소율
+  registration_date: '2026-09-23'
+  sender_name: 뚝배기유통 주식회사
+  sender_address: 대구광역시 동구 동대구로 465
+  sender_phone: 1833-0763
+  recipient_address: 강원특별자치도 춘천시 공지로 261
+  recipient_phone: 010-7234-4057
+  weight: 5.4
+  width: 37
+  height: 32
+  length: 33
+  shipping_method: 일반택배
+  shipping_duration: 5
+  shipping_fee: 0
+title: 배송 상세 정보

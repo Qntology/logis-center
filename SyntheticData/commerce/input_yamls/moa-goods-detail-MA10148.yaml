@@ -1,0 +1,30 @@
+page_id: moa-goods-detail-MA10148
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/goods/view?id=MA10148
+page_type: goods
+layout: detail
+fields:
+  id,link: MA10148
+  title: 통풍 샌들
+  status: 판매중
+  category: 의류
+  sale_price: 31700
+  quantity: 350
+  registration_date: '2026-01-05'
+  brand_name: Tidewell
+  code: MA-HOT-104
+  stock_keeping_unit: MAHO1004
+  model_name: HO-999
+  manufacturer: Oakfern Works
+  origin_country: 포르투갈
+  color: 연회색
+  barcode: '8870621046517'
+  supply_price: 22539
+  low_stock_threshold: 10
+  shipping_fee: 3000
+  description: 구멍 뚫린 갑피로 발이 답답하지 않습니다.
+title: 상품 정보

@@ -34,6 +34,22 @@ struct TitleCandidate {
 ///
 ///  ── 중복 접기 ──
 ///   앵커끼리 겹치는 구(껍데기 ↔ UI 액션 등)는 유일 구만 실연산합니다.
+/// 🌟 [DOC NUMBER EVIDENCE] 뒷장이 새 문서라는 근거가 되는 번호인가. 서식 코드로 시작해야 합니다.
+///   숫자 네 자리만 있어도 식별자 모양으로 통과해 뒷장의 중량 2500.0 · 금액 78500.0 · 계좌번호가 '자기 문서번호' 가 되었고,
+///   두 장짜리 문서 28건 중 16건의 둘째 장이 독립 문서로 갈라졌습니다. 표제가 있는 첫 장은 표제 축이 따로 잡습니다.
+pub fn carries_doc_code(value: &str) -> bool {
+    let head: String = value.trim().chars().take_while(|c| c.is_alphabetic()).collect();
+    !head.is_empty() && crate::utils::bias_schema::canonical_trade_doc_code(&head).is_some()
+}
+
+/// 접두어 없는 서식의 코사인 폴백에서 문서번호가 될 수 없는 칸을 거릅니다. 수치 · 날짜 · 연락처 칸과 소수는 번호가 아닙니다.
+pub fn self_id_value_possible(label: &str, value: &str) -> bool {
+    use crate::utils::ai_utils::{detect_field_format, FieldFormat};
+    let v = value.trim();
+    let decimal = v.contains('.') && v.replace(',', "").parse::<f64>().is_ok();
+    !decimal && !v.starts_with('+') && !matches!(detect_field_format(label), FieldFormat::Numeric | FieldFormat::Phone | FieldFormat::Date)
+}
+
 async fn trade_anchor_banks(
     model: &LogisModel,
     defs: &[(&str, &str)],
@@ -674,6 +690,10 @@ pub async fn probe_trade_document(
         emit_term("  🛒 [MODE KEEP] 무역 코드가 하나도 점수를 얻지 못했습니다. 커머스 판정을 유지합니다.");
         return None;
     }
+    // 🌟 [DOC CODE MATCH] 서식코드 증거 하나는 그 코드가 표제 축이 고른 서식일 때만 강한 증거입니다.
+    //    표제는 보험증권을 가리키는데 본문에 CO-12345 가 있다는 것은 무역 문서의 증거가 아닙니다.
+    let strong_structure = markers.len() >= 2
+        || markers.iter().any(|m| m.strip_prefix("doccode:") == Some(best_trade.0.as_str()));
     // ── ④ 게이트 1 : 진영 승패 ──
     //
     //  🌟 [STRUCTURE OVERRIDE] 강한 구조 증거가 있으면 진영 승부를 건너뜁니다.
@@ -837,10 +857,15 @@ fn trade_structural_evidence(pug: &str) -> (bool, Vec<String>) {
             found.push("bl_label".to_string());
         }
     }
-    if let Ok(re) = regex::Regex::new(r"\b([A-Z]{2,8})-[A-Z0-9]{3,}\b") {
+    if let Ok(re) = regex::Regex::new(r"\b([A-Z]{2,8})-([A-Z0-9]+(?:-[A-Z0-9]+)*)\b") {
         let mut seen: Vec<String> = Vec::new();
         for cap in re.captures_iter(&upper) {
             let prefix = match cap.get(1) { Some(m) => m.as_str().to_string(), None => continue };
+            // 🌟 [DOC NUMBER SHAPE] 문서번호는 숫자를 포함해 다섯 글자 이상입니다(CI-2026-08001, BL-55432219).
+            //    'CO-123' · 'PC-100' 같은 짧은 코드는 상품 모델명에 흔하고, 합성 상품 상세가 이 증거로 무역 서식이 되었습니다.
+            let number = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+            let body = number.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+            if body < 5 || !number.chars().any(|c| c.is_ascii_digit()) { continue; }
             if seen.iter().any(|e| e == &prefix) { continue; }
             let known = TRADE_DOC_TITLES.iter().any(|(c, _)| *c == prefix.as_str());
             if !known { continue; }
@@ -3097,7 +3122,7 @@ pub async fn process_trading_task(
                 let id_shaped = crate::utils::ai_utils::value_matches_format(
                     crate::utils::ai_utils::FieldFormat::Identifier,
                     &p.value,
-                );
+                ) && carries_doc_code(&p.value);
                 if in_row || below_rows || !id_shaped {
                     skipped.push(format!("{}='{}'", p.label, p.value));
                     continue;
@@ -3111,7 +3136,7 @@ pub async fn process_trading_task(
                     skipped.len() as f32,
                 );
                 emit_term(&format!(
-                    "     🧾 [PAGE CONTINUITY / SELF-ID SCOPE] 자기 문서번호 후보에서 뺀 라벨 {}개: {:?} | 문서번호는 품목 행보다 위의 머리 영역에 식별자 모양 값으로 인쇄됩니다. 행 번호 구역('[ Item N ]' 등) 안이나 첫 행 구역보다 아래에 있는 라벨, 식별자 모양이 아닌 값(수량 · 중량 등)은 이 페이지가 새 문서라는 근거가 되지 않습니다. 본문 추출의 SELF-ID ANCHOR 도 식별자 모양 값만 문서번호로 받으므로 같은 기준입니다.",
+                    "     🧾 [PAGE CONTINUITY / SELF-ID SCOPE] 자기 문서번호 후보에서 뺀 라벨 {}개: {:?} | 문서번호는 품목 행보다 위의 머리 영역에 서식 코드로 시작하는 값으로 인쇄됩니다. 행 번호 구역('[ Item N ]' 등) 안이나 첫 행 구역보다 아래에 있는 라벨, 서식 코드로 시작하지 않는 값(중량 · 금액 · 계좌번호 · 봉인번호 등)은 이 페이지가 새 문서라는 근거가 되지 않습니다.",
                     skipped.len(),
                     skipped.iter().take(8).collect::<Vec<_>>()
                 ));
@@ -4043,7 +4068,7 @@ pub async fn process_trading_task(
                     crate::utils::ai_utils::FieldFormat::Identifier, v,
                 ) { continue; }
                 if let Some(code) = leading_code(v) {
-                    if code.eq_ignore_ascii_case(doc_type.as_str()) {
+                    if crate::logic::same_trade_doc(code, doc_type.as_str()) {
                         prefix_hits.push(h);
                     }
                 }
@@ -4100,8 +4125,9 @@ pub async fn process_trading_task(
                     // 타 문서코드 접두어를 가진 값은 명시적으로 배제합니다.
                     // (CI-, PO-, LC- 가 자기 번호로 승격되는 경로를 코사인 단계에서 차단)
                     if let Some(code) = leading_code(v) {
-                        if !code.eq_ignore_ascii_case(doc_type.as_str()) { continue; }
+                        if !crate::logic::same_trade_doc(code, doc_type.as_str()) { continue; }
                     }
+                    if !self_id_value_possible(&unique_labels[h], v) { continue; }
                     cands.push(h);
                 }
                 if !row_scoped.is_empty() {
@@ -4134,7 +4160,7 @@ pub async fn process_trading_task(
                 crate::utils::ai_utils::FieldFormat::Identifier, v,
             ) { return false; }
             match leading_code(v) {
-                Some(code) => !code.eq_ignore_ascii_case(doc_type.as_str()),
+                Some(code) => !crate::logic::same_trade_doc(code, doc_type.as_str()),
                 None => false,
             }
         }).collect();

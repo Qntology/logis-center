@@ -1,0 +1,30 @@
+page_id: haneul-goods-detail-HN10148
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/goods/view?id=HN10148
+page_type: goods
+layout: detail
+fields:
+  id,link: HN10148
+  title: 65W 고속 충전기
+  status: 판매중
+  category: 디지털
+  sale_price: 36300
+  quantity: 42
+  registration_date: '2026-02-14'
+  brand_name: 버들
+  code: HN-AUD-104
+  stock_keeping_unit: HNAU1004
+  model_name: AU-151
+  manufacturer: 누리온산업
+  origin_country: 포르투갈
+  color: 올리브
+  barcode: '8893330653420'
+  supply_price: 21884
+  low_stock_threshold: 20
+  shipping_fee: 3000
+  description: 노트북까지 충전되는 GaN 충전기입니다.
+title: 상품 정보

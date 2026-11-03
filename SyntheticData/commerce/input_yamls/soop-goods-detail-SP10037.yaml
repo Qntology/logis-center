@@ -1,0 +1,30 @@
+page_id: soop-goods-detail-SP10037
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/products/SP10037
+page_type: goods
+layout: detail
+fields:
+  id,link: SP10037
+  title: 극세사 담요
+  status: 판매중
+  category: 생활
+  sale_price: 24400
+  quantity: 18
+  registration_date: '2026-07-24'
+  brand_name: Tidewell
+  code: SP-COL-101
+  stock_keeping_unit: SPCO1001
+  model_name: CO-698
+  manufacturer: Tidewell Supply
+  origin_country: 말레이시아
+  color: 크림
+  barcode: '8886823771715'
+  supply_price: 16777
+  low_stock_threshold: 20
+  shipping_fee: 3000
+  description: 촘촘한 극세사 원단이라 덮으면 금방 포근해집니다.
+title: 상품 정보

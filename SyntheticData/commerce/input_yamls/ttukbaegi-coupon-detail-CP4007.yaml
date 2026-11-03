@@ -1,0 +1,21 @@
+page_id: ttukbaegi-coupon-detail-CP4007
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/coupons/CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: TTU308
+  title: 앱 전용 혜택 1차
+  type: 정액
+  discount: ₩3,000
+  started_at: '2026-08-01'
+  expired_at: '2026-08-15'
+  status: 대기중
+  quantity: 500
+  min_order_amount: 10000
+title: 쿠폰 정보

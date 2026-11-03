@@ -1,0 +1,136 @@
+page_id: haneul-order-list-2
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/order/list?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20260417-100689
+  registration_date: '2026-04-17'
+  status: 배송완료
+  goods: 유기농 그래놀라
+  tracking_number: '625857926103'
+  sender_name: 이하은
+  recipient_name: 이하은
+  quantity: 6
+  amount: 162900
+  shipping_fee: 0
+  payment_method: 간편결제
+- id,link: 20260907-100742
+  registration_date: '2026-09-07'
+  status: 입금대기
+  goods: 토끼 봉제 인형
+  sender_name: 이민준
+  recipient_name: 이민준
+  quantity: 6
+  amount: 234500
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260916-100795
+  registration_date: '2026-09-16'
+  status: 취소
+  goods: 토끼 봉제 인형
+  sender_name: 이도윤
+  recipient_name: 이도윤
+  quantity: 5
+  amount: 136170
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260829-100848
+  registration_date: '2026-08-29'
+  status: 취소
+  goods: 접이식 등산 스틱
+  sender_name: 김서연
+  recipient_name: 정은호
+  quantity: 4
+  amount: 101070
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260519-100901
+  registration_date: '2026-05-19'
+  status: 입금대기
+  goods: 무향 바디 로션
+  sender_name: 최채원
+  recipient_name: 최주원
+  quantity: 2
+  amount: 39200
+  shipping_fee: 3000
+  payment_method: 간편결제
+- id,link: 20260415-100954
+  registration_date: '2026-04-15'
+  status: 배송완료
+  goods: 충전식 손난로
+  tracking_number: '279400440756'
+  sender_name: 한예준
+  recipient_name: 한예준
+  quantity: 1
+  amount: 25000
+  shipping_fee: 3000
+  payment_method: 간편결제
+- id,link: 20260624-101007
+  registration_date: '2026-06-24'
+  status: 취소
+  goods: 약산성 클렌징 폼
+  sender_name: 조유진
+  recipient_name: 조주원
+  quantity: 1
+  amount: 17300
+  shipping_fee: 3000
+  payment_method: 신용카드
+- id,link: 20260822-101060
+  registration_date: '2026-08-22'
+  status: 배송완료
+  goods: LED 충전 랜턴
+  tracking_number: '521111791809'
+  sender_name: 이도윤
+  recipient_name: 이도윤
+  quantity: 5
+  amount: 169600
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260607-101113
+  registration_date: '2026-06-07'
+  status: 취소
+  goods: 자외선 차단 양산
+  sender_name: 임건우
+  recipient_name: 임건우
+  quantity: 6
+  amount: 686200
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260531-101166
+  registration_date: '2026-05-31'
+  status: 배송중
+  goods: 어린이 킥보드
+  tracking_number: '959170073566'
+  sender_name: 서은호
+  recipient_name: 신소율
+  quantity: 6
+  amount: 329800
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260925-101219
+  registration_date: '2026-09-25'
+  status: 결제완료
+  goods: 2인용 돔 텐트
+  sender_name: 최유진
+  recipient_name: 최유진
+  quantity: 2
+  amount: 234720
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260716-101272
+  registration_date: '2026-07-16'
+  status: 배송중
+  goods: 펫 빗 브러시
+  tracking_number: '991093348982'
+  sender_name: 임은호
+  recipient_name: 임은호
+  quantity: 1
+  amount: 15510
+  shipping_fee: 3000
+  payment_method: 신용카드
+title: 주문내역 관리

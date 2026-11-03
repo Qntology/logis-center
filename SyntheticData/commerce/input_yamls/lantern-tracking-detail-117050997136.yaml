@@ -1,0 +1,30 @@
+page_id: lantern-tracking-detail-117050997136
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/shipments/117050997136
+page_type: tracking
+layout: detail
+fields:
+  id,link: '117050997136'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Lightweight camp chair
+  shipping_date: '2026-09-30'
+  recipient_name: Avery Whitfield
+  registration_date: '2026-09-28'
+  sender_name: Blue Lantern Supply Co.
+  sender_address: 88 Quarry Road, Duluth, MN 55802
+  sender_phone: +1-218-555-0177
+  recipient_address: 193 Alder St, Boise, ID 83702
+  recipient_phone: +1-323-555-0184
+  weight: 2.7
+  width: 36
+  height: 45
+  length: 29
+  shipping_method: Store pickup
+  shipping_duration: 4
+  shipping_fee: 0.0
+title: Shipment details

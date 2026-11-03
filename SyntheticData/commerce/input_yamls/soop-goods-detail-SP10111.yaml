@@ -1,0 +1,30 @@
+page_id: soop-goods-detail-SP10111
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/products/SP10111
+page_type: goods
+layout: detail
+fields:
+  id,link: SP10111
+  title: 저알러지 사료
+  status: 판매중
+  category: 반려
+  sale_price: 33800
+  quantity: 7
+  registration_date: '2026-04-13'
+  brand_name: 하람
+  code: SP-PET-103
+  stock_keeping_unit: SPPE1003
+  model_name: PE-999
+  manufacturer: 누리온산업
+  origin_country: 말레이시아
+  color: 하늘색
+  barcode: '8825739144115'
+  supply_price: 22293
+  low_stock_threshold: 20
+  shipping_fee: 3000
+  description: 단일 단백질로 만들어 피부가 예민한 아이에게 맞습니다.
+title: 상품 정보

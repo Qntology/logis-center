@@ -1,0 +1,21 @@
+page_id: harbor-coupon-detail-CP4007
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/coupon/view?id=CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: HAR123
+  title: Weekend-only offer 1
+  type: Percent off
+  discount: 15%
+  started_at: '2026-07-30'
+  expired_at: '2026-08-06'
+  status: Live
+  quantity: 1000
+  min_order_amount: 38.45
+title: Discount code

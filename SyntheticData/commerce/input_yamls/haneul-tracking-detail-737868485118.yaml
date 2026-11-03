@@ -1,0 +1,30 @@
+page_id: haneul-tracking-detail-737868485118
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/shipping/view?id=737868485118
+page_type: tracking
+layout: detail
+fields:
+  id,link: '737868485118'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 어린이 킥보드
+  shipping_date: '2026-04-28'
+  recipient_name: 한시우
+  registration_date: '2026-04-27'
+  sender_name: (주)하늘커머스
+  sender_address: 서울특별시 금천구 가산디지털2로 77 9층
+  sender_phone: 1800-0119
+  recipient_address: 광주광역시 서구 상무대로 147 11층
+  recipient_phone: 010-4704-8927
+  weight: 3.3
+  width: 55
+  height: 22
+  length: 25
+  shipping_method: 방문수령
+  shipping_duration: 3
+  shipping_fee: 0
+title: 배송 상세 정보

@@ -1,0 +1,71 @@
+page_id: haneul-review-list-1
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/review/list?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: 승인
+  title: 생각보다 색이 예뻐서 만족합니다.
+  name: 권소율
+  registration_date: '2026-08-02'
+- id,link: RV7022
+  status: 숨김
+  title: 생각보다 가벼워서 만족합니다.
+  name: 박채원
+  registration_date: '2026-05-05'
+- id,link: RV7033
+  status: 대기중
+  title: 생각보다 마감이 좋아서 만족합니다.
+  name: 조수아
+  registration_date: '2026-05-11'
+- id,link: RV7044
+  status: 승인
+  title: 포장이 꼼꼼했고 색이 예뻐서 괜찮습니다.
+  name: 이채원
+  registration_date: '2026-05-21'
+- id,link: RV7055
+  status: 승인
+  title: 두 번째 구매인데 역시 튼튼해서 좋네요.
+  name: 최수아
+  registration_date: '2026-09-23'
+- id,link: RV7066
+  status: 대기중
+  title: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+  name: 임도윤
+  registration_date: '2026-08-21'
+- id,link: RV7077
+  status: 승인
+  title: 생각보다 마감이 좋아서 만족합니다.
+  name: 권예준
+  registration_date: '2026-08-10'
+- id,link: RV7088
+  status: 승인
+  title: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+  name: 장채원
+  registration_date: '2026-08-17'
+- id,link: RV7099
+  status: 승인
+  title: 두 번째 구매인데 역시 튼튼해서 좋네요.
+  name: 최시우
+  registration_date: '2026-09-10'
+- id,link: RV7110
+  status: 숨김
+  title: 생각보다 마감이 좋아서 만족합니다.
+  name: 서시우
+  registration_date: '2026-05-19'
+- id,link: RV7121
+  status: 대기중
+  title: 생각보다 마감이 좋아서 만족합니다.
+  name: 최소율
+  registration_date: '2026-08-02'
+- id,link: RV7132
+  status: 승인
+  title: 생각보다 색이 예뻐서 만족합니다.
+  name: 박수아
+  registration_date: '2026-06-17'
+title: 상품후기 관리

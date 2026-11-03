@@ -1,0 +1,30 @@
+page_id: lantern-goods-detail-BL10111
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/products/BL10111
+page_type: goods
+layout: detail
+fields:
+  id,link: BL10111
+  title: Colouring sketchbook
+  status: Active
+  category: Toys
+  sale_price: 7.75
+  quantity: 18
+  registration_date: '2026-06-09'
+  brand_name: Tidewell
+  code: BL-KID-103
+  stock_keeping_unit: BLKI1003
+  model_name: KI-619
+  manufacturer: Tidewell Supply
+  origin_country: Portugal
+  color: Olive
+  barcode: '8893427207266'
+  supply_price: 4.99
+  low_stock_threshold: 10
+  shipping_fee: 2.3
+  description: Forty animal outlines to fill in.
+title: Product details

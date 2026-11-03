@@ -1,0 +1,29 @@
+page_id: lantern-order-detail-20260928-100159
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/orders/20260928-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260928-100159
+  registration_date: '2026-09-28'
+  status: Delivered
+  goods: Lightweight camp chair
+  tracking_number: '117050997136'
+  sender_name: Avery Whitfield
+  recipient_name: Avery Whitfield
+  quantity: 6
+  amount: 138.2
+  shipping_fee: 0.0
+  payment_method: Wire transfer
+  sender_phone: +1-323-555-0184
+  sender_address: 193 Alder St, Boise, ID 83702
+  recipient_phone: +1-323-555-0184
+  recipient_address: 193 Alder St, Boise, ID 83702
+  payment_origin: CheckoutBridge
+  payment_date: '2026-09-29'
+  bank: First Lantern Bank
+title: Order details

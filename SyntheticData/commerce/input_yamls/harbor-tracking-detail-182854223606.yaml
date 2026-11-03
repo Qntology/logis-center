@@ -1,0 +1,30 @@
+page_id: harbor-tracking-detail-182854223606
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/shipping/view?id=182854223606
+page_type: tracking
+layout: detail
+fields:
+  id,link: '182854223606'
+  carrier: Pinewood Express
+  status: Shipped
+  title: Hypoallergenic kibble
+  shipping_date: '2026-07-31'
+  recipient_name: Morgan Whitfield
+  registration_date: '2026-07-30'
+  sender_name: Harbor & Pine Trading LLC
+  sender_address: 410 Foundry Way, Tacoma, WA 98402
+  sender_phone: +1-253-555-0142
+  recipient_address: 5209 Birch Ave, Portland, OR 97205
+  recipient_phone: +1-562-555-0102
+  weight: 4.5
+  width: 43
+  height: 10
+  length: 26
+  shipping_method: Freight
+  shipping_duration: 5
+  shipping_fee: 0.0
+title: Shipment details

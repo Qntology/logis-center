@@ -1,0 +1,139 @@
+page_id: moa-order-list-1
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/order/list?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20260707-100053
+  registration_date: '2026-07-07'
+  status: 배송중
+  goods: 노트북 거치대
+  tracking_number: '886177832427'
+  sender_name: 장건우
+  recipient_name: 임예준
+  quantity: 1
+  amount: 34700
+  shipping_fee: 3000
+  payment_method: 간편결제
+- id,link: 20260602-100106
+  registration_date: '2026-06-02'
+  status: 배송완료
+  goods: 원목 블록 세트
+  tracking_number: '572403973922'
+  sender_name: 오하은
+  recipient_name: 오하은
+  quantity: 2
+  amount: 73200
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260819-100159
+  registration_date: '2026-08-19'
+  status: 상품준비중
+  goods: 저소음 기계식 키보드
+  sender_name: 박다은
+  recipient_name: 박다은
+  quantity: 6
+  amount: 161640
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260501-100212
+  registration_date: '2026-05-01'
+  status: 배송중
+  goods: 털 슬리퍼
+  tracking_number: '330500692791'
+  sender_name: 서도윤
+  recipient_name: 서도윤
+  quantity: 10
+  amount: 155500
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260613-100265
+  registration_date: '2026-06-13'
+  status: 배송완료
+  goods: 비타민 C 세럼
+  tracking_number: '913794300012'
+  sender_name: 최채원
+  recipient_name: 최채원
+  quantity: 3
+  amount: 99720
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260607-100318
+  registration_date: '2026-06-07'
+  status: 취소
+  goods: 진공 보온 텀블러
+  sender_name: 윤도윤
+  recipient_name: 장하은
+  quantity: 3
+  amount: 70800
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260627-100371
+  registration_date: '2026-06-27'
+  status: 입금대기
+  goods: 핸드 블렌더
+  sender_name: 신지우
+  recipient_name: 신지우
+  quantity: 1
+  amount: 48200
+  shipping_fee: 3000
+  payment_method: 신용카드
+- id,link: 20260520-100424
+  registration_date: '2026-05-20'
+  status: 반품
+  goods: 노이즈캔슬링 무선 이어폰
+  tracking_number: '759830694554'
+  sender_name: 조은호
+  recipient_name: 신예준
+  quantity: 3
+  amount: 285200
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260411-100477
+  registration_date: '2026-04-11'
+  status: 결제완료
+  goods: LED 충전 랜턴
+  sender_name: 장다은
+  recipient_name: 장다은
+  quantity: 6
+  amount: 230300
+  shipping_fee: 0
+  payment_method: 간편결제
+- id,link: 20260617-100530
+  registration_date: '2026-06-17'
+  status: 반품
+  goods: 비타민 C 세럼
+  tracking_number: '429626620594'
+  sender_name: 신채원
+  recipient_name: 신채원
+  quantity: 1
+  amount: 37920
+  shipping_fee: 3000
+  payment_method: 신용카드
+- id,link: 20260709-100583
+  registration_date: '2026-07-09'
+  status: 배송중
+  goods: 무기자차 선크림
+  tracking_number: '504192449610'
+  sender_name: 장주원
+  recipient_name: 장주원
+  quantity: 7
+  amount: 196000
+  shipping_fee: 0
+  payment_method: 간편결제
+- id,link: 20260408-100636
+  registration_date: '2026-04-08'
+  status: 반품
+  goods: 코딩 로봇 키트
+  tracking_number: '997689028990'
+  sender_name: 임수아
+  recipient_name: 임수아
+  quantity: 2
+  amount: 151000
+  shipping_fee: 0
+  payment_method: 신용카드
+title: 주문내역 관리

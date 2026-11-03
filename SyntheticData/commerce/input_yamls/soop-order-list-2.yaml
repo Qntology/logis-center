@@ -1,0 +1,136 @@
+page_id: soop-order-list-2
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/orders?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20261008-100689
+  registration_date: '2026-10-08'
+  status: 배송완료
+  goods: 무향 바디 로션
+  tracking_number: '548218378892'
+  sender_name: 권은호
+  recipient_name: 권은호
+  quantity: 3
+  amount: 46470
+  shipping_fee: 3000
+  payment_method: 간편결제
+- id,link: 20260527-100742
+  registration_date: '2026-05-27'
+  status: 입금대기
+  goods: 핸드 블렌더
+  sender_name: 임주원
+  recipient_name: 임주원
+  quantity: 11
+  amount: 352260
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20261011-100795
+  registration_date: '2026-10-11'
+  status: 반품
+  goods: 저당 단백질바
+  tracking_number: '952548712763'
+  sender_name: 장건우
+  recipient_name: 강현우
+  quantity: 1
+  amount: 27000
+  shipping_fee: 3000
+  payment_method: 간편결제
+- id,link: 20260809-100848
+  registration_date: '2026-08-09'
+  status: 결제완료
+  goods: 콜드브루 원액
+  sender_name: 김소율
+  recipient_name: 김소율
+  quantity: 5
+  amount: 75600
+  shipping_fee: 0
+  payment_method: 간편결제
+- id,link: 20260923-100901
+  registration_date: '2026-09-23'
+  status: 입금대기
+  goods: 휴대용 코펠 세트
+  sender_name: 윤주원
+  recipient_name: 신소율
+  quantity: 3
+  amount: 123300
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260414-100954
+  registration_date: '2026-04-14'
+  status: 배송중
+  goods: 저알러지 사료
+  tracking_number: '305504018645'
+  sender_name: 김소율
+  recipient_name: 김소율
+  quantity: 2
+  amount: 60840
+  shipping_fee: 0
+  payment_method: 간편결제
+- id,link: 20260622-101007
+  registration_date: '2026-06-22'
+  status: 배송중
+  goods: 핸드 블렌더
+  tracking_number: '309323361982'
+  sender_name: 이다은
+  recipient_name: 강시우
+  quantity: 3
+  amount: 110880
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260505-101060
+  registration_date: '2026-05-05'
+  status: 결제완료
+  goods: 2인용 돔 텐트
+  sender_name: 강다은
+  recipient_name: 강다은
+  quantity: 2
+  amount: 163800
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260906-101113
+  registration_date: '2026-09-06'
+  status: 배송중
+  goods: 경량 캠핑 의자
+  tracking_number: '205381259317'
+  sender_name: 조민준
+  recipient_name: 조민준
+  quantity: 5
+  amount: 165100
+  shipping_fee: 0
+  payment_method: 간편결제
+- id,link: 20260527-101166
+  registration_date: '2026-05-27'
+  status: 입금대기
+  goods: 모니터 받침대
+  sender_name: 정소율
+  recipient_name: 정소율
+  quantity: 6
+  amount: 125100
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260523-101219
+  registration_date: '2026-05-23'
+  status: 입금대기
+  goods: 수분 장벽 크림
+  sender_name: 임채원
+  recipient_name: 임채원
+  quantity: 1
+  amount: 33700
+  shipping_fee: 3000
+  payment_method: 무통장입금
+- id,link: 20260418-101272
+  registration_date: '2026-04-18'
+  status: 취소
+  goods: 양털 플리스 자켓
+  sender_name: 서건우
+  recipient_name: 서건우
+  quantity: 1
+  amount: 51390
+  shipping_fee: 0
+  payment_method: 간편결제
+title: 주문내역 관리

@@ -1,0 +1,17 @@
+page_id: moa-event-detail-EV303
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/event/view?id=EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: 봄 산책 기획전
+  type: 체험단
+  started_at: '2026-03-06'
+  expired_at: '2026-03-16'
+  status: 대기중
+title: 기획전 정보

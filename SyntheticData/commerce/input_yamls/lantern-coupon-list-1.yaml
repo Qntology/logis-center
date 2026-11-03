@@ -1,0 +1,91 @@
+page_id: lantern-coupon-list-1
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/coupons?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: LAN708
+  title: First order welcome 1
+  type: Fixed amount
+  discount: $2.30
+  started_at: '2026-05-27'
+  expired_at: '2026-06-10'
+  status: Live
+- id,link: CP4014
+  code: LAN507
+  title: App-exclusive deal 2
+  type: Percent off
+  discount: 5%
+  started_at: '2026-07-19'
+  expired_at: '2026-08-18'
+  status: Live
+- id,link: CP4021
+  code: LAN326
+  title: Cart rescue offer 3
+  type: Fixed amount
+  discount: $3.85
+  started_at: '2026-05-10'
+  expired_at: '2026-05-17'
+  status: Live
+- id,link: CP4028
+  code: LAN336
+  title: App-exclusive deal 4
+  type: Fixed amount
+  discount: $2.30
+  started_at: '2026-05-11'
+  expired_at: '2026-06-10'
+  status: Ended
+- id,link: CP4035
+  code: LAN318
+  title: Weekend-only offer 5
+  type: Percent off
+  discount: 15%
+  started_at: '2026-08-19'
+  expired_at: '2026-08-26'
+  status: Live
+- id,link: CP4042
+  code: LAN606
+  title: Weekend-only offer 6
+  type: Percent off
+  discount: 5%
+  started_at: '2026-07-14'
+  expired_at: '2026-07-21'
+  status: Live
+- id,link: CP4049
+  code: LAN372
+  title: App-exclusive deal 7
+  type: Fixed amount
+  discount: $3.85
+  started_at: '2026-03-24'
+  expired_at: '2026-03-31'
+  status: Ended
+- id,link: CP4056
+  code: LAN292
+  title: App-exclusive deal 8
+  type: Percent off
+  discount: 15%
+  started_at: '2026-08-21'
+  expired_at: '2026-08-28'
+  status: Ended
+- id,link: CP4063
+  code: LAN746
+  title: Cart rescue offer 9
+  type: Percent off
+  discount: 10%
+  started_at: '2026-07-15'
+  expired_at: '2026-08-14'
+  status: Scheduled
+- id,link: CP4070
+  code: LAN190
+  title: Weekend-only offer 10
+  type: Percent off
+  discount: 15%
+  started_at: '2026-05-04'
+  expired_at: '2026-05-18'
+  status: Ended
+title: Discount codes

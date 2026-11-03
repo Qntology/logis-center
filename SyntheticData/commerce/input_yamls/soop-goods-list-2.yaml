@@ -1,0 +1,111 @@
+page_id: soop-goods-list-2
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/products?page=2
+page_type: goods
+layout: list
+items:
+- id,link: SP10481
+  title: 세라믹 식칼
+  status: 판매중
+  category: 주방
+  sale_price: 33800
+  compare_at_price: 40560
+  quantity: 3
+  registration_date: '2026-03-17'
+  brand_name: 다온랩
+- id,link: SP10518
+  title: 손상모 헤어 에센스
+  status: 판매중
+  category: 뷰티
+  sale_price: 20500
+  quantity: 120
+  registration_date: '2026-05-08'
+  brand_name: 버들
+- id,link: SP10555
+  title: 무기자차 선크림
+  status: 판매중
+  category: 뷰티
+  sale_price: 23000
+  compare_at_price: 27600
+  quantity: 18
+  registration_date: '2026-09-11'
+  brand_name: 하람
+- id,link: SP10592
+  title: 서류 정리함
+  status: 품절
+  category: 사무
+  sale_price: 13000
+  quantity: 0
+  registration_date: '2026-05-08'
+  brand_name: Marlow & Finch
+- id,link: SP10629
+  title: 모니터 받침대
+  status: 판매중
+  category: 사무
+  sale_price: 35100
+  compare_at_price: 42120
+  quantity: 18
+  registration_date: '2026-03-07'
+  brand_name: Marlow & Finch
+- id,link: SP10666
+  title: 65W 고속 충전기
+  status: 품절
+  category: 디지털
+  sale_price: 34600
+  quantity: 0
+  registration_date: '2026-08-04'
+  brand_name: 마루공방
+- id,link: SP10703
+  title: 무향 바디 로션
+  status: 판매중
+  category: 뷰티
+  sale_price: 16100
+  quantity: 18
+  registration_date: '2026-01-05'
+  brand_name: 다온랩
+- id,link: SP10740
+  title: 펫 빗 브러시
+  status: 판매중
+  category: 반려
+  sale_price: 12600
+  quantity: 7
+  registration_date: '2026-07-07'
+  brand_name: Oakfern
+- id,link: SP10777
+  title: 유기농 그래놀라
+  status: 품절
+  category: 식품
+  sale_price: 13400
+  compare_at_price: 16080
+  quantity: 0
+  registration_date: '2026-05-10'
+  brand_name: 다온랩
+- id,link: SP10814
+  title: 경량 패딩 조끼
+  status: 판매중
+  category: 의류
+  sale_price: 75500
+  quantity: 350
+  registration_date: '2026-08-26'
+  brand_name: 누리온
+- id,link: SP10851
+  title: 강아지 하네스
+  status: 판매중
+  category: 반려
+  sale_price: 26600
+  quantity: 7
+  registration_date: '2026-05-16'
+  brand_name: 솔빛
+- id,link: SP10888
+  title: 스마트 밴드
+  status: 품절
+  category: 디지털
+  sale_price: 49300
+  quantity: 0
+  registration_date: '2026-04-09'
+  brand_name: 솔빛
+title: 상품 관리

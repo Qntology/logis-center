@@ -1,0 +1,30 @@
+page_id: harbor-tracking-detail-470699340482
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/shipping/view?id=470699340482
+page_type: tracking
+layout: detail
+fields:
+  id,link: '470699340482'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Rechargeable LED lantern
+  shipping_date: '2026-08-06'
+  recipient_name: Riley Langley
+  registration_date: '2026-08-02'
+  sender_name: Harbor & Pine Trading LLC
+  sender_address: 410 Foundry Way, Tacoma, WA 98402
+  sender_phone: +1-253-555-0142
+  recipient_address: 3017 Birch Ave, Santa Fe, NM 87501
+  recipient_phone: +1-845-555-0148
+  weight: 5.7
+  width: 47
+  height: 10
+  length: 13
+  shipping_method: Freight
+  shipping_duration: 4
+  shipping_fee: 0.0
+title: Shipment details

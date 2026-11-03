@@ -1,0 +1,21 @@
+page_id: moa-coupon-detail-CP4007
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/coupon/view?id=CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: MOA827
+  title: 가을 맞이 감사제 1차
+  type: 정액
+  discount: 5,000
+  started_at: '2026-09-13'
+  expired_at: '2026-09-27'
+  status: 종료
+  quantity: 500
+  min_order_amount: 10000
+title: 쿠폰 정보

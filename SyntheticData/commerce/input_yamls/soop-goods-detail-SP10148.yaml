@@ -1,0 +1,30 @@
+page_id: soop-goods-detail-SP10148
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/products/SP10148
+page_type: goods
+layout: detail
+fields:
+  id,link: SP10148
+  title: 반려동물 이동장
+  status: 품절
+  category: 반려
+  sale_price: 45300
+  quantity: 0
+  registration_date: '2026-01-11'
+  brand_name: 마루공방
+  code: SP-PET-104
+  stock_keeping_unit: SPPE1004
+  model_name: PE-167
+  manufacturer: Oakfern Works
+  origin_country: 태국
+  color: 먹색
+  barcode: '8847005479155'
+  supply_price: 29493
+  low_stock_threshold: 5
+  shipping_fee: 3000
+  description: 병원에 갈 때 쓰는 통기성 가방입니다.
+title: 상품 정보

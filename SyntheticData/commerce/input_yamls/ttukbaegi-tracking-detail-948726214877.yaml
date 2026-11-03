@@ -1,0 +1,30 @@
+page_id: ttukbaegi-tracking-detail-948726214877
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/shipments/948726214877
+page_type: tracking
+layout: detail
+fields:
+  id,link: '948726214877'
+  carrier: 바른택배
+  status: 배송완료
+  title: LED 충전 랜턴
+  shipping_date: '2026-05-05'
+  recipient_name: 서소율
+  registration_date: '2026-05-03'
+  sender_name: 뚝배기유통 주식회사
+  sender_address: 대구광역시 동구 동대구로 465
+  sender_phone: 1833-0763
+  recipient_address: 전북특별자치도 전주시 완산구 효자로 213
+  recipient_phone: 010-4552-2433
+  weight: 5.0
+  width: 18
+  height: 31
+  length: 19
+  shipping_method: 방문수령
+  shipping_duration: 3
+  shipping_fee: 0
+title: 배송 상세 정보
