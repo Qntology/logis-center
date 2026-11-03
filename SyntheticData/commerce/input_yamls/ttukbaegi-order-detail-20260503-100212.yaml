@@ -1,0 +1,29 @@
+page_id: ttukbaegi-order-detail-20260503-100212
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/orders/20260503-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260503-100212
+  registration_date: '2026-05-03'
+  status: 배송완료
+  goods: LED 충전 랜턴
+  tracking_number: '948726214877'
+  sender_name: 정건우
+  recipient_name: 서소율
+  quantity: 5
+  amount: 136500
+  shipping_fee: 0
+  payment_method: 신용카드
+  sender_phone: 010-8854-5367
+  sender_address: 부산광역시 수영구 광남로 288
+  recipient_phone: 010-4552-2433
+  recipient_address: 전북특별자치도 전주시 완산구 효자로 213
+  payment_origin: 바로결제
+  payment_date: '2026-05-03'
+  card: 한결카드
+title: 주문 상세내역

@@ -1,0 +1,83 @@
+page_id: ttukbaegi-tracking-list-1
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/shipments?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '633694505390'
+  carrier: 바른택배
+  status: 배송완료
+  title: 통풍 샌들
+  shipping_date: '2026-09-25'
+  recipient_name: 강소율
+- id,link: '382022382852'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 실리콘 조리도구 세트
+  shipping_date: '2026-07-05'
+  recipient_name: 장하은
+- id,link: '127860933381'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 경량 패딩 조끼
+  shipping_date: '2026-06-27'
+  recipient_name: 한현우
+- id,link: '948726214877'
+  carrier: 바른택배
+  status: 배송완료
+  title: LED 충전 랜턴
+  shipping_date: '2026-05-05'
+  recipient_name: 서소율
+- id,link: '403471162970'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 밀폐 유리 용기 세트
+  shipping_date: '2026-04-11'
+  recipient_name: 신다은
+- id,link: '293476699685'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: 경량 캠핑 의자
+  shipping_date: '2026-05-07'
+  recipient_name: 권도윤
+- id,link: '558916847703'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 코딩 로봇 키트
+  shipping_date: '2026-09-30'
+  recipient_name: 신예준
+- id,link: '258190560107'
+  carrier: 바른택배
+  status: 배송완료
+  title: 토끼 봉제 인형
+  shipping_date: '2026-08-22'
+  recipient_name: 박주원
+- id,link: '778942350872'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 코딩 로봇 키트
+  shipping_date: '2026-06-24'
+  recipient_name: 조유진
+- id,link: '902513893818'
+  carrier: 한빛로지스
+  status: 배송중
+  title: 밀폐 유리 용기 세트
+  shipping_date: '2026-06-07'
+  recipient_name: 이채원
+- id,link: '296402183519'
+  carrier: 새길운송
+  status: 배송완료
+  title: 대용량 보조배터리
+  shipping_date: '2026-07-09'
+  recipient_name: 서도윤
+- id,link: '626585636413'
+  carrier: 바른택배
+  status: 배송완료
+  title: 실리콘 조리도구 세트
+  shipping_date: '2026-10-04'
+  recipient_name: 박서연
+title: 배송 조회

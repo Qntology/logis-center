@@ -1,0 +1,112 @@
+page_id: ttukbaegi-goods-list-1
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/products?page=1
+page_type: goods
+layout: list
+items:
+- id,link: TB10037
+  title: 방수 블루투스 스피커
+  status: 품절
+  category: 디지털
+  sale_price: 53700
+  compare_at_price: 64440
+  quantity: 0
+  registration_date: '2026-07-16'
+  brand_name: Oakfern
+- id,link: TB10074
+  title: 냉감 넥밴드
+  status: 판매중
+  category: 생활
+  sale_price: 11400
+  quantity: 7
+  registration_date: '2026-03-27'
+  brand_name: Oakfern
+- id,link: TB10111
+  title: 노트북 거치대
+  status: 품절
+  category: 사무
+  sale_price: 31800
+  compare_at_price: 38160
+  quantity: 0
+  registration_date: '2026-03-26'
+  brand_name: 다온랩
+- id,link: TB10148
+  title: 케이블 정리함
+  status: 품절
+  category: 사무
+  sale_price: 16400
+  compare_at_price: 19680
+  quantity: 0
+  registration_date: '2026-06-11'
+  brand_name: Oakfern
+- id,link: TB10185
+  title: 휴대용 코펠 세트
+  status: 품절
+  category: 레저
+  sale_price: 45600
+  compare_at_price: 54720
+  quantity: 0
+  registration_date: '2026-01-28'
+  brand_name: 다온랩
+- id,link: TB10222
+  title: LED 충전 랜턴
+  status: 판매중
+  category: 레저
+  sale_price: 27300
+  quantity: 7
+  registration_date: '2026-05-22'
+  brand_name: Marlow & Finch
+- id,link: TB10259
+  title: 토끼 봉제 인형
+  status: 품절
+  category: 완구
+  sale_price: 20000
+  quantity: 0
+  registration_date: '2026-04-12'
+  brand_name: 다온랩
+- id,link: TB10296
+  title: 무향 바디 로션
+  status: 품절
+  category: 뷰티
+  sale_price: 18300
+  compare_at_price: 21960
+  quantity: 0
+  registration_date: '2026-06-13'
+  brand_name: 누리온
+- id,link: TB10333
+  title: 온도조절 전기포트
+  status: 진열안함
+  category: 가전
+  sale_price: 44900
+  quantity: 42
+  registration_date: '2026-09-02'
+  brand_name: 솔빛
+- id,link: TB10370
+  title: 스마트 밴드
+  status: 진열안함
+  category: 디지털
+  sale_price: 49100
+  quantity: 350
+  registration_date: '2026-03-30'
+  brand_name: 솔빛
+- id,link: TB10407
+  title: 접이식 등산 스틱
+  status: 판매중
+  category: 레저
+  sale_price: 57200
+  quantity: 7
+  registration_date: '2026-07-20'
+  brand_name: Oakfern
+- id,link: TB10444
+  title: 코딩 로봇 키트
+  status: 판매중
+  category: 완구
+  sale_price: 77200
+  quantity: 3
+  registration_date: '2026-05-09'
+  brand_name: 누리온
+title: 상품 관리

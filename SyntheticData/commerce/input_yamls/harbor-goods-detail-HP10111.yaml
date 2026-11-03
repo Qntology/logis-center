@@ -1,0 +1,30 @@
+page_id: harbor-goods-detail-HP10111
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/goods/view?id=HP10111
+page_type: goods
+layout: detail
+fields:
+  id,link: HP10111
+  title: Hypoallergenic kibble
+  status: Sold out
+  category: Pets
+  sale_price: 24.15
+  quantity: 0
+  registration_date: '2026-02-22'
+  brand_name: 하람
+  code: HP-PET-103
+  stock_keeping_unit: HPPE1003
+  model_name: PE-127
+  manufacturer: Tidewell Supply
+  origin_country: Portugal
+  color: Cream
+  barcode: '8830576695188'
+  supply_price: 15.43
+  low_stock_threshold: 10
+  shipping_fee: 2.3
+  description: Single-protein food for sensitive skin.
+title: Product details

@@ -1,0 +1,83 @@
+page_id: haneul-tracking-list-1
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '944787807166'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 기모 후드집업
+  shipping_date: '2026-05-03'
+  recipient_name: 임현우
+- id,link: '871729019834'
+  carrier: 새길운송
+  status: 반품
+  title: 어린이 킥보드
+  shipping_date: '2026-09-27'
+  recipient_name: 오건우
+- id,link: '737868485118'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 어린이 킥보드
+  shipping_date: '2026-04-28'
+  recipient_name: 한시우
+- id,link: '144638439415'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 코딩 로봇 키트
+  shipping_date: '2026-10-01'
+  recipient_name: 신현우
+- id,link: '449819227060'
+  carrier: 새길운송
+  status: 배송중
+  title: 65W 고속 충전기
+  shipping_date: '2026-06-30'
+  recipient_name: 박민준
+- id,link: '949201983244'
+  carrier: 바른택배
+  status: 배송완료
+  title: 기모 후드집업
+  shipping_date: '2026-10-04'
+  recipient_name: 서하은
+- id,link: '154999338813'
+  carrier: 바른택배
+  status: 배송완료
+  title: 기모 후드집업
+  shipping_date: '2026-07-01'
+  recipient_name: 서도윤
+- id,link: '365556517003'
+  carrier: 한빛로지스
+  status: 배송중
+  title: 대용량 보조배터리
+  shipping_date: '2026-04-06'
+  recipient_name: 윤유진
+- id,link: '312694597279'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 비타민 C 세럼
+  shipping_date: '2026-05-24'
+  recipient_name: 장소율
+- id,link: '625857926103'
+  carrier: 새길운송
+  status: 배송완료
+  title: 유기농 그래놀라
+  shipping_date: '2026-04-19'
+  recipient_name: 이하은
+- id,link: '279400440756'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 충전식 손난로
+  shipping_date: '2026-04-17'
+  recipient_name: 한예준
+- id,link: '521111791809'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: LED 충전 랜턴
+  shipping_date: '2026-08-26'
+  recipient_name: 이도윤
+title: 배송 조회

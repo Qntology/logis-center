@@ -1,0 +1,29 @@
+page_id: moa-order-detail-20260501-100212
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/order/view?id=20260501-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260501-100212
+  registration_date: '2026-05-01'
+  status: 배송중
+  goods: 털 슬리퍼
+  tracking_number: '330500692791'
+  sender_name: 서도윤
+  recipient_name: 서도윤
+  quantity: 10
+  amount: 155500
+  shipping_fee: 0
+  payment_method: 신용카드
+  sender_phone: 010-5486-8573
+  sender_address: 경기도 수원시 영통구 매탄로 143 16층
+  recipient_phone: 010-5486-8573
+  recipient_address: 경기도 수원시 영통구 매탄로 143 16층
+  payment_origin: 스마트PG
+  payment_date: '2026-05-01'
+  card: 가온카드
+title: 주문 상세내역

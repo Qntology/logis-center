@@ -1,0 +1,28 @@
+page_id: harbor-order-detail-20260408-100159
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/order/view?id=20260408-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260408-100159
+  registration_date: '2026-04-08'
+  status: Cancelled
+  goods: Pet grooming brush
+  sender_name: Taylor Prescott
+  recipient_name: Finley Holloway
+  quantity: 5
+  amount: 49.5
+  shipping_fee: 0.0
+  payment_method: Credit card
+  sender_phone: +1-684-555-0194
+  sender_address: 140 Willow Ct, Madison, WI 53703
+  recipient_phone: +1-501-555-0111
+  recipient_address: 7025 Birch Ave, Asheville, NC 28801
+  payment_origin: CheckoutBridge
+  payment_date: '2026-04-08'
+  card: Pinecrest Rewards
+title: Order details

@@ -1,0 +1,30 @@
+page_id: lantern-goods-detail-BL10148
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/products/BL10148
+page_type: goods
+layout: detail
+fields:
+  id,link: BL10148
+  title: 65W fast charger
+  status: Active
+  category: Electronics
+  sale_price: 28.85
+  quantity: 42
+  registration_date: '2026-07-24'
+  brand_name: Marlow & Finch
+  code: BL-AUD-104
+  stock_keeping_unit: BLAU1004
+  model_name: AU-180
+  manufacturer: Tidewell Supply
+  origin_country: Korea
+  color: Olive
+  barcode: '8846397678203'
+  supply_price: 17.92
+  low_stock_threshold: 10
+  shipping_fee: 2.3
+  description: A GaN charger strong enough for laptops.
+title: Product details

@@ -1,0 +1,30 @@
+page_id: moa-tracking-detail-886177832427
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/shipping/view?id=886177832427
+page_type: tracking
+layout: detail
+fields:
+  id,link: '886177832427'
+  carrier: 한빛로지스
+  status: 배송중
+  title: 노트북 거치대
+  shipping_date: '2026-07-10'
+  recipient_name: 임예준
+  registration_date: '2026-07-07'
+  sender_name: 모아리테일 주식회사
+  sender_address: 경기도 성남시 수정구 창업로 42
+  sender_phone: 1811-0345
+  recipient_address: 서울특별시 마포구 합정로 284 2층
+  recipient_phone: 010-8673-9475
+  weight: 3.9
+  width: 25
+  height: 22
+  length: 17
+  shipping_method: 일반택배
+  shipping_duration: 5
+  shipping_fee: 3000
+title: 배송 상세 정보

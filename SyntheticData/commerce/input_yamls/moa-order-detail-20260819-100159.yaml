@@ -1,0 +1,28 @@
+page_id: moa-order-detail-20260819-100159
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/order/view?id=20260819-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260819-100159
+  registration_date: '2026-08-19'
+  status: 상품준비중
+  goods: 저소음 기계식 키보드
+  sender_name: 박다은
+  recipient_name: 박다은
+  quantity: 6
+  amount: 161640
+  shipping_fee: 0
+  payment_method: 신용카드
+  sender_phone: 010-7680-6078
+  sender_address: 전북특별자치도 전주시 완산구 효자로 240 6층
+  recipient_phone: 010-7680-6078
+  recipient_address: 전북특별자치도 전주시 완산구 효자로 240 6층
+  payment_origin: 바로결제
+  payment_date: '2026-08-19'
+  card: 누리카드
+title: 주문 상세내역

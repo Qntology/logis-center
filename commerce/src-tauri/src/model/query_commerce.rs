@@ -382,6 +382,9 @@ impl crate::model::LogisModel {
                                         // 🌟 [로그 추가] 형태소 분석 결과 전체 로그 출력
                                         let mut debug_pos_log = Vec::new();
                                         let drop_tags = crate::utils::ai_utils::STANZA_DROP_TAGS;
+                                        // 🌟 [POS RELIABILITY] 태그를 믿을 수 없으면 낱말을 지우지 않습니다. 'cat' 이 PART, 'skin' 이 ADP 로 나와
+                                        //    'products for looking after dry skin' 이 'for' 만 남았습니다.
+                                        let pos_reliable = stanza.preprocessor.pos_reliable;
                                         let mut dropped_log = Vec::new();
                                         let mut filtered_words = Vec::new();
 
@@ -419,7 +422,11 @@ impl crate::model::LogisModel {
                                             }
                                         }
 
-                                        let depparse_opt = crate::utils::ai_utils::run_depparse_deprels(&stanza.preprocessor, &mut stanza.depparse_session, &padded_chunk, &pos_ids);
+                                        let depparse_opt = if pos_reliable {
+                                            crate::utils::ai_utils::run_depparse_deprels(&stanza.preprocessor, &mut stanza.depparse_session, &padded_chunk, &pos_ids)
+                                        } else {
+                                            None
+                                        };
                                         let mut filtered_lemmas = Vec::new();
                                         let mut filtered_deprels = Vec::new();
                                         // 🌟 [POS TAG COLLECT] 필터링을 통과한 단어의 POS 태그를 함께 수집합니다.
@@ -439,8 +446,14 @@ impl crate::model::LogisModel {
                                             copy_marks(&marks.price_bound, &mut stanza_bound);
                                         }
                                         for (i, word) in ext_words_string.iter().enumerate() {
-                                            let tag = pos_tags[i];
-                                            let lemma = if let Some(l) = lemma_words.get(i) { l.clone() } else { String::new() };
+                                            let tag = if pos_reliable { pos_tags[i] } else { "" };
+                                            let lemma = if !pos_reliable {
+                                                String::new()
+                                            } else if let Some(l) = lemma_words.get(i) {
+                                                l.clone()
+                                            } else {
+                                                String::new()
+                                            };
                                             
                                             debug_pos_log.push(format!("{}(tag:{}, lemma:{})", word, tag, lemma));
                                             
@@ -2106,7 +2119,8 @@ impl crate::model::LogisModel {
                     } else {
                         match word_pos {
                             "VERB" | "AUX" => true,
-                            "NOUN" | "PROPN" | "ADJ" | "NUM" => {
+                            // 품사를 모를 때도 값 명사와 같은 기준을 씁니다. 동률에 가까운 '식히는' · '충전하는' 을 명령어로 지우면 안 됩니다.
+                            "NOUN" | "PROPN" | "ADJ" | "NUM" | "" => {
                                 action_sim > rival_max && action_sim > rival_max * 1.10
                             },
                             _ => {
@@ -2271,6 +2285,11 @@ impl crate::model::LogisModel {
                                         let flipped = downward_words.contains(word);
                                         for cat in claim.iter() {
                                             if let Some(b) = f_scores.iter().find(|s| &s.category == cat) {
+                                                // 🌟 [QUALIFIER SURPRISAL] 축과 방향은 각자 기대치를 넘어야 합니다. 한쪽만 넘은 'on' · 'a' · '것' 이
+                                                //    '무게 하위 20%' 같은 순위 조건을 만들어 정답을 잘라냈습니다.
+                                                if b.surprisal <= 0.0 {
+                                                    continue;
+                                                }
                                                 let key = match (flipped && *cat == "find_filters", b.key.as_str()) {
                                                     (true, "much") => "little".to_string(),
                                                     (true, "little") => "much".to_string(),

@@ -1,0 +1,91 @@
+page_id: haneul-coupon-list-1
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: HAN372
+  title: 앱 전용 혜택 1차
+  type: 정액
+  discount: 2,000원
+  started_at: '2026-05-13'
+  expired_at: '2026-05-27'
+  status: 진행중
+- id,link: CP4014
+  code: HAN149
+  title: 장바구니 응원 2차
+  type: 정률
+  discount: 10%
+  started_at: '2026-03-17'
+  expired_at: '2026-03-31'
+  status: 종료
+- id,link: CP4021
+  code: HAN209
+  title: 장바구니 응원 3차
+  type: 정률
+  discount: 5%
+  started_at: '2026-04-26'
+  expired_at: '2026-05-03'
+  status: 대기중
+- id,link: CP4028
+  code: HAN635
+  title: 주말 한정 할인 4차
+  type: 정액
+  discount: 3,000원
+  started_at: '2026-04-28'
+  expired_at: '2026-05-05'
+  status: 종료
+- id,link: CP4035
+  code: HAN614
+  title: 재구매 고객 감사 5차
+  type: 정액
+  discount: 5,000원
+  started_at: '2026-05-19'
+  expired_at: '2026-05-26'
+  status: 대기중
+- id,link: CP4042
+  code: HAN780
+  title: 장바구니 응원 6차
+  type: 정률
+  discount: 15%
+  started_at: '2026-05-23'
+  expired_at: '2026-06-22'
+  status: 종료
+- id,link: CP4049
+  code: HAN465
+  title: 재구매 고객 감사 7차
+  type: 정액
+  discount: 2,000원
+  started_at: '2026-03-11'
+  expired_at: '2026-04-10'
+  status: 대기중
+- id,link: CP4056
+  code: HAN510
+  title: 재구매 고객 감사 8차
+  type: 정액
+  discount: 5,000원
+  started_at: '2026-04-09'
+  expired_at: '2026-04-23'
+  status: 종료
+- id,link: CP4063
+  code: HAN948
+  title: 첫 구매 환영 혜택 9차
+  type: 정률
+  discount: 5%
+  started_at: '2026-04-26'
+  expired_at: '2026-05-26'
+  status: 진행중
+- id,link: CP4070
+  code: HAN229
+  title: 재구매 고객 감사 10차
+  type: 정액
+  discount: 2,000원
+  started_at: '2026-07-12'
+  expired_at: '2026-07-19'
+  status: 진행중
+title: 쿠폰 관리

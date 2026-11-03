@@ -1,0 +1,30 @@
+page_id: moa-tracking-detail-913794300012
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/shipping/view?id=913794300012
+page_type: tracking
+layout: detail
+fields:
+  id,link: '913794300012'
+  carrier: 새길운송
+  status: 배송완료
+  title: 비타민 C 세럼
+  shipping_date: '2026-06-14'
+  recipient_name: 최채원
+  registration_date: '2026-06-13'
+  sender_name: 모아리테일 주식회사
+  sender_address: 경기도 성남시 수정구 창업로 42
+  sender_phone: 1811-0345
+  recipient_address: 서울특별시 마포구 합정로 186 11층
+  recipient_phone: 010-5864-1662
+  weight: 2.2
+  width: 25
+  height: 12
+  length: 30
+  shipping_method: 화물배송
+  shipping_duration: 5
+  shipping_fee: 0
+title: 배송 상세 정보

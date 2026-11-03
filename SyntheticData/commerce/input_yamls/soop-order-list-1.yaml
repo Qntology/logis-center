@@ -1,0 +1,134 @@
+page_id: soop-order-list-1
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/orders?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20260716-100053
+  registration_date: '2026-07-16'
+  status: 상품준비중
+  goods: 무기자차 선크림
+  sender_name: 권예준
+  recipient_name: 오소율
+  quantity: 2
+  amount: 53300
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260614-100106
+  registration_date: '2026-06-14'
+  status: 상품준비중
+  goods: 펫 빗 브러시
+  sender_name: 김지우
+  recipient_name: 김지우
+  quantity: 3
+  amount: 105800
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260514-100159
+  registration_date: '2026-05-14'
+  status: 결제완료
+  goods: 세라믹 식칼
+  sender_name: 박하은
+  recipient_name: 김수아
+  quantity: 2
+  amount: 67600
+  shipping_fee: 0
+  payment_method: 간편결제
+- id,link: 20260527-100212
+  registration_date: '2026-05-27'
+  status: 상품준비중
+  goods: 원목 블록 세트
+  sender_name: 김소율
+  recipient_name: 박시우
+  quantity: 3
+  amount: 68040
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260925-100265
+  registration_date: '2026-09-25'
+  status: 상품준비중
+  goods: LED 충전 랜턴
+  sender_name: 조건우
+  recipient_name: 한다은
+  quantity: 5
+  amount: 192870
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260406-100318
+  registration_date: '2026-04-06'
+  status: 배송완료
+  goods: 기모 후드집업
+  tracking_number: '377890210013'
+  sender_name: 임주원
+  recipient_name: 임주원
+  quantity: 4
+  amount: 108360
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260606-100371
+  registration_date: '2026-06-06'
+  status: 배송중
+  goods: 색칠놀이 스케치북
+  tracking_number: '442048660228'
+  sender_name: 정시우
+  recipient_name: 정시우
+  quantity: 1
+  amount: 11500
+  shipping_fee: 3000
+  payment_method: 신용카드
+- id,link: 20260624-100424
+  registration_date: '2026-06-24'
+  status: 입금대기
+  goods: 저당 단백질바
+  sender_name: 권수아
+  recipient_name: 권수아
+  quantity: 4
+  amount: 115020
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260421-100477
+  registration_date: '2026-04-21'
+  status: 반품
+  goods: 경량 캠핑 의자
+  tracking_number: '300213061856'
+  sender_name: 장시우
+  recipient_name: 김시우
+  quantity: 1
+  amount: 40170
+  shipping_fee: 3000
+  payment_method: 무통장입금
+- id,link: 20260603-100530
+  registration_date: '2026-06-03'
+  status: 입금대기
+  goods: 반려동물 이동장
+  sender_name: 신예준
+  recipient_name: 신예준
+  quantity: 3
+  amount: 122310
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260622-100583
+  registration_date: '2026-06-22'
+  status: 결제완료
+  goods: 2인용 돔 텐트
+  sender_name: 윤은호
+  recipient_name: 박유진
+  quantity: 1
+  amount: 143300
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260405-100636
+  registration_date: '2026-04-05'
+  status: 상품준비중
+  goods: 65W 고속 충전기
+  sender_name: 임건우
+  recipient_name: 최주원
+  quantity: 3
+  amount: 103800
+  shipping_fee: 0
+  payment_method: 신용카드
+title: 주문내역 관리

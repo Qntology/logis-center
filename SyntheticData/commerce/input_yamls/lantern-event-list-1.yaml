@@ -1,0 +1,47 @@
+page_id: lantern-event-list-1
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/events?page=1
+page_type: event
+layout: list
+items:
+- id,link: EV303
+  title: Spring stroll showcase
+  type: Sweepstakes
+  started_at: '2026-06-03'
+  expired_at: '2026-07-18'
+  status: Scheduled
+- id,link: EV306
+  title: Summer getaway picks
+  type: Tester
+  started_at: '2026-05-05'
+  expired_at: '2026-05-25'
+  status: Live
+- id,link: EV309
+  title: Harvest gift guide
+  type: Sweepstakes
+  started_at: '2026-09-16'
+  expired_at: '2026-10-31'
+  status: Ended
+- id,link: EV312
+  title: Year-end celebration
+  type: Showcase
+  started_at: '2026-09-05'
+  expired_at: '2026-09-15'
+  status: Live
+- id,link: EV315
+  title: New arrivals tester program
+  type: Showcase
+  started_at: '2026-06-20'
+  expired_at: '2026-07-10'
+  status: Live
+- id,link: EV318
+  title: Top reviewer contest
+  type: Sweepstakes
+  started_at: '2026-02-15'
+  expired_at: '2026-02-25'
+  status: Ended
+title: Campaigns

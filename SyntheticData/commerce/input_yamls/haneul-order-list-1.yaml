@@ -1,0 +1,140 @@
+page_id: haneul-order-list-1
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/order/list?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20260409-100053
+  registration_date: '2026-04-09'
+  status: 결제완료
+  goods: 비타민 C 세럼
+  sender_name: 임서연
+  recipient_name: 권소율
+  quantity: 7
+  amount: 297540
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260502-100106
+  registration_date: '2026-05-02'
+  status: 배송완료
+  goods: 기모 후드집업
+  tracking_number: '944787807166'
+  sender_name: 임현우
+  recipient_name: 임현우
+  quantity: 2
+  amount: 95040
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260625-100159
+  registration_date: '2026-06-25'
+  status: 상품준비중
+  goods: 제주 감귤 주스
+  sender_name: 권서연
+  recipient_name: 권서연
+  quantity: 6
+  amount: 230300
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260923-100212
+  registration_date: '2026-09-23'
+  status: 반품
+  goods: 어린이 킥보드
+  tracking_number: '871729019834'
+  sender_name: 오건우
+  recipient_name: 오건우
+  quantity: 4
+  amount: 237100
+  shipping_fee: 0
+  payment_method: 간편결제
+- id,link: 20260427-100265
+  registration_date: '2026-04-27'
+  status: 배송중
+  goods: 어린이 킥보드
+  tracking_number: '737868485118'
+  sender_name: 한시우
+  recipient_name: 한시우
+  quantity: 5
+  amount: 338500
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260928-100318
+  registration_date: '2026-09-28'
+  status: 배송완료
+  goods: 코딩 로봇 키트
+  tracking_number: '144638439415'
+  sender_name: 신현우
+  recipient_name: 신현우
+  quantity: 5
+  amount: 278500
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260628-100371
+  registration_date: '2026-06-28'
+  status: 배송중
+  goods: 65W 고속 충전기
+  tracking_number: '449819227060'
+  sender_name: 박민준
+  recipient_name: 박민준
+  quantity: 2
+  amount: 104700
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260611-100424
+  registration_date: '2026-06-11'
+  status: 취소
+  goods: 토끼 봉제 인형
+  sender_name: 박시우
+  recipient_name: 서서연
+  quantity: 1
+  amount: 24000
+  shipping_fee: 3000
+  payment_method: 간편결제
+- id,link: 20261002-100477
+  registration_date: '2026-10-02'
+  status: 배송완료
+  goods: 기모 후드집업
+  tracking_number: '949201983244'
+  sender_name: 서하은
+  recipient_name: 서하은
+  quantity: 11
+  amount: 345690
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260627-100530
+  registration_date: '2026-06-27'
+  status: 배송완료
+  goods: 기모 후드집업
+  tracking_number: '154999338813'
+  sender_name: 서도윤
+  recipient_name: 서도윤
+  quantity: 2
+  amount: 179900
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260403-100583
+  registration_date: '2026-04-03'
+  status: 배송중
+  goods: 대용량 보조배터리
+  tracking_number: '365556517003'
+  sender_name: 윤유진
+  recipient_name: 윤유진
+  quantity: 2
+  amount: 52400
+  shipping_fee: 3000
+  payment_method: 무통장입금
+- id,link: 20260522-100636
+  registration_date: '2026-05-22'
+  status: 배송완료
+  goods: 비타민 C 세럼
+  tracking_number: '312694597279'
+  sender_name: 장소율
+  recipient_name: 장소율
+  quantity: 7
+  amount: 297540
+  shipping_fee: 0
+  payment_method: 무통장입금
+title: 주문내역 관리

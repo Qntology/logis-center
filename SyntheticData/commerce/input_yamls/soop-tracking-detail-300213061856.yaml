@@ -1,0 +1,30 @@
+page_id: soop-tracking-detail-300213061856
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/shipments/300213061856
+page_type: tracking
+layout: detail
+fields:
+  id,link: '300213061856'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: 경량 캠핑 의자
+  shipping_date: '2026-04-23'
+  recipient_name: 김시우
+  registration_date: '2026-04-21'
+  sender_name: 숲속잡화 협동조합
+  sender_address: 제주특별자치도 제주시 첨단로 213
+  sender_phone: 1877-0221
+  recipient_address: 서울특별시 성동구 왕십리로 150 11층
+  recipient_phone: 010-3628-3970
+  weight: 4.1
+  width: 31
+  height: 14
+  length: 6
+  shipping_method: 일반택배
+  shipping_duration: 1
+  shipping_fee: 3000
+title: 배송 상세 정보

@@ -1,0 +1,91 @@
+page_id: harbor-coupon-list-1
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: HAR123
+  title: Weekend-only offer 1
+  type: Percent off
+  discount: 15%
+  started_at: '2026-07-30'
+  expired_at: '2026-08-06'
+  status: Live
+- id,link: CP4014
+  code: HAR422
+  title: Weekend-only offer 2
+  type: Percent off
+  discount: 15%
+  started_at: '2026-03-28'
+  expired_at: '2026-04-27'
+  status: Scheduled
+- id,link: CP4021
+  code: HAR156
+  title: App-exclusive deal 3
+  type: Percent off
+  discount: 10%
+  started_at: '2026-05-05'
+  expired_at: '2026-05-19'
+  status: Scheduled
+- id,link: CP4028
+  code: HAR245
+  title: Weekend-only offer 4
+  type: Fixed amount
+  discount: $2.30
+  started_at: '2026-03-21'
+  expired_at: '2026-04-04'
+  status: Live
+- id,link: CP4035
+  code: HAR445
+  title: Returning customer perk 5
+  type: Percent off
+  discount: 20%
+  started_at: '2026-04-05'
+  expired_at: '2026-04-19'
+  status: Live
+- id,link: CP4042
+  code: HAR757
+  title: Weekend-only offer 6
+  type: Percent off
+  discount: 15%
+  started_at: '2026-07-09'
+  expired_at: '2026-08-08'
+  status: Live
+- id,link: CP4049
+  code: HAR653
+  title: Returning customer perk 7
+  type: Fixed amount
+  discount: $3.85
+  started_at: '2026-07-29'
+  expired_at: '2026-08-28'
+  status: Live
+- id,link: CP4056
+  code: HAR657
+  title: Returning customer perk 8
+  type: Fixed amount
+  discount: $2.30
+  started_at: '2026-08-05'
+  expired_at: '2026-09-04'
+  status: Scheduled
+- id,link: CP4063
+  code: HAR974
+  title: Cart rescue offer 9
+  type: Percent off
+  discount: 10%
+  started_at: '2026-08-06'
+  expired_at: '2026-08-20'
+  status: Scheduled
+- id,link: CP4070
+  code: HAR458
+  title: App-exclusive deal 10
+  type: Percent off
+  discount: 10%
+  started_at: '2026-04-28'
+  expired_at: '2026-05-28'
+  status: Live
+title: Discount codes

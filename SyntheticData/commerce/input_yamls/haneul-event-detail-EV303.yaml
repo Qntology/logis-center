@@ -1,0 +1,17 @@
+page_id: haneul-event-detail-EV303
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/event/view?id=EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: 봄 산책 기획전
+  type: 기획전
+  started_at: '2026-06-12'
+  expired_at: '2026-07-02'
+  status: 종료
+title: 기획전 정보

@@ -1,0 +1,16 @@
+page_id: haneul-review-detail-RV7011
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/review/view?id=RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: 승인
+  title: 생각보다 색이 예뻐서 만족합니다.
+  name: 권소율
+  registration_date: '2026-08-02'
+title: 후기 보기

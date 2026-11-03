@@ -1,0 +1,71 @@
+page_id: moa-review-list-1
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/review/list?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: 대기중
+  title: 생각보다 튼튼해서 만족합니다.
+  name: 권지우
+  registration_date: '2026-08-27'
+- id,link: RV7022
+  status: 승인
+  title: 포장이 꼼꼼했고 가벼워서 괜찮습니다.
+  name: 강소율
+  registration_date: '2026-08-07'
+- id,link: RV7033
+  status: 승인
+  title: 생각보다 가벼워서 만족합니다.
+  name: 박다은
+  registration_date: '2026-07-03'
+- id,link: RV7044
+  status: 승인
+  title: 두 번째 구매인데 역시 가벼워서 좋네요.
+  name: 김유진
+  registration_date: '2026-06-22'
+- id,link: RV7055
+  status: 승인
+  title: 포장이 꼼꼼했고 마감이 좋아서 괜찮습니다.
+  name: 김지우
+  registration_date: '2026-07-28'
+- id,link: RV7066
+  status: 승인
+  title: 포장이 꼼꼼했고 색이 예뻐서 괜찮습니다.
+  name: 신현우
+  registration_date: '2026-06-26'
+- id,link: RV7077
+  status: 숨김
+  title: 포장이 꼼꼼했고 색이 예뻐서 괜찮습니다.
+  name: 윤하은
+  registration_date: '2026-05-29'
+- id,link: RV7088
+  status: 대기중
+  title: 포장이 꼼꼼했고 마감이 좋아서 괜찮습니다.
+  name: 임시우
+  registration_date: '2026-05-08'
+- id,link: RV7099
+  status: 숨김
+  title: 두 번째 구매인데 역시 색이 예뻐서 좋네요.
+  name: 강유진
+  registration_date: '2026-07-21'
+- id,link: RV7110
+  status: 숨김
+  title: 생각보다 가벼워서 만족합니다.
+  name: 김도윤
+  registration_date: '2026-05-11'
+- id,link: RV7121
+  status: 승인
+  title: 생각보다 가벼워서 만족합니다.
+  name: 윤주원
+  registration_date: '2026-08-11'
+- id,link: RV7132
+  status: 승인
+  title: 포장이 꼼꼼했고 가벼워서 괜찮습니다.
+  name: 장수아
+  registration_date: '2026-06-27'
+title: 상품후기 관리

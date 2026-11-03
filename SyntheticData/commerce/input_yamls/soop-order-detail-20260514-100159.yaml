@@ -1,0 +1,27 @@
+page_id: soop-order-detail-20260514-100159
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/orders/20260514-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260514-100159
+  registration_date: '2026-05-14'
+  status: 결제완료
+  goods: 세라믹 식칼
+  sender_name: 박하은
+  recipient_name: 김수아
+  quantity: 2
+  amount: 67600
+  shipping_fee: 0
+  payment_method: 간편결제
+  sender_phone: 010-2836-2736
+  sender_address: 부산광역시 수영구 광남로 345
+  recipient_phone: 010-4345-5225
+  recipient_address: 대전광역시 유성구 대학로 48 12층
+  payment_origin: 바로결제
+  payment_date: '2026-05-14'
+title: 주문 상세내역

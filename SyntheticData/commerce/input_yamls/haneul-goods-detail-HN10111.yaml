@@ -1,0 +1,29 @@
+page_id: haneul-goods-detail-HN10111
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/goods/view?id=HN10111
+page_type: goods
+layout: detail
+fields:
+  id,link: HN10111
+  title: 스마트 밴드
+  status: 품절
+  category: 디지털
+  sale_price: 51500
+  quantity: 0
+  registration_date: '2026-02-26'
+  brand_name: Oakfern
+  code: HN-AUD-103
+  stock_keeping_unit: HNAU1003
+  model_name: AU-209
+  manufacturer: 누리온산업
+  origin_country: 포르투갈
+  color: 올리브
+  barcode: '8883790596890'
+  supply_price: 31174
+  low_stock_threshold: 10
+  description: 걸음 수와 수면을 기록합니다.
+title: 상품 정보

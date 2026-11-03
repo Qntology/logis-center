@@ -1,0 +1,31 @@
+page_id: moa-goods-detail-MA10111
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/goods/view?id=MA10111
+page_type: goods
+layout: detail
+fields:
+  id,link: MA10111
+  title: 비타민 C 세럼
+  status: 판매중
+  category: 뷰티
+  sale_price: 38800
+  compare_at_price: 46560
+  quantity: 18
+  registration_date: '2026-03-21'
+  brand_name: Marlow & Finch
+  code: MA-SKI-103
+  stock_keeping_unit: MASK1003
+  model_name: SK-885
+  manufacturer: Oakfern Works
+  origin_country: 포르투갈
+  color: 모래색
+  barcode: '8855149577012'
+  supply_price: 25067
+  low_stock_threshold: 20
+  shipping_fee: 3000
+  description: 칙칙한 피부 톤을 정돈해 줍니다.
+title: 상품 정보

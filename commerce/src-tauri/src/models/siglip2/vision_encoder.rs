@@ -8,6 +8,14 @@ use crate::utils::ai_utils::{split_bias_phrases_full, surprisal_dual_scores};
 
 pub const ERR_TEXT_ENCODER_REQUIRED: &str = "SIGLIP2_TEXT_ENCODER_REQUIRED";
 
+/// 🌟 [POOLED TITLE AXIS] 제목 판정의 1 · 2위 마진이 이 값(z 단위)을 넘으면 언어 모델에 다시 묻지 않습니다.
+///   합성 무역 문서 30건에서 틀린 판정의 마진은 모두 0.44 이하였고, 맞은 판정 28건 중 25건이 이 값을 넘었습니다.
+pub const TITLE_TRUST_MARGIN: f32 = 0.5;
+/// 풀링 축은 페이지 전체를 보고 띠 축은 제목 자리를 봅니다. 풀링 축 단독이 79%, 띠 축 단독이 54% 라 2 : 1 로 합칩니다.
+const POOLED_AXIS_WEIGHT: f32 = 2.0;
+/// 재판정 후보로 넘기는 서식 수.
+const TITLE_BAND_CODES: usize = 3;
+
 /// 텍스트 인코더 한 번에 묶는 구 수 (64토큰 × 1152 × 27층의 VRAM 안전선).
 pub const PHRASE_BATCH_ROWS: usize = 32;
 
@@ -528,6 +536,13 @@ struct TitleGateVerdict {
     band: Vec<(String, f32)>,
 }
 
+fn z_scores(v: &[f32]) -> Vec<f32> {
+    let n = v.len().max(1) as f32;
+    let mean = v.iter().sum::<f32>() / n;
+    let sd = (v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).sqrt().max(1e-6);
+    v.iter().map(|x| (x - mean) / sd).collect()
+}
+
 fn run_title_gate(
     model: &Siglip2Model,
     grid: &PatchGrid,
@@ -567,6 +582,23 @@ fn run_title_gate(
     let (keys, matrix) = score_patches_bank_neutral(grid, &bank, None);
     if keys.is_empty() {
         return None;
+    }
+
+    // 🌟 [POOLED TITLE AXIS] 페이지 풀링 벡터 × 서식 제목.
+    //
+    //  ── 왜 필요한가 ──
+    //   글자는 패치 하나(원본 약 120px)에 두세 줄이 들어갈 만큼 작아서, 패치 축만으로는 합성 무역 문서 30건의 첫 페이지
+    //   서식을 절반쯤밖에 못 맞혔습니다. 풀링 벡터는 어텐션 풀링이 페이지 전체에서 모은 것이고 SigLIP2 가 학습한 바로 그 공간이라
+    //   제목 구와 곧바로 비교할 수 있는데, 지금까지 계산만 하고 판정에 쓰지 않았습니다.
+    //   같은 문서에서 풀링 축 단독 78.6%, 상단 띠 축 단독 53.6%, 둘의 z 합(2 : 1) 92.9% 이고 정답은 항상 상위 5 안에 있습니다.
+    let mut pooled_axis = vec![f32::MIN; keys.len()];
+    for (_, k, e) in bank.bias.iter() {
+        if let Some(ki) = keys.iter().position(|x| x == k) {
+            let s: f32 = grid.pooled.iter().zip(e.iter()).map(|(a, b)| a * b).sum();
+            if s > pooled_axis[ki] {
+                pooled_axis[ki] = s;
+            }
+        }
     }
 
     let mut best: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
@@ -653,71 +685,52 @@ fn run_title_gate(
         ));
     }
 
-    if sorted.len() >= 2 && sorted[0].1 == sorted[1].1 {
-        emit(&format!(
-            "   ⚪ [TITLE GATE] '{}' 와 '{}' 의 전문 점수가 완전 동률({:+.4})입니다. 같은 전문을 공유하는 서식이므로 거부하고 벡터 판정에 위임합니다.",
-            sorted[0].0, sorted[1].0, sorted[0].1
-        ));
-        return None;
-    }
-
-    let top_score = sorted[0].1;
-    let tie_band: Vec<(String, f32, usize)> = sorted
-        .iter()
-        .filter(|(_, s)| *s >= top_score - 1.0)
-        .filter_map(|(c, s)| patch_best.get(c).map(|(_, r, _, _)| (c.clone(), *s, *r)))
+    // 🌟 [POOLED TITLE AXIS] 두 축을 코드 전체의 z 로 맞춰 합칩니다. 제목이 같은 쌍둥이 코드(BC/BK · INS/IP 등)는 점수가 같으므로
+    //    경쟁자로 세지 않습니다. 예전에는 쌍둥이의 동률을 '판정 불가' 로 보고 제목 축을 통째로 버렸습니다.
+    let band_axis: Vec<f32> = (0..keys.len())
+        .map(|ki| {
+            (0..grid.len())
+                .filter(|idx| grid.rc(*idx).0 < title_rows)
+                .map(|idx| matrix[ki][idx])
+                .filter(|v| *v != f32::MIN)
+                .fold(f32::MIN, f32::max)
+        })
         .collect();
-    let min_row = tie_band.iter().map(|(_, _, r)| *r).min().unwrap_or(0);
-    let mut band_top: Vec<(String, f32)> = tie_band
+    let floor_of = |v: &[f32]| v.iter().cloned().filter(|x| *x != f32::MIN).fold(f32::MAX, f32::min);
+    let pooled_floor = floor_of(&pooled_axis);
+    let band_floor = floor_of(&band_axis);
+    let pooled_z = z_scores(&pooled_axis.iter().map(|v| if *v == f32::MIN { pooled_floor } else { *v }).collect::<Vec<_>>());
+    let band_z = z_scores(&band_axis.iter().map(|v| if *v == f32::MIN { band_floor } else { *v }).collect::<Vec<_>>());
+    let mut fused: Vec<(String, f32)> = keys
         .iter()
-        .filter(|(_, _, r)| *r == min_row)
-        .map(|(c, s, _)| (c.clone(), *s))
+        .enumerate()
+        .map(|(ki, k)| (k.clone(), POOLED_AXIS_WEIGHT * pooled_z[ki] + band_z[ki]))
         .collect();
-    band_top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut top_code = sorted[0].0.clone();
-    let mut verdict_score = top_score;
-    let mut tie_broken = false;
-    if let Some((c, s)) = band_top.first() {
-        if *c != top_code {
-            emit(&format!(
-                "     🥇 [TITLE ROW TIE-BREAK] 1위 '{}'({:+.4}) 와 pooled σ 한 칸 안에 든 전문 {}개 가운데 가장 위 행 r{} 에 봉우리를 둔 '{}'({:+.4}) 를 제목으로 확정합니다. 서식 제목은 상단에 인쇄되고, 그 아래 격자 안의 서식 전문은 다른 문서를 가리키는 참조 라벨입니다.",
-                top_code, top_score, tie_band.len(), min_row, c, s
-            ));
-            top_code = c.clone();
-            verdict_score = *s;
-            tie_broken = true;
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let title_of = |code: &str| -> &'static str {
+        TRADE_DOC_TITLES.iter().find(|(c, _)| *c == code).map(|(_, t)| *t).unwrap_or("")
+    };
+    let mut band_top: Vec<(String, f32)> = Vec::new();
+    for (c, v) in fused.iter() {
+        if band_top.iter().any(|(b, _)| title_of(b) == title_of(c)) {
+            continue;
+        }
+        band_top.push((c.clone(), *v));
+        if band_top.len() >= TITLE_BAND_CODES {
+            break;
         }
     }
-    crate::utils::score_dynamics::record_baseline(
-        "vision.title_row_tiebreak",
-        if tie_broken { 1.0 } else { 0.0 },
-    );
-    if band_top.len() >= 2 {
-        emit(&format!(
-            "     🎞️ [TITLE ROW BAND] 제목 행 r{} 에서 동점 안에 든 전문 {}개: {:?} — 마진이 부족하면 LLM 재판정은 이 밴드 안에서만 고릅니다.",
-            min_row,
-            band_top.len(),
-            band_top.iter().map(|(c, s)| format!("{}({:+.3})", c, s)).collect::<Vec<_>>()
-        ));
-    }
-
-    let runner_up = sorted
-        .iter()
-        .filter(|(c, _)| *c != top_code)
-        .map(|(_, s)| *s)
-        .fold(f32::MIN, f32::max);
-    let margin = if runner_up == f32::MIN {
-        verdict_score
-    } else {
-        (verdict_score - runner_up).abs()
-    };
+    let top_code = band_top[0].0.clone();
+    let verdict_score = band_top[0].1;
+    let margin = if band_top.len() >= 2 { band_top[0].1 - band_top[1].1 } else { verdict_score };
     crate::utils::score_dynamics::record_baseline("vision.title_margin", margin);
     emit(&format!(
-        "     👑 [TITLE GATE VERDICT] '{}' | Surprisal {:+.4} | 마진 {:+.4}{}",
+        "     👑 [TITLE GATE VERDICT] '{}' | 풀링 × {} + 띠 z 합 {:+.4} | 2위 마진 {:+.4} | 후보 {:?}",
         top_code,
+        POOLED_AXIS_WEIGHT,
         verdict_score,
         margin,
-        if tie_broken { " (행 순서로 확정)" } else { "" }
+        band_top.iter().map(|(c, v)| format!("{}({:+.2})", c, v)).collect::<Vec<_>>()
     ));
 
     let title = TRADE_DOC_TITLES
@@ -1142,16 +1155,16 @@ pub fn classify_doc_type(
                 conflict_candidates.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>()
             ));
         }
-        if leader_is_candidate {
-            c_scores.retain(|(c, _)| *c != gate.code);
-            c_scores.insert(0, (gate.code.clone(), gate.score));
-            forced_margin = Some(if conflict { 0.0 } else { band_margin });
-        } else {
+        if !leader_is_candidate {
+            // 그룹 단계는 코드 후보를 좁힐 뿐이고 최종 그룹은 아래에서 코드로 다시 정합니다. 제목 축이 후보 밖을 가리키면 제목을 따릅니다.
             emit(&format!(
-                "  ⚪ [TITLE LEADER OUTSIDE CANDIDATES] 제목 행 선두 '{}' 가 이번 코드 후보에 없습니다. 바디 순서를 유지하고 재판정 단계에 제목 밴드를 넘깁니다.",
+                "  🔁 [TITLE LEADER OUTSIDE CANDIDATES] 제목 판정 '{}' 이 그룹 단계의 코드 후보에 없어 후보에 넣습니다.",
                 gate.code
             ));
         }
+        c_scores.retain(|(c, _)| *c != gate.code);
+        c_scores.insert(0, (gate.code.clone(), gate.score));
+        forced_margin = Some(if conflict { 0.0 } else { band_margin });
     }
     if c_scores.is_empty() {
         c_scores.push((codes[0].to_string(), 0.0));

@@ -1676,6 +1676,10 @@ pub async fn tokenize_query_with_morphology(
         }
     };
     let mut stanza = wrapper.0;
+    if !stanza.preprocessor.pos_reliable {
+        println!("[ANALYTIC] ⚪ [POS RELIABILITY] 사전학습 단어 사전이 없어 품사 태그가 무작위에 가깝습니다. 공백 분할로 진행합니다.");
+        return fallback;
+    }
 
     let refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
 

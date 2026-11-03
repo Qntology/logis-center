@@ -1,0 +1,27 @@
+page_id: lantern-order-detail-20260927-100212
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/orders/20260927-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260927-100212
+  registration_date: '2026-09-27'
+  status: Paid
+  goods: Folding trekking poles
+  sender_name: Harper Mercer
+  recipient_name: Harper Mercer
+  quantity: 5
+  amount: 191.5
+  shipping_fee: 0.0
+  payment_method: Digital wallet
+  sender_phone: +1-611-555-0176
+  sender_address: 4710 Maple Dr, Asheville, NC 28801
+  recipient_phone: +1-611-555-0176
+  recipient_address: 4710 Maple Dr, Asheville, NC 28801
+  payment_origin: CheckoutBridge
+  payment_date: '2026-09-27'
+title: Order details

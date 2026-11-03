@@ -1,0 +1,29 @@
+page_id: ttukbaegi-order-detail-20260923-100053
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/orders/20260923-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260923-100053
+  registration_date: '2026-09-23'
+  status: 배송완료
+  goods: 통풍 샌들
+  tracking_number: '633694505390'
+  sender_name: 강소율
+  recipient_name: 강소율
+  quantity: 8
+  amount: 337100
+  shipping_fee: 0
+  payment_method: 신용카드
+  sender_phone: 010-7234-4057
+  sender_address: 강원특별자치도 춘천시 공지로 261
+  recipient_phone: 010-7234-4057
+  recipient_address: 강원특별자치도 춘천시 공지로 261
+  payment_origin: 스마트PG
+  payment_date: '2026-09-23'
+  card: 한결카드
+title: 주문 상세내역

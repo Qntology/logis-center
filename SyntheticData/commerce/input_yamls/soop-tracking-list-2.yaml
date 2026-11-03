@@ -1,0 +1,59 @@
+page_id: soop-tracking-list-2
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/shipments?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '559777950333'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 원목 블록 세트
+  shipping_date: '2026-07-02'
+  recipient_name: 강하은
+- id,link: '861963712164'
+  carrier: 새길운송
+  status: 반품
+  title: 기모 후드집업
+  shipping_date: '2026-10-10'
+  recipient_name: 정현우
+- id,link: '816534818222'
+  carrier: 한빛로지스
+  status: 반품
+  title: 휴대용 코펠 세트
+  shipping_date: '2026-05-07'
+  recipient_name: 정서연
+- id,link: '958283862822'
+  carrier: 새길운송
+  status: 배송완료
+  title: 스마트 밴드
+  shipping_date: '2026-07-13'
+  recipient_name: 강유진
+- id,link: '570804450737'
+  carrier: 새길운송
+  status: 배송완료
+  title: 코딩 로봇 키트
+  shipping_date: '2026-09-19'
+  recipient_name: 조하은
+- id,link: '841919062603'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 스테인리스 프라이팬
+  shipping_date: '2026-06-30'
+  recipient_name: 윤서연
+- id,link: '531308239861'
+  carrier: 한빛로지스
+  status: 반품
+  title: 휴대용 코펠 세트
+  shipping_date: '2026-08-27'
+  recipient_name: 강다은
+- id,link: '704311002504'
+  carrier: 새길운송
+  status: 반품
+  title: 스마트 밴드
+  shipping_date: '2026-04-18'
+  recipient_name: 박유진
+title: 배송 조회

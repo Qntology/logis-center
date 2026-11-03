@@ -1,0 +1,28 @@
+page_id: soop-order-detail-20260614-100106
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/orders/20260614-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260614-100106
+  registration_date: '2026-06-14'
+  status: 상품준비중
+  goods: 펫 빗 브러시
+  sender_name: 김지우
+  recipient_name: 김지우
+  quantity: 3
+  amount: 105800
+  shipping_fee: 0
+  payment_method: 무통장입금
+  sender_phone: 010-3828-4580
+  sender_address: 경기도 고양시 일산동구 중앙로 22
+  recipient_phone: 010-3828-4580
+  recipient_address: 경기도 고양시 일산동구 중앙로 22
+  payment_origin: 스마트PG
+  payment_date: '2026-06-14'
+  bank: 가온은행
+title: 주문 상세내역

@@ -1,0 +1,30 @@
+page_id: haneul-goods-detail-HN10074
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/goods/view?id=HN10074
+page_type: goods
+layout: detail
+fields:
+  id,link: HN10074
+  title: 제주 감귤 주스
+  status: 판매중
+  category: 식품
+  sale_price: 17100
+  quantity: 3
+  registration_date: '2026-05-11'
+  brand_name: Marlow & Finch
+  code: HN-SNA-102
+  stock_keeping_unit: HNSN1002
+  model_name: SN-858
+  manufacturer: 솔빛리빙
+  origin_country: 국산
+  color: 하늘색
+  barcode: '8816099332158'
+  supply_price: 11586
+  low_stock_threshold: 10
+  shipping_fee: 3000
+  description: 감귤을 착즙해 병에 담았습니다.
+title: 상품 정보

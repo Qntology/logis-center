@@ -1,0 +1,28 @@
+page_id: harbor-order-detail-20260808-100212
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/order/view?id=20260808-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260808-100212
+  registration_date: '2026-08-08'
+  status: Cancelled
+  goods: Plush bunny doll
+  sender_name: Riley Mercer
+  recipient_name: Riley Mercer
+  quantity: 5
+  amount: 68.85
+  shipping_fee: 0.0
+  payment_method: Credit card
+  sender_phone: +1-909-555-0117
+  sender_address: 795 Willow Ct, Madison, WI 53703
+  recipient_phone: +1-909-555-0117
+  recipient_address: 795 Willow Ct, Madison, WI 53703
+  payment_origin: SwiftTender
+  payment_date: '2026-08-08'
+  card: Lantern Card
+title: Order details

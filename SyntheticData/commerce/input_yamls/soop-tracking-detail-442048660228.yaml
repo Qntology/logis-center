@@ -1,0 +1,30 @@
+page_id: soop-tracking-detail-442048660228
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/shipments/442048660228
+page_type: tracking
+layout: detail
+fields:
+  id,link: '442048660228'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 색칠놀이 스케치북
+  shipping_date: '2026-06-09'
+  recipient_name: 정시우
+  registration_date: '2026-06-06'
+  sender_name: 숲속잡화 협동조합
+  sender_address: 제주특별자치도 제주시 첨단로 213
+  sender_phone: 1877-0221
+  recipient_address: 강원특별자치도 춘천시 공지로 337
+  recipient_phone: 010-2200-2090
+  weight: 1.3
+  width: 32
+  height: 14
+  length: 28
+  shipping_method: 방문수령
+  shipping_duration: 2
+  shipping_fee: 3000
+title: 배송 상세 정보

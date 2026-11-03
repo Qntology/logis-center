@@ -1,0 +1,112 @@
+page_id: lantern-goods-list-1
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/products?page=1
+page_type: goods
+layout: list
+items:
+- id,link: BL10037
+  title: Automatic pet feeder
+  status: Active
+  category: Pets
+  sale_price: 53.15
+  compare_at_price: 63.78
+  quantity: 7
+  registration_date: '2026-04-24'
+  brand_name: 하람
+- id,link: BL10074
+  title: Airtight glass container set
+  status: Sold out
+  category: Kitchen
+  sale_price: 24.85
+  compare_at_price: 29.82
+  quantity: 0
+  registration_date: '2026-04-13'
+  brand_name: Tidewell
+- id,link: BL10111
+  title: Colouring sketchbook
+  status: Active
+  category: Toys
+  sale_price: 7.75
+  quantity: 18
+  registration_date: '2026-06-09'
+  brand_name: Tidewell
+- id,link: BL10148
+  title: 65W fast charger
+  status: Active
+  category: Electronics
+  sale_price: 28.85
+  quantity: 42
+  registration_date: '2026-07-24'
+  brand_name: Marlow & Finch
+- id,link: BL10185
+  title: Organic granola
+  status: Active
+  category: Grocery
+  sale_price: 11.45
+  compare_at_price: 13.74
+  quantity: 120
+  registration_date: '2026-07-11'
+  brand_name: 버들
+- id,link: BL10222
+  title: Pet travel carrier
+  status: Active
+  category: Pets
+  sale_price: 37.15
+  quantity: 350
+  registration_date: '2026-08-07'
+  brand_name: 하람
+- id,link: BL10259
+  title: Ventilated sandals
+  status: Draft
+  category: Apparel
+  sale_price: 23.9
+  quantity: 96
+  registration_date: '2026-04-05'
+  brand_name: 하람
+- id,link: BL10296
+  title: Stainless steel frying pan
+  status: Draft
+  category: Kitchen
+  sale_price: 46.15
+  quantity: 3
+  registration_date: '2026-05-21'
+  brand_name: Kestrel Lane
+- id,link: BL10333
+  title: UV-blocking parasol
+  status: Sold out
+  category: Home
+  sale_price: 22.75
+  compare_at_price: 27.3
+  quantity: 0
+  registration_date: '2026-08-26'
+  brand_name: Kestrel Lane
+- id,link: BL10370
+  title: Toddler tableware set
+  status: Active
+  category: Baby
+  sale_price: 18.85
+  quantity: 7
+  registration_date: '2026-05-29'
+  brand_name: Marlow & Finch
+- id,link: BL10407
+  title: Plush bunny doll
+  status: Active
+  category: Toys
+  sale_price: 15.55
+  compare_at_price: 18.66
+  quantity: 96
+  registration_date: '2026-03-05'
+  brand_name: 다온랩
+- id,link: BL10444
+  title: Scorched brown rice crisps
+  status: Active
+  category: Grocery
+  sale_price: 7.9
+  quantity: 42
+  registration_date: '2026-03-02'
+  brand_name: 누리온
+title: Products

@@ -1,0 +1,30 @@
+page_id: ttukbaegi-tracking-detail-382022382852
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/shipments/382022382852
+page_type: tracking
+layout: detail
+fields:
+  id,link: '382022382852'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 실리콘 조리도구 세트
+  shipping_date: '2026-07-05'
+  recipient_name: 장하은
+  registration_date: '2026-07-04'
+  sender_name: 뚝배기유통 주식회사
+  sender_address: 대구광역시 동구 동대구로 465
+  sender_phone: 1833-0763
+  recipient_address: 전북특별자치도 전주시 완산구 효자로 327
+  recipient_phone: 010-8804-5100
+  weight: 6.3
+  width: 57
+  height: 37
+  length: 34
+  shipping_method: 방문수령
+  shipping_duration: 5
+  shipping_fee: 3000
+title: 배송 상세 정보

@@ -1,0 +1,29 @@
+page_id: haneul-order-detail-20260502-100106
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/order/view?id=20260502-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260502-100106
+  registration_date: '2026-05-02'
+  status: 배송완료
+  goods: 기모 후드집업
+  tracking_number: '944787807166'
+  sender_name: 임현우
+  recipient_name: 임현우
+  quantity: 2
+  amount: 95040
+  shipping_fee: 0
+  payment_method: 신용카드
+  sender_phone: 010-5851-8854
+  sender_address: 서울특별시 마포구 합정로 208 13층
+  recipient_phone: 010-5851-8854
+  recipient_address: 서울특별시 마포구 합정로 208 13층
+  payment_origin: 온페이먼츠
+  payment_date: '2026-05-02'
+  card: 누리카드
+title: 주문 상세내역

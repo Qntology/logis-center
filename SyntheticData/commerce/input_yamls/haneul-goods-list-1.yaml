@@ -1,0 +1,110 @@
+page_id: haneul-goods-list-1
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/goods/list?page=1
+page_type: goods
+layout: list
+items:
+- id,link: HN10037
+  title: 펫 빗 브러시
+  status: 품절
+  category: 반려
+  sale_price: 13900
+  compare_at_price: 16680
+  quantity: 0
+  registration_date: '2026-06-07'
+  brand_name: 다온랩
+- id,link: HN10074
+  title: 제주 감귤 주스
+  status: 판매중
+  category: 식품
+  sale_price: 17100
+  quantity: 3
+  registration_date: '2026-05-11'
+  brand_name: Marlow & Finch
+- id,link: HN10111
+  title: 스마트 밴드
+  status: 품절
+  category: 디지털
+  sale_price: 51500
+  quantity: 0
+  registration_date: '2026-02-26'
+  brand_name: Oakfern
+- id,link: HN10148
+  title: 65W 고속 충전기
+  status: 판매중
+  category: 디지털
+  sale_price: 36300
+  quantity: 42
+  registration_date: '2026-02-14'
+  brand_name: 버들
+- id,link: HN10185
+  title: 아이스 쿨매트
+  status: 판매중
+  category: 생활
+  sale_price: 42700
+  quantity: 18
+  registration_date: '2026-02-19'
+  brand_name: 버들
+- id,link: HN10222
+  title: 자외선 차단 양산
+  status: 판매중
+  category: 생활
+  sale_price: 27700
+  quantity: 3
+  registration_date: '2026-05-16'
+  brand_name: Tidewell
+- id,link: HN10259
+  title: 저소음 기계식 키보드
+  status: 판매중
+  category: 디지털
+  sale_price: 85100
+  compare_at_price: 102120
+  quantity: 120
+  registration_date: '2026-06-19'
+  brand_name: Tidewell
+- id,link: HN10296
+  title: 구운 아몬드
+  status: 판매중
+  category: 식품
+  sale_price: 11900
+  quantity: 7
+  registration_date: '2026-01-30'
+  brand_name: 솔빛
+- id,link: HN10333
+  title: 저알러지 사료
+  status: 판매중
+  category: 반려
+  sale_price: 32400
+  quantity: 18
+  registration_date: '2026-04-27'
+  brand_name: 솔빛
+- id,link: HN10370
+  title: 핸드 블렌더
+  status: 진열안함
+  category: 가전
+  sale_price: 45900
+  quantity: 3
+  registration_date: '2026-02-04'
+  brand_name: Marlow & Finch
+- id,link: HN10407
+  title: 스테인리스 프라이팬
+  status: 품절
+  category: 주방
+  sale_price: 57400
+  compare_at_price: 68880
+  quantity: 0
+  registration_date: '2026-08-18'
+  brand_name: 다온랩
+- id,link: HN10444
+  title: 무향 바디 로션
+  status: 판매중
+  category: 뷰티
+  sale_price: 18100
+  quantity: 18
+  registration_date: '2026-09-02'
+  brand_name: Tidewell
+title: 상품 관리

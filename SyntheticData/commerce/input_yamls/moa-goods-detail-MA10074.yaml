@@ -1,0 +1,30 @@
+page_id: moa-goods-detail-MA10074
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/goods/view?id=MA10074
+page_type: goods
+layout: detail
+fields:
+  id,link: MA10074
+  title: 고양이 스크래처
+  status: 진열안함
+  category: 반려
+  sale_price: 19500
+  quantity: 350
+  registration_date: '2026-09-07'
+  brand_name: Oakfern
+  code: MA-PET-102
+  stock_keeping_unit: MAPE1002
+  model_name: PE-210
+  manufacturer: Tidewell Supply
+  origin_country: 포르투갈
+  color: 올리브
+  barcode: '8811082990724'
+  supply_price: 13444
+  low_stock_threshold: 20
+  shipping_fee: 3000
+  description: 골판지로 만든 원통형 스크래처입니다.
+title: 상품 정보

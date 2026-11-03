@@ -1,0 +1,136 @@
+page_id: moa-order-list-2
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/order/list?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20260818-100689
+  registration_date: '2026-08-18'
+  status: 상품준비중
+  goods: 노트북 거치대
+  sender_name: 서유진
+  recipient_name: 서유진
+  quantity: 7
+  amount: 223600
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260731-100742
+  registration_date: '2026-07-31'
+  status: 배송완료
+  goods: 65W 고속 충전기
+  tracking_number: '290539531496'
+  sender_name: 권유진
+  recipient_name: 권유진
+  quantity: 5
+  amount: 202000
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260514-100795
+  registration_date: '2026-05-14'
+  status: 상품준비중
+  goods: 스테인리스 프라이팬
+  sender_name: 서은호
+  recipient_name: 서은호
+  quantity: 5
+  amount: 142300
+  shipping_fee: 0
+  payment_method: 간편결제
+- id,link: 20260901-100848
+  registration_date: '2026-09-01'
+  status: 반품
+  goods: 강아지 하네스
+  tracking_number: '785356489847'
+  sender_name: 권예준
+  recipient_name: 임소율
+  quantity: 6
+  amount: 340000
+  shipping_fee: 0
+  payment_method: 간편결제
+- id,link: 20260617-100901
+  registration_date: '2026-06-17'
+  status: 상품준비중
+  goods: 휴대용 코펠 세트
+  sender_name: 이예준
+  recipient_name: 권지우
+  quantity: 15
+  amount: 547500
+  shipping_fee: 0
+  payment_method: 무통장입금
+- id,link: 20260407-100954
+  registration_date: '2026-04-07'
+  status: 결제완료
+  goods: 온도조절 전기포트
+  sender_name: 강다은
+  recipient_name: 강다은
+  quantity: 6
+  amount: 278400
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260716-101007
+  registration_date: '2026-07-16'
+  status: 배송완료
+  goods: 손상모 헤어 에센스
+  tracking_number: '917334219994'
+  sender_name: 장민준
+  recipient_name: 신민준
+  quantity: 2
+  amount: 39540
+  shipping_fee: 3000
+  payment_method: 무통장입금
+- id,link: 20261011-101060
+  registration_date: '2026-10-11'
+  status: 반품
+  goods: 자외선 차단 양산
+  tracking_number: '493010304115'
+  sender_name: 강수아
+  recipient_name: 오유진
+  quantity: 8
+  amount: 417690
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260918-101113
+  registration_date: '2026-09-18'
+  status: 상품준비중
+  goods: 코딩 로봇 키트
+  sender_name: 조주원
+  recipient_name: 임다은
+  quantity: 1
+  amount: 67950
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260524-101166
+  registration_date: '2026-05-24'
+  status: 반품
+  goods: 자외선 차단 양산
+  tracking_number: '134838649493'
+  sender_name: 권건우
+  recipient_name: 권건우
+  quantity: 3
+  amount: 85200
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260826-101219
+  registration_date: '2026-08-26'
+  status: 입금대기
+  goods: 손상모 헤어 에센스
+  sender_name: 임은호
+  recipient_name: 임은호
+  quantity: 10
+  amount: 280530
+  shipping_fee: 0
+  payment_method: 신용카드
+- id,link: 20260813-101272
+  registration_date: '2026-08-13'
+  status: 입금대기
+  goods: LED 충전 랜턴
+  sender_name: 이건우
+  recipient_name: 이건우
+  quantity: 2
+  amount: 59600
+  shipping_fee: 0
+  payment_method: 간편결제
+title: 주문내역 관리

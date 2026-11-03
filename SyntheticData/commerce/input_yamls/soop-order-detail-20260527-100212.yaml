@@ -1,0 +1,28 @@
+page_id: soop-order-detail-20260527-100212
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/my/orders/20260527-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260527-100212
+  registration_date: '2026-05-27'
+  status: 상품준비중
+  goods: 원목 블록 세트
+  sender_name: 김소율
+  recipient_name: 박시우
+  quantity: 3
+  amount: 68040
+  shipping_fee: 0
+  payment_method: 무통장입금
+  sender_phone: 010-5894-1162
+  sender_address: 경기도 수원시 영통구 매탄로 104 5층
+  recipient_phone: 010-2842-8909
+  recipient_address: 전북특별자치도 전주시 완산구 효자로 209 9층
+  payment_origin: 스마트PG
+  payment_date: '2026-05-27'
+  bank: 누리은행
+title: 주문 상세내역

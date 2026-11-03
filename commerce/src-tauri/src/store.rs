@@ -1868,6 +1868,98 @@ impl VectorStore {
 
          Ok(result_slice)
     }
+    /// 🌟 [WHOLE QUERY FUSION] 질의 벡터에 가까운 순서 그대로 (id, data) 를 돌려줍니다.
+    ///   search_items 는 트랙 점수를 더하므로 트랙별 순위가 남지 않습니다.
+    pub async fn rank_items_vector(&self, query_text: &str, query_vec: &[f32], limit: usize, scope: &str) -> Result<Vec<(String, String)>> {
+        if query_vec.is_empty() || query_vec.iter().all(|&x| x == 0.0) {
+            return Ok(Vec::new());
+        }
+        let table = self.conn.open_table("items").execute().await?;
+        let batches = table
+            .query()
+            .only_if(format!("({}) AND data LIKE '%\"embed\":1%'", scope))
+            .limit(limit)
+            .nearest_to(query_vec.to_vec())?
+            .column("vector")
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(Self::named_rows(&batches, query_text))
+    }
+
+    /// 🌟 [WHOLE QUERY FUSION] FTS 순서 그대로 (id, data) 를 돌려줍니다.
+    pub async fn rank_items_fts(&self, query_text: &str, limit: usize, scope: &str) -> Result<Vec<(String, String)>> {
+        if query_text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let table = self.conn.open_table("items").execute().await?;
+        let fts_query = query_text
+            .split_whitespace()
+            .map(|w| format!("\"{}\"", w.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let batches = table
+            .query()
+            .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query))
+            .only_if(scope.to_string())
+            .limit(limit)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(Self::named_rows(&batches, query_text))
+    }
+
+    fn named_rows(batches: &[RecordBatch], query_text: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for b in batches {
+            let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                let keep = match serde_json::from_str::<Value>(txs.value(i)) {
+                    Ok(doc) => !is_relay_draft(&doc) || draft_named_by_query(&doc, query_text),
+                    Err(_) => true,
+                };
+                if keep {
+                    out.push((ids.value(i).to_string(), txs.value(i).to_string()));
+                }
+            }
+        }
+        out
+    }
+
+    /// 🌟 [CONDITION GROUNDING] 범위 안에서 data 에 이 글자가 든 행의 저장 JSON 을 돌려줍니다.
+    pub async fn rows_mentioning(&self, scope: &str, value: &str, limit: usize) -> Result<Vec<String>> {
+        let table = self.conn.open_table("items").execute().await?;
+        let pattern = value.replace('\'', "''");
+        let batches = table
+            .query()
+            .only_if(format!("({}) AND data LIKE '%{}%'", scope, pattern))
+            .limit(limit)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut out = Vec::new();
+        for b in batches.iter() {
+            let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                out.push(txs.value(i).to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// 🌟 [REROUTE DATA GUARD] 이 조건에 맞는 행이 하나라도 있는가.
+    pub async fn has_rows(&self, filter: &str) -> bool {
+        let Ok(table) = self.conn.open_table("items").execute().await else { return false };
+        match table.query().only_if(filter.to_string()).limit(1).execute().await {
+            Ok(stream) => stream.try_collect::<Vec<_>>().await.map_or(false, |b| b.iter().any(|x| x.num_rows() > 0)),
+            Err(_) => false,
+        }
+    }
+
     pub async fn find_item_by_property(&self, table_name: &str, property: &str, value: &Value) -> Result<Option<(String, Value)>> {
         let target = Self::resolve_table(table_name);
         let table = self.conn.open_table(target).execute().await?;

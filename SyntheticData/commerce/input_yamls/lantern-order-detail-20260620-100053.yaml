@@ -1,0 +1,28 @@
+page_id: lantern-order-detail-20260620-100053
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/orders/20260620-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260620-100053
+  registration_date: '2026-06-20'
+  status: Processing
+  goods: Low-sugar protein bar
+  sender_name: Casey Ashby
+  recipient_name: Casey Ashby
+  quantity: 1
+  amount: 16.43
+  shipping_fee: 2.3
+  payment_method: Credit card
+  sender_phone: +1-385-555-0133
+  sender_address: 6622 Birch Ave, Boise, ID 83702
+  recipient_phone: +1-385-555-0133
+  recipient_address: 6622 Birch Ave, Boise, ID 83702
+  payment_origin: CheckoutBridge
+  payment_date: '2026-06-20'
+  card: Lantern Card
+title: Order details

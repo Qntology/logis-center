@@ -1,0 +1,29 @@
+page_id: ttukbaegi-order-detail-20260704-100106
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/orders/20260704-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260704-100106
+  registration_date: '2026-07-04'
+  status: 배송완료
+  goods: 실리콘 조리도구 세트
+  tracking_number: '382022382852'
+  sender_name: 권소율
+  recipient_name: 장하은
+  quantity: 1
+  amount: 33000
+  shipping_fee: 3000
+  payment_method: 신용카드
+  sender_phone: 010-4553-9269
+  sender_address: 서울특별시 마포구 합정로 246 5층
+  recipient_phone: 010-8804-5100
+  recipient_address: 전북특별자치도 전주시 완산구 효자로 327
+  payment_origin: 스마트PG
+  payment_date: '2026-07-04'
+  card: 한결카드
+title: 주문 상세내역

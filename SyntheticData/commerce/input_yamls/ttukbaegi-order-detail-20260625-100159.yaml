@@ -1,0 +1,28 @@
+page_id: ttukbaegi-order-detail-20260625-100159
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/orders/20260625-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260625-100159
+  registration_date: '2026-06-25'
+  status: 배송완료
+  goods: 경량 패딩 조끼
+  tracking_number: '127860933381'
+  sender_name: 한현우
+  recipient_name: 한현우
+  quantity: 5
+  amount: 128520
+  shipping_fee: 0
+  payment_method: 간편결제
+  sender_phone: 010-2045-2173
+  sender_address: 부산광역시 수영구 광남로 251 13층
+  recipient_phone: 010-2045-2173
+  recipient_address: 부산광역시 수영구 광남로 251 13층
+  payment_origin: 온페이먼츠
+  payment_date: '2026-06-25'
+title: 주문 상세내역

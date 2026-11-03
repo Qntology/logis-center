@@ -1,0 +1,83 @@
+page_id: ttukbaegi-tracking-list-2
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/shipments?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '666672609279'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 케이블 정리함
+  shipping_date: '2026-06-28'
+  recipient_name: 조다은
+- id,link: '378061530697'
+  carrier: 바른택배
+  status: 배송완료
+  title: 자외선 차단 양산
+  shipping_date: '2026-06-28'
+  recipient_name: 오건우
+- id,link: '190867869231'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 스마트 밴드
+  shipping_date: '2026-04-08'
+  recipient_name: 서예준
+- id,link: '723294439675'
+  carrier: 한빛로지스
+  status: 배송중
+  title: 유아 식기 세트
+  shipping_date: '2026-05-19'
+  recipient_name: 정도윤
+- id,link: '613797585921'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 극세사 담요
+  shipping_date: '2026-07-17'
+  recipient_name: 강소율
+- id,link: '854291860486'
+  carrier: 새길운송
+  status: 배송중
+  title: 통풍 샌들
+  shipping_date: '2026-07-25'
+  recipient_name: 조은호
+- id,link: '692647138913'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 펫 빗 브러시
+  shipping_date: '2026-04-05'
+  recipient_name: 장유진
+- id,link: '896897404308'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 펫 빗 브러시
+  shipping_date: '2026-09-12'
+  recipient_name: 최수아
+- id,link: '333292053102'
+  carrier: 새길운송
+  status: 배송완료
+  title: 온도조절 전기포트
+  shipping_date: '2026-04-20'
+  recipient_name: 서다은
+- id,link: '948665022047'
+  carrier: 바른택배
+  status: 배송완료
+  title: 스마트 밴드
+  shipping_date: '2026-05-11'
+  recipient_name: 장지우
+- id,link: '739545141747'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 자외선 차단 양산
+  shipping_date: '2026-07-06'
+  recipient_name: 임지우
+- id,link: '248366978727'
+  carrier: 새길운송
+  status: 배송완료
+  title: 유기농 그래놀라
+  shipping_date: '2026-07-24'
+  recipient_name: 오수아
+title: 배송 조회

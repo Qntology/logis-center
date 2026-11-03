@@ -1,0 +1,30 @@
+page_id: ttukbaegi-tracking-detail-127860933381
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/my/shipments/127860933381
+page_type: tracking
+layout: detail
+fields:
+  id,link: '127860933381'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 경량 패딩 조끼
+  shipping_date: '2026-06-27'
+  recipient_name: 한현우
+  registration_date: '2026-06-25'
+  sender_name: 뚝배기유통 주식회사
+  sender_address: 대구광역시 동구 동대구로 465
+  sender_phone: 1833-0763
+  recipient_address: 부산광역시 수영구 광남로 251 13층
+  recipient_phone: 010-2045-2173
+  weight: 2.6
+  width: 38
+  height: 22
+  length: 36
+  shipping_method: 방문수령
+  shipping_duration: 1
+  shipping_fee: 0
+title: 배송 상세 정보

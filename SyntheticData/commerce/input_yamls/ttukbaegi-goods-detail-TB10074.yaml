@@ -1,0 +1,30 @@
+page_id: ttukbaegi-goods-detail-TB10074
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/products/TB10074
+page_type: goods
+layout: detail
+fields:
+  id,link: TB10074
+  title: 냉감 넥밴드
+  status: 판매중
+  category: 생활
+  sale_price: 11400
+  quantity: 7
+  registration_date: '2026-03-27'
+  brand_name: Oakfern
+  code: TB-HOT-102
+  stock_keeping_unit: TBHO1002
+  model_name: HO-966
+  manufacturer: 솔빛리빙
+  origin_country: 폴란드
+  color: 크림
+  barcode: '8879586504613'
+  supply_price: 6493
+  low_stock_threshold: 20
+  shipping_fee: 3000
+  description: 물에 적시면 체온을 낮춰 주는 목걸이형 밴드입니다.
+title: 상품 정보

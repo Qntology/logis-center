@@ -1,0 +1,83 @@
+page_id: moa-tracking-list-2
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '134838649493'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: 자외선 차단 양산
+  shipping_date: '2026-05-28'
+  recipient_name: 권건우
+- id,link: '724796057003'
+  carrier: 바른택배
+  status: 배송중
+  title: 2인용 돔 텐트
+  shipping_date: '2026-09-20'
+  recipient_name: 김수아
+- id,link: '747603647873'
+  carrier: 새길운송
+  status: 배송완료
+  title: 실리콘 조리도구 세트
+  shipping_date: '2026-05-07'
+  recipient_name: 오현우
+- id,link: '807259324063'
+  carrier: 새길운송
+  status: 배송완료
+  title: 기모 후드집업
+  shipping_date: '2026-08-05'
+  recipient_name: 장유진
+- id,link: '734746399945'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 온도조절 전기포트
+  shipping_date: '2026-09-05'
+  recipient_name: 조지우
+- id,link: '361383503857'
+  carrier: 새길운송
+  status: 배송완료
+  title: 케이블 정리함
+  shipping_date: '2026-07-16'
+  recipient_name: 임다은
+- id,link: '363866387455'
+  carrier: 새길운송
+  status: 반품
+  title: 노트북 거치대
+  shipping_date: '2026-04-23'
+  recipient_name: 권수아
+- id,link: '609847373628'
+  carrier: 바른택배
+  status: 배송완료
+  title: 밀폐 유리 용기 세트
+  shipping_date: '2026-08-04'
+  recipient_name: 윤유진
+- id,link: '460797149981'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 경량 패딩 조끼
+  shipping_date: '2026-10-07'
+  recipient_name: 오민준
+- id,link: '719124666459'
+  carrier: 새길운송
+  status: 배송중
+  title: 세라믹 식칼
+  shipping_date: '2026-05-07'
+  recipient_name: 권주원
+- id,link: '189712840103'
+  carrier: 한빛로지스
+  status: 배송중
+  title: 강아지 하네스
+  shipping_date: '2026-06-21'
+  recipient_name: 윤주원
+- id,link: '923551521267'
+  carrier: 바른택배
+  status: 배송완료
+  title: 세라믹 식칼
+  shipping_date: '2026-09-30'
+  recipient_name: 김유진
+title: 배송 조회

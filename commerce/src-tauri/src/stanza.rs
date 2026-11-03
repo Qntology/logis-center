@@ -15,6 +15,10 @@ pub struct StanzaPreprocessor {
     pub word_unk_id: i64,
     pub char_unk_id: i64,
     pub tok_char_unk_id: i64, // 🌟 Tokenizer 전용 UNK ID
+    /// 🌟 [POS RELIABILITY] POS 모델의 pre 입력을 채울 사전학습 단어 사전이 vocab.json 에 있는가.
+    ///   변환본에는 이 사전이 없어 pre 가 0 으로 들어가고, 손으로 태깅한 문장 대조에서 영어 8% · 한국어 53% 만 맞았습니다.
+    ///   이 값이 false 면 품사 · 원형 · 의존관계를 판정 근거로 쓰지 않습니다.
+    pub pos_reliable: bool,
 }
 
 impl StanzaPreprocessor {
@@ -125,7 +129,8 @@ impl StanzaPreprocessor {
             
         let char_unk_id = *char_vocab.get(&'<').unwrap_or(&0); // '<unk>' 처리용
         
-        Ok(Self { word_vocab, char_vocab, tok_char_vocab, id_to_char, upos_vocab, deprel_vocab, word_unk_id, char_unk_id, tok_char_unk_id })
+        let pos_reliable = json_val.get("pretrain").is_some();
+        Ok(Self { word_vocab, char_vocab, tok_char_vocab, id_to_char, upos_vocab, deprel_vocab, word_unk_id, char_unk_id, tok_char_unk_id, pos_reliable })
     }
 
     // 🌟 중복된 JSON 파싱 로직을 공통 헬퍼 함수로 분리

@@ -916,6 +916,13 @@
     }
   },
   "search_bridge": {
+    "domain_words": {
+      "order": ["purchase", "주문", "구매"],
+      "tracking": ["shipment", "shipping", "delivery", "parcel", "배송", "택배", "송장", "운송"],
+      "review": ["리뷰", "후기"],
+      "coupon": ["voucher", "쿠폰"],
+      "event": ["campaign", "promotion", "이벤트", "기획전", "프로모션", "캠페인"]
+    },
     "path_alias": {
       "amount": ["amount_total", "total_amount", "grand_total_amount", "price", "total_price_sum"],
       "amount_subtotal": ["subtotal", "sub_total", "net_amount", "total_supply_amount"],
@@ -1978,12 +1985,12 @@
     "event": {
       "layout_list": {
         "semantic": "다중 이벤트를 나열하는 목록, 이벤트 표, 이벤트 리스트 페이지",
-        "bias": "이벤트목록, 이벤트리스트, 이벤트표, 이벤트일괄, 쿠폰목록, 발급현황, 사용내역조회",
+        "bias": "이벤트목록, 이벤트리스트, 이벤트표, 이벤트일괄, 기획전목록, 프로모션목록, 캠페인목록, 쿠폰목록, 발급현황, 사용내역조회",
         "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
         "semantic": "단일 이벤트의 상세 정보를 보여주거나 입력하는 이벤트 폼 페이지",
-        "bias": "이벤트상세, 이벤트폼, 이벤트입력, 이벤트수정, 쿠폰생성, 조건설정, 할인율입력, 단일발급, 타겟설정, input, select, textarea",
+        "bias": "이벤트상세, 이벤트폼, 이벤트입력, 이벤트수정, 기획전상세, 프로모션상세, 캠페인상세, 쿠폰생성, 조건설정, 할인율입력, 단일발급, 타겟설정, input, select, textarea",
         "prejudice": "global navigation, menus, footers, aside."
       },
       "id,link": {
@@ -3135,12 +3142,12 @@
     "event": {
       "layout_list": {
         "semantic": "List displaying multiple events, event table, event list page",
-        "bias": "event list, event table, bulk events, issuance status, usage history",
+        "bias": "event list, event table, bulk events, campaign list, promotion list, issuance status, usage history",
         "prejudice": "global navigation, menus, footers, aside."
       },
       "layout_form": {
         "semantic": "Form page showing or entering details for a single event",
-        "bias": "event details, event form, create event, set conditions, enter discount rate, single issuance, target audience setup, input, select, textarea",
+        "bias": "event details, event form, create event, campaign details, promotion details, set conditions, enter discount rate, single issuance, target audience setup, input, select, textarea",
         "prejudice": "global navigation, menus, footers, aside."
       },
       "id,link": {

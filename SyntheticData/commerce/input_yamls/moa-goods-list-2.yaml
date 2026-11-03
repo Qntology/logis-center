@@ -1,0 +1,114 @@
+page_id: moa-goods-list-2
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/goods/list?page=2
+page_type: goods
+layout: list
+items:
+- id,link: MA10481
+  title: 휴대용 코펠 세트
+  status: 판매중
+  category: 레저
+  sale_price: 40700
+  compare_at_price: 48840
+  quantity: 96
+  registration_date: '2026-07-30'
+  brand_name: 하람
+- id,link: MA10518
+  title: 진공 보온 텀블러
+  status: 판매중
+  category: 주방
+  sale_price: 23000
+  compare_at_price: 27600
+  quantity: 18
+  registration_date: '2026-05-11'
+  brand_name: 누리온
+- id,link: MA10555
+  title: 기모 후드집업
+  status: 판매중
+  category: 의류
+  sale_price: 46500
+  quantity: 7
+  registration_date: '2026-03-20'
+  brand_name: 버들
+- id,link: MA10592
+  title: 구운 아몬드
+  status: 판매중
+  category: 식품
+  sale_price: 12400
+  quantity: 18
+  registration_date: '2026-09-05'
+  brand_name: Tidewell
+- id,link: MA10629
+  title: 노이즈캔슬링 무선 이어폰
+  status: 판매중
+  category: 디지털
+  sale_price: 118600
+  compare_at_price: 142320
+  quantity: 3
+  registration_date: '2026-03-01'
+  brand_name: Kestrel Lane
+- id,link: MA10666
+  title: 인체공학 버티컬 마우스
+  status: 진열안함
+  category: 디지털
+  sale_price: 45200
+  quantity: 18
+  registration_date: '2026-07-21'
+  brand_name: 다온랩
+- id,link: MA10703
+  title: 충전식 손난로
+  status: 판매중
+  category: 생활
+  sale_price: 23000
+  compare_at_price: 27600
+  quantity: 96
+  registration_date: '2026-04-03'
+  brand_name: 하람
+- id,link: MA10740
+  title: LED 충전 랜턴
+  status: 판매중
+  category: 레저
+  sale_price: 29800
+  compare_at_price: 35760
+  quantity: 18
+  registration_date: '2026-08-28'
+  brand_name: 마루공방
+- id,link: MA10777
+  title: 원목 블록 세트
+  status: 판매중
+  category: 완구
+  sale_price: 36600
+  compare_at_price: 43920
+  quantity: 42
+  registration_date: '2026-04-19'
+  brand_name: 솔빛
+- id,link: MA10814
+  title: 색칠놀이 스케치북
+  status: 품절
+  category: 완구
+  sale_price: 9600
+  quantity: 0
+  registration_date: '2026-07-15'
+  brand_name: Tidewell
+- id,link: MA10851
+  title: 케이블 정리함
+  status: 판매중
+  category: 사무
+  sale_price: 14800
+  compare_at_price: 17760
+  quantity: 3
+  registration_date: '2026-03-03'
+  brand_name: 다온랩
+- id,link: MA10888
+  title: 65W 고속 충전기
+  status: 품절
+  category: 디지털
+  sale_price: 36000
+  quantity: 0
+  registration_date: '2026-01-19'
+  brand_name: 버들
+title: 상품 관리

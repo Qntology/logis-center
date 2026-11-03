@@ -1,0 +1,114 @@
+page_id: lantern-goods-list-2
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/products?page=2
+page_type: goods
+layout: list
+items:
+- id,link: BL10481
+  title: Barrier moisture cream
+  status: Sold out
+  category: Beauty
+  sale_price: 26.45
+  quantity: 0
+  registration_date: '2026-05-15'
+  brand_name: 솔빛
+- id,link: BL10518
+  title: Vitamin C serum
+  status: Active
+  category: Beauty
+  sale_price: 27.3
+  compare_at_price: 32.76
+  quantity: 96
+  registration_date: '2026-02-09'
+  brand_name: Oakfern
+- id,link: BL10555
+  title: Fragrance-free body lotion
+  status: Draft
+  category: Beauty
+  sale_price: 13.75
+  compare_at_price: 16.5
+  quantity: 42
+  registration_date: '2026-04-17'
+  brand_name: 하람
+- id,link: BL10592
+  title: Silent mechanical keyboard
+  status: Active
+  category: Electronics
+  sale_price: 71.0
+  compare_at_price: 85.2
+  quantity: 42
+  registration_date: '2026-06-23'
+  brand_name: Kestrel Lane
+- id,link: BL10629
+  title: Monitor riser stand
+  status: Active
+  category: Office
+  sale_price: 25.1
+  compare_at_price: 30.12
+  quantity: 120
+  registration_date: '2026-07-14'
+  brand_name: Tidewell
+- id,link: BL10666
+  title: Jeju tangerine juice
+  status: Active
+  category: Grocery
+  sale_price: 14.1
+  compare_at_price: 16.92
+  quantity: 350
+  registration_date: '2026-07-13'
+  brand_name: Marlow & Finch
+- id,link: BL10703
+  title: Rechargeable LED lantern
+  status: Active
+  category: Outdoor
+  sale_price: 21.9
+  compare_at_price: 26.28
+  quantity: 3
+  registration_date: '2026-04-11'
+  brand_name: 버들
+- id,link: BL10740
+  title: Fleece-lined zip hoodie
+  status: Active
+  category: Apparel
+  sale_price: 39.9
+  compare_at_price: 47.88
+  quantity: 18
+  registration_date: '2026-01-15'
+  brand_name: 마루공방
+- id,link: BL10777
+  title: Cold brew concentrate
+  status: Draft
+  category: Grocery
+  sale_price: 13.25
+  quantity: 96
+  registration_date: '2026-06-23'
+  brand_name: 누리온
+- id,link: BL10814
+  title: Linen short-sleeve shirt
+  status: Active
+  category: Apparel
+  sale_price: 32.85
+  quantity: 3
+  registration_date: '2026-04-14'
+  brand_name: 버들
+- id,link: BL10851
+  title: Low-sugar protein bar
+  status: Sold out
+  category: Grocery
+  sale_price: 15.7
+  quantity: 0
+  registration_date: '2026-04-19'
+  brand_name: 솔빛
+- id,link: BL10888
+  title: Wooden building blocks
+  status: Sold out
+  category: Toys
+  sale_price: 30.85
+  quantity: 0
+  registration_date: '2026-05-22'
+  brand_name: 솔빛
+title: Products

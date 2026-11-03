@@ -395,8 +395,10 @@ fn pre_clean_html_and_clean_pug() {
         parsing::pre_clean_html(
             "<!-- c --><div class=\"a\" style=\"x\" onclick=\"y\">Hi<script>alert(1)</script><br></div>"
         ),
-        "<div class=\"a\">Hi</div>"
+        "<div class=\"a\">Hi </div>"
     );
+    // <br> 은 낱말을 가르므로 공백이 남아야 합니다.
+    assert_eq!(parsing::pre_clean_html("<td>마포구<br>합정로 128</td>"), "<td>마포구 합정로 128</td>");
     assert_eq!(parsing::pre_clean_html("<input type=\"text\" value=\"5\" />"), "<input type=\"text\" value=\"5\" />");
     assert_eq!(parsing::pre_clean_html("<img src=\"a.png\" alt=\"A\" width=\"10\">"), "<img src=\"a.png\" alt=\"A\">");
 

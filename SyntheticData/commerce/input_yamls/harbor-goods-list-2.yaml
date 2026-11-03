@@ -1,0 +1,113 @@
+page_id: harbor-goods-list-2
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/goods/list?page=2
+page_type: goods
+layout: list
+items:
+- id,link: HP10481
+  title: Low-pH cleansing foam
+  status: Draft
+  category: Beauty
+  sale_price: 12.45
+  compare_at_price: 14.94
+  quantity: 18
+  registration_date: '2026-08-02'
+  brand_name: Tidewell
+- id,link: HP10518
+  title: Handheld mini fan
+  status: Sold out
+  category: Appliances
+  sale_price: 13.9
+  quantity: 0
+  registration_date: '2026-02-14'
+  brand_name: 솔빛
+- id,link: HP10555
+  title: Jeju tangerine juice
+  status: Sold out
+  category: Grocery
+  sale_price: 15.4
+  quantity: 0
+  registration_date: '2026-03-14'
+  brand_name: 하람
+- id,link: HP10592
+  title: Mineral sunscreen
+  status: Active
+  category: Beauty
+  sale_price: 17.45
+  compare_at_price: 20.94
+  quantity: 7
+  registration_date: '2026-08-04'
+  brand_name: Kestrel Lane
+- id,link: HP10629
+  title: Fleece-lined zip hoodie
+  status: Draft
+  category: Apparel
+  sale_price: 40.4
+  compare_at_price: 48.48
+  quantity: 350
+  registration_date: '2026-01-06'
+  brand_name: 다온랩
+- id,link: HP10666
+  title: Plush bunny doll
+  status: Sold out
+  category: Toys
+  sale_price: 15.3
+  quantity: 0
+  registration_date: '2026-08-15'
+  brand_name: Marlow & Finch
+- id,link: HP10703
+  title: Folding trekking poles
+  status: Sold out
+  category: Outdoor
+  sale_price: 41.85
+  compare_at_price: 50.22
+  quantity: 0
+  registration_date: '2026-01-20'
+  brand_name: Kestrel Lane
+- id,link: HP10740
+  title: Organic granola
+  status: Sold out
+  category: Grocery
+  sale_price: 10.6
+  quantity: 0
+  registration_date: '2026-01-13'
+  brand_name: Oakfern
+- id,link: HP10777
+  title: Pet travel carrier
+  status: Sold out
+  category: Pets
+  sale_price: 36.6
+  quantity: 0
+  registration_date: '2026-01-15'
+  brand_name: 솔빛
+- id,link: HP10814
+  title: Noise-cancelling wireless earbuds
+  status: Active
+  category: Electronics
+  sale_price: 96.3
+  compare_at_price: 115.56
+  quantity: 120
+  registration_date: '2026-03-18'
+  brand_name: 다온랩
+- id,link: HP10851
+  title: Portable cookware set
+  status: Active
+  category: Outdoor
+  sale_price: 30.55
+  compare_at_price: 36.66
+  quantity: 96
+  registration_date: '2026-09-04'
+  brand_name: Tidewell
+- id,link: HP10888
+  title: Fragrance-free body lotion
+  status: Active
+  category: Beauty
+  sale_price: 14.6
+  quantity: 96
+  registration_date: '2026-01-30'
+  brand_name: 하람
+title: Products

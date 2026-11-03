@@ -1,0 +1,28 @@
+page_id: haneul-order-detail-20260409-100053
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/order/view?id=20260409-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260409-100053
+  registration_date: '2026-04-09'
+  status: 결제완료
+  goods: 비타민 C 세럼
+  sender_name: 임서연
+  recipient_name: 권소율
+  quantity: 7
+  amount: 297540
+  shipping_fee: 0
+  payment_method: 신용카드
+  sender_phone: 010-8850-5046
+  sender_address: 강원특별자치도 춘천시 공지로 454 8층
+  recipient_phone: 010-7703-2717
+  recipient_address: 광주광역시 서구 상무대로 92 18층
+  payment_origin: 바로결제
+  payment_date: '2026-04-09'
+  card: 가온카드
+title: 주문 상세내역

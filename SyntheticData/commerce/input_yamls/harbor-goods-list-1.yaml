@@ -1,0 +1,110 @@
+page_id: harbor-goods-list-1
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/goods/list?page=1
+page_type: goods
+layout: list
+items:
+- id,link: HP10037
+  title: Scorched brown rice crisps
+  status: Sold out
+  category: Grocery
+  sale_price: 9.1
+  quantity: 0
+  registration_date: '2026-01-16'
+  brand_name: 누리온
+- id,link: HP10074
+  title: Vacuum insulated tumbler
+  status: Active
+  category: Kitchen
+  sale_price: 16.9
+  quantity: 18
+  registration_date: '2026-05-01'
+  brand_name: Oakfern
+- id,link: HP10111
+  title: Hypoallergenic kibble
+  status: Sold out
+  category: Pets
+  sale_price: 24.15
+  quantity: 0
+  registration_date: '2026-02-22'
+  brand_name: 하람
+- id,link: HP10148
+  title: Silent mechanical keyboard
+  status: Sold out
+  category: Electronics
+  sale_price: 71.6
+  quantity: 0
+  registration_date: '2026-04-28'
+  brand_name: 다온랩
+- id,link: HP10185
+  title: Linen short-sleeve shirt
+  status: Active
+  category: Apparel
+  sale_price: 36.15
+  compare_at_price: 43.38
+  quantity: 96
+  registration_date: '2026-02-14'
+  brand_name: Tidewell
+- id,link: HP10222
+  title: Low-sugar protein bar
+  status: Active
+  category: Grocery
+  sale_price: 16.7
+  compare_at_price: 20.04
+  quantity: 18
+  registration_date: '2026-02-11'
+  brand_name: 마루공방
+- id,link: HP10259
+  title: Ceramic chef knife
+  status: Active
+  category: Kitchen
+  sale_price: 25.55
+  quantity: 3
+  registration_date: '2026-02-13'
+  brand_name: 누리온
+- id,link: HP10296
+  title: Waterproof Bluetooth speaker
+  status: Active
+  category: Electronics
+  sale_price: 46.9
+  quantity: 18
+  registration_date: '2026-03-29'
+  brand_name: 누리온
+- id,link: HP10333
+  title: Cat scratching post
+  status: Sold out
+  category: Pets
+  sale_price: 16.15
+  quantity: 0
+  registration_date: '2026-05-10'
+  brand_name: 다온랩
+- id,link: HP10370
+  title: Smart fitness band
+  status: Active
+  category: Electronics
+  sale_price: 38.45
+  quantity: 7
+  registration_date: '2026-06-13'
+  brand_name: 다온랩
+- id,link: HP10407
+  title: Vitamin C serum
+  status: Active
+  category: Beauty
+  sale_price: 28.3
+  quantity: 42
+  registration_date: '2026-07-11'
+  brand_name: 누리온
+- id,link: HP10444
+  title: Sherpa fleece jacket
+  status: Draft
+  category: Apparel
+  sale_price: 47.4
+  compare_at_price: 56.88
+  quantity: 3
+  registration_date: '2026-02-07'
+  brand_name: 마루공방
+title: Products

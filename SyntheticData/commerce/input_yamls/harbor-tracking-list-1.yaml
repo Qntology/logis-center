@@ -1,0 +1,83 @@
+page_id: harbor-tracking-list-1
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '543189543185'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Low-pH cleansing foam
+  shipping_date: '2026-05-18'
+  recipient_name: Sawyer Kendrick
+- id,link: '182854223606'
+  carrier: Pinewood Express
+  status: Shipped
+  title: Hypoallergenic kibble
+  shipping_date: '2026-07-31'
+  recipient_name: Morgan Whitfield
+- id,link: '232531792143'
+  carrier: Swiftline Parcel
+  status: Shipped
+  title: Ceramic chef knife
+  shipping_date: '2026-06-11'
+  recipient_name: Finley Dorsey
+- id,link: '470699340482'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Rechargeable LED lantern
+  shipping_date: '2026-08-06'
+  recipient_name: Riley Langley
+- id,link: '607410130932'
+  carrier: Pinewood Express
+  status: Returned
+  title: Mineral sunscreen
+  shipping_date: '2026-07-12'
+  recipient_name: Finley Kendrick
+- id,link: '113077849144'
+  carrier: Swiftline Parcel
+  status: Shipped
+  title: Lightweight camp chair
+  shipping_date: '2026-08-20'
+  recipient_name: Emerson Dorsey
+- id,link: '719547899303'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Ceramic chef knife
+  shipping_date: '2026-08-22'
+  recipient_name: Quinn Langley
+- id,link: '831378491353'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Kids kick scooter
+  shipping_date: '2026-10-12'
+  recipient_name: Rowan Prescott
+- id,link: '852600838892'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Cold brew concentrate
+  shipping_date: '2026-07-24'
+  recipient_name: Finley Marsh
+- id,link: '862331718450'
+  carrier: Harbor Courier
+  status: Shipped
+  title: Stainless steel frying pan
+  shipping_date: '2026-05-17'
+  recipient_name: Sawyer Holloway
+- id,link: '270242494338'
+  carrier: Harbor Courier
+  status: Returned
+  title: Dog harness
+  shipping_date: '2026-07-12'
+  recipient_name: Sawyer Sinclair
+- id,link: '494640201406'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Repair hair essence
+  shipping_date: '2026-10-08'
+  recipient_name: Casey Whitfield
+title: Shipments

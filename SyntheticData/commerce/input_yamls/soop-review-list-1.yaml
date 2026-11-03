@@ -1,0 +1,71 @@
+page_id: soop-review-list-1
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/reviews?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: 승인
+  title: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+  name: 오주원
+  registration_date: '2026-06-01'
+- id,link: RV7022
+  status: 대기중
+  title: 두 번째 구매인데 역시 마감이 좋아서 좋네요.
+  name: 김현우
+  registration_date: '2026-05-26'
+- id,link: RV7033
+  status: 대기중
+  title: 두 번째 구매인데 역시 색이 예뻐서 좋네요.
+  name: 김수아
+  registration_date: '2026-09-07'
+- id,link: RV7044
+  status: 승인
+  title: 두 번째 구매인데 역시 가벼워서 좋네요.
+  name: 윤수아
+  registration_date: '2026-06-24'
+- id,link: RV7055
+  status: 숨김
+  title: 두 번째 구매인데 역시 마감이 좋아서 좋네요.
+  name: 장건우
+  registration_date: '2026-09-20'
+- id,link: RV7066
+  status: 숨김
+  title: 두 번째 구매인데 역시 가벼워서 좋네요.
+  name: 박시우
+  registration_date: '2026-09-02'
+- id,link: RV7077
+  status: 숨김
+  title: 두 번째 구매인데 역시 색이 예뻐서 좋네요.
+  name: 오유진
+  registration_date: '2026-05-12'
+- id,link: RV7088
+  status: 승인
+  title: 두 번째 구매인데 역시 가벼워서 좋네요.
+  name: 신건우
+  registration_date: '2026-05-09'
+- id,link: RV7099
+  status: 숨김
+  title: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+  name: 오하은
+  registration_date: '2026-05-10'
+- id,link: RV7110
+  status: 승인
+  title: 포장이 꼼꼼했고 가벼워서 괜찮습니다.
+  name: 한시우
+  registration_date: '2026-06-28'
+- id,link: RV7121
+  status: 승인
+  title: 생각보다 색이 예뻐서 만족합니다.
+  name: 김도윤
+  registration_date: '2026-05-11'
+- id,link: RV7132
+  status: 대기중
+  title: 두 번째 구매인데 역시 가벼워서 좋네요.
+  name: 서수아
+  registration_date: '2026-09-16'
+title: 상품후기 관리

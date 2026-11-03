@@ -60,3 +60,6 @@ mod gpu_memory;
 mod qwen35_kv;
 // SigLIP2 비전 파이프라인 배치 경로 (패치 × 구 채점 · 값 접지 · 구 인코딩)
 mod vision_batch;
+// 합성 데이터를 실제 파이프라인에 태우는 평가 하네스 (LOGIS_SYNTH_PLAN, --ignored)
+mod search_fusion;
+mod synthetic_eval;

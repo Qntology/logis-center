@@ -1,0 +1,17 @@
+page_id: soop-event-detail-EV303
+split: dev
+shop: soop
+shop_name: 숲속잡화
+lang: ko
+theme: store_cards
+url: https://soop-shop.test/events/EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: 봄 산책 기획전
+  type: 응모
+  started_at: '2026-06-08'
+  expired_at: '2026-06-28'
+  status: 진행중
+title: 기획전 정보

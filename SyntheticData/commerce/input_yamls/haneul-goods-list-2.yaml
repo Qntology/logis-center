@@ -1,0 +1,110 @@
+page_id: haneul-goods-list-2
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/goods/list?page=2
+page_type: goods
+layout: list
+items:
+- id,link: HN10481
+  title: 경량 패딩 조끼
+  status: 품절
+  category: 의류
+  sale_price: 64000
+  quantity: 0
+  registration_date: '2026-08-22'
+  brand_name: Kestrel Lane
+- id,link: HN10518
+  title: 저당 단백질바
+  status: 판매중
+  category: 식품
+  sale_price: 22000
+  quantity: 3
+  registration_date: '2026-08-20'
+  brand_name: Tidewell
+- id,link: HN10555
+  title: 비타민 C 세럼
+  status: 판매중
+  category: 뷰티
+  sale_price: 40300
+  quantity: 42
+  registration_date: '2026-07-07'
+  brand_name: Tidewell
+- id,link: HN10592
+  title: 기모 후드집업
+  status: 판매중
+  category: 의류
+  sale_price: 48200
+  quantity: 18
+  registration_date: '2026-01-28'
+  brand_name: 하람
+- id,link: HN10629
+  title: 대용량 보조배터리
+  status: 판매중
+  category: 디지털
+  sale_price: 37500
+  quantity: 42
+  registration_date: '2026-05-26'
+  brand_name: Kestrel Lane
+- id,link: HN10666
+  title: 토끼 봉제 인형
+  status: 판매중
+  category: 완구
+  sale_price: 21000
+  compare_at_price: 25200
+  quantity: 42
+  registration_date: '2026-08-03'
+  brand_name: 솔빛
+- id,link: HN10703
+  title: 유기농 그래놀라
+  status: 품절
+  category: 식품
+  sale_price: 14900
+  compare_at_price: 17880
+  quantity: 0
+  registration_date: '2026-07-23'
+  brand_name: 솔빛
+- id,link: HN10740
+  title: 어린이 킥보드
+  status: 품절
+  category: 완구
+  sale_price: 67700
+  quantity: 0
+  registration_date: '2026-03-30'
+  brand_name: 솔빛
+- id,link: HN10777
+  title: 방수 블루투스 스피커
+  status: 품절
+  category: 디지털
+  sale_price: 58800
+  compare_at_price: 70560
+  quantity: 0
+  registration_date: '2026-08-14'
+  brand_name: 버들
+- id,link: HN10814
+  title: 진공 보온 텀블러
+  status: 판매중
+  category: 주방
+  sale_price: 25200
+  quantity: 3
+  registration_date: '2026-07-01'
+  brand_name: Oakfern
+- id,link: HN10851
+  title: 자동 급식기
+  status: 진열안함
+  category: 반려
+  sale_price: 68400
+  quantity: 96
+  registration_date: '2026-02-04'
+  brand_name: 버들
+- id,link: HN10888
+  title: 충전식 손난로
+  status: 판매중
+  category: 생활
+  sale_price: 22000
+  quantity: 3
+  registration_date: '2026-06-19'
+  brand_name: Kestrel Lane
+title: 상품 관리

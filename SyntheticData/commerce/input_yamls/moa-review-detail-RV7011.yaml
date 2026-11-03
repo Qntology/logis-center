@@ -1,0 +1,16 @@
+page_id: moa-review-detail-RV7011
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/review/view?id=RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: 대기중
+  title: 생각보다 튼튼해서 만족합니다.
+  name: 권지우
+  registration_date: '2026-08-27'
+title: 후기 보기

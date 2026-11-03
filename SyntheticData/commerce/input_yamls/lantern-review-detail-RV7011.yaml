@@ -1,0 +1,16 @@
+page_id: lantern-review-detail-RV7011
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/reviews/RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: Hidden
+  title: Better than expected, really well finished.
+  name: Quinn Dorsey
+  registration_date: '2026-07-14'
+title: Review

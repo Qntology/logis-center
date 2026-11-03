@@ -1,0 +1,16 @@
+page_id: harbor-review-detail-RV7011
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/review/view?id=RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: Hidden
+  title: Second purchase and still sturdy.
+  name: Casey Langley
+  registration_date: '2026-08-30'
+title: Review

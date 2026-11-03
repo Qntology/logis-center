@@ -1,0 +1,21 @@
+page_id: lantern-coupon-detail-CP4007
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/coupons/CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: LAN708
+  title: First order welcome 1
+  type: Fixed amount
+  discount: $2.30
+  started_at: '2026-05-27'
+  expired_at: '2026-06-10'
+  status: Live
+  quantity: 1000
+  min_order_amount: 7.7
+title: Discount code

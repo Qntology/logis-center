@@ -1,0 +1,29 @@
+page_id: lantern-order-detail-20260711-100106
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/orders/20260711-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260711-100106
+  registration_date: '2026-07-11'
+  status: Delivered
+  goods: Organic granola
+  tracking_number: '237628677867'
+  sender_name: Harper Marsh
+  recipient_name: Harper Marsh
+  quantity: 4
+  amount: 44.91
+  shipping_fee: 0.0
+  payment_method: Credit card
+  sender_phone: +1-445-555-0174
+  sender_address: 1757 Alder St, Burlington, VT 05401
+  recipient_phone: +1-445-555-0174
+  recipient_address: 1757 Alder St, Burlington, VT 05401
+  payment_origin: SwiftTender
+  payment_date: '2026-07-11'
+  card: Pinecrest Rewards
+title: Order details

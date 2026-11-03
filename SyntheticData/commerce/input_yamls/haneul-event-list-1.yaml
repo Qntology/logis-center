@@ -1,0 +1,47 @@
+page_id: haneul-event-list-1
+split: dev
+shop: haneul
+shop_name: 하늘상점
+lang: ko
+theme: admin_twin
+url: https://haneul-market.test/admin/event/list?page=1
+page_type: event
+layout: list
+items:
+- id,link: EV303
+  title: 봄 산책 기획전
+  type: 기획전
+  started_at: '2026-06-12'
+  expired_at: '2026-07-02'
+  status: 종료
+- id,link: EV306
+  title: 여름 휴가 준비전
+  type: 응모
+  started_at: '2026-06-24'
+  expired_at: '2026-08-08'
+  status: 대기중
+- id,link: EV309
+  title: 추석 선물 모음
+  type: 응모
+  started_at: '2026-07-21'
+  expired_at: '2026-09-04'
+  status: 대기중
+- id,link: EV312
+  title: 연말 감사 축제
+  type: 체험단
+  started_at: '2026-02-25'
+  expired_at: '2026-03-17'
+  status: 종료
+- id,link: EV315
+  title: 신상품 체험단 모집
+  type: 응모
+  started_at: '2026-08-24'
+  expired_at: '2026-09-13'
+  status: 대기중
+- id,link: EV318
+  title: 리뷰 왕 선발
+  type: 응모
+  started_at: '2026-02-19'
+  expired_at: '2026-03-01'
+  status: 진행중
+title: 기획전 관리

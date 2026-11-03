@@ -1,0 +1,113 @@
+page_id: ttukbaegi-goods-list-2
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/products?page=2
+page_type: goods
+layout: list
+items:
+- id,link: TB10481
+  title: 현미 누룽지
+  status: 품절
+  category: 식품
+  sale_price: 10700
+  compare_at_price: 12840
+  quantity: 0
+  registration_date: '2026-04-01'
+  brand_name: Tidewell
+- id,link: TB10518
+  title: 고양이 스크래처
+  status: 판매중
+  category: 반려
+  sale_price: 20800
+  quantity: 42
+  registration_date: '2026-09-07'
+  brand_name: Tidewell
+- id,link: TB10555
+  title: 콜드브루 원액
+  status: 품절
+  category: 식품
+  sale_price: 15400
+  compare_at_price: 18480
+  quantity: 0
+  registration_date: '2026-04-23'
+  brand_name: Tidewell
+- id,link: TB10592
+  title: 아이스 쿨매트
+  status: 품절
+  category: 생활
+  sale_price: 41900
+  quantity: 0
+  registration_date: '2026-01-19'
+  brand_name: Oakfern
+- id,link: TB10629
+  title: 세라믹 식칼
+  status: 진열안함
+  category: 주방
+  sale_price: 37200
+  compare_at_price: 44640
+  quantity: 18
+  registration_date: '2026-04-03'
+  brand_name: Tidewell
+- id,link: TB10666
+  title: 반려동물 이동장
+  status: 품절
+  category: 반려
+  sale_price: 44800
+  quantity: 0
+  registration_date: '2026-06-20'
+  brand_name: 마루공방
+- id,link: TB10703
+  title: 핸드 블렌더
+  status: 판매중
+  category: 가전
+  sale_price: 41200
+  compare_at_price: 49440
+  quantity: 96
+  registration_date: '2026-07-05'
+  brand_name: 누리온
+- id,link: TB10740
+  title: 대용량 보조배터리
+  status: 판매중
+  category: 디지털
+  sale_price: 38100
+  quantity: 96
+  registration_date: '2026-09-07'
+  brand_name: 솔빛
+- id,link: TB10777
+  title: 자외선 차단 양산
+  status: 판매중
+  category: 생활
+  sale_price: 30500
+  quantity: 120
+  registration_date: '2026-06-05'
+  brand_name: Tidewell
+- id,link: TB10814
+  title: 모니터 받침대
+  status: 판매중
+  category: 사무
+  sale_price: 32200
+  quantity: 96
+  registration_date: '2026-03-22'
+  brand_name: Marlow & Finch
+- id,link: TB10851
+  title: 인체공학 버티컬 마우스
+  status: 판매중
+  category: 디지털
+  sale_price: 41300
+  compare_at_price: 49560
+  quantity: 42
+  registration_date: '2026-02-23'
+  brand_name: 누리온
+- id,link: TB10888
+  title: 충전식 손난로
+  status: 판매중
+  category: 생활
+  sale_price: 23000
+  compare_at_price: 27600
+  quantity: 7
+  registration_date: '2026-07-07'
+  brand_name: Oakfern
+title: 상품 관리

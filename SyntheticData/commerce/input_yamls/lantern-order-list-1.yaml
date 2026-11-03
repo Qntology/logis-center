@@ -1,0 +1,139 @@
+page_id: lantern-order-list-1
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/orders?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20260620-100053
+  registration_date: '2026-06-20'
+  status: Processing
+  goods: Low-sugar protein bar
+  sender_name: Casey Ashby
+  recipient_name: Casey Ashby
+  quantity: 1
+  amount: 16.43
+  shipping_fee: 2.3
+  payment_method: Credit card
+- id,link: 20260711-100106
+  registration_date: '2026-07-11'
+  status: Delivered
+  goods: Organic granola
+  tracking_number: '237628677867'
+  sender_name: Harper Marsh
+  recipient_name: Harper Marsh
+  quantity: 4
+  amount: 44.91
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260928-100159
+  registration_date: '2026-09-28'
+  status: Delivered
+  goods: Lightweight camp chair
+  tracking_number: '117050997136'
+  sender_name: Avery Whitfield
+  recipient_name: Avery Whitfield
+  quantity: 6
+  amount: 138.2
+  shipping_fee: 0.0
+  payment_method: Wire transfer
+- id,link: 20260927-100212
+  registration_date: '2026-09-27'
+  status: Paid
+  goods: Folding trekking poles
+  sender_name: Harper Mercer
+  recipient_name: Harper Mercer
+  quantity: 5
+  amount: 191.5
+  shipping_fee: 0.0
+  payment_method: Digital wallet
+- id,link: 20260501-100265
+  registration_date: '2026-05-01'
+  status: Returned
+  goods: Sherpa fleece jacket
+  tracking_number: '435066256648'
+  sender_name: Riley Kendrick
+  recipient_name: Riley Kendrick
+  quantity: 1
+  amount: 43.29
+  shipping_fee: 0.0
+  payment_method: Digital wallet
+- id,link: 20260514-100318
+  registration_date: '2026-05-14'
+  status: Delivered
+  goods: Pet grooming brush
+  tracking_number: '611855088553'
+  sender_name: Morgan Dorsey
+  recipient_name: Quinn Whitfield
+  quantity: 1
+  amount: 12.2
+  shipping_fee: 2.3
+  payment_method: Credit card
+- id,link: 20260603-100371
+  registration_date: '2026-06-03'
+  status: Delivered
+  goods: Monitor riser stand
+  tracking_number: '197273780600'
+  sender_name: Riley Whitfield
+  recipient_name: Riley Whitfield
+  quantity: 2
+  amount: 50.2
+  shipping_fee: 0.0
+  payment_method: Digital wallet
+- id,link: 20260601-100424
+  registration_date: '2026-06-01'
+  status: Paid
+  goods: Automatic pet feeder
+  sender_name: Taylor Langley
+  recipient_name: Riley Dorsey
+  quantity: 2
+  amount: 106.3
+  shipping_fee: 0.0
+  payment_method: Wire transfer
+- id,link: 20261002-100477
+  registration_date: '2026-10-02'
+  status: Delivered
+  goods: Mineral sunscreen
+  tracking_number: '599950030479'
+  sender_name: Morgan Kendrick
+  recipient_name: Morgan Kendrick
+  quantity: 3
+  amount: 38.6
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260512-100530
+  registration_date: '2026-05-12'
+  status: Returned
+  goods: Organic granola
+  tracking_number: '330383358752'
+  sender_name: Harper Marsh
+  recipient_name: Rowan Kendrick
+  quantity: 5
+  amount: 57.25
+  shipping_fee: 0.0
+  payment_method: Wire transfer
+- id,link: 20260813-100583
+  registration_date: '2026-08-13'
+  status: Cancelled
+  goods: Low-sugar protein bar
+  sender_name: Casey Mercer
+  recipient_name: Casey Mercer
+  quantity: 6
+  amount: 72.95
+  shipping_fee: 0.0
+  payment_method: Credit card
+- id,link: 20260413-100636
+  registration_date: '2026-04-13'
+  status: Returned
+  goods: Lightweight camp chair
+  tracking_number: '885034212845'
+  sender_name: Rowan Marsh
+  recipient_name: Casey Langley
+  quantity: 1
+  amount: 28.0
+  shipping_fee: 2.3
+  payment_method: Credit card
+title: Orders

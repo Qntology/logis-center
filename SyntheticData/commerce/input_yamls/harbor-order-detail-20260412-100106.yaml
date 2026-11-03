@@ -1,0 +1,28 @@
+page_id: harbor-order-detail-20260412-100106
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/order/view?id=20260412-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260412-100106
+  registration_date: '2026-04-12'
+  status: Paid
+  goods: Lightweight camp chair
+  sender_name: Quinn Dorsey
+  recipient_name: Morgan Dorsey
+  quantity: 1
+  amount: 29.21
+  shipping_fee: 2.3
+  payment_method: Wire transfer
+  sender_phone: +1-871-555-0158
+  sender_address: 9648 Alder St, Portland, OR 97205
+  recipient_phone: +1-425-555-0123
+  recipient_address: 2018 Willow Ct, Madison, WI 53703
+  payment_origin: PayRelay
+  payment_date: '2026-04-12'
+  bank: Pinecrest Credit Union
+title: Order details

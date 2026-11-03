@@ -1,0 +1,17 @@
+page_id: ttukbaegi-event-detail-EV303
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/events/EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: 봄 산책 기획전
+  type: 기획전
+  started_at: '2026-02-10'
+  expired_at: '2026-02-20'
+  status: 종료
+title: 기획전 정보

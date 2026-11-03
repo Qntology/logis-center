@@ -1,0 +1,29 @@
+page_id: moa-order-detail-20260602-100106
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/order/view?id=20260602-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260602-100106
+  registration_date: '2026-06-02'
+  status: 배송완료
+  goods: 원목 블록 세트
+  tracking_number: '572403973922'
+  sender_name: 오하은
+  recipient_name: 오하은
+  quantity: 2
+  amount: 73200
+  shipping_fee: 0
+  payment_method: 신용카드
+  sender_phone: 010-5310-6415
+  sender_address: 경기도 고양시 일산동구 중앙로 120 15층
+  recipient_phone: 010-5310-6415
+  recipient_address: 경기도 고양시 일산동구 중앙로 120 15층
+  payment_origin: 바로결제
+  payment_date: '2026-06-02'
+  card: 한결카드
+title: 주문 상세내역

@@ -1,0 +1,71 @@
+page_id: lantern-review-list-1
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/reviews?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: Hidden
+  title: Better than expected, really well finished.
+  name: Quinn Dorsey
+  registration_date: '2026-07-14'
+- id,link: RV7022
+  status: Hidden
+  title: Packed with care and lightweight overall.
+  name: Jordan Sinclair
+  registration_date: '2026-07-13'
+- id,link: RV7033
+  status: Approved
+  title: Second purchase and still sturdy.
+  name: Jordan Marsh
+  registration_date: '2026-06-24'
+- id,link: RV7044
+  status: Approved
+  title: Better than expected, really sturdy.
+  name: Sawyer Marsh
+  registration_date: '2026-06-26'
+- id,link: RV7055
+  status: Approved
+  title: Packed with care and sturdy overall.
+  name: Sawyer Kendrick
+  registration_date: '2026-05-29'
+- id,link: RV7066
+  status: Pending
+  title: Better than expected, really sturdy.
+  name: Quinn Ashby
+  registration_date: '2026-08-13'
+- id,link: RV7077
+  status: Pending
+  title: Second purchase and still lightweight.
+  name: Emerson Kendrick
+  registration_date: '2026-06-17'
+- id,link: RV7088
+  status: Pending
+  title: Second purchase and still well finished.
+  name: Harper Ashby
+  registration_date: '2026-09-13'
+- id,link: RV7099
+  status: Approved
+  title: Second purchase and still lovely in colour.
+  name: Emerson Langley
+  registration_date: '2026-05-11'
+- id,link: RV7110
+  status: Hidden
+  title: Better than expected, really lightweight.
+  name: Jordan Dorsey
+  registration_date: '2026-05-18'
+- id,link: RV7121
+  status: Hidden
+  title: Better than expected, really lovely in colour.
+  name: Morgan Sinclair
+  registration_date: '2026-08-13'
+- id,link: RV7132
+  status: Hidden
+  title: Packed with care and well finished overall.
+  name: Casey Sinclair
+  registration_date: '2026-07-12'
+title: Product reviews

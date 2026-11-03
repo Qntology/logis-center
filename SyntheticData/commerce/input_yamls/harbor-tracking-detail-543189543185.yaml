@@ -1,0 +1,30 @@
+page_id: harbor-tracking-detail-543189543185
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/shipping/view?id=543189543185
+page_type: tracking
+layout: detail
+fields:
+  id,link: '543189543185'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Low-pH cleansing foam
+  shipping_date: '2026-05-18'
+  recipient_name: Sawyer Kendrick
+  registration_date: '2026-05-16'
+  sender_name: Harbor & Pine Trading LLC
+  sender_address: 410 Foundry Way, Tacoma, WA 98402
+  sender_phone: +1-253-555-0142
+  recipient_address: 4868 Alder St, Burlington, VT 05401
+  recipient_phone: +1-619-555-0139
+  weight: 0.9
+  width: 39
+  height: 30
+  length: 21
+  shipping_method: Store pickup
+  shipping_duration: 5
+  shipping_fee: 2.3
+title: Shipment details

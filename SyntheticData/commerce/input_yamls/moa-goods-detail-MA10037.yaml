@@ -1,0 +1,29 @@
+page_id: moa-goods-detail-MA10037
+split: dev
+shop: moa
+shop_name: 모아몰
+lang: ko
+theme: admin_grid
+url: https://moa-mall.test/admin/goods/view?id=MA10037
+page_type: goods
+layout: detail
+fields:
+  id,link: MA10037
+  title: 경량 패딩 조끼
+  status: 품절
+  category: 의류
+  sale_price: 69500
+  quantity: 0
+  registration_date: '2026-01-22'
+  brand_name: Oakfern
+  code: MA-COL-101
+  stock_keeping_unit: MACO1001
+  model_name: CO-575
+  manufacturer: 누리온산업
+  origin_country: 폴란드
+  color: 하늘색
+  barcode: '8875825622741'
+  supply_price: 39051
+  low_stock_threshold: 20
+  description: 거위털을 얇게 충전해 겉옷 안에 겹쳐 입을 수 있습니다.
+title: 상품 정보

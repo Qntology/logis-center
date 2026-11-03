@@ -2571,6 +2571,16 @@ pub const TRADE_ARRAY_CATEGORIES: &[&str] = &["items", "containers"];
 pub const TRADE_IDENTITY_CATEGORY: &str = "header";
 pub const TRADE_IDENTITY_FIELD: &str = "doc_number";
 
+/// 🌟 [TWIN DOC CODE] 같은 서식을 가리키는 코드인가. 'CA' 와 'COA' 처럼 전문이 같은 쌍둥이도 같은 서식입니다.
+///   글자로만 비교하면 분석증명서(doc_type 'CA')의 'COA-2026-0824' 가 타 문서 번호로 빠지고, 남은 전화번호가 문서번호가 됩니다.
+pub fn same_trade_doc(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    let title = |code: &str| TRADE_DOC_TITLES.iter().find(|(c, _)| c.eq_ignore_ascii_case(code)).map(|(_, t)| *t);
+    matches!((title(a), title(b)), (Some(x), Some(y)) if x == y)
+}
+
 pub const TRADE_DOC_TITLES: &[(&str, &str)] = &[
     ("CI", "commercial invoice"),
     ("PI", "proforma invoice"),

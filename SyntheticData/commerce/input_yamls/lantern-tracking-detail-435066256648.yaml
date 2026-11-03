@@ -1,0 +1,30 @@
+page_id: lantern-tracking-detail-435066256648
+split: test
+shop: lantern
+shop_name: Blue Lantern Supply
+lang: en
+theme: store_sections
+url: https://bluelantern-supply.test/my/shipments/435066256648
+page_type: tracking
+layout: detail
+fields:
+  id,link: '435066256648'
+  carrier: BlueRoute Freight
+  status: Returned
+  title: Sherpa fleece jacket
+  shipping_date: '2026-05-03'
+  recipient_name: Riley Kendrick
+  registration_date: '2026-05-01'
+  sender_name: Blue Lantern Supply Co.
+  sender_address: 88 Quarry Road, Duluth, MN 55802
+  sender_phone: +1-218-555-0177
+  recipient_address: 325 Willow Ct, Madison, WI 53703
+  recipient_phone: +1-526-555-0116
+  weight: 6.5
+  width: 18
+  height: 20
+  length: 26
+  shipping_method: Store pickup
+  shipping_duration: 4
+  shipping_fee: 0.0
+title: Shipment details

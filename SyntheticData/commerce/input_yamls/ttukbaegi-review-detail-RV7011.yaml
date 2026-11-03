@@ -1,0 +1,16 @@
+page_id: ttukbaegi-review-detail-RV7011
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/reviews/RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: 승인
+  title: 포장이 꼼꼼했고 마감이 좋아서 괜찮습니다.
+  name: 조은호
+  registration_date: '2026-09-10'
+title: 후기 보기

@@ -1,0 +1,30 @@
+page_id: ttukbaegi-goods-detail-TB10037
+split: test
+shop: ttukbaegi
+shop_name: 뚝배기마켓
+lang: ko
+theme: mobile_dl
+url: https://ttukbaegi.test/products/TB10037
+page_type: goods
+layout: detail
+fields:
+  id,link: TB10037
+  title: 방수 블루투스 스피커
+  status: 품절
+  category: 디지털
+  sale_price: 53700
+  compare_at_price: 64440
+  quantity: 0
+  registration_date: '2026-07-16'
+  brand_name: Oakfern
+  code: TB-AUD-101
+  stock_keeping_unit: TBAU1001
+  model_name: AU-298
+  manufacturer: 누리온산업
+  origin_country: 말레이시아
+  color: 먹색
+  barcode: '8829856447224'
+  supply_price: 35224
+  low_stock_threshold: 20
+  description: 물가에서도 쓸 수 있는 소형 스피커입니다.
+title: 상품 정보

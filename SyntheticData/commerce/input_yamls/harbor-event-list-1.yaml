@@ -1,0 +1,47 @@
+page_id: harbor-event-list-1
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/event/list?page=1
+page_type: event
+layout: list
+items:
+- id,link: EV303
+  title: Spring stroll showcase
+  type: Sweepstakes
+  started_at: '2026-08-03'
+  expired_at: '2026-08-23'
+  status: Scheduled
+- id,link: EV306
+  title: Summer getaway picks
+  type: Tester
+  started_at: '2026-03-20'
+  expired_at: '2026-04-09'
+  status: Ended
+- id,link: EV309
+  title: Harvest gift guide
+  type: Showcase
+  started_at: '2026-08-08'
+  expired_at: '2026-08-28'
+  status: Scheduled
+- id,link: EV312
+  title: Year-end celebration
+  type: Sweepstakes
+  started_at: '2026-09-11'
+  expired_at: '2026-09-21'
+  status: Scheduled
+- id,link: EV315
+  title: New arrivals tester program
+  type: Sweepstakes
+  started_at: '2026-07-23'
+  expired_at: '2026-08-02'
+  status: Ended
+- id,link: EV318
+  title: Top reviewer contest
+  type: Showcase
+  started_at: '2026-02-01'
+  expired_at: '2026-03-18'
+  status: Ended
+title: Campaigns

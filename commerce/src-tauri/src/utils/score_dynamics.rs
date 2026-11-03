@@ -542,6 +542,8 @@ static BASES: Lazy<RwLock<HashMap<Ledger, SdsFile>>> = Lazy::new(|| RwLock::new(
 static RUNS: Lazy<RwLock<HashMap<Ledger, RunBuf>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 static DIRTY: Lazy<RwLock<HashMap<Ledger, bool>>> = Lazy::new(|| RwLock::new(HashMap::new()));
 static INDEXING_DEPTH: Lazy<RwLock<u32>> = Lazy::new(|| RwLock::new(0));
+/// load() 로 디스크의 원장을 바탕에 올렸는지. 올리지 않은 프로세스는 저장하지 않습니다.
+static LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Debug, Clone, Default)]
 struct RunBuf {
@@ -874,6 +876,7 @@ pub fn load(team: &str) {
     if let Ok(mut w) = RUNS.write() { w.clear(); }
     if let Ok(mut d) = DIRTY.write() { d.clear(); }
     presence_load(team);
+    LOADED.store(true, std::sync::atomic::Ordering::Release);
 
     if loaded == 0 {
         println!("[SDS] 🆕 저장된 원장이 없습니다. 냉간 시작합니다. (현행 판정 그대로)");
@@ -1057,6 +1060,12 @@ fn flush_locked() {
     // 단위 테스트(cfg(test))는 사용자 앱 데이터 폴더의 원장을 쓰지 않습니다. 테스트 프로세스는 load() 를 거치지 않아
     // 원장 바탕이 비어 있으므로, 여기서 쓰면 누적된 원장을 테스트 관측만으로 덮어씁니다.
     if cfg!(test) {
+        return;
+    }
+    // 🌟 [SDS LOAD GUARD] load() 를 거치지 않은 프로세스의 관측은 저장하지 않습니다.
+    //    통합 테스트(tests/it)는 cfg(test) 가 아니어서 위 가드를 지나가고, 바탕이 빈 채로 저장하면 원장이 그 프로세스의
+    //    관측만으로 덮입니다. 2026-10-14 실제로 extract.json 의 trading · commerce 스코프가 이렇게 사라졌습니다.
+    if !LOADED.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
     presence_flush();
@@ -1659,7 +1668,7 @@ pub fn report() -> String {
     }
     if parts.is_empty() { parts.push("관측 없음".to_string()); }
     format!(
-        "[SDS REPORT] {} | 저장 보유 문서 {}건 | 닫는 실행 [{}] | (Phase 0: 판정 미개입)",
+        "[SDS REPORT] {} | 저장 보유 문서 {}건 | 닫는 실행 [{}]",
         parts.join(" | "),
         docs_total,
         if closed.is_empty() { "-".to_string() } else { closed.join(", ") }

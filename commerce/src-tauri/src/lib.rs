@@ -15,6 +15,7 @@ pub mod logic;
 pub mod scheduler;
 pub mod analytic;
 pub mod stanza;
+pub mod search_fusion;
 pub mod js_templates;
 pub mod prompts; // 🌟 새로 추가된 프롬프트 모듈 선언
 pub mod parsers; // 🌟 문서 파서 모듈 선언
@@ -1486,6 +1487,7 @@ fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
         "type": ctx.get("type").and_then(|v| v.as_str()).unwrap_or(""),
         "types": types,
         "mode": search_mode,
+        "cc": ctx.get("cc").and_then(|v| v.as_str()).unwrap_or(""),
         "conditions": conditions,
         "keywords": keywords,
         "alternates": ctx.get("alternates").cloned().unwrap_or(json!({})),
@@ -2195,6 +2197,266 @@ async fn probe_trade_query<E: Fn(&str)>(
     None
 }
 
+/// 🌟 [CONDITION GROUNDING] 저장 데이터로 통과시킬 수 없는 조건을 힌트로 내립니다.
+///
+///   Plinko 는 낱말을 가장 가까운 속성에 붙이므로 '책상' 이 color, '결제금액' 이 payment_method, 285200 이 quantity 조건이 됩니다.
+///   프론트엔드는 조건으로 후보를 거르기 때문에, 맞는 행이 하나도 없는 조건은 정답을 화면에서 지우기만 합니다.
+///   이런 조건은 힌트로 내려 청크 검색의 근거로만 남깁니다. 조건이 전부 내려간 맥락은 플랜에서 뺍니다. 조건 없는 플랜은 후보를
+///   전부 통과시키므로 남겨 두면 다른 맥락의 올바른 조건까지 무력화합니다.
+///
+///   질의가 가리키는 유형과 다른 맥락도 플랜에서 뺍니다. '비타민 C 세럼 들어간 주문' 이 상품 맥락의 제목 조건을 만들면
+///   제목 칸이 없는 주문이 전부 걸러집니다. 이런 맥락은 회수에만 쓰입니다.
+async fn ground_conditions<E: Fn(&str)>(store: &VectorStore, structured: &mut Value, cc: &str, domains: &[String], emit: &E) {
+    use crate::utils::ai_utils::FieldFormat;
+    const SAMPLE_ROWS: usize = 2000;
+    const LITERAL_ROWS: usize = 200;
+
+    fn number_of(v: &Value) -> Option<f64> {
+        v.as_f64().or_else(|| v.as_str().and_then(|s| s.replace(',', "").trim().parse::<f64>().ok()))
+    }
+    fn in_types(row: &Value, types: &[String]) -> bool {
+        types.is_empty() || row.get("type").and_then(|t| t.as_str()).map_or(false, |t| types.iter().any(|x| x == t))
+    }
+
+    let scope = commerce_scope(cc);
+    let mut sample: Option<Vec<Value>> = None;
+    let Some(contexts) = structured.get_mut("context").and_then(|v| v.as_array_mut()) else { return };
+    for ctx in contexts.iter_mut() {
+        let ctx_type = ctx.get("type").and_then(|v| v.as_str()).map(|t| t.strip_suffix("_items").unwrap_or(t).to_string()).unwrap_or_default();
+        if !ctx_type.is_empty() && !domains.iter().any(|d| *d == ctx_type) {
+            if let Some(obj) = ctx.as_object_mut() {
+                obj.insert("plan_off".to_string(), json!(true));
+            }
+            emit(&format!("[AI-SEARCH] ⚓ [CONDITION GROUNDING] '{}' 맥락은 질의가 가리키는 유형 {:?} 이 아니라 플랜에서 뺍니다.", ctx_type, domains));
+            continue;
+        }
+        let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()).cloned() else { continue };
+        let types: Vec<String> = ctx
+            .get("types")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|t| t.as_str().map(|s| s.strip_suffix("_items").unwrap_or(s).to_string())).collect())
+            .unwrap_or_default();
+        let mut demoted: Vec<(String, Value)> = Vec::new();
+        for (key, spec) in cond.iter() {
+            let field = crate::utils::bias_schema::canonical_field_name(key).to_string();
+            let format = crate::utils::ai_utils::detect_field_format(&field);
+            // 상태는 코드로, 날짜는 시각으로 저장되어 글자로 대조할 수 없습니다.
+            if field.contains("status") || matches!(format, FieldFormat::Date | FieldFormat::Synthesis) {
+                continue;
+            }
+            let op = spec.get("operator").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
+            let compare = matches!(op.as_str(), "gt" | "gte" | "lt" | "lte");
+            let grounded = if op == "top" || op == "bottom" {
+                // 순위 조건은 맥락의 유형에 그 칸이 있어야 뜻이 있습니다. 상품에는 무게가 없는데 'Lightweight' 가 무게 하위 20% 를 만들었습니다.
+                if sample.is_none() {
+                    let rows = store.rows_mentioning(&scope, "", SAMPLE_ROWS).await.unwrap_or_default();
+                    sample = Some(rows.iter().filter_map(|r| serde_json::from_str::<Value>(r).ok()).collect());
+                }
+                sample.as_deref().unwrap_or_default().iter().any(|r| {
+                    r.get("type").and_then(|t| t.as_str()) == Some(ctx_type.as_str()) && r.get(field.as_str()).and_then(number_of).is_some()
+                })
+            } else if format == FieldFormat::Numeric && compare {
+                let Some(target) = spec.get("value").and_then(number_of) else { continue };
+                if sample.is_none() {
+                    let rows = store.rows_mentioning(&scope, "", SAMPLE_ROWS).await.unwrap_or_default();
+                    sample = Some(rows.iter().filter_map(|r| serde_json::from_str::<Value>(r).ok()).collect());
+                }
+                let rows = sample.as_deref().unwrap_or_default();
+                let known = rows.iter().filter(|r| in_types(r, &types)).filter_map(|r| r.get(field.as_str()).and_then(number_of));
+                let mut seen = false;
+                let mut passes = false;
+                for x in known {
+                    seen = true;
+                    passes |= match op.as_str() {
+                        "gt" => x > target,
+                        "gte" => x >= target,
+                        "lt" => x < target,
+                        _ => x <= target,
+                    };
+                }
+                passes || !seen
+            } else if op == "contains" || op == "eq" {
+                let Some(value) = spec.get("value").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()) else { continue };
+                if value.contains(|c: char| matches!(c, '%' | '_')) { continue; }
+                if format == FieldFormat::Numeric && value.chars().all(|c| c.is_ascii_digit() || c == '.') { continue; }
+                match store.rows_mentioning(&scope, value, LITERAL_ROWS).await {
+                    Ok(rows) => rows.iter().any(|r| {
+                        serde_json::from_str::<Value>(r)
+                            .map_or(false, |d| in_types(&d, &types) && crate::search_fusion::field_contains(&d, &field, value))
+                    }),
+                    Err(_) => true,
+                }
+            } else {
+                continue;
+            };
+            crate::utils::score_dynamics::record_baseline("search.condition_grounded", if grounded { 1.0 } else { 0.0 });
+            if !grounded {
+                demoted.push((key.clone(), spec.clone()));
+            }
+        }
+        if demoted.is_empty() { continue; }
+        let has_status = ctx.get("status").and_then(|v| v.as_str()).map_or(false, |s| !s.trim().is_empty() && s.trim() != "null");
+        if let Some(obj) = ctx.as_object_mut() {
+            let mut left = 0usize;
+            if let Some(c) = obj.get_mut("condition").and_then(|v| v.as_object_mut()) {
+                for (key, _) in demoted.iter() {
+                    c.remove(key);
+                }
+                left = c.len();
+            }
+            let hint = obj.entry("hint".to_string()).or_insert_with(|| json!({}));
+            if !hint.is_object() { *hint = json!({}); }
+            if let Some(h) = hint.as_object_mut() {
+                for (key, spec) in demoted.iter() {
+                    h.entry(key.clone()).or_insert_with(|| spec.clone());
+                }
+            }
+            if left == 0 && !has_status {
+                obj.insert("plan_off".to_string(), json!(true));
+            }
+        }
+        emit(&format!(
+            "[AI-SEARCH] ⚓ [CONDITION GROUNDING] 저장 데이터로 통과시킬 수 없어 힌트로 내립니다: {:?}",
+            demoted.iter().map(|(k, s)| format!("{} {} {}", k, s.get("operator").unwrap_or(&Value::Null), s.get("value").unwrap_or(&Value::Null))).collect::<Vec<_>>()
+        ));
+    }
+}
+
+/// 유형별 지시어: 언어별 유형 이름에 bias.json 의 search_bridge.domain_words 를 더합니다. 상품은 기본값이라 넣지 않습니다.
+fn domain_vocabulary(language: &str) -> Vec<(String, Vec<String>)> {
+    ["order", "tracking", "review", "coupon", "event"]
+        .iter()
+        .map(|cat| {
+            let mut terms = vec![cat.to_string(), crate::parsing::get_localized_page_type(cat, language)];
+            if let Some(list) = crate::parsing::BIAS_DICT
+                .get("search_bridge")
+                .and_then(|b| b.get("domain_words"))
+                .and_then(|d| d.get(*cat))
+                .and_then(|v| v.as_array())
+            {
+                terms.extend(list.iter().filter_map(|t| t.as_str().map(str::to_string)));
+            }
+            (cat.to_string(), terms)
+        })
+        .collect()
+}
+
+fn commerce_scope(cc: &str) -> String {
+    if cc.trim().is_empty() {
+        "mode = 'commerce'".to_string()
+    } else {
+        format!("mode = 'commerce' AND `cc` = '{}'", cc.replace('\'', "''"))
+    }
+}
+
+/// 🌟 [WHOLE QUERY FUSION] 질의 전체의 벡터 · 청크 · 글자 일치 순위를 해석 결과의 순위와 합칩니다.
+async fn fuse_whole_query<E: Fn(&str)>(
+    store: &VectorStore,
+    model: &LogisModel,
+    query: &str,
+    language: &str,
+    cc: &str,
+    ranked: &mut Vec<Value>,
+    emit: &E,
+) -> Value {
+    use crate::search_fusion as sf;
+    const TRACK_LIMIT: usize = 200;
+    const CHUNK_LIMIT: usize = 50;
+
+    let scope = commerce_scope(cc);
+    let emb = model.get_embedding(query.to_string()).await.unwrap_or_default();
+    let vector_rows = store.rank_items_vector(query, &emb, TRACK_LIMIT, &scope).await.unwrap_or_default();
+    let fts_rows = store.rank_items_fts(query, TRACK_LIMIT, &scope).await.unwrap_or_default();
+    let chunk_filter = if cc.trim().is_empty() {
+        "mode = 'commerce'".to_string()
+    } else {
+        format!("mode = 'commerce' AND cc = '{}'", cc.replace('\'', "''"))
+    };
+    let chunk_rows = store.search_chunks(&emb, CHUNK_LIMIT, Some(&chunk_filter)).await.unwrap_or_default();
+    let domains = sf::query_domains(query, &domain_vocabulary(language));
+    let type_list = domains.iter().map(|d| format!("'{}'", d.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+    let typed_rows = store
+        .rank_items_vector(query, &emb, TRACK_LIMIT, &format!("{} AND type IN ({})", scope, type_list))
+        .await
+        .unwrap_or_default();
+    let typed_chunks = store
+        .search_chunks(&emb, CHUNK_LIMIT, Some(&format!("{} AND item_type IN ({})", chunk_filter, type_list)))
+        .await
+        .unwrap_or_default();
+
+    let mut data_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut pool: Vec<(String, String)> = Vec::new();
+    for (id, data) in vector_rows.iter().chain(typed_rows.iter()).chain(fts_rows.iter()) {
+        if data_of.contains_key(id) { continue; }
+        data_of.insert(id.clone(), data.clone());
+        pool.push((id.clone(), sf::value_text(data)));
+    }
+
+    let pipeline: Vec<String> = ranked.iter().filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string)).collect();
+    let vector: Vec<String> = vector_rows.iter().map(|(id, _)| id.clone()).collect();
+    let chunks: Vec<String> = chunk_rows.iter().map(|c| c.1.clone()).collect();
+    let terms = sf::query_terms(query);
+    let literal = sf::literal_ranking(&terms, &pool);
+    let typed_vector: Vec<String> = typed_rows.iter().map(|(id, _)| id.clone()).collect();
+    let typed_chunk_ids: Vec<String> = typed_chunks.iter().map(|c| c.1.clone()).collect();
+    let typed_literal: Vec<String> = literal
+        .iter()
+        .filter(|id| {
+            data_of
+                .get(*id)
+                .and_then(|d| serde_json::from_str::<Value>(d).ok())
+                .and_then(|d| d.get("type").and_then(|t| t.as_str()).map(|t| domains.iter().any(|x| x == t)))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    let fused = sf::fuse(
+        &[
+            (pipeline.as_slice(), 1.0),
+            (vector.as_slice(), 1.0),
+            (chunks.as_slice(), 1.0),
+            (literal.as_slice(), sf::LITERAL_WEIGHT),
+            (typed_vector.as_slice(), 1.0),
+            (typed_chunk_ids.as_slice(), 1.0),
+            (typed_literal.as_slice(), 1.0),
+        ],
+        sf::FUSION_K,
+    );
+
+    let top = fused.first().map_or(1.0, |f| f.1.max(f32::MIN_POSITIVE));
+    let mut known: std::collections::HashMap<String, Value> = ranked
+        .drain(..)
+        .filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string).map(|id| (id, r)))
+        .collect();
+    let added = fused.iter().filter(|(id, _)| !known.contains_key(id)).count();
+    for (id, s) in fused.iter() {
+        let mut row = match known.remove(id) {
+            Some(r) => r,
+            None => {
+                let data = data_of.get(id).cloned().unwrap_or_default();
+                let doc_type = serde_json::from_str::<Value>(&data)
+                    .ok()
+                    .and_then(|d| d.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                    .unwrap_or_default();
+                json!({ "id": id, "text": data, "context_type": doc_type, "relation": "whole_query" })
+            }
+        };
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("score".to_string(), json!(*s / top));
+        }
+        ranked.push(row);
+    }
+    crate::utils::score_dynamics::record_baseline("search.fusion_added", added as f32);
+    emit(&format!(
+        "[AI-SEARCH] 🧮 [WHOLE QUERY FUSION] 질의 유형 {:?} | 해석 {}건 · 질의 벡터 {}건 · 청크 {}건 · 글자 일치 {}건을 합쳐 {}건 (새로 들어온 문서 {}건)",
+        domains, pipeline.len(), vector.len(), chunks.len(), literal.len(), ranked.len(), added
+    ));
+    json!({
+        "pipeline": pipeline, "vector": vector, "chunks": chunks, "literal": literal,
+        "domains": domains, "typed_vector": typed_vector, "typed_chunks": typed_chunk_ids
+    })
+}
+
 #[tauri::command]
 async fn get_all_documents(
     state: State<'_, AppState>,
@@ -2518,6 +2780,7 @@ async fn ai_search_complex(
         let mut dexie_plans: Vec<Value> = Vec::new();
         // 🌟 [VISION QUERY] shipping(무역) 트랙 전용 비전 질의 벡터. 컨텍스트 전체가 공유합니다.
         let mut vision_qvec: Option<Vec<f32>> = None;
+        let mut fusion_trace = Value::Null;
 
         let team_id = crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000"); 
         let mut metrics_json_str = "{}".to_string();
@@ -2546,6 +2809,18 @@ async fn ai_search_complex(
                 if verdict.is_some() { 1.0 } else { 0.0 },
             );
             crate::utils::score_dynamics::leave_scope();
+            // 🌟 [REROUTE DATA GUARD] 무역 문서가 하나도 없으면 전환해도 0건입니다. 코사인 초과분 +0.1 로 전환된
+            //    'gadgets for listening to music' 이 빈 결과가 되었습니다.
+            let verdict = match (verdict, store_opt.as_ref()) {
+                (Some(code), Some(store)) if !store.has_rows("mode = 'shipping'").await => {
+                    emit_term(&format!(
+                        "[MODE REROUTE / QUERY] ⚪ 서식 '{}' 로 전환할 수 있지만 저장된 무역 문서가 없어 커머스 범위를 유지합니다.",
+                        code
+                    ));
+                    None
+                }
+                (v, _) => v,
+            };
             match verdict {
                 Some(code) => {
                     emit_term(&format!(
@@ -2560,7 +2835,7 @@ async fn ai_search_complex(
             search_mode.clone()
         };
 
-        let structured_query = match search_mode.as_str() {
+        let mut structured_query = match search_mode.as_str() {
             "shipping" => {
                 model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
             },
@@ -2584,6 +2859,13 @@ async fn ai_search_complex(
                 model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
             }
         };
+
+        if search_mode == "commerce" {
+            if let Some(store) = store_opt.as_ref() {
+                let domains = crate::search_fusion::query_domains(&query, &domain_vocabulary(&language));
+                ground_conditions(store, &mut structured_query, &cc, &domains, &emit_term).await;
+            }
+        }
 
         // =====================================================================
         // 🌟 [VISION QUERY TRACK] shipping 모드에서 SigLIP2 텍스트 인코더로
@@ -2771,7 +3053,9 @@ async fn ai_search_complex(
                 );
 
                 // 🌟 [PLAN 수집] 프론트엔드가 실행할 정밀 필터 플랜을 응답에 동봉합니다.
-                dexie_plans.push(dexie_plan.clone());
+                if ctx.get("plan_off").and_then(|v| v.as_bool()) != Some(true) {
+                    dexie_plans.push(dexie_plan.clone());
+                }
 
                 // 🌟 [TRACKING] tracking_number 는 이제 LIKE 땜질이 아니라
                 //    dexie_plan 의 data.tracking_number eq 조건으로 정확히 처리됩니다.
@@ -2864,6 +3148,13 @@ async fn ai_search_complex(
                             let quoted: Vec<String> = list.iter().map(|t| format!("'{}'", t)).collect();
                             format!("item_type IN ({}) AND mode = '{}'", quoted.join(", "), search_mode)
                         }
+                    };
+                    // 🌟 [CHUNK TENANT SCOPE] 문서 트랙과 같은 사이트 범위를 청크 트랙에도 겁니다. 없으면 다른 쇼핑몰의 청크가
+                    //    그대로 결과에 들어오고, 조건 없는 질의는 프론트엔드 필터도 지나갑니다. shipping 은 문서 트랙과 같이 걸지 않습니다.
+                    let chunk_type_filter = if cc.trim().is_empty() || search_mode == "shipping" {
+                        chunk_type_filter
+                    } else {
+                        format!("{} AND cc = '{}'", chunk_type_filter, cc.replace('\'', "''"))
                     };
 
                     // 4-B: PLINKO 조건 기반 타겟 속성 목록 구축
@@ -3373,6 +3664,13 @@ async fn ai_search_complex(
                 let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
+
+            // ── 5-D2: 질의 전체 트랙과 합칩니다 (search_fusion 모듈 설명 참조) ──
+            if search_mode == "commerce" {
+                if let Some(store) = store_opt.as_ref() {
+                    fusion_trace = fuse_whole_query(store, &model, &query, &language, &cc, &mut ranked_results, &emit_term).await;
+                }
+            }
 
             // ── 5-E: 프론트엔드 응답 포맷 확정 ──
             // 프론트엔드(main.ts)가 소비하는 필드:
@@ -4078,7 +4376,8 @@ async fn ai_search_complex(
             "results": all_results,
             "dexie_plans": dexie_plans,
             "report": analytic_report,
-            "mode": search_mode
+            "mode": search_mode,
+            "tracks": fusion_trace
         }))
     }.await; 
 
@@ -5350,6 +5649,44 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
 
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+fn app_context() -> tauri::Context {
+    tauri::generate_context!()
+}
+
+/// 🌟 [SYNTH EVAL] 창과 이벤트 루프 없이 AppHandle 만 만듭니다. run() 을 부르지 않으므로 설정의 창이 뜨지 않고,
+///   process_task · ai_search_complex 를 앱과 같은 경로로 부를 수 있습니다 (tests/it/synthetic_eval.rs).
+#[cfg(any(windows, target_os = "linux"))]
+pub fn build_headless_app(state: AppState) -> tauri::Result<tauri::App> {
+    crate::model::lang_llm::register_loader(crate::models::qwen4_exp::registry::load_lang_runtime);
+    crate::models::qwen::generate::init_bake_worker();
+    tauri::Builder::default().any_thread().manage(state).build(app_context())
+}
+
+/// 🌟 [SYNTH EVAL] 프론트엔드 없이 ai_search_complex 를 부릅니다. build_headless_app 으로 만든 앱에서만 씁니다.
+#[cfg(any(windows, target_os = "linux"))]
+pub async fn eval_ai_search(
+    app: &tauri::AppHandle,
+    task_id: String,
+    query: String,
+    language: String,
+    search_mode: String,
+    cc: String,
+) -> Result<Value, String> {
+    ai_search_complex(
+        app.state::<AppState>(),
+        app.clone(),
+        task_id,
+        query,
+        language,
+        None,
+        search_mode,
+        cc,
+        String::new(),
+        String::new(),
+    )
+    .await
+}
+
 pub fn run() {
     crate::model::lang_llm::register_loader(crate::models::qwen4_exp::registry::load_lang_runtime);
     let model = Arc::new(TokioMutex::new(None));
@@ -5594,7 +5931,7 @@ pub fn run() {
             translit_cache_respond, get_embedding_batch_for_translit,
             get_lang_llm_status
         ])
-        .build(tauri::generate_context!())
+        .build(app_context())
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
             if let tauri::RunEvent::Exit = event {

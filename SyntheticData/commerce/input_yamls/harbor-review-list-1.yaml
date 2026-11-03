@@ -1,0 +1,71 @@
+page_id: harbor-review-list-1
+split: dev
+shop: harbor
+shop_name: Harbor & Pine
+lang: en
+theme: admin_flat
+url: https://harborandpine.test/admin/review/list?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: Hidden
+  title: Second purchase and still sturdy.
+  name: Casey Langley
+  registration_date: '2026-08-30'
+- id,link: RV7022
+  status: Pending
+  title: Packed with care and sturdy overall.
+  name: Riley Whitfield
+  registration_date: '2026-09-23'
+- id,link: RV7033
+  status: Hidden
+  title: Packed with care and lightweight overall.
+  name: Finley Langley
+  registration_date: '2026-05-28'
+- id,link: RV7044
+  status: Approved
+  title: Packed with care and lightweight overall.
+  name: Avery Prescott
+  registration_date: '2026-06-09'
+- id,link: RV7055
+  status: Hidden
+  title: Packed with care and well finished overall.
+  name: Finley Sinclair
+  registration_date: '2026-08-15'
+- id,link: RV7066
+  status: Approved
+  title: Second purchase and still lovely in colour.
+  name: Morgan Whitfield
+  registration_date: '2026-05-22'
+- id,link: RV7077
+  status: Approved
+  title: Second purchase and still lightweight.
+  name: Casey Sinclair
+  registration_date: '2026-08-31'
+- id,link: RV7088
+  status: Hidden
+  title: Better than expected, really well finished.
+  name: Avery Dorsey
+  registration_date: '2026-06-17'
+- id,link: RV7099
+  status: Approved
+  title: Packed with care and sturdy overall.
+  name: Casey Whitfield
+  registration_date: '2026-05-13'
+- id,link: RV7110
+  status: Approved
+  title: Better than expected, really lightweight.
+  name: Avery Ashby
+  registration_date: '2026-05-05'
+- id,link: RV7121
+  status: Approved
+  title: Better than expected, really sturdy.
+  name: Rowan Mercer
+  registration_date: '2026-05-25'
+- id,link: RV7132
+  status: Approved
+  title: Packed with care and lovely in colour overall.
+  name: Taylor Whitfield
+  registration_date: '2026-06-28'
+title: Product reviews
