@@ -1281,3 +1281,43 @@ fn tokenizer_init_errors_and_wordlevel_encoding() -> anyhow::Result<()> {
     assert_eq!(t.to_vec2::<u32>()?, vec![vec![2, 1]]);
     Ok(())
 }
+
+// ── bias.json 덮어쓰기 (RFC 7386 JSON Merge Patch) ─────────────────
+
+#[test]
+fn bias_overlay_follows_rfc7386() {
+    let cases = [
+        (json!({"a": "b"}), json!({"a": "c"}), json!({"a": "c"})),
+        (json!({"a": "b"}), json!({"b": "c"}), json!({"a": "b", "b": "c"})),
+        (json!({"a": "b", "b": "c"}), json!({"a": null}), json!({"b": "c"})),
+        (json!({"a": ["b"]}), json!({"a": "c"}), json!({"a": "c"})),
+        (json!({"a": {"b": "c"}}), json!({"a": {"b": "d", "c": null}}), json!({"a": {"b": "d"}})),
+        (json!({"a": [{"b": "c"}]}), json!({"a": [1]}), json!({"a": [1]})),
+        (json!({"e": null}), json!({"a": 1}), json!({"e": null, "a": 1})),
+        (json!([1, 2]), json!({"a": "b", "c": null}), json!({"a": "b"})),
+        (json!({}), json!({"a": {"bb": {"ccc": null}}}), json!({"a": {"bb": {}}})),
+    ];
+    for (mut target, patch, expected) in cases {
+        bias::merge_patch(&mut target, &patch);
+        assert_eq!(target, expected, "patch {patch}");
+    }
+}
+
+#[test]
+fn bias_overlay_replaces_only_the_keys_it_names() -> anyhow::Result<()> {
+    let mut dict = json!({
+        "status_filters": {"ko": ["배송중", "결제완료"], "en": ["shipped"]},
+        "verb": {"find": ["찾아"]},
+    });
+    let changed = bias::apply_bias_overlay(&mut dict, "\u{feff}{\"status_filters\": {\"ko\": [\"출고\"]}, \"verb\": null}")?;
+    assert_eq!(changed, 2);
+    assert_eq!(dict, json!({"status_filters": {"ko": ["출고"], "en": ["shipped"]}}));
+
+    // JSON 이 아니거나 최상위가 객체가 아니면 사전을 건드리지 않습니다.
+    let before = dict.clone();
+    assert!(bias::apply_bias_overlay(&mut dict, "{ not json").is_err());
+    assert!(bias::apply_bias_overlay(&mut dict, "[1, 2]").is_err());
+    assert_eq!(dict, before);
+    assert_eq!(bias::BIAS_OVERRIDE_FILE, "bias.override.json");
+    Ok(())
+}

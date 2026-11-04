@@ -1,10 +1,86 @@
 use once_cell::sync::Lazy;
 use serde_json::Value;
 
+/// 도메인 사전. 내장 `bias.json` 위에 앱 폴더의 덮어쓰기 파일(있으면)을 얹은 결과입니다 ([`BIAS_OVERRIDE_FILE`]).
 pub static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
-    let json_str = include_str!("bias.json");
-    serde_json::from_str(json_str).unwrap_or(serde_json::json!({}))
+    let mut dict = serde_json::from_str(include_str!("bias.json")).unwrap_or(serde_json::json!({}));
+    load_bias_overlay(&mut dict);
+    dict
 });
+
+// =====================================================================
+// 🌟 [BIAS OVERLAY] 실행 파일 밖에서 도메인 사전 고치기
+// ---------------------------------------------------------------------
+//  bias.json 은 include_str! 로 실행 파일에 들어가 있어, 키워드 · 서식 · 상태 문구 하나를 고쳐도 다시 빌드해야 했습니다.
+//  앱 폴더의 `bias.override.json` 을 JSON Merge Patch(RFC 7386)로 내장 사전 위에 얹습니다.
+//   · 객체는 키별로 합치고, 배열 · 문자열 · 숫자는 통째로 바꾸며, null 은 그 키를 지웁니다.
+//     덮어쓰기 파일에는 바꿀 키만 둡니다. 앱을 갱신해도 나머지 키는 새 내장 값을 따릅니다.
+//   · 읽기 · 해석에 실패하면 내장 사전만 쓰고 한 줄로 알립니다 (앱이 멈추지 않습니다).
+//   · 처음 쓰일 때 한 번 읽습니다. 파생 캐시(질의 뱅크 등)가 그 뒤에 만들어지므로, 고친 뒤에는 앱을 다시 시작합니다.
+//   · 라벨 뱅크를 크게 바꾸면 코사인 보정표(models/embedding/calibration.rs)도 다시 맞춥니다.
+//  `LOGIS_BIAS_OVERRIDE=<경로>` 로 다른 파일을, `LOGIS_BIAS_OVERRIDE=off` 로 끄기를 지정합니다.
+// =====================================================================
+
+/// 앱 폴더에 두는 덮어쓰기 파일 이름.
+pub const BIAS_OVERRIDE_FILE: &str = "bias.override.json";
+/// 덮어쓰기 파일 경로를 바꾸거나(`off` 면 끄기) 지정하는 환경 변수.
+pub const BIAS_OVERRIDE_ENV: &str = "LOGIS_BIAS_OVERRIDE";
+
+/// 이번 프로세스가 읽을 덮어쓰기 파일 경로. 꺼져 있으면 `None`.
+pub fn bias_override_path() -> Option<std::path::PathBuf> {
+    match std::env::var(BIAS_OVERRIDE_ENV) {
+        Ok(v) if matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "none" | "false") => None,
+        Ok(v) if !v.trim().is_empty() => Some(std::path::PathBuf::from(v.trim())),
+        _ => Some(crate::utils::get_app_dir().join(BIAS_OVERRIDE_FILE)),
+    }
+}
+
+/// RFC 7386 JSON Merge Patch. 바꾸거나 지운 값의 수를 돌려줍니다.
+pub fn merge_patch(target: &mut Value, patch: &Value) -> usize {
+    let Value::Object(entries) = patch else {
+        *target = patch.clone();
+        return 1;
+    };
+    if !target.is_object() {
+        *target = Value::Object(serde_json::Map::new());
+    }
+    let map = target.as_object_mut().expect("바로 위에서 객체로 만들었습니다");
+    let mut changed = 0;
+    for (key, value) in entries {
+        if value.is_null() {
+            changed += map.remove(key).is_some() as usize;
+        } else {
+            changed += merge_patch(map.entry(key.clone()).or_insert(Value::Null), value);
+        }
+    }
+    changed
+}
+
+/// 덮어쓰기 문서를 해석해 `dict` 에 얹습니다. 최상위가 객체가 아니거나 JSON 이 아니면 `dict` 를 건드리지 않고 오류를 돌려줍니다.
+pub fn apply_bias_overlay(dict: &mut Value, overlay_text: &str) -> anyhow::Result<usize> {
+    let patch: Value = serde_json::from_str(overlay_text.trim_start_matches('\u{feff}'))
+        .map_err(|e| anyhow::anyhow!("JSON 해석 실패: {}", e))?;
+    if !patch.is_object() {
+        anyhow::bail!("최상위가 객체가 아닙니다 (바꿀 키만 담은 객체여야 합니다)");
+    }
+    Ok(merge_patch(dict, &patch))
+}
+
+fn load_bias_overlay(dict: &mut Value) {
+    let Some(path) = bias_override_path() else { return };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            println!("[BIAS] ⚠️ 덮어쓰기 파일 {:?} 을 읽지 못해 내장 사전만 씁니다: {}", path, e);
+            return;
+        }
+    };
+    match apply_bias_overlay(dict, &text) {
+        Ok(changed) => println!("[BIAS] 🧩 덮어쓰기 파일 {:?} 을 내장 사전에 얹었습니다 (값 {}개 변경).", path, changed),
+        Err(e) => println!("[BIAS] ⚠️ 덮어쓰기 파일 {:?} 을 쓰지 않고 내장 사전만 씁니다: {}", path, e),
+    }
+}
 
 const LANG_NAME_CODES: &[(&str, &str)] = &[
     ("korean", "ko"), ("한국어", "ko"), ("한국", "ko"),
