@@ -7,8 +7,9 @@ use candle_core::DType;
 use tokio::sync::Mutex as TokioMutex;
 use crate::models::qwen3::generate::Qwen3GenerateModel;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering as XOrder};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as XOrder};
 
+pub mod residency;
 pub mod lifecycle;
 pub mod vision;
 pub mod inference;
@@ -21,6 +22,7 @@ pub mod lang_llm;
 pub mod lang_gguf;
 
 pub use merge::*;
+pub use residency::{CostBook, GenerationHold, Residency, GEN_KIND_LANG4B};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModelSize {
@@ -41,7 +43,8 @@ pub struct LogisModel {
     
     pub embedding_model: Arc<TokioMutex<Option<EmbeddingModel>>>,
     pub embedding_cache: Arc<TokioMutex<std::collections::HashMap<String, Vec<f32>>>>,
-    pub generation_hold: Arc<std::sync::atomic::AtomicU32>,
+    /// 생성 모델 전환 구간. clone 끼리 공유합니다 (`hold_generation`).
+    pub hold_gate: Arc<residency::HoldGate>,
     pub is_cpu_mode: bool, 
     pub is_disk_swap: bool,
     pub dual_mode_enabled: bool,
@@ -59,13 +62,6 @@ pub struct LogisModel {
     pub siglip2_model: Arc<TokioMutex<Option<crate::models::siglip2::Siglip2Model>>>,
     pub siglip2_config: Option<crate::models::siglip2::Siglip2Config>,
     pub siglip2_model_path: String,
-}
-pub struct GenerationHold(Arc<std::sync::atomic::AtomicU32>);
-
-impl Drop for GenerationHold {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
 }
 pub struct VramSampler {
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -114,15 +110,19 @@ impl Drop for VramSampler {
 
 impl LogisModel {
     /// 생성 모델 전환 구간 진입을 선언합니다.
-    /// 반환된 가드가 살아 있는 동안 ensure_embedding 은 로드를 양보합니다.
+    /// 반환된 가드가 살아 있는 동안 ensure_embedding 은 로드를 양보하고, 마지막 가드가 풀리면 바로 깨어납니다.
     pub fn hold_generation(&self) -> GenerationHold {
-        self.generation_hold.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        GenerationHold(self.generation_hold.clone())
+        self.hold_gate.hold()
     }
 
     /// 지금 생성 모델 전환 구간인지 확인합니다.
     pub fn is_generation_held(&self) -> bool {
-        self.generation_hold.load(std::sync::atomic::Ordering::SeqCst) > 0
+        self.hold_gate.is_held()
+    }
+
+    /// 상주 비용 실측 장부 (프로세스에 하나).
+    pub fn costs(&self) -> &'static CostBook {
+        CostBook::process()
     }
 }
 
@@ -152,41 +152,13 @@ impl LogisModel {
 //   ③ 배치 적응: 여유가 적으면 임베딩 배치를 쪼개
 //      가중치가 아니라 '연산 중 순간 점유(activation)' 를 깎습니다.
 //
-//  ── 왜 전역 static 인가 ──
-//   LogisModel 은 Clone 이고 내부가 전부 Arc 슬롯입니다.
-//   generation_hold 와 같은 이유로 clone 간 상태가 공유되어야 하는데,
-//   구조체에 필드를 추가하면 LogisModel::new(lifecycle.rs)를 함께 고쳐야
-//   합니다. 프로세스 전역에 모델은 하나뿐이므로 static 이 동일하게
-//   동작하며, TRANSLIT_MEM_CACHE 가 이미 같은 선례입니다.
+//  ── 상태는 어디에 있는가 (model/residency.rs) ──
+//   · 무엇이 상주하는가(Residency) : 슬롯에서만 유도합니다. 따로 적는 원장이 없어
+//     퍼지가 임베딩을 남겼는데 원장만 IDLE 인 식의 불일치가 생길 수 없습니다.
+//   · 실측 비용 · 통계(CostBook)   : 장치와 파일의 성질이라 프로세스에 하나이고,
+//     LogisModel 을 새로 만들어도 유지됩니다.
+//   · 전환 구간(HoldGate)          : clone 끼리 공유하는 Arc 필드입니다.
 // =====================================================================
-
-/// 아무것도 상주하지 않는 상태 (퍼지 직후)
-pub const PHASE_IDLE: u8 = 0;
-/// 임베딩 모델만 상주
-pub const PHASE_EMBEDDING: u8 = 1;
-/// 생성 모델만 상주
-pub const PHASE_GENERATION: u8 = 2;
-/// 둘 다 상주 (예산이 허용한 경우에만)
-pub const PHASE_BOTH: u8 = 3;
-
-static CROSSOVER_PHASE: AtomicU8 = AtomicU8::new(PHASE_IDLE);
-static EMBED_RESIDENT_MB: AtomicU64 = AtomicU64::new(0);
-static GEN_RESIDENT_MB: AtomicU64 = AtomicU64::new(0);
-static GEN_COST_BY_KIND: [AtomicU64; 4] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-pub const GEN_KIND_LANG4B: usize = 3;
-static PEAK_RESIDENT_MB: AtomicU64 = AtomicU64::new(0);
-static SWAP_COUNT: AtomicU64 = AtomicU64::new(0);
-/// 동시 상주로 스왑을 회피한 횟수.
-static COEXIST_COUNT: AtomicU64 = AtomicU64::new(0);
-/// 마지막 스왑 시각(epoch ms). 왕복 진단용.
-static LAST_SWAP_MS: AtomicU64 = AtomicU64::new(0);
-/// 관측된 activation 여유(MB). 로드 직후 free 와 연산 중 free 의 차이입니다.
-static ACTIVATION_HEADROOM_MB: AtomicU64 = AtomicU64::new(0);
 
 pub const RAM_PRESSURE_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -278,33 +250,19 @@ impl LogisModel {
 
     /// 임베딩 모델을 올리는 데 필요한 VRAM(MB). 실측이 있으면 실측을 씁니다.
     pub fn embedding_budget_mb(&self) -> u64 {
-        let observed = EMBED_RESIDENT_MB.load(XOrder::SeqCst);
-        let base = if observed > 0 {
-            observed
-        } else {
-            Self::path_footprint_mb(&self.embedding_path).max(1)
-        };
-        base + ACTIVATION_HEADROOM_MB.load(XOrder::SeqCst)
+        self.costs()
+            .embedding_budget_mb(|| Self::path_footprint_mb(&self.embedding_path))
     }
 
-    /// 생성 모델을 올리는 데 필요한 VRAM(MB).
-    ///
-    ///  ── 편견 계산분을 예산에 더하지 않는 이유 ──
-    ///   qwen3/generate.rs 와 qwen3_5/generate.rs 는 편견 벡터를
-    ///   VOCAB_CHUNK 블록 루프로 계산하며, 상주하는 텐서가 없습니다.
-    ///   블록 버퍼(134MB)는 계산 중에만 존재하는 activation 이므로
-    ///   ACTIVATION_HEADROOM_MB 축이 이미 담당합니다.
-    ///   여기서 또 더하면 이중 계산이 되어 예산이 과대평가됩니다.
+    /// 생성 모델을 올리는 데 필요한 VRAM(MB). 규칙은 `CostBook::generation_budget_mb`.
     pub fn generation_budget_mb(&self, size: ModelSize) -> u64 {
         let dir = match size {
-            ModelSize::Qwen => self.qwen_model_path.clone(),
-            ModelSize::Qwen3 => self.qwen3_model_path.clone(),
-            ModelSize::Qwen3_5 => self.qwen3_5_model_path.clone(),
+            ModelSize::Qwen => &self.qwen_model_path,
+            ModelSize::Qwen3 => &self.qwen3_model_path,
+            ModelSize::Qwen3_5 => &self.qwen3_5_model_path,
         };
-        let disk = Self::path_footprint_mb(std::path::Path::new(&dir));
-        let own = Self::measured_generation_mb(Self::gen_kind(size));
-        let observed = if own > 0 { own } else { GEN_RESIDENT_MB.load(XOrder::SeqCst) };
-        disk.max(observed).max(1) + ACTIVATION_HEADROOM_MB.load(XOrder::SeqCst)
+        let disk = Self::path_footprint_mb(std::path::Path::new(dir));
+        self.costs().generation_budget_mb(Self::gen_kind(size), disk)
     }
 
     pub fn gen_kind(size: ModelSize) -> usize {
@@ -316,7 +274,7 @@ impl LogisModel {
     }
 
     pub fn measured_generation_mb(kind: usize) -> u64 {
-        GEN_COST_BY_KIND.get(kind).map(|c| c.load(XOrder::SeqCst)).unwrap_or(0)
+        CostBook::process().generation_mb(kind)
     }
 
     pub async fn resident_generation_cost_mb(&self) -> u64 {
@@ -337,28 +295,8 @@ impl LogisModel {
         total
     }
 
-    // ── 페이즈 상태 ────────────────────────────────────────────────
-    pub fn crossover_phase(&self) -> u8 {
-        CROSSOVER_PHASE.load(XOrder::SeqCst)
-    }
-
-    fn set_phase(p: u8) {
-        CROSSOVER_PHASE.store(p, XOrder::SeqCst);
-    }
-
     fn mark_swap() {
-        SWAP_COUNT.fetch_add(1, XOrder::SeqCst);
-        LAST_SWAP_MS.store(
-            chrono::Utc::now().timestamp_millis().max(0) as u64,
-            XOrder::SeqCst,
-        );
-    }
-
-    /// 퍼지 직후 등 '아무것도 없음' 을 선언합니다.
-    /// deep_purge_resources 를 직접 호출한 경로가 상태를 되돌릴 때 씁니다.
-    /// 🌟 sync_crossover_phase 가 도입된 뒤로는 하위 호환용입니다.
-    pub fn mark_crossover_idle(&self) {
-        Self::set_phase(PHASE_IDLE);
+        CostBook::process().mark_swap();
     }
 
     // ── 실제 슬롯 조회 ─────────────────────────────────────────────
@@ -381,22 +319,19 @@ impl LogisModel {
             || self.qwen4_exp_generator.lock().await.is_some()
     }
 
-    /// 🌟 실제 슬롯 상태를 읽어 페이즈 원장을 사실과 일치시킵니다.
+    /// 🌟 실제 슬롯에서 지금 상주 상태를 읽고, 그 상태가 차지하는 가중치를 피크에 반영합니다.
+    ///  슬롯이 바뀐 직후마다 부릅니다. 상태를 따로 적어 두지 않으므로 사실과 어긋날 수 없습니다.
     ///
     ///  각 lock 은 `.is_some()` 임시값이라 statement 끝에서 즉시 해제됩니다.
     ///  따라서 deep_purge_resources / unload_embedding 의 말미처럼
     ///  이미 가드를 놓은 지점에서 호출해도 재진입 데드락이 없습니다.
-    pub async fn sync_crossover_phase(&self) -> u8 {
-        let e = self.embedding_resident().await;
-        let g = self.generation_resident().await;
-        let p = match (g, e) {
-            (true, true) => PHASE_BOTH,
-            (true, false) => PHASE_GENERATION,
-            (false, true) => PHASE_EMBEDDING,
-            (false, false) => PHASE_IDLE,
-        };
-        Self::set_phase(p);
-        p
+    ///  단, `EmbeddingLease` 를 쥔 채로 부르면 임베딩 슬롯을 기다리며 멈춥니다.
+    pub async fn sync_crossover_phase(&self) -> Residency {
+        let embedding = self.embedding_resident().await;
+        let generation = self.generation_resident().await;
+        let residency = Residency::from_slots(generation, embedding);
+        self.costs().observe_residency(residency);
+        residency
     }
 
     /// 🌟 임베딩을 상주시킨 채 이 생성 모델을 올려도 되는가.
@@ -466,55 +401,19 @@ impl LogisModel {
         VramSampler { stop, min_free, phase, worst_phase, label, baseline }
     }
 
+    /// 임베딩 로드 비용을 기록합니다. `free_before` 는 이 함수를 부른 쪽이 정리를 끝낸 직후 값입니다.
+    /// 피크는 뒤이은 `sync_crossover_phase` 가 실제 슬롯 상태로 셉니다.
     fn observe_embedding_cost(&self, free_before: u64) {
         if self.is_cpu_mode { return; }
-        let after = self.get_free_vram_mb();
-        // free_before 는 '이 함수를 부른 쪽이 정리를 끝낸 직후' 값입니다.
-        // 로드 중 내부에서 퍼지가 일어났다면 after > free_before 가 되어
-        // 아래 조건이 거짓이 되므로 오염된 값이 기록되지 않습니다.
-        if free_before > after {
-            let cost = free_before - after;
-            if cost > 0 { EMBED_RESIDENT_MB.store(cost, XOrder::SeqCst); }
-        }
-        self.observe_peak(after);
+        self.costs().record_embedding_load(free_before, self.get_free_vram_mb());
     }
 
-    /// 🌟 [STRICT MEASURE] 생성 모델 비용은 '아무것도 상주하지 않은 상태' 에서만 기록합니다.
-    ///
-    ///  ── 왜 조건을 다는가 ──
-    ///   secure_vram_relay 는 퍼지 후 로드입니다. 퍼지 전 free 를 기준으로 재면
-    ///   '임베딩이 내려간 만큼' 이 생성 비용에서 상쇄되어 과소평가됩니다.
-    ///   예산이 과소평가되면 곧바로 OOM 방향의 오판이 되므로 허용할 수 없습니다.
-    ///   측정이 깨끗하지 않으면 기록하지 않고 디스크 추정치를 유지합니다.
-    ///   (디스크 추정치는 과대평가 방향이라 안전합니다)
+    /// 🌟 [STRICT MEASURE] 생성 모델 비용은 깨끗한 기준선에서만 기록합니다 (`CostBook::record_generation_load`).
     fn observe_generation_cost(&self, kind: usize, free_before: u64, clean: bool) -> bool {
         if self.is_cpu_mode { return false; }
-        let after = self.get_free_vram_mb();
-        let measured = clean && free_before > after;
-        if measured {
-            let cost = free_before - after;
-            if let Some(slot) = GEN_COST_BY_KIND.get(kind) {
-                slot.store(cost, XOrder::SeqCst);
-            }
-            GEN_RESIDENT_MB.store(cost, XOrder::SeqCst);
-        }
-        self.observe_peak(after);
-        measured
-    }
-
-    /// 지금까지 관측된 '가장 적게 남았던 순간' 을 피크로 환산해 기록합니다.
-    fn observe_peak(&self, free_now: u64) {
-        let e = EMBED_RESIDENT_MB.load(XOrder::SeqCst);
-        let g = GEN_RESIDENT_MB.load(XOrder::SeqCst);
-        let occupied = match CROSSOVER_PHASE.load(XOrder::SeqCst) {
-            PHASE_BOTH => e + g,
-            PHASE_EMBEDDING => e,
-            PHASE_GENERATION => g,
-            _ => 0,
-        };
-        let prev = PEAK_RESIDENT_MB.load(XOrder::SeqCst);
-        if occupied > prev { PEAK_RESIDENT_MB.store(occupied, XOrder::SeqCst); }
-        let _ = free_now;
+        self.costs()
+            .record_generation_load(kind, free_before, self.get_free_vram_mb(), clean)
+            .is_some()
     }
 
     // ── 크로스오버 진입점 ──────────────────────────────────────────
@@ -534,9 +433,7 @@ impl LogisModel {
             return Ok(());
         }
 
-        // 🌟 [FACT OVER LEDGER] 원장(CROSSOVER_PHASE)이 아니라 실제 슬롯을 봅니다.
-        //    ensure_qwen3 / ensure_qwen3_5 / release_siglip2 등 원장을 거치지 않는
-        //    경로가 여전히 존재하므로, 판정 근거는 항상 슬롯이어야 합니다.
+        // 🌟 [FACT OVER LEDGER] 판정 근거는 언제나 실제 슬롯입니다.
         if self.embedding_resident().await {
             self.sync_crossover_phase().await;
             return Ok(());
@@ -546,10 +443,10 @@ impl LogisModel {
             let free = self.get_free_vram_mb();
             let need = self.embedding_budget_mb();
             if free >= need {
-                COEXIST_COUNT.fetch_add(1, XOrder::SeqCst);
+                let coexists = self.costs().mark_coexist();
                 println!(
                     "[CROSSOVER] 🤝 [COEXIST] {} | 자유 {}MB >= 임베딩 예산 {}MB → 생성 모델을 유지한 채 임베딩을 얹습니다. (스왑 회피 누적 {}회)",
-                    reason, free, need, COEXIST_COUNT.load(XOrder::SeqCst)
+                    reason, free, need, coexists
                 );
                 let before = self.get_free_vram_mb();
                 self.check_embedding_downloaded().await?;
@@ -578,7 +475,7 @@ impl LogisModel {
             "[CROSSOVER] 🧬 [EMBEDDING PHASE] {} | 임베딩 상주 확정 (phase={} | 실측 {}MB | 자유 {}MB)",
             reason,
             phase,
-            EMBED_RESIDENT_MB.load(XOrder::SeqCst),
+            self.costs().embedding_mb(),
             self.get_free_vram_mb()
         );
         Ok(())
@@ -642,11 +539,11 @@ impl LogisModel {
         let before = self.get_free_vram_mb();
 
         if coexist_ok {
-            COEXIST_COUNT.fetch_add(1, XOrder::SeqCst);
+            let coexists = self.costs().mark_coexist();
             println!(
                 "[CROSSOVER] 🤝 [COEXIST] {} | 자유 {}MB >= 생성 예산 {}MB → 임베딩을 유지한 채 {:?} 를 올립니다. (스왑 회피 누적 {}회)",
                 reason, before, self.generation_budget_mb(size), size,
-                COEXIST_COUNT.load(XOrder::SeqCst)
+                coexists
             );
             match size {
                 ModelSize::Qwen => self.ensure_generator_ext(ModelSize::Qwen, false, false).await?,
@@ -716,15 +613,7 @@ impl LogisModel {
 
     /// 🌟 크로스오버 진단 요약. 태스크 종료 시 한 줄로 남깁니다.
     pub fn crossover_report(&self) -> String {
-        format!(
-            "[CROSSOVER REPORT] 스왑 {}회 | 동시상주 회피 {}회 | 임베딩 실측 {}MB | 생성 실측 {}MB | 관측 피크 {}MB | activation 여유 {}MB",
-            SWAP_COUNT.load(XOrder::SeqCst),
-            COEXIST_COUNT.load(XOrder::SeqCst),
-            EMBED_RESIDENT_MB.load(XOrder::SeqCst),
-            GEN_RESIDENT_MB.load(XOrder::SeqCst),
-            PEAK_RESIDENT_MB.load(XOrder::SeqCst),
-            ACTIVATION_HEADROOM_MB.load(XOrder::SeqCst),
-        )
+        self.costs().report()
     }
 
     /// 🌟 activation 여유를 관측합니다.
@@ -732,11 +621,6 @@ impl LogisModel {
     ///  누적 최대값으로 학습되어 다음 예산 판정이 정확해집니다.
     pub fn observe_activation_headroom(&self, free_before_batch: u64) {
         if self.is_cpu_mode { return; }
-        let now = self.get_free_vram_mb();
-        if free_before_batch > now {
-            let used = free_before_batch - now;
-            let prev = ACTIVATION_HEADROOM_MB.load(XOrder::SeqCst);
-            if used > prev { ACTIVATION_HEADROOM_MB.store(used, XOrder::SeqCst); }
-        }
+        self.costs().observe_activation(free_before_batch, self.get_free_vram_mb());
     }
 }

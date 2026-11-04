@@ -185,10 +185,8 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
         if let Some(m) = model_guard.as_ref() {
             println!("[UNLOAD] {}", m.crossover_report());
             m.deep_purge_resources().await;
-            // 🌟 [CROSSOVER] 모델 슬롯을 통째로 비우므로 원장도 IDLE 로 되돌립니다.
-            //    이 줄이 없으면 다음 LogisModel::new 이후에도
-            //    전역 페이즈가 GENERATION 으로 남아 첫 임베딩 로드가 오판됩니다.
-            m.mark_crossover_idle();
+            // 🌟 [CROSSOVER] 상주 상태는 인스턴스의 슬롯에서 읽으므로(model/residency.rs)
+            //    다음 LogisModel::new 에 이전 페이즈가 남지 않습니다. 따로 IDLE 을 선언하지 않습니다.
         }
         *model_guard = None;
     }
@@ -484,7 +482,6 @@ async fn reindex_pending_embeddings(
             let wants_cpu = device_preference.as_deref() == Some("cpu");
             if m.is_cpu_mode != wants_cpu {
                 m.deep_purge_resources().await;
-                m.mark_crossover_idle();
                 *model_guard = None;
             }
         }
@@ -695,7 +692,7 @@ async fn reindex_pending_embeddings(
     model.unload_embedding().await;
     // 🌟 [CROSSOVER] unload_embedding 이 내부에서 sync_crossover_phase 를 호출하므로
     //    여기서 IDLE 로 뭉뚱그릴 필요가 없어졌습니다.
-    //    생성 모델이 함께 상주 중이었다면 PHASE_GENERATION 이 정확한 상태이고,
+    //    생성 모델이 함께 상주 중이었다면 GENERATION 이 정확한 상태이고,
     //    IDLE 로 덮어쓰면 다음 enter_generation_phase 가 이미 올라와 있는 모델을
     //    '없다' 고 판단해 불필요한 relay 를 태웁니다.
     if yielded_to_task {
@@ -4420,7 +4417,6 @@ async fn ai_search_complex(
     //    순서가 뒤집히면 파기 도중에 다른 커맨드가 모델을 올려 컨텍스트가 충돌합니다.
     println!("[AI-SEARCH] {}", model.crossover_report());
     model.deep_purge_resources().await;
-    model.mark_crossover_idle();
     drop(model_guard);
 
     {

@@ -3062,8 +3062,7 @@ pub async fn process_task(
         None
     };
     model.deep_purge_resources().await;
-    model.mark_crossover_idle();
- 
+
     {
         let q3_clear_arc = model.qwen3_generator.clone();
         let _ = tokio::task::spawn_blocking(move || {
@@ -7919,7 +7918,6 @@ pub async fn process_task(
                             }
                         }
                         model.deep_purge_resources().await;
-                        model.mark_crossover_idle();
                         if detail_route.is_none() {
                             model
                                 .switch_to_generation(
@@ -9469,8 +9467,6 @@ pub async fn process_task(
                 code
             )),
             None => {
-                model.mark_crossover_idle();
-
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
                 crate::utils::resources::wait_for_resources_settled(1200, 800, Some(cancellation_token), model.device_config.gpu_id as u32).await?;

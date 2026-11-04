@@ -474,42 +474,37 @@ impl crate::model::LogisModel {
         if let Some(vector) = GRANITE_TEXT_CACHE.get(space, &text) {
             return Ok(vector.to_vec());
         }
-        // Ensure embedding model is loaded (and generator is unloaded)
-        self.ensure_embedding().await?;
+        // 🌟 [EMBED-LEASE] 슬롯을 쥔 채 계산 스레드로 넘깁니다. 계산이 끝날 때까지 아무도 임베딩을 내릴 수 없어
+        //    예전처럼 그 틈에 내려간 슬롯을 보고 0 벡터를 돌려주는 일이 없습니다.
+        let lease = self.lease_embedding().await?;
         // 🌟 [CROSSOVER] 이 호출이 실제로 쓴 순간 점유를 학습합니다.
         //    가중치가 아니라 activation 축이며, embedding_budget_mb() 에 더해져
         //    다음 예산 판정이 '연산 중 여유' 까지 포함하게 만듭니다.
         //    (NVML 은 이제 전역 핸들이라 질의 1회가 ~0.01ms 입니다)
         let free_before = self.get_free_vram_mb();
-        let embedding_model_arc = self.embedding_model.clone();
         let text_clone = text.clone();
 
         // (벡터, 이 공간의 값인지) — 배치 경로가 실패해 per-text 로 대신 구한 벡터는 다른 공간의 값입니다.
         let (vector, in_space) = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<f32>, bool)> {
-            let guard = embedding_model_arc.blocking_lock();
-            if let Some(model) = guard.as_ref() {
-                if model.batched_enabled() {
-                    // 🌟 [EMBED-BATCHED] 1건도 배치와 같은 경로(embed_many)를 거칩니다.
-                    //    그래서 단건으로 구한 벡터와 어떤 배치 안에서 구한 벡터가 비트 단위로 같고,
-                    //    캐시 공간도 배치 경로와 같습니다. 실패(OOM · Vulkan VRAM 사본 실패 등)하면
-                    //    get_embedding_batch 와 같이 per-text 로 계산하고 캐시에는 넣지 않습니다.
-                    match model.embed_many(std::slice::from_ref(&text_clone), &model.batch_opts()) {
-                        Ok(mut v) => Ok((v.pop().unwrap_or_else(|| vec![0.0; crate::models::embedding::EMBED_DIM]), true)),
-                        Err(e) => {
-                            println!(
-                                "[EMBED-BATCHED] ⚠️ 단건 배치 순전파 실패({}). per-text 경로로 계산하고 캐시에는 넣지 않습니다.",
-                                e
-                            );
-                            let v = model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
-                            Ok((v, false))
-                        }
+            let model = &*lease;
+            if model.batched_enabled() {
+                // 🌟 [EMBED-BATCHED] 1건도 배치와 같은 경로(embed_many)를 거칩니다.
+                //    그래서 단건으로 구한 벡터와 어떤 배치 안에서 구한 벡터가 비트 단위로 같고,
+                //    캐시 공간도 배치 경로와 같습니다. 실패(OOM · Vulkan VRAM 사본 실패 등)하면
+                //    get_embedding_batch 와 같이 per-text 로 계산하고 캐시에는 넣지 않습니다.
+                match model.embed_many(std::slice::from_ref(&text_clone), &model.batch_opts()) {
+                    Ok(mut v) => Ok((v.pop().unwrap_or_else(|| vec![0.0; crate::models::embedding::EMBED_DIM]), true)),
+                    Err(e) => {
+                        println!(
+                            "[EMBED-BATCHED] ⚠️ 단건 배치 순전파 실패({}). per-text 경로로 계산하고 캐시에는 넣지 않습니다.",
+                            e
+                        );
+                        let v = model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?;
+                        Ok((v, false))
                     }
-                } else {
-                    Ok((model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?, true))
                 }
             } else {
-                // Fallback to zeros if model failed to load
-                Ok((vec![0.0; crate::models::embedding::EMBED_DIM], true))
+                Ok((model.embed(&text_clone).map_err(|e| anyhow::anyhow!("Embedding error: {}", e))?, true))
             }
         }).await??;
         self.observe_activation_headroom(free_before);
@@ -639,7 +634,7 @@ impl crate::model::LogisModel {
             return Ok(out.into_iter().map(|v| v.unwrap_or_else(|| vec![0.0; EMBED_DIM])).collect());
         }
 
-        self.ensure_embedding().await?;
+        let lease = self.lease_embedding().await?;
         self.embed_ram_watch(miss_texts.len());
         const RAM_CHUNK: usize = 512;
         if hit_count > 0 || dup_folded > 0 {
@@ -650,7 +645,6 @@ impl crate::model::LogisModel {
         }
 
         let free_before = self.get_free_vram_mb();
-        let embedding_model_arc = self.embedding_model.clone();
         let miss_for_compute = miss_texts.clone();
         let miss_len = miss_texts.len();
 
@@ -664,24 +658,12 @@ impl crate::model::LogisModel {
 
         let computed = tokio::task::spawn_blocking(
             move || -> anyhow::Result<Computed> {
-                // 🌟 락을 '한 번만' 잡고 순회합니다.
-                //    이 스코프가 끝날 때까지 모델이 파기될 수 없으므로
+                // 🌟 [EMBED-LEASE] lease_embedding 이 잡은 슬롯을 그대로 쥐고 순회합니다.
+                //    적재 확인부터 마지막 청크까지 모델이 파기될 수 없으므로
                 //    중간에 0벡터로 대체되는 무증상 손상이 원천 차단됩니다.
                 let started = std::time::Instant::now();
-                let guard = embedding_model_arc.blocking_lock();
                 let n = miss_for_compute.len();
-                let model = match guard.as_ref() {
-                    Some(m) => m,
-                    None => {
-                        return Ok(Computed {
-                            vecs: vec![vec![0.0; EMBED_DIM]; n],
-                            cacheable: vec![false; n],
-                            threads: 0,
-                            batched: None,
-                            ms: 0.0,
-                        })
-                    }
-                };
+                let model = &*lease;
                 let mut acc: Vec<Vec<f32>> = Vec::with_capacity(n);
                 let mut cacheable: Vec<bool> = Vec::with_capacity(n);
                 if model.batched_enabled() {

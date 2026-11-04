@@ -51,6 +51,8 @@ mod app_model;
 mod app_embed;
 // 메모리 수명주기 · KV 계획 v2 (증분 가격 · 비례 여유 · 히스테리시스 · F16 원본 KV · 공유 장치 해제)
 mod mem_lifecycle;
+// 상주 상태 · 실측 장부 · 생성 전환 구간 · 슬롯 가드 (model/residency.rs, 장치 없음)
+mod residency;
 // P2b 실모델 대조: 융합 GDN(Qwen3.5) · Qwen3-0.6B Q8_0 상주 정확 W8A16 (LOGIS_TEST_MODELS=1, --ignored)
 mod p2b_models;
 // FlashAttention / TurboQuant 정확도 teacher-forcing (목업 Qwen3, FA on/off × TQ KV on/off, CPU + GPU)
