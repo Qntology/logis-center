@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub mod text_cache;
 pub mod cpu_par;
+pub mod calibration;
 mod batched;
 pub(crate) mod cpu_packed;
 pub use batched::{BatchOpts, BatchRunStats};
@@ -170,6 +171,8 @@ pub fn forward_mode() -> ForwardMode {
 //   동일 텍스트(1.0)는 1.0 그대로입니다. 표는 위 635만 쌍의 두 판본 코사인 분위수(확률 0 · 1e-5 · 1e-4 · 1e-3 ·
 //   0.005 · 0.01 · 0.02 · 0.05 · 0.1 … 0.9 · 0.95 · 0.98 · 0.99 · 0.995 · 0.999 · 0.9999 · 0.99999 · 1)를 짝지은
 //   것에 (−1, −1) · (1, 1) 을 더한 것입니다. 모델 가중치나 라벨 뱅크(bias.json)가 바뀌면 다시 맞춰야 합니다.
+//   다시 맞추는 절차는 embedding/calibration.rs, 실행은 tests/it/calibration.rs 의 refit_cls_to_legacy_cos 입니다.
+//   표를 바꾸면 CLS 공간의 SDS 기준선과 섞이지 않게 ForwardMode::space_tag 의 판본도 올립니다.
 // =====================================================================
 const CLS_TO_LEGACY_COS: [(f32, f32); 27] = [
     (-1.0000, -1.0000),
@@ -201,7 +204,13 @@ const CLS_TO_LEGACY_COS: [(f32, f32); 27] = [
     (1.0000, 1.0000),
 ];
 
-fn interp_knots(x: f32, knots: &[(f32, f32)]) -> f32 {
+/// 지금 쓰는 CLS → 예전 눈금 보정표 (다시 맞춘 표와 비교할 때 씁니다).
+pub fn cls_to_legacy_knots() -> &'static [(f32, f32)] {
+    &CLS_TO_LEGACY_COS
+}
+
+/// 보정표 사이를 직선으로 잇습니다. 표 밖은 양 끝 값, NaN · 무한대는 그대로 돌려줍니다.
+pub fn interp_knots(x: f32, knots: &[(f32, f32)]) -> f32 {
     if !x.is_finite() {
         return x;
     }

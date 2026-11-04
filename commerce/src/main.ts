@@ -30,6 +30,7 @@ import {
 import {
     syncAnalyticsData,
     syncAnalyticsInBackground,
+    runAnalyticLocalTick,
     resetAnalyticThrottle
 } from "./modes/analytic";
 import {
@@ -6033,12 +6034,15 @@ function startPolling() {
                 console.error("[POLLING] Error during poll:", e);
             }
         } else {
-            if (currentSession.hash) {
-                try {
+            try {
+                if (currentSession.hash) {
                     await syncAnalyticsInBackground();
-                } catch (e) {
-                    console.error("[POLLING] Analytics background sync error:", e);
+                } else {
+                    // 🌟 [LOCAL-ONLY] 세션이 없어도(오프라인 · 로그인 전) 로컬에 쌓인 행동 로그는 구조화합니다. 서버에는 접속하지 않습니다.
+                    await runAnalyticLocalTick();
                 }
+            } catch (e) {
+                console.error("[POLLING] Analytics background sync error:", e);
             }
         }
         const nextInterval = computeSyncInterval();
