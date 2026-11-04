@@ -4476,8 +4476,9 @@ async fn deep_research_command(
     let model = model_guard.as_ref().unwrap().clone();
     drop(model_guard);
 
-    // 1. Context Gathering
-    let mut context_data = String::new();
+    // 1. Context Gathering: 검색 상위 문서 + 저장된 문서 전체 집계 (model/research.rs 의 Map 단계)
+    let mut top_documents = String::new();
+    let mut digest = crate::model::research::ResearchDigest::default();
     let mut store_guard = state.store.lock().await;
     
     if store_guard.is_none() {
@@ -4499,12 +4500,22 @@ async fn deep_research_command(
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
                 .collect();
-            context_data = docs.join("\n");
+            top_documents = docs.join("\n");
+        }
+        // 🌟 [RESEARCH MAP] 숫자는 Rust 가 전체 문서에서 셉니다. 생성 모델은 이 집계표를 해석만 합니다.
+        match store.get_all_items("items", 20_000, 0, None).await {
+            Ok(docs) => {
+                let rows: Vec<crate::model::research::ResearchRow> = docs.iter().map(Into::into).collect();
+                digest = crate::model::research::ResearchDigest::from_rows(&rows);
+            }
+            Err(e) => println!("[DEEP-RESEARCH] ⚠️ 전체 집계용 조회 실패. 검색 상위 문서만으로 씁니다: {}", e),
         }
     }
-    
-    // 2. Run Deep Research
-    model.run_deep_research(query, context_data, &app_handle, Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
+    // 생성하는 동안 store 를 쥐고 있지 않습니다 (예전에는 보고서 생성 내내 다른 명령의 store 접근이 막혔습니다).
+    drop(store_guard);
+
+    // 2. Run Deep Research (Reduce: 생성 한 번)
+    model.run_deep_research(query, &digest, top_documents, &app_handle, Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
