@@ -10,6 +10,7 @@ import {
   extractAnalyticText,
   finalizeAnalyticBubbles,
   resetAnalyticThrottle,
+  runAnalyticLocalTick,
   runAnalyticStructuring,
   syncAnalyticsData,
   syncAnalyticsInBackground,
@@ -224,5 +225,36 @@ describe("syncAnalyticsData", () => {
     resetAnalyticThrottle();
     await syncAnalyticsInBackground();
     expect(env.runtime.stopSpinner).toHaveBeenCalledTimes(2);
+  });
+
+  it("still structures local raw events when no site is registered", async () => {
+    serve({ structure_pending_analytics: () => ({ processed: 1 }) });
+    await syncAnalyticsData();
+    expect(callsOf(invokeMock, "proxy_fetch")).toHaveLength(0);
+    expect(callsOf(invokeMock, "structure_pending_analytics")).toHaveLength(1);
+    expect(env.runtime.runLocalEmbeddingSync).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("runAnalyticLocalTick (no session)", () => {
+  it("structures local raw events without a session and never contacts the server", async () => {
+    setup({ session: { hash: "" } });
+    serve({ structure_pending_analytics: () => ({ processed: 3 }) });
+    expect(await runAnalyticLocalTick()).toBe(3);
+    expect(callsOf(invokeMock, "proxy_fetch")).toHaveLength(0);
+    expect(callsOf(invokeMock, "structure_pending_analytics")).toHaveLength(1);
+    expect(env.runtime.runLocalEmbeddingSync).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares the 30 s throttle with the server sync and schedules no embedding when nothing was structured", async () => {
+    setup({ session: { hash: "" } });
+    serve({ structure_pending_analytics: () => ({ processed: 0, skipped: "no_pending" }) });
+    await runAnalyticLocalTick();
+    await runAnalyticLocalTick();
+    expect(callsOf(invokeMock, "structure_pending_analytics")).toHaveLength(1);
+    expect(env.runtime.runLocalEmbeddingSync).not.toHaveBeenCalled();
+    vi.setSystemTime(NOW + 10 * 60_000);
+    await runAnalyticLocalTick();
+    expect(callsOf(invokeMock, "structure_pending_analytics")).toHaveLength(2);
   });
 });

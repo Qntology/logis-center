@@ -4,11 +4,12 @@
 //
 //  ── 이 트랙만의 특수 사정 ──
 //   commerce D1 의 items 테이블에는 mode / flag 물리 컬럼이 없습니다.
-//   그래서 수신 직후 클라이언트가
+//   그래서 수신 직후 클라이언트가 normalizeCommerceRows() 한 곳에서
 //     ① MODE TAGGING  : modeOfType() 으로 mode 를 확정하고
-//     ② FLAG RECOVERY : 세션 flag(GeoIP 국가코드)로 flag 를 보강하고
-//     ③ ROOT ABSORB   : 루트 물리 컬럼을 data 로 내려 인덱스를 살립니다.
-//   trading D1 은 두 컬럼을 물리 컬럼으로 갖고 있어 이 보강이 전혀 필요 없습니다.
+//     ② DRAFT PRESERVE: updated_at 이 없으면 0 으로 draft 를 지키고
+//     ③ FLAG RECOVERY : 세션 flag(GeoIP 국가코드)로 flag 를 보강하고
+//     ④ ROOT ABSORB   : 루트 물리 컬럼을 data 로 내려 인덱스를 살립니다.
+//   trading D1 은 두 컬럼을 물리 컬럼으로 갖고 있어 이 보강이 필요 없고(trading.ts 는 BLOB 해제 · 봉투 우선만 합니다),
 //   보강 규칙이 근본적으로 다르기 때문에 파일을 분리합니다.
 // ============================================================
 import { invoke } from "@tauri-apps/api/core";
@@ -20,6 +21,98 @@ import { rt, getRootDomain, ENVELOPE_ROOT_KEYS, updateSyncBackoff } from "./runt
 export const COMMERCE_API_HOST = "https://commerce.logis.center";
 
 let isCommerceSyncRunning = false;
+
+// =====================================================================
+// 🌟 [COMMERCE ADAPTER] commerce D1 봉투 → 로컬 봉투
+//  전경(syncCommerceData) · 백그라운드(syncCommerceInBackground) 동기화가 같은 두 함수를 씁니다.
+//  예전에는 두 경로에 규칙이 따로 복사되어 있었고 서로 달랐습니다.
+//   · 전경에는 base64 분기가 없어 문자열 data 가 페이지 판정의 JSON.parse 에서 던졌고,
+//     LanceDB 에는 써졌는데 Dexie 쓰기는 통째로 건너뛰었습니다 (BUG-COM-1).
+//   · 백그라운드에는 DRAFT PRESERVE 가 없어 updated_at 없는 행이 Rust 에서 현재 시각을 받아 draft 가 count 가 되었습니다.
+//  서버 봉투를 trading 과 통일하려면 commerce Worker(이 저장소 밖)를 고쳐야 하므로, 그 차이는 여기서 흡수합니다.
+// =====================================================================
+
+function bytesOf(arrData: any): Uint8Array | null {
+    if (Array.isArray(arrData)) return new Uint8Array(arrData);
+    if (arrData && arrData.buffer) return new Uint8Array(arrData.buffer);
+    const keys = arrData ? Object.keys(arrData) : [];
+    if (keys.length > 0 && !isNaN(Number(keys[0]))) return new Uint8Array(Object.values(arrData) as number[]);
+    return null;
+}
+
+/** 서버 행의 data 를 객체로 풉니다: gzip 바이트 배열 · base64(gzip) · base64(JSON). 풀 수 없으면 그대로 둡니다. */
+export function decodeCommerceRows(rows: any[]): void {
+    const pako = (window as any).pako;
+    const decodeText = (bytes: Uint8Array) => new TextDecoder('utf-8').decode(bytes);
+    for (const item of rows) {
+        if (!item) continue;
+        if (item.data && typeof item.data === 'object' && !item.data.text && !item.data.title) {
+            const arr = bytesOf(item.data.data || item.data);
+            if (!arr) continue;
+            try {
+                item.data = JSON.parse(pako ? pako.ungzip(arr, { to: 'string' }) : decodeText(arr));
+            } catch (e) {
+                try {
+                    item.data = JSON.parse(decodeText(arr));
+                } catch (err) {}
+            }
+        } else if (typeof item.data === 'string' && item.data.length > 50) {
+            // 🌟 [BASE64 GZIP PATH] syncAnalyticsData 와 동일한 처리.
+            try {
+                const rawBytes = Uint8Array.from(atob(item.data), c => c.charCodeAt(0));
+                const gzip = rawBytes[0] === 0x1f && rawBytes[1] === 0x8b;
+                item.data = JSON.parse(gzip && pako ? pako.ungzip(rawBytes, { to: 'string' }) : decodeText(rawBytes));
+            } catch (_strErr) {
+                // JSON 도 base64 도 아니면 원본 문자열을 그대로 둡니다.
+            }
+        }
+    }
+}
+
+/**
+ * commerce D1 행을 로컬 봉투 계약에 맞춥니다. commerce D1 의 items 에는 mode / flag 물리 컬럼이 없습니다.
+ *  ① MODE TAGGING   : modes/types.ts 의 modeOfType() 단일 판정
+ *  ② DRAFT PRESERVE : updated_at 이 루트에도 data 에도 없으면 0 을 명시 (Rust upsert_item 이 현재 시각을 부여하면 draft → count)
+ *  ③ FLAG RECOVERY  : data 안의 flag(users/team 문서)를 먼저 믿고, 없으면 세션 flag(Client Worker 의 GeoIP 국가 코드)
+ *  ④ ROOT ABSORB    : 루트에만 있는 물리 컬럼을 data 로 내립니다. Rust upsert_items 는 data → 루트 방향만 처리하고,
+ *                     normalizeEnvelope 의 ROOT ABSORB 와 같은 키 집합(ENVELOPE_ROOT_KEYS)이어야 두 저장소가 일치합니다.
+ * 반환값: 세션 flag 로 보강한 행 수.
+ */
+export function normalizeCommerceRows(rows: any[], sessionFlag: string): number {
+    let flagFilled = 0;
+    for (const r of rows) {
+        if (!r) continue;
+        if (!r.mode) r.mode = modeOfType(String(r.type || ""));
+
+        const data = (r.data && typeof r.data === 'object') ? r.data : null;
+        const innerUpdated = data ? data.updated_at : undefined;
+        if ((r.updated_at === undefined || r.updated_at === null) && (innerUpdated === undefined || innerUpdated === null)) {
+            r.updated_at = 0;
+        }
+
+        if (sessionFlag && !r.flag) {
+            if (data && data.flag) {
+                r.flag = data.flag;
+            } else {
+                r.flag = sessionFlag;
+                flagFilled++;
+            }
+        }
+
+        if (!data) continue;
+        for (const k in r) {
+            if (!Object.prototype.hasOwnProperty.call(r, k)) continue;
+            if (ENVELOPE_ROOT_KEYS.has(k)) continue;
+            const v = r[k];
+            if (v === undefined || v === null) continue;
+            if (typeof v === 'function') continue;
+            if (data[k] === undefined || data[k] === null || data[k] === "") {
+                data[k] = v;
+            }
+        }
+    }
+    return flagFilled;
+}
 
 export async function syncCommerceInBackground() {
     const R = rt();
@@ -63,54 +156,7 @@ export async function syncCommerceInBackground() {
             session_params: { hash: S.hash, token: S.token, cc: ctx.cc || "" }
         });
         if (response.results && Array.isArray(response.results)) {
-            try {
-                const pako = (window as any).pako;
-                for (let i = 0; i < response.results.length; i++) {
-                    let item = response.results[i];
-                    if (item.data && typeof item.data === 'object' && !item.data.text && !item.data.title) {
-                        let arrData = item.data.data || item.data;
-                        let arr: Uint8Array | null = null;
-                        if (Array.isArray(arrData)) {
-                            arr = new Uint8Array(arrData);
-                        } else if (arrData.buffer) {
-                            arr = new Uint8Array(arrData.buffer);
-                        } else if (Object.keys(arrData).length > 0 && !isNaN(Number(Object.keys(arrData)[0]))) {
-                            arr = new Uint8Array(Object.values(arrData) as number[]);
-                        }
-                        if (arr) {
-                            try {
-                                if (pako) {
-                                    const decompressed = pako.ungzip(arr, { to: 'string' });
-                                    item.data = JSON.parse(decompressed);
-                                } else {
-                                    const decompressed = new TextDecoder('utf-8').decode(arr);
-                                    item.data = JSON.parse(decompressed);
-                                }
-                            } catch (e) {
-                                try {
-                                    const decompressed = new TextDecoder('utf-8').decode(arr);
-                                    item.data = JSON.parse(decompressed);
-                                } catch (err) {}
-                            }
-                        }
-                    } else if (typeof item.data === 'string' && item.data.length > 50) {
-                        // 🌟 [BASE64 GZIP PATH] syncAnalyticsData 와 동일한 처리.
-                        //    data 가 base64(gzip) 문자열로 내려오는 경우를 커버합니다.
-                        try {
-                            const rawBytes = Uint8Array.from(atob(item.data), c => c.charCodeAt(0));
-                            if (rawBytes[0] === 0x1f && rawBytes[1] === 0x8b) {
-                                item.data = JSON.parse(pako ? pako.ungzip(rawBytes, { to: 'string' }) : new TextDecoder('utf-8').decode(rawBytes));
-                            } else {
-                                item.data = JSON.parse(new TextDecoder('utf-8').decode(rawBytes));
-                            }
-                        } catch (_strErr) {
-                            // JSON 도 base64 도 아니면 원본 문자열을 그대로 둡니다.
-                        }
-                    }
-                }
-            } catch (err) {
-                console.warn("[SYNC-BG] pako decompression failed:", err);
-            }
+            decodeCommerceRows(response.results);
             // 🌟 [TOMBSTONE GUARD] analytic 탭에서도 commerce D1 을 백그라운드로 긁으므로
             //    syncCommerceData 와 동일한 부활 경로가 열려 있습니다. 같은 게이트를 적용합니다.
             const bgTombstones = await R.loadTalkTombstones();
@@ -140,35 +186,7 @@ export async function syncCommerceInBackground() {
                 console.log(`[ITEM-TOMBSTONE] 🪦 [BG] 삭제된 문서 ${bgItemTombBlocked}건의 백그라운드 재삽입을 차단했습니다.`);
             }
             if (filteredResults.length > 0) {
-                for (const r of filteredResults) {
-                    if (!r) continue;
-                    if (r.mode) continue;
-                    r.mode = modeOfType(String(r.type || ""));
-                }
-                const sessionFlag = String((S as any).flag || "");
-                if (sessionFlag) {
-                    for (const r of filteredResults) {
-                        if (!r) continue;
-                        if (r.flag) continue;
-                        const inner = (r.data && typeof r.data === 'object') ? r.data.flag : undefined;
-                        if (inner) { r.flag = inner; continue; }
-                        r.flag = sessionFlag;
-                    }
-                }
-                for (const r of filteredResults) {
-                    if (!r) continue;
-                    if (!r.data || typeof r.data !== 'object') continue;
-                    for (const k in r) {
-                        if (!Object.prototype.hasOwnProperty.call(r, k)) continue;
-                        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
-                        const v = r[k];
-                        if (v === undefined || v === null) continue;
-                        if (typeof v === 'function') continue;
-                        if (r.data[k] === undefined || r.data[k] === null || r.data[k] === "") {
-                            r.data[k] = v;
-                        }
-                    }
-                }
+                normalizeCommerceRows(filteredResults, String((S as any).flag || ""));
                 // 🌟 [BACKOFF RESET] 백그라운드 commerce 동기화에서 변경이 있었으므로 리셋합니다.
                 updateSyncBackoff(true);
                 console.log(`[SYNC-BG] Commerce D1 background sync: ${filteredResults.length} item(s)`);
@@ -273,43 +291,8 @@ export async function syncCommerceData() {
         R.stepQrSpinner();
         console.log('response',response);
         if (response.results && Array.isArray(response.results)) {
-            // 🌟 [추가] 서버에서 압축된 gzip 데이터를 그대로 보낼 경우, chrome.js와 동일하게 pako로 압축 해제
-            try {
-                const pako = (window as any).pako;
-                for (let i = 0; i < response.results.length; i++) {
-                    let item = response.results[i];
-                    if (item.data && typeof item.data === 'object' && !item.data.text && !item.data.title) {
-                        let arrData = item.data.data || item.data;
-                        let arr: Uint8Array | null = null;
-
-                        if (Array.isArray(arrData)) {
-                            arr = new Uint8Array(arrData);
-                        } else if (arrData.buffer) {
-                            arr = new Uint8Array(arrData.buffer);
-                        } else if (Object.keys(arrData).length > 0 && !isNaN(Number(Object.keys(arrData)[0]))) {
-                            arr = new Uint8Array(Object.values(arrData) as number[]);
-                        }
-                        if (arr) {
-                            try {
-                                if (pako) {
-                                    const decompressed = pako.ungzip(arr, { to: 'string' });
-                                    item.data = JSON.parse(decompressed);
-                                } else {
-                                    const decompressed = new TextDecoder('utf-8').decode(arr);
-                                    item.data = JSON.parse(decompressed);
-                                }
-                            } catch (e) {
-                                try {
-                                    const decompressed = new TextDecoder('utf-8').decode(arr);
-                                    item.data = JSON.parse(decompressed);
-                                } catch (err) {}
-                            }
-                        }
-                    }
-                }
-            } catch (err) {
-                console.warn("[SYNC] pako decompression failed:", err);
-            }
+            // 🌟 서버가 gzip 바이트 · base64 문자열로 보낸 data 를 풉니다 (백그라운드 동기화와 같은 함수).
+            decodeCommerceRows(response.results);
             // 🌟 [버그 수정] DOM에 렌더링된 요소뿐만 아니라, Dexie DB에 있는 백그라운드 통계(team) 객체의 최신 시간도 대조해야 합니다.
             const localUsers = await Select["users"]({});
             const localPages = await Select["pages"]({});
@@ -362,70 +345,13 @@ export async function syncCommerceData() {
             }
             if (filteredResults.length > 0) {
                 updateSyncBackoff(true);
-                // 🌟 [MODE TAGGING v2] 클라우드 D1 에는 mode 컬럼이 없습니다.
-                //    mode 는 '동기화 시점에 클라이언트가 확정하는 값' 이며,
-                //    판정은 modes/types.ts 의 modeOfType() 단일 함수가 전담합니다.
-                //
-                //    ── v1 의 결함 ──
-                //     TRADING_TYPES 에 소문자 'tracking' 이 들어 있어
-                //     proxy 의 Relay("tracking","order") 가 만든 commerce 배송추적 문서가
-                //     전부 mode='shipping' 으로 오염되었고,
-                //     loadMoreDocs 의 mode 필터에서 commerce 목록이 통째로 비었습니다.
-                for (const r of filteredResults) {
-                    if (!r) continue;
-                    if (r.mode) continue;
-                    r.mode = modeOfType(String(r.type || ""));
-                }
-                // 🌟 [DRAFT PRESERVE] 서버 행에 updated_at 이 없으면
-                //    Rust upsert_item 이 현재 시각을 부여해 draft → count 가 됩니다.
-                //    data 내부에도 없으면 여기서 0 을 명시해 draft 계약을 보존합니다.
-                for (const r of filteredResults) {
-                    if (!r) continue;
-                    const hasRoot = r.updated_at !== undefined && r.updated_at !== null;
-                    const inner = (r.data && typeof r.data === 'object') ? r.data.updated_at : undefined;
-                    const hasInner = inner !== undefined && inner !== null;
-                    if (!hasRoot && !hasInner) {
-                        r.updated_at = 0;
-                    }
-                }
-                // 🌟 [FLAG RECOVERY] commerce D1 의 items 테이블에는 flag 컬럼이 없습니다.
-                //    (analytics D1 · LanceDB · Dexie 에는 모두 존재)
-                //    그대로 두면 commerce 트랙 전 문서의 flag 가 영구 공백이 되어
-                //    지역 스코프 조회가 성립하지 않습니다.
-                //    세션 flag(= Client Worker 가 GeoIP 로 확정한 국가 코드)로 보강합니다.
+                // 🌟 [COMMERCE ADAPTER] mode / flag 컬럼이 없는 commerce D1 봉투를 로컬 봉투로 맞춥니다.
+                //    (v1 의 결함: TRADING_TYPES 의 소문자 'tracking' 이 commerce 배송추적 문서를 전부
+                //     mode='shipping' 으로 오염시켜 commerce 목록이 통째로 비었습니다. 판정은 modeOfType() 하나입니다)
                 const sessionFlag = String((S as any).flag || "");
-                if (sessionFlag) {
-                    let flagFilled = 0;
-                    for (const r of filteredResults) {
-                        if (!r) continue;
-                        if (r.flag) continue;
-                        // data 안에 이미 flag 가 있으면(users/team 문서) 그쪽을 신뢰합니다.
-                        const inner = (r.data && typeof r.data === 'object') ? r.data.flag : undefined;
-                        if (inner) { r.flag = inner; continue; }
-                        r.flag = sessionFlag;
-                        flagFilled++;
-                    }
-                    if (flagFilled > 0) {
-                        console.log(`[SYNC] flag 컬럼 부재 문서 ${flagFilled}건을 세션 flag('${sessionFlag}')로 보강했습니다.`);
-                    }
-                }
-                // 🌟 [ROOT ABSORB / RUST] Rust 의 upsert_items 는 item.data 객체의 알맹이를
-                //    루트로 끌어올리는 방향만 처리합니다. 반대로 '루트에만 있는 물리 컬럼' 은
-                //    data 로 내려 주지 않으므로, 여기서 미리 합쳐 보냅니다.
-                //    (normalizeEnvelope 의 ROOT ABSORB 와 동일 규칙이어야 두 저장소가 일치합니다)
-                for (const r of filteredResults) {
-                    if (!r) continue;
-                    if (!r.data || typeof r.data !== 'object') continue;
-                    for (const k in r) {
-                        if (!Object.prototype.hasOwnProperty.call(r, k)) continue;
-                        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
-                        const v = r[k];
-                        if (v === undefined || v === null) continue;
-                        if (typeof v === 'function') continue;
-                        if (r.data[k] === undefined || r.data[k] === null || r.data[k] === "") {
-                            r.data[k] = v;
-                        }
-                    }
+                const flagFilled = normalizeCommerceRows(filteredResults, sessionFlag);
+                if (flagFilled > 0) {
+                    console.log(`[SYNC] flag 컬럼 부재 문서 ${flagFilled}건을 세션 flag('${sessionFlag}')로 보강했습니다.`);
                 }
                 console.log(`[SYNC] 2. 로컬 LanceDB 최신화 중... (${filteredResults.length} / ${response.results.length} 건 변경됨)`);
                 await invoke("upsert_items", { items: filteredResults });

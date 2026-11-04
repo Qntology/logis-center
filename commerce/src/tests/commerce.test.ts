@@ -4,7 +4,13 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
 import { bindModeRuntime, getSyncIntervalMs, resetSyncBackoff } from "../modes/runtime";
-import { COMMERCE_API_HOST, syncCommerceData, syncCommerceInBackground } from "../modes/commerce";
+import {
+  COMMERCE_API_HOST,
+  decodeCommerceRows,
+  normalizeCommerceRows,
+  syncCommerceData,
+  syncCommerceInBackground,
+} from "../modes/commerce";
 import { makeDb, type FakeDb, type Row } from "./helpers/fakedb";
 import { callsOf, makeRuntime, type FakeRuntimeOptions } from "./helpers/runtime";
 
@@ -198,10 +204,48 @@ describe("syncCommerceData: storing server rows", () => {
     expect(db.ids("users")).not.toContain("pending_invite_1");
   });
 
-  it.fails("BUG-COM-1 commerce.ts:281-308,445 foreground sync has no base64 branch: JSON.parse throws after upsert_items, so Dexie is never updated", async () => {
-    respond({ results: [{ id: "g1", type: "goods", created_at: 5, data: base64Json({ title: "x".repeat(60) }) }] });
+  it("decodes base64 JSON string data like the background sync, so Dexie is updated (was BUG-COM-1)", async () => {
+    const payload = { title: "x".repeat(60) };
+    respond({ results: [{ id: "g1", type: "goods", created_at: 5, data: base64Json(payload) }] });
     await syncCommerceData();
+    expect(upserted()[0].data).toEqual(payload);
     expect(db.ids("items")).toContain("g1");
+  });
+});
+
+describe("commerce adapter", () => {
+  it("normalizeCommerceRows tags mode, preserves drafts, recovers flag and absorbs root columns in one pass", () => {
+    const rows: any[] = [
+      { id: "b1", type: "BL", data: { title: "t" }, vessel: "V" },
+      { id: "t1", type: "tracking", mode: "commerce", updated_at: 7, data: { title: "t", flag: "US" } },
+      { id: "u1", type: "goods", data: { title: "t", updated_at: 3 } },
+      null,
+    ];
+    expect(normalizeCommerceRows(rows, "KR")).toBe(2);
+    expect(rows[0]).toMatchObject({ mode: "shipping", flag: "KR", updated_at: 0, data: { title: "t", vessel: "V" } });
+    expect(rows[1]).toMatchObject({ mode: "commerce", flag: "US", updated_at: 7 });
+    expect(rows[2].updated_at).toBeUndefined(); // data.updated_at is kept as the draft marker
+    expect(rows[2].flag).toBe("KR");
+    expect(rows[0].data).not.toHaveProperty("updated_at"); // envelope keys never go down into data
+  });
+
+  it("normalizeCommerceRows leaves flag empty without a session flag", () => {
+    const rows: any[] = [{ id: "g1", type: "goods", data: { title: "t" } }];
+    expect(normalizeCommerceRows(rows, "")).toBe(0);
+    expect(rows[0].flag).toBeUndefined();
+  });
+
+  it("decodeCommerceRows unpacks byte arrays and base64, and leaves plain objects and short strings alone", () => {
+    const payload = { title: "x".repeat(60) };
+    const bytes = Array.from(new TextEncoder().encode(JSON.stringify(payload)));
+    const rows: any[] = [
+      { id: "a", data: { data: bytes } },
+      { id: "b", data: base64Json(payload) },
+      { id: "c", data: { node: 1 } },
+      { id: "d", data: "short" },
+    ];
+    decodeCommerceRows(rows);
+    expect(rows.map((r) => r.data)).toEqual([payload, payload, { node: 1 }, "short"]);
   });
 });
 
@@ -213,6 +257,12 @@ describe("syncCommerceInBackground", () => {
     expect(upserted()[0].data).toEqual(payload);
     expect(db.rows("items")[0]).toMatchObject({ id: "g1", mode: "commerce", data: payload });
     expect(env.runtime.loadMoreDocs).toHaveBeenCalledWith(false, true);
+  });
+
+  it("preserves drafts like the foreground sync", async () => {
+    respond({ results: [{ id: "g1", type: "goods", created_at: 5, data: { title: "draft" } }] });
+    await syncCommerceInBackground();
+    expect(upserted()[0]).toMatchObject({ id: "g1", updated_at: 0, flag: "KR" });
   });
 
   it("requires hash + email", async () => {

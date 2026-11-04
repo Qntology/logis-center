@@ -8,6 +8,7 @@
 //   ② runAnalyticStructuring : 원시 이벤트를 Qwen 이 시맨틱 문장으로 구조화합니다.
 //   ③ finalizeAnalyticBubbles : 구조화 진행 말풍선을 Done 으로 마감합니다.
 //   ④ runLocalEmbeddingSync : 구조화된 문장을 로컬에서 임베딩합니다. (main.ts 소유)
+//   ①만 서버가 필요합니다. 세션이 없으면 폴링이 runAnalyticLocalTick 으로 ②~④만 돌립니다.
 //
 //  ── DELTA GUARD 계약 ──
 //   updated_at == 0  → 아직 구조화되지 않은 원시 이벤트
@@ -319,6 +320,21 @@ async function fetchAnalyticsOrigin(origin: string, cursor: number): Promise<num
     return items.length;
 }
 
+/**
+ * 로컬에 남은 원시 이벤트(updated_at == 0)를 구조화하고 임베딩을 예약합니다. 서버에는 접속하지 않습니다.
+ * `received` 는 이번에 서버에서 새 행을 받았는지입니다 (받았으면 구조화 결과와 무관하게 임베딩을 예약).
+ */
+async function structurePendingAnalytics(received: boolean): Promise<number> {
+    const structured = await runAnalyticStructuring();
+    if (structured > 0) {
+        await finalizeAnalyticBubbles(structured);
+    }
+    if (received || structured > 0) {
+        rt().runLocalEmbeddingSync();
+    }
+    return structured;
+}
+
 export async function syncAnalyticsData() {
     const R = rt();
     const S = R.getSession();
@@ -327,6 +343,7 @@ export async function syncAnalyticsData() {
     isAnalyticsSyncRunning = true;
     try {
         const origins = await resolveAnalyticsOrigins();
+        let totalStored = 0;
         if (origins.length === 0) {
             console.warn(
                 "[SYNC-ANALYTIC] 조회할 추적 대상 사이트가 없습니다. " +
@@ -334,35 +351,23 @@ export async function syncAnalyticsData() {
                 "브라우저로 추적 대상 사이트를 열어 두세요. " +
                 "(Worker 는 cc 파라미터가 아니라 href 의 host 로 조회 대상을 결정합니다)"
             );
-            return;
-        }
-        const now = Date.now();
-        const cursor = Math.max(now, now - R.timezoneOffset) + 60_000;
-        console.log(`[SYNC-ANALYTIC] 대상 사이트 ${origins.length}곳 조회 시작: ${JSON.stringify(origins)} | cursor=${cursor}`);
-        let totalStored = 0;
-        for (const origin of origins) {
-            totalStored += await fetchAnalyticsOrigin(origin, cursor);
-        }
-        if (totalStored > 0) {
-            if (R.getSearchMode() === "analytic") {
+        } else {
+            const now = Date.now();
+            const cursor = Math.max(now, now - R.timezoneOffset) + 60_000;
+            console.log(`[SYNC-ANALYTIC] 대상 사이트 ${origins.length}곳 조회 시작: ${JSON.stringify(origins)} | cursor=${cursor}`);
+            for (const origin of origins) {
+                totalStored += await fetchAnalyticsOrigin(origin, cursor);
+            }
+            if (totalStored > 0 && R.getSearchMode() === "analytic") {
                 await R.renderNavigation();
                 if (R.getCurrentTab() === "list") {
                     await R.loadMoreDocs(false, true);
                 }
             }
-            const structuredCount = await runAnalyticStructuring();
-            if (structuredCount > 0) {
-                await finalizeAnalyticBubbles(structuredCount);
-            }
-
-            R.runLocalEmbeddingSync();
-        } else {
-            const structured = await runAnalyticStructuring();
-            if (structured > 0) {
-                await finalizeAnalyticBubbles(structured);
-                R.runLocalEmbeddingSync();
-            }
         }
+        // 🌟 [LOCAL STRUCTURING] 조회할 사이트가 없거나 새로 받은 행이 없어도 로컬에 남은 원시 이벤트는 구조화합니다.
+        //    (예전에는 사이트가 0곳이면 여기까지 오지 않았습니다)
+        await structurePendingAnalytics(totalStored > 0);
         console.log(`[SYNC-ANALYTIC] 완료. 총 저장 ${totalStored}건.`);
     } catch (e) {
         console.warn("[SYNC-ANALYTIC] Failed:", e);
@@ -374,6 +379,25 @@ export async function syncAnalyticsData() {
         R.stopSpinner();
         // 🌟 [SYNC DONE → SUBMIT RESTORE] 구 btnSubmit 복사본을 단일 함수로 대체합니다.
         R.restoreSubmitButton();
+    }
+}
+
+/**
+ * 🌟 [LOCAL-ONLY] 세션이 없을 때(오프라인 · 로그인 전 · 로그아웃) 폴링이 부르는 로컬 단계입니다.
+ *  원시 이벤트 구조화는 로컬 Qwen 과 LanceDB 만 쓰는데, 예전에는 서버 동기화(syncAnalyticsData) 안에서만 불려
+ *  세션이 없으면 로컬에 쌓인 이벤트가 구조화되지 않았습니다. 서버 동기화와 같은 스로틀(30초 이상)을 씁니다.
+ *  대상이 없으면 Rust 가 LanceDB 조회 한 번으로 끝내고 모델을 올리지 않습니다.
+ */
+export async function runAnalyticLocalTick(): Promise<number> {
+    if (isAnalyticsSyncRunning) return 0;
+    const throttleMs = Math.max(30_000, getSyncIntervalMs());
+    if (Date.now() - lastAnalyticsSyncAt < throttleMs) return 0;
+    isAnalyticsSyncRunning = true;
+    try {
+        return await structurePendingAnalytics(false);
+    } finally {
+        isAnalyticsSyncRunning = false;
+        lastAnalyticsSyncAt = Date.now();
     }
 }
 
