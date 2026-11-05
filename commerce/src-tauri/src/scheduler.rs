@@ -135,6 +135,54 @@ async fn run_synthesis_pass(
     let pass_reason = format!("{} pass", step.replace('_', " "));
     let verdict = model.lang_route("commerce", step, doc_lang, probe_text).await;
     emit_term(&format!("  {}", verdict.line));
+    let sds_gate = |is_lang: bool| -> Option<(f32, u64)> {
+        crate::utils::score_dynamics::adaptive_recent(crate::model::lang_llm::synthesis_drop_axis(is_lang))
+            .filter(|(recent, _, _)| *recent >= skip_drop)
+            .map(|(recent, _, n)| (recent, n))
+    };
+    // 🌟 [SYNTHESIS PRE-LOAD GATE] 게이트는 엔진을 올리기 전에 봅니다 (`lang_llm::SynthesisEntry`).
+    let routed_lang = verdict.code.is_some();
+    if let Some((recent, n)) = sds_gate(routed_lang) {
+        use crate::model::lang_llm::{synthesis_entry, SynthesisEntry};
+        let engine = verdict
+            .code
+            .as_deref()
+            .map(|c| format!("Qwen3.5-4B-{}", c))
+            .unwrap_or_else(|| "Qwen3".to_string());
+        let resident = model.generation_engine_resident(verdict.code.as_deref()).await;
+        let probe_axis = format!("{}|{}", crate::model::lang_llm::synthesis_drop_axis(routed_lang), step);
+        let (entry, left) = synthesis_entry(resident, verdict.probe, &probe_axis);
+        if entry == SynthesisEntry::Skip {
+            emit_term(&format!(
+                "  ⏭️ [SYNTHESIS PASS / SDS PRE-LOAD] {} 의 최근 요약 문장 {:.0}% 가 원문 대조에서 폐기되었습니다 (관측 {}건, 기준 {:.0}%). {} 는 지금 올라와 있지 않아 요약 {}건을 모델을 올리지 않고 비워 둡니다 — 예전에는 관측용 요약 한 건을 위해 엔진을 올리고(임베딩 반환 · 적재) 나머지를 비웠습니다. 관측용 적재는 {}번 뒤입니다.",
+                engine,
+                recent * 100.0,
+                n,
+                skip_drop * 100.0,
+                engine,
+                jobs.len(),
+                left
+            ));
+            crate::utils::score_dynamics::record_baseline("commerce.synthesis_preload_skip", 1.0);
+            for _ in jobs.iter() {
+                crate::utils::score_dynamics::record_baseline("commerce.synthesis_skip", 1.0);
+            }
+            crate::utils::score_dynamics::flush();
+            return Ok(());
+        }
+        crate::utils::score_dynamics::record_baseline("commerce.synthesis_preload_skip", 0.0);
+        emit_term(&format!(
+            "  🔬 [SYNTHESIS PASS / SDS PRE-LOAD] {} 의 폐기율 게이트가 닫혀 있습니다 (최근 {:.0}%, 관측 {}건). {}",
+            engine,
+            recent * 100.0,
+            n,
+            match entry {
+                SynthesisEntry::ObserveResident => "엔진이 이미 올라와 있어 전환 없이 관측용 요약 하나를 만듭니다.",
+                _ if verdict.probe => "경로가 관측용으로 열린 차례라 엔진을 올려 관측용 요약 하나를 만듭니다.",
+                _ => "관측 차례라 엔진을 올려 관측용 요약 하나를 만듭니다 (이 관측이 게이트를 다시 여는 유일한 입력입니다).",
+            }
+        ));
+    }
     let mut lang: Option<crate::model::lang_llm::LangSession> = match verdict.code.as_deref() {
         Some(code) => model.enter_lang_generation(code, &pass_reason).await,
         None => None,
@@ -151,11 +199,6 @@ async fn run_synthesis_pass(
             )
             .await?;
     }
-    let sds_gate = |is_lang: bool| -> Option<(f32, u64)> {
-        crate::utils::score_dynamics::adaptive_recent(crate::model::lang_llm::synthesis_drop_axis(is_lang))
-            .filter(|(recent, _, _)| *recent >= skip_drop)
-            .map(|(recent, _, n)| (recent, n))
-    };
     let total_items = items.len();
     emit_term(&format!(
         "  🧠 [SYNTHESIS PASS] 요약 {}건을 {} 로 만듭니다 | 값이 모두 확정된 아이템의 값표만 넘기고, 추출 단계의 디코딩 제약(확정된 다른 필드 값의 금지 목록 · 다른 필드 의미 편견)을 걸지 않습니다. 결과는 같은 원문 대조 게이트를 거치고, 연속 {}건이 게이트를 통과하지 못하면 다음 엔진으로 넘기거나 멈춥니다.",
@@ -253,6 +296,14 @@ async fn run_synthesis_pass(
                 .await
                 .map(|(text, _)| text)
         } else {
+            if model.reenter_qwen3_if_evicted(Some(cancel.clone()), &pass_reason).await? {
+                emit_term(&format!(
+                    "    ♻️ [GEN RE-ENTER] Item {}/{} · '{}' | Qwen3 슬롯이 비어 있어 다시 올렸습니다.",
+                    pos + 1,
+                    total_items,
+                    field_name
+                ));
+            }
             let q3_gen = model.qwen3_generator.clone();
             let cancel_clone = cancel.clone();
             let params = ChatCompletionParameters {
@@ -5829,6 +5880,15 @@ pub async fn process_task(
                                     text
                                 })
                         } else {
+                            if model
+                                .reenter_qwen3_if_evicted(Some(cancellation_token.clone()), "list item extraction loop (generator evicted)")
+                                .await?
+                            {
+                                emit_term(&format!(
+                                    "    ♻️ [GEN RE-ENTER] Item {}/{} · Field '{}' | 아이템 사이의 임베딩 적재가 VRAM 을 확보하려고 Qwen3 를 내렸습니다. 이 필드부터 다시 올려 이어 갑니다 — 예전에는 빈 슬롯에서 'Qwen 3 Generator not available' 로 실패해 남은 필드가 모두 비었습니다.",
+                                    idx + 1, total_items, field_name
+                                ));
+                            }
                             let q3_gen = model.qwen3_generator.clone();
                             let cancel_clone = cancellation_token.clone();
                             let sys_msg = system_message.clone();
@@ -6214,6 +6274,10 @@ pub async fn process_task(
                             },
                             Err(e) => {
                                 println!("[Scheduler] Error extracting list item field {}: {:?}", field_name_clone, e);
+                                emit_term(&format!(
+                                    "    ⚠️ [FIELD ERROR] Item {}/{} · Field '{}' | 생성이 실패해 이 필드는 비워 둡니다: {}",
+                                    idx + 1, total_items, field_name_clone, e
+                                ));
                                 break;
                             }
                         }
@@ -8749,6 +8813,15 @@ pub async fn process_task(
                                 text
                             })
                     } else {
+                        if model
+                            .reenter_qwen3_if_evicted(Some(cancellation_token.clone()), "detail field extraction loop (generator evicted)")
+                            .await?
+                        {
+                            emit_term(&format!(
+                                "  ♻️ [GEN RE-ENTER] Field '{}' | Qwen3 슬롯이 비어 있어 다시 올렸습니다. 예전에는 'Qwen 3 Generator not available' 로 실패해 이 필드가 비었습니다.",
+                                field_name
+                            ));
+                        }
                         let q3_gen = model.qwen3_generator.clone();
                         let cancel_clone = cancellation_token.clone();
                         let sys_msg = system_message.clone();
@@ -9093,6 +9166,7 @@ pub async fn process_task(
                         },
                         Err(e) => {
                             println!("[Scheduler] Error extracting detail field {}: {:?}", field_name_clone, e);
+                            emit_term(&format!("  ⚠️ [FIELD ERROR] Field '{}' | 생성이 실패해 이 필드는 비워 둡니다: {}", field_name_clone, e));
                             break;
                         }
                     }

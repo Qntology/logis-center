@@ -319,6 +319,41 @@ impl LogisModel {
             || self.qwen4_exp_generator.lock().await.is_some()
     }
 
+    /// 요약 · 필드 생성에 쓸 엔진이 지금 슬롯에 있는가. `lang` 이 있으면 그 언어의 4B, 없으면 Qwen3 입니다.
+    /// (`ensure_qwen3_5_lang` 의 빠른 경로와 같은 판정이라, 참이면 진입 시 전환이 일어나지 않습니다)
+    pub async fn generation_engine_resident(&self, lang: Option<&str>) -> bool {
+        match lang {
+            Some(code) => {
+                let slot = self.qwen3_5_generator.lock().await.is_some() || self.qwen4_exp_generator.lock().await.is_some();
+                slot && crate::model::lang_llm::resident_variant().as_deref() == Some(code)
+            }
+            None => self.qwen3_generator.lock().await.is_some(),
+        }
+    }
+
+    /// 🌟 [GEN RE-ENTER] 생성 루프 도중 Qwen3 슬롯이 비었으면 생성 페이즈로 다시 들어갑니다. 다시 올렸으면 true.
+    ///
+    ///  ── 무엇이 문제였나 ──
+    ///   목록 · 상세 루프는 첫 LLM 필드에서 Qwen3 를 한 번 올리고 그 뒤로는 슬롯이 차 있다고 믿었습니다.
+    ///   그런데 아이템 사이의 임베딩 적재(`lease_embedding` 의 VRAM GATE)는 예산이 모자라면 생성 슬롯을 반환합니다.
+    ///   그 뒤의 필드는 모두 'Qwen 3 Generator not available' 로 실패했고, 오류는 터미널에만 찍혀 필드가 조용히 비었습니다
+    ///   (2026-11-03 합성 평가 로그: VRAM GATE 한 번 뒤 같은 목록의 필드 11개).
+    ///  ── 해결 ──
+    ///   루프의 '올렸다' 표시 대신 생성 직전에 슬롯을 봅니다 (상주 상태는 슬롯에서만 읽는다는 residency 원칙).
+    pub async fn reenter_qwen3_if_evicted(&self, cancel: Option<Arc<AtomicBool>>, reason: &str) -> anyhow::Result<bool> {
+        if self.qwen3_generator.lock().await.is_some() {
+            return Ok(false);
+        }
+        println!(
+            "[CROSSOVER] ♻️ [GEN RE-ENTER] {} | Qwen3 슬롯이 비어 있습니다 (앞선 임베딩 적재 · 퍼지가 생성 슬롯을 반환). 생성 페이즈로 다시 들어갑니다.",
+            reason
+        );
+        self.enter_generation_phase(ModelSize::Qwen3, None, cancel, false, Some("inference".to_string()), reason)
+            .await?;
+        crate::utils::score_dynamics::record_baseline("commerce.generator_reentry", 1.0);
+        Ok(true)
+    }
+
     /// 🌟 실제 슬롯에서 지금 상주 상태를 읽고, 그 상태가 차지하는 가중치를 피크에 반영합니다.
     ///  슬롯이 바뀐 직후마다 부릅니다. 상태를 따로 적어 두지 않으므로 사실과 어긋날 수 없습니다.
     ///
