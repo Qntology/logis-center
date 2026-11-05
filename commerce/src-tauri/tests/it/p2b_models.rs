@@ -472,3 +472,73 @@ fn p2b_qwen3_kv_tier_forced() -> R {
     assert!(worst_top1 >= 90.0, "KV 계층 강제 결과의 top-1 이 {worst_top1:.1}% 로 낮습니다");
     Ok(())
 }
+
+/// 🌟 [KV-PLAN v2] `generate()` 가 직전 호출의 RAM 계층 판정을 다음 호출의 프리필로 넘기지 않는지 (온도 0).
+/// 예전에는 디코딩 진입에서 RAM 으로 내린 계층이 다음 호출까지 남아, 프리필 KV 가 청크마다 층마다 FP8 로 CPU 를
+/// 오갔습니다 (위 시험의 RAM 계층은 원본 대비 top-1 96%). 지금은 생성 시작마다 VRAM 계층으로 되돌리므로
+/// 같은 질문의 답이 새 생성기와 같아야 합니다.
+#[test]
+#[ignore = "실모델 (LOGIS_TEST_MODELS=1)"]
+fn p2b_qwen3_generate_resets_kv_tier() -> R {
+    use tauri_app_lib::openai_types::{
+        ChatCompletionParameters, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
+    };
+    use tauri_app_lib::utils::resources::KvResidency;
+    if !enabled() {
+        return Ok(());
+    }
+    let Some(dev) = gpu() else { return Ok(()) };
+    let dir = models_dir().join("Qwen3-0.6B-Instruct-gguf");
+    if !dir.exists() {
+        println!("[P2B-TEST] {dir:?} 없음 → 건너뜀");
+        return Ok(());
+    }
+    let path = dir.to_str().unwrap().to_string();
+    let mut g = tauri_app_lib::models::qwen3::generate::Qwen3GenerateModel::init_from_gguf_with(
+        &path,
+        Some(&dev),
+        Some(DType::BF16),
+        true,
+    )?;
+    let params = || ChatCompletionParameters {
+        messages: vec![
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: format!("[JSON CONTEXT]\n{}", prompt_text(1)),
+                name: None,
+            }),
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(
+                    "Return the first order id and its customer name as JSON with keys \"id\" and \"customer\". RETURN JSON ONLY /no_think"
+                        .to_string(),
+                ),
+                name: None,
+            }),
+        ],
+        model: "qwen3".to_string(),
+        max_tokens: Some(128),
+        temperature: Some(0.0),
+        top_p: Some(0.95),
+        ..Default::default()
+    };
+    let t0 = Instant::now();
+    let fresh = g.generate(params(), None, None, None)?;
+    let fresh_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    g.clear_kv_cache();
+    // 직전 호출이 디코딩 진입에서 RAM 으로 내린 상태를 흉내냅니다 (모델의 KV 계층만 바꿉니다).
+    g.model_mut().set_kv_residency(KvResidency::Ram);
+    let t1 = Instant::now();
+    let after_ram = g.generate(params(), None, None, None)?;
+    let after_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    g.clear_kv_cache();
+    drop(g);
+    let _ = dev.synchronize_all();
+    let _ = dev.trim_memory_pool(0);
+    println!(
+        "[P2B-RESULT] Qwen3-0.6B generate (온도 0) | 새 생성기 {:.0} ms · 직전 RAM 판정 뒤 {:.0} ms | 답 {:?}",
+        fresh_ms, after_ms, fresh
+    );
+    assert!(!fresh.trim().is_empty(), "답이 비었습니다");
+    assert_eq!(fresh, after_ram, "직전 호출의 RAM 계층 판정이 다음 호출의 답을 바꿨습니다");
+    Ok(())
+}

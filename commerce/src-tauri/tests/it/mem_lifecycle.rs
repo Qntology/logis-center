@@ -39,6 +39,56 @@ fn kv_plan_48mb_with_678mb_free_is_vram() {
     assert_eq!(new, KvResidency::Vram);
 }
 
+/// 합성 평가(2026-11-03, RX 6600 ROCm) e2e_final_commerce 의 Qwen3-0.6B 필드 추출 호출 (같은 로그에 6번):
+/// `[KV-PLAN] Qwen3(0.6B) generate | Tokens: 826 (이미 상주 0 · 새로 826) | PerToken: 57344 B | Need: 47.37 MB |
+///  VRAM free: 540.88 MB (margin 671 MB) | RAM free: 4829.28 MB (margin 2147 MB) | 직전 None → Ram`
+/// 이 경로만 예전 서명(프롬프트 재구매 · 고정 640MiB)을 써서 Qwen3.5 의 v2 와 다른 판정을 냈습니다.
+#[test]
+fn qwen3_decode_plan_keeps_field_calls_in_vram() {
+    use tauri_app_lib::models::qwen3::generate::{qwen3_kv_bytes_per_token, QWEN3_DECODE_TRANSIENT_BYTES};
+    // Qwen3-0.6B: 28층 · KV 헤드 8 · d=128. 로그의 PerToken 은 FP8 1바이트로 센 값입니다.
+    let (layers, heads, dim) = (28, 8, 128);
+    let fp8 = kv_bytes_per_token_exact(layers, heads, dim, 1);
+    assert_eq!(fp8, 57_344);
+    let (planned, max_tokens) = (826usize, 512usize);
+    let prompt = planned - max_tokens;
+    let vram_free = Some(540_880_000u64);
+    let ram_free = 4_829_280_000u64;
+
+    // 예전: 프리필로 이미 만든 프롬프트 KV 까지 다시 사고(already 0) 여유 640MiB / 2GiB → RAM (로그 재현)
+    let old_need = kv_need_bytes(fp8, planned, 0);
+    assert_eq!(old_need, 47_366_144);
+    let old = decide_kv_tier(old_need, vram_free, ram_free, KV_VRAM_SAFETY_MARGIN_BYTES, KV_RAM_SAFETY_MARGIN_BYTES, None);
+    assert_eq!(old, KvResidency::Ram);
+
+    // 새: 새로 생길 토큰만 실제 보관 크기로 (압축 KV = TurboQuant 행 d+8, 원본 KV = BF16), 여유 128MiB
+    assert_eq!(qwen3_kv_bytes_per_token(layers, heads, dim, false, 2), 2 * 28 * 8 * 136);
+    assert_eq!(qwen3_kv_bytes_per_token(layers, heads, dim, true, 2), 2 * 28 * 8 * 128 * 2);
+    let vm = kv_vram_margin_bytes(QWEN3_DECODE_TRANSIENT_BYTES);
+    assert_eq!(vm, 128 * MIB);
+    let rm = kv_ram_margin_bytes(17_102 * MB);
+    for exact in [false, true] {
+        let per = qwen3_kv_bytes_per_token(layers, heads, dim, exact, 2);
+        let need = kv_need_bytes(per, planned, prompt);
+        let tier = decide_kv_tier(need, vram_free, ram_free, vm, rm, None);
+        println!(
+            "[KV-PLAN-TEST] Qwen3-0.6B {} KV | 예전 {:.2} MB + 여유 {} MB → {:?} | 새 {:.2} MB + 여유 {} MB → {:?} (VRAM free 540.88 MB)",
+            if exact { "원본" } else { "압축" },
+            old_need as f64 / 1e6,
+            KV_VRAM_SAFETY_MARGIN_BYTES / MB,
+            old,
+            need as f64 / 1e6,
+            vm / MB,
+            tier
+        );
+        assert_eq!(tier, KvResidency::Vram);
+    }
+
+    // 여유는 여전히 지킵니다: 원본 KV 512 토큰(58.7MB) + 128MiB 가 안 들어가는 150MB 에서는 RAM 으로 내립니다.
+    let exact_need = kv_need_bytes(qwen3_kv_bytes_per_token(layers, heads, dim, true, 2), planned, prompt);
+    assert_eq!(decide_kv_tier(exact_need, Some(150 * MB), ram_free, vm, rm, None), KvResidency::Ram);
+}
+
 #[test]
 fn kv_plan_margins_are_proportional() {
     assert_eq!(kv_vram_margin_bytes(0), 96 * MIB);

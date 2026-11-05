@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::models::qwen3::config::{Qwen3Config, Qwen3GenerationConfig};
 use crate::models::qwen3::model::Qwen3Model;
+use crate::utils::resources::KvResidency;
 use crate::utils::{
     find_type_files, get_device,
     get_dtype, get_logit_processor,
@@ -23,6 +24,25 @@ pub struct Qwen3GenerateModel {
     eos_token_id2: u32,
     generation_config: Qwen3GenerationConfig,
     model_name: String,
+    /// 🌟 [KV-PLAN v2] 직전 디코딩 진입의 KV 배치 판정 (히스테리시스). 생성기를 버리면(퍼지 · 작업 종료) 함께 사라집니다.
+    last_kv_plan: Option<KvResidency>,
+}
+
+/// 🌟 [KV-PLAN v2] Qwen3-0.6B 디코딩 한 스텝의 활성값 순간치(대략).
+///  층마다 KV 를 한 토큰씩 이어 붙인 새 텐서(원본 BF16 이면 1k 토큰에 층당 약 4MB, 압축이면 그것을 푼 사본)와
+///  logits(151,936 × F32 ≈ 0.6MB) · 편견 벡터 뺄셈 정도라 실제로는 수십 MB 아래입니다.
+///  Qwen3.5 의 `DECODE_TRANSIENT_BYTES` 와 같은 64MB 로 두어 VRAM 여유는 max(96MB, 2 × 64MB) = 128MB 입니다 (예전 고정 640MB).
+pub const QWEN3_DECODE_TRANSIENT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 🌟 [KV-PLAN v2] 이번 생성의 Qwen3 KV 가 VRAM 에 실제로 차지하는 토큰당 바이트 (전 층 K+V).
+///  원본 KV(`exact`)는 원소 크기 그대로(GPU 는 BF16 2바이트), 압축 KV 는 TurboQuant 벡터별 FP8 행(d + 8 바이트)입니다.
+///  (압축 캐시를 쓰지 않는 빌드의 FP8 보관은 d 바이트라 이 값이 6% 크게 잡습니다 — 과대평가 쪽이라 안전합니다)
+pub fn qwen3_kv_bytes_per_token(layers: usize, kv_heads: usize, head_dim: usize, exact: bool, exact_elem_bytes: usize) -> u64 {
+    if exact {
+        crate::utils::resources::kv_bytes_per_token_exact(layers, kv_heads, head_dim, exact_elem_bytes)
+    } else {
+        crate::utils::resources::kv_bytes_per_token_compressed(layers, kv_heads, head_dim)
+    }
 }
 
 // =====================================================================
@@ -80,6 +100,7 @@ impl Qwen3GenerateModel {
             eos_token_id2: generation_config.eos_token_id[1] as u32,
             generation_config,
             model_name: "qwen3".to_string(),
+            last_kv_plan: None,
         })
     }
     /// 🌟 [Q8-RESIDENT] CUDA/ROCm 에서는 Q8_0 가중치를 그대로 GPU 에 상주시키고(정확 W8A16), 그 외 장치나
@@ -134,6 +155,7 @@ impl Qwen3GenerateModel {
                         eos_token_id2: generation_config.eos_token_id.get(1).cloned().unwrap_or(151645) as u32,
                         generation_config,
                         model_name: "qwen3".to_string(),
+                        last_kv_plan: None,
                     });
                 }
                 Err(e) => println!("[QWEN3-Q8] ⚠️ Q8 상주 로드 실패 → 기존 BF16 역양자화 경로로 로드합니다: {e}"),
@@ -197,6 +219,7 @@ impl Qwen3GenerateModel {
             eos_token_id2: generation_config.eos_token_id.get(1).cloned().unwrap_or(151645) as u32,
             generation_config,
             model_name: "qwen3".to_string(),
+            last_kv_plan: None,
         })
     }
 
@@ -281,9 +304,13 @@ impl Qwen3GenerateModel {
         Ok(prejudice)
     }
 
-    /// 🌟 [KV-PRECISION] 이번 생성의 KV 를 원본 정밀도(BF16)로 둘지, TurboQuant 로 압축할지 정해 모델에 설정합니다.
+    /// 🌟 [KV-PRECISION] 이번 생성의 KV 를 원본 정밀도(BF16)로 둘지, TurboQuant 로 압축할지 정해 모델에 설정하고 돌려줍니다.
     /// 캐시가 빈 상태(새 생성)에서 프리필 전에 호출합니다. 판정 기준은 kv_turbo::exact_kv_affordable 을 보세요.
-    fn plan_kv_precision(&mut self, planned_tokens: usize) {
+    fn plan_kv_precision(&mut self, planned_tokens: usize) -> bool {
+        // 🌟 [KV-PLAN v2] 직전 호출이 KV 를 RAM 으로 내렸어도 이번 프리필 KV 는 VRAM 에 만듭니다 (프로세스의 첫 호출과 같은 상태).
+        //    예전에는 그 판정이 다음 호출의 프리필까지 남아 청크마다 층마다 KV 를 CPU 로 내렸다 올렸습니다.
+        //    VRAM 이 빠듯하면 아래 정밀도 판정이 압축 KV 를 고르고, 디코딩 진입 계획(plan_decode_kv)이 다시 정합니다.
+        self.qwen3.set_kv_residency(KvResidency::Vram);
         let (layers, heads, head_dim) = self.qwen3.kv_geometry();
         let elem = if self.device.is_cuda_or_rocm() { 2 } else { 4 };
         let exact_bytes = (layers * heads * head_dim * 2 * elem * planned_tokens) as u64;
@@ -304,6 +331,45 @@ impl Qwen3GenerateModel {
                 }
             );
         }
+        exact
+    }
+
+    /// 🌟 [KV-PLAN v2] 디코딩 진입 직전에 KV 배치 위치를 정합니다 (generate · generate_part 공용).
+    ///
+    ///  ── 무엇이 문제였나 ──
+    ///   이 경로만 예전 서명(`plan_kv_residency`)을 써서 (1) 프리필로 이미 VRAM 에 만든 프롬프트 KV 를 free 에서 한 번 빼고
+    ///   필요량으로 또 요구했고, (2) VRAM 여유가 고정 640MB 였고, (3) 원본 KV(BF16)도 FP8 1바이트로 셌습니다.
+    ///   합성 평가(2026-11-03, RX 6600 ROCm)의 필드 추출 호출에서 KV 47MB 가 VRAM free 541~578MB 에서 RAM 으로 내려갔습니다.
+    ///   RAM 계층은 디코딩 토큰마다 층마다 KV 전체를 GPU 로 올리고 다시 CPU 로 내립니다 (28층 × 왕복 2회 + 층마다 동기화).
+    ///  ── 해결 ──
+    ///   Qwen3.5 와 같은 v2 판정: 새로 생길 토큰만 실제 보관 크기로 사고, VRAM 여유 = max(96MB, 2 × 디코딩 순간치),
+    ///   직전보다 좋은 계층으로 올라갈 때만 띠를 더 요구합니다. `LOGIS_KV_PLAN=legacy` 이면 예전 판정 그대로입니다.
+    fn plan_decode_kv(&mut self, prompt_tokens: usize, sample_len: usize, exact: bool, label: &str) {
+        use crate::utils::resources::{plan_kv_residency_ex, primary_gpu_id, KvPlanExtra, KvPlanInput};
+        let (kv_layers, kv_heads, head_dim) = self.qwen3.kv_geometry();
+        let elem = if self.device.is_cuda_or_rocm() { 2 } else { 4 };
+        let plan = plan_kv_residency_ex(
+            &KvPlanInput {
+                gpu_id: primary_gpu_id(),
+                is_cpu_mode: self.device.is_cpu(),
+                num_kv_layers: kv_layers,
+                num_kv_heads: kv_heads,
+                head_dim,
+                // 예전 판정(`LOGIS_KV_PLAN=legacy`)만 쓰는 값: RAM 대피본의 FP8 1바이트
+                bytes_per_elem: 1,
+                planned_tokens: prompt_tokens + sample_len,
+                label,
+            },
+            &KvPlanExtra {
+                // 프리필 KV 는 plan_kv_precision 이 VRAM 계층으로 되돌린 뒤 만들어 free 에서 이미 빠져 있습니다.
+                already_tokens: prompt_tokens,
+                decode_transient_bytes: QWEN3_DECODE_TRANSIENT_BYTES,
+                bytes_per_token: Some(qwen3_kv_bytes_per_token(kv_layers, kv_heads, head_dim, exact, elem)),
+                prev: self.last_kv_plan,
+            },
+        );
+        self.last_kv_plan = Some(plan);
+        self.qwen3.set_kv_residency(plan);
     }
 
     pub fn get_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {
@@ -411,8 +477,12 @@ impl Qwen3GenerateModel {
     ) -> Result<String> {
         if is_prefill {
             self.clear_kv_cache();
-        } else if let Some(session_id) = load_session_id {
-            self.load_kv_cache(&session_id, cache_dir)?;
+        } else {
+            // 🌟 [KV-PLAN v2] 이어 쓰는 KV(세션 · 직전 캐시)와 남은 프리필도 VRAM 에 둡니다 (디코딩 진입 계획이 이미 상주로 셉니다).
+            self.qwen3.set_kv_residency(KvResidency::Vram);
+            if let Some(session_id) = load_session_id {
+                self.load_kv_cache(&session_id, cache_dir)?;
+            }
         }
 
         let temperature = mes.temperature.unwrap_or(self.generation_config.temperature as f64);
@@ -467,11 +537,12 @@ impl Qwen3GenerateModel {
         }
         // 🌟 [KV-PRECISION] 새로 시작하는 생성이면 VRAM 여유에 따라 KV 정밀도를 정합니다.
         //    (저장된 세션을 이어 쓸 때는 기존 압축 경로가 스냅샷을 흡수하므로 그대로 둡니다)
-        if is_prefill {
-            self.plan_kv_precision(start_len + prompt_seq_len + sample_len as usize);
+        let kv_exact = if is_prefill {
+            self.plan_kv_precision(start_len + prompt_seq_len + sample_len as usize)
         } else {
             self.qwen3.set_kv_exact(false);
-        }
+            false
+        };
 
         // 🌟 [Phase 1: Chunked Prefill] VRAM 폭발과 RAM 널뛰기를 막기 위해 256 토큰 단위로 강하게 압박합니다.
         // 🌟 [Q8-RESIDENT] Q8 상주 경로는 프리필마다 가중치를 타일로 풀어 GEMM 하므로 청크를 1024 로 키웁니다 (기존 BF16 경로는 256).
@@ -538,23 +609,7 @@ impl Qwen3GenerateModel {
         // 🌟 [KV RESIDENCY PLAN] 디코딩 루프 진입 직전에 단 1회만 VRAM/RAM 여유를 계산합니다.
         //    KV Cache 는 단조 증가하므로 "마지막 토큰까지 자랐을 때의 최대 크기"로 판정해야
         //    디코딩 도중 OOM 이 발생하지 않습니다. 매 토큰 재확인은 불필요합니다.
-        {
-            let (kv_layers, kv_heads, head_dim) = self.qwen3.kv_geometry();
-            let plan = crate::utils::resources::plan_kv_residency(
-                &crate::utils::resources::KvPlanInput {
-                    gpu_id: crate::utils::resources::primary_gpu_id(),
-                    is_cpu_mode: self.device.is_cpu(),
-                    num_kv_layers: kv_layers,
-                    num_kv_heads: kv_heads,
-                    head_dim,
-                    // VRAM 상주 시 Fp8VramKVCache 가 FP8(1바이트)로 압축 보관합니다.
-                    bytes_per_elem: 1,
-                    planned_tokens: seqlen_offset + sample_len as usize,
-                    label: "Qwen3(0.6B) generate_part",
-                },
-            );
-            self.qwen3.set_kv_residency(plan);
-        }
+        self.plan_decode_kv(seqlen_offset, sample_len as usize, kv_exact, "Qwen3(0.6B) generate_part");
 
         // 🌟 [Phase 2: Decoding] 첫 토큰을 얻은 후 1글자씩 이어서 생성합니다.
         for i in 1..sample_len {
@@ -763,7 +818,7 @@ impl Qwen3GenerateModel {
             }
         }
         // 🌟 [KV-PRECISION] VRAM 여유가 충분하면 이번 생성의 KV 를 압축하지 않습니다.
-        self.plan_kv_precision(prompt_seq_len + sample_len as usize);
+        let kv_exact = self.plan_kv_precision(prompt_seq_len + sample_len as usize);
 
         // 🌟 [Phase 1: Chunked Prefill] 긴 문맥을 256 토큰 단위로 강하게 잘라 VRAM 및 RAM 널뛰기를 막습니다.
         // 🌟 [Q8-RESIDENT] Q8 상주 경로는 프리필마다 가중치를 타일로 풀어 GEMM 하므로 청크를 1024 로 키웁니다 (기존 BF16 경로는 256).
@@ -826,24 +881,9 @@ impl Qwen3GenerateModel {
         }
 
         // 🌟 [KV RESIDENCY PLAN] 디코딩 루프 진입 직전에 단 1회만 VRAM/RAM 여유를 계산합니다.
-        //    VRAM 이 충분하면 FP8 캐시를 VRAM 에 그대로 두고(왕복 0회),
+        //    VRAM 이 충분하면 캐시를 VRAM 에 그대로 두고(왕복 0회),
         //    부족하면 RAM 으로 대피시켜 OOM 을 원천 차단합니다.
-        {
-            let (kv_layers, kv_heads, head_dim) = self.qwen3.kv_geometry();
-            let plan = crate::utils::resources::plan_kv_residency(
-                &crate::utils::resources::KvPlanInput {
-                    gpu_id: crate::utils::resources::primary_gpu_id(),
-                    is_cpu_mode: self.device.is_cpu(),
-                    num_kv_layers: kv_layers,
-                    num_kv_heads: kv_heads,
-                    head_dim,
-                    bytes_per_elem: 1,
-                    planned_tokens: seqlen_offset + sample_len as usize,
-                    label: "Qwen3(0.6B) generate",
-                },
-            );
-            self.qwen3.set_kv_residency(plan);
-        }
+        self.plan_decode_kv(seqlen_offset, sample_len as usize, kv_exact, "Qwen3(0.6B) generate");
 
         // 🌟 [Phase 2: Decoding] 첫 번째 토큰을 얻은 후 1글자씩 이어서 생성합니다.
         for i in 1..sample_len {

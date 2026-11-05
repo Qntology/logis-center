@@ -1,10 +1,30 @@
-//! 상주 상태 · 실측 장부 · 전환 구간 · 슬롯 가드 (model/residency.rs). 장치 없이 돕니다.
+//! 상주 상태 · 실측 장부 · 전환 구간 · 슬롯 가드 (model/residency.rs) · 요약 패스 진입 판정 (lang_llm). 장치 없이 돕니다.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use tauri_app_lib::model::lang_llm::{synthesis_entry, SynthesisEntry};
 use tauri_app_lib::model::residency::{CostBook, HoldGate, Residency, SlotLease, GEN_KIND_LANG4B};
 use tokio::sync::Mutex as TokioMutex;
+
+/// 폐기율 게이트가 닫힌 요약 패스: 엔진이 이미 있으면 관측, 없으면 LANG ROUTE 와 같은 주기(10번째)로만 올립니다.
+#[test]
+fn synthesis_entry_loads_only_to_observe() {
+    let axis = "test.synthesis_entry|list_synthesis";
+    // 엔진이 이미 올라와 있으면 전환 없이 관측합니다 (차례를 세지 않습니다).
+    assert_eq!(synthesis_entry(true, false, axis), (SynthesisEntry::ObserveResident, 0));
+    // 경로 판정이 관측용으로 연 차례면 그 차례를 따릅니다 (두 주기가 엇갈려 관측이 끊기지 않게).
+    assert_eq!(synthesis_entry(false, true, axis), (SynthesisEntry::ObserveProbe, 0));
+    // 엔진이 없으면 10번째마다만 올립니다.
+    let seen: Vec<(SynthesisEntry, u64)> = (0..20).map(|_| synthesis_entry(false, false, axis)).collect();
+    assert_eq!(seen[0], (SynthesisEntry::Skip, 9));
+    assert_eq!(seen[8], (SynthesisEntry::Skip, 1));
+    assert_eq!(seen[9], (SynthesisEntry::ObserveProbe, 0));
+    assert_eq!(seen[10], (SynthesisEntry::Skip, 9));
+    assert_eq!(seen.iter().filter(|(e, _)| *e == SynthesisEntry::ObserveProbe).count(), 2);
+    // 축마다 따로 셉니다.
+    assert_eq!(synthesis_entry(false, false, "test.synthesis_entry|detail_synthesis"), (SynthesisEntry::Skip, 9));
+}
 
 #[test]
 fn residency_is_derived_from_slots() {

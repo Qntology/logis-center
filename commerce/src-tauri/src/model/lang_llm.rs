@@ -1615,6 +1615,8 @@ pub fn token_fit(code: &str, sample: &str, reference: &Path) -> Result<TokenFit,
 pub struct RouteVerdict {
     pub code: Option<String>,
     pub line: String,
+    /// SDS 통과율로 닫힌 경로를 관측용으로 한 번 연 판정인지 (`ROUTE_PROBE_EVERY` 번째마다)
+    pub probe: bool,
 }
 
 fn bump_skip(axis: &str) -> u64 {
@@ -1639,6 +1641,7 @@ pub fn closed_verdict(track: &str, step: &str, code: Option<&str>, why: &str) ->
             code.map(|c| format!("4B-{} 후보", c)).unwrap_or_else(|| "대응 4B 없음".to_string()),
             why
         ),
+        probe: false,
     }
 }
 
@@ -1785,6 +1788,7 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
         .unwrap_or_default();
     RouteVerdict {
         code: Some(code.to_string()),
+        probe: !probe.is_empty(),
         line: format!(
             "🧭 [LANG ROUTE] {}.{} | Qwen3.5-4B-{} (alphaedge-ai) 로 보냅니다 | 문자 비율 문서언어 {:.1}% · 라틴 {:.1}% · 기타 {:.1}% (글자 {}자) | 토큰 4B {} / 기준 {} = {:.2}배 · 왕복 손실 0자{}{}",
             track,
@@ -1817,6 +1821,42 @@ pub fn synthesis_drop_axis(lang: bool) -> &'static str {
         "commerce.synthesis_sentence_drop.lang4b"
     } else {
         "commerce.synthesis_sentence_drop"
+    }
+}
+
+/// 🌟 [SYNTHESIS PRE-LOAD GATE] SDS 폐기율 게이트가 닫힌 요약 패스를 생성 모델을 올리기 전에 어떻게 처리할지.
+///
+///  ── 무엇이 문제였나 ──
+///   요약 패스는 엔진을 올린 뒤에야(임베딩 반환 · 생성 모델 적재) 게이트를 보고, 닫혀 있으면 첫 요약 하나만
+///   관측용으로 만들고 나머지를 비웠습니다. 엔진이 내려가 있던 목록은 요약 한 건을 위해 전환 비용을 그대로 냈습니다.
+///  ── 왜 관측을 없애지 않는가 ──
+///   그 한 건이 이 게이트를 다시 여는 유일한 입력입니다(최근 폐기율 링). 아예 건너뛰면 게이트는 영원히 닫힙니다.
+///   그래서 엔진이 이미 올라와 있으면 예전처럼 관측하고, 내려가 있으면 LANG ROUTE 와 같은 주기
+///   (`ROUTE_PROBE_EVERY` 번째마다)로만 올려 관측합니다. 경로 판정 자체가 관측용으로 연 것이면 그 차례를 존중합니다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SynthesisEntry {
+    /// 엔진이 이미 상주 중 → 전환 없이 첫 요약 하나를 관측용으로 만듭니다
+    ObserveResident,
+    /// 엔진은 없지만 관측 차례(경로 관측 또는 주기) → 올려서 첫 요약 하나를 만듭니다
+    ObserveProbe,
+    /// 엔진을 올리지 않고 이번 목록의 요약을 모두 비워 둡니다
+    Skip,
+}
+
+/// 게이트가 닫힌 요약 패스의 진입 판정. `probe_axis` 의 닫힌 판정 횟수는 엔진이 없고 경로 관측도 아닐 때만 셉니다.
+/// 돌려주는 두 번째 값은 Skip 일 때 다음 관측용 적재까지 남은 횟수입니다.
+pub fn synthesis_entry(engine_resident: bool, route_probe: bool, probe_axis: &str) -> (SynthesisEntry, u64) {
+    if engine_resident {
+        return (SynthesisEntry::ObserveResident, 0);
+    }
+    if route_probe {
+        return (SynthesisEntry::ObserveProbe, 0);
+    }
+    let k = bump_skip(probe_axis);
+    if k % ROUTE_PROBE_EVERY == 0 {
+        (SynthesisEntry::ObserveProbe, 0)
+    } else {
+        (SynthesisEntry::Skip, ROUTE_PROBE_EVERY - k % ROUTE_PROBE_EVERY)
     }
 }
 
