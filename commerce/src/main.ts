@@ -286,11 +286,10 @@ let isExtracting = false;
 let modelStatus: Record<string, boolean> = {};
 const TARGET_MODELS = [
     'Qwen3', 'Qwen3.5', 'Embedding', 'Granite', 'SigLIP2',
+    // stanza-onnx-export 변환본(format 2)이 있는 12개 언어 (src-tauri/src/stanza.rs UI_LANGS 와 같음)
     'stanza_korean', 'stanza_english', 'stanza_japanese', 'stanza_chinese',
     'stanza_french', 'stanza_german', 'stanza_spanish', 'stanza_italian',
-    'stanza_portuguese', 'stanza_dutch', 'stanza_russian', 'stanza_arabic',
-    'stanza_thai', 'stanza_hindi', 'stanza_bengali', 'stanza_greek',
-    'stanza_hebrew', 'stanza_vietnamese'
+    'stanza_portuguese', 'stanza_dutch', 'stanza_arabic', 'stanza_czech'
 ];
 export let lastSearchedQuery = "";
 

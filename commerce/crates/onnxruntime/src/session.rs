@@ -312,6 +312,15 @@ pub struct Session<'a> {
 unsafe impl<'a> Send for Session<'a> {}
 unsafe impl<'a> Sync for Session<'a> {}
 
+impl<'a> Session<'a> {
+    /// `mixed::run_mixed` 가 C API `Run` 에 넘길 세션 포인터.
+    /// 이전에는 필드 구성이 다른 거울 구조체로 읽었는데, Rust 는 `repr(Rust)` 필드 순서를 보장하지 않아
+    /// 잘못된 포인터를 읽을 수 있었습니다.
+    pub(crate) fn raw_session_ptr(&self) -> *mut sys::OrtSession {
+        self.session_ptr
+    }
+}
+
 /// Information about an ONNX's input as stored in loaded file
 #[derive(Debug)]
 pub struct Input {

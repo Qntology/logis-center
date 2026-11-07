@@ -9,6 +9,8 @@ tests/it/synthetic_eval.rs 가 읽는 JSONL 계획을 씁니다.
   python make_plan.py images   --split dev --pages-dir <PNG 폴더> --out plan.jsonl
   python make_plan.py search   --split dev --out plan.jsonl
   python make_plan.py shipsearch --split dev --out plan.jsonl
+  python make_plan.py ml12 --out plan.jsonl       (12개 언어 커머스 질의, queries_12lang.yaml)
+  python make_plan.py mlship12 --out plan.jsonl   (12개 언어 무역 질의)
   python make_plan.py seeds    --split dev --out plan.jsonl   (정답 레코드를 바로 색인)
 
 --only 는 id 부분 문자열 필터입니다(쉼표로 여러 개). --limit 은 앞에서 N 건만 씁니다.
@@ -20,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from score_commerce import STATUS_CODE, status_table
-from truth import COMMERCE, commerce_pages, commerce_queries, trading_docs, trading_queries
+from truth import COMMERCE, commerce_pages, commerce_queries, multilingual_queries, trading_docs, trading_queries
 
 
 def commerce_plan(split: str) -> list:
@@ -76,6 +78,16 @@ def ship_search_plan(split: str) -> list:
     return out
 
 
+def ml_search_plan(domain: str) -> list:
+    """12개 언어 시나리오 (queries_12lang.yaml). 앱 언어는 한국어로 두고 질의 글에서 언어를 고르게 합니다."""
+    hosts = {p["shop"]: urlparse(p["url"]).hostname for p in commerce_pages()}
+    prefix, mode = ("m", "commerce") if domain == "commerce" else ("n", "shipping")
+    return [{
+        "id": f"{prefix}{i:04d}", "kind": "search", "query": q["query"], "mode": mode, "language": "korean",
+        "host": hosts.get(q["shop"], "") if domain == "commerce" else "", "truth_index": i, "lang": q["lang"],
+    } for i, q in enumerate(multilingual_queries(domain))]
+
+
 def seed_plan(split: str) -> list:
     """정답 레코드를 앱이 저장하는 모양으로 바꿉니다. 목록과 상세에 나뉜 값은 합칩니다."""
     statuses = status_table()
@@ -111,7 +123,7 @@ def seed_plan(split: str) -> list:
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["commerce", "trading", "images", "search", "shipsearch", "seeds"])
+    ap.add_argument("what", choices=["commerce", "trading", "images", "search", "shipsearch", "seeds", "ml12", "mlship12"])
     ap.add_argument("--split", default="dev", choices=["dev", "test", "all"])
     ap.add_argument("--pages-dir", type=Path)
     ap.add_argument("--only", default="")
@@ -124,6 +136,8 @@ def main() -> int:
         plan = trading_plan(a.split)
     elif a.what == "images":
         plan = image_plan(a.split, a.pages_dir)
+    elif a.what in ("ml12", "mlship12"):
+        plan = ml_search_plan("commerce" if a.what == "ml12" else "shipping")
     elif a.what == "shipsearch":
         plan = ship_search_plan(a.split)
     elif a.what == "seeds":

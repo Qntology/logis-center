@@ -69,3 +69,7 @@ mod vision_batch;
 // 합성 데이터를 실제 파이프라인에 태우는 평가 하네스 (LOGIS_SYNTH_PLAN, --ignored)
 mod search_fusion;
 mod synthetic_eval;
+// Stanza 실행기 (format 2): 의존 구문 디코딩 · 언어 판정 · 어간 + PyTorch 기준 출력 대조 (LOGIS_STANZA_DIR, --ignored)
+mod stanza_runtime;
+// 내장 도메인 사전: 개발 bias.json(ko · en) ↔ 배포 full_bias.json(모든 언어) 일관성
+mod bias_source;

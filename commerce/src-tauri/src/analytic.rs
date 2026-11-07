@@ -1596,48 +1596,21 @@ pub fn deterministic_time_keys(query: &str) -> (String, String) {
     (t_key, s_key)
 }
 
-/// 🌟 [STANZA LANG CODE] parse_commerce_query 와 동일한 매핑입니다.
-///  모델 디렉터리가 없으면 tokenize_query_with_pos 가 공백 분할로 폴백하므로,
-///  여기서는 매핑만 담당하고 존재 여부는 검사하지 않습니다.
+/// 🌟 [STANZA LANG CODE] 앱 언어 → 변환본 언어 코드 (crate::stanza::lang_code, 12개 언어 밖이면 en).
+///  질의 글의 언어는 crate::stanza::detect_query_lang 으로 고릅니다.
 pub fn stanza_lang_code(language: &str) -> &'static str {
-    match language {
-        "korean" | "ko" => "ko",
-        "english" | "en" => "en",
-        "japanese" | "ja" => "ja",
-        "chinese" | "zh" | "zh-hans" | "zh-hant" | "zh-tw" | "zh-hk" => "zh-hans",
-        "french" | "fr" => "fr",
-        "german" | "de" => "de",
-        "spanish" | "es" => "es",
-        "italian" | "it" => "it",
-        "portuguese" | "pt" => "pt",
-        "dutch" | "nl" => "nl",
-        "russian" | "ru" => "ru",
-        "arabic" | "ar" => "ar",
-        "thai" | "th" => "th",
-        "hindi" | "hi" => "hi",
-        "bengali" | "bn" => "bn",
-        "telugu" | "te" => "te",
-        "khmer" | "km" => "km",
-        "greek" | "el" => "el",
-        "hebrew" | "he" => "he",
-        "vietnamese" | "vi" => "vi",
-        _ => "en",
-    }
+    crate::stanza::lang_code(language).unwrap_or("en")
 }
 
-/// 🌟 [STANZA TOKENIZE + MORPHOLOGY] 질의를 어절 단위로 쪼개고 UPOS 태그와 Lemma 원형을 함께 부착합니다.
-///  ── 왜 Lemma 까지 필요한가 ──
-///   Stanza 토크나이저는 교착어 어절을 통째로 한 토큰으로 돌려줍니다.
-///     "클릭한게" → 1토큰  (클릭 + 한 + 게)
-///   이 표면형은 bias.json 의 exact_match("클릭")와 완전일치하지 않고,
-///   영어 구 뱅크("clicked", "pressed")와의 코사인도 낮아
-///   슬라이딩 윈도우에서 NMS 후보가 단 하나도 만들어지지 않습니다.
-///   (로그 실측: [NMS CANDIDATE] 0건 → EVENT FALLBACK 4종 전체)
-///   commerce 의 parse_commerce_query 는 이미 lemma_session 을 돌려
-///   '가디건찾아줘' → '가디건' 절단을 수행하고 있으므로, 같은 장치를 이식합니다.
-///
+/// 🌟 [STANZA TOKENIZE + MORPHOLOGY] 질의를 단위로 나누고 대표 UPOS 와 어간(원형)을 붙입니다.
+///  ── 단위 ──
+///   공백으로 낱말을 나누는 언어는 공백 어절, 일본어 · 중국어는 Stanza 토큰입니다 (crate::stanza::analyze_query).
+///  ── 왜 원형(어간)까지 필요한가 ──
+///   교착어 어절은 한 토큰입니다. "클릭한게" 는 bias.json 의 exact_match("클릭")와 완전일치하지 않고,
+///   영어 구 뱅크("clicked")와의 코사인도 낮아 슬라이딩 윈도우에서 NMS 후보가 없었습니다.
+///   한국어는 KAIST 품사로 실질 형태소만 이은 어간(클릭+하+ㄴ+것+이 → 클릭), 그 밖의 언어는 대표 낱말의 원형을 씁니다.
 ///  ── 반환 ──
-///   (표면형, UPOS 태그, Lemma 원형). 실패 시 태그/Lemma 는 빈 문자열입니다.
+///   (표면형, UPOS 태그, 어간). 모델이 없거나 실패하면 공백 분할에 태그 · 어간은 빈 문자열입니다.
 pub async fn tokenize_query_with_morphology(
     query: &str,
     lang_code: &str,
@@ -1654,155 +1627,29 @@ pub async fn tokenize_query_with_morphology(
     if words.is_empty() {
         return fallback;
     }
-
-    let base_dir = crate::utils::get_app_dir().join("models").join("stanza");
-    let lang_dir = base_dir.join(lang_code);
-    if !lang_dir.exists() {
-        println!(
-            "[ANALYTIC] ⚠️ Stanza 모델 디렉터리가 없어 공백 분할로 폴백합니다: {:?}",
-            lang_dir
-        );
-        return fallback;
-    }
-
-    struct UnsafePipelineWrapper(crate::stanza::StanzaPipeline);
-    unsafe impl Send for UnsafePipelineWrapper {}
-
-    let wrapper = match crate::stanza::StanzaPipeline::new(base_dir, lang_code).await {
-        Ok(p) => UnsafePipelineWrapper(p),
+    let q = query.to_string();
+    let code = lang_code.to_string();
+    match tokio::task::spawn_blocking(move || crate::stanza::analyze_query(&q, &code)).await {
+        Ok(Ok(qa)) => {
+            println!(
+                "[ANALYTIC] 🧠 Stanza ({}, {} ms, 단위: {}): {:?}",
+                qa.lang,
+                qa.elapsed_ms,
+                if qa.whitespace_units { "공백 어절" } else { "Stanza 토큰" },
+                qa.describe()
+            );
+            // 내용어가 있는 단위는 기능어 태그로 내지 않습니다 (한국어 '따뜻하게' SCONJ → 첫 실질 형태소 태그)
+            qa.units.into_iter().map(|u| (u.surface, u.upos, u.stem)).collect()
+        }
+        Ok(Err(e)) => {
+            println!("[ANALYTIC] ⚠️ Stanza 분석을 건너뜁니다 ({}): {:#}. 공백 분할로 폴백합니다.", lang_code, e);
+            fallback
+        }
         Err(e) => {
-            println!("[ANALYTIC] ⚠️ Stanza 로드 실패({:?}). 공백 분할로 폴백합니다.", e);
-            return fallback;
-        }
-    };
-    let mut stanza = wrapper.0;
-    if !stanza.preprocessor.pos_reliable {
-        println!("[ANALYTIC] ⚪ [POS RELIABILITY] 사전학습 단어 사전이 없어 품사 태그가 무작위에 가깝습니다. 공백 분할로 진행합니다.");
-        return fallback;
-    }
-
-    let refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
-
-    // ONNX Export 시 고정된 시퀀스 길이를 그대로 존중합니다.
-    let mut chunk_size = refs.len();
-    for input_meta in &stanza.pos_session.inputs {
-        let dims = &input_meta.dimensions;
-        if dims.len() == 2 && dims.get(1) == Some(&Some(32)) {
-            if let Some(&Some(fixed_seq)) = dims.get(0) {
-                chunk_size = fixed_seq as usize;
-            }
+            println!("[ANALYTIC] ⚠️ Stanza 분석 작업 실패({}). 공백 분할로 폴백합니다.", e);
+            fallback
         }
     }
-    if chunk_size == 0 {
-        chunk_size = refs.len();
-    }
-    let mut padded = refs.clone();
-    let valid_len = padded.len();
-    while padded.len() < chunk_size {
-        padded.push("<pad>");
-    }
-
-    let inputs = match stanza
-        .preprocessor
-        .encode_to_tensor(&padded, &stanza.pos_session, None, None)
-    {
-        Ok(v) => v,
-        Err(e) => {
-            println!("[ANALYTIC] ⚠️ Stanza encode 실패({:?}). 공백 분할로 폴백합니다.", e);
-            return fallback;
-        }
-    };
-
-    let outputs = match stanza.pos_session.run::<'_, '_, '_, i64, f32, _>(inputs) {
-        Ok(v) => v,
-        Err(e) => {
-            println!("[ANALYTIC] ⚠️ Stanza POS 추론 실패({:?}). 공백 분할로 폴백합니다.", e);
-            return fallback;
-        }
-    };
-
-    let t = &outputs[0];
-    let shape = t.shape();
-    if shape.len() < 2 {
-        return fallback;
-    }
-    let num_classes = if shape.len() == 3 {
-        shape[2] as usize
-    } else {
-        shape[1] as usize
-    };
-
-    // ── ① UPOS 디코드 + Lemma 세션 입력용 POS ID 수집 ──
-    let mut tags: Vec<String> = Vec::with_capacity(valid_len);
-    let mut pos_ids: Vec<i64> = Vec::with_capacity(valid_len);
-    for i in 0..valid_len {
-        let mut max_val = f32::MIN;
-        let mut max_idx = 0usize;
-        for c in 0..num_classes {
-            let v = if shape.len() == 3 { t[[0, i, c]] } else { t[[i, c]] };
-            if v > max_val {
-                max_val = v;
-                max_idx = c;
-            }
-        }
-        tags.push(
-            stanza
-                .preprocessor
-                .upos_vocab
-                .get(max_idx)
-                .cloned()
-                .unwrap_or_else(|| "X".to_string()),
-        );
-        pos_ids.push(max_idx as i64);
-    }
-
-    // ── ② Lemma 디코드 (commerce parse_commerce_query 와 동일 로직) ──
-    let mut lemmas: Vec<String> = vec![String::new(); valid_len];
-    if let Ok(lemma_inputs) = stanza.preprocessor.encode_to_tensor(
-        &padded,
-        &stanza.lemma_session,
-        Some(&pos_ids),
-        None,
-    ) {
-        if let Ok(lemma_outputs) = stanza
-            .lemma_session
-            .run::<'_, '_, '_, i64, f32, _>(lemma_inputs)
-        {
-            let lt = &lemma_outputs[0];
-            let ls = lt.shape();
-            if ls.len() == 3 || ls.len() == 4 {
-                let is_4d = ls.len() == 4;
-                let max_char_len = if is_4d { ls[2] as usize } else { ls[1] as usize };
-                let lemma_classes = if is_4d { ls[3] as usize } else { ls[2] as usize };
-                for i in 0..valid_len {
-                    let mut lemma_str = String::new();
-                    for j in 0..max_char_len {
-                        let mut mv = f32::MIN;
-                        let mut mi = 0usize;
-                        for c in 0..lemma_classes {
-                            let v = if is_4d { lt[[0, i, j, c]] } else { lt[[i, j, c]] };
-                            if v > mv {
-                                mv = v;
-                                mi = c;
-                            }
-                        }
-                        if let Some(&ch) = stanza.preprocessor.id_to_char.get(&(mi as i64)) {
-                            if ch != '<' && ch != '>' && ch != '_' {
-                                lemma_str.push(ch);
-                            }
-                        }
-                    }
-                    lemmas[i] = lemma_str.trim().to_string();
-                }
-            }
-        }
-    }
-
-    let mut out: Vec<(String, String, String)> = Vec::with_capacity(valid_len);
-    for i in 0..valid_len {
-        out.push((words[i].clone(), tags[i].clone(), lemmas[i].clone()));
-    }
-    out
 }
 
 /// 🌟 [ANALYTIC SEARCH QUERY] #global-search 의 자연어 질의를 검색 컨텍스트로 변환합니다.

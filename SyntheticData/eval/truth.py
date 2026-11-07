@@ -189,6 +189,26 @@ def commerce_records() -> list:
     return read_yaml(COMMERCE / "records.yaml")
 
 
+# ──────────────────────────────────────────────
+# 12개 언어 검색 시나리오 (eval/queries_12lang.yaml)
+# Stanza 변환본 12개 언어가 검색 경로에서 도는지 보려고 같은 정답 집합의 질의를 12개 언어로 씁니다.
+# 계획 id 는 이 목록의 순번입니다 (커머스 · 무역 따로).
+# ──────────────────────────────────────────────
+LANGS_12 = ["en", "ko", "de", "es", "fr", "it", "pt", "nl", "cs", "ar", "ja", "zh-hans"]
+
+
+def multilingual_queries(domain: str) -> list:
+    spec = read_yaml(Path(__file__).resolve().parent / "queries_12lang.yaml")
+    out = []
+    for entry in spec["commerce" if domain == "commerce" else "shipping"]:
+        for lang in LANGS_12:
+            out.append({
+                "split": "12lang", "shop": entry.get("shop", ""), "kind": entry["kind"], "key": entry["key"],
+                "lang": lang, "domain": domain, "query": entry["query"][lang], "relevant": list(entry["relevant"]),
+            })
+    return out
+
+
 if __name__ == "__main__":
     import collections
     import sys

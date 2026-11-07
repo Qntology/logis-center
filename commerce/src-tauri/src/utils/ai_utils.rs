@@ -65,6 +65,16 @@ fn is_modifier_deprel(label: &str) -> bool {
     )
 }
 
+/// UD 기능어 관계 (조동사 · 계사 · 격 표지 · 접속 · 한정사 · 구두점). `is_modifier_deprel` 과 달리 내용 수식어
+/// (amod · advmod · acl · advcl)는 넣지 않습니다. 의존 구문이 실제로 맞게 나오면서(stanza format 2) 'beige'(amod) 같은
+/// 조건어가 기능어로 빠지지 않게 하려는 것입니다.
+fn is_function_deprel(label: &str) -> bool {
+    matches!(
+        deprel_base(label).as_str(),
+        "aux" | "cop" | "case" | "mark" | "cc" | "det" | "discourse" | "expl" | "punct"
+    )
+}
+
 /// [PHASE 2] UD 체언 논항·복합어 의존관계 → 개체명 후보 근거 (전 언어 공통)
 fn is_nominal_deprel(label: &str) -> bool {
     matches!(
@@ -259,59 +269,6 @@ pub fn evaluate_entity_candidacy(
     }
 
     MorphVerdict::ok("UD UPOS 체언 근거 확보")
-}
-
-/// [PHASE 2] Depparse ONNX 세션을 실행하여 토큰별 UD DEPREL 레이블을 추출합니다.
-/// preprocessor 와 session 을 분리 수신하여 StanzaPipeline 의 필드 단위 대여 충돌을 방지합니다.
-pub fn run_depparse_deprels(
-    preprocessor: &crate::stanza::StanzaPreprocessor,
-    session: &mut onnxruntime::session::Session<'static>,
-    words: &[&str],
-    pos_ids: &[i64],
-) -> Option<Vec<String>> {
-    if preprocessor.deprel_vocab.is_empty() || words.is_empty() { return None; }
-    if pos_ids.len() < words.len() { return None; }
-
-    // 세션 가변 대여 이전에 사전을 복제하여 라이프타임 충돌을 원천 차단
-    let deprel_vocab: Vec<String> = preprocessor.deprel_vocab.clone();
-
-    let inputs = preprocessor
-        .encode_to_tensor(words, session, Some(&pos_ids[..words.len()]), None)
-        .ok()?;
-
-    let outputs = session.run::<'_, '_, '_, i64, f32, _>(inputs).ok()?;
-    if outputs.len() < 2 { return None; }
-
-    let arc = &outputs[0];
-    let rel = &outputs[1];
-    let arc_shape = arc.shape();
-    let rel_shape = rel.shape();
-    if arc_shape.len() < 3 || rel_shape.len() < 4 { return None; }
-
-    let seq = words.len().min(arc_shape[1] as usize).min(rel_shape[1] as usize);
-    let head_dim = (arc_shape[2] as usize).min(rel_shape[2] as usize);
-    let num_rel = rel_shape[3] as usize;
-    if seq == 0 || head_dim == 0 || num_rel == 0 { return None; }
-
-    let mut result = Vec::with_capacity(seq);
-    for i in 0..seq {
-        // 1) 최고 점수 head(지배소) 탐색
-        let mut best_head = 0usize;
-        let mut best_arc = std::f32::MIN;
-        for h in 0..head_dim {
-            let v = arc[[0, i, h]];
-            if v > best_arc { best_arc = v; best_head = h; }
-        }
-        // 2) 해당 head 에 대한 최적 DEPREL 레이블 탐색
-        let mut best_rel = 0usize;
-        let mut best_rel_score = std::f32::MIN;
-        for r in 0..num_rel {
-            let v = rel[[0, i, best_head, r]];
-            if v > best_rel_score { best_rel_score = v; best_rel = r; }
-        }
-        result.push(deprel_vocab.get(best_rel).cloned().unwrap_or_else(|| "dep".to_string()));
-    }
-    Some(result)
 }
 
 pub fn max_pool_sim(target: &[f32], phrase_embs: &Vec<Vec<f32>>) -> f32 {
@@ -1822,10 +1779,10 @@ pub fn is_functional_word_chunk(
 
     let idx_opt = words.iter().position(|w| w == c);
 
-    // ① 이 토큰 자체가 UD 수식어/기능어 관계인가 (deprel 이 있을 때만)
+    // ① 이 토큰 자체가 UD 기능어 관계인가 (deprel 이 있을 때만)
     if let (Some(rels), Some(idx)) = (deprels, idx_opt) {
         if let Some(r) = rels.get(idx) {
-            if is_modifier_deprel(r) { return true; }
+            if is_function_deprel(r) { return true; }
         }
     }
 
@@ -4299,7 +4256,10 @@ pub fn exact_match_filter_key_tailed(category: &str, chunk: &str) -> Option<Stri
         .find_map(|(stem, _)| exact_match_filter_key(category, stem))
 }
 
-pub const STANZA_DROP_TAGS: [&str; 7] = ["VERB", "ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
+/// 검색어에서 기능어로 보고 빼는 UPOS. VERB 는 넣지 않습니다: 품사가 맞게 나오면 'cancelled' · 'expiring' · '식히는' 같은
+/// 내용 동사가 조건(상태 · 용도)인데, 이전 목록은 이것까지 지웠습니다 (이전 변환본은 품사가 무작위라 목록이 실제로 쓰이지 않음).
+/// 명령 동사('찾아줘' · 'find')는 parse_commerce_query 의 ACTION VERB 판정이 가립니다.
+pub const STANZA_DROP_TAGS: &[&str] = &["ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
 
 fn time_unit_prefix(norm: &str) -> Option<(&'static str, String)> {
     let mut best: Option<(&'static str, usize, String)> = None;
