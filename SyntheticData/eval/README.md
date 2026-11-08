@@ -70,6 +70,16 @@ python score_search.py mlship12_out.jsonl 무역추출결과.jsonl --domain ship
 
 - 커머스: 쇼핑몰 4곳 dev, 2곳 test. 레이아웃이 겹치지 않습니다.
 - 무역: Part 번호가 3의 배수인 15건 test, 나머지 30건 dev.
+- ml: 한국어 · 영어 밖 언어의 합성 데이터. 커머스는 10개 언어 쇼핑몰 10곳(`commerce/lang_packs`), 무역은 11개 언어 × 서식 5종(`trading/ml`). 질의도 그 언어로 씁니다. 언어별로 보려면 `score_search.py --by lang`, 무역 추출은 `score_trading.py --split ml` 이 언어별 줄을 덧붙입니다.
+
+```bat
+python make_plan.py seeds --split ml --out seeds_ml.jsonl         & rem 커머스 정답 레코드 999건 (통화는 쇼핑몰 통화)
+python make_plan.py search --split ml --out search_ml.jsonl       & rem 커머스 질의 648건
+python make_plan.py trading --split ml --out trading_ml.jsonl     & rem 무역 서류 55건
+python make_plan.py shipsearch --split ml --out ship_ml.jsonl     & rem 무역 질의 187건
+```
+
+값 비교(`normalize.py`)는 유럽식 숫자(`1.234,50` · `2 840,0` · `174,42`)와 날짜(`26.07.2026` · `26/07/2026` · `26. 7. 2026` · `2026年7月26日`)도 같은 값으로 봅니다. 영어 · 한국어 결과의 채점은 바뀌지 않습니다(무역 45건으로 대조).
 
 검색 시드는 `make_plan.py seeds` 로 만듭니다. 주문 `no` · 운송장 `tracking_number` 칸까지 넣어야 식별자 조건을 공정하게 잽니다. 그 칸이 빠진 예전 시드로 잰 수치는 쓰지 않습니다.
 

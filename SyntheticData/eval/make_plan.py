@@ -5,6 +5,7 @@
 tests/it/synthetic_eval.rs 가 읽는 JSONL 계획을 씁니다.
 
   python make_plan.py commerce --split dev --out plan.jsonl
+  python make_plan.py commerce --split ml --out plan.jsonl   (10개 언어 쇼핑몰, 같은 꼴로 search · seeds 도)
   python make_plan.py trading  --split dev --out plan.jsonl
   python make_plan.py images   --split dev --pages-dir <PNG 폴더> --out plan.jsonl
   python make_plan.py search   --split dev --out plan.jsonl
@@ -23,6 +24,12 @@ from urllib.parse import urlparse
 
 from score_commerce import STATUS_CODE, status_table
 from truth import COMMERCE, commerce_pages, commerce_queries, multilingual_queries, trading_docs, trading_queries
+
+sys.path.insert(0, str(COMMERCE))
+from lang_packs import PACKS  # noqa: E402
+
+# 쇼핑몰 언어 → 통화 (언어 팩 쇼핑몰은 팩의 통화)
+CURRENCY = {"ko": "KRW", "en": "USD", **{lang: pk["shop"]["currency"] for lang, pk in PACKS.items()}}
 
 
 def commerce_plan(split: str) -> list:
@@ -61,7 +68,7 @@ def search_plan(split: str) -> list:
             continue
         out.append({
             "id": f"q{i:04d}", "kind": "search", "query": q["query"], "mode": "commerce",
-            "language": "korean", "host": hosts[q["shop"]], "truth_index": i,
+            "language": "korean", "host": hosts[q["shop"]], "truth_index": i, "lang": q["lang"],
         })
     return out
 
@@ -110,7 +117,7 @@ def seed_plan(split: str) -> list:
         data["link"] = f"https://{host}/{kind}/{rid}"
         # 번호는 앱이 저장하는 칸에도 둡니다. 없으면 식별자 조건이 정답을 지워 검색이 부당하게 나빠 보입니다.
         data.setdefault({"order": "no", "tracking": "tracking_number"}.get(kind, "code"), rid)
-        data["currency"] = "KRW" if rec["page"]["lang"] == "ko" else "USD"
+        data["currency"] = CURRENCY[rec["page"]["lang"]]
         if "goods" in data:
             data["goods_title"] = data.pop("goods")
         out.append({
@@ -124,7 +131,8 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
     ap.add_argument("what", choices=["commerce", "trading", "images", "search", "shipsearch", "seeds", "ml12", "mlship12"])
-    ap.add_argument("--split", default="dev", choices=["dev", "test", "all"])
+    ap.add_argument("--split", default="dev", choices=["dev", "test", "ml", "all"],
+                    help="ml: 한국어 · 영어 밖 10개 언어 (커머스 언어 팩 쇼핑몰 · 무역 다국어 문서)")
     ap.add_argument("--pages-dir", type=Path)
     ap.add_argument("--only", default="")
     ap.add_argument("--limit", type=int, default=0)

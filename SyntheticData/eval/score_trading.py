@@ -89,7 +89,8 @@ def main() -> int:
                         errors.append((d["stem"], field, v, got[:3]))
                 else:
                     c["없음"] += 1
-        doc_rows.append({"stem": d["stem"], "code": d["code"], "got": got_code, "ok_code": ok_code, "hit": hit, "total": total})
+        doc_rows.append({"stem": d["stem"], "code": d["code"], "lang": d.get("lang", "en"), "got": got_code,
+                         "ok_code": ok_code, "hit": hit, "total": total})
     print(f"문서 {docs_n} | 저장 {doc_ok} | 서식 코드 {code_ok}/{docs_n} = {code_ok / max(1, docs_n):.1%}")
     t = Counter()
     for c in per_field.values():
@@ -100,6 +101,14 @@ def main() -> int:
     for f, c in sorted(per_field.items(), key=lambda kv: -sum(kv[1].values())):
         total = sum(c.values())
         print(f"  {f:22s} {c['맞음']:4d}/{total:<4d} {c['맞음'] / total:6.1%} 틀림 {c['틀림']:3d} 없음 {c['없음']:3d}")
+    langs = sorted({r["lang"] for r in doc_rows})
+    if len(langs) > 1:  # 분할 ml: 언어별 서식 코드 · 값 맞음
+        print("언어별")
+        for lang in langs:
+            rows = [r for r in doc_rows if r["lang"] == lang]
+            hit, total = sum(r["hit"] for r in rows), sum(r["total"] for r in rows)
+            print(f"  {lang:8s} 문서 {len(rows):2d} | 서식 코드 {sum(r['ok_code'] for r in rows)}/{len(rows)} | "
+                  f"값 {hit}/{total} = {hit / max(1, total):.1%}")
     for e in errors[: a.errors]:
         print("  ", e)
     if a.dump:
