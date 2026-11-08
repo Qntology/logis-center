@@ -3,7 +3,7 @@
 //! 두 파일은 손으로 따로 고치므로 어긋나기 쉽습니다. 공통 구역과 ko · en 구역이 같은지, full 에만 있는 구역이 언어 구역인지 봅니다.
 
 use serde_json::{Map, Value};
-use tauri_app_lib::utils::bias_schema::BIAS_SOURCE;
+use tauri_app_lib::utils::bias_schema::{lang_code_of, BIAS_SOURCE};
 
 const DEV: &str = include_str!("../../src/utils/bias.json");
 const FULL: &str = include_str!("../../src/utils/full_bias.json");
@@ -32,6 +32,19 @@ fn full_bias_is_dev_bias_plus_language_sections() {
     for k in extra {
         assert!(is_language_section(&full[k]), "full_bias.json 에만 있는 '{k}' 는 언어 구역이어야 합니다");
     }
+}
+
+/// 배포 사전은 Stanza 가 받는 12개 언어마다 언어 구역을 둡니다. 구역이 없으면 그 언어 페이지 · 서류도
+/// 영어 구역 앵커로 필드를 맞춥니다(bias_schema 의 `or_else(|| BIAS_DICT.get("en"))`).
+#[test]
+fn full_bias_covers_every_stanza_language() {
+    let full = sections(FULL);
+    let missing: Vec<String> = tauri_app_lib::stanza::LANGS
+        .iter()
+        .map(|l| lang_code_of(l))
+        .filter(|code| !full.get(code).is_some_and(is_language_section))
+        .collect();
+    assert!(missing.is_empty(), "full_bias.json 에 언어 구역이 없습니다: {missing:?}");
 }
 
 #[test]
