@@ -77,3 +77,5 @@ mod bias_source;
 mod sds_ledger;
 // 행동 로그 도메인 · 웹 경로 정의: link 경로 → 페이지 종류, 12개 언어 질의 문구 → 페이지 종류 (bias.json analytic_page_filters)
 mod analytic_page;
+// 목록 행의 자기 식별자: 코사인 게이트가 실패하면 이 페이지 유형의 별칭 매개변수 링크(od_id · it_id · invoice)를 먼저
+mod relay_links;

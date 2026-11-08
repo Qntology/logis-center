@@ -7091,6 +7091,29 @@ pub fn collect_typed_relay_refs(
     claims
 }
 
+/// 🌟 [ID/LINK SELF ALIAS] 코사인 게이트를 아무 후보도 통과하지 못했을 때 레거시 해석기보다 먼저 봅니다: 이 페이지 유형의
+/// 별칭을 매개변수 이름으로 가진 링크(주문 목록의 od_id, 상품 목록의 it_id ...)가 한 번호로만 나오면 그것이 행 자신의 식별자입니다.
+///
+/// 한 행에 주문 · 상품 · 운송장 · 쿠폰 링크가 함께 있으면 레거시 해석기가 운송장(invoice) 링크를 주문의 자기 식별자로 잡았고,
+/// 그 주문을 주문번호로 가리키는 배송 행의 연결이 한 건도 성립하지 않았습니다 (v2 관계형 합성 데이터: 배송 → 주문 0/22).
+/// URL 매개변수 이름만 보므로 화면 언어와 무관합니다.
+pub fn self_alias_id_link(cands: &[IdLinkCandidate], page_type: &str) -> Option<(String, String)> {
+    let aliases = crate::logic::relay_type_aliases(page_type);
+    if aliases.is_empty() {
+        return None;
+    }
+    let typed: Vec<&IdLinkCandidate> = cands
+        .iter()
+        .filter(|c| !c.is_host_part && candidate_type_evidence(c, aliases) >= 2)
+        .collect();
+    let first = typed.first()?;
+    if typed.iter().all(|c| same_id_token(&c.token, &first.token)) {
+        Some((first.token.clone(), first.href.clone()))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LabeledTokenCandidate {
     pub token: String,
