@@ -204,6 +204,19 @@ pub fn leave_scope() {
     }
 }
 
+/// 지금 스코프를 그대로 돌려줍니다(비어 있을 수 있음). 남이 연 스코프 안에서 잠시 다른 스코프로 관측하는 함수는
+/// 끝날 때 leave_scope 대신 restore_scope 로 되돌립니다. leave_scope 는 호출자의 스코프까지 지워, 그 뒤 호출자의
+/// 관측이 'unscoped' 로 떨어집니다.
+pub fn scope_snapshot() -> Scope {
+    ACTIVE_SCOPE.read().map(|s| s.clone()).unwrap_or_default()
+}
+
+pub fn restore_scope(s: Scope) {
+    if let Ok(mut w) = ACTIVE_SCOPE.write() {
+        *w = s;
+    }
+}
+
 fn current_scope() -> Option<Scope> {
     let s = ACTIVE_SCOPE.read().ok()?.clone();
     if s.is_empty() { None } else { Some(s) }
@@ -544,6 +557,15 @@ static DIRTY: Lazy<RwLock<HashMap<Ledger, bool>>> = Lazy::new(|| RwLock::new(Has
 static INDEXING_DEPTH: Lazy<RwLock<u32>> = Lazy::new(|| RwLock::new(0));
 /// load() 로 디스크의 원장을 바탕에 올렸는지. 올리지 않은 프로세스는 저장하지 않습니다.
 static LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 🌟 [SDS TEAM HOLD] 로그인 전(로컬 기본 팀)으로 부팅했을 때 읽은 실제 팀의 원장 · 보유 현황.
+///   판정에 쓰지 않고 파일도 덮어쓰지 않은 채 rebind_team 을 기다립니다. 같은 팀으로 로그인하면 바탕으로 되살리고
+///   다른 팀이면 그때 버립니다. 예전에는 load() 가 이 원장을 '팀 불일치' 로 버린 뒤 곧바로 빈 원장으로 덮어써서,
+///   로그인한 사용자의 누적 통계가 앱을 다시 켤 때마다 사라졌습니다(부팅은 언제나 로컬 기본 팀으로 load 합니다).
+static HELD: Lazy<RwLock<HashMap<Ledger, SdsFile>>> = Lazy::new(|| RwLock::new(HashMap::new()));
+static HELD_PRESENCE: Lazy<RwLock<Option<PresenceIndex>>> = Lazy::new(|| RwLock::new(None));
+/// 🌟 [SDS RUN RETIRE] report() 가 닫기로 표시한 뒤 저장되기 전에 새 관측이 들어와 새 실행으로 바뀐 실행들.
+///   관측은 바뀌는 즉시 원장 바탕에 합쳤고, 실행 파일만 다음 저장에서 씁니다.
+static RETIRED: Lazy<RwLock<Vec<(Ledger, RunBuf)>>> = Lazy::new(|| RwLock::new(Vec::new()));
 
 #[derive(Debug, Clone, Default)]
 struct RunBuf {
@@ -554,6 +576,8 @@ struct RunBuf {
     closing: bool,
     observations: u64,
     scopes: HashMap<String, ScopeStat>,
+    /// 라벨이 바뀌기 전 이름들. 그 이름으로 이미 쓴 파일은 다음 저장에서 지웁니다.
+    stale_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -744,25 +768,68 @@ fn fresh_run(l: Ledger, label: &str) -> RunBuf {
         closing: false,
         observations: 0,
         scopes: HashMap::new(),
+        stale_files: Vec::new(),
     }
 }
 
-fn open_run<'a>(runs: &'a mut HashMap<Ledger, RunBuf>, l: Ledger, label: &str) -> &'a mut RunBuf {
+/// 이 원장의 열린 실행을 돌려줍니다. 두 번째 값은 report() 가 닫기로 표시했지만 아직 저장(finalize)되지 않아
+/// 새 실행으로 바꾼 예전 실행입니다. 호출자는 RUNS 잠금을 놓은 뒤 retire_run 에 넘깁니다
+/// (resolve_entry 가 BASES → RUNS 순으로 잠그므로 RUNS 를 쥔 채 BASES 를 잠그면 안 됩니다).
+fn open_run<'a>(runs: &'a mut HashMap<Ledger, RunBuf>, l: Ledger, label: &str) -> (&'a mut RunBuf, Option<RunBuf>) {
     let run = runs.entry(l).or_insert_with(|| fresh_run(l, label));
-    if run.closing { *run = fresh_run(l, label); }
-    run
+    // 🌟 [SDS RUN RETIRE] 예전에는 닫는 실행을 그 자리에서 새 실행으로 덮어썼습니다. report() 와 flush() 의 finalize
+    //    사이에 다른 스레드(백그라운드 색인 등)의 관측이 들어오면 닫는 실행의 관측이 원장에 합쳐지지 못하고 사라졌습니다.
+    let retired = if run.closing { Some(std::mem::replace(run, fresh_run(l, label))) } else { None };
+    (run, retired)
+}
+
+/// open_run 이 바꾼 예전 실행의 관측을 원장 바탕에 합치고, 실행 파일은 다음 저장에서 쓰도록 줄 세웁니다.
+fn retire_run(l: Ledger, run: RunBuf) {
+    absorb_run_into_base(l, &run.scopes);
+    println!(
+        "[SDS] 🧾 [RUN RETIRED] {} | 닫는 중이던 '{}' 관측 {}건을 저장 전에 원장에 합쳤습니다. (그 사이 새 관측이 들어와 새 실행을 열었습니다)",
+        l.as_str(), run.file, run.observations
+    );
+    if let Ok(mut q) = RETIRED.write() { q.push((l, run)); }
+    mark_dirty(l);
+}
+
+fn absorb_run_into_base(l: Ledger, scopes: &HashMap<String, ScopeStat>) {
+    let team = TEAM.read().map(|t| t.clone()).unwrap_or_default();
+    if let Ok(mut b) = BASES.write() {
+        let base = b.entry(l).or_insert_with(|| SdsFile {
+            recipe: SDS_RECIPE.to_string(),
+            team,
+            updated_at: 0,
+            scopes: HashMap::new(),
+        });
+        for (k, v) in scopes.iter() {
+            base.scopes.entry(k.clone()).or_insert_with(ScopeStat::default).absorb(v.clone(), ring_for_key(k));
+        }
+        base.updated_at = chrono::Utc::now().timestamp_millis();
+    }
+}
+
+/// 실행의 라벨을 바꿉니다. 🌟 [SDS RUN RELABEL] 예전 이름은 stale_files 에 남겨 다음 저장에서 그 파일을 지웁니다.
+/// 예전에는 이미 저장된 예전 이름의 파일이 남아, 같은 관측이 두 실행 파일(예: '_search' 와 '_<질의>')에 겹쳐 보였습니다.
+fn relabel_run(run: &mut RunBuf, l: Ledger, label: &str) {
+    if run.label == label { return; }
+    let file = unique_run_file(l, &run.stamp, label);
+    let prev = std::mem::replace(&mut run.file, file);
+    if !run.stale_files.contains(&prev) { run.stale_files.push(prev); }
+    run.label = label.to_string();
 }
 
 pub fn set_run_label(label: &str) {
     let l = sanitize_label(label);
     let ledger = current_ledger();
+    let mut retired = None;
     if let Ok(mut runs) = RUNS.write() {
-        let run = open_run(&mut runs, ledger, &l);
-        if run.label != l {
-            run.label = l.clone();
-            run.file = unique_run_file(ledger, &run.stamp, &l);
-        }
+        let (run, old) = open_run(&mut runs, ledger, &l);
+        retired = old;
+        relabel_run(run, ledger, &l);
     }
+    if let Some(old) = retired { retire_run(ledger, old); }
 }
 
 pub fn run_stamp() -> String {
@@ -823,6 +890,8 @@ pub fn load(team: &str) {
     let mut loaded = 0usize;
     let mut scopes_total = 0usize;
     let mut bases: HashMap<Ledger, SdsFile> = HashMap::new();
+    let mut held: HashMap<Ledger, SdsFile> = HashMap::new();
+    let local = local_default_team();
     for l in Ledger::all() {
         let path = ledger_path(l);
         let mut fresh = SdsFile {
@@ -840,29 +909,38 @@ pub fn load(team: &str) {
                                 "[SDS] 🧹 [{}] 레시피 세대 불일치 (저장 '{}' vs 현재 '{}'). 이 원장을 폐기하고 새로 시작합니다.",
                                 l.as_str(), f.recipe, SDS_RECIPE
                             );
-                        } else if !team.is_empty()
-                            && !f.team.is_empty()
-                            && f.team != team
-                            && f.team == local_default_team()
-                        {
-                            let n = f.scopes.len();
-                            let prev_team = f.team.clone();
-                            fresh = f;
-                            fresh.team = team.to_string();
-                            println!(
-                                "[SDS] 🚚 [TEAM MIGRATE / {}] 로컬 기본 팀 '{}' 의 스코프 {}개를 실제 팀 '{}' 로 이관했습니다.",
-                                l.as_str(), prev_team, n, team
-                            );
-                        } else if !team.is_empty() && !f.team.is_empty() && f.team != team {
-                            println!(
-                                "[SDS] 🧹 [{}] 팀 불일치 (저장 '{}' vs 현재 '{}'). 이 원장을 폐기합니다. (스코프 격리 원칙)",
-                                l.as_str(), f.team, team
-                            );
                         } else {
-                            scopes_total += f.scopes.len();
-                            loaded += 1;
-                            fresh = f;
-                            fresh.team = team.to_string();
+                            match team_fate(&f.team, team, &local) {
+                                TeamFate::Migrate => {
+                                    let n = f.scopes.len();
+                                    let prev_team = f.team.clone();
+                                    fresh = f;
+                                    fresh.team = team.to_string();
+                                    println!(
+                                        "[SDS] 🚚 [TEAM MIGRATE / {}] 로컬 기본 팀 '{}' 의 스코프 {}개를 실제 팀 '{}' 로 이관했습니다.",
+                                        l.as_str(), prev_team, n, team
+                                    );
+                                }
+                                TeamFate::Hold => {
+                                    println!(
+                                        "[SDS] ⏸️ [TEAM HOLD / {}] 저장 원장은 실제 팀 '{}' 의 것(스코프 {}개)입니다. 로그인 전이라 판정에 쓰지 않고 파일도 그대로 둡니다. 같은 팀으로 로그인하면 되살립니다.",
+                                        l.as_str(), f.team, f.scopes.len()
+                                    );
+                                    held.insert(l, f);
+                                }
+                                TeamFate::Discard => {
+                                    println!(
+                                        "[SDS] 🧹 [{}] 팀 불일치 (저장 '{}' vs 현재 '{}'). 이 원장을 폐기합니다. (스코프 격리 원칙)",
+                                        l.as_str(), f.team, team
+                                    );
+                                }
+                                TeamFate::Keep => {
+                                    scopes_total += f.scopes.len();
+                                    loaded += 1;
+                                    fresh = f;
+                                    fresh.team = team.to_string();
+                                }
+                            }
                         }
                     }
                     Err(e) => println!("[SDS] ⚠️ [{}] 원장 파싱 실패({}). 새로 시작합니다.", l.as_str(), e),
@@ -873,7 +951,9 @@ pub fn load(team: &str) {
         bases.insert(l, fresh);
     }
     if let Ok(mut w) = BASES.write() { *w = bases; }
+    if let Ok(mut w) = HELD.write() { *w = held; }
     if let Ok(mut w) = RUNS.write() { w.clear(); }
+    if let Ok(mut q) = RETIRED.write() { q.clear(); }
     if let Ok(mut d) = DIRTY.write() { d.clear(); }
     presence_load(team);
     LOADED.store(true, std::sync::atomic::Ordering::Release);
@@ -918,24 +998,31 @@ fn presence_load(team: &str) {
         updated_at: chrono::Utc::now().timestamp_millis(),
         docs: HashMap::new(),
     };
+    let mut held: Option<PresenceIndex> = None;
     if path.exists() {
         if let Ok(txt) = std::fs::read_to_string(&path) {
             if let Ok(p) = serde_json::from_str::<PresenceIndex>(&txt) {
-                let team_ok = team.is_empty()
-                    || p.team.is_empty()
-                    || p.team == team
-                    || p.team == local_default_team();
-                if p.recipe == SDS_RECIPE && team_ok {
+                let fate = team_fate(&p.team, team, &local_default_team());
+                if p.recipe != SDS_RECIPE || fate == TeamFate::Discard {
+                    println!("[SDS] 🧹 [PRESENCE] 세대 또는 팀 불일치로 저장 보유 현황을 새로 시작합니다.");
+                } else if fate == TeamFate::Hold {
+                    println!(
+                        "[SDS] ⏸️ [PRESENCE HOLD] 저장 보유 현황 {}건은 실제 팀의 것입니다. 로그인 전이라 쓰지 않고 파일도 그대로 둡니다.",
+                        p.docs.len()
+                    );
+                    held = Some(p);
+                } else {
                     fresh = p;
                     fresh.team = team.to_string();
-                } else {
-                    println!("[SDS] 🧹 [PRESENCE] 세대 또는 팀 불일치로 저장 보유 현황을 새로 시작합니다.");
                 }
             }
         }
     }
+    let holding = held.is_some();
+    if let Ok(mut w) = HELD_PRESENCE.write() { *w = held; }
     if let Ok(mut w) = PRESENCE.write() { *w = fresh; }
-    if let Ok(mut d) = PRESENCE_DIRTY.write() { *d = true; }
+    // 보류 중이면 파일을 다시 쓰지 않습니다(빈 현황으로 실제 팀의 파일을 덮지 않도록).
+    if let Ok(mut d) = PRESENCE_DIRTY.write() { *d = !holding; }
 }
 
 pub fn presence_record(doc_type: &str, id: &str, fields: &[String]) {
@@ -980,6 +1067,9 @@ pub fn presence_forget(id: &str) {
 fn presence_flush() {
     let dirty = PRESENCE_DIRTY.read().map(|d| *d).unwrap_or(false);
     if !dirty { return; }
+    // 🌟 [SDS TEAM HOLD] 실제 팀의 보유 현황을 보류하는 동안(로그인 전)은 파일을 덮어쓰지 않습니다.
+    //    그동안의 기록은 메모리에 남아 rebind_team 에서 합쳐진 뒤 저장됩니다.
+    if HELD_PRESENCE.read().map(|h| h.is_some()).unwrap_or(false) { return; }
     let snapshot = match PRESENCE.read() { Ok(p) => p.clone(), Err(_) => return };
     let mut snapshot = snapshot;
     snapshot.recipe = SDS_RECIPE.to_string();
@@ -1013,6 +1103,31 @@ fn local_default_team() -> String {
     crate::utils::hash::hash_id("0x0000000000000000000000000000000000000000")
 }
 
+/// 저장된 원장 · 보유 현황의 팀(stored)을 지금 팀(current)에서 어떻게 다룰지.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeamFate {
+    /// 같은 팀이거나 어느 한쪽 팀을 모름 — 그대로 씁니다.
+    Keep,
+    /// 로그인 전 로컬 기본 팀에서 쌓인 것 — 지금 팀으로 이관합니다.
+    Migrate,
+    /// 지금이 로그인 전(로컬 기본 팀)인데 저장본은 실제 팀의 것 — 쓰지도 덮지도 않고 rebind_team 을 기다립니다.
+    Hold,
+    /// 다른 실제 팀의 것 — 버립니다(스코프 격리 원칙).
+    Discard,
+}
+
+fn team_fate(stored: &str, current: &str, local: &str) -> TeamFate {
+    if current.is_empty() || stored.is_empty() || stored == current {
+        TeamFate::Keep
+    } else if stored == local {
+        TeamFate::Migrate
+    } else if current == local {
+        TeamFate::Hold
+    } else {
+        TeamFate::Discard
+    }
+}
+
 pub fn rebind_team(team: &str) {
     let prev = TEAM.read().map(|t| t.clone()).unwrap_or_default();
     if prev.is_empty() || prev == team {
@@ -1023,26 +1138,54 @@ pub fn rebind_team(team: &str) {
         if let Ok(mut p) = PRESENCE.write() { p.team = team.to_string(); }
         return;
     }
-    if prev == local_default_team() {
+    let local = local_default_team();
+    if prev == local {
+        // 보류를 풀고 다시 저장하기까지 백그라운드 저장이 끼어들지 않게 한 번에 잠급니다.
+        // (끼어들면 보류가 풀린 뒤 · 되살리기 전의 바탕으로 실제 팀의 원장 파일을 덮어씁니다)
+        let _flush_guard = FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let held = HELD.write().map(|mut h| std::mem::take(&mut *h)).unwrap_or_default();
+        let held_presence = HELD_PRESENCE.write().ok().and_then(|mut h| h.take());
         let scopes: usize = BASES.read().map(|b| b.values().map(|f| f.scopes.len()).sum()).unwrap_or(0);
         let docs = PRESENCE.read().map(|p| p.docs.len()).unwrap_or(0);
-        if let Ok(mut w) = TEAM.write() { *w = team.to_string(); }
+        let (mut restored, mut dropped) = (0usize, 0usize);
         if let Ok(mut b) = BASES.write() {
+            for (l, h) in held {
+                // 🌟 [SDS TEAM HOLD] 부팅 때 보류한 원장이 이 팀의 것이면 바탕으로 되살리고, 로그인 전에 쌓인
+                //    관측(지금 바탕)을 그 위에 합칩니다. 다른 팀의 것이면 버립니다.
+                if team_fate(&h.team, team, &local) != TeamFate::Keep {
+                    dropped += h.scopes.len();
+                    continue;
+                }
+                restored += h.scopes.len();
+                let mut base = h;
+                if let Some(cur) = b.remove(&l) {
+                    for (k, v) in cur.scopes {
+                        let ring = ring_for_key(&k);
+                        base.scopes.entry(k).or_insert_with(ScopeStat::default).absorb(v, ring);
+                    }
+                }
+                b.insert(l, base);
+            }
             for f in b.values_mut() { f.team = team.to_string(); }
         }
-        if let Ok(mut p) = PRESENCE.write() { p.team = team.to_string(); }
+        let mut docs_restored = 0usize;
+        if let Ok(mut p) = PRESENCE.write() {
+            if let Some(h) = held_presence.filter(|h| team_fate(&h.team, team, &local) == TeamFate::Keep) {
+                docs_restored = h.docs.len();
+                let newer = std::mem::take(&mut p.docs);
+                p.docs = h.docs;
+                p.docs.extend(newer);
+            }
+            p.team = team.to_string();
+        }
+        if let Ok(mut w) = TEAM.write() { *w = team.to_string(); }
         for l in Ledger::all() { mark_dirty(l); }
         if let Ok(mut d) = PRESENCE_DIRTY.write() { *d = true; }
-        flush();
+        flush_locked();
         println!(
-            "[SDS] 🚚 [TEAM MIGRATE] 로컬 기본 팀의 스코프 {}개 · 저장 보유 문서 {}건을 실제 팀 '{}' 로 이관했습니다.",
-            scopes, docs, team
+            "[SDS] 🚚 [TEAM MIGRATE] 로컬 기본 팀의 스코프 {}개 · 저장 보유 문서 {}건을 실제 팀 '{}' 로 이관했습니다. (부팅 때 보류한 이 팀의 스코프 {}개 · 보유 문서 {}건을 되살림, 다른 팀 것 {}개 폐기)",
+            scopes, docs, team, restored, docs_restored, dropped
         );
-        if scopes == 0 {
-            println!(
-                "[SDS] ⚠️ [TEAM MIGRATE] 이관 시점에 메모리 스코프가 0개였습니다. load() 가 이미 폐기했을 가능성이 있으니 원장의 team 값을 확인하십시오."
-            );
-        }
         return;
     }
     println!("[SDS] 🔄 팀 전환 감지. 이전 팀 통계를 폐기하고 새 팀으로 재바인딩합니다.");
@@ -1069,10 +1212,12 @@ fn flush_locked() {
         return;
     }
     presence_flush();
+    let retired: Vec<(Ledger, RunBuf)> = RETIRED.write().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
     let open: Vec<Ledger> = RUNS.read().map(|r| r.keys().cloned().collect()).unwrap_or_default();
+    let held: Vec<Ledger> = HELD.read().map(|h| h.keys().cloned().collect()).unwrap_or_default();
     let mut targets: Vec<Ledger> = Vec::new();
     for l in Ledger::all() {
-        if is_dirty(l) || open.contains(&l) { targets.push(l); }
+        if is_dirty(l) || open.contains(&l) || retired.iter().any(|(r, _)| *r == l) { targets.push(l); }
     }
     if targets.is_empty() {
         println!("[SDS] ⏭️ 새 관측이 없어 저장을 건너뜁니다. (열린 실행 0건)");
@@ -1083,34 +1228,20 @@ fn flush_locked() {
     let mut finalize: Vec<Ledger> = Vec::new();
     let mut lines: Vec<String> = Vec::new();
 
+    for (l, run) in retired.iter() {
+        if let Some(line) = write_run_file(*l, run, &team) { lines.push(line); }
+    }
+
     for l in targets {
         let run_meta = RUNS.read().ok().and_then(|r| r.get(&l).cloned());
         if let Some(run) = run_meta.as_ref() {
-            let rf = RunFile {
-                recipe: SDS_RECIPE.to_string(),
-                team: team.clone(),
-                ledger: l.as_str().to_string(),
-                label: run.label.clone(),
-                started_at: run.started_ms,
-                updated_at: chrono::Utc::now().timestamp_millis(),
-                observations: run.observations,
-                scopes: run.scopes.clone(),
-            };
-            if let Ok(txt) = serde_json::to_string_pretty(&rf) {
-                let dir = runs_dir(l);
-                let _ = std::fs::create_dir_all(&dir);
-                let file = dir.join(&run.file);
-                match write_atomic(&file, txt.as_bytes()) {
-                    Ok(_) => lines.push(format!(
-                        "{}={}건→{}",
-                        l.as_str(),
-                        run.observations,
-                        file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
-                    )),
-                    Err(e) => println!("[SDS] ⚠️ [{}] 실행 파일 저장 실패: {}", l.as_str(), e),
-                }
-            }
+            if let Some(line) = write_run_file(l, run, &team) { lines.push(line); }
             if run.closing { finalize.push(l); }
+        }
+        if held.contains(&l) {
+            // 🌟 [SDS TEAM HOLD] 로그인 전에는 실제 팀의 원장 파일을 덮어쓰지 않습니다(실행 파일만 씁니다).
+            lines.push(format!("{}.json=보류(로그인 대기)", l.as_str()));
+            continue;
         }
 
         let snapshot = merged_file(l);
@@ -1148,7 +1279,12 @@ fn flush_locked() {
     }
 
     for l in finalize {
-        let run = RUNS.write().ok().and_then(|mut r| r.remove(&l));
+        // 저장하는 사이 새 관측이 닫는 실행을 바꿨다면(open_run → retire_run) 그 실행은 이미 바탕에 합쳐졌고,
+        // 지금 자리의 실행은 새로 열린 것이라 닫지 않습니다.
+        let run = RUNS
+            .write()
+            .ok()
+            .and_then(|mut r| if r.get(&l).map_or(false, |x| x.closing) { r.remove(&l) } else { None });
         if let Some(run) = run {
             if let Ok(mut b) = BASES.write() {
                 let base = b.entry(l).or_insert_with(|| SdsFile {
@@ -1176,11 +1312,43 @@ fn flush_locked() {
     }
 }
 
+/// 실행 파일 하나를 씁니다. 라벨이 바뀌며 남은 예전 이름의 파일(stale_files)은 지웁니다.
+fn write_run_file(l: Ledger, run: &RunBuf, team: &str) -> Option<String> {
+    let rf = RunFile {
+        recipe: SDS_RECIPE.to_string(),
+        team: team.to_string(),
+        ledger: l.as_str().to_string(),
+        label: run.label.clone(),
+        started_at: run.started_ms,
+        updated_at: chrono::Utc::now().timestamp_millis(),
+        observations: run.observations,
+        scopes: run.scopes.clone(),
+    };
+    let txt = serde_json::to_string_pretty(&rf).ok()?;
+    let dir = runs_dir(l);
+    let _ = std::fs::create_dir_all(&dir);
+    match write_atomic(&dir.join(&run.file), txt.as_bytes()) {
+        Ok(_) => {
+            for stale in run.stale_files.iter().filter(|s| **s != run.file) {
+                let _ = std::fs::remove_file(dir.join(stale));
+            }
+            Some(format!("{}={}건→{}", l.as_str(), run.observations, run.file))
+        }
+        Err(e) => {
+            println!("[SDS] ⚠️ [{}] 실행 파일 저장 실패: {}", l.as_str(), e);
+            None
+        }
+    }
+}
+
 pub fn purge() {
     let _flush_guard = FLUSH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let team = TEAM.read().map(|t| t.clone()).unwrap_or_default();
     if let Ok(mut b) = BASES.write() { b.clear(); }
+    if let Ok(mut h) = HELD.write() { h.clear(); }
+    if let Ok(mut h) = HELD_PRESENCE.write() { *h = None; }
     if let Ok(mut r) = RUNS.write() { r.clear(); }
+    if let Ok(mut q) = RETIRED.write() { q.clear(); }
     if let Ok(mut d) = DIRTY.write() { d.clear(); }
     if let Ok(mut p) = PRESENCE.write() {
         *p = PresenceIndex {
@@ -1202,13 +1370,16 @@ fn with_scope_mut<F: FnOnce(&mut ScopeStat, usize)>(f: F) {
 
 fn with_scope_mut_in<F: FnOnce(&mut ScopeStat, usize)>(ledger: Ledger, f: F) {
     let (key, ring) = effective_scope_key();
+    let mut retired = None;
     if let Ok(mut runs) = RUNS.write() {
-        let run = open_run(&mut runs, ledger, ledger.as_str());
+        let (run, old) = open_run(&mut runs, ledger, ledger.as_str());
+        retired = old;
         run.observations = run.observations.saturating_add(1);
         let e = run.scopes.entry(key).or_insert_with(ScopeStat::default);
         f(e, ring);
         e.updated_at = chrono::Utc::now().timestamp_millis();
     }
+    if let Some(old) = retired { retire_run(ledger, old); }
     mark_dirty(ledger);
     bump_and_maybe_flush();
 }
@@ -1910,5 +2081,78 @@ mod entry_merge_tests {
         let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(leftovers.len(), 1, "{leftovers:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod team_and_run_tests {
+    //! 🌟 [SDS TEAM HOLD] · [RUN RETIRE] · [RUN RELABEL] 판정 검증. 전역 원장을 바꾸거나 파일을 쓰지 않습니다
+    //! (실행 파일 이름을 고를 때 runs 폴더에 같은 이름이 있는지만 봅니다).
+    use super::*;
+
+    #[test]
+    fn team_fate_holds_a_real_team_ledger_at_boot() {
+        let (local, a, b) = ("L", "A", "B");
+        assert_eq!(team_fate(a, a, local), TeamFate::Keep);
+        assert_eq!(team_fate(local, local, local), TeamFate::Keep);
+        assert_eq!(team_fate("", a, local), TeamFate::Keep);
+        assert_eq!(team_fate(a, "", local), TeamFate::Keep);
+        // 로그인 전 로컬 기본 팀에서 쌓인 것은 로그인한 팀으로 이관
+        assert_eq!(team_fate(local, a, local), TeamFate::Migrate);
+        // 부팅(언제나 로컬 기본 팀으로 load)에 읽은 실제 팀 원장: 예전에는 폐기 + 즉시 덮어쓰기였다
+        assert_eq!(team_fate(a, local, local), TeamFate::Hold);
+        // 다른 실제 팀은 폐기(스코프 격리 원칙)
+        assert_eq!(team_fate(a, b, local), TeamFate::Discard);
+        // 보류한 원장을 rebind_team 에서 다시 판정: 같은 팀이면 되살리고 다른 팀이면 버림
+        assert_eq!(team_fate(a, a, local), TeamFate::Keep);
+        assert_ne!(team_fate(a, b, local), TeamFate::Keep);
+    }
+
+    fn run_with(observations: u64, closing: bool) -> RunBuf {
+        let mut r = RunBuf {
+            stamp: "20261108-000000".into(),
+            label: "extract".into(),
+            file: "20261108-000000_extract.json".into(),
+            started_ms: 1,
+            closing,
+            observations,
+            ..Default::default()
+        };
+        r.scopes.insert("vision|commerce|".into(), ScopeStat::default());
+        r
+    }
+
+    #[test]
+    fn closing_run_is_retired_instead_of_overwritten() {
+        let mut runs = HashMap::new();
+        runs.insert(Ledger::Extract, run_with(7, true));
+        let (run, retired) = open_run(&mut runs, Ledger::Extract, "extract");
+        assert_eq!((run.observations, run.closing), (0, false));
+        let old = retired.expect("닫는 실행은 돌려받아 원장에 합쳐야 한다");
+        assert_eq!((old.observations, old.scopes.len()), (7, 1));
+
+        // 열린 실행은 그대로 쓴다
+        let (run, retired) = open_run(&mut runs, Ledger::Extract, "extract");
+        run.observations += 1;
+        assert!(retired.is_none());
+        assert_eq!(runs[&Ledger::Extract].observations, 1);
+    }
+
+    #[test]
+    fn relabel_remembers_the_old_file_for_cleanup() {
+        let mut run = run_with(3, false);
+        relabel_run(&mut run, Ledger::Search, "query_a");
+        assert_eq!(run.label, "query_a");
+        assert!(run.file.starts_with("20261108-000000_query_a"), "{}", run.file);
+        assert_eq!(run.stale_files, vec!["20261108-000000_extract.json".to_string()]);
+
+        let file_a = run.file.clone();
+        relabel_run(&mut run, Ledger::Search, "query_a");
+        assert_eq!((run.file.as_str(), run.stale_files.len()), (file_a.as_str(), 1));
+
+        relabel_run(&mut run, Ledger::Search, "query_b");
+        assert_eq!(run.stale_files.len(), 2);
+        assert!(run.stale_files.contains(&file_a));
+        assert!(!run.stale_files.contains(&run.file));
     }
 }

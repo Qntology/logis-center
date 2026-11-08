@@ -73,3 +73,5 @@ mod synthetic_eval;
 mod stanza_runtime;
 // 내장 도메인 사전: 개발 bias.json(ko · en) ↔ 배포 full_bias.json(모든 언어) 일관성
 mod bias_source;
+// SDS 원장: 부팅(로컬 기본 팀) → 로그인(실제 팀) 사이에 원장이 살아남는지 실제 파일로 (LOGIS_APP_DIR, --ignored)
+mod sds_ledger;

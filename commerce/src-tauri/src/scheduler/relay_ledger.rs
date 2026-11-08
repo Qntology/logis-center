@@ -754,6 +754,9 @@ pub async fn relay_join(
     if results.is_empty() {
         return rep;
     }
+    // 기간 조인은 계획마다 검색 스코프를 잠시 바꿉니다. 끝나면 leave_scope 가 아니라 호출자의 스코프로 되돌립니다
+    // (leave_scope 는 호출자 스코프까지 지워 그 뒤 호출자의 관측이 'unscoped' 로 떨어집니다).
+    let caller_scope = crate::utils::score_dynamics::scope_snapshot();
 
     let mut docs: Vec<Option<Value>> = Vec::with_capacity(results.len());
     for r in results.iter() {
@@ -1039,7 +1042,7 @@ pub async fn relay_join(
             if let Some(o) = plan.as_object_mut() {
                 o.insert("relay".to_string(), json!({ "period": period, "key": key, "partner_types": partner_types, "void_only": void_only, "applied": false, "void_only_applied": void_dropped > 0 }));
             }
-            crate::utils::score_dynamics::leave_scope();
+            crate::utils::score_dynamics::restore_scope(caller_scope.clone());
             continue;
         }
 
@@ -1165,7 +1168,7 @@ pub async fn relay_join(
             unit_json(units_net_total), unit_json(void_units_total), unit_json(units_total),
             if units_exact { " — 연결 문서의 quantity 를 그대로 더했습니다." } else { " — quantity 가 없거나 한 문서가 여러 상대를 가리키는 경우는 1개로 셌습니다(relay_period_units_exact=false)." }
         ));
-        crate::utils::score_dynamics::leave_scope();
+        crate::utils::score_dynamics::restore_scope(caller_scope.clone());
     }
 
     if rep.edges > 0 {
