@@ -1805,7 +1805,7 @@
       },
       "recipient_name": {
         "semantic": "받는사람, 수령인, 구매자 이름",
-        "bias": "받는사람, 수령인, 구매자 이름, 김철수, 이영희, 박지성",
+        "bias": "받는사람, 수령인, 구매자 이름, 김철수, 이영희, 박지성, 받는분, 받는 분",
         "prejudice": "식별자, 링크, 운송장번호, 송장, 번호, 코드, 배송상태, 진행상황, 등록일, 접수일, 발송일, 출발일, 보낸사람, 발송인, 판매자, 주소, 위치, 연락처, 전화번호, 핸드폰, 받는사람, 수령지, 배송지, 가로, 너비, 폭, 세로, 높이, 길이, 깊이, 무게, 중량, 택배사, 배송업체, 운송사, 배송비, 운송료, 요금, 배송방법, 배송수단, 배송기간, 소요일, 묶음배송, 합배송"
       },
       "recipient_address": {
@@ -2932,7 +2932,7 @@
       },
       "title": {
         "semantic": "Product name, apparel name, item name, item, name, title",
-        "bias": "shipping product name, shipping item title, shipping item name, Nike Air Force, Samsung Galaxy Book, iPhone Case, Dress Set",
+        "bias": "shipping product name, shipping item title, shipping item name, Nike Air Force, Samsung Galaxy Book, iPhone Case, Dress Set, Items, Contents",
         "prejudice": "identifier, link, tracking number, waybill, number, code, delivery status, progress, registration date, received date, dispatch date, departure date, address, location, contact, phone number, mobile, width, breadth, height, length, depth, weight, mass, carrier, courier, shipping company, shipping fee, shipping cost, rate, shipping method, delivery method, transit time, delivery duration, combined shipping, bundled shipping"
       },
       "registration_date": {
@@ -2942,7 +2942,7 @@
       },
       "shipping_date": {
         "semantic": "Dispatch date, shipping date, departure date",
-        "bias": "dispatch date, shipping date, transit time, 2026-03-16, 05/21/2026",
+        "bias": "dispatch date, shipping date, transit time, 2026-03-16, 05/21/2026, Shipped on, Ship date, Dispatched on",
         "prejudice": "identifier, link, tracking number, waybill, number, code, delivery status, progress, product name, item, name, title, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, width, breadth, height, length, depth, weight, mass, carrier, courier, shipping company, shipping fee, shipping cost, rate, shipping method, delivery method, combined shipping, bundled shipping"
       },
       "sender_name": {
@@ -3054,7 +3054,7 @@
       },
       "registration_date": {
         "semantic": "Registration date, creation date",
-        "bias": "product date, item date, product registration date, 2026-03-15T12:00:00, 2026-05-20",
+        "bias": "product date, item date, product registration date, 2026-03-15T12:00:00, 2026-05-20, Created, Created on, Date added, Added on",
         "prejudice": "identifier, link, address, code, sales status, display status, product name, item name, name, payment method, bank, account, deposit, wire transfer, card, credit card, model name, brand name, manufacturer, product condition, used, detailed description, body text, short description, tags, keywords, country of origin, sale price, discount price, price, supply price, cost price, purchase price, currency, unit, regular price, MSRP, original price, quantity, stock, inventory level, low stock warning, unit name, taxable, tax, VAT, tax code, main image, thumbnail, additional image, video, clip, carrier, courier, shipping fee, shipping cost, shipping method, delivery method, transit time, combined shipping, bundled shipping, width, breadth, height, length, weight, mass, options, choices, add-on item, related product"
       },
       "payment_method": {
@@ -3271,7 +3271,7 @@
       },
       "tracking_number": {
         "semantic": "Tracking number, waybill",
-        "bias": "tracking number, waybill number, courier tracking, 1Z9999999999999999, 9400100000000000000000, 381234567891",
+        "bias": "tracking number, waybill number, courier tracking, 1Z9999999999999999, 9400100000000000000000, 381234567891, Tracking #, Tracking no., Tracking ID",
         "prejudice": "number, sequence, serial number, row number, list number, index, No, link, order number, order status, delivery status, status, order date, payment date, date, quantity, count, item amount, total order amount, shipping fee, order item, product name, item name, item, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "status": {
@@ -3281,17 +3281,17 @@
       },
       "registration_date": {
         "semantic": "Order date, payment date, date",
-        "bias": "order date and time, order date, order time, order registration date, 2026-03-15T14:16:35, 05/20/2026, 03-15-26 14:16",
+        "bias": "order date and time, order date, order time, order registration date, 2026-03-15T14:16:35, 05/20/2026, 03-15-26 14:16, Ordered, Ordered on, Order placed, Placed on, Date placed, Purchase date",
         "prejudice": "number, sequence, serial number, row number, index, quantity, count, item amount, total order amount, payment amount, shipping fee, identifier, link, order number, tracking number, waybill, order status, delivery status, status, order item, product name, item name, item, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, deposit, account, wire transfer, card, credit card, payment card, payment method, payment option, payment gateway, PG, payment route"
       },
       "goods": {
         "semantic": "Order item, product name, item name, item",
-        "bias": "iPhone, 15, wireless, keyboard, Nike, sneakers, dress, knit, T-shirt, order name, order title, main item name, item name and 2 more",
+        "bias": "iPhone, 15, wireless, keyboard, Nike, sneakers, dress, knit, T-shirt, order name, order title, main item name, item name and 2 more, Items, Line items, Products",
         "prejudice": "identifier, link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "sender_name": {
         "semantic": "Orderer, buyer, sender, name",
-        "bias": "John Doe, Jane Smith, Inc., member, guest",
+        "bias": "John Doe, Jane Smith, Inc., member, guest, Customer, Customer name, Billed to, Bill to",
         "prejudice": "link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, contact, phone number, mobile, address, location, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "sender_address": {
@@ -3306,7 +3306,7 @@
       },
       "recipient_name": {
         "semantic": "Recipient, receiver, name",
-        "bias": "Jane Doe, Michael Smith, Emily Brown",
+        "bias": "Jane Doe, Michael Smith, Emily Brown, Ship to, Shipping name, Deliver to",
         "prejudice": "link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, address, location, contact, phone number, mobile, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "recipient_address": {
@@ -4090,7 +4090,7 @@
       },
       "shipping_date": {
         "semantic": "Absendedatum, Versanddatum, Abfahrtsdatum",
-        "bias": "Absendedatum, Versanddatum, Laufzeit, 2026-03-16, 21.05.2026",
+        "bias": "Absendedatum, Versanddatum, Laufzeit, 2026-03-16, 21.05.2026, Versandt am, Verschickt am",
         "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Absender, Versender, Verkäufer, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Kombiversand, gebündelter Versand"
       },
       "sender_name": {
@@ -4202,7 +4202,7 @@
       },
       "registration_date": {
         "semantic": "Erfassungsdatum, Erstellungsdatum",
-        "bias": "Produktdatum, Artikeldatum, Erfassungsdatum des Produkts, 2026-03-15T12:00:00, 2026-05-20",
+        "bias": "Produktdatum, Artikeldatum, Erfassungsdatum des Produkts, 2026-03-15T12:00:00, 2026-05-20, Angelegt, Angelegt am, Erstellt am",
         "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
       },
       "payment_method": {
@@ -4419,7 +4419,7 @@
       },
       "tracking_number": {
         "semantic": "Sendungsnummer, Frachtbrief",
-        "bias": "Sendungsnummer, Frachtbriefnummer, Sendungsverfolgung, 1Z9999999999999999, 00340434161234567890, 381234567891",
+        "bias": "Sendungsnummer, Frachtbriefnummer, Sendungsverfolgung, 1Z9999999999999999, 00340434161234567890, 381234567891, Sendungsnr., Tracking-Nr.",
         "prejudice": "Nummer, Reihenfolge, laufende Nummer, Zeilennummer, Listennummer, Index, Nr., Link, Bestellnummer, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, Menge, Anzahl, Artikelbetrag, Gesamtbestellwert, Versandkosten, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
       },
       "status": {
@@ -4429,7 +4429,7 @@
       },
       "registration_date": {
         "semantic": "Bestelldatum, Zahlungsdatum, Datum",
-        "bias": "Bestelldatum und -uhrzeit, Bestelldatum, Bestellzeitpunkt, Erfassungsdatum der Bestellung, 2026-03-15T14:16:35, 20.05.2026, 15.03.26 14:16",
+        "bias": "Bestelldatum und -uhrzeit, Bestelldatum, Bestellzeitpunkt, Erfassungsdatum der Bestellung, 2026-03-15T14:16:35, 20.05.2026, 15.03.26 14:16, Bestellt am, Bestellzeit",
         "prejudice": "Nummer, Reihenfolge, laufende Nummer, Zeilennummer, Index, Menge, Anzahl, Artikelbetrag, Gesamtbestellwert, Zahlungsbetrag, Versandkosten, Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
       },
       "goods": {
@@ -4439,7 +4439,7 @@
       },
       "sender_name": {
         "semantic": "Besteller, Käufer, Absender, Name",
-        "bias": "Max Mustermann, Anna Schmidt, GmbH, Mitglied, Gast",
+        "bias": "Max Mustermann, Anna Schmidt, GmbH, Mitglied, Gast, Kunde, Kundenname, Rechnungsempfänger",
         "prejudice": "Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Kontakt, Telefonnummer, Mobil, Adresse, Standort, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
       },
       "sender_address": {
@@ -4454,7 +4454,7 @@
       },
       "recipient_name": {
         "semantic": "Empfänger, Warenempfänger, Name",
-        "bias": "Erika Mustermann, Michael Schmidt, Laura Braun",
+        "bias": "Erika Mustermann, Michael Schmidt, Laura Braun, Lieferung an, Versand an",
         "prejudice": "Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
       },
       "recipient_address": {
@@ -5228,7 +5228,7 @@
       },
       "title": {
         "semantic": "Nombre del producto, nombre de la prenda, nombre del artículo, artículo, nombre, título",
-        "bias": "nombre del producto de envío, título del artículo de envío, nombre del artículo de envío, Nike Air Force, Samsung Galaxy Book, Funda para iPhone, Conjunto de vestido Zara",
+        "bias": "nombre del producto de envío, título del artículo de envío, nombre del artículo de envío, Nike Air Force, Samsung Galaxy Book, Funda para iPhone, Conjunto de vestido Zara, Artículos",
         "prejudice": "identificador, enlace, número de seguimiento, número de guía, albarán, número, código, estado de entrega, progreso, fecha de registro, fecha de recepción, fecha de despacho, fecha de salida, dirección, ubicación, contacto, número de teléfono, móvil, celular, ancho, anchura, alto, altura, largo, longitud, profundidad, peso, masa, transportista, mensajería, paquetería, empresa de transporte, gastos de envío, costo de envío, tarifa, método de envío, método de entrega, tiempo de tránsito, duración de la entrega, envío combinado, envío agrupado"
       },
       "registration_date": {
@@ -5567,7 +5567,7 @@
       },
       "tracking_number": {
         "semantic": "Número de seguimiento, número de guía, albarán",
-        "bias": "número de seguimiento, número de guía, rastreo de mensajería, PQ12345678901234567890, 1Z9999999999999999, 381234567891",
+        "bias": "número de seguimiento, número de guía, rastreo de mensajería, PQ12345678901234567890, 1Z9999999999999999, 381234567891, N.º de seguimiento, Nº de seguimiento",
         "prejudice": "número, secuencia, número de serie, número de fila, número de lista, índice, N.º, enlace, número de pedido, estado del pedido, estado de entrega, estado, fecha de pedido, fecha de pago, fecha, cantidad, recuento, importe del artículo, importe total del pedido, gastos de envío, artículo del pedido, nombre del producto, nombre del artículo, artículo, comprador, ordenante, remitente, nombre, dirección, ubicación, contacto, número de teléfono, móvil, celular, destinatario, receptor, banco, depósito, cuenta, transferencia bancaria, tarjeta, tarjeta de crédito, tarjeta de pago, fecha de compra, fecha de depósito, método de pago, opción de pago, pasarela de pago, TPV, ruta de pago"
       },
       "status": {
@@ -5577,12 +5577,12 @@
       },
       "registration_date": {
         "semantic": "Fecha de pedido, fecha de pago, fecha",
-        "bias": "fecha y hora del pedido, fecha de pedido, hora del pedido, fecha de registro del pedido, 2026-03-15T14:16:35, 20/05/2026, 15-03-26 14:16",
+        "bias": "fecha y hora del pedido, fecha de pedido, hora del pedido, fecha de registro del pedido, 2026-03-15T14:16:35, 20/05/2026, 15-03-26 14:16, Fecha del pedido, Pedido el",
         "prejudice": "número, secuencia, número de serie, número de fila, índice, cantidad, recuento, importe del artículo, importe total del pedido, importe de pago, gastos de envío, identificador, enlace, número de pedido, número de seguimiento, número de guía, albarán, estado del pedido, estado de entrega, estado, artículo del pedido, nombre del producto, nombre del artículo, artículo, comprador, ordenante, remitente, nombre, dirección, ubicación, contacto, número de teléfono, móvil, celular, destinatario, receptor, banco, depósito, cuenta, transferencia bancaria, tarjeta, tarjeta de crédito, tarjeta de pago, método de pago, opción de pago, pasarela de pago, TPV, ruta de pago"
       },
       "goods": {
         "semantic": "Artículo del pedido, nombre del producto, nombre del artículo, artículo",
-        "bias": "iPhone, 15, inalámbrico, teclado, Nike, zapatillas, tenis, vestido, punto, camiseta, playera, nombre del pedido, título del pedido, nombre del artículo principal, nombre del artículo y 2 más",
+        "bias": "iPhone, 15, inalámbrico, teclado, Nike, zapatillas, tenis, vestido, punto, camiseta, playera, nombre del pedido, título del pedido, nombre del artículo principal, nombre del artículo y 2 más, Artículos, Productos",
         "prejudice": "identificador, enlace, número de pedido, número de seguimiento, número de guía, albarán, estado del pedido, estado de entrega, estado, fecha de pedido, fecha de pago, fecha, comprador, ordenante, remitente, nombre, dirección, ubicación, contacto, número de teléfono, móvil, celular, destinatario, receptor, banco, depósito, cuenta, transferencia bancaria, tarjeta, tarjeta de crédito, tarjeta de pago, fecha de compra, fecha de depósito, método de pago, opción de pago, pasarela de pago, TPV, ruta de pago"
       },
       "sender_name": {
@@ -5602,7 +5602,7 @@
       },
       "recipient_name": {
         "semantic": "Destinatario, receptor, nombre",
-        "bias": "María García, Carlos Rodríguez, Laura Fernández",
+        "bias": "María García, Carlos Rodríguez, Laura Fernández, Enviar a, Destinatario",
         "prejudice": "enlace, número de pedido, número de seguimiento, número de guía, albarán, estado del pedido, estado de entrega, estado, fecha de pedido, fecha de pago, fecha, artículo del pedido, nombre del producto, nombre del artículo, artículo, dirección, ubicación, contacto, número de teléfono, móvil, celular, banco, depósito, cuenta, transferencia bancaria, tarjeta, tarjeta de crédito, tarjeta de pago, fecha de compra, fecha de depósito, método de pago, opción de pago, pasarela de pago, TPV, ruta de pago"
       },
       "recipient_address": {
@@ -6376,7 +6376,7 @@
       },
       "title": {
         "semantic": "Nom du produit, nom du vêtement, nom de l'article, article, nom, titre",
-        "bias": "nom du produit expédié, titre de l'article expédié, nom de l'article, Nike Air Force, Samsung Galaxy Book, Coque iPhone, Ensemble robe",
+        "bias": "nom du produit expédié, titre de l'article expédié, nom de l'article, Nike Air Force, Samsung Galaxy Book, Coque iPhone, Ensemble robe, Articles",
         "prejudice": "identifiant, lien, numéro de suivi, bordereau, numéro, code, statut de livraison, progression, date d'enregistrement, date de réception, date d'expédition, date de départ, adresse, lieu, contact, numéro de téléphone, mobile, largeur, hauteur, longueur, profondeur, poids, masse, transporteur, société de livraison, frais de port, frais de livraison, tarif, mode d'expédition, mode de livraison, délai de livraison, durée d'acheminement, livraison groupée, expédition groupée"
       },
       "registration_date": {
@@ -6386,7 +6386,7 @@
       },
       "shipping_date": {
         "semantic": "Date d'envoi, date d'expédition, date de départ",
-        "bias": "date d'envoi, date d'expédition, délai d'acheminement, 2026-03-16, 21/05/2026",
+        "bias": "date d'envoi, date d'expédition, délai d'acheminement, 2026-03-16, 21/05/2026, Expédié le",
         "prejudice": "identifiant, lien, numéro de suivi, bordereau, numéro, code, statut de livraison, progression, nom du produit, article, nom, titre, expéditeur, vendeur, adresse, lieu, contact, numéro de téléphone, mobile, destinataire, acheteur, largeur, hauteur, longueur, profondeur, poids, masse, transporteur, société de livraison, frais de port, frais de livraison, tarif, mode d'expédition, mode de livraison, livraison groupée, expédition groupée"
       },
       "sender_name": {
@@ -6498,7 +6498,7 @@
       },
       "registration_date": {
         "semantic": "Date d'enregistrement, date de création",
-        "bias": "date du produit, date de l'article, date d'ajout du produit, 2026-03-15T12:00:00, 20/05/2026",
+        "bias": "date du produit, date de l'article, date d'ajout du produit, 2026-03-15T12:00:00, 20/05/2026, Créé le, Date de création",
         "prejudice": "identifiant, lien, adresse, code, statut de vente, statut d'affichage, nom du produit, nom de l'article, nom, moyen de paiement, banque, compte, virement bancaire, carte, carte bancaire, nom du modèle, marque, fabricant, état du produit, occasion, description détaillée, corps du texte, description courte, tags, mots-clés, pays d'origine, prix de vente, prix remisé, prix, prix d'achat, prix de revient, devise, unité, prix conseillé, PVC, prix initial, quantité, stock, niveau de stock, alerte stock bas, nom de l'unité, imposable, taxe, TVA, code taxe, image principale, miniature, image supplémentaire, vidéo, clip, transporteur, frais de port, mode de livraison, délai de livraison, livraison groupée, largeur, hauteur, longueur, poids, masse, options, déclinaisons, produit complémentaire, produit associé"
       },
       "payment_method": {
@@ -6715,7 +6715,7 @@
       },
       "tracking_number": {
         "semantic": "Numéro de suivi, numéro de bordereau",
-        "bias": "numéro de suivi, numéro de colis, suivi transporteur, 6A12345678901, 8R00000000000, 1Z9999999999999999",
+        "bias": "numéro de suivi, numéro de colis, suivi transporteur, 6A12345678901, 8R00000000000, 1Z9999999999999999, N° de suivi",
         "prejudice": "numéro, séquence, numéro de série, numéro de ligne, numéro de liste, index, N°, lien, numéro de commande, statut de la commande, statut de livraison, statut, date de commande, date de paiement, date, quantité, nombre, montant de l'article, montant total de la commande, frais de port, article commandé, nom du produit, nom de l'article, article, acheteur, client, expéditeur, nom, adresse, lieu, contact, numéro de téléphone, mobile, destinataire, récepteur, banque, dépôt, compte, virement bancaire, carte, carte de crédit, carte bancaire, date de règlement, moyen de paiement, option de paiement, passerelle de paiement, prestataire de paiement"
       },
       "status": {
@@ -6730,7 +6730,7 @@
       },
       "goods": {
         "semantic": "Article commandé, nom du produit, nom de l'article, article",
-        "bias": "iPhone, 15, sans fil, clavier, Nike, baskets, robe, pull, T-shirt, libellé de la commande, titre de la commande, nom de l'article principal, nom de l'article et 2 autres",
+        "bias": "iPhone, 15, sans fil, clavier, Nike, baskets, robe, pull, T-shirt, libellé de la commande, titre de la commande, nom de l'article principal, nom de l'article et 2 autres, Articles, Produits",
         "prejudice": "identifiant, lien, numéro de commande, numéro de suivi, bordereau, statut de la commande, statut de livraison, statut, date de commande, date de paiement, date, acheteur, client, expéditeur, nom, adresse, lieu, contact, numéro de téléphone, mobile, destinataire, récepteur, banque, dépôt, compte, virement bancaire, carte, carte de crédit, carte bancaire, date de règlement, moyen de paiement, option de paiement, passerelle de paiement, prestataire de paiement"
       },
       "sender_name": {
@@ -6750,7 +6750,7 @@
       },
       "recipient_name": {
         "semantic": "Destinataire, récepteur, nom",
-        "bias": "Marie Martin, Pierre Bernard, Camille Petit",
+        "bias": "Marie Martin, Pierre Bernard, Camille Petit, Livrer à, Destinataire",
         "prejudice": "lien, numéro de commande, numéro de suivi, bordereau, statut de la commande, statut de livraison, statut, date de commande, date de paiement, date, article commandé, nom du produit, nom de l'article, article, adresse, lieu, contact, numéro de téléphone, mobile, banque, dépôt, compte, virement bancaire, carte, carte de crédit, carte bancaire, date de règlement, moyen de paiement, option de paiement, passerelle de paiement, prestataire de paiement"
       },
       "recipient_address": {
@@ -7933,7 +7933,7 @@
       },
       "payment_method": {
         "semantic": "決済方法、お支払い方法",
-        "bias": "クレジットカード, 銀行振込, 口座振替, コンビニ決済, 代金引換, PayPay, 楽天ペイ, d払い, Apple Pay, Google Pay, 後払い",
+        "bias": "クレジットカード, 銀行振込, 口座振替, コンビニ決済, 代金引換, PayPay, 楽天ペイ, d払い, Apple Pay, Google Pay, 後払い, 支払方法, お支払い方法",
         "prejudice": "識別子, リンク, 注文番号, 追跡番号, 送り状番号, 注文ステータス, 配送状況, ステータス, 注文日, 決済日, 日付, 注文商品, 商品名, アイテム名, 商品, 注文者, 購入者, 依頼主, 氏名, 住所, 所在地, 連絡先, 電話番号, 携帯番号, お届け先, 受取人, 注文日時, 入金日"
       },
       "payment_origin": {
@@ -7948,7 +7948,7 @@
       },
       "amount": {
         "semantic": "注文合計、注文金額、決済金額、お支払い合計、総合計",
-        "bias": "1,500円, ¥2,980, 15,000",
+        "bias": "1,500円, ¥2,980, 15,000, 合計金額, お支払い金額",
         "prejudice": "識別子, リンク, 注文番号, 追跡番号, 送り状番号, 行番号, 注文ステータス, 配送状況, ステータス, 注文日, 決済日, 日付, 注文商品, 商品名, アイテム名, 商品, 注文者, 購入者, 氏名, 住所, 連絡先, 電話番号, お届け先, 銀行, 口座, 銀行振込, カード, 決済方法, 支払方法, 数量, 注文数量, 個数, 送料, 配送料, 商品金額, 販売価格, 単価, 販売者, 加盟店"
       },
       "shipping_fee": {
@@ -8667,12 +8667,12 @@
       },
       "status": {
         "semantic": "Status, status de entrega, andamento",
-        "bias": "status de envio, andamento da entrega, preparando para envio, coletado, processado na unidade, em trânsito, saiu para entrega, entregue, devolvido",
+        "bias": "status de envio, andamento da entrega, preparando para envio, coletado, processado na unidade, em trânsito, saiu para entrega, entregue, devolvido, Estado",
         "prejudice": "código de rastreamento, conhecimento de transporte, identificador, número, código, nome do produto, item, nome, título, data de cadastro, data de recebimento, data de expedição, data de saída, remetente, expedidor, vendedor, endereço, localização, contato, número de telefone, celular, destinatário, recebedor, comprador, largura, altura, comprimento, profundidade, peso, massa, transportadora, empresa de entrega, taxa de entrega, custo de envio, frete, método de envio, forma de entrega, tempo de trânsito, prazo de entrega, envio combinado, envio agrupado"
       },
       "title": {
         "semantic": "Nome do produto, nome do vestuário, nome do item, item, nome, título",
-        "bias": "nome do produto enviado, título do item enviado, nome do item de envio, Nike Air Force, Samsung Galaxy Book, Capa para iPhone, Conjunto de Vestido",
+        "bias": "nome do produto enviado, título do item enviado, nome do item de envio, Nike Air Force, Samsung Galaxy Book, Capa para iPhone, Conjunto de Vestido, Artigos",
         "prejudice": "identificador, link, código de rastreamento, conhecimento de transporte, número, código, status de entrega, andamento, data de cadastro, data de recebimento, data de expedição, data de saída, endereço, localização, contato, número de telefone, celular, largura, altura, comprimento, profundidade, peso, massa, transportadora, empresa de entrega, taxa de entrega, custo de envio, frete, método de envio, forma de entrega, tempo de trânsito, prazo de entrega, envio combinado, envio agrupado"
       },
       "registration_date": {
@@ -8682,7 +8682,7 @@
       },
       "shipping_date": {
         "semantic": "Data de expedição, data de envio, data de saída",
-        "bias": "data de expedição, data de envio, tempo de trânsito, 2026-03-16, 16/03/2026, 21/05/2026",
+        "bias": "data de expedição, data de envio, tempo de trânsito, 2026-03-16, 16/03/2026, 21/05/2026, Enviado em",
         "prejudice": "identificador, link, código de rastreamento, conhecimento de transporte, número, código, status de entrega, andamento, nome do produto, item, nome, título, remetente, expedidor, vendedor, endereço, localização, contato, número de telefone, celular, destinatário, recebedor, comprador, largura, altura, comprimento, profundidade, peso, massa, transportadora, empresa de entrega, taxa de entrega, custo de envio, frete, método de envio, forma de entrega, envio combinado, envio agrupado"
       },
       "sender_name": {
@@ -8794,7 +8794,7 @@
       },
       "registration_date": {
         "semantic": "Data de cadastro, data de criação",
-        "bias": "data do produto, data do item, data de cadastro do produto, 2026-03-15T12:00:00, 15/03/2026, 2026-05-20",
+        "bias": "data do produto, data do item, data de cadastro do produto, 2026-03-15T12:00:00, 15/03/2026, 2026-05-20, Criado em, Data de criação",
         "prejudice": "identificador, link, endereço, código, status de venda, status de exibição, nome do produto, nome do item, nome, método de pagamento, banco, conta, depósito, transferência bancária, Pix, cartão, cartão de crédito, nome do modelo, marca, fabricante, condição do produto, usado, descrição detalhada, texto principal, descrição curta, tags, palavras-chave, país de origem, preço de venda, preço promocional, preço, preço de custo, preço de fornecimento, preço de compra, moeda, unidade, preço normal, preço sugerido, preço original, quantidade, estoque, nível de estoque, alerta de estoque baixo, nome da unidade, tributável, imposto, ICMS, IVA, código fiscal, imagem principal, miniatura, imagem adicional, vídeo, clipe, transportadora, frete, custo de envio, método de envio, forma de entrega, tempo de trânsito, envio combinado, envio agrupado, largura, altura, comprimento, peso, massa, opções, escolhas, item adicional, produto relacionado"
       },
       "payment_method": {
@@ -8914,7 +8914,7 @@
       },
       "quantity": {
         "semantic": "Quantidade, estoque, nível de estoque",
-        "bias": "100, 50, 0, 999",
+        "bias": "100, 50, 0, 999, Stock, Estoque",
         "prejudice": "identificador, link, endereço, código, status de venda, status de exibição, nome do produto, nome do item, nome, data de cadastro, data de criação, método de pagamento, banco, conta, depósito, transferência bancária, Pix, cartão, cartão de crédito, nome do modelo, marca, fabricante, condição do produto, usado, descrição detalhada, texto principal, descrição curta, tags, palavras-chave, país de origem, data de lançamento, data de fabricação, data de validade, preço de venda, preço promocional, preço, preço de custo, preço de fornecimento, preço de compra, preço normal, preço sugerido, preço original, unidade, nome da unidade, tributável, imposto, ICMS, IVA, código fiscal, imagem principal, miniatura, imagem adicional, vídeo, clipe, transportadora, frete, custo de envio, método de envio, forma de entrega, tempo de trânsito, envio combinado, envio agrupado, largura, altura, comprimento, peso, massa, opções, escolhas, item adicional, produto relacionado"
       },
       "stock_keeping_unit": {
@@ -9011,22 +9011,22 @@
       },
       "tracking_number": {
         "semantic": "Código de rastreamento, número de rastreio, conhecimento de transporte",
-        "bias": "código de rastreamento, número do conhecimento de transporte, rastreio da transportadora, BR123456789BR, AA123456789BR, 1Z9999999999999999, 381234567891",
+        "bias": "código de rastreamento, número do conhecimento de transporte, rastreio da transportadora, BR123456789BR, AA123456789BR, 1Z9999999999999999, 381234567891, N.º de seguimento, Código de rastreio",
         "prejudice": "número, sequência, número de série, número da linha, número da lista, índice, Nº, link, número do pedido, status do pedido, status de entrega, status, data do pedido, data de pagamento, data, quantidade, contagem, valor do item, valor total do pedido, frete, item do pedido, nome do produto, nome do item, item, comprador, cliente, remetente, nome, endereço, localização, contato, número de telefone, celular, destinatário, recebedor, banco, depósito, conta, transferência bancária, Pix, cartão, cartão de crédito, cartão de pagamento, data da compra, data do depósito, método de pagamento, opção de pagamento, gateway de pagamento, PG, meio de pagamento"
       },
       "status": {
         "semantic": "Status do pedido, status de entrega, status",
-        "bias": "status do pedido, andamento do pedido, pagamento aprovado, preparando para envio, em trânsito, entregue, cancelado, devolvido, trocado, reembolsado",
+        "bias": "status do pedido, andamento do pedido, pagamento aprovado, preparando para envio, em trânsito, entregue, cancelado, devolvido, trocado, reembolsado, Estado, Situação",
         "prejudice": "identificador, link, número do pedido, código de rastreamento, conhecimento de transporte, data do pedido, data de pagamento, data, item do pedido, nome do produto, nome do item, item, comprador, cliente, remetente, nome, endereço, localização, contato, número de telefone, celular, destinatário, recebedor, banco, depósito, conta, transferência bancária, Pix, cartão, cartão de crédito, cartão de pagamento, data da compra, data do depósito, método de pagamento, opção de pagamento, gateway de pagamento, PG, meio de pagamento"
       },
       "registration_date": {
         "semantic": "Data do pedido, data de pagamento, data",
-        "bias": "data e hora do pedido, data do pedido, hora do pedido, data de cadastro do pedido, 2026-03-15T14:16:35, 15/03/2026, 15-03-26 14:16",
+        "bias": "data e hora do pedido, data do pedido, hora do pedido, data de cadastro do pedido, 2026-03-15T14:16:35, 15/03/2026, 15-03-26 14:16, Data da encomenda",
         "prejudice": "número, sequência, número de série, número da linha, índice, quantidade, contagem, valor do item, valor total do pedido, valor do pagamento, frete, identificador, link, número do pedido, código de rastreamento, conhecimento de transporte, status do pedido, status de entrega, status, item do pedido, nome do produto, nome do item, item, comprador, cliente, remetente, nome, endereço, localização, contato, número de telefone, celular, destinatário, recebedor, banco, depósito, conta, transferência bancária, Pix, cartão, cartão de crédito, cartão de pagamento, método de pagamento, opção de pagamento, gateway de pagamento, PG, meio de pagamento"
       },
       "goods": {
         "semantic": "Item do pedido, nome do produto, nome do item, item",
-        "bias": "iPhone, 15, sem fio, teclado, Nike, tênis, vestido, tricô, camiseta, nome do pedido, título do pedido, nome do item principal, nome do item e mais 2",
+        "bias": "iPhone, 15, sem fio, teclado, Nike, tênis, vestido, tricô, camiseta, nome do pedido, título do pedido, nome do item principal, nome do item e mais 2, Artigos, Produtos",
         "prejudice": "identificador, link, número do pedido, código de rastreamento, conhecimento de transporte, status do pedido, status de entrega, status, data do pedido, data de pagamento, data, comprador, cliente, remetente, nome, endereço, localização, contato, número de telefone, celular, destinatário, recebedor, banco, depósito, conta, transferência bancária, Pix, cartão, cartão de crédito, cartão de pagamento, data da compra, data do depósito, método de pagamento, opção de pagamento, gateway de pagamento, PG, meio de pagamento"
       },
       "sender_name": {
@@ -9046,7 +9046,7 @@
       },
       "recipient_name": {
         "semantic": "Destinatário, recebedor, nome",
-        "bias": "Maria Oliveira, Pedro Santos, Ana Costa",
+        "bias": "Maria Oliveira, Pedro Santos, Ana Costa, Enviar para, Destinatário",
         "prejudice": "link, número do pedido, código de rastreamento, conhecimento de transporte, status do pedido, status de entrega, status, data do pedido, data de pagamento, data, item do pedido, nome do produto, nome do item, item, endereço, localização, contato, número de telefone, celular, banco, depósito, conta, transferência bancária, Pix, cartão, cartão de crédito, cartão de pagamento, data da compra, data do depósito, método de pagamento, opção de pagamento, gateway de pagamento, PG, meio de pagamento"
       },
       "recipient_address": {
@@ -9091,7 +9091,7 @@
       },
       "quantity": {
         "semantic": "Quantidade, quantidade do pedido, qtd, número de itens pedidos",
-        "bias": "1, 2, 3, 10",
+        "bias": "1, 2, 3, 10, Qtd., Quantidade",
         "prejudice": "identificador, link, número do pedido, código de rastreamento, conhecimento de transporte, número da linha, status do pedido, status de entrega, status, data do pedido, data de pagamento, data, item do pedido, nome do produto, nome do item, item, comprador, cliente, remetente, nome, endereço, contato, número de telefone, destinatário, recebedor, banco, conta, transferência bancária, Pix, cartão, método de pagamento, opção de pagamento, valor do item, valor do pedido, total do pedido, valor do pagamento, frete, preço de venda, preço, vendedor, franquia"
       },
       "amount": {
@@ -9820,7 +9820,7 @@
       },
       "title": {
         "semantic": "اسم المنتج، اسم الملبس، اسم السلعة، السلعة، الاسم، العنوان",
-        "bias": "اسم منتج الشحن، عنوان سلعة الشحن، اسم سلعة الشحن، نايكي إير فورس، سامسونج جالاكسي بوك، كفر آيفون، طقم عباءة، عطر عود ملكي",
+        "bias": "اسم منتج الشحن، عنوان سلعة الشحن، اسم سلعة الشحن، نايكي إير فورس، سامسونج جالاكسي بوك، كفر آيفون، طقم عباءة، عطر عود ملكي, الأصناف",
         "prejudice": "المعرّف، الرابط، رقم التتبع، بوليصة الشحن، الرقم، الرمز، حالة التوصيل، التقدم، تاريخ التسجيل، تاريخ الاستلام، تاريخ الإرسال، تاريخ المغادرة، العنوان، الموقع، جهة الاتصال، رقم الهاتف، الجوال، العرض، الاتساع، الارتفاع، الطول، العمق، الوزن، الكتلة، شركة الشحن، المندوب، شركة التوصيل، رسوم الشحن، تكلفة الشحن، السعر، طريقة الشحن، طريقة التوصيل، مدة النقل، مدة التوصيل، الشحن المدمج، الشحن المجمع"
       },
       "registration_date": {
@@ -10174,12 +10174,12 @@
       },
       "goods": {
         "semantic": "سلعة الطلب، اسم المنتج، اسم السلعة، السلعة",
-        "bias": "آيفون، 15، لاسلكي، لوحة مفاتيح، نايكي، حذاء رياضي، فستان، عباءة، ثوب، تيشيرت، اسم الطلب، عنوان الطلب، اسم السلعة الرئيسية، اسم السلعة و2 منتجات أخرى",
+        "bias": "آيفون، 15، لاسلكي، لوحة مفاتيح، نايكي، حذاء رياضي، فستان، عباءة، ثوب، تيشيرت، اسم الطلب، عنوان الطلب، اسم السلعة الرئيسية، اسم السلعة و2 منتجات أخرى, الأصناف, المنتجات",
         "prejudice": "المعرّف، الرابط، رقم الطلب، رقم التتبع، بوليصة الشحن، حالة الطلب، حالة التوصيل، الحالة، تاريخ الطلب، تاريخ الدفع، التاريخ، صاحب الطلب، المشتري، المرسل، الاسم، العنوان، الموقع، جهة الاتصال، رقم الهاتف، الجوال، المستلم، المتلقي، البنك، الإيداع، الحساب، التحويل البنكي، البطاقة، البطاقة الائتمانية، بطاقة الدفع، تاريخ الطلب، تاريخ الإيداع، طريقة الدفع، خيار الدفع، بوابة الدفع، مسار الدفع"
       },
       "sender_name": {
         "semantic": "صاحب الطلب، المشتري، المرسل، الاسم",
-        "bias": "أحمد الدوسري، مريم الكعبي، شركة، عضو، زائر",
+        "bias": "أحمد الدوسري، مريم الكعبي، شركة، عضو، زائر, العميل, اسم العميل",
         "prejudice": "الرابط، رقم الطلب، رقم التتبع، بوليصة الشحن، حالة الطلب، حالة التوصيل، الحالة، تاريخ الطلب، تاريخ الدفع، التاريخ، سلعة الطلب، اسم المنتج، اسم السلعة، السلعة، جهة الاتصال، رقم الهاتف، الجوال، العنوان، الموقع، البنك، الإيداع، الحساب، التحويل البنكي، البطاقة، البطاقة الائتمانية، بطاقة الدفع، تاريخ الطلب، تاريخ الإيداع، طريقة الدفع، خيار الدفع، بوابة الدفع، مسار الدفع"
       },
       "sender_address": {
@@ -10194,7 +10194,7 @@
       },
       "recipient_name": {
         "semantic": "المستلم، المتلقي، الاسم",
-        "bias": "نورة القحطاني، خالد السويدي، ليلى حسن",
+        "bias": "نورة القحطاني، خالد السويدي، ليلى حسن, الشحن إلى, المستلم",
         "prejudice": "الرابط، رقم الطلب، رقم التتبع، بوليصة الشحن، حالة الطلب، حالة التوصيل، الحالة، تاريخ الطلب، تاريخ الدفع، التاريخ، سلعة الطلب، اسم المنتج، اسم السلعة، السلعة، العنوان، الموقع، جهة الاتصال، رقم الهاتف، الجوال، البنك، الإيداع، الحساب، التحويل البنكي، البطاقة، البطاقة الائتمانية، بطاقة الدفع، تاريخ الطلب، تاريخ الإيداع، طريقة الدفع، خيار الدفع، بوابة الدفع، مسار الدفع"
       },
       "recipient_address": {
@@ -10244,7 +10244,7 @@
       },
       "amount": {
         "semantic": "إجمالي الطلب، مبلغ الطلب، مبلغ الدفع، إجمالي المدفوع، المجموع الكلي",
-        "bias": "55.00، 129.99 ر.س، 1,500.00 د.إ",
+        "bias": "55.00، 129.99 ر.س، 1,500.00 د.إ, الإجمالي, المبلغ الإجمالي",
         "prejudice": "المعرّف، الرابط، رقم الطلب، رقم التتبع، بوليصة الشحن، رقم الصف، حالة الطلب، حالة التوصيل، الحالة، تاريخ الطلب، تاريخ الدفع، التاريخ، سلعة الطلب، اسم المنتج، اسم السلعة، السلعة، صاحب الطلب، المشتري، الاسم، العنوان، جهة الاتصال، رقم الهاتف، المستلم، البنك، الحساب، التحويل البنكي، البطاقة، طريقة الدفع، خيار الدفع، الكمية، كمية الطلب، العدد، رسوم الشحن، تكلفة الشحن، مبلغ السلعة، سعر البيع، سعر الوحدة، البائع، الفرع"
       },
       "shipping_fee": {
@@ -11090,7 +11090,7 @@
       },
       "registration_date": {
         "semantic": "Datum registrace, datum vytvoření",
-        "bias": "datum produktu, datum položky, datum registrace produktu, 2026-03-15T12:00:00, 15.03.2026, 2026-05-20",
+        "bias": "datum produktu, datum položky, datum registrace produktu, 2026-03-15T12:00:00, 15.03.2026, 2026-05-20, Vytvořeno, Datum vytvoření",
         "prejudice": "identifikátor, odkaz, adresa, kód, stav prodeje, stav zobrazení, název produktu, název položky, název, platební metoda, banka, účet, vklad, bankovní převod, karta, platební karta, název modelu, značka, výrobce, stav zboží, použité, podrobný popis, text, krátký popis, štítky, klíčová slova, země původu, prodejní cena, akční cena, cena, nákupní cena, nákladová cena, měna, jednotka, běžná cena, doporučená cena, původní cena, množství, sklad, stav skladu, upozornění na nízký stav skladu, název jednotky, zdanitelné, daň, DPH, daňový kód, hlavní obrázek, náhled, další obrázek, video, klip, dopravce, kurýr, poplatek za dopravu, cena dopravy, způsob dopravy, způsob doručení, doba přepravy, kombinovaná doprava, společná doprava, šířka, výška, délka, hmotnost, váha, varianty, možnosti, doplňková položka, související produkt"
       },
       "payment_method": {
@@ -11210,7 +11210,7 @@
       },
       "quantity": {
         "semantic": "Množství, sklad, stav skladu, počet kusů",
-        "bias": "100, 50, 0, 999",
+        "bias": "100, 50, 0, 999, Skladem, Sklad",
         "prejudice": "identifikátor, odkaz, adresa, kód, stav prodeje, stav zobrazení, název produktu, název položky, název, datum registrace, datum vytvoření, platební metoda, banka, účet, vklad, bankovní převod, karta, platební karta, název modelu, značka, výrobce, stav zboží, použité, podrobný popis, text, krátký popis, štítky, klíčová slova, země původu, datum uvedení, datum výroby, datum expirace, prodejní cena, akční cena, cena, nákupní cena, nákladová cena, běžná cena, doporučená cena, původní cena, jednotka, název jednotky, zdanitelné, daň, DPH, daňový kód, hlavní obrázek, náhled, další obrázek, video, klip, dopravce, kurýr, poplatek za dopravu, cena dopravy, způsob dopravy, způsob doručení, doba přepravy, kombinovaná doprava, společná doprava, šířka, výška, délka, hmotnost, váha, varianty, možnosti, doplňková položka, související produkt"
       },
       "stock_keeping_unit": {
@@ -11342,7 +11342,7 @@
       },
       "recipient_name": {
         "semantic": "Příjemce, adresát, jméno",
-        "bias": "Jana Nováková, Petr Svoboda, Eva Černá",
+        "bias": "Jana Nováková, Petr Svoboda, Eva Černá, Doručit na, Příjemce",
         "prejudice": "odkaz, číslo objednávky, sledovací číslo, nákladní list, stav objednávky, stav doručení, stav, datum objednávky, datum platby, datum, položka objednávky, název produktu, název položky, položka, adresa, místo, kontakt, telefonní číslo, mobil, banka, vklad, účet, bankovní převod, karta, kreditní karta, platební karta, datum objednání, datum úhrady, platební metoda, možnost platby, platební brána, PG, platební kanál"
       },
       "recipient_address": {
@@ -12116,7 +12116,7 @@
       },
       "title": {
         "semantic": "Nome del prodotto, capo d'abbigliamento, nome dell'articolo, articolo, nome, titolo",
-        "bias": "nome del prodotto spedito, titolo dell'articolo spedito, nome dell'articolo spedito, Nike Air Force, Samsung Galaxy Book, Cover per iPhone, Completo elegante, Borsa Gucci",
+        "bias": "nome del prodotto spedito, titolo dell'articolo spedito, nome dell'articolo spedito, Nike Air Force, Samsung Galaxy Book, Cover per iPhone, Completo elegante, Borsa Gucci, Articoli",
         "prejudice": "identificativo, link, numero di tracciamento, lettera di vettura, numero, codice, stato della consegna, avanzamento, data di registrazione, data di ricezione, data di spedizione, data di partenza, indirizzo, località, contatto, numero di telefono, cellulare, larghezza, ampiezza, altezza, lunghezza, profondità, peso, massa, corriere, vettore, azienda di spedizioni, costo di spedizione, spese di spedizione, tariffa, metodo di spedizione, metodo di consegna, tempo di transito, durata della consegna, spedizione combinata, spedizione cumulativa"
       },
       "registration_date": {
@@ -12126,7 +12126,7 @@
       },
       "shipping_date": {
         "semantic": "Data di invio, data di spedizione, data di partenza",
-        "bias": "data di invio, data di spedizione, tempo di transito, 2026-03-16, 21/05/2026",
+        "bias": "data di invio, data di spedizione, tempo di transito, 2026-03-16, 21/05/2026, Spedito il",
         "prejudice": "identificativo, link, numero di tracciamento, lettera di vettura, numero, codice, stato della consegna, avanzamento, nome del prodotto, articolo, nome, titolo, mittente, speditore, venditore, indirizzo, località, contatto, numero di telefono, cellulare, destinatario, ricevente, acquirente, larghezza, ampiezza, altezza, lunghezza, profondità, peso, massa, corriere, vettore, azienda di spedizioni, costo di spedizione, spese di spedizione, tariffa, metodo di spedizione, metodo di consegna, spedizione combinata, spedizione cumulativa"
       },
       "sender_name": {
@@ -12238,7 +12238,7 @@
       },
       "registration_date": {
         "semantic": "Data di registrazione, data di creazione",
-        "bias": "data del prodotto, data dell'articolo, data di registrazione prodotto, 2026-03-15T12:00:00, 2026-05-20",
+        "bias": "data del prodotto, data dell'articolo, data di registrazione prodotto, 2026-03-15T12:00:00, 2026-05-20, Creato il, Data di creazione",
         "prejudice": "identificativo, link, indirizzo, codice, stato di vendita, stato di visualizzazione, nome del prodotto, nome dell'articolo, nome, metodo di pagamento, banca, conto, versamento, bonifico bancario, carta, carta di credito, nome del modello, marchio, produttore, condizioni del prodotto, usato, descrizione dettagliata, testo principale, descrizione breve, tag, parole chiave, paese di origine, prezzo di vendita, prezzo scontato, prezzo, prezzo di fornitura, prezzo di costo, prezzo di acquisto, valuta, unità, prezzo di listino, prezzo consigliato, prezzo originale, quantità, scorte, livello di inventario, avviso scorte in esaurimento, nome dell'unità, soggetto a tassazione, imposta, IVA, codice fiscale IVA, immagine principale, miniatura, immagine aggiuntiva, video, clip, corriere, vettore, costo di spedizione, spese di spedizione, metodo di spedizione, metodo di consegna, tempo di transito, spedizione combinata, spedizione cumulativa, larghezza, ampiezza, altezza, lunghezza, peso, massa, opzioni, scelte, articolo aggiuntivo, prodotto correlato"
       },
       "payment_method": {
@@ -12263,7 +12263,7 @@
       },
       "brand_name": {
         "semantic": "Marchio, brand, produttore",
-        "bias": "nome del prodotto, titolo del prodotto, nome dell'articolo, Samsung, Apple, Nike, Sony, Gucci, Prada, Armani, De'Longhi",
+        "bias": "nome del prodotto, titolo del prodotto, nome dell'articolo, Samsung, Apple, Nike, Sony, Gucci, Prada, Armani, De'Longhi, Marca",
         "prejudice": "identificativo, link, indirizzo, codice, stato di vendita, stato di visualizzazione, nome del prodotto, nome dell'articolo, nome, data di registrazione, data di creazione, metodo di pagamento, banca, conto, versamento, bonifico bancario, carta, carta di credito, nome del modello, condizioni del prodotto, usato, descrizione dettagliata, testo principale, descrizione breve, tag, parole chiave, paese di origine, data di uscita, data di produzione, data di scadenza, prezzo di vendita, prezzo scontato, prezzo, prezzo di fornitura, prezzo di costo, prezzo di acquisto, valuta, unità, prezzo di listino, prezzo consigliato, prezzo originale, quantità, scorte, livello di inventario, avviso scorte in esaurimento, nome dell'unità, soggetto a tassazione, imposta, IVA, codice fiscale IVA, immagine principale, miniatura, immagine aggiuntiva, video, clip, corriere, vettore, costo di spedizione, spese di spedizione, metodo di spedizione, metodo di consegna, tempo di transito, spedizione combinata, spedizione cumulativa, larghezza, ampiezza, altezza, lunghezza, peso, massa, opzioni, scelte, articolo aggiuntivo, prodotto correlato"
       },
       "condition": {
@@ -12455,7 +12455,7 @@
       },
       "tracking_number": {
         "semantic": "Numero di tracciamento, lettera di vettura",
-        "bias": "numero di tracciamento, numero lettera di vettura, tracciamento corriere, 1Z9999999999999999, 077123456789, IT1234567890",
+        "bias": "numero di tracciamento, numero lettera di vettura, tracciamento corriere, 1Z9999999999999999, 077123456789, IT1234567890, N. tracciamento",
         "prejudice": "numero, sequenza, numero di serie, numero di riga, numero elenco, indice, N., link, numero d'ordine, stato dell'ordine, stato della consegna, stato, data dell'ordine, data di pagamento, data, quantità, conteggio, importo articolo, importo totale dell'ordine, costo di spedizione, articolo ordinato, nome del prodotto, nome dell'articolo, articolo, ordinante, acquirente, mittente, nome, indirizzo, località, contatto, numero di telefono, cellulare, destinatario, ricevente, banca, versamento, conto, bonifico bancario, carta, carta di credito, carta di pagamento, data dell'ordine, data di versamento, metodo di pagamento, opzione di pagamento, gateway di pagamento, PG, canale di pagamento"
       },
       "status": {
@@ -12465,12 +12465,12 @@
       },
       "registration_date": {
         "semantic": "Data dell'ordine, data di pagamento, data",
-        "bias": "data e ora dell'ordine, data dell'ordine, ora dell'ordine, data di registrazione dell'ordine, 2026-03-15T14:16:35, 20/05/2026, 15-03-26 14:16",
+        "bias": "data e ora dell'ordine, data dell'ordine, ora dell'ordine, data di registrazione dell'ordine, 2026-03-15T14:16:35, 20/05/2026, 15-03-26 14:16, Data ordine",
         "prejudice": "numero, sequenza, numero di serie, numero di riga, indice, quantità, conteggio, importo articolo, importo totale dell'ordine, importo del pagamento, costo di spedizione, identificativo, link, numero d'ordine, numero di tracciamento, lettera di vettura, stato dell'ordine, stato della consegna, stato, articolo ordinato, nome del prodotto, nome dell'articolo, articolo, ordinante, acquirente, mittente, nome, indirizzo, località, contatto, numero di telefono, cellulare, destinatario, ricevente, banca, versamento, conto, bonifico bancario, carta, carta di credito, carta di pagamento, metodo di pagamento, opzione di pagamento, gateway di pagamento, PG, canale di pagamento"
       },
       "goods": {
         "semantic": "Articolo ordinato, nome del prodotto, nome dell'articolo, articolo",
-        "bias": "iPhone, 15, wireless, tastiera, Nike, sneakers, abito, maglione, T-shirt, nome dell'ordine, titolo dell'ordine, nome dell'articolo principale, nome dell'articolo e altri 2",
+        "bias": "iPhone, 15, wireless, tastiera, Nike, sneakers, abito, maglione, T-shirt, nome dell'ordine, titolo dell'ordine, nome dell'articolo principale, nome dell'articolo e altri 2, Articoli, Prodotti",
         "prejudice": "identificativo, link, numero d'ordine, numero di tracciamento, lettera di vettura, stato dell'ordine, stato della consegna, stato, data dell'ordine, data di pagamento, data, ordinante, acquirente, mittente, nome, indirizzo, località, contatto, numero di telefono, cellulare, destinatario, ricevente, banca, versamento, conto, bonifico bancario, carta, carta di credito, carta di pagamento, data dell'ordine, data di versamento, metodo di pagamento, opzione di pagamento, gateway di pagamento, PG, canale di pagamento"
       },
       "sender_name": {
@@ -12490,7 +12490,7 @@
       },
       "recipient_name": {
         "semantic": "Destinatario, ricevente, nome",
-        "bias": "Giulia Bianchi, Luca Verdi, Elena Ferrari",
+        "bias": "Giulia Bianchi, Luca Verdi, Elena Ferrari, Spedire a, Destinatario",
         "prejudice": "link, numero d'ordine, numero di tracciamento, lettera di vettura, stato dell'ordine, stato della consegna, stato, data dell'ordine, data di pagamento, data, articolo ordinato, nome del prodotto, nome dell'articolo, articolo, indirizzo, località, contatto, numero di telefono, cellulare, banca, versamento, conto, bonifico bancario, carta, carta di credito, carta di pagamento, data dell'ordine, data di versamento, metodo di pagamento, opzione di pagamento, gateway di pagamento, PG, canale di pagamento"
       },
       "recipient_address": {
@@ -13264,7 +13264,7 @@
       },
       "title": {
         "semantic": "Productnaam, kledingnaam, artikelnaam, artikel, naam, titel",
-        "bias": "verzendproductnaam, titel verzendartikel, naam verzendartikel, Nike Air Force, Samsung Galaxy Book, iPhone-hoesje, Kledingset",
+        "bias": "verzendproductnaam, titel verzendartikel, naam verzendartikel, Nike Air Force, Samsung Galaxy Book, iPhone-hoesje, Kledingset, Artikelen",
         "prejudice": "identificatie, link, track & trace-nummer, vrachtbrief, nummer, code, bezorgstatus, voortgang, registratiedatum, ontvangstdatum, verzenddatum, vertrekdatum, adres, locatie, contact, telefoonnummer, mobiel, breedte, hoogte, lengte, diepte, gewicht, massa, vervoerder, koerier, verzendbedrijf, verzendkosten, tarief, verzendmethode, bezorgmethode, transittijd, bezorgduur, gecombineerde verzending, bundelverzending"
       },
       "registration_date": {
@@ -13274,7 +13274,7 @@
       },
       "shipping_date": {
         "semantic": "Verzenddatum, afgiftedatum, vertrekdatum",
-        "bias": "afgiftedatum, verzenddatum, transittijd, 2026-03-16, 21-05-2026",
+        "bias": "afgiftedatum, verzenddatum, transittijd, 2026-03-16, 21-05-2026, Verzonden op",
         "prejudice": "identificatie, link, track & trace-nummer, vrachtbrief, nummer, code, bezorgstatus, voortgang, productnaam, artikel, naam, titel, afzender, verzender, verkoper, adres, locatie, contact, telefoonnummer, mobiel, ontvanger, geadresseerde, koper, breedte, hoogte, lengte, diepte, gewicht, massa, vervoerder, koerier, verzendbedrijf, verzendkosten, tarief, verzendmethode, bezorgmethode, gecombineerde verzending, bundelverzending"
       },
       "sender_name": {
@@ -13386,7 +13386,7 @@
       },
       "registration_date": {
         "semantic": "Registratiedatum, aanmaakdatum",
-        "bias": "productdatum, artikeldatum, productregistratiedatum, 2026-03-15T12:00:00, 2026-05-20",
+        "bias": "productdatum, artikeldatum, productregistratiedatum, 2026-03-15T12:00:00, 2026-05-20, Aangemaakt op, Aangemaakt",
         "prejudice": "identificatie, link, adres, code, verkoopstatus, weergavestatus, productnaam, artikelnaam, naam, betaalmethode, bank, rekening, storting, overboeking, kaart, creditcard, modelnaam, merknaam, fabrikant, productconditie, tweedehands, uitgebreide beschrijving, hoofdtekst, korte beschrijving, tags, zoekwoorden, land van herkomst, verkoopprijs, kortingsprijs, prijs, inkoopprijs, kostprijs, valuta, eenheid, normale prijs, adviesprijs, oorspronkelijke prijs, aantal, voorraad, voorraadniveau, waarschuwing lage voorraad, eenheidsnaam, belastbaar, belasting, btw, belastingcode, hoofdafbeelding, thumbnail, extra afbeelding, video, clip, vervoerder, koerier, verzendkosten, verzendmethode, bezorgmethode, transittijd, gecombineerde verzending, bundelverzending, breedte, hoogte, lengte, gewicht, massa, opties, keuzes, extra artikel, gerelateerd product"
       },
       "payment_method": {
@@ -13603,7 +13603,7 @@
       },
       "tracking_number": {
         "semantic": "Track & trace-nummer, vrachtbriefnummer",
-        "bias": "track & trace-nummer, vrachtbriefnummer, koerier tracking, 3SABCD123456789, JVGL0123456789, 1Z9999999999999999",
+        "bias": "track & trace-nummer, vrachtbriefnummer, koerier tracking, 3SABCD123456789, JVGL0123456789, 1Z9999999999999999, Zendingsnummer, Trackingnummer",
         "prejudice": "nummer, volgorde, serienummer, rijnummer, lijstnummer, index, Nr, link, bestelnummer, bestelstatus, bezorgstatus, status, besteldatum, betaaldatum, datum, aantal, telling, artikelbedrag, totaalbedrag bestelling, verzendkosten, bestelartikel, productnaam, artikelnaam, artikel, besteller, koper, afzender, naam, adres, locatie, contact, telefoonnummer, mobiel, ontvanger, geadresseerde, bank, storting, rekening, overboeking, kaart, creditcard, betaalpas, datum van bestelling, stortingsdatum, betaalmethode, betaaloptie, betaalgateway, PG, betaalroute"
       },
       "status": {
@@ -13613,17 +13613,17 @@
       },
       "registration_date": {
         "semantic": "Besteldatum, betaaldatum, datum",
-        "bias": "besteldatum en -tijd, besteldatum, besteltijd, bestelregistratiedatum, 2026-03-15T14:16:35, 20-05-2026, 15-03-26 14:16",
+        "bias": "besteldatum en -tijd, besteldatum, besteltijd, bestelregistratiedatum, 2026-03-15T14:16:35, 20-05-2026, 15-03-26 14:16, Besteld op",
         "prejudice": "nummer, volgorde, serienummer, rijnummer, index, aantal, telling, artikelbedrag, totaalbedrag bestelling, betaalbedrag, verzendkosten, identificatie, link, bestelnummer, track & trace-nummer, vrachtbrief, bestelstatus, bezorgstatus, status, bestelartikel, productnaam, artikelnaam, artikel, besteller, koper, afzender, naam, adres, locatie, contact, telefoonnummer, mobiel, ontvanger, geadresseerde, bank, storting, rekening, overboeking, kaart, creditcard, betaalpas, betaalmethode, betaaloptie, betaalgateway, PG, betaalroute"
       },
       "goods": {
         "semantic": "Bestelartikel, productnaam, artikelnaam, artikel",
-        "bias": "iPhone, 15, draadloos, toetsenbord, Nike, sneakers, jurk, gebreid, T-shirt, bestelnaam, besteltitel, naam hoofdartikel, artikelnaam en nog 2",
+        "bias": "iPhone, 15, draadloos, toetsenbord, Nike, sneakers, jurk, gebreid, T-shirt, bestelnaam, besteltitel, naam hoofdartikel, artikelnaam en nog 2, Artikelen, Producten",
         "prejudice": "identificatie, link, bestelnummer, track & trace-nummer, vrachtbrief, bestelstatus, bezorgstatus, status, besteldatum, betaaldatum, datum, besteller, koper, afzender, naam, adres, locatie, contact, telefoonnummer, mobiel, ontvanger, geadresseerde, bank, storting, rekening, overboeking, kaart, creditcard, betaalpas, datum van bestelling, stortingsdatum, betaalmethode, betaaloptie, betaalgateway, PG, betaalroute"
       },
       "sender_name": {
         "semantic": "Besteller, koper, afzender, naam",
-        "bias": "Jan de Vries, Sanne Jansen, B.V., lid, gast",
+        "bias": "Jan de Vries, Sanne Jansen, B.V., lid, gast, Klant, Klantnaam",
         "prejudice": "link, bestelnummer, track & trace-nummer, vrachtbrief, bestelstatus, bezorgstatus, status, besteldatum, betaaldatum, datum, bestelartikel, productnaam, artikelnaam, artikel, contact, telefoonnummer, mobiel, adres, locatie, bank, storting, rekening, overboeking, kaart, creditcard, betaalpas, datum van bestelling, stortingsdatum, betaalmethode, betaaloptie, betaalgateway, PG, betaalroute"
       },
       "sender_address": {
@@ -13638,7 +13638,7 @@
       },
       "recipient_name": {
         "semantic": "Ontvanger, geadresseerde, naam",
-        "bias": "Sanne Jansen, Daan Bakker, Lotte Smit",
+        "bias": "Sanne Jansen, Daan Bakker, Lotte Smit, Verzenden naar, Ontvanger",
         "prejudice": "link, bestelnummer, track & trace-nummer, vrachtbrief, bestelstatus, bezorgstatus, status, besteldatum, betaaldatum, datum, bestelartikel, productnaam, artikelnaam, artikel, adres, locatie, contact, telefoonnummer, mobiel, bank, storting, rekening, overboeking, kaart, creditcard, betaalpas, datum van bestelling, stortingsdatum, betaalmethode, betaaloptie, betaalgateway, PG, betaalroute"
       },
       "recipient_address": {
@@ -13673,7 +13673,7 @@
       },
       "payment_method": {
         "semantic": "Betaalmethode, betaaloptie",
-        "bias": "iDEAL, Creditcard, Bankoverschrijving, Directe bankoverschrijving, Klarna, PayPal, Apple Pay, Google Pay",
+        "bias": "iDEAL, Creditcard, Bankoverschrijving, Directe bankoverschrijving, Klarna, PayPal, Apple Pay, Google Pay, Betaling, Betaalmethode",
         "prejudice": "identificatie, link, bestelnummer, track & trace-nummer, vrachtbrief, bestelstatus, bezorgstatus, status, besteldatum, betaaldatum, datum, bestelartikel, productnaam, artikelnaam, artikel, besteller, koper, afzender, naam, adres, locatie, contact, telefoonnummer, mobiel, ontvanger, geadresseerde, datum van bestelling, stortingsdatum"
       },
       "payment_origin": {
@@ -14422,7 +14422,7 @@
       },
       "shipping_date": {
         "semantic": "发货日期, 寄件日期, 发车日期",
-        "bias": "发货日期, 寄件日期, 运输时间, 2026-03-16, 2026/05/21",
+        "bias": "发货日期, 寄件日期, 运输时间, 2026-03-16, 2026/05/21, 发货时间",
         "prejudice": "标识符, 链接, 快递单号, 运单号, 编号, 代码, 物流状态, 进度, 商品名称, 物品, 名称, 标题, 寄件人, 发货方, 卖家, 地址, 位置, 联系方式, 电话号码, 手机号, 收件人, 签收人, 买家, 宽度, 广度, 高度, 长度, 深度, 重量, 质量, 快递公司, 承运商, 物流公司, 运费, 配送费, 费率, 配送方式, 发货方式, 合并发货, 合包发货"
       },
       "sender_name": {
@@ -14442,7 +14442,7 @@
       },
       "recipient_name": {
         "semantic": "收件人, 签收人, 买家姓名",
-        "bias": "收件人, 签收人, 买家姓名, 李娜, 王芳, 陈明",
+        "bias": "收件人, 签收人, 买家姓名, 李娜, 王芳, 陈明, 收货人",
         "prejudice": "标识符, 链接, 快递单号, 运单号, 编号, 代码, 物流状态, 进度, 登记日期, 揽收日期, 发货日期, 发件日期, 寄件人, 发货方, 卖家, 地址, 位置, 联系方式, 电话号码, 手机号, 收件人, 收货目的地, 收货地址, 宽度, 广度, 高度, 长度, 深度, 重量, 质量, 快递公司, 承运商, 物流公司, 运费, 配送费, 费率, 配送方式, 发货方式, 运输时间, 配送时长, 合并发货, 合包发货"
       },
       "recipient_address": {
@@ -14534,7 +14534,7 @@
       },
       "registration_date": {
         "semantic": "登记日期, 创建日期",
-        "bias": "商品日期, 宝贝日期, 商品发布日期, 2026-03-15T12:00:00, 2026-05-20",
+        "bias": "商品日期, 宝贝日期, 商品发布日期, 2026-03-15T12:00:00, 2026-05-20, 创建时间, 上架时间",
         "prejudice": "标识符, 链接, 网址, 代码, 销售状态, 上架状态, 商品名称, 宝贝名称, 名称, 支付方式, 银行, 账户, 存款, 银行转账, 银行卡, 信用卡, 型号名称, 品牌名称, 制造商, 商品成色, 二手, 详细描述, 正文内容, 简短描述, 标签, 关键词, 原产国, 销售价, 折扣价, 价格, 供货价, 成本价, 采购价, 货币, 单位, 原价, 建议零售价, 吊牌价, 数量, 库存, 库存水平, 库存预警, 单位名称, 是否含税, 税费, 增值税, 税收分类编码, 主图, 缩略图, 附加图片, 视频, 短视频, 快递公司, 承运商, 运费, 配送费, 配送方式, 发货方式, 运输时间, 合并发货, 合包发货, 宽度, 广度, 高度, 长度, 重量, 质量, 规格选项, 选项, 加购商品, 关联商品"
       },
       "payment_method": {
@@ -14786,7 +14786,7 @@
       },
       "recipient_name": {
         "semantic": "收件人, 签收人, 姓名",
-        "bias": "王芳, 陈明, 刘洋",
+        "bias": "王芳, 陈明, 刘洋, 收货地, 收货人",
         "prejudice": "链接, 订单编号, 快递单号, 运单号, 订单状态, 物流状态, 状态, 下单日期, 付款日期, 日期, 订单商品, 商品名称, 宝贝名称, 物品, 地址, 位置, 联系方式, 电话号码, 手机号, 银行, 存款, 账户, 银行转账, 银行卡, 信用卡, 支付卡, 下单时间, 到账日期, 支付方式, 付款选项, 支付网关, 支付渠道, 支付路径"
       },
       "recipient_address": {

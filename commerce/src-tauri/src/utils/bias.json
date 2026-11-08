@@ -1805,7 +1805,7 @@
       },
       "recipient_name": {
         "semantic": "받는사람, 수령인, 구매자 이름",
-        "bias": "받는사람, 수령인, 구매자 이름, 김철수, 이영희, 박지성",
+        "bias": "받는사람, 수령인, 구매자 이름, 김철수, 이영희, 박지성, 받는분, 받는 분",
         "prejudice": "식별자, 링크, 운송장번호, 송장, 번호, 코드, 배송상태, 진행상황, 등록일, 접수일, 발송일, 출발일, 보낸사람, 발송인, 판매자, 주소, 위치, 연락처, 전화번호, 핸드폰, 받는사람, 수령지, 배송지, 가로, 너비, 폭, 세로, 높이, 길이, 깊이, 무게, 중량, 택배사, 배송업체, 운송사, 배송비, 운송료, 요금, 배송방법, 배송수단, 배송기간, 소요일, 묶음배송, 합배송"
       },
       "recipient_address": {
@@ -2932,7 +2932,7 @@
       },
       "title": {
         "semantic": "Product name, apparel name, item name, item, name, title",
-        "bias": "shipping product name, shipping item title, shipping item name, Nike Air Force, Samsung Galaxy Book, iPhone Case, Dress Set",
+        "bias": "shipping product name, shipping item title, shipping item name, Nike Air Force, Samsung Galaxy Book, iPhone Case, Dress Set, Items, Contents",
         "prejudice": "identifier, link, tracking number, waybill, number, code, delivery status, progress, registration date, received date, dispatch date, departure date, address, location, contact, phone number, mobile, width, breadth, height, length, depth, weight, mass, carrier, courier, shipping company, shipping fee, shipping cost, rate, shipping method, delivery method, transit time, delivery duration, combined shipping, bundled shipping"
       },
       "registration_date": {
@@ -2942,7 +2942,7 @@
       },
       "shipping_date": {
         "semantic": "Dispatch date, shipping date, departure date",
-        "bias": "dispatch date, shipping date, transit time, 2026-03-16, 05/21/2026",
+        "bias": "dispatch date, shipping date, transit time, 2026-03-16, 05/21/2026, Shipped on, Ship date, Dispatched on",
         "prejudice": "identifier, link, tracking number, waybill, number, code, delivery status, progress, product name, item, name, title, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, width, breadth, height, length, depth, weight, mass, carrier, courier, shipping company, shipping fee, shipping cost, rate, shipping method, delivery method, combined shipping, bundled shipping"
       },
       "sender_name": {
@@ -3054,7 +3054,7 @@
       },
       "registration_date": {
         "semantic": "Registration date, creation date",
-        "bias": "product date, item date, product registration date, 2026-03-15T12:00:00, 2026-05-20",
+        "bias": "product date, item date, product registration date, 2026-03-15T12:00:00, 2026-05-20, Created, Created on, Date added, Added on",
         "prejudice": "identifier, link, address, code, sales status, display status, product name, item name, name, payment method, bank, account, deposit, wire transfer, card, credit card, model name, brand name, manufacturer, product condition, used, detailed description, body text, short description, tags, keywords, country of origin, sale price, discount price, price, supply price, cost price, purchase price, currency, unit, regular price, MSRP, original price, quantity, stock, inventory level, low stock warning, unit name, taxable, tax, VAT, tax code, main image, thumbnail, additional image, video, clip, carrier, courier, shipping fee, shipping cost, shipping method, delivery method, transit time, combined shipping, bundled shipping, width, breadth, height, length, weight, mass, options, choices, add-on item, related product"
       },
       "payment_method": {
@@ -3271,7 +3271,7 @@
       },
       "tracking_number": {
         "semantic": "Tracking number, waybill",
-        "bias": "tracking number, waybill number, courier tracking, 1Z9999999999999999, 9400100000000000000000, 381234567891",
+        "bias": "tracking number, waybill number, courier tracking, 1Z9999999999999999, 9400100000000000000000, 381234567891, Tracking #, Tracking no., Tracking ID",
         "prejudice": "number, sequence, serial number, row number, list number, index, No, link, order number, order status, delivery status, status, order date, payment date, date, quantity, count, item amount, total order amount, shipping fee, order item, product name, item name, item, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "status": {
@@ -3281,17 +3281,17 @@
       },
       "registration_date": {
         "semantic": "Order date, payment date, date",
-        "bias": "order date and time, order date, order time, order registration date, 2026-03-15T14:16:35, 05/20/2026, 03-15-26 14:16",
+        "bias": "order date and time, order date, order time, order registration date, 2026-03-15T14:16:35, 05/20/2026, 03-15-26 14:16, Ordered, Ordered on, Order placed, Placed on, Date placed, Purchase date",
         "prejudice": "number, sequence, serial number, row number, index, quantity, count, item amount, total order amount, payment amount, shipping fee, identifier, link, order number, tracking number, waybill, order status, delivery status, status, order item, product name, item name, item, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, deposit, account, wire transfer, card, credit card, payment card, payment method, payment option, payment gateway, PG, payment route"
       },
       "goods": {
         "semantic": "Order item, product name, item name, item",
-        "bias": "iPhone, 15, wireless, keyboard, Nike, sneakers, dress, knit, T-shirt, order name, order title, main item name, item name and 2 more",
+        "bias": "iPhone, 15, wireless, keyboard, Nike, sneakers, dress, knit, T-shirt, order name, order title, main item name, item name and 2 more, Items, Line items, Products",
         "prejudice": "identifier, link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "sender_name": {
         "semantic": "Orderer, buyer, sender, name",
-        "bias": "John Doe, Jane Smith, Inc., member, guest",
+        "bias": "John Doe, Jane Smith, Inc., member, guest, Customer, Customer name, Billed to, Bill to",
         "prejudice": "link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, contact, phone number, mobile, address, location, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "sender_address": {
@@ -3306,7 +3306,7 @@
       },
       "recipient_name": {
         "semantic": "Recipient, receiver, name",
-        "bias": "Jane Doe, Michael Smith, Emily Brown",
+        "bias": "Jane Doe, Michael Smith, Emily Brown, Ship to, Shipping name, Deliver to",
         "prejudice": "link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, address, location, contact, phone number, mobile, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "recipient_address": {
