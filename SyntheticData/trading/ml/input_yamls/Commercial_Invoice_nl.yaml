@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: nl
+document_title: Handelsfactuur
+metadata:
+  invoice_number: CI-NL-2609-280
+  issue_date: '2026-09-27'
+  reference_po_number: PO-NL-65999
+  related_bl_number: BL-NL93718156
+  related_lc_number: LC-NL6264010
+  currency: EUR
+parties:
+  shipper_exporter:
+    name: Kwekerij Duinzicht B.V.
+    address: Heereweg 210, 2161 BR Lisse, Nederland
+    contact_number: +31 252 555 014
+    tax_id: NL812345678B01
+  consignee:
+    name: Yeoreum Garden Co., Ltd.
+    address: 58 Sejong-daero, Jung-gu, Seoel, Zuid-Korea
+    contact_number: +82 2 555 0151
+    tax_id: 104-81-77320
+shipping_details:
+  port_of_loading: Rotterdam, Nederland
+  port_of_discharge: Busan, Zuid-Korea
+  vessel_flight: NOORDERZON V.517E
+  incoterms: CIF Busan
+line_items:
+- item_code: TUL-12
+  description: Tulpenbollen maat 12/+
+  quantity: 200000
+  unit: st.
+  unit_price: 0.21
+  total_amount: 42000.0
+  hs_code: '0601.10'
+- item_code: HYA-17
+  description: Hyacintenbollen maat 17/18
+  quantity: 40000
+  unit: st.
+  unit_price: 0.48
+  total_amount: 19200.0
+  hs_code: '0601.10'
+summary:
+  total_quantity: 240000
+  total_items_amount: 61200.0
+  freight_charge: 4896.0
+  insurance: 244.8
+  grand_total_amount: 66340.8

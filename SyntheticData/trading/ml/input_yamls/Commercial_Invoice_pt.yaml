@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: pt
+document_title: Fatura comercial
+metadata:
+  invoice_number: CI-PT-2609-197
+  issue_date: '2026-09-21'
+  reference_po_number: PO-PT-74235
+  related_bl_number: BL-PT56145092
+  related_lc_number: LC-PT3608203
+  currency: EUR
+parties:
+  shipper_exporter:
+    name: Corticeira Vale Verde, Lda.
+    address: Rua do Sobreiro 9, 4520-123 Santa Maria da Feira, Portugal
+    contact_number: +351 256 555 014
+    tax_id: PT 509 876 543
+  consignee:
+    name: Hwain Interior Co., Ltd.
+    address: 27 Haeun-daero, Haeundae-gu, Busan, Coreia do Sul
+    contact_number: +82 51 555 0137
+    tax_id: 617-81-45209
+shipping_details:
+  port_of_loading: Leixões, Portugal
+  port_of_discharge: Busan, Coreia do Sul
+  vessel_flight: ATLANTICO NORTE V.091E
+  incoterms: CFR Busan
+line_items:
+- item_code: RCN-24
+  description: Rolhas de cortiça natural 24 x 45 mm
+  quantity: 500000
+  unit: un.
+  unit_price: 0.12
+  total_amount: 60000.0
+  hs_code: '4503.10'
+- item_code: PAV-60
+  description: Painéis de aglomerado de cortiça para pavimento
+  quantity: 4800
+  unit: un.
+  unit_price: 9.6
+  total_amount: 46080.0
+  hs_code: '4504.10'
+summary:
+  total_quantity: 504800
+  total_items_amount: 106080.0
+  freight_charge: 7425.6
+  insurance: 0.0
+  grand_total_amount: 113505.6

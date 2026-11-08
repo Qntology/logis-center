@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: fr
+document_title: Liste de colisage
+metadata:
+  packing_list_number: PL-FR-2609-555
+  issue_date: '2026-09-14'
+  related_invoice_number: CI-FR-2609-311
+  related_po_number: PO-FR-12413
+  related_bl_number: BL-FR22344855
+parties:
+  shipper_exporter:
+    name: Laboratoires Belle-Rive SAS
+    address: 12 rue des Tanneurs, 69002 Lyon, France
+  consignee:
+    name: Saebom Cosmetics Co., Ltd.
+    address: 41 Songdo-gwahak-ro, Yeonsu-gu, Incheon, Corée du Sud
+shipping_details:
+  vessel_flight: CAP DU PONANT V.115E
+  port_of_loading: Le Havre, France
+  port_of_discharge: Incheon, Corée du Sud
+packing_details:
+- item_code: CRH-50
+  description: Crème hydratante visage 50 ml
+  quantity: 12000
+  unit: pcs
+  packages: 120
+  package_type: cartons
+  net_weight_kg: 900.0
+  gross_weight_kg: 1150.0
+  measurement_cbm: 6.0
+- item_code: EDP-100
+  description: Eau de parfum 100 ml
+  quantity: 3000
+  unit: pcs
+  packages: 60
+  package_type: cartons
+  net_weight_kg: 720.0
+  gross_weight_kg: 980.0
+  measurement_cbm: 3.6
+summary:
+  total_packages: 180
+  total_net_weight_kg: 1620.0
+  total_gross_weight_kg: 2130.0
+  total_measurement_cbm: 9.6

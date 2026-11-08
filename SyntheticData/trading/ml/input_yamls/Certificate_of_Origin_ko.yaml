@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: ko
+document_title: 원산지증명서
+metadata:
+  certificate_number: CO-2026-KR-4268
+  issue_date: '2026-09-16'
+  related_invoice_number: CI-KR-2609-313
+  related_bl_number: BL-KR90619014
+  related_lc_number: LC-KR2372314
+parties:
+  exporter:
+    name: (주)한빛타이어
+    address: 울산광역시 남구 산업로 123
+  importer_consignee:
+    name: Vina Auto Parts Co., Ltd.
+    address: 25 Nguyen Van Linh, District 7, Ho Chi Minh City, Vietnam
+  issuing_authority:
+    name: 한바다상공회의소
+    address: 울산광역시 남구 상공로 9
+transport_details:
+  vessel_flight: HANBADA V.118S
+  port_of_loading: 부산, 대한민국
+  port_of_discharge: 호찌민, 베트남
+cargo_details:
+- marks_and_numbers: VINA AUTO / HO CHI MINH / MADE IN KOREA
+  description_of_goods: 승용차용 래디얼 타이어 205/55R16 (HT-20555)
+  hs_code: '4011.10'
+  quantity: 4,800 개
+  gross_weight_kg: 43200.0
+  origin_criterion: 대한민국에서 완전 생산
+- marks_and_numbers: VINA AUTO / HO CHI MINH / MADE IN KOREA
+  description_of_goods: 알루미늄 휠 16x7J (AW-1607)
+  hs_code: '8708.70'
+  quantity: 1,200 개
+  gross_weight_kg: 11640.0
+  origin_criterion: 대한민국에서 완전 생산
+declaration:
+  statement: 위 물품의 원산지가 대한민국임을 증명합니다.

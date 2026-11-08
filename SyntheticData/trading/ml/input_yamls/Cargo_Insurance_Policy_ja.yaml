@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: ja
+document_title: 貨物海上保険証券
+metadata:
+  policy_number: IP-JP-193703
+  issue_date: '2026-09-03'
+  effective_date: '2026-09-04'
+  related_invoice_number: CI-JP-2609-343
+  related_bl_number: BL-JP34178511
+  related_lc_number: LC-JP5532891
+  related_po_number: PO-JP-57075
+parties:
+  insurer:
+    name: 北斗損害保険株式会社
+    address: 〒231-0002 神奈川県横浜市中区海岸通4-15
+  insured:
+    name: 北斗精機株式会社
+    address: 〒460-0008 愛知県名古屋市中区栄3-5-12
+coverage_details:
+  sum_insured: 126809760.0
+  currency: JPY
+  valuation_basis: CIF価額の110%
+  coverage_conditions: 協会貨物約款（A）オールリスク
+  premium_amount: 317024.0
+  claims_payable_at: 釜山、韓国
+transport_details:
+  vessel_flight: HOKUTO MARU V.712W
+  port_of_loading: 名古屋、日本
+  port_of_discharge: 釜山、韓国
+cargo_details:
+- mark_and_numbers: DAON / CHANGWON / MADE IN JAPAN
+  description_of_goods: 産業用ロボットアームおよびサーボモーター
+  number_of_packages: 39箱
+  gross_weight_kg: 6540.0

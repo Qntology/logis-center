@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: ja
+document_title: 原産地証明書
+metadata:
+  certificate_number: CO-2026-JP-9160
+  issue_date: '2026-09-03'
+  related_invoice_number: CI-JP-2609-343
+  related_bl_number: BL-JP34178511
+  related_lc_number: LC-JP5532891
+parties:
+  exporter:
+    name: 北斗精機株式会社
+    address: 〒460-0008 愛知県名古屋市中区栄3-5-12
+  importer_consignee:
+    name: Daon Robotics Co., Ltd.
+    address: 27 Gongdan-ro, Seongsan-gu, Changwon, 韓国
+  issuing_authority:
+    name: 北斗商工会議所
+    address: 〒460-0003 愛知県名古屋市中区錦4-7-1
+transport_details:
+  vessel_flight: HOKUTO MARU V.712W
+  port_of_loading: 名古屋、日本
+  port_of_discharge: 釜山、韓国
+cargo_details:
+- marks_and_numbers: DAON / CHANGWON / MADE IN JAPAN
+  description_of_goods: 6軸産業用ロボットアーム (RA-6X)
+  hs_code: '8479.50'
+  quantity: 24 台
+  gross_weight_kg: 5280.0
+  origin_criterion: 日本で完全に生産された産品
+- marks_and_numbers: DAON / CHANGWON / MADE IN JAPAN
+  description_of_goods: ACサーボモーター 750W (SV-750)
+  hs_code: '8501.52'
+  quantity: 300 台
+  gross_weight_kg: 1260.0
+  origin_criterion: 日本で完全に生産された産品
+declaration:
+  statement: 上記の貨物が日本を原産地とすることを証明する。

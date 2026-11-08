@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: nl
+document_title: Transportverzekeringspolis
+metadata:
+  policy_number: IP-NL-811857
+  issue_date: '2026-09-28'
+  effective_date: '2026-09-29'
+  related_invoice_number: CI-NL-2609-280
+  related_bl_number: BL-NL93718156
+  related_lc_number: LC-NL6264010
+  related_po_number: PO-NL-65999
+parties:
+  insurer:
+    name: Noorderzon Transportverzekeringen N.V.
+    address: Wilhelminakade 77, 3072 AP Rotterdam, Nederland
+  insured:
+    name: Kwekerij Duinzicht B.V.
+    address: Heereweg 210, 2161 BR Lisse, Nederland
+coverage_details:
+  sum_insured: 72974.88
+  currency: EUR
+  valuation_basis: CIF-waarde verhoogd met 10 %
+  coverage_conditions: Institute Cargo Clauses (A) – alle risico's
+  premium_amount: 182.44
+  claims_payable_at: Seoel, Zuid-Korea
+transport_details:
+  vessel_flight: NOORDERZON V.517E
+  port_of_loading: Rotterdam, Nederland
+  port_of_discharge: Busan, Zuid-Korea
+cargo_details:
+- mark_and_numbers: YEOREUM / SEOEL / PRODUCT VAN NEDERLAND
+  description_of_goods: Tulpenbollen en hyacintenbollen
+  number_of_packages: 500 kartons
+  gross_weight_kg: 6500.0

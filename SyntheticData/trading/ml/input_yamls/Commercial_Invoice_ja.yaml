@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: ja
+document_title: 商業送り状
+metadata:
+  invoice_number: CI-JP-2609-343
+  issue_date: '2026-09-02'
+  reference_po_number: PO-JP-57075
+  related_bl_number: BL-JP34178511
+  related_lc_number: LC-JP5532891
+  currency: JPY
+parties:
+  shipper_exporter:
+    name: 北斗精機株式会社
+    address: 〒460-0008 愛知県名古屋市中区栄3-5-12
+    contact_number: 052-555-0142
+    tax_id: T5180001023456
+  consignee:
+    name: Daon Robotics Co., Ltd.
+    address: 27 Gongdan-ro, Seongsan-gu, Changwon, 韓国
+    contact_number: +82 55 555 0182
+    tax_id: 609-86-11823
+shipping_details:
+  port_of_loading: 名古屋、日本
+  port_of_discharge: 釜山、韓国
+  vessel_flight: HOKUTO MARU V.712W
+  incoterms: CIF Busan
+line_items:
+- item_code: RA-6X
+  description: 6軸産業用ロボットアーム
+  quantity: 24
+  unit: 台
+  unit_price: 3850000.0
+  total_amount: 92400000.0
+  hs_code: '8479.50'
+- item_code: SV-750
+  description: ACサーボモーター 750W
+  quantity: 300
+  unit: 台
+  unit_price: 68000.0
+  total_amount: 20400000.0
+  hs_code: '8501.52'
+summary:
+  total_quantity: 324
+  total_items_amount: 112800000.0
+  freight_charge: 2256000.0
+  insurance: 225600.0
+  grand_total_amount: 115281600.0

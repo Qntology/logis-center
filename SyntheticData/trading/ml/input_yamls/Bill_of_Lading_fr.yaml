@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: fr
+document_title: Connaissement
+metadata:
+  bl_number: BL-FR22344855
+  issue_date: '2026-09-16'
+  related_invoice_number: CI-FR-2609-311
+  related_po_number: PO-FR-12413
+  related_lc_number: LC-FR5474227
+  freight_term: Fret payé d'avance
+parties:
+  shipper:
+    name: Laboratoires Belle-Rive SAS
+    address: 12 rue des Tanneurs, 69002 Lyon, France
+  consignee:
+    name: Saebom Cosmetics Co., Ltd.
+    address: 41 Songdo-gwahak-ro, Yeonsu-gu, Incheon, Corée du Sud
+  notify_party:
+    name: Saebom Cosmetics Co., Ltd.
+    address: 41 Songdo-gwahak-ro, Yeonsu-gu, Incheon, Corée du Sud
+  carrier:
+    name: Compagnie Maritime du Ponant
+shipping_details:
+  vessel_flight: CAP DU PONANT V.115E
+  port_of_loading: Le Havre, France
+  port_of_discharge: Incheon, Corée du Sud
+  place_of_receipt: Lyon, France
+  place_of_delivery: Incheon, Corée du Sud
+cargo_details:
+  container_number: CMPU7542109
+  seal_number: SL326302
+  marks_and_numbers: SAEBOM / INCHEON / FABRIQUÉ EN FRANCE
+  number_of_packages: 180 cartons
+  description_of_goods: Crèmes hydratantes et eaux de parfum
+  gross_weight_kg: 2130.0
+  measurement_cbm: 9.6

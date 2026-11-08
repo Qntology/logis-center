@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: es
+document_title: Factura comercial
+metadata:
+  invoice_number: CI-ES-2610-707
+  issue_date: '2026-10-01'
+  reference_po_number: PO-ES-35900
+  related_bl_number: BL-ES68027868
+  related_lc_number: LC-ES5284106
+  currency: EUR
+parties:
+  shipper_exporter:
+    name: Olivares del Alba S.L.
+    address: Calle Mayor 21, 23001 Jaén, España
+    contact_number: +34 953 555 014
+    tax_id: B23456781
+  consignee:
+    name: Hanmaru Foods Co., Ltd.
+    address: 77 Jungang-daero, Jung-gu, Busan, Corea del Sur
+    contact_number: +82 51 555 0188
+    tax_id: 602-81-33417
+shipping_details:
+  port_of_loading: Valencia, España
+  port_of_discharge: Busan, Corea del Sur
+  vessel_flight: ALBORAN STAR V.208E
+  incoterms: CIF Busan
+line_items:
+- item_code: AOV-5L
+  description: Aceite de oliva virgen extra en garrafas de 5 l
+  quantity: 2400
+  unit: uds.
+  unit_price: 31.5
+  total_amount: 75600.0
+  hs_code: '1509.20'
+- item_code: ACT-1K
+  description: Aceitunas de mesa en tarros de 1 kg
+  quantity: 3600
+  unit: uds.
+  unit_price: 4.2
+  total_amount: 15120.0
+  hs_code: '2005.70'
+summary:
+  total_quantity: 6000
+  total_items_amount: 90720.0
+  freight_charge: 5443.2
+  insurance: 362.88
+  grand_total_amount: 96526.08

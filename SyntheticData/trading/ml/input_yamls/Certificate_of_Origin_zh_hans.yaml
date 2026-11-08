@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: zh-hans
+document_title: 原产地证明书
+metadata:
+  certificate_number: CO-2026-CN-1545
+  issue_date: '2026-10-04'
+  related_invoice_number: CI-CN-2610-722
+  related_bl_number: BL-CN22569071
+  related_lc_number: LC-CN8832551
+parties:
+  exporter:
+    name: 海星新能源科技有限公司
+    address: 浙江省宁波市鄞州区海星路88号
+  importer_consignee:
+    name: Sinhan Battery Co., Ltd.
+    address: 45 Saneop-ro, Heungdeok-gu, Cheongju, 韩国
+  issuing_authority:
+    name: 海星国际贸易促进委员会宁波分会
+    address: 浙江省宁波市海曙区海星街12号
+transport_details:
+  vessel_flight: HAI XING V.903E
+  port_of_loading: 宁波，中国
+  port_of_discharge: 釜山，韩国
+cargo_details:
+- marks_and_numbers: SINHAN / CHEONGJU / MADE IN CHINA
+  description_of_goods: 磷酸铁锂电池模组 280Ah (LFP-280)
+  hs_code: '8507.60'
+  quantity: 600 套
+  gross_weight_kg: 19800.0
+  origin_criterion: 完全在中国获得
+- marks_and_numbers: SINHAN / CHEONGJU / MADE IN CHINA
+  description_of_goods: 电池管理系统控制板 (BMS-16S)
+  hs_code: '8537.10'
+  quantity: 600 套
+  gross_weight_kg: 560.0
+  origin_criterion: 完全在中国获得
+declaration:
+  statement: 兹证明上述货物原产于中国。

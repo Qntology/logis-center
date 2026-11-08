@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: nl
+document_title: Certificaat van oorsprong
+metadata:
+  certificate_number: CO-2026-NL-3020
+  issue_date: '2026-09-28'
+  related_invoice_number: CI-NL-2609-280
+  related_bl_number: BL-NL93718156
+  related_lc_number: LC-NL6264010
+parties:
+  exporter:
+    name: Kwekerij Duinzicht B.V.
+    address: Heereweg 210, 2161 BR Lisse, Nederland
+  importer_consignee:
+    name: Yeoreum Garden Co., Ltd.
+    address: 58 Sejong-daero, Jung-gu, Seoel, Zuid-Korea
+  issuing_authority:
+    name: Handelskamer Bollenstreek
+    address: Stationsweg 3, 2161 AL Lisse, Nederland
+transport_details:
+  vessel_flight: NOORDERZON V.517E
+  port_of_loading: Rotterdam, Nederland
+  port_of_discharge: Busan, Zuid-Korea
+cargo_details:
+- marks_and_numbers: YEOREUM / SEOEL / PRODUCT VAN NEDERLAND
+  description_of_goods: Tulpenbollen maat 12/+ (TUL-12)
+  hs_code: '0601.10'
+  quantity: 200.000 st.
+  gross_weight_kg: 4600.0
+  origin_criterion: Volledig verkregen in Nederland
+- marks_and_numbers: YEOREUM / SEOEL / PRODUCT VAN NEDERLAND
+  description_of_goods: Hyacintenbollen maat 17/18 (HYA-17)
+  hs_code: '0601.10'
+  quantity: 40.000 st.
+  gross_weight_kg: 1900.0
+  origin_criterion: Volledig verkregen in Nederland
+declaration:
+  statement: Hierbij wordt verklaard dat de hierboven omschreven goederen van oorsprong uit Nederland zijn.

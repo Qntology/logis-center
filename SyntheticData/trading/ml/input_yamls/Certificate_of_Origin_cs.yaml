@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: cs
+document_title: Osvědčení o původu
+metadata:
+  certificate_number: CO-2026-CZ-8326
+  issue_date: '2026-10-09'
+  related_invoice_number: CI-CZ-2610-218
+  related_bl_number: BL-CZ29101749
+  related_lc_number: LC-CZ9182102
+parties:
+  exporter:
+    name: Ložiska Tři řeky s.r.o.
+    address: Průmyslová 7, 301 00 Plzeň, Česko
+  importer_consignee:
+    name: Hanul Precision Co., Ltd.
+    address: 33 Gongdan-ro, Gumi, Jižní Korea
+  issuing_authority:
+    name: Hospodářská komora Západ
+    address: Americká 39, 301 00 Plzeň, Česko
+transport_details:
+  vessel_flight: ELBE BRIDGE V.226E
+  port_of_loading: Hamburk, Německo
+  port_of_discharge: Pusan, Jižní Korea
+cargo_details:
+- marks_and_numbers: HANUL / GUMI / VYROBENO V ČESKU
+  description_of_goods: Kuličková ložiska 6205-2RS
+  hs_code: '8482.10'
+  quantity: 20 000 ks
+  gross_weight_kg: 2840.0
+  origin_criterion: Zcela vyrobeno v Česku
+- marks_and_numbers: HANUL / GUMI / VYROBENO V ČESKU
+  description_of_goods: Kuželíková ložiska 30205 (KL-30205)
+  hs_code: '8482.20'
+  quantity: 8 000 ks
+  gross_weight_kg: 2900.0
+  origin_criterion: Zcela vyrobeno v Česku
+declaration:
+  statement: Potvrzuje se, že výše popsané zboží má původ v České republice.

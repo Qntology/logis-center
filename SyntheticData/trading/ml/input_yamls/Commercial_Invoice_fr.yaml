@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: fr
+document_title: Facture commerciale
+metadata:
+  invoice_number: CI-FR-2609-311
+  issue_date: '2026-09-14'
+  reference_po_number: PO-FR-12413
+  related_bl_number: BL-FR22344855
+  related_lc_number: LC-FR5474227
+  currency: EUR
+parties:
+  shipper_exporter:
+    name: Laboratoires Belle-Rive SAS
+    address: 12 rue des Tanneurs, 69002 Lyon, France
+    contact_number: +33 4 78 55 01 42
+    tax_id: FR 47 812 345 678
+  consignee:
+    name: Saebom Cosmetics Co., Ltd.
+    address: 41 Songdo-gwahak-ro, Yeonsu-gu, Incheon, Corée du Sud
+    contact_number: +82 32 555 0164
+    tax_id: 131-86-20457
+shipping_details:
+  port_of_loading: Le Havre, France
+  port_of_discharge: Incheon, Corée du Sud
+  vessel_flight: CAP DU PONANT V.115E
+  incoterms: CIP Incheon
+line_items:
+- item_code: CRH-50
+  description: Crème hydratante visage 50 ml
+  quantity: 12000
+  unit: pcs
+  unit_price: 6.8
+  total_amount: 81600.0
+  hs_code: '3304.99'
+- item_code: EDP-100
+  description: Eau de parfum 100 ml
+  quantity: 3000
+  unit: pcs
+  unit_price: 18.4
+  total_amount: 55200.0
+  hs_code: '3303.00'
+summary:
+  total_quantity: 15000
+  total_items_amount: 136800.0
+  freight_charge: 6840.0
+  insurance: 410.4
+  grand_total_amount: 144050.4

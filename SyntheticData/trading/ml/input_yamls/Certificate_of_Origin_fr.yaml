@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: fr
+document_title: Certificat d'origine
+metadata:
+  certificate_number: CO-2026-FR-8818
+  issue_date: '2026-09-15'
+  related_invoice_number: CI-FR-2609-311
+  related_bl_number: BL-FR22344855
+  related_lc_number: LC-FR5474227
+parties:
+  exporter:
+    name: Laboratoires Belle-Rive SAS
+    address: 12 rue des Tanneurs, 69002 Lyon, France
+  importer_consignee:
+    name: Saebom Cosmetics Co., Ltd.
+    address: 41 Songdo-gwahak-ro, Yeonsu-gu, Incheon, Corée du Sud
+  issuing_authority:
+    name: Chambre de commerce Rhône-Confluence
+    address: 5 place de la Bourse, 69002 Lyon, France
+transport_details:
+  vessel_flight: CAP DU PONANT V.115E
+  port_of_loading: Le Havre, France
+  port_of_discharge: Incheon, Corée du Sud
+cargo_details:
+- marks_and_numbers: SAEBOM / INCHEON / FABRIQUÉ EN FRANCE
+  description_of_goods: Crème hydratante visage 50 ml (CRH-50)
+  hs_code: '3304.99'
+  quantity: 12 000 pcs
+  gross_weight_kg: 1150.0
+  origin_criterion: Entièrement obtenu en France
+- marks_and_numbers: SAEBOM / INCHEON / FABRIQUÉ EN FRANCE
+  description_of_goods: Eau de parfum 100 ml (EDP-100)
+  hs_code: '3303.00'
+  quantity: 3 000 pcs
+  gross_weight_kg: 980.0
+  origin_criterion: Entièrement obtenu en France
+declaration:
+  statement: Il est certifié que les marchandises désignées ci-dessus sont originaires de France.

@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: cs
+document_title: Pojistka na přepravu zboží
+metadata:
+  policy_number: IP-CZ-940419
+  issue_date: '2026-10-09'
+  effective_date: '2026-10-10'
+  related_invoice_number: CI-CZ-2610-218
+  related_bl_number: BL-CZ29101749
+  related_lc_number: LC-CZ9182102
+  related_po_number: PO-CZ-83137
+parties:
+  insurer:
+    name: Pojišťovna Tři řeky a.s.
+    address: Na Poříčí 12, 110 00 Praha 1, Česko
+  insured:
+    name: Hanul Precision Co., Ltd.
+    address: 33 Gongdan-ro, Gumi, Jižní Korea
+coverage_details:
+  sum_insured: 75020.0
+  currency: EUR
+  valuation_basis: Hodnota faktury zvýšená o 10 %
+  coverage_conditions: Institute Cargo Clauses (A) – všechna rizika
+  premium_amount: 187.55
+  claims_payable_at: Gumi, Jižní Korea
+transport_details:
+  vessel_flight: ELBE BRIDGE V.226E
+  port_of_loading: Hamburk, Německo
+  port_of_discharge: Pusan, Jižní Korea
+cargo_details:
+- mark_and_numbers: HANUL / GUMI / VYROBENO V ČESKU
+  description_of_goods: Kuličková a kuželíková ložiska
+  number_of_packages: 16 beden
+  gross_weight_kg: 5740.0

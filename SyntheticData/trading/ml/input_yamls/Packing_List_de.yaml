@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: de
+document_title: Packliste
+metadata:
+  packing_list_number: PL-DE-2609-663
+  issue_date: '2026-09-05'
+  related_invoice_number: CI-DE-2609-360
+  related_po_number: PO-DE-72911
+  related_bl_number: BL-DE23591658
+parties:
+  shipper_exporter:
+    name: Talwerk Hydraulik GmbH
+    address: Talstraße 14, 70173 Stuttgart, Deutschland
+  consignee:
+    name: Daehan Fluid Power Co., Ltd.
+    address: 15 Gongdan-ro, Seongsan-gu, Changwon, Südkorea
+shipping_details:
+  vessel_flight: NORDLICHT V.412E
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Busan, Südkorea
+packing_details:
+- item_code: HP-4100
+  description: Hydraulische Zahnradpumpen
+  quantity: 240
+  unit: Stk.
+  packages: 12
+  package_type: Paletten
+  net_weight_kg: 2880.0
+  gross_weight_kg: 3120.0
+  measurement_cbm: 9.6
+- item_code: DS-220
+  description: Dichtungssätze für Hydraulikzylinder
+  quantity: 1800
+  unit: Stk.
+  packages: 4
+  package_type: Paletten
+  net_weight_kg: 540.0
+  gross_weight_kg: 610.0
+  measurement_cbm: 2.4
+summary:
+  total_packages: 16
+  total_net_weight_kg: 3420.0
+  total_gross_weight_kg: 3730.0
+  total_measurement_cbm: 12.0

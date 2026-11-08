@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: nl
+document_title: Cognossement
+metadata:
+  bl_number: BL-NL93718156
+  issue_date: '2026-09-29'
+  related_invoice_number: CI-NL-2609-280
+  related_po_number: PO-NL-65999
+  related_lc_number: LC-NL6264010
+  freight_term: Vracht vooruitbetaald
+parties:
+  shipper:
+    name: Kwekerij Duinzicht B.V.
+    address: Heereweg 210, 2161 BR Lisse, Nederland
+  consignee:
+    name: Yeoreum Garden Co., Ltd.
+    address: 58 Sejong-daero, Jung-gu, Seoel, Zuid-Korea
+  notify_party:
+    name: Yeoreum Garden Co., Ltd.
+    address: 58 Sejong-daero, Jung-gu, Seoel, Zuid-Korea
+  carrier:
+    name: Rederij Noorderzon B.V.
+shipping_details:
+  vessel_flight: NOORDERZON V.517E
+  port_of_loading: Rotterdam, Nederland
+  port_of_discharge: Busan, Zuid-Korea
+  place_of_receipt: Lisse, Nederland
+  place_of_delivery: Seoel, Zuid-Korea
+cargo_details:
+  container_number: RNZU9390820
+  seal_number: SL884362
+  marks_and_numbers: YEOREUM / SEOEL / PRODUCT VAN NEDERLAND
+  number_of_packages: 500 kartons
+  description_of_goods: Tulpenbollen en hyacintenbollen
+  gross_weight_kg: 6500.0
+  measurement_cbm: 26.0

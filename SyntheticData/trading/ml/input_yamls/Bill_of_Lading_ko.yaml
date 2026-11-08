@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: ko
+document_title: 선하증권
+metadata:
+  bl_number: BL-KR90619014
+  issue_date: '2026-09-17'
+  related_invoice_number: CI-KR-2609-313
+  related_po_number: PO-KR-30263
+  related_lc_number: LC-KR2372314
+  freight_term: 운임 선지급
+parties:
+  shipper:
+    name: (주)한빛타이어
+    address: 울산광역시 남구 산업로 123
+  consignee:
+    name: Vina Auto Parts Co., Ltd.
+    address: 25 Nguyen Van Linh, District 7, Ho Chi Minh City, Vietnam
+  notify_party:
+    name: Vina Auto Parts Co., Ltd.
+    address: 25 Nguyen Van Linh, District 7, Ho Chi Minh City, Vietnam
+  carrier:
+    name: 한바다해운(주)
+shipping_details:
+  vessel_flight: HANBADA V.118S
+  port_of_loading: 부산, 대한민국
+  port_of_discharge: 호찌민, 베트남
+  place_of_receipt: 울산, 대한민국
+  place_of_delivery: 호찌민, 베트남
+cargo_details:
+  container_number: HBDU1549496
+  seal_number: SL177715
+  marks_and_numbers: VINA AUTO / HO CHI MINH / MADE IN KOREA
+  number_of_packages: 90 팔레트
+  description_of_goods: 승용차용 타이어 및 알루미늄 휠
+  gross_weight_kg: 54840.0
+  measurement_cbm: 132.0

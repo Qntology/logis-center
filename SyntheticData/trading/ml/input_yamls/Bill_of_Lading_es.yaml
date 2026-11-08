@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: es
+document_title: Conocimiento de embarque
+metadata:
+  bl_number: BL-ES68027868
+  issue_date: '2026-10-03'
+  related_invoice_number: CI-ES-2610-707
+  related_po_number: PO-ES-35900
+  related_lc_number: LC-ES5284106
+  freight_term: Flete pagado en origen
+parties:
+  shipper:
+    name: Olivares del Alba S.L.
+    address: Calle Mayor 21, 23001 Jaén, España
+  consignee:
+    name: Hanmaru Foods Co., Ltd.
+    address: 77 Jungang-daero, Jung-gu, Busan, Corea del Sur
+  notify_party:
+    name: Hanmaru Foods Co., Ltd.
+    address: 77 Jungang-daero, Jung-gu, Busan, Corea del Sur
+  carrier:
+    name: Naviera Alborán S.A.
+shipping_details:
+  vessel_flight: ALBORAN STAR V.208E
+  port_of_loading: Valencia, España
+  port_of_discharge: Busan, Corea del Sur
+  place_of_receipt: Jaén, España
+  place_of_delivery: Busan, Corea del Sur
+cargo_details:
+  container_number: NALU6484865
+  seal_number: SL828118
+  marks_and_numbers: HANMARU / BUSAN / HECHO EN ESPAÑA
+  number_of_packages: 26 palés
+  description_of_goods: Aceite de oliva virgen extra y aceitunas de mesa
+  gross_weight_kg: 15970.0
+  measurement_cbm: 31.2

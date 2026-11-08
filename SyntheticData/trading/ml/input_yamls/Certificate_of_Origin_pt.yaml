@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: pt
+document_title: Certificado de origem
+metadata:
+  certificate_number: CO-2026-PT-9220
+  issue_date: '2026-09-22'
+  related_invoice_number: CI-PT-2609-197
+  related_bl_number: BL-PT56145092
+  related_lc_number: LC-PT3608203
+parties:
+  exporter:
+    name: Corticeira Vale Verde, Lda.
+    address: Rua do Sobreiro 9, 4520-123 Santa Maria da Feira, Portugal
+  importer_consignee:
+    name: Hwain Interior Co., Ltd.
+    address: 27 Haeun-daero, Haeundae-gu, Busan, Coreia do Sul
+  issuing_authority:
+    name: Câmara de Comércio do Entre Douro e Vouga
+    address: Praça da República 3, 4520-174 Santa Maria da Feira, Portugal
+transport_details:
+  vessel_flight: ATLANTICO NORTE V.091E
+  port_of_loading: Leixões, Portugal
+  port_of_discharge: Busan, Coreia do Sul
+cargo_details:
+- marks_and_numbers: HWAIN / BUSAN / FABRICADO EM PORTUGAL
+  description_of_goods: Rolhas de cortiça natural 24 x 45 mm (RCN-24)
+  hs_code: '4503.10'
+  quantity: 500 000 un.
+  gross_weight_kg: 2150.0
+  origin_criterion: Inteiramente obtido em Portugal
+- marks_and_numbers: HWAIN / BUSAN / FABRICADO EM PORTUGAL
+  description_of_goods: Painéis de aglomerado de cortiça para pavimento (PAV-60)
+  hs_code: '4504.10'
+  quantity: 4 800 un.
+  gross_weight_kg: 6600.0
+  origin_criterion: Inteiramente obtido em Portugal
+declaration:
+  statement: Certifica-se que as mercadorias acima descritas são originárias de Portugal.

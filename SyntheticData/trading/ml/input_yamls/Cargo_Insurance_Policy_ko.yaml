@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: ko
+document_title: 적하보험증권
+metadata:
+  policy_number: IP-KR-776702
+  issue_date: '2026-09-16'
+  effective_date: '2026-09-17'
+  related_invoice_number: CI-KR-2609-313
+  related_bl_number: BL-KR90619014
+  related_lc_number: LC-KR2372314
+  related_po_number: PO-KR-30263
+parties:
+  insurer:
+    name: 한바다손해보험(주)
+    address: 서울특별시 중구 한바다로 45
+  insured:
+    name: (주)한빛타이어
+    address: 울산광역시 남구 산업로 123
+coverage_details:
+  sum_insured: 335929.44
+  currency: USD
+  valuation_basis: CIF 가액의 110%
+  coverage_conditions: 협회적하약관 (A) 전위험담보
+  premium_amount: 839.82
+  claims_payable_at: 호찌민, 베트남
+transport_details:
+  vessel_flight: HANBADA V.118S
+  port_of_loading: 부산, 대한민국
+  port_of_discharge: 호찌민, 베트남
+cargo_details:
+- mark_and_numbers: VINA AUTO / HO CHI MINH / MADE IN KOREA
+  description_of_goods: 승용차용 타이어 및 알루미늄 휠
+  number_of_packages: 90 팔레트
+  gross_weight_kg: 54840.0

@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: ar
+document_title: وثيقة تأمين البضائع
+metadata:
+  policy_number: IP-SA-213792
+  issue_date: '2026-10-02'
+  effective_date: '2026-10-03'
+  related_invoice_number: CI-SA-2610-806
+  related_bl_number: BL-SA92992380
+  related_lc_number: LC-SA7357768
+  related_po_number: PO-SA-12044
+parties:
+  insurer:
+    name: شركة الخليج للتأمين التعاوني
+    address: طريق الكورنيش 18، الدمام 32241، المملكة العربية السعودية
+  insured:
+    name: Seorin Polymer Co., Ltd.
+    address: 19 Yeosusandan-ro، يوسو، كوريا الجنوبية
+coverage_details:
+  sum_insured: 780780.0
+  currency: USD
+  valuation_basis: قيمة الفاتورة مضافًا إليها 10%
+  coverage_conditions: شروط معهد لندن للبضائع (A) – جميع الأخطار
+  premium_amount: 1951.95
+  claims_payable_at: يوسو، كوريا الجنوبية
+transport_details:
+  vessel_flight: AL JUBAIL PEARL V.044E
+  port_of_loading: الجبيل، المملكة العربية السعودية
+  port_of_discharge: يوسو، كوريا الجنوبية
+cargo_details:
+- mark_and_numbers: SEORIN / YEOSU / صنع في السعودية
+  description_of_goods: حبيبات بولي إيثيلين وبولي بروبيلين
+  number_of_packages: 24000 كيس
+  gross_weight_kg: 602400.0

@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: cs
+document_title: Balicí list
+metadata:
+  packing_list_number: PL-CZ-2610-667
+  issue_date: '2026-10-08'
+  related_invoice_number: CI-CZ-2610-218
+  related_po_number: PO-CZ-83137
+  related_bl_number: BL-CZ29101749
+parties:
+  shipper_exporter:
+    name: Ložiska Tři řeky s.r.o.
+    address: Průmyslová 7, 301 00 Plzeň, Česko
+  consignee:
+    name: Hanul Precision Co., Ltd.
+    address: 33 Gongdan-ro, Gumi, Jižní Korea
+shipping_details:
+  vessel_flight: ELBE BRIDGE V.226E
+  port_of_loading: Hamburk, Německo
+  port_of_discharge: Pusan, Jižní Korea
+packing_details:
+- item_code: 6205-2RS
+  description: Kuličková ložiska 6205-2RS
+  quantity: 20000
+  unit: ks
+  packages: 8
+  package_type: bedny
+  net_weight_kg: 2560.0
+  gross_weight_kg: 2840.0
+  measurement_cbm: 3.2
+- item_code: KL-30205
+  description: Kuželíková ložiska 30205
+  quantity: 8000
+  unit: ks
+  packages: 8
+  package_type: bedny
+  net_weight_kg: 2640.0
+  gross_weight_kg: 2900.0
+  measurement_cbm: 3.2
+summary:
+  total_packages: 16
+  total_net_weight_kg: 5200.0
+  total_gross_weight_kg: 5740.0
+  total_measurement_cbm: 6.4

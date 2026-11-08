@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: it
+document_title: Certificato di origine
+metadata:
+  certificate_number: CO-2026-IT-4302
+  issue_date: '2026-09-16'
+  related_invoice_number: CI-IT-2609-622
+  related_bl_number: BL-IT74203367
+  related_lc_number: LC-IT9700023
+parties:
+  exporter:
+    name: Officine Caffè Aurora S.r.l.
+    address: Via Torino 48, 20123 Milano, Italia
+  importer_consignee:
+    name: Dabin Coffee Equipment Co., Ltd.
+    address: 112 Teheran-ro, Gangnam-gu, Seul, Corea del Sud
+  issuing_authority:
+    name: Camera di Commercio dei Navigli
+    address: Via Meravigli 9, 20123 Milano, Italia
+transport_details:
+  vessel_flight: STELLA DEL TIRRENO V.330E
+  port_of_loading: Genova, Italia
+  port_of_discharge: Busan, Corea del Sud
+cargo_details:
+- marks_and_numbers: DABIN / SEUL / PRODOTTO IN ITALIA
+  description_of_goods: Macchine per caffè espresso a due gruppi (ESP-2G)
+  hs_code: '8516.71'
+  quantity: 60 pz
+  gross_weight_kg: 4800.0
+  origin_criterion: Interamente prodotto in Italia
+- marks_and_numbers: DABIN / SEUL / PRODOTTO IN ITALIA
+  description_of_goods: Macinacaffè elettrici professionali (MAC-64)
+  hs_code: '8509.40'
+  quantity: 120 pz
+  gross_weight_kg: 1860.0
+  origin_criterion: Interamente prodotto in Italia
+declaration:
+  statement: Si certifica che le merci sopra descritte sono originarie dell'Italia.
