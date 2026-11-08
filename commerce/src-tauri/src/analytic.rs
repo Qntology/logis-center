@@ -86,6 +86,118 @@ pub fn event_type_prefix_key(word: &str) -> Option<String> {
     }
 }
 
+// =====================================================================
+// 🌟 [ANALYTIC PAGE / SITE] 도메인 · 웹 경로 정의
+// ---------------------------------------------------------------------
+//  행동 로그 한 건은 어느 사이트(host) 의 어느 페이지(경로)에서 일어났는지를 link 에 들고 있지만,
+//  검색은 그것을 조건으로 쓰지 못했습니다. 사이트 범위는 앱이 고른 cc 하나뿐이었고, '상품 상세 페이지에서' ·
+//  '결제 페이지까지' 같은 경로 조건은 질의 해석에도 검색 필터에도 자리가 없었습니다.
+//
+//  · 페이지 종류는 bias.json 의 analytic_page_filters 가 정합니다. paths(경로 접두)로 link 의 종류를 판정하고,
+//    exact_match(12개 언어 문구)로 질의가 가리키는 종류를 찾습니다. 코드에는 어떤 언어의 어휘도 없습니다.
+//  · 사이트는 저장된 행동 로그의 site(사이트 이름) · origin(host) 에서 찾습니다. 질의에 이름이 하나만 나오면
+//    그 사이트의 cc 로 좁힙니다.
+// =====================================================================
+
+/// link(또는 href)의 (host, 경로). 경로는 쿼리 · 조각을 뺀 소문자이고, 비어 있으면 "/".
+pub fn url_host_path(link: &str) -> (String, String) {
+    let s = link.trim();
+    let rest = match s.find("://") {
+        Some(p) => &s[p + 3..],
+        None => s,
+    };
+    let (host, path) = if s.contains("://") {
+        match rest.find('/') {
+            Some(p) => (&rest[..p], &rest[p..]),
+            None => (rest, "/"),
+        }
+    } else {
+        ("", rest)
+    };
+    let path = path.split(|c| c == '?' || c == '#').next().unwrap_or("").to_lowercase();
+    let path = if path.is_empty() { "/".to_string() } else { path };
+    (host.to_lowercase(), path)
+}
+
+/// 웹 경로 → 페이지 종류. analytic_page_filters.<종류>.paths 의 접두 중 가장 긴 것이 이깁니다("/" 는 루트만).
+pub fn page_kind_of(link: &str) -> Option<String> {
+    let (_, path) = url_host_path(link);
+    let filters = crate::parsing::BIAS_DICT.get("analytic_page_filters")?.as_object()?;
+    let mut best: Option<(usize, String)> = None;
+    for (kind, node) in filters.iter() {
+        for p in node.get("paths").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|v| v.as_str()) {
+            let p = p.trim().to_lowercase();
+            let hit = if p == "/" { path == "/" } else { path == p || path.starts_with(&p) && (p.ends_with('/') || path[p.len()..].starts_with('/')) };
+            if hit && best.as_ref().map_or(true, |(len, _)| p.len() > *len) {
+                best = Some((p.len(), kind.clone()));
+            }
+        }
+    }
+    best.map(|(_, k)| k)
+}
+
+/// 문서(data)의 페이지 종류: 구조화가 남긴 page, 없으면 link · href 에서 판정합니다.
+pub fn doc_page_kind(data: &Value) -> Option<String> {
+    if let Some(p) = data.get("page").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+        return Some(p.trim().to_string());
+    }
+    let link = data.get("link").or_else(|| data.get("href")).and_then(|v| v.as_str()).unwrap_or("");
+    if link.is_empty() { None } else { page_kind_of(link) }
+}
+
+/// 질의가 가리키는 페이지 종류들 (analytic_page_filters.<종류>.exact_match 문구가 질의에 들어 있으면).
+pub fn page_kinds_in_query(query: &str) -> Vec<(String, String)> {
+    let q = query.to_lowercase();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let Some(filters) = crate::parsing::BIAS_DICT.get("analytic_page_filters").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (kind, node) in filters.iter() {
+        let phrase = node
+            .get("exact_match")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty() && q.contains(p.as_str()))
+            .max_by_key(|p| p.chars().count());
+        if let Some(p) = phrase {
+            out.push((kind.clone(), p));
+        }
+    }
+    out
+}
+
+/// 질의에 나온 사이트: 저장된 행동 로그의 사이트 이름(site) · host 가 질의에 들어 있고 그런 사이트가 하나뿐이면 (cc, 이름).
+pub async fn site_mention(store: &crate::store::VectorStore, query: &str) -> Option<(String, String)> {
+    let docs = store
+        .get_all_items("items", 5000, 0, Some("mode = 'analytic'".to_string()))
+        .await
+        .ok()?;
+    let q = query.to_lowercase();
+    let mut hits: Vec<(String, String)> = Vec::new();
+    for d in docs.iter() {
+        if d.cc.trim().is_empty() || hits.iter().any(|(cc, _)| *cc == d.cc) {
+            continue;
+        }
+        let data: Value = serde_json::from_str(&d.json_data).unwrap_or(json!({}));
+        let mut names: Vec<String> = Vec::new();
+        if let Some(s) = data.get("site").and_then(|v| v.as_str()) {
+            names.push(s.trim().to_string());
+        }
+        let origin = data.get("origin").and_then(|v| v.as_str()).unwrap_or("");
+        let (host, _) = url_host_path(origin);
+        if !host.is_empty() {
+            names.push(host);
+        }
+        if let Some(n) = names.into_iter().find(|n| n.chars().count() >= 3 && q.contains(&n.to_lowercase())) {
+            hits.push((d.cc.clone(), n));
+        }
+    }
+    if hits.len() == 1 { hits.pop() } else { None }
+}
+
 /// 🌟 [MORPHOLOGICAL VARIANTS] 교착어 어절 하나에서 '검색 가능한 원형 후보'를 만들어 냅니다.
 ///  ── 근거 3단 ──
 ///   ① Stanza Lemma      : 모델이 직접 알려준 원형 ("클릭한게" → "클릭")
@@ -918,6 +1030,17 @@ pub async fn run_analytic_structuring(
             o.insert("masked_text".to_string(), json!(combined.clone()));
             o.insert("mode".to_string(), json!("analytic"));
             o.insert("updated_at".to_string(), json!(now_ts));
+            // 🌟 [ANALYTIC PAGE / SITE] 사이트 · 경로 · 페이지 종류를 남겨 검색이 조건으로 쓸 수 있게 합니다.
+            let (host, path) = url_host_path(&link);
+            if !host.is_empty() {
+                o.insert("host".to_string(), json!(host));
+            }
+            if !link.is_empty() {
+                o.insert("path".to_string(), json!(path));
+            }
+            if let Some(kind) = page_kind_of(&link) {
+                o.insert("page".to_string(), json!(kind));
+            }
             // 🌟 전처리에서 확정한 음차 결과를 저장합니다.
             if !translit_native.is_empty() {
                 o.insert("translit_native".to_string(), json!(translit_native));

@@ -75,3 +75,5 @@ mod stanza_runtime;
 mod bias_source;
 // SDS 원장: 부팅(로컬 기본 팀) → 로그인(실제 팀) 사이에 원장이 살아남는지 실제 파일로 (LOGIS_APP_DIR, --ignored)
 mod sds_ledger;
+// 행동 로그 도메인 · 웹 경로 정의: link 경로 → 페이지 종류, 12개 언어 질의 문구 → 페이지 종류 (bias.json analytic_page_filters)
+mod analytic_page;

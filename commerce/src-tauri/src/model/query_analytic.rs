@@ -1145,8 +1145,16 @@ impl crate::model::LogisModel {
         // =====================================================================
         // STEP 12 : 컨텍스트 조립 (lib.rs STAGE-3 계약과 동일)
         // =====================================================================
+        // 🌟 [PERIOD RANGE] 시작과 끝이 둘 다 있으면 한 컨텍스트에 범위(between)로 겁니다.
+        //    예전에는 '시작 이상' 컨텍스트와 '끝 이하' 컨텍스트를 따로 검색해 합쳤는데, 두 집합의 합은
+        //    기간과 상관없이 전 구간이라 기간 조건이 사실상 사라졌습니다.
         let mut condition = serde_json::Map::new();
-        if started_at > 0 {
+        if started_at > 0 && expired_at > 0 {
+            condition.insert(
+                "created_at".to_string(),
+                json!({ "operator": "between", "value": started_at, "value_to": expired_at }),
+            );
+        } else if started_at > 0 {
             condition.insert(
                 "created_at".to_string(),
                 json!({ "operator": "gte", "value": started_at }),
@@ -1158,31 +1166,25 @@ impl crate::model::LogisModel {
             );
         }
 
-        let mut contexts: Vec<serde_json::Value> = Vec::new();
-        contexts.push(json!({
+        // 🌟 [ANALYTIC PAGE] 질의가 가리키는 페이지 종류 (bias.json analytic_page_filters 문구 일치).
+        let page_hits = crate::analytic::page_kinds_in_query(&query);
+        let page_kinds: Vec<String> = page_hits.iter().map(|(k, _)| k.clone()).collect();
+        if !page_hits.is_empty() {
+            emit_term(&format!(
+                "   🧭 [PAGE KIND] 질의의 페이지 문구 {:?} → 페이지 종류 {:?} 로 좁힙니다. (link 경로를 analytic_page_filters.paths 로 판정)",
+                page_hits.iter().map(|(_, p)| p.as_str()).collect::<Vec<_>>(),
+                page_kinds
+            ));
+        }
+
+        let contexts: Vec<serde_json::Value> = vec![json!({
             "text": target,
             "language": language,
             "type": event_types[0],
             "types": event_types,
             "condition": serde_json::Value::Object(condition.clone()),
             "unassigned": keywords
-        }));
-
-        if started_at > 0 && expired_at > 0 {
-            let mut upper = serde_json::Map::new();
-            upper.insert(
-                "created_at".to_string(),
-                json!({ "operator": "lte", "value": expired_at }),
-            );
-            contexts.push(json!({
-                "text": target,
-                "language": language,
-                "type": event_types[0],
-                "types": event_types,
-                "condition": serde_json::Value::Object(upper),
-                "unassigned": keywords
-            }));
-        }
+        })];
 
         let out = json!({
             "original_text": query,
@@ -1191,6 +1193,7 @@ impl crate::model::LogisModel {
             "started_at": started_at,
             "expired_at": expired_at,
             "event_types": event_types,
+            "page_kinds": page_kinds,
             "keywords": keywords,
             "target": target,
             "context": contexts

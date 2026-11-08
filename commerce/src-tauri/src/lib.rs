@@ -1213,6 +1213,23 @@ fn build_scope_filter(ctx: &Value, search_mode: &str) -> Option<String> {
                 Some(s) => s.trim().to_lowercase(),
                 None => continue,
             };
+            let epoch = |v: Option<&Value>| -> Option<String> {
+                match v {
+                    Some(Value::Number(n)) => Some(n.to_string()),
+                    Some(Value::String(s)) => Some(s.chars().filter(|c| c.is_ascii_digit()).collect::<String>()).filter(|s| !s.is_empty()),
+                    _ => None,
+                }
+            };
+            // 🌟 [PERIOD RANGE] 범위는 한 컨텍스트 안에서 두 경계를 함께 겁니다 (행동 로그 기간 질의).
+            if op_str.starts_with("between") {
+                if let Some(lo) = epoch(val_obj.get("value")) {
+                    filters.push(format!("{} >= {}", envelope_col, lo));
+                }
+                if let Some(hi) = epoch(val_obj.get("value_to")) {
+                    filters.push(format!("{} <= {}", envelope_col, hi));
+                }
+                continue;
+            }
             // 비교 연산자만 SQL 로 내립니다. top/bottom/contains 는 Dexie 담당입니다.
             let sql_op = if op_str.starts_with("gte") { ">=" }
                 else if op_str.starts_with("gt") { ">" }
@@ -2864,6 +2881,35 @@ async fn ai_search_complex(
             }
         }
 
+        // 🌟 [ANALYTIC PAGE / SITE] 행동 로그 질의에 사이트 이름이 하나 나오면(앱이 사이트를 고르지 않았을 때) 그 사이트로 좁히고,
+        //    페이지 종류가 나오면 회수한 문서를 link 경로의 페이지 종류로 거릅니다 (analytic.rs 의 도메인 · 경로 정의).
+        let analytic_pages: Vec<String> = if search_mode == "analytic" {
+            structured_query
+                .get("page_kinds")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let cc = if search_mode == "analytic" && cc.trim().is_empty() {
+            match store_opt.as_ref() {
+                Some(store) => match crate::analytic::site_mention(store, &query).await {
+                    Some((site_cc, name)) => {
+                        emit_term(&format!(
+                            "[AI-SEARCH] 🌐 [SITE SCOPE] 질의에 사이트 '{}' 가 나와 그 사이트의 행동 로그로 좁힙니다 (cc={}).",
+                            name, site_cc
+                        ));
+                        site_cc
+                    }
+                    None => cc,
+                },
+                None => cc,
+            }
+        } else {
+            cc
+        };
+
         // =====================================================================
         // 🌟 [VISION QUERY TRACK] shipping 모드에서 SigLIP2 텍스트 인코더로
         //    질의를 1152차원 공유공간에 올려 비전 벡터 검색을 활성화합니다.
@@ -3062,13 +3108,14 @@ async fn ai_search_complex(
                 // 🌟 [RECALL LIMIT] Dexie 가 뒤에서 조건으로 잘라내므로 여기서는 넓게 긁습니다.
                 //    기존 limit 5 는 '조건이 SQL 에 이미 적용되었다' 는 전제였는데,
                 //    v4 에서는 조건이 SQL 에 없으므로 5건만 가져오면 정답이 잘려 나갑니다.
-                const RECALL_LIMIT: usize = 50;
+                //    행동 로그를 페이지 종류로 거를 때는 거른 뒤에도 정답이 남도록 넓게 회수합니다.
+                let recall_limit: usize = if analytic_pages.is_empty() { 50 } else { 200 };
 
                 // 🌟 [비전 트랙] 루프 밖에서 1회 생성한 질의 벡터를 전 컨텍스트가 공유합니다.
                 //    (구버전은 여기서 매번 siglip2_model 을 들여다봤지만 로드 코드가 없어
                 //     항상 None 이었습니다. 자세한 경위는 위 [VISION QUERY TRACK] 주석 참조)
                 let final_results = store
-                    .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), RECALL_LIMIT, 0, scope_filter.clone(), true)
+                    .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), recall_limit, 0, scope_filter.clone(), true)
                     .await
                     .unwrap_or_else(|e| {
                         println!("[AI-SEARCH] ⚠️ scope query failed ({}). Falling back to mode-only scope.", e);
@@ -3089,14 +3136,24 @@ async fn ai_search_complex(
                     };
                     println!("[AI-SEARCH] 🛟 [SCOPE FALLBACK] 0 hit with full scope. Retrying with '{}'.", mode_only);
                     store
-                        .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), RECALL_LIMIT, 0, Some(mode_only), true)
+                        .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), recall_limit, 0, Some(mode_only), true)
                         .await
                         .unwrap_or_default()
                 } else {
                     final_results
                 };
 
+                let mut page_dropped = 0usize;
                 for (id, content, score) in final_results {
+                    if !analytic_pages.is_empty() {
+                        let kind = serde_json::from_str::<Value>(&content)
+                            .ok()
+                            .and_then(|d| crate::analytic::doc_page_kind(&d));
+                        if !kind.as_ref().map_or(false, |k| analytic_pages.contains(k)) {
+                            page_dropped += 1;
+                            continue;
+                        }
+                    }
                     // 결과 배열 내 중복 방어
                     let is_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&id));
                     if !is_dup {
@@ -5625,6 +5682,34 @@ pub async fn eval_ai_search(
         String::new(),
     )
     .await
+}
+
+/// 🌟 [SYNTH EVAL / ANALYTIC] 행동 로그 원시 행을 프론트엔드 동기화(modes/analytic.ts)와 같은 명령 순서로 넣습니다.
+///   upsert_items(원시 행 저장, updated_at 0) → structure_pending_analytics(대상이 없을 때까지)
+///   → reindex_pending_embeddings(mode analytic, 대상이 없을 때까지).
+/// Cloudflare D1(console.logis.center) 대신 합성 행을 받는 연결점이라, 원시 행의 모양은 Worker 응답을
+/// fetchAnalyticsOrigin 이 바꾼 모양과 같아야 합니다 (data 는 풀린 JSON).
+pub async fn eval_analytic_ingest(app: &tauri::AppHandle, items: Vec<Value>, batch: usize) -> Result<Value, String> {
+    let saved = upsert_items(app.state::<AppState>(), items).await?;
+    let processed = |r: &Value| r.get("processed").and_then(|v| v.as_u64()).unwrap_or(0);
+    let (mut structured, mut rounds) = (0u64, 0u32);
+    loop {
+        let r = structure_pending_analytics(app.state::<AppState>(), app.clone(), Some(batch.max(1)), None).await?;
+        rounds += 1;
+        structured += processed(&r);
+        if processed(&r) == 0 || rounds >= 500 {
+            break;
+        }
+    }
+    let mut embedded = 0u64;
+    for _ in 0..500 {
+        let r = reindex_pending_embeddings(app.state::<AppState>(), app.clone(), Some(64), None, Some("analytic".to_string())).await?;
+        embedded += processed(&r);
+        if processed(&r) == 0 {
+            break;
+        }
+    }
+    Ok(json!({ "saved": saved, "structured": structured, "rounds": rounds, "embedded": embedded }))
 }
 
 pub fn run() {
