@@ -5474,7 +5474,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
                 }
                 let _ = std::fs::create_dir_all(&dir_path);
             }
-            let base = format!("{}{}/resolve/main", crate::stanza::HF_REPO_PREFIX, code);
+            let base = crate::stanza::remote_base(code);
             match crate::stanza::remote_manifest(&base).await {
                 Ok(files) => files.into_iter().map(|f| (format!("{}/{}", base, f), f)).collect(),
                 Err(e) => {
