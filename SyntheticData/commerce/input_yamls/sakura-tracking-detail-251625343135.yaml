@@ -1,0 +1,30 @@
+page_id: sakura-tracking-detail-251625343135
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/shipping/view?id=251625343135
+page_type: tracking
+layout: detail
+fields:
+  id,link: '251625343135'
+  carrier: さくら便
+  status: 配達完了
+  title: 密閉ガラス保存容器セット
+  shipping_date: '2026-04-23'
+  recipient_name: 加藤 葵
+  registration_date: '2026-04-20'
+  sender_name: 株式会社さくら商店
+  sender_address: 東京都台東区桜橋2-14-8 さくらビル3階
+  sender_phone: 03-5555-0142
+  recipient_address: 〒154-0015 東京都世田谷区本町1-1-2
+  recipient_phone: 090-2103-4016
+  weight: 6.4
+  width: 31
+  height: 45
+  length: 16
+  shipping_method: 通常配送
+  shipping_duration: 2
+  shipping_fee: 0
+title: 出荷詳細

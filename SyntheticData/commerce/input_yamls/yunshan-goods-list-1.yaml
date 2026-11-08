@@ -1,0 +1,113 @@
+page_id: yunshan-goods-list-1
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/products?page=1
+page_type: goods
+layout: list
+items:
+- id,link: CN10037
+  title: 65W快充充电器
+  status: 已售罄
+  category: 数码
+  sale_price: 200.0
+  compare_at_price: 240.0
+  quantity: 0
+  registration_date: '2026-05-12'
+  brand_name: Tidewell
+- id,link: CN10074
+  title: 加绒拉链卫衣
+  status: 已售罄
+  category: 服饰
+  sale_price: 288.4
+  compare_at_price: 346.08
+  quantity: 0
+  registration_date: '2026-06-10'
+  brand_name: Tidewell
+- id,link: CN10111
+  title: 显示器增高架
+  status: 草稿
+  category: 办公
+  sale_price: 199.45
+  quantity: 350
+  registration_date: '2026-05-12'
+  brand_name: 다온랩
+- id,link: CN10148
+  title: 便携户外锅具套装
+  status: 在售
+  category: 户外
+  sale_price: 219.45
+  quantity: 42
+  registration_date: '2026-09-01'
+  brand_name: 하람
+- id,link: CN10185
+  title: 低糖蛋白棒
+  status: 草稿
+  category: 食品
+  sale_price: 126.85
+  compare_at_price: 152.22
+  quantity: 3
+  registration_date: '2026-06-15'
+  brand_name: Oakfern
+- id,link: CN10222
+  title: 冷萃咖啡浓缩液
+  status: 已售罄
+  category: 食品
+  sale_price: 90.0
+  quantity: 0
+  registration_date: '2026-05-07'
+  brand_name: 마루공방
+- id,link: CN10259
+  title: 宠物外出包
+  status: 在售
+  category: 宠物
+  sale_price: 229.45
+  compare_at_price: 275.34
+  quantity: 3
+  registration_date: '2026-01-16'
+  brand_name: Tidewell
+- id,link: CN10296
+  title: 防水蓝牙音箱
+  status: 已售罄
+  category: 数码
+  sale_price: 340.0
+  compare_at_price: 408.0
+  quantity: 0
+  registration_date: '2026-08-06'
+  brand_name: Oakfern
+- id,link: CN10333
+  title: 不锈钢煎锅
+  status: 已售罄
+  category: 厨房
+  sale_price: 283.7
+  compare_at_price: 340.44
+  quantity: 0
+  registration_date: '2026-04-07'
+  brand_name: 누리온
+- id,link: CN10370
+  title: 毛绒兔子玩偶
+  status: 在售
+  category: 玩具
+  sale_price: 108.95
+  quantity: 3
+  registration_date: '2026-04-07'
+  brand_name: Oakfern
+- id,link: CN10407
+  title: 透气凉鞋
+  status: 已售罄
+  category: 服饰
+  sale_price: 183.15
+  quantity: 0
+  registration_date: '2026-03-23'
+  brand_name: 누리온
+- id,link: CN10444
+  title: 亚麻短袖衬衫
+  status: 草稿
+  category: 服饰
+  sale_price: 233.7
+  quantity: 42
+  registration_date: '2026-05-21'
+  brand_name: 다온랩
+title: 商品列表

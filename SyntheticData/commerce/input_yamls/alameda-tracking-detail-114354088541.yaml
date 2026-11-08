@@ -1,0 +1,30 @@
+page_id: alameda-tracking-detail-114354088541
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/shipments/114354088541
+page_type: tracking
+layout: detail
+fields:
+  id,link: '114354088541'
+  carrier: Rutas del Sur
+  status: Entregado
+  title: Rascador para gatos
+  shipping_date: '2026-05-05'
+  recipient_name: Carmen Moreno
+  registration_date: '2026-05-04'
+  sender_name: Alameda Comercio S.L.
+  sender_address: Calle del Olmo 24, 28012 Madrid
+  sender_phone: +34 910 555 142
+  recipient_address: Calle de la Rosa 83, 41004 Sevilla
+  recipient_phone: +34 691 059 491
+  weight: 2.1
+  width: 19
+  height: 14
+  length: 9
+  shipping_method: Envío de carga
+  shipping_duration: 4
+  shipping_fee: 2.05
+title: Detalle del envío

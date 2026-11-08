@@ -1,0 +1,136 @@
+page_id: ribeira-order-list-1
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/orders?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20260625-100053
+  registration_date: '2026-06-25'
+  status: Em processamento
+  goods: Manta de microfibra
+  sender_name: Rafael Martins
+  recipient_name: Rafael Martins
+  quantity: 6
+  amount: 210.05
+  shipping_fee: 0.0
+  payment_method: Carteira digital
+- id,link: 20260929-100106
+  registration_date: '2026-09-29'
+  status: Enviado
+  goods: Aquecedor de mãos recarregável
+  tracking_number: '237367738412'
+  sender_name: João Fernandes
+  recipient_name: João Fernandes
+  quantity: 6
+  amount: 122.0
+  shipping_fee: 0.0
+  payment_method: Cartão de crédito
+- id,link: 20260401-100159
+  registration_date: '2026-04-01'
+  status: Cancelado
+  goods: Frigideira de aço inoxidável
+  sender_name: Rafael Rodrigues
+  recipient_name: Rafael Rodrigues
+  quantity: 5
+  amount: 185.25
+  shipping_fee: 0.0
+  payment_method: Cartão de crédito
+- id,link: 20260909-100212
+  registration_date: '2026-09-09'
+  status: Devolvido
+  goods: Pulseira de atividade inteligente
+  tracking_number: '755149486673'
+  sender_name: Rodrigo Costa
+  recipient_name: Beatriz Santos
+  quantity: 2
+  amount: 73.8
+  shipping_fee: 0.0
+  payment_method: Carteira digital
+- id,link: 20260527-100265
+  registration_date: '2026-05-27'
+  status: Em processamento
+  goods: Fita refrescante para o pescoço
+  sender_name: Rafael Ferreira
+  recipient_name: Mariana Martins
+  quantity: 6
+  amount: 100.55
+  shipping_fee: 0.0
+  payment_method: Cartão de crédito
+- id,link: 20260619-100318
+  registration_date: '2026-06-19'
+  status: Devolvido
+  goods: Comedouro automático
+  tracking_number: '502276797313'
+  sender_name: Rodrigo Fernandes
+  recipient_name: Miguel Costa
+  quantity: 10
+  amount: 558.1
+  shipping_fee: 0.0
+  payment_method: Carteira digital
+- id,link: 20260905-100371
+  registration_date: '2026-09-05'
+  status: Devolvido
+  goods: Barra proteica com pouco açúcar
+  tracking_number: '732793469328'
+  sender_name: Mariana Ferreira
+  recipient_name: Mariana Ferreira
+  quantity: 1
+  amount: 17.22
+  shipping_fee: 2.05
+  payment_method: Cartão de crédito
+- id,link: 20260708-100424
+  registration_date: '2026-07-08'
+  status: Entregue
+  goods: Manta de microfibra
+  tracking_number: '612856659584'
+  sender_name: Carolina Santos
+  recipient_name: Carolina Santos
+  quantity: 6
+  amount: 109.4
+  shipping_fee: 0.0
+  payment_method: Carteira digital
+- id,link: 20260725-100477
+  registration_date: '2026-07-25'
+  status: A aguardar pagamento
+  goods: Essência reparadora para cabelo
+  sender_name: Beatriz Sousa
+  recipient_name: Beatriz Sousa
+  quantity: 1
+  amount: 14.55
+  shipping_fee: 2.05
+  payment_method: Carteira digital
+- id,link: 20261012-100530
+  registration_date: '2026-10-12'
+  status: A aguardar pagamento
+  goods: Tenda iglu para duas pessoas
+  sender_name: Mariana Pereira
+  recipient_name: Mariana Pereira
+  quantity: 4
+  amount: 142.45
+  shipping_fee: 0.0
+  payment_method: Carteira digital
+- id,link: 20260721-100583
+  registration_date: '2026-07-21'
+  status: Cancelado
+  goods: Fita refrescante para o pescoço
+  sender_name: Mariana Fernandes
+  recipient_name: Mariana Fernandes
+  quantity: 7
+  amount: 271.53
+  shipping_fee: 0.0
+  payment_method: Cartão de crédito
+- id,link: 20260625-100636
+  registration_date: '2026-06-25'
+  status: Cancelado
+  goods: Casaco de pelo sherpa
+  sender_name: Sofia Pereira
+  recipient_name: Sofia Pereira
+  quantity: 2
+  amount: 68.13
+  shipping_fee: 0.0
+  payment_method: Cartão de crédito
+title: Encomendas

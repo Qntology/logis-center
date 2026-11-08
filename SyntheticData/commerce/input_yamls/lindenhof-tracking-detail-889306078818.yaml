@@ -1,0 +1,30 @@
+page_id: lindenhof-tracking-detail-889306078818
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/shipping/view?id=889306078818
+page_type: tracking
+layout: detail
+fields:
+  id,link: '889306078818'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Wasserkocher mit Temperaturwahl
+  shipping_date: '2026-04-11'
+  recipient_name: Clara Keller
+  registration_date: '2026-04-09'
+  sender_name: Lindenhof Handels GmbH
+  sender_address: Hafenstraße 18, 20457 Hamburg
+  sender_phone: +49 40 5550 1842
+  recipient_address: Gartenweg 49, 10115 Berlin
+  recipient_phone: +49 198 22157327
+  weight: 5.5
+  width: 57
+  height: 34
+  length: 40
+  shipping_method: Standardversand
+  shipping_duration: 1
+  shipping_fee: 0.0
+title: Sendungsdetails

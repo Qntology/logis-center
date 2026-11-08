@@ -1,0 +1,29 @@
+page_id: alameda-goods-detail-ES10037
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/products/ES10037
+page_type: goods
+layout: detail
+fields:
+  id,link: ES10037
+  title: Auriculares inalámbricos con cancelación de ruido
+  status: Activo
+  category: Electrónica
+  sale_price: 89.25
+  quantity: 7
+  registration_date: '2026-07-20'
+  brand_name: 솔빛
+  code: ES-AUD-101
+  stock_keeping_unit: ESAU1001
+  model_name: AU-835
+  manufacturer: Oakfern Works
+  origin_country: Portugal
+  color: Burdeos
+  barcode: '8866204218681'
+  supply_price: 63.73
+  low_stock_threshold: 10
+  description: Auriculares Bluetooth que apagan el ruido exterior.
+title: Detalle del producto

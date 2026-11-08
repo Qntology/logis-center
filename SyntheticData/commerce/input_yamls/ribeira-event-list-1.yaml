@@ -1,0 +1,47 @@
+page_id: ribeira-event-list-1
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/events?page=1
+page_type: event
+layout: list
+items:
+- id,link: EV303
+  title: Passeio de primavera
+  type: Testadores
+  started_at: '2026-02-11'
+  expired_at: '2026-02-21'
+  status: Agendado
+- id,link: EV306
+  title: Preparativos para as férias de verão
+  type: Montra
+  started_at: '2026-03-28'
+  expired_at: '2026-04-17'
+  status: Agendado
+- id,link: EV309
+  title: Guia de presentes das colheitas
+  type: Testadores
+  started_at: '2026-05-17'
+  expired_at: '2026-07-01'
+  status: Ativo
+- id,link: EV312
+  title: Festa de fim de ano
+  type: Testadores
+  started_at: '2026-08-30'
+  expired_at: '2026-09-09'
+  status: Ativo
+- id,link: EV315
+  title: Programa de testadores de novidades
+  type: Montra
+  started_at: '2026-09-14'
+  expired_at: '2026-10-29'
+  status: Terminado
+- id,link: EV318
+  title: Concurso da melhor avaliação
+  type: Testadores
+  started_at: '2026-06-24'
+  expired_at: '2026-07-04'
+  status: Terminado
+title: Campanhas

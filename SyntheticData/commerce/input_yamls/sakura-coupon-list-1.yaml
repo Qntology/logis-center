@@ -1,0 +1,91 @@
+page_id: sakura-coupon-list-1
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: SAK702
+  title: 初回購入ウェルカムクーポン 1
+  type: 割引率
+  discount: 20%
+  started_at: '2026-05-25'
+  expired_at: '2026-06-24'
+  status: 開催予定
+- id,link: CP4014
+  code: SAK349
+  title: 初回購入ウェルカムクーポン 2
+  type: 割引率
+  discount: 5%
+  started_at: '2026-06-01'
+  expired_at: '2026-06-15'
+  status: 開催予定
+- id,link: CP4021
+  code: SAK255
+  title: 秋の感謝クーポン 3
+  type: 定額割引
+  discount: ¥220
+  started_at: '2026-06-27'
+  expired_at: '2026-07-27'
+  status: 開催中
+- id,link: CP4028
+  code: SAK999
+  title: カゴ落ちフォロークーポン 4
+  type: 定額割引
+  discount: ¥540
+  started_at: '2026-05-31'
+  expired_at: '2026-06-14'
+  status: 開催予定
+- id,link: CP4035
+  code: SAK311
+  title: アプリ限定クーポン 5
+  type: 定額割引
+  discount: ¥220
+  started_at: '2026-03-21'
+  expired_at: '2026-04-20'
+  status: 開催予定
+- id,link: CP4042
+  code: SAK664
+  title: 週末限定クーポン 6
+  type: 定額割引
+  discount: ¥220
+  started_at: '2026-04-25'
+  expired_at: '2026-05-25'
+  status: 開催中
+- id,link: CP4049
+  code: SAK499
+  title: 週末限定クーポン 7
+  type: 割引率
+  discount: 5%
+  started_at: '2026-09-02'
+  expired_at: '2026-10-02'
+  status: 開催中
+- id,link: CP4056
+  code: SAK238
+  title: カゴ落ちフォロークーポン 8
+  type: 定額割引
+  discount: ¥220
+  started_at: '2026-09-02'
+  expired_at: '2026-09-16'
+  status: 開催中
+- id,link: CP4063
+  code: SAK522
+  title: 初回購入ウェルカムクーポン 9
+  type: 定額割引
+  discount: ¥330
+  started_at: '2026-06-02'
+  expired_at: '2026-07-02'
+  status: 開催予定
+- id,link: CP4070
+  code: SAK757
+  title: アプリ限定クーポン 10
+  type: 割引率
+  discount: 5%
+  started_at: '2026-07-21'
+  expired_at: '2026-08-04'
+  status: 開催予定
+title: クーポン一覧

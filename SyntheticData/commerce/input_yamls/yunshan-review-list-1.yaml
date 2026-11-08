@@ -1,0 +1,71 @@
+page_id: yunshan-review-list-1
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/reviews?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: 已通过
+  title: 第二次购买了，依然很轻便。
+  name: 周洋
+  registration_date: '2026-06-10'
+- id,link: RV7022
+  status: 待审核
+  title: 第二次购买了，依然很好看。
+  name: 李浩然
+  registration_date: '2026-05-17'
+- id,link: RV7033
+  status: 已通过
+  title: 比预期的好，真的很精致。
+  name: 周磊
+  registration_date: '2026-07-01'
+- id,link: RV7044
+  status: 已隐藏
+  title: 包装很好，整体来说很结实。
+  name: 张娜
+  registration_date: '2026-08-01'
+- id,link: RV7055
+  status: 已隐藏
+  title: 第二次购买了，依然很好看。
+  name: 黄浩然
+  registration_date: '2026-05-21'
+- id,link: RV7066
+  status: 已通过
+  title: 比预期的好，真的很结实。
+  name: 陈芳
+  registration_date: '2026-08-27'
+- id,link: RV7077
+  status: 已通过
+  title: 比预期的好，真的很精致。
+  name: 张敏
+  registration_date: '2026-07-22'
+- id,link: RV7088
+  status: 已通过
+  title: 比预期的好，真的很精致。
+  name: 刘静
+  registration_date: '2026-06-19'
+- id,link: RV7099
+  status: 已隐藏
+  title: 包装很好，整体来说很好看。
+  name: 张敏
+  registration_date: '2026-09-03'
+- id,link: RV7110
+  status: 已通过
+  title: 比预期的好，真的很结实。
+  name: 王娜
+  registration_date: '2026-06-27'
+- id,link: RV7121
+  status: 已隐藏
+  title: 第二次购买了，依然很结实。
+  name: 王静
+  registration_date: '2026-08-13'
+- id,link: RV7132
+  status: 待审核
+  title: 第二次购买了，依然很精致。
+  name: 周婷
+  registration_date: '2026-06-28'
+title: 商品评价

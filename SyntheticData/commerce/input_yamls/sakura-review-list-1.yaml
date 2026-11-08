@@ -1,0 +1,71 @@
+page_id: sakura-review-list-1
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/review/list?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: 承認済み
+  title: 梱包も丁寧で、全体的に色がきれいです。
+  name: 渡辺 大翔
+  registration_date: '2026-07-07'
+- id,link: RV7022
+  status: 承認済み
+  title: リピート購入ですが、やはり丈夫です。
+  name: 山本 葵
+  registration_date: '2026-08-04'
+- id,link: RV7033
+  status: 承認済み
+  title: 梱包も丁寧で、全体的に丈夫です。
+  name: 山本 健太
+  registration_date: '2026-08-15'
+- id,link: RV7044
+  status: 承認済み
+  title: リピート購入ですが、やはり仕上がりがきれいです。
+  name: 伊藤 悠真
+  registration_date: '2026-06-16'
+- id,link: RV7055
+  status: 承認待ち
+  title: 思っていたより丈夫です。
+  name: 伊藤 芽依
+  registration_date: '2026-08-19'
+- id,link: RV7066
+  status: 非表示
+  title: 思っていたより丈夫です。
+  name: 鈴木 蓮
+  registration_date: '2026-06-14'
+- id,link: RV7077
+  status: 承認済み
+  title: リピート購入ですが、やはり色がきれいです。
+  name: 小林 凛
+  registration_date: '2026-07-18'
+- id,link: RV7088
+  status: 承認済み
+  title: 思っていたより仕上がりがきれいです。
+  name: 加藤 凛
+  registration_date: '2026-07-10'
+- id,link: RV7099
+  status: 承認済み
+  title: 梱包も丁寧で、全体的に丈夫です。
+  name: 田中 芽依
+  registration_date: '2026-05-14'
+- id,link: RV7110
+  status: 承認済み
+  title: 梱包も丁寧で、全体的に軽くて使いやすいです。
+  name: 加藤 美咲
+  registration_date: '2026-06-07'
+- id,link: RV7121
+  status: 承認済み
+  title: リピート購入ですが、やはり仕上がりがきれいです。
+  name: 小林 湊
+  registration_date: '2026-07-08'
+- id,link: RV7132
+  status: 承認済み
+  title: リピート購入ですが、やはり軽くて使いやすいです。
+  name: 加藤 葵
+  registration_date: '2026-05-09'
+title: 商品レビュー

@@ -1,0 +1,27 @@
+page_id: yunshan-order-detail-20260916-100106
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/my/orders/20260916-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260916-100106
+  registration_date: '2026-09-16'
+  status: 待付款
+  goods: 冰凉颈带
+  sender_name: 周洋
+  recipient_name: 周伟
+  quantity: 5
+  amount: 596.3
+  shipping_fee: 0.0
+  payment_method: 银行转账
+  sender_phone: 131 6488 6100
+  sender_address: 浙江省杭州市西湖区解放路48号2栋602室
+  recipient_phone: 130 9589 7408
+  recipient_address: 浙江省杭州市西湖区建设路144号5栋905室
+  payment_origin: 云杉支付
+  bank: 白鹭农商银行
+title: 订单详情

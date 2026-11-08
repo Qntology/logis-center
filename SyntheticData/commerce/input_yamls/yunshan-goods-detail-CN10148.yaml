@@ -1,0 +1,30 @@
+page_id: yunshan-goods-detail-CN10148
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/products/CN10148
+page_type: goods
+layout: detail
+fields:
+  id,link: CN10148
+  title: 便携户外锅具套装
+  status: 在售
+  category: 户外
+  sale_price: 219.45
+  quantity: 42
+  registration_date: '2026-09-01'
+  brand_name: 하람
+  code: CN-OUT-104
+  stock_keeping_unit: CNOU1004
+  model_name: OU-530
+  manufacturer: 솔빛리빙
+  origin_country: 马来西亚
+  color: 奶油色
+  barcode: '8854779312217'
+  supply_price: 140.69
+  low_stock_threshold: 5
+  shipping_fee: 15.8
+  description: 锅和煎锅可以叠放收纳。
+title: 商品详情

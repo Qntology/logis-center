@@ -1,0 +1,28 @@
+page_id: faro-order-detail-20260829-100212
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/orders/20260829-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260829-100212
+  registration_date: '2026-08-29'
+  status: Annullato
+  goods: Essenza riparatrice per capelli
+  sender_name: Davide Bianchi
+  recipient_name: Davide Bianchi
+  quantity: 2
+  amount: 27.25
+  shipping_fee: 2.05
+  payment_method: Bonifico
+  sender_phone: +39 373 550 4357
+  sender_address: Via Mazzini 114, 00184 Roma
+  recipient_phone: +39 373 550 4357
+  recipient_address: Via Mazzini 114, 00184 Roma
+  payment_origin: PayMolo
+  payment_date: '2026-08-29'
+  bank: Banca Aurora
+title: Dettaglio ordine

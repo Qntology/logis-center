@@ -1,0 +1,17 @@
+page_id: ribeira-event-detail-EV303
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/events/EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: Passeio de primavera
+  type: Testadores
+  started_at: '2026-02-11'
+  expired_at: '2026-02-21'
+  status: Agendado
+title: Campanha

@@ -1,0 +1,91 @@
+page_id: alameda-coupon-list-1
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/coupons?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: ALA683
+  title: Bienvenida a tu primer pedido 1
+  type: Porcentaje
+  discount: 15%
+  started_at: '2026-03-13'
+  expired_at: '2026-04-12'
+  status: Finalizado
+- id,link: CP4014
+  code: ALA643
+  title: Rescate del carrito 2
+  type: Porcentaje
+  discount: 10%
+  started_at: '2026-04-16'
+  expired_at: '2026-05-16'
+  status: Finalizado
+- id,link: CP4021
+  code: ALA850
+  title: Bienvenida a tu primer pedido 3
+  type: Importe fijo
+  discount: 1,40 €
+  started_at: '2026-07-11'
+  expired_at: '2026-07-18'
+  status: En curso
+- id,link: CP4028
+  code: ALA785
+  title: Rescate del carrito 4
+  type: Importe fijo
+  discount: 1,40 €
+  started_at: '2026-09-01'
+  expired_at: '2026-09-08'
+  status: Programado
+- id,link: CP4035
+  code: ALA923
+  title: Bienvenida a tu primer pedido 5
+  type: Porcentaje
+  discount: 20%
+  started_at: '2026-05-07'
+  expired_at: '2026-05-21'
+  status: En curso
+- id,link: CP4042
+  code: ALA119
+  title: Oferta solo de fin de semana 6
+  type: Porcentaje
+  discount: 20%
+  started_at: '2026-07-08'
+  expired_at: '2026-07-15'
+  status: Finalizado
+- id,link: CP4049
+  code: ALA626
+  title: Oferta exclusiva de la app 7
+  type: Porcentaje
+  discount: 15%
+  started_at: '2026-03-29'
+  expired_at: '2026-04-05'
+  status: Programado
+- id,link: CP4056
+  code: ALA874
+  title: Bienvenida a tu primer pedido 8
+  type: Porcentaje
+  discount: 5%
+  started_at: '2026-04-03'
+  expired_at: '2026-05-03'
+  status: En curso
+- id,link: CP4063
+  code: ALA200
+  title: Gracias de otoño 9
+  type: Porcentaje
+  discount: 20%
+  started_at: '2026-03-23'
+  expired_at: '2026-04-22'
+  status: En curso
+- id,link: CP4070
+  code: ALA319
+  title: Rescate del carrito 10
+  type: Porcentaje
+  discount: 15%
+  started_at: '2026-08-03'
+  expired_at: '2026-08-17'
+  status: Finalizado
+title: Códigos de descuento

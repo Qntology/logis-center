@@ -1,0 +1,30 @@
+page_id: ulipy-goods-detail-CZ10037
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/goods/view?id=CZ10037
+page_type: goods
+layout: detail
+fields:
+  id,link: CZ10037
+  title: Skládací trekové hole
+  status: Koncept
+  category: Outdoor
+  sale_price: 860
+  compare_at_price: 1032
+  quantity: 7
+  registration_date: '2026-08-14'
+  brand_name: 마루공방
+  code: CZ-OUT-101
+  stock_keeping_unit: CZOU1001
+  model_name: OU-117
+  manufacturer: 다온랩스
+  origin_country: Malajsie
+  color: Nebesky modrá
+  barcode: '8889312016222'
+  supply_price: 613
+  low_stock_threshold: 10
+  description: Třídílné hole, které se vejdou do batohu.
+title: Detail produktu

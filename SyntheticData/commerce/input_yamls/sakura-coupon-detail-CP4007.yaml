@@ -1,0 +1,21 @@
+page_id: sakura-coupon-detail-CP4007
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/coupon/view?id=CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: SAK702
+  title: 初回購入ウェルカムクーポン 1
+  type: 割引率
+  discount: 20%
+  started_at: '2026-05-25'
+  expired_at: '2026-06-24'
+  status: 開催予定
+  quantity: 100
+  min_order_amount: 3260
+title: クーポン

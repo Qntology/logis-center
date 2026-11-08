@@ -1,0 +1,83 @@
+page_id: dekade-tracking-list-2
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '975799942039'
+  carrier: Polderkoerier
+  status: Bezorgd
+  title: Parfumvrije bodylotion
+  shipping_date: '2026-06-25'
+  recipient_name: Thijs Meijer
+- id,link: '677277045812'
+  carrier: Polderkoerier
+  status: Geretourneerd
+  title: Kleurboek
+  shipping_date: '2026-08-07'
+  recipient_name: Daan Jansen
+- id,link: '580303850628'
+  carrier: Duinvracht
+  status: Verzonden
+  title: Staafmixer
+  shipping_date: '2026-05-25'
+  recipient_name: Thijs Jansen
+- id,link: '847949005859'
+  carrier: Polderkoerier
+  status: Bezorgd
+  title: Herstellende haaressence
+  shipping_date: '2026-06-19'
+  recipient_name: Fleur Visser
+- id,link: '684870459184'
+  carrier: Duinvracht
+  status: Bezorgd
+  title: Koepeltent voor twee personen
+  shipping_date: '2026-08-10'
+  recipient_name: Emma Visser
+- id,link: '190173761801'
+  carrier: Duinvracht
+  status: Verzonden
+  title: Minerale zonnebrandcrème
+  shipping_date: '2026-08-16'
+  recipient_name: Lotte Meijer
+- id,link: '102438716747'
+  carrier: Duinvracht
+  status: Verzonden
+  title: Houten bouwblokken
+  shipping_date: '2026-08-03'
+  recipient_name: Thijs de Boer
+- id,link: '547359172289'
+  carrier: Kade Pakketdienst
+  status: Bezorgd
+  title: Koepeltent voor twee personen
+  shipping_date: '2026-08-16'
+  recipient_name: Ruben Jansen
+- id,link: '659679191178'
+  carrier: Duinvracht
+  status: Bezorgd
+  title: Kleurboek
+  shipping_date: '2026-05-09'
+  recipient_name: Bram Jansen
+- id,link: '983972516869'
+  carrier: Polderkoerier
+  status: Verzonden
+  title: Vacuümgeïsoleerde thermobeker
+  shipping_date: '2026-04-09'
+  recipient_name: Thijs Meijer
+- id,link: '350721594216'
+  carrier: Grachtenexpres
+  status: Geretourneerd
+  title: Set luchtdichte glazen bakjes
+  shipping_date: '2026-04-18'
+  recipient_name: Sanne van Dijk
+- id,link: '182768707748'
+  carrier: Duinvracht
+  status: Verzonden
+  title: Krabpaal
+  shipping_date: '2026-05-25'
+  recipient_name: Emma de Groot
+title: Zendingen

@@ -1,0 +1,29 @@
+page_id: yunshan-order-detail-20260422-100159
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/my/orders/20260422-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260422-100159
+  registration_date: '2026-04-22'
+  status: 已签收
+  goods: 双人圆顶帐篷
+  tracking_number: '229389811173'
+  sender_name: 杨芳
+  recipient_name: 杨芳
+  quantity: 3
+  amount: 953.15
+  shipping_fee: 0.0
+  payment_method: 银行转账
+  sender_phone: 131 2012 5193
+  sender_address: 四川省成都市武侯区建设路87号8栋1208室
+  recipient_phone: 131 2012 5193
+  recipient_address: 四川省成都市武侯区建设路87号8栋1208室
+  payment_origin: 云杉支付
+  payment_date: '2026-04-23'
+  bank: 白鹭农商银行
+title: 订单详情

@@ -1,0 +1,29 @@
+page_id: ulipy-order-detail-20260822-100212
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/order/view?id=20260822-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260822-100212
+  registration_date: '2026-08-22'
+  status: Odesláno
+  goods: Minerální opalovací krém
+  tracking_number: '400828234978'
+  sender_name: Jan Kučera
+  recipient_name: Jan Kučera
+  quantity: 8
+  amount: 5400
+  shipping_fee: 0
+  payment_method: Platební karta
+  sender_phone: +420 776 128 453
+  sender_address: Školní 145, 779 00 Olomouc
+  recipient_phone: +420 776 128 453
+  recipient_address: Školní 145, 779 00 Olomouc
+  payment_origin: Rychlá pokladna
+  payment_date: '2026-08-22'
+  card: Hradní kredit
+title: Detail objednávky

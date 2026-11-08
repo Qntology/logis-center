@@ -1,0 +1,30 @@
+page_id: sakura-goods-detail-JP10074
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/goods/view?id=JP10074
+page_type: goods
+layout: detail
+fields:
+  id,link: JP10074
+  title: ヘアリペアエッセンス
+  status: 売り切れ
+  category: コスメ
+  sale_price: 2300
+  quantity: 0
+  registration_date: '2026-03-14'
+  brand_name: 누리온
+  code: JP-SKI-102
+  stock_keeping_unit: JPSK1002
+  model_name: SK-140
+  manufacturer: 하람제작소
+  origin_country: マレーシア
+  color: チャコール
+  barcode: '8855943920581'
+  supply_price: 1379
+  low_stock_threshold: 10
+  shipping_fee: 330
+  description: 傷んだ髪をなめらかに整えます。
+title: 商品詳細

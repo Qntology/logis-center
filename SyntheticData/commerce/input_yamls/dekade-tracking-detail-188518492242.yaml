@@ -1,0 +1,30 @@
+page_id: dekade-tracking-detail-188518492242
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/shipping/view?id=188518492242
+page_type: tracking
+layout: detail
+fields:
+  id,link: '188518492242'
+  carrier: Duinvracht
+  status: Bezorgd
+  title: Pluche pantoffels
+  shipping_date: '2026-05-21'
+  recipient_name: Lars Meijer
+  registration_date: '2026-05-19'
+  sender_name: De Kade Handel B.V.
+  sender_address: Kadestraat 18, 3512 AB Utrecht
+  sender_phone: +31 30 555 0142
+  recipient_address: Lindelaan 77, 1012 AB Amsterdam
+  recipient_phone: +31 6 3108 7546
+  weight: 1.4
+  width: 24
+  height: 28
+  length: 35
+  shipping_method: Standaard
+  shipping_duration: 1
+  shipping_fee: 2.05
+title: Zendinggegevens

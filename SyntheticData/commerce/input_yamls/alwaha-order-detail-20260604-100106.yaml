@@ -1,0 +1,28 @@
+page_id: alwaha-order-detail-20260604-100106
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/orders/20260604-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260604-100106
+  registration_date: '2026-06-04'
+  status: ملغى
+  goods: جرانولا عضوية
+  sender_name: ريم القحطاني
+  recipient_name: ريم القحطاني
+  quantity: 3
+  amount: 214.2
+  shipping_fee: 0.0
+  payment_method: بطاقة ائتمان
+  sender_phone: +966 58 153 5353
+  sender_address: شارع الياسمين 109، الخبر 34428
+  recipient_phone: +966 58 153 5353
+  recipient_address: شارع الياسمين 109، الخبر 34428
+  payment_origin: دفع الواحة
+  payment_date: '2026-06-04'
+  card: بطاقة الواحة
+title: تفاصيل الطلب

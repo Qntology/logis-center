@@ -1,0 +1,140 @@
+page_id: dekade-order-list-2
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/order/list?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20260725-100689
+  registration_date: '2026-07-25'
+  status: Bezorgd
+  goods: Reinigingsschuim met lage pH
+  tracking_number: '253386056561'
+  sender_name: Thijs Meijer
+  recipient_name: Thijs Meijer
+  quantity: 1
+  amount: 11.55
+  shipping_fee: 2.05
+  payment_method: Digitale portemonnee
+- id,link: 20261002-100742
+  registration_date: '2026-10-02'
+  status: Bezorgd
+  goods: Herstellende haaressence
+  tracking_number: '171472747058'
+  sender_name: Lotte Visser
+  recipient_name: Lotte Visser
+  quantity: 5
+  amount: 64.75
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+- id,link: 20260623-100795
+  registration_date: '2026-06-23'
+  status: Bezorgd
+  goods: Parfumvrije bodylotion
+  tracking_number: '975799942039'
+  sender_name: Thijs Meijer
+  recipient_name: Thijs Meijer
+  quantity: 5
+  amount: 56.52
+  shipping_fee: 0.0
+  payment_method: Creditcard
+- id,link: 20260805-100848
+  registration_date: '2026-08-05'
+  status: Geretourneerd
+  goods: Kleurboek
+  tracking_number: '677277045812'
+  sender_name: Daan Jansen
+  recipient_name: Daan Jansen
+  quantity: 4
+  amount: 38.43
+  shipping_fee: 0.0
+  payment_method: Creditcard
+- id,link: 20260522-100901
+  registration_date: '2026-05-22'
+  status: Verzonden
+  goods: Staafmixer
+  tracking_number: '580303850628'
+  sender_name: Thijs Jansen
+  recipient_name: Thijs Jansen
+  quantity: 6
+  amount: 136.44
+  shipping_fee: 0.0
+  payment_method: Creditcard
+- id,link: 20260617-100954
+  registration_date: '2026-06-17'
+  status: Bezorgd
+  goods: Herstellende haaressence
+  tracking_number: '847949005859'
+  sender_name: Fleur Visser
+  recipient_name: Fleur Visser
+  quantity: 1
+  amount: 15.0
+  shipping_fee: 2.05
+  payment_method: Digitale portemonnee
+- id,link: 20260809-101007
+  registration_date: '2026-08-09'
+  status: Bezorgd
+  goods: Koepeltent voor twee personen
+  tracking_number: '684870459184'
+  sender_name: Emma Visser
+  recipient_name: Emma Visser
+  quantity: 5
+  amount: 270.2
+  shipping_fee: 0.0
+  payment_method: Creditcard
+- id,link: 20260725-101060
+  registration_date: '2026-07-25'
+  status: Geannuleerd
+  goods: Kinderservies
+  sender_name: Jesse Meijer
+  recipient_name: Sanne Meijer
+  quantity: 7
+  amount: 180.3
+  shipping_fee: 0.0
+  payment_method: Creditcard
+- id,link: 20260812-101113
+  registration_date: '2026-08-12'
+  status: Verzonden
+  goods: Minerale zonnebrandcrème
+  tracking_number: '190173761801'
+  sender_name: Lotte Mulder
+  recipient_name: Lotte Meijer
+  quantity: 3
+  amount: 79.55
+  shipping_fee: 0.0
+  payment_method: Creditcard
+- id,link: 20260801-101166
+  registration_date: '2026-08-01'
+  status: Verzonden
+  goods: Houten bouwblokken
+  tracking_number: '102438716747'
+  sender_name: Thijs de Boer
+  recipient_name: Thijs de Boer
+  quantity: 4
+  amount: 105.3
+  shipping_fee: 0.0
+  payment_method: Digitale portemonnee
+- id,link: 20260913-101219
+  registration_date: '2026-09-13'
+  status: Betaald
+  goods: Draadloze oordopjes met ruisonderdrukking
+  sender_name: Bram Bakker
+  recipient_name: Bram Bakker
+  quantity: 1
+  amount: 90.35
+  shipping_fee: 0.0
+  payment_method: Creditcard
+- id,link: 20261001-101272
+  registration_date: '2026-10-01'
+  status: Wacht op betaling
+  goods: Powerbank met grote capaciteit
+  sender_name: Ruben de Vries
+  recipient_name: Sanne Smit
+  quantity: 2
+  amount: 35.15
+  shipping_fee: 0.0
+  payment_method: Creditcard
+title: Bestellingen

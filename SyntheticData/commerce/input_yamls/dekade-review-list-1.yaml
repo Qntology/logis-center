@@ -1,0 +1,71 @@
+page_id: dekade-review-list-1
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/review/list?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: Goedgekeurd
+  title: Goed verpakt en over het geheel licht.
+  name: Sanne Jansen
+  registration_date: '2026-05-20'
+- id,link: RV7022
+  status: In afwachting
+  title: Goed verpakt en over het geheel mooi van kleur.
+  name: Jesse Smit
+  registration_date: '2026-07-30'
+- id,link: RV7033
+  status: Verborgen
+  title: Goed verpakt en over het geheel licht.
+  name: Lotte de Boer
+  registration_date: '2026-05-05'
+- id,link: RV7044
+  status: Verborgen
+  title: Goed verpakt en over het geheel mooi van kleur.
+  name: Sanne van Dijk
+  registration_date: '2026-09-09'
+- id,link: RV7055
+  status: Verborgen
+  title: Beter dan verwacht, echt licht.
+  name: Lotte Jansen
+  registration_date: '2026-07-17'
+- id,link: RV7066
+  status: In afwachting
+  title: Voor de tweede keer besteld en nog steeds stevig.
+  name: Lotte Mulder
+  registration_date: '2026-09-10'
+- id,link: RV7077
+  status: Goedgekeurd
+  title: Voor de tweede keer besteld en nog steeds stevig.
+  name: Lotte de Groot
+  registration_date: '2026-09-07'
+- id,link: RV7088
+  status: Goedgekeurd
+  title: Voor de tweede keer besteld en nog steeds mooi van kleur.
+  name: Thijs Smit
+  registration_date: '2026-08-25'
+- id,link: RV7099
+  status: Verborgen
+  title: Beter dan verwacht, echt stevig.
+  name: Iris de Boer
+  registration_date: '2026-09-10'
+- id,link: RV7110
+  status: Goedgekeurd
+  title: Goed verpakt en over het geheel licht.
+  name: Jesse van Dijk
+  registration_date: '2026-08-01'
+- id,link: RV7121
+  status: Goedgekeurd
+  title: Voor de tweede keer besteld en nog steeds stevig.
+  name: Thijs de Boer
+  registration_date: '2026-07-21'
+- id,link: RV7132
+  status: In afwachting
+  title: Goed verpakt en over het geheel mooi van kleur.
+  name: Noor Bakker
+  registration_date: '2026-09-10'
+title: Productbeoordelingen

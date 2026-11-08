@@ -1,0 +1,83 @@
+page_id: dekade-tracking-list-1
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '173660812230'
+  carrier: Polderkoerier
+  status: Verzonden
+  title: Lichte bodywarmer
+  shipping_date: '2026-05-05'
+  recipient_name: Emma Jansen
+- id,link: '460642418407'
+  carrier: Kade Pakketdienst
+  status: Bezorgd
+  title: Lichte bodywarmer
+  shipping_date: '2026-04-07'
+  recipient_name: Bram Visser
+- id,link: '674240535101'
+  carrier: Polderkoerier
+  status: Bezorgd
+  title: Set luchtdichte glazen bakjes
+  shipping_date: '2026-04-24'
+  recipient_name: Iris Mulder
+- id,link: '188518492242'
+  carrier: Duinvracht
+  status: Bezorgd
+  title: Pluche pantoffels
+  shipping_date: '2026-05-21'
+  recipient_name: Lars Meijer
+- id,link: '736910782044'
+  carrier: Duinvracht
+  status: Verzonden
+  title: Ergonomische verticale muis
+  shipping_date: '2026-07-18'
+  recipient_name: Sanne Bakker
+- id,link: '827150714647'
+  carrier: Grachtenexpres
+  status: Verzonden
+  title: Automatische voerbak
+  shipping_date: '2026-08-26'
+  recipient_name: Jesse Bakker
+- id,link: '408526865618'
+  carrier: Duinvracht
+  status: Bezorgd
+  title: Kinderservies
+  shipping_date: '2026-06-30'
+  recipient_name: Lotte de Groot
+- id,link: '214506429829'
+  carrier: Grachtenexpres
+  status: Bezorgd
+  title: Stil mechanisch toetsenbord
+  shipping_date: '2026-09-17'
+  recipient_name: Thijs Meijer
+- id,link: '815495466995'
+  carrier: Kade Pakketdienst
+  status: Geretourneerd
+  title: Oplaadbare handwarmer
+  shipping_date: '2026-07-15'
+  recipient_name: Fleur de Groot
+- id,link: '394516776075'
+  carrier: Polderkoerier
+  status: Geretourneerd
+  title: Set siliconen keukengerei
+  shipping_date: '2026-04-14'
+  recipient_name: Sanne de Vries
+- id,link: '253386056561'
+  carrier: Grachtenexpres
+  status: Bezorgd
+  title: Reinigingsschuim met lage pH
+  shipping_date: '2026-07-28'
+  recipient_name: Thijs Meijer
+- id,link: '171472747058'
+  carrier: Polderkoerier
+  status: Bezorgd
+  title: Herstellende haaressence
+  shipping_date: '2026-10-05'
+  recipient_name: Lotte Visser
+title: Zendingen

@@ -1,0 +1,113 @@
+page_id: ribeira-goods-list-1
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/products?page=1
+page_type: goods
+layout: list
+items:
+- id,link: PT10037
+  title: Espuma de limpeza de pH baixo
+  status: À venda
+  category: Beleza
+  sale_price: 10.5
+  quantity: 96
+  registration_date: '2026-05-24'
+  brand_name: 누리온
+- id,link: PT10074
+  title: Essência reparadora para cabelo
+  status: Rascunho
+  category: Beleza
+  sale_price: 12.5
+  compare_at_price: 15.0
+  quantity: 120
+  registration_date: '2026-07-15'
+  brand_name: 마루공방
+- id,link: PT10111
+  title: Suporte elevatório para monitor
+  status: À venda
+  category: Escritório
+  sale_price: 26.95
+  compare_at_price: 32.34
+  quantity: 7
+  registration_date: '2026-01-20'
+  brand_name: Marlow & Finch
+- id,link: PT10148
+  title: Organizador de documentos
+  status: À venda
+  category: Escritório
+  sale_price: 8.9
+  quantity: 96
+  registration_date: '2026-04-16'
+  brand_name: 마루공방
+- id,link: PT10185
+  title: Kit de robô de programação
+  status: À venda
+  category: Brinquedos
+  sale_price: 52.5
+  compare_at_price: 63.0
+  quantity: 18
+  registration_date: '2026-02-15'
+  brand_name: Kestrel Lane
+- id,link: PT10222
+  title: Bastões de caminhada dobráveis
+  status: Esgotado
+  category: Ar livre
+  sale_price: 34.55
+  compare_at_price: 41.46
+  quantity: 0
+  registration_date: '2026-05-06'
+  brand_name: Marlow & Finch
+- id,link: PT10259
+  title: Concentrado de café cold brew
+  status: Rascunho
+  category: Mercearia
+  sale_price: 11.4
+  quantity: 120
+  registration_date: '2026-02-18'
+  brand_name: Oakfern
+- id,link: PT10296
+  title: Escova de tosquia para animais
+  status: À venda
+  category: Animais
+  sale_price: 8.85
+  quantity: 18
+  registration_date: '2026-06-22'
+  brand_name: Marlow & Finch
+- id,link: PT10333
+  title: Lanterna LED recarregável
+  status: Rascunho
+  category: Ar livre
+  sale_price: 18.4
+  quantity: 350
+  registration_date: '2026-03-06'
+  brand_name: 다온랩
+- id,link: PT10370
+  title: Caixa organizadora de cabos
+  status: À venda
+  category: Escritório
+  sale_price: 10.5
+  compare_at_price: 12.6
+  quantity: 350
+  registration_date: '2026-07-06'
+  brand_name: 누리온
+- id,link: PT10407
+  title: Manta de microfibra
+  status: Esgotado
+  category: Casa
+  sale_price: 16.3
+  compare_at_price: 19.56
+  quantity: 0
+  registration_date: '2026-04-29'
+  brand_name: 마루공방
+- id,link: PT10444
+  title: Rato vertical ergonómico
+  status: Rascunho
+  category: Eletrónica
+  sale_price: 27.25
+  quantity: 120
+  registration_date: '2026-05-27'
+  brand_name: 누리온
+title: Produtos

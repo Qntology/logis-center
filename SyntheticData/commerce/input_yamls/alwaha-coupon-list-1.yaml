@@ -1,0 +1,91 @@
+page_id: alwaha-coupon-list-1
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/coupons?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: ALW672
+  title: عرض نهاية الأسبوع فقط 1
+  type: نسبة مئوية
+  discount: 20%
+  started_at: '2026-07-24'
+  expired_at: '2026-08-23'
+  status: مجدولة
+- id,link: CP4014
+  code: ALW641
+  title: ترحيب بالطلب الأول 2
+  type: مبلغ ثابت
+  discount: 8.20 ر.س
+  started_at: '2026-03-30'
+  expired_at: '2026-04-29'
+  status: منتهية
+- id,link: CP4021
+  code: ALW917
+  title: شكرًا من الخريف 3
+  type: نسبة مئوية
+  discount: 5%
+  started_at: '2026-07-25'
+  expired_at: '2026-08-24'
+  status: جارية
+- id,link: CP4028
+  code: ALW668
+  title: عرض نهاية الأسبوع فقط 4
+  type: مبلغ ثابت
+  discount: 13.70 ر.س
+  started_at: '2026-06-01'
+  expired_at: '2026-06-08'
+  status: مجدولة
+- id,link: CP4035
+  code: ALW879
+  title: ترحيب بالطلب الأول 5
+  type: مبلغ ثابت
+  discount: 8.20 ر.س
+  started_at: '2026-07-29'
+  expired_at: '2026-08-28'
+  status: منتهية
+- id,link: CP4042
+  code: ALW197
+  title: عرض حصري للتطبيق 6
+  type: نسبة مئوية
+  discount: 15%
+  started_at: '2026-05-07'
+  expired_at: '2026-05-21'
+  status: منتهية
+- id,link: CP4049
+  code: ALW559
+  title: ترحيب بالطلب الأول 7
+  type: مبلغ ثابت
+  discount: 5.50 ر.س
+  started_at: '2026-06-26'
+  expired_at: '2026-07-03'
+  status: مجدولة
+- id,link: CP4056
+  code: ALW119
+  title: ترحيب بالطلب الأول 8
+  type: مبلغ ثابت
+  discount: 5.50 ر.س
+  started_at: '2026-08-15'
+  expired_at: '2026-08-22'
+  status: مجدولة
+- id,link: CP4063
+  code: ALW195
+  title: عرض حصري للتطبيق 9
+  type: نسبة مئوية
+  discount: 20%
+  started_at: '2026-07-02'
+  expired_at: '2026-07-16'
+  status: مجدولة
+- id,link: CP4070
+  code: ALW846
+  title: عرض نهاية الأسبوع فقط 10
+  type: مبلغ ثابت
+  discount: 8.20 ر.س
+  started_at: '2026-07-20'
+  expired_at: '2026-07-27'
+  status: جارية
+title: رموز الخصم

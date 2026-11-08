@@ -1,0 +1,114 @@
+page_id: yunshan-goods-list-2
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/products?page=2
+page_type: goods
+layout: list
+items:
+- id,link: CN10481
+  title: 控温电水壶
+  status: 在售
+  category: 家电
+  sale_price: 247.35
+  compare_at_price: 296.82
+  quantity: 120
+  registration_date: '2026-05-16'
+  brand_name: Tidewell
+- id,link: CN10518
+  title: 充电LED营地灯
+  status: 在售
+  category: 户外
+  sale_price: 157.35
+  compare_at_price: 188.82
+  quantity: 3
+  registration_date: '2026-05-05'
+  brand_name: Marlow & Finch
+- id,link: CN10555
+  title: 有机格兰诺拉麦片
+  status: 草稿
+  category: 食品
+  sale_price: 74.2
+  quantity: 18
+  registration_date: '2026-05-18'
+  brand_name: Oakfern
+- id,link: CN10592
+  title: 静音机械键盘
+  status: 已售罄
+  category: 数码
+  sale_price: 478.95
+  quantity: 0
+  registration_date: '2026-04-11'
+  brand_name: 솔빛
+- id,link: CN10629
+  title: 烘烤杏仁
+  status: 在售
+  category: 食品
+  sale_price: 68.4
+  quantity: 42
+  registration_date: '2026-04-05'
+  brand_name: Oakfern
+- id,link: CN10666
+  title: 狗狗胸背带
+  status: 草稿
+  category: 宠物
+  sale_price: 122.1
+  compare_at_price: 146.52
+  quantity: 350
+  registration_date: '2026-05-10'
+  brand_name: 마루공방
+- id,link: CN10703
+  title: 手持迷你风扇
+  status: 在售
+  category: 家电
+  sale_price: 101.6
+  quantity: 18
+  registration_date: '2026-06-04'
+  brand_name: 누리온
+- id,link: CN10740
+  title: 防晒遮阳伞
+  status: 草稿
+  category: 家居
+  sale_price: 149.45
+  compare_at_price: 179.34
+  quantity: 3
+  registration_date: '2026-08-28'
+  brand_name: 다온랩
+- id,link: CN10777
+  title: 充电暖手宝
+  status: 在售
+  category: 家居
+  sale_price: 113.7
+  quantity: 18
+  registration_date: '2026-02-27'
+  brand_name: Tidewell
+- id,link: CN10814
+  title: 降噪无线耳机
+  status: 已售罄
+  category: 数码
+  sale_price: 648.4
+  compare_at_price: 778.08
+  quantity: 0
+  registration_date: '2026-04-03'
+  brand_name: 하람
+- id,link: CN10851
+  title: 双人圆顶帐篷
+  status: 在售
+  category: 户外
+  sale_price: 643.7
+  compare_at_price: 772.44
+  quantity: 7
+  registration_date: '2026-07-31'
+  brand_name: 하람
+- id,link: CN10888
+  title: 物理防晒霜
+  status: 在售
+  category: 美妆
+  sale_price: 134.75
+  compare_at_price: 161.7
+  quantity: 3
+  registration_date: '2026-04-13'
+  brand_name: 마루공방
+title: 商品列表

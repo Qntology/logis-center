@@ -1,0 +1,28 @@
+page_id: faro-order-detail-20261006-100053
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/orders/20261006-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20261006-100053
+  registration_date: '2026-10-06'
+  status: Pagato
+  goods: Spazzola per toelettatura
+  sender_name: Andrea Greco
+  recipient_name: Andrea Greco
+  quantity: 6
+  amount: 74.75
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+  sender_phone: +39 328 357 7615
+  sender_address: Via Roma 95, 50123 Firenze
+  recipient_phone: +39 328 357 7615
+  recipient_address: Via Roma 95, 50123 Firenze
+  payment_origin: PagaPonte
+  payment_date: '2026-10-06'
+  card: Carta Faro
+title: Dettaglio ordine

@@ -1,0 +1,31 @@
+page_id: tilleuls-goods-detail-FR10111
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/goods/view?id=FR10111
+page_type: goods
+layout: detail
+fields:
+  id,link: FR10111
+  title: Sandales aérées
+  status: Brouillon
+  category: Vêtements
+  sale_price: 22.5
+  compare_at_price: 27.0
+  quantity: 7
+  registration_date: '2026-08-17'
+  brand_name: 다온랩
+  code: FR-HOT-103
+  stock_keeping_unit: FRHO1003
+  model_name: HO-945
+  manufacturer: 누리온산업
+  origin_country: Pologne
+  color: Bleu ciel
+  barcode: '8845878345742'
+  supply_price: 14.1
+  low_stock_threshold: 10
+  shipping_fee: 2.05
+  description: Une tige perforée pour que les pieds ne se sentent pas à l'étroit.
+title: Fiche produit

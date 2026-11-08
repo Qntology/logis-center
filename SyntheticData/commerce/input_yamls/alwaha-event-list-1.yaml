@@ -1,0 +1,47 @@
+page_id: alwaha-event-list-1
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/events?page=1
+page_type: event
+layout: list
+items:
+- id,link: EV303
+  title: نزهة الربيع
+  type: تجربة المنتجات
+  started_at: '2026-04-22'
+  expired_at: '2026-06-06'
+  status: مجدولة
+- id,link: EV306
+  title: استعدادات إجازة الصيف
+  type: عرض مميز
+  started_at: '2026-03-25'
+  expired_at: '2026-05-09'
+  status: مجدولة
+- id,link: EV309
+  title: دليل هدايا موسم الحصاد
+  type: تجربة المنتجات
+  started_at: '2026-02-25'
+  expired_at: '2026-03-07'
+  status: جارية
+- id,link: EV312
+  title: احتفال نهاية العام
+  type: عرض مميز
+  started_at: '2026-06-06'
+  expired_at: '2026-06-26'
+  status: جارية
+- id,link: EV315
+  title: برنامج تجربة المنتجات الجديدة
+  type: تجربة المنتجات
+  started_at: '2026-03-06'
+  expired_at: '2026-03-26'
+  status: مجدولة
+- id,link: EV318
+  title: مسابقة أفضل مراجعة
+  type: عرض مميز
+  started_at: '2026-09-28'
+  expired_at: '2026-10-08'
+  status: منتهية
+title: الحملات

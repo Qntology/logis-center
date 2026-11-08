@@ -1,0 +1,29 @@
+page_id: sakura-order-detail-20260408-100053
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/order/view?id=20260408-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260408-100053
+  registration_date: '2026-04-08'
+  status: 返品
+  goods: コールドブリュー濃縮コーヒー
+  tracking_number: '465019825630'
+  sender_name: 中村 陽菜
+  recipient_name: 鈴木 芽依
+  quantity: 5
+  amount: 8650
+  shipping_fee: 0
+  payment_method: クレジットカード
+  sender_phone: 090-3874-0559
+  sender_address: 〒460-0008 愛知県名古屋市中区本町8-20-12
+  recipient_phone: 090-3079-7111
+  recipient_address: 〒530-0001 大阪府大阪市北区栄町6-5-13
+  payment_origin: かんたん決済
+  payment_date: '2026-04-08'
+  card: あおばカード
+title: 注文詳細

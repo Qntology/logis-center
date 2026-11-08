@@ -1,0 +1,30 @@
+page_id: tilleuls-tracking-detail-597573966324
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/shipping/view?id=597573966324
+page_type: tracking
+layout: detail
+fields:
+  id,link: '597573966324'
+  carrier: Fret Azur
+  status: Expédiée
+  title: Hub USB-C multiport
+  shipping_date: '2026-04-08'
+  recipient_name: Arthur Moreau
+  registration_date: '2026-04-07'
+  sender_name: Comptoir des Tilleuls SARL
+  sender_address: 12 rue des Lilas, 69003 Lyon
+  sender_phone: +33 4 55 50 12 34
+  recipient_address: 107 boulevard Voltaire, 44000 Nantes
+  recipient_phone: +33 6 39 73 68 02
+  weight: 3.1
+  width: 26
+  height: 11
+  length: 8
+  shipping_method: Standard
+  shipping_duration: 1
+  shipping_fee: 0.0
+title: Détail de l'expédition

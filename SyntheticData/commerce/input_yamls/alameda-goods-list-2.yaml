@@ -1,0 +1,112 @@
+page_id: alameda-goods-list-2
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/products?page=2
+page_type: goods
+layout: list
+items:
+- id,link: ES10481
+  title: Elevador para monitor
+  status: Borrador
+  category: Oficina
+  sale_price: 26.75
+  compare_at_price: 32.1
+  quantity: 3
+  registration_date: '2026-01-15'
+  brand_name: Marlow & Finch
+- id,link: ES10518
+  title: Cuchillo de cocinero de cerámica
+  status: Activo
+  category: Cocina
+  sale_price: 26.95
+  compare_at_price: 32.34
+  quantity: 18
+  registration_date: '2026-01-05'
+  brand_name: 하람
+- id,link: ES10555
+  title: Concentrado de café cold brew
+  status: Activo
+  category: Alimentación
+  sale_price: 10.3
+  quantity: 96
+  registration_date: '2026-02-17'
+  brand_name: Marlow & Finch
+- id,link: ES10592
+  title: Ratón vertical ergonómico
+  status: Activo
+  category: Electrónica
+  sale_price: 29.1
+  quantity: 96
+  registration_date: '2026-01-21'
+  brand_name: Tidewell
+- id,link: ES10629
+  title: Pulsera de actividad inteligente
+  status: Borrador
+  category: Electrónica
+  sale_price: 31.8
+  compare_at_price: 38.16
+  quantity: 350
+  registration_date: '2026-02-12'
+  brand_name: 마루공방
+- id,link: ES10666
+  title: Banda refrescante para el cuello
+  status: Activo
+  category: Hogar
+  sale_price: 8.95
+  quantity: 96
+  registration_date: '2026-01-19'
+  brand_name: 마루공방
+- id,link: ES10703
+  title: Transportín para mascotas
+  status: Activo
+  category: Mascotas
+  sale_price: 29.85
+  quantity: 42
+  registration_date: '2026-03-30'
+  brand_name: 버들
+- id,link: ES10740
+  title: Miniventilador de mano
+  status: Agotado
+  category: Electrodomésticos
+  sale_price: 12.9
+  compare_at_price: 15.48
+  quantity: 0
+  registration_date: '2026-04-11'
+  brand_name: 솔빛
+- id,link: ES10777
+  title: Cuaderno para colorear
+  status: Agotado
+  category: Juguetes
+  sale_price: 6.75
+  quantity: 0
+  registration_date: '2026-03-05'
+  brand_name: 누리온
+- id,link: ES10814
+  title: Sartén de acero inoxidable
+  status: Agotado
+  category: Cocina
+  sale_price: 36.6
+  quantity: 0
+  registration_date: '2026-02-12'
+  brand_name: 다온랩
+- id,link: ES10851
+  title: Chaqueta de borreguillo
+  status: Agotado
+  category: Ropa
+  sale_price: 38.15
+  quantity: 0
+  registration_date: '2026-06-24'
+  brand_name: 다온랩
+- id,link: ES10888
+  title: Rascador para gatos
+  status: Activo
+  category: Mascotas
+  sale_price: 12.15
+  compare_at_price: 14.58
+  quantity: 350
+  registration_date: '2026-03-05'
+  brand_name: 누리온
+title: Productos

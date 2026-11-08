@@ -1,0 +1,30 @@
+page_id: faro-tracking-detail-229271781691
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/shipments/229271781691
+page_type: tracking
+layout: detail
+fields:
+  id,link: '229271781691'
+  carrier: Pacco Veloce
+  status: Consegnato
+  title: Crema solare minerale
+  shipping_date: '2026-06-07'
+  recipient_name: Elena Conti
+  registration_date: '2026-06-06'
+  sender_name: Bottega del Faro S.r.l.
+  sender_address: Via dei Mille 15, 40121 Bologna
+  sender_phone: +39 051 555 0142
+  recipient_address: Corso Italia 153, 80133 Napoli
+  recipient_phone: +39 372 867 1477
+  weight: 2.3
+  width: 52
+  height: 23
+  length: 31
+  shipping_method: Standard
+  shipping_duration: 3
+  shipping_fee: 2.05
+title: Dettaglio spedizione

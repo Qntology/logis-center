@@ -1,0 +1,21 @@
+page_id: tilleuls-coupon-detail-CP4007
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/coupon/view?id=CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: TIL983
+  title: Offre exclusive appli 1
+  type: Pourcentage
+  discount: 10%
+  started_at: '2026-06-08'
+  expired_at: '2026-07-08'
+  status: En cours
+  quantity: 500
+  min_order_amount: 20.7
+title: Code promo

@@ -1,0 +1,30 @@
+page_id: alwaha-goods-detail-AR10037
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/products/AR10037
+page_type: goods
+layout: detail
+fields:
+  id,link: AR10037
+  title: لوز محمص
+  status: معروض للبيع
+  category: بقالة
+  sale_price: 30.7
+  quantity: 96
+  registration_date: '2026-04-08'
+  brand_name: 마루공방
+  code: AR-SNA-101
+  stock_keeping_unit: ARSN1001
+  model_name: SN-943
+  manufacturer: Oakfern Works
+  origin_country: كوريا
+  color: كريمي
+  barcode: '8861682389714'
+  supply_price: 20.72
+  low_stock_threshold: 5
+  shipping_fee: 8.2
+  description: محمص دون زيت بنكهة المكسرات.
+title: تفاصيل المنتج

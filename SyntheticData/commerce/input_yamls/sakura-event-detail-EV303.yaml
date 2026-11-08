@@ -1,0 +1,17 @@
+page_id: sakura-event-detail-EV303
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/event/view?id=EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: 春のおでかけ特集
+  type: 抽選
+  started_at: '2026-04-13'
+  expired_at: '2026-05-03'
+  status: 終了
+title: キャンペーン

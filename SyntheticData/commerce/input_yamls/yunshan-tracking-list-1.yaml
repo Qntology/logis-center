@@ -1,0 +1,83 @@
+page_id: yunshan-tracking-list-1
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/my/shipments?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '148167768001'
+  carrier: 飞燕快运
+  status: 已发货
+  title: 轻量露营椅
+  shipping_date: '2026-08-31'
+  recipient_name: 周静
+- id,link: '229389811173'
+  carrier: 云杉快递
+  status: 已签收
+  title: 双人圆顶帐篷
+  shipping_date: '2026-04-26'
+  recipient_name: 杨芳
+- id,link: '677625882099'
+  carrier: 云杉快递
+  status: 已发货
+  title: 维C精华液
+  shipping_date: '2026-04-05'
+  recipient_name: 杨磊
+- id,link: '536639637574'
+  carrier: 青松速运
+  status: 已签收
+  title: 双人圆顶帐篷
+  shipping_date: '2026-05-31'
+  recipient_name: 杨宇轩
+- id,link: '775541733202'
+  carrier: 云杉快递
+  status: 已签收
+  title: 弱酸性洁面泡沫
+  shipping_date: '2026-04-16'
+  recipient_name: 周伟
+- id,link: '427640629113'
+  carrier: 飞燕快运
+  status: 已签收
+  title: 烘烤杏仁
+  shipping_date: '2026-05-25'
+  recipient_name: 杨婷
+- id,link: '487705207625'
+  carrier: 云杉快递
+  status: 已签收
+  title: 降噪无线耳机
+  shipping_date: '2026-07-29'
+  recipient_name: 王娜
+- id,link: '699478560193'
+  carrier: 白鹭物流
+  status: 已退货
+  title: 烘烤杏仁
+  shipping_date: '2026-07-29'
+  recipient_name: 黄婷
+- id,link: '348739916393'
+  carrier: 白鹭物流
+  status: 已发货
+  title: 充电LED营地灯
+  shipping_date: '2026-04-20'
+  recipient_name: 黄宇轩
+- id,link: '827556015900'
+  carrier: 飞燕快运
+  status: 已退货
+  title: 轻薄羽绒马甲
+  shipping_date: '2026-05-09'
+  recipient_name: 赵敏
+- id,link: '566565115552'
+  carrier: 飞燕快运
+  status: 已签收
+  title: 烘烤杏仁
+  shipping_date: '2026-07-05'
+  recipient_name: 周敏
+- id,link: '187761248942'
+  carrier: 青松速运
+  status: 已签收
+  title: 编程机器人套件
+  shipping_date: '2026-09-14'
+  recipient_name: 黄伟
+title: 发货列表

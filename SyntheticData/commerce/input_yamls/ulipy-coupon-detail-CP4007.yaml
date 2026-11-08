@@ -1,0 +1,21 @@
+page_id: ulipy-coupon-detail-CP4007
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/coupon/view?id=CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: ULI265
+  title: Jen tento víkend 1
+  type: Procentní sleva
+  discount: 5%
+  started_at: '2026-05-19'
+  expired_at: '2026-06-02'
+  status: Probíhá
+  quantity: 100
+  min_order_amount: 500
+title: Slevový kód

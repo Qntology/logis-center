@@ -1,0 +1,21 @@
+page_id: faro-coupon-detail-CP4007
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/coupons/CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: FAR401
+  title: Offerta esclusiva app 1
+  type: Percentuale
+  discount: 15%
+  started_at: '2026-04-01'
+  expired_at: '2026-04-15'
+  status: Attivo
+  quantity: 1000
+  min_order_amount: 20.7
+title: Codice sconto

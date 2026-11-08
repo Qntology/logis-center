@@ -1,0 +1,30 @@
+page_id: ulipy-tracking-detail-400828234978
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/shipping/view?id=400828234978
+page_type: tracking
+layout: detail
+fields:
+  id,link: '400828234978'
+  carrier: Morava náklad
+  status: Odesláno
+  title: Minerální opalovací krém
+  shipping_date: '2026-08-23'
+  recipient_name: Jan Kučera
+  registration_date: '2026-08-22'
+  sender_name: U Lípy obchodní s.r.o.
+  sender_address: Lipová 12, 110 00 Praha 1
+  sender_phone: +420 222 555 014
+  recipient_address: Školní 145, 779 00 Olomouc
+  recipient_phone: +420 776 128 453
+  weight: 6.3
+  width: 50
+  height: 22
+  length: 16
+  shipping_method: Nákladní doprava
+  shipping_duration: 3
+  shipping_fee: 0
+title: Detail zásilky

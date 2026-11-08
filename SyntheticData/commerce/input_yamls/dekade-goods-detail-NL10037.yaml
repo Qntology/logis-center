@@ -1,0 +1,31 @@
+page_id: dekade-goods-detail-NL10037
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/goods/view?id=NL10037
+page_type: goods
+layout: detail
+fields:
+  id,link: NL10037
+  title: Linnen overhemd met korte mouwen
+  status: Concept
+  category: Kleding
+  sale_price: 29.4
+  compare_at_price: 35.28
+  quantity: 96
+  registration_date: '2026-01-25'
+  brand_name: Oakfern
+  code: NL-HOT-101
+  stock_keeping_unit: NLHO1001
+  model_name: HO-841
+  manufacturer: 다온랩스
+  origin_country: Polen
+  color: Antraciet
+  barcode: '8814053110342'
+  supply_price: 19.26
+  low_stock_threshold: 10
+  shipping_fee: 2.05
+  description: Ademend linnen dat niet plakt als je zweet.
+title: Productgegevens

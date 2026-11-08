@@ -1,0 +1,140 @@
+page_id: lindenhof-order-list-2
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/order/list?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20260728-100689
+  registration_date: '2026-07-28'
+  status: Zugestellt
+  goods: Leichter Campingstuhl
+  tracking_number: '802171983974'
+  sender_name: Hannah Schneider
+  recipient_name: Hannah Schneider
+  quantity: 1
+  amount: 29.3
+  shipping_fee: 2.05
+  payment_method: Kreditkarte
+- id,link: 20260602-100742
+  registration_date: '2026-06-02'
+  status: Bezahlt
+  goods: Mineralische Sonnencreme
+  sender_name: Hannah Neumann
+  recipient_name: Marie Schulz
+  quantity: 8
+  amount: 191.8
+  shipping_fee: 0.0
+  payment_method: Kreditkarte
+- id,link: 20260721-100795
+  registration_date: '2026-07-21'
+  status: Unterwegs
+  goods: Hypoallergenes Trockenfutter
+  tracking_number: '340030207536'
+  sender_name: Marie Becker
+  recipient_name: Marie Becker
+  quantity: 2
+  amount: 41.94
+  shipping_fee: 0.0
+  payment_method: Überweisung
+- id,link: 20260612-100848
+  registration_date: '2026-06-12'
+  status: Unterwegs
+  goods: Transporttasche für Haustiere
+  tracking_number: '395491810511'
+  sender_name: Jonas Braun
+  recipient_name: Hannah Neumann
+  quantity: 3
+  amount: 77.0
+  shipping_fee: 0.0
+  payment_method: Kreditkarte
+- id,link: 20260923-100901
+  registration_date: '2026-09-23'
+  status: Zurückgesendet
+  goods: Kuppelzelt für zwei Personen
+  tracking_number: '372080525796'
+  sender_name: Jonas Richter
+  recipient_name: Paul Wagner
+  quantity: 2
+  amount: 186.3
+  shipping_fee: 0.0
+  payment_method: Überweisung
+- id,link: 20260517-100954
+  registration_date: '2026-05-17'
+  status: Zugestellt
+  goods: Ergonomische Vertikalmaus
+  tracking_number: '195286810252'
+  sender_name: Clara Braun
+  recipient_name: Felix Schulz
+  quantity: 3
+  amount: 82.35
+  shipping_fee: 0.0
+  payment_method: Überweisung
+- id,link: 20260928-101007
+  registration_date: '2026-09-28'
+  status: Unterwegs
+  goods: Tragbares Kochgeschirr-Set
+  tracking_number: '771602916348'
+  sender_name: Marie Wagner
+  recipient_name: Leon Hoffmann
+  quantity: 2
+  amount: 44.6
+  shipping_fee: 0.0
+  payment_method: Kreditkarte
+- id,link: 20260430-101060
+  registration_date: '2026-04-30'
+  status: Zugestellt
+  goods: Silikon-Küchenhelfer-Set
+  tracking_number: '624666179356'
+  sender_name: Felix Wagner
+  recipient_name: Felix Wagner
+  quantity: 1
+  amount: 21.2
+  shipping_fee: 2.05
+  payment_method: Überweisung
+- id,link: 20260811-101113
+  registration_date: '2026-08-11'
+  status: In Bearbeitung
+  goods: Monitorerhöhung
+  sender_name: Sophie Schneider
+  recipient_name: Jonas Becker
+  quantity: 2
+  amount: 53.0
+  shipping_fee: 0.0
+  payment_method: Überweisung
+- id,link: 20260402-101166
+  registration_date: '2026-04-02'
+  status: Zurückgesendet
+  goods: USB-C-Multiport-Hub
+  tracking_number: '172007067867'
+  sender_name: Emil Schulz
+  recipient_name: Emil Schulz
+  quantity: 5
+  amount: 121.95
+  shipping_fee: 0.0
+  payment_method: Überweisung
+- id,link: 20260517-101219
+  registration_date: '2026-05-17'
+  status: In Bearbeitung
+  goods: Aufladbarer Handwärmer
+  sender_name: Paul Schulz
+  recipient_name: Paul Schulz
+  quantity: 4
+  amount: 55.3
+  shipping_fee: 0.0
+  payment_method: Überweisung
+- id,link: 20260808-101272
+  registration_date: '2026-08-08'
+  status: Zugestellt
+  goods: Cold-Brew-Konzentrat
+  tracking_number: '540539657243'
+  sender_name: Anna Hoffmann
+  recipient_name: Anna Hoffmann
+  quantity: 4
+  amount: 82.49
+  shipping_fee: 0.0
+  payment_method: Überweisung
+title: Bestellungen

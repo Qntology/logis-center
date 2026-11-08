@@ -1,0 +1,83 @@
+page_id: alameda-tracking-list-1
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/shipments?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '894459860597'
+  carrier: Paquetería Veloz
+  status: Enviado
+  title: Bloques de construcción de madera
+  shipping_date: '2026-05-31'
+  recipient_name: Álvaro Moreno
+- id,link: '695952291446'
+  carrier: Envíos Brisa
+  status: Entregado
+  title: Ratón vertical ergonómico
+  shipping_date: '2026-09-19'
+  recipient_name: Elena Torres
+- id,link: '645838296899'
+  carrier: Envíos Brisa
+  status: Entregado
+  title: Zumo de mandarina de Jeju
+  shipping_date: '2026-08-06'
+  recipient_name: Mateo Sánchez
+- id,link: '114354088541'
+  carrier: Rutas del Sur
+  status: Entregado
+  title: Rascador para gatos
+  shipping_date: '2026-05-05'
+  recipient_name: Carmen Moreno
+- id,link: '886083831935'
+  carrier: Rutas del Sur
+  status: Entregado
+  title: Bastones de trekking plegables
+  shipping_date: '2026-08-10'
+  recipient_name: Sofía Torres
+- id,link: '662499719297'
+  carrier: Paquetería Veloz
+  status: Enviado
+  title: Esterilla refrescante de gel
+  shipping_date: '2026-09-20'
+  recipient_name: Paula López
+- id,link: '608254314982'
+  carrier: Correo Ágil
+  status: Devuelto
+  title: Manta de microfibra
+  shipping_date: '2026-08-19'
+  recipient_name: Martina Moreno
+- id,link: '939211234506'
+  carrier: Correo Ágil
+  status: Entregado
+  title: Bloques de construcción de madera
+  shipping_date: '2026-08-26'
+  recipient_name: Carmen Torres
+- id,link: '646254842893'
+  carrier: Correo Ágil
+  status: Entregado
+  title: Esterilla refrescante de gel
+  shipping_date: '2026-06-26'
+  recipient_name: Diego Torres
+- id,link: '538226403596'
+  carrier: Envíos Brisa
+  status: Entregado
+  title: Elevador para monitor
+  shipping_date: '2026-06-13'
+  recipient_name: Martina Navarro
+- id,link: '987797516600'
+  carrier: Envíos Brisa
+  status: Entregado
+  title: Cuaderno para colorear
+  shipping_date: '2026-07-07'
+  recipient_name: Álvaro Torres
+- id,link: '323086276054'
+  carrier: Correo Ágil
+  status: Entregado
+  title: Comedero automático
+  shipping_date: '2026-08-16'
+  recipient_name: Martina Torres
+title: Envíos

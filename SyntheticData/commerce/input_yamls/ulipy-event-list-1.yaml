@@ -1,0 +1,47 @@
+page_id: ulipy-event-list-1
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/event/list?page=1
+page_type: event
+layout: list
+items:
+- id,link: EV303
+  title: Jarní výlet
+  type: Soutěž
+  started_at: '2026-08-03'
+  expired_at: '2026-08-23'
+  status: Ukončeno
+- id,link: EV306
+  title: Příprava na letní prázdniny
+  type: Testování
+  started_at: '2026-06-04'
+  expired_at: '2026-06-14'
+  status: Probíhá
+- id,link: EV309
+  title: Dárkový průvodce na dožínky
+  type: Testování
+  started_at: '2026-09-28'
+  expired_at: '2026-10-18'
+  status: Ukončeno
+- id,link: EV312
+  title: Oslava konce roku
+  type: Testování
+  started_at: '2026-08-25'
+  expired_at: '2026-10-09'
+  status: Ukončeno
+- id,link: EV315
+  title: Testování novinek
+  type: Výloha
+  started_at: '2026-09-18'
+  expired_at: '2026-09-28'
+  status: Probíhá
+- id,link: EV318
+  title: Soutěž o nejlepší recenzi
+  type: Testování
+  started_at: '2026-06-30'
+  expired_at: '2026-07-10'
+  status: Ukončeno
+title: Kampaně

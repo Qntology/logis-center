@@ -1,0 +1,29 @@
+page_id: dekade-order-detail-20260502-100053
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/order/view?id=20260502-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260502-100053
+  registration_date: '2026-05-02'
+  status: Verzonden
+  goods: Lichte bodywarmer
+  tracking_number: '173660812230'
+  sender_name: Emma Jansen
+  recipient_name: Emma Jansen
+  quantity: 5
+  amount: 159.55
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+  sender_phone: +31 6 5924 8497
+  sender_address: Stationsweg 135, 3011 AD Rotterdam
+  recipient_phone: +31 6 5924 8497
+  recipient_address: Stationsweg 135, 3011 AD Rotterdam
+  payment_origin: PayPolder
+  payment_date: '2026-05-02'
+  bank: Kadebank
+title: Bestelgegevens

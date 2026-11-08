@@ -1,0 +1,112 @@
+page_id: ulipy-goods-list-2
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/goods/list?page=2
+page_type: goods
+layout: list
+items:
+- id,link: CZ10481
+  title: Ergonomická vertikální myš
+  status: V prodeji
+  category: Elektronika
+  sale_price: 780
+  compare_at_price: 936
+  quantity: 7
+  registration_date: '2026-02-19'
+  brand_name: Tidewell
+- id,link: CZ10518
+  title: Iglú stan pro dvě osoby
+  status: Koncept
+  category: Outdoor
+  sale_price: 2330
+  quantity: 96
+  registration_date: '2026-03-02'
+  brand_name: Kestrel Lane
+- id,link: CZ10555
+  title: Bio granola
+  status: V prodeji
+  category: Potraviny
+  sale_price: 250
+  quantity: 42
+  registration_date: '2026-05-28'
+  brand_name: 마루공방
+- id,link: CZ10592
+  title: Lehká prošívaná vesta
+  status: Vyprodáno
+  category: Oblečení
+  sale_price: 1140
+  quantity: 0
+  registration_date: '2026-08-15'
+  brand_name: 마루공방
+- id,link: CZ10629
+  title: Proteinová tyčinka s nízkým obsahem cukru
+  status: Koncept
+  category: Potraviny
+  sale_price: 350
+  compare_at_price: 420
+  quantity: 3
+  registration_date: '2026-07-14'
+  brand_name: Marlow & Finch
+- id,link: CZ10666
+  title: Podstavec pod monitor
+  status: V prodeji
+  category: Kancelář
+  sale_price: 590
+  quantity: 120
+  registration_date: '2026-02-14'
+  brand_name: 솔빛
+- id,link: CZ10703
+  title: Ruční mini ventilátor
+  status: Koncept
+  category: Spotřebiče
+  sale_price: 310
+  quantity: 120
+  registration_date: '2026-07-18'
+  brand_name: 마루공방
+- id,link: CZ10740
+  title: Přepravní taška pro mazlíčky
+  status: Koncept
+  category: Mazlíčci
+  sale_price: 790
+  compare_at_price: 948
+  quantity: 7
+  registration_date: '2026-06-10'
+  brand_name: Oakfern
+- id,link: CZ10777
+  title: Kartáč na srst
+  status: Koncept
+  category: Mazlíčci
+  sale_price: 240
+  quantity: 7
+  registration_date: '2026-03-17'
+  brand_name: 다온랩
+- id,link: CZ10814
+  title: Dřevěné stavebnicové kostky
+  status: Vyprodáno
+  category: Hračky
+  sale_price: 700
+  compare_at_price: 840
+  quantity: 0
+  registration_date: '2026-03-11'
+  brand_name: 솔빛
+- id,link: CZ10851
+  title: Minerální opalovací krém
+  status: V prodeji
+  category: Kosmetika
+  sale_price: 430
+  compare_at_price: 516
+  quantity: 7
+  registration_date: '2026-08-14'
+  brand_name: 하람
+- id,link: CZ10888
+  title: Mikina na zip s fleecovou podšívkou
+  status: V prodeji
+  category: Oblečení
+  sale_price: 790
+  quantity: 96
+  registration_date: '2026-02-28'
+  brand_name: 마루공방
+title: Produkty

@@ -1,0 +1,29 @@
+page_id: alwaha-order-detail-20260723-100212
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/orders/20260723-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260723-100212
+  registration_date: '2026-07-23'
+  status: تم التوصيل
+  goods: سيروم إصلاح الشعر
+  tracking_number: '886468616431'
+  sender_name: ريم العنزي
+  recipient_name: هند القحطاني
+  quantity: 5
+  amount: 234.23
+  shipping_fee: 0.0
+  payment_method: بطاقة ائتمان
+  sender_phone: +966 57 304 9798
+  sender_address: شارع الياسمين 128، مكة المكرمة 24231
+  recipient_phone: +966 59 869 9872
+  recipient_address: شارع الندى 126، جدة 21442
+  payment_origin: باي النخيل
+  payment_date: '2026-07-23'
+  card: بطاقة الواحة
+title: تفاصيل الطلب

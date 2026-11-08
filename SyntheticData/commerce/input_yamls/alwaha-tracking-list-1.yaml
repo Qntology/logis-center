@@ -1,0 +1,83 @@
+page_id: alwaha-tracking-list-1
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/shipments?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '481102287050'
+  carrier: ناقل الكثبان
+  status: تم التوصيل
+  title: موزع USB-C متعدد المنافذ
+  shipping_date: '2026-06-02'
+  recipient_name: عبدالله الزهراني
+- id,link: '612860245088'
+  carrier: بريد النخيل السريع
+  status: تم الشحن
+  title: فأرة عمودية مريحة
+  shipping_date: '2026-05-07'
+  recipient_name: سلطان الحربي
+- id,link: '886468616431'
+  carrier: توصيل السراب
+  status: تم التوصيل
+  title: سيروم إصلاح الشعر
+  shipping_date: '2026-07-24'
+  recipient_name: هند القحطاني
+- id,link: '407509526790'
+  carrier: ناقل الكثبان
+  status: تم الشحن
+  title: سيروم إصلاح الشعر
+  shipping_date: '2026-05-01'
+  recipient_name: عبدالله المطيري
+- id,link: '855188322504'
+  carrier: شحن الواحة
+  status: تم التوصيل
+  title: لوز محمص
+  shipping_date: '2026-05-14'
+  recipient_name: سلطان المطيري
+- id,link: '745565994216'
+  carrier: شحن الواحة
+  status: مرتجع
+  title: طعام جاف مضاد للحساسية
+  shipping_date: '2026-07-02'
+  recipient_name: سلطان الغامدي
+- id,link: '994766072500'
+  carrier: توصيل السراب
+  status: تم التوصيل
+  title: لوحة مفاتيح ميكانيكية صامتة
+  shipping_date: '2026-09-04'
+  recipient_name: لمى الشمري
+- id,link: '512369266957'
+  carrier: توصيل السراب
+  status: تم الشحن
+  title: مدفأة يد قابلة لإعادة الشحن
+  shipping_date: '2026-07-19'
+  recipient_name: عبدالله الحربي
+- id,link: '271611447605'
+  carrier: شحن الواحة
+  status: تم التوصيل
+  title: سوار لياقة ذكي
+  shipping_date: '2026-07-15'
+  recipient_name: ريم الغامدي
+- id,link: '793273036706'
+  carrier: توصيل السراب
+  status: تم التوصيل
+  title: خلاط يدوي غاطس
+  shipping_date: '2026-10-04'
+  recipient_name: لمى المطيري
+- id,link: '972974430596'
+  carrier: بريد النخيل السريع
+  status: مرتجع
+  title: طقم حافظات زجاجية محكمة الإغلاق
+  shipping_date: '2026-05-29'
+  recipient_name: خالد المطيري
+- id,link: '446089182612'
+  carrier: ناقل الكثبان
+  status: مرتجع
+  title: لوشن جسم خالٍ من العطور
+  shipping_date: '2026-04-09'
+  recipient_name: فيصل الحربي
+title: الشحنات

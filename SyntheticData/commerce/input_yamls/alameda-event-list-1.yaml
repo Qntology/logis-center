@@ -1,0 +1,47 @@
+page_id: alameda-event-list-1
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/events?page=1
+page_type: event
+layout: list
+items:
+- id,link: EV303
+  title: Paseo de primavera
+  type: Probadores
+  started_at: '2026-04-15'
+  expired_at: '2026-04-25'
+  status: En curso
+- id,link: EV306
+  title: Escapada de verano
+  type: Probadores
+  started_at: '2026-08-23'
+  expired_at: '2026-10-07'
+  status: En curso
+- id,link: EV309
+  title: Guía de regalos de la cosecha
+  type: Sorteo
+  started_at: '2026-02-08'
+  expired_at: '2026-02-28'
+  status: Finalizado
+- id,link: EV312
+  title: Celebración de fin de año
+  type: Probadores
+  started_at: '2026-04-09'
+  expired_at: '2026-04-19'
+  status: En curso
+- id,link: EV315
+  title: Programa de probadores de novedades
+  type: Probadores
+  started_at: '2026-08-24'
+  expired_at: '2026-10-08'
+  status: En curso
+- id,link: EV318
+  title: Concurso a la mejor reseña
+  type: Sorteo
+  started_at: '2026-07-17'
+  expired_at: '2026-08-06'
+  status: En curso
+title: Campañas

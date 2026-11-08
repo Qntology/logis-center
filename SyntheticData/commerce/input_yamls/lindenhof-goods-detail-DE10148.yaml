@@ -1,0 +1,30 @@
+page_id: lindenhof-goods-detail-DE10148
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/goods/view?id=DE10148
+page_type: goods
+layout: detail
+fields:
+  id,link: DE10148
+  title: Mikrofaser-Kuscheldecke
+  status: Aktiv
+  category: Wohnen
+  sale_price: 17.6
+  quantity: 350
+  registration_date: '2026-04-17'
+  brand_name: 마루공방
+  code: DE-COL-104
+  stock_keeping_unit: DECO1004
+  model_name: CO-681
+  manufacturer: 하람제작소
+  origin_country: Malaysia
+  color: Anthrazit
+  barcode: '8850504006625'
+  supply_price: 10.88
+  low_stock_threshold: 10
+  shipping_fee: 2.05
+  description: Dichte Mikrofaser, die sich in Minuten gemütlich anfühlt.
+title: Produktdetails

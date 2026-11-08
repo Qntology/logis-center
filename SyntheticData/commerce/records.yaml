@@ -4385,3 +4385,7354 @@
   date: '2026-09-04'
   carrier: Harbor Courier
   order_id: 20260901-101855
+- key: lindenhof:goods:DE10037
+  shop: lindenhof
+  type: goods
+  id: DE10037
+  title: Parfümfreie Bodylotion
+  concept: skincare
+  status: Aktiv
+  price: 11.25
+  date: '2026-01-08'
+- key: lindenhof:goods:DE10074
+  shop: lindenhof
+  type: goods
+  id: DE10074
+  title: Ergonomische Vertikalmaus
+  concept: desk_work
+  status: Aktiv
+  price: 27.45
+  date: '2026-01-06'
+- key: lindenhof:goods:DE10111
+  shop: lindenhof
+  type: goods
+  id: DE10111
+  title: Proteinriegel mit wenig Zucker
+  concept: snack_food
+  status: Ausverkauft
+  price: 15.5
+  date: '2026-08-10'
+- key: lindenhof:goods:DE10148
+  shop: lindenhof
+  type: goods
+  id: DE10148
+  title: Mikrofaser-Kuscheldecke
+  concept: cold_weather
+  status: Aktiv
+  price: 17.6
+  date: '2026-04-17'
+- key: lindenhof:goods:DE10185
+  shop: lindenhof
+  type: goods
+  id: DE10185
+  title: Hypoallergenes Trockenfutter
+  concept: pet
+  status: Ausverkauft
+  price: 23.3
+  date: '2026-08-01'
+- key: lindenhof:goods:DE10222
+  shop: lindenhof
+  type: goods
+  id: DE10222
+  title: Kindergeschirr-Set
+  concept: kids
+  status: Ausverkauft
+  price: 20.0
+  date: '2026-07-11'
+- key: lindenhof:goods:DE10259
+  shop: lindenhof
+  type: goods
+  id: DE10259
+  title: Kuppelzelt für zwei Personen
+  concept: outdoor
+  status: Aktiv
+  price: 93.15
+  date: '2026-08-25'
+- key: lindenhof:goods:DE10296
+  shop: lindenhof
+  type: goods
+  id: DE10296
+  title: Mineralische Sonnencreme
+  concept: skincare
+  status: Aktiv
+  price: 16.35
+  date: '2026-03-01'
+- key: lindenhof:goods:DE10333
+  shop: lindenhof
+  type: goods
+  id: DE10333
+  title: Edelstahl-Bratpfanne
+  concept: cooking
+  status: Aktiv
+  price: 38.95
+  date: '2026-07-12'
+- key: lindenhof:goods:DE10370
+  shop: lindenhof
+  type: goods
+  id: DE10370
+  title: Geröstete Naturreis-Chips
+  concept: snack_food
+  status: Ausverkauft
+  price: 8.2
+  date: '2026-04-03'
+- key: lindenhof:goods:DE10407
+  shop: lindenhof
+  type: goods
+  id: DE10407
+  title: Vitamin-C-Serum
+  concept: skincare
+  status: Entwurf
+  price: 26.55
+  date: '2026-06-08'
+- key: lindenhof:goods:DE10444
+  shop: lindenhof
+  type: goods
+  id: DE10444
+  title: Smartes Fitnessarmband
+  concept: audio_power
+  status: Ausverkauft
+  price: 32.6
+  date: '2026-03-28'
+- key: lindenhof:goods:DE10481
+  shop: lindenhof
+  type: goods
+  id: DE10481
+  title: Kühlgel-Matte
+  concept: hot_weather
+  status: Aktiv
+  price: 27.25
+  date: '2026-07-28'
+- key: lindenhof:goods:DE10518
+  shop: lindenhof
+  type: goods
+  id: DE10518
+  title: Holzbausteine
+  concept: kids
+  status: Aktiv
+  price: 28.9
+  date: '2026-07-25'
+- key: lindenhof:goods:DE10555
+  shop: lindenhof
+  type: goods
+  id: DE10555
+  title: Silikon-Küchenhelfer-Set
+  concept: cooking
+  status: Aktiv
+  price: 19.15
+  date: '2026-01-18'
+- key: lindenhof:goods:DE10592
+  shop: lindenhof
+  type: goods
+  id: DE10592
+  title: Kratzsäule für Katzen
+  concept: pet
+  status: Ausverkauft
+  price: 12.95
+  date: '2026-06-07'
+- key: lindenhof:goods:DE10629
+  shop: lindenhof
+  type: goods
+  id: DE10629
+  title: Programmierroboter-Set
+  concept: kids
+  status: Aktiv
+  price: 57.4
+  date: '2026-05-15'
+- key: lindenhof:goods:DE10666
+  shop: lindenhof
+  type: goods
+  id: DE10666
+  title: Luftdichtes Glasbehälter-Set
+  concept: cooking
+  status: Aktiv
+  price: 24.4
+  date: '2026-05-21'
+- key: lindenhof:goods:DE10703
+  shop: lindenhof
+  type: goods
+  id: DE10703
+  title: Leichter Campingstuhl
+  concept: outdoor
+  status: Entwurf
+  price: 27.25
+  date: '2026-06-19'
+- key: lindenhof:goods:DE10740
+  shop: lindenhof
+  type: goods
+  id: DE10740
+  title: Sherpa-Fleecejacke
+  concept: cold_weather
+  status: Aktiv
+  price: 39.05
+  date: '2026-09-09'
+- key: lindenhof:goods:DE10777
+  shop: lindenhof
+  type: goods
+  id: DE10777
+  title: Hundegeschirr
+  concept: pet
+  status: Aktiv
+  price: 16.75
+  date: '2026-01-12'
+- key: lindenhof:goods:DE10814
+  shop: lindenhof
+  type: goods
+  id: DE10814
+  title: Geröstete Mandeln
+  concept: snack_food
+  status: Aktiv
+  price: 8.2
+  date: '2026-01-22'
+- key: lindenhof:goods:DE10851
+  shop: lindenhof
+  type: goods
+  id: DE10851
+  title: Wasserdichter Bluetooth-Lautsprecher
+  concept: audio_power
+  status: Aktiv
+  price: 38.55
+  date: '2026-06-09'
+- key: lindenhof:goods:DE10888
+  shop: lindenhof
+  type: goods
+  id: DE10888
+  title: Fellpflegebürste
+  concept: pet
+  status: Ausverkauft
+  price: 9.6
+  date: '2026-05-24'
+- key: lindenhof:order:20260726-100053
+  shop: lindenhof
+  type: order
+  id: 20260726-100053
+  title: Wasserkocher mit Temperaturwahl
+  status: Storniert
+  amount: 174.42
+  date: '2026-07-26'
+  buyer: Clara Richter
+  tracking: null
+  goods_ids:
+  - DE11147
+  - DE10518
+- key: lindenhof:order:20260513-100106
+  shop: lindenhof
+  type: order
+  id: 20260513-100106
+  title: Holzbausteine
+  status: Zurückgesendet
+  amount: 144.5
+  date: '2026-05-13'
+  buyer: Lena Neumann
+  tracking: '440326034407'
+  goods_ids:
+  - DE10518
+- key: lindenhof:order:20260507-100159
+  shop: lindenhof
+  type: order
+  id: 20260507-100159
+  title: Fellpflegebürste
+  status: Bezahlt
+  amount: 88.95
+  date: '2026-05-07'
+  buyer: Anna Schneider
+  tracking: null
+  goods_ids:
+  - DE10888
+  - DE11073
+  - DE11406
+- key: lindenhof:order:20261003-100212
+  shop: lindenhof
+  type: order
+  id: 20261003-100212
+  title: Kurzarmhemd aus Leinen
+  status: Storniert
+  amount: 89.85
+  date: '2026-10-03'
+  buyer: Jonas Richter
+  tracking: null
+  goods_ids:
+  - DE11036
+- key: lindenhof:order:20260512-100265
+  shop: lindenhof
+  type: order
+  id: 20260512-100265
+  title: Smartes Fitnessarmband
+  status: Zahlung ausstehend
+  amount: 65.2
+  date: '2026-05-12'
+  buyer: Emil Becker
+  tracking: null
+  goods_ids:
+  - DE10444
+- key: lindenhof:order:20260620-100318
+  shop: lindenhof
+  type: order
+  id: 20260620-100318
+  title: Silikon-Küchenhelfer-Set
+  status: Bezahlt
+  amount: 90.81
+  date: '2026-06-20'
+  buyer: Anna Braun
+  tracking: null
+  goods_ids:
+  - DE10555
+  - DE10481
+- key: lindenhof:order:20260525-100371
+  shop: lindenhof
+  type: order
+  id: 20260525-100371
+  title: Kuppelzelt für zwei Personen
+  status: Zugestellt
+  amount: 130.2
+  date: '2026-05-25'
+  buyer: Sophie Wolf
+  tracking: '230582628986'
+  goods_ids:
+  - DE10259
+  - DE10074
+  - DE10888
+- key: lindenhof:order:20260706-100424
+  shop: lindenhof
+  type: order
+  id: 20260706-100424
+  title: Kindergeschirr-Set
+  status: Storniert
+  amount: 20.05
+  date: '2026-07-06'
+  buyer: Jonas Neumann
+  tracking: null
+  goods_ids:
+  - DE10222
+- key: lindenhof:order:20260403-100477
+  shop: lindenhof
+  type: order
+  id: 20260403-100477
+  title: Kratzsäule für Katzen
+  status: Bezahlt
+  amount: 15.0
+  date: '2026-04-03'
+  buyer: Lukas Hoffmann
+  tracking: null
+  goods_ids:
+  - DE10592
+- key: lindenhof:order:20260409-100530
+  shop: lindenhof
+  type: order
+  id: 20260409-100530
+  title: Wasserkocher mit Temperaturwahl
+  status: Zugestellt
+  amount: 71.4
+  date: '2026-04-09'
+  buyer: Clara Keller
+  tracking: '889306078818'
+  goods_ids:
+  - DE11147
+- key: lindenhof:order:20260901-100583
+  shop: lindenhof
+  type: order
+  id: 20260901-100583
+  title: 65-W-Schnellladegerät
+  status: Zahlung ausstehend
+  amount: 139.23
+  date: '2026-09-01'
+  buyer: Felix Braun
+  tracking: null
+  goods_ids:
+  - DE11443
+  - DE10111
+  - DE10370
+- key: lindenhof:order:20260411-100636
+  shop: lindenhof
+  type: order
+  id: 20260411-100636
+  title: Leichter Campingstuhl
+  status: Zugestellt
+  amount: 56.66
+  date: '2026-04-11'
+  buyer: Leon Schneider
+  tracking: '626436664173'
+  goods_ids:
+  - DE10703
+  - DE11147
+- key: lindenhof:order:20260728-100689
+  shop: lindenhof
+  type: order
+  id: 20260728-100689
+  title: Leichter Campingstuhl
+  status: Zugestellt
+  amount: 29.3
+  date: '2026-07-28'
+  buyer: Hannah Schneider
+  tracking: '802171983974'
+  goods_ids:
+  - DE10703
+- key: lindenhof:order:20260602-100742
+  shop: lindenhof
+  type: order
+  id: 20260602-100742
+  title: Mineralische Sonnencreme
+  status: Bezahlt
+  amount: 191.8
+  date: '2026-06-02'
+  buyer: Hannah Neumann
+  tracking: null
+  goods_ids:
+  - DE10296
+  - DE11258
+- key: lindenhof:order:20260721-100795
+  shop: lindenhof
+  type: order
+  id: 20260721-100795
+  title: Hypoallergenes Trockenfutter
+  status: Unterwegs
+  amount: 41.94
+  date: '2026-07-21'
+  buyer: Marie Becker
+  tracking: '340030207536'
+  goods_ids:
+  - DE10185
+- key: lindenhof:order:20260612-100848
+  shop: lindenhof
+  type: order
+  id: 20260612-100848
+  title: Transporttasche für Haustiere
+  status: Unterwegs
+  amount: 77.0
+  date: '2026-06-12'
+  buyer: Jonas Braun
+  tracking: '395491810511'
+  goods_ids:
+  - DE11073
+  - DE10148
+- key: lindenhof:order:20260923-100901
+  shop: lindenhof
+  type: order
+  id: 20260923-100901
+  title: Kuppelzelt für zwei Personen
+  status: Zurückgesendet
+  amount: 186.3
+  date: '2026-09-23'
+  buyer: Jonas Richter
+  tracking: '372080525796'
+  goods_ids:
+  - DE10259
+- key: lindenhof:order:20260517-100954
+  shop: lindenhof
+  type: order
+  id: 20260517-100954
+  title: Ergonomische Vertikalmaus
+  status: Zugestellt
+  amount: 82.35
+  date: '2026-05-17'
+  buyer: Clara Braun
+  tracking: '195286810252'
+  goods_ids:
+  - DE10074
+- key: lindenhof:order:20260928-101007
+  shop: lindenhof
+  type: order
+  id: 20260928-101007
+  title: Tragbares Kochgeschirr-Set
+  status: Unterwegs
+  amount: 44.6
+  date: '2026-09-28'
+  buyer: Marie Wagner
+  tracking: '771602916348'
+  goods_ids:
+  - DE11258
+  - DE11554
+- key: lindenhof:order:20260430-101060
+  shop: lindenhof
+  type: order
+  id: 20260430-101060
+  title: Silikon-Küchenhelfer-Set
+  status: Zugestellt
+  amount: 21.2
+  date: '2026-04-30'
+  buyer: Felix Wagner
+  tracking: '624666179356'
+  goods_ids:
+  - DE10555
+- key: lindenhof:order:20260811-101113
+  shop: lindenhof
+  type: order
+  id: 20260811-101113
+  title: Monitorerhöhung
+  status: In Bearbeitung
+  amount: 53.0
+  date: '2026-08-11'
+  buyer: Sophie Schneider
+  tracking: null
+  goods_ids:
+  - DE10999
+  - DE11036
+- key: lindenhof:order:20260402-101166
+  shop: lindenhof
+  type: order
+  id: 20260402-101166
+  title: USB-C-Multiport-Hub
+  status: Zurückgesendet
+  amount: 121.95
+  date: '2026-04-02'
+  buyer: Emil Schulz
+  tracking: '172007067867'
+  goods_ids:
+  - DE10925
+- key: lindenhof:order:20260517-101219
+  shop: lindenhof
+  type: order
+  id: 20260517-101219
+  title: Aufladbarer Handwärmer
+  status: In Bearbeitung
+  amount: 55.3
+  date: '2026-05-17'
+  buyer: Paul Schulz
+  tracking: null
+  goods_ids:
+  - DE11332
+  - DE10814
+- key: lindenhof:order:20260808-101272
+  shop: lindenhof
+  type: order
+  id: 20260808-101272
+  title: Cold-Brew-Konzentrat
+  status: Zugestellt
+  amount: 82.49
+  date: '2026-08-08'
+  buyer: Anna Hoffmann
+  tracking: '540539657243'
+  goods_ids:
+  - DE11406
+  - DE10925
+- key: lindenhof:tracking:440326034407
+  shop: lindenhof
+  type: tracking
+  id: '440326034407'
+  title: Holzbausteine
+  status: Zurückgesendet
+  date: '2026-05-15'
+  carrier: Kiefernexpress
+  order_id: 20260513-100106
+- key: lindenhof:tracking:230582628986
+  shop: lindenhof
+  type: tracking
+  id: '230582628986'
+  title: Kuppelzelt für zwei Personen
+  status: Zugestellt
+  date: '2026-05-28'
+  carrier: Rheinfracht
+  order_id: 20260525-100371
+- key: lindenhof:tracking:889306078818
+  shop: lindenhof
+  type: tracking
+  id: '889306078818'
+  title: Wasserkocher mit Temperaturwahl
+  status: Zugestellt
+  date: '2026-04-11'
+  carrier: Rheinfracht
+  order_id: 20260409-100530
+- key: lindenhof:tracking:626436664173
+  shop: lindenhof
+  type: tracking
+  id: '626436664173'
+  title: Leichter Campingstuhl
+  status: Zugestellt
+  date: '2026-04-13'
+  carrier: Rheinfracht
+  order_id: 20260411-100636
+- key: lindenhof:tracking:802171983974
+  shop: lindenhof
+  type: tracking
+  id: '802171983974'
+  title: Leichter Campingstuhl
+  status: Zugestellt
+  date: '2026-07-30'
+  carrier: Rheinfracht
+  order_id: 20260728-100689
+- key: lindenhof:tracking:340030207536
+  shop: lindenhof
+  type: tracking
+  id: '340030207536'
+  title: Hypoallergenes Trockenfutter
+  status: Unterwegs
+  date: '2026-07-22'
+  carrier: Blitzpaket
+  order_id: 20260721-100795
+- key: lindenhof:tracking:395491810511
+  shop: lindenhof
+  type: tracking
+  id: '395491810511'
+  title: Transporttasche für Haustiere
+  status: Unterwegs
+  date: '2026-06-13'
+  carrier: Nordkurier Logistik
+  order_id: 20260612-100848
+- key: lindenhof:tracking:372080525796
+  shop: lindenhof
+  type: tracking
+  id: '372080525796'
+  title: Kuppelzelt für zwei Personen
+  status: Zurückgesendet
+  date: '2026-09-27'
+  carrier: Rheinfracht
+  order_id: 20260923-100901
+- key: lindenhof:tracking:195286810252
+  shop: lindenhof
+  type: tracking
+  id: '195286810252'
+  title: Ergonomische Vertikalmaus
+  status: Zugestellt
+  date: '2026-05-18'
+  carrier: Blitzpaket
+  order_id: 20260517-100954
+- key: lindenhof:tracking:771602916348
+  shop: lindenhof
+  type: tracking
+  id: '771602916348'
+  title: Tragbares Kochgeschirr-Set
+  status: Unterwegs
+  date: '2026-10-02'
+  carrier: Nordkurier Logistik
+  order_id: 20260928-101007
+- key: lindenhof:tracking:624666179356
+  shop: lindenhof
+  type: tracking
+  id: '624666179356'
+  title: Silikon-Küchenhelfer-Set
+  status: Zugestellt
+  date: '2026-05-02'
+  carrier: Rheinfracht
+  order_id: 20260430-101060
+- key: lindenhof:tracking:172007067867
+  shop: lindenhof
+  type: tracking
+  id: '172007067867'
+  title: USB-C-Multiport-Hub
+  status: Zurückgesendet
+  date: '2026-04-04'
+  carrier: Nordkurier Logistik
+  order_id: 20260402-101166
+- key: lindenhof:tracking:540539657243
+  shop: lindenhof
+  type: tracking
+  id: '540539657243'
+  title: Cold-Brew-Konzentrat
+  status: Zugestellt
+  date: '2026-08-10'
+  carrier: Kiefernexpress
+  order_id: 20260808-101272
+- key: lindenhof:tracking:733671615506
+  shop: lindenhof
+  type: tracking
+  id: '733671615506'
+  title: Transporttasche für Haustiere
+  status: Zugestellt
+  date: '2026-08-21'
+  carrier: Kiefernexpress
+  order_id: 20260819-101325
+- key: lindenhof:tracking:198060551822
+  shop: lindenhof
+  type: tracking
+  id: '198060551822'
+  title: Hundegeschirr
+  status: Zurückgesendet
+  date: '2026-07-01'
+  carrier: Rheinfracht
+  order_id: 20260630-101378
+- key: lindenhof:tracking:296101417557
+  shop: lindenhof
+  type: tracking
+  id: '296101417557'
+  title: Proteinriegel mit wenig Zucker
+  status: Unterwegs
+  date: '2026-10-14'
+  carrier: Nordkurier Logistik
+  order_id: 20261013-101431
+- key: lindenhof:tracking:515295661252
+  shop: lindenhof
+  type: tracking
+  id: '515295661252'
+  title: Faltbare Trekkingstöcke
+  status: Zugestellt
+  date: '2026-07-13'
+  carrier: Kiefernexpress
+  order_id: 20260711-101537
+- key: lindenhof:tracking:432123660780
+  shop: lindenhof
+  type: tracking
+  id: '432123660780'
+  title: Mineralische Sonnencreme
+  status: Unterwegs
+  date: '2026-06-30'
+  carrier: Nordkurier Logistik
+  order_id: 20260628-101590
+- key: lindenhof:tracking:669168731552
+  shop: lindenhof
+  type: tracking
+  id: '669168731552'
+  title: Mikrofaser-Kuscheldecke
+  status: Zugestellt
+  date: '2026-05-03'
+  carrier: Nordkurier Logistik
+  order_id: 20260502-101696
+- key: lindenhof:tracking:238791797118
+  shop: lindenhof
+  type: tracking
+  id: '238791797118'
+  title: Parfümfreie Bodylotion
+  status: Zugestellt
+  date: '2026-06-10'
+  carrier: Kiefernexpress
+  order_id: 20260608-101749
+- key: lindenhof:tracking:306304270433
+  shop: lindenhof
+  type: tracking
+  id: '306304270433'
+  title: Aufladbarer Handwärmer
+  status: Unterwegs
+  date: '2026-07-04'
+  carrier: Kiefernexpress
+  order_id: 20260701-101802
+- key: lindenhof:tracking:695305814678
+  shop: lindenhof
+  type: tracking
+  id: '695305814678'
+  title: Mini-Handventilator
+  status: Zurückgesendet
+  date: '2026-05-10'
+  carrier: Blitzpaket
+  order_id: 20260509-101908
+- key: lindenhof:tracking:796408461698
+  shop: lindenhof
+  type: tracking
+  id: '796408461698'
+  title: Geröstete Mandeln
+  status: Zugestellt
+  date: '2026-07-24'
+  carrier: Blitzpaket
+  order_id: 20260723-102067
+- key: lindenhof:tracking:910839281992
+  shop: lindenhof
+  type: tracking
+  id: '910839281992'
+  title: Transporttasche für Haustiere
+  status: Unterwegs
+  date: '2026-05-30'
+  carrier: Rheinfracht
+  order_id: 20260529-102120
+- key: alameda:goods:ES10037
+  shop: alameda
+  type: goods
+  id: ES10037
+  title: Auriculares inalámbricos con cancelación de ruido
+  concept: audio_power
+  status: Activo
+  price: 89.25
+  date: '2026-07-20'
+- key: alameda:goods:ES10074
+  shop: alameda
+  type: goods
+  id: ES10074
+  title: Caja organizadora de cables
+  concept: desk_work
+  status: Borrador
+  price: 10.85
+  date: '2026-04-24'
+- key: alameda:goods:ES10111
+  shop: alameda
+  type: goods
+  id: ES10111
+  title: Juego de cocina portátil
+  concept: outdoor
+  status: Borrador
+  price: 29.1
+  date: '2026-06-21'
+- key: alameda:goods:ES10148
+  shop: alameda
+  type: goods
+  id: ES10148
+  title: Calentador de manos recargable
+  concept: cold_weather
+  status: Activo
+  price: 16.75
+  date: '2026-04-19'
+- key: alameda:goods:ES10185
+  shop: alameda
+  type: goods
+  id: ES10185
+  title: Bastones de trekking plegables
+  concept: outdoor
+  status: Activo
+  price: 33.65
+  date: '2026-07-25'
+- key: alameda:goods:ES10222
+  shop: alameda
+  type: goods
+  id: ES10222
+  title: Sudadera con cremallera forrada de polar
+  concept: cold_weather
+  status: Borrador
+  price: 36.05
+  date: '2026-06-17'
+- key: alameda:goods:ES10259
+  shop: alameda
+  type: goods
+  id: ES10259
+  title: Manta de microfibra
+  concept: cold_weather
+  status: Activo
+  price: 16.05
+  date: '2026-07-11'
+- key: alameda:goods:ES10296
+  shop: alameda
+  type: goods
+  id: ES10296
+  title: Zumo de mandarina de Jeju
+  concept: snack_food
+  status: Activo
+  price: 11.85
+  date: '2026-03-14'
+- key: alameda:goods:ES10333
+  shop: alameda
+  type: goods
+  id: ES10333
+  title: Kit de robot de programación
+  concept: kids
+  status: Activo
+  price: 50.6
+  date: '2026-04-14'
+- key: alameda:goods:ES10370
+  shop: alameda
+  type: goods
+  id: ES10370
+  title: Vaso térmico al vacío
+  concept: outdoor
+  status: Borrador
+  price: 15.25
+  date: '2026-02-28'
+- key: alameda:goods:ES10407
+  shop: alameda
+  type: goods
+  id: ES10407
+  title: Arnés para perro
+  concept: pet
+  status: Activo
+  price: 16.05
+  date: '2026-02-07'
+- key: alameda:goods:ES10444
+  shop: alameda
+  type: goods
+  id: ES10444
+  title: Juego de recipientes herméticos de vidrio
+  concept: cooking
+  status: Activo
+  price: 21.25
+  date: '2026-08-18'
+- key: alameda:goods:ES10481
+  shop: alameda
+  type: goods
+  id: ES10481
+  title: Elevador para monitor
+  concept: desk_work
+  status: Borrador
+  price: 26.75
+  date: '2026-01-15'
+- key: alameda:goods:ES10518
+  shop: alameda
+  type: goods
+  id: ES10518
+  title: Cuchillo de cocinero de cerámica
+  concept: cooking
+  status: Activo
+  price: 26.95
+  date: '2026-01-05'
+- key: alameda:goods:ES10555
+  shop: alameda
+  type: goods
+  id: ES10555
+  title: Concentrado de café cold brew
+  concept: snack_food
+  status: Activo
+  price: 10.3
+  date: '2026-02-17'
+- key: alameda:goods:ES10592
+  shop: alameda
+  type: goods
+  id: ES10592
+  title: Ratón vertical ergonómico
+  concept: desk_work
+  status: Activo
+  price: 29.1
+  date: '2026-01-21'
+- key: alameda:goods:ES10629
+  shop: alameda
+  type: goods
+  id: ES10629
+  title: Pulsera de actividad inteligente
+  concept: audio_power
+  status: Borrador
+  price: 31.8
+  date: '2026-02-12'
+- key: alameda:goods:ES10666
+  shop: alameda
+  type: goods
+  id: ES10666
+  title: Banda refrescante para el cuello
+  concept: hot_weather
+  status: Activo
+  price: 8.95
+  date: '2026-01-19'
+- key: alameda:goods:ES10703
+  shop: alameda
+  type: goods
+  id: ES10703
+  title: Transportín para mascotas
+  concept: pet
+  status: Activo
+  price: 29.85
+  date: '2026-03-30'
+- key: alameda:goods:ES10740
+  shop: alameda
+  type: goods
+  id: ES10740
+  title: Miniventilador de mano
+  concept: hot_weather
+  status: Agotado
+  price: 12.9
+  date: '2026-04-11'
+- key: alameda:goods:ES10777
+  shop: alameda
+  type: goods
+  id: ES10777
+  title: Cuaderno para colorear
+  concept: kids
+  status: Agotado
+  price: 6.75
+  date: '2026-03-05'
+- key: alameda:goods:ES10814
+  shop: alameda
+  type: goods
+  id: ES10814
+  title: Sartén de acero inoxidable
+  concept: cooking
+  status: Agotado
+  price: 36.6
+  date: '2026-02-12'
+- key: alameda:goods:ES10851
+  shop: alameda
+  type: goods
+  id: ES10851
+  title: Chaqueta de borreguillo
+  concept: cold_weather
+  status: Agotado
+  price: 38.15
+  date: '2026-06-24'
+- key: alameda:goods:ES10888
+  shop: alameda
+  type: goods
+  id: ES10888
+  title: Rascador para gatos
+  concept: pet
+  status: Activo
+  price: 12.15
+  date: '2026-03-05'
+- key: alameda:order:20260629-100053
+  shop: alameda
+  type: order
+  id: 20260629-100053
+  title: Ratón vertical ergonómico
+  status: En proceso
+  amount: 31.15
+  date: '2026-06-29'
+  buyer: Paula Ruiz
+  tracking: null
+  goods_ids:
+  - ES10592
+- key: alameda:order:20260529-100106
+  shop: alameda
+  type: order
+  id: 20260529-100106
+  title: Bloques de construcción de madera
+  status: Enviado
+  amount: 25.5
+  date: '2026-05-29'
+  buyer: Sofía García
+  tracking: '894459860597'
+  goods_ids:
+  - ES10962
+- key: alameda:order:20260416-100159
+  shop: alameda
+  type: order
+  id: 20260416-100159
+  title: Bloques de construcción de madera
+  status: Pendiente de pago
+  amount: 77.75
+  date: '2026-04-16'
+  buyer: Sofía Torres
+  tracking: null
+  goods_ids:
+  - ES10962
+  - ES11406
+  - ES11332
+- key: alameda:order:20260916-100212
+  shop: alameda
+  type: order
+  id: 20260916-100212
+  title: Ratón vertical ergonómico
+  status: Entregado
+  amount: 52.38
+  date: '2026-09-16'
+  buyer: Pablo Navarro
+  tracking: '695952291446'
+  goods_ids:
+  - ES10592
+- key: alameda:order:20260804-100265
+  shop: alameda
+  type: order
+  id: 20260804-100265
+  title: Zumo de mandarina de Jeju
+  status: Entregado
+  amount: 35.55
+  date: '2026-08-04'
+  buyer: Mateo Sánchez
+  tracking: '645838296899'
+  goods_ids:
+  - ES10296
+- key: alameda:order:20260816-100318
+  shop: alameda
+  type: order
+  id: 20260816-100318
+  title: Arnés para perro
+  status: Cancelado
+  amount: 92.3
+  date: '2026-08-16'
+  buyer: Pablo Ruiz
+  tracking: null
+  goods_ids:
+  - ES10407
+  - ES10370
+- key: alameda:order:20260504-100371
+  shop: alameda
+  type: order
+  id: 20260504-100371
+  title: Rascador para gatos
+  status: Entregado
+  amount: 23.92
+  date: '2026-05-04'
+  buyer: Carmen Moreno
+  tracking: '114354088541'
+  goods_ids:
+  - ES10888
+- key: alameda:order:20260807-100424
+  shop: alameda
+  type: order
+  id: 20260807-100424
+  title: Bastones de trekking plegables
+  status: Entregado
+  amount: 107.35
+  date: '2026-08-07'
+  buyer: Sofía Torres
+  tracking: '886083831935'
+  goods_ids:
+  - ES10185
+  - ES11221
+- key: alameda:order:20260919-100477
+  shop: alameda
+  type: order
+  id: 20260919-100477
+  title: Esterilla refrescante de gel
+  status: Enviado
+  amount: 37.45
+  date: '2026-09-19'
+  buyer: Paula García
+  tracking: '662499719297'
+  goods_ids:
+  - ES11332
+  - ES10074
+- key: alameda:order:20260817-100530
+  shop: alameda
+  type: order
+  id: 20260817-100530
+  title: Manta de microfibra
+  status: Devuelto
+  amount: 44.35
+  date: '2026-08-17'
+  buyer: Martina Moreno
+  tracking: '608254314982'
+  goods_ids:
+  - ES10259
+  - ES10999
+- key: alameda:order:20260703-100583
+  shop: alameda
+  type: order
+  id: 20260703-100583
+  title: Almendras tostadas
+  status: En proceso
+  amount: 29.2
+  date: '2026-07-03'
+  buyer: Pablo López
+  tracking: null
+  goods_ids:
+  - ES11369
+- key: alameda:order:20260822-100636
+  shop: alameda
+  type: order
+  id: 20260822-100636
+  title: Bloques de construcción de madera
+  status: Entregado
+  amount: 87.93
+  date: '2026-08-22'
+  buyer: Carmen Torres
+  tracking: '939211234506'
+  goods_ids:
+  - ES10962
+  - ES11443
+  - ES11073
+- key: alameda:order:20260830-100689
+  shop: alameda
+  type: order
+  id: 20260830-100689
+  title: Elevador para monitor
+  status: En proceso
+  amount: 70.74
+  date: '2026-08-30'
+  buyer: Paula Sánchez
+  tracking: null
+  goods_ids:
+  - ES10481
+  - ES11406
+- key: alameda:order:20260624-100742
+  shop: alameda
+  type: order
+  id: 20260624-100742
+  title: Esterilla refrescante de gel
+  status: Entregado
+  amount: 134.75
+  date: '2026-06-24'
+  buyer: Diego Torres
+  tracking: '646254842893'
+  goods_ids:
+  - ES11332
+  - ES10222
+- key: alameda:order:20260610-100795
+  shop: alameda
+  type: order
+  id: 20260610-100795
+  title: Elevador para monitor
+  status: Entregado
+  amount: 133.75
+  date: '2026-06-10'
+  buyer: Martina Navarro
+  tracking: '538226403596'
+  goods_ids:
+  - ES10481
+- key: alameda:order:20260612-100848
+  shop: alameda
+  type: order
+  id: 20260612-100848
+  title: Arnés para perro
+  status: En proceso
+  amount: 57.25
+  date: '2026-06-12'
+  buyer: Hugo López
+  tracking: null
+  goods_ids:
+  - ES10407
+  - ES11184
+- key: alameda:order:20260703-100901
+  shop: alameda
+  type: order
+  id: 20260703-100901
+  title: Cuaderno para colorear
+  status: Entregado
+  amount: 38.05
+  date: '2026-07-03'
+  buyer: Mateo Torres
+  tracking: '987797516600'
+  goods_ids:
+  - ES10777
+  - ES10259
+  - ES10370
+- key: alameda:order:20260609-100954
+  shop: alameda
+  type: order
+  id: 20260609-100954
+  title: Cuaderno para colorear
+  status: Cancelado
+  amount: 114.0
+  date: '2026-06-09'
+  buyer: Carmen López
+  tracking: null
+  goods_ids:
+  - ES10777
+  - ES10259
+- key: alameda:order:20260814-101007
+  shop: alameda
+  type: order
+  id: 20260814-101007
+  title: Comedero automático
+  status: Entregado
+  amount: 88.92
+  date: '2026-08-14'
+  buyer: Martina Torres
+  tracking: '323086276054'
+  goods_ids:
+  - ES11517
+- key: alameda:order:20260419-101060
+  shop: alameda
+  type: order
+  id: 20260419-101060
+  title: Ratón vertical ergonómico
+  status: En proceso
+  amount: 31.15
+  date: '2026-04-19'
+  buyer: Hugo Ruiz
+  tracking: null
+  goods_ids:
+  - ES10592
+- key: alameda:order:20260608-101113
+  shop: alameda
+  type: order
+  id: 20260608-101113
+  title: Sudadera con cremallera forrada de polar
+  status: Cancelado
+  amount: 72.1
+  date: '2026-06-08'
+  buyer: Daniel Navarro
+  tracking: null
+  goods_ids:
+  - ES10222
+- key: alameda:order:20260702-101166
+  shop: alameda
+  type: order
+  id: 20260702-101166
+  title: Elevador para monitor
+  status: Enviado
+  amount: 94.7
+  date: '2026-07-02'
+  buyer: Elena Ruiz
+  tracking: '769902159902'
+  goods_ids:
+  - ES10481
+  - ES11184
+- key: alameda:order:20260813-101219
+  shop: alameda
+  type: order
+  id: 20260813-101219
+  title: Silla de camping ligera
+  status: Enviado
+  amount: 88.15
+  date: '2026-08-13'
+  buyer: Elena Navarro
+  tracking: '285104724787'
+  goods_ids:
+  - ES10925
+  - ES11110
+  - ES11480
+- key: alameda:order:20260515-101272
+  shop: alameda
+  type: order
+  id: 20260515-101272
+  title: Almendras tostadas
+  status: Enviado
+  amount: 20.15
+  date: '2026-05-15'
+  buyer: Carmen López
+  tracking: '159147579628'
+  goods_ids:
+  - ES11369
+- key: alameda:tracking:894459860597
+  shop: alameda
+  type: tracking
+  id: '894459860597'
+  title: Bloques de construcción de madera
+  status: Enviado
+  date: '2026-05-31'
+  carrier: Paquetería Veloz
+  order_id: 20260529-100106
+- key: alameda:tracking:695952291446
+  shop: alameda
+  type: tracking
+  id: '695952291446'
+  title: Ratón vertical ergonómico
+  status: Entregado
+  date: '2026-09-19'
+  carrier: Envíos Brisa
+  order_id: 20260916-100212
+- key: alameda:tracking:645838296899
+  shop: alameda
+  type: tracking
+  id: '645838296899'
+  title: Zumo de mandarina de Jeju
+  status: Entregado
+  date: '2026-08-06'
+  carrier: Envíos Brisa
+  order_id: 20260804-100265
+- key: alameda:tracking:114354088541
+  shop: alameda
+  type: tracking
+  id: '114354088541'
+  title: Rascador para gatos
+  status: Entregado
+  date: '2026-05-05'
+  carrier: Rutas del Sur
+  order_id: 20260504-100371
+- key: alameda:tracking:886083831935
+  shop: alameda
+  type: tracking
+  id: '886083831935'
+  title: Bastones de trekking plegables
+  status: Entregado
+  date: '2026-08-10'
+  carrier: Rutas del Sur
+  order_id: 20260807-100424
+- key: alameda:tracking:662499719297
+  shop: alameda
+  type: tracking
+  id: '662499719297'
+  title: Esterilla refrescante de gel
+  status: Enviado
+  date: '2026-09-20'
+  carrier: Paquetería Veloz
+  order_id: 20260919-100477
+- key: alameda:tracking:608254314982
+  shop: alameda
+  type: tracking
+  id: '608254314982'
+  title: Manta de microfibra
+  status: Devuelto
+  date: '2026-08-19'
+  carrier: Correo Ágil
+  order_id: 20260817-100530
+- key: alameda:tracking:939211234506
+  shop: alameda
+  type: tracking
+  id: '939211234506'
+  title: Bloques de construcción de madera
+  status: Entregado
+  date: '2026-08-26'
+  carrier: Correo Ágil
+  order_id: 20260822-100636
+- key: alameda:tracking:646254842893
+  shop: alameda
+  type: tracking
+  id: '646254842893'
+  title: Esterilla refrescante de gel
+  status: Entregado
+  date: '2026-06-26'
+  carrier: Correo Ágil
+  order_id: 20260624-100742
+- key: alameda:tracking:538226403596
+  shop: alameda
+  type: tracking
+  id: '538226403596'
+  title: Elevador para monitor
+  status: Entregado
+  date: '2026-06-13'
+  carrier: Envíos Brisa
+  order_id: 20260610-100795
+- key: alameda:tracking:987797516600
+  shop: alameda
+  type: tracking
+  id: '987797516600'
+  title: Cuaderno para colorear
+  status: Entregado
+  date: '2026-07-07'
+  carrier: Envíos Brisa
+  order_id: 20260703-100901
+- key: alameda:tracking:323086276054
+  shop: alameda
+  type: tracking
+  id: '323086276054'
+  title: Comedero automático
+  status: Entregado
+  date: '2026-08-16'
+  carrier: Correo Ágil
+  order_id: 20260814-101007
+- key: alameda:tracking:769902159902
+  shop: alameda
+  type: tracking
+  id: '769902159902'
+  title: Elevador para monitor
+  status: Enviado
+  date: '2026-07-03'
+  carrier: Envíos Brisa
+  order_id: 20260702-101166
+- key: alameda:tracking:285104724787
+  shop: alameda
+  type: tracking
+  id: '285104724787'
+  title: Silla de camping ligera
+  status: Enviado
+  date: '2026-08-15'
+  carrier: Correo Ágil
+  order_id: 20260813-101219
+- key: alameda:tracking:159147579628
+  shop: alameda
+  type: tracking
+  id: '159147579628'
+  title: Almendras tostadas
+  status: Enviado
+  date: '2026-05-18'
+  carrier: Envíos Brisa
+  order_id: 20260515-101272
+- key: alameda:tracking:277930917322
+  shop: alameda
+  type: tracking
+  id: '277930917322'
+  title: Hub USB-C multipuerto
+  status: Entregado
+  date: '2026-08-06'
+  carrier: Correo Ágil
+  order_id: 20260805-101325
+- key: alameda:tracking:400755153808
+  shop: alameda
+  type: tracking
+  id: '400755153808'
+  title: Esterilla refrescante de gel
+  status: Entregado
+  date: '2026-04-28'
+  carrier: Correo Ágil
+  order_id: 20260426-101378
+- key: alameda:tracking:353124270906
+  shop: alameda
+  type: tracking
+  id: '353124270906'
+  title: Sandalias transpirables
+  status: Entregado
+  date: '2026-05-17'
+  carrier: Paquetería Veloz
+  order_id: 20260514-101484
+- key: alameda:tracking:473668249852
+  shop: alameda
+  type: tracking
+  id: '473668249852'
+  title: Almendras tostadas
+  status: Devuelto
+  date: '2026-08-01'
+  carrier: Paquetería Veloz
+  order_id: 20260729-101537
+- key: alameda:tracking:344373122572
+  shop: alameda
+  type: tracking
+  id: '344373122572'
+  title: Sartén de acero inoxidable
+  status: Entregado
+  date: '2026-08-26'
+  carrier: Envíos Brisa
+  order_id: 20260825-101590
+- key: alameda:tracking:388151046414
+  shop: alameda
+  type: tracking
+  id: '388151046414'
+  title: Transportín para mascotas
+  status: Devuelto
+  date: '2026-06-28'
+  carrier: Envíos Brisa
+  order_id: 20260627-101643
+- key: alameda:tracking:663416674814
+  shop: alameda
+  type: tracking
+  id: '663416674814'
+  title: Sudadera con cremallera forrada de polar
+  status: Devuelto
+  date: '2026-07-09'
+  carrier: Paquetería Veloz
+  order_id: 20260708-101696
+- key: alameda:tracking:403629389953
+  shop: alameda
+  type: tracking
+  id: '403629389953'
+  title: Pulsera de actividad inteligente
+  status: Entregado
+  date: '2026-08-15'
+  carrier: Envíos Brisa
+  order_id: 20260813-101749
+- key: alameda:tracking:562851739184
+  shop: alameda
+  type: tracking
+  id: '562851739184'
+  title: Soporte para portátil
+  status: Entregado
+  date: '2026-06-08'
+  carrier: Rutas del Sur
+  order_id: 20260606-101802
+- key: tilleuls:goods:FR10037
+  shop: tilleuls
+  type: goods
+  id: FR10037
+  title: Distributeur de croquettes automatique
+  concept: pet
+  status: En vente
+  price: 54.55
+  date: '2026-06-04'
+- key: tilleuls:goods:FR10074
+  shop: tilleuls
+  type: goods
+  id: FR10074
+  title: Chauffe-mains rechargeable
+  concept: cold_weather
+  status: En vente
+  price: 14.15
+  date: '2026-07-11'
+- key: tilleuls:goods:FR10111
+  shop: tilleuls
+  type: goods
+  id: FR10111
+  title: Sandales aérées
+  concept: hot_weather
+  status: Brouillon
+  price: 22.5
+  date: '2026-08-17'
+- key: tilleuls:goods:FR10148
+  shop: tilleuls
+  type: goods
+  id: FR10148
+  title: Lapin en peluche
+  concept: kids
+  status: Brouillon
+  price: 15.15
+  date: '2026-02-03'
+- key: tilleuls:goods:FR10185
+  shop: tilleuls
+  type: goods
+  id: FR10185
+  title: Trottinette pour enfant
+  concept: kids
+  status: Épuisé
+  price: 47.05
+  date: '2026-04-20'
+- key: tilleuls:goods:FR10222
+  shop: tilleuls
+  type: goods
+  id: FR10222
+  title: Gobelet isotherme sous vide
+  concept: outdoor
+  status: En vente
+  price: 15.85
+  date: '2026-01-29'
+- key: tilleuls:goods:FR10259
+  shop: tilleuls
+  type: goods
+  id: FR10259
+  title: Tente dôme deux places
+  concept: outdoor
+  status: Épuisé
+  price: 96.7
+  date: '2026-06-20'
+- key: tilleuls:goods:FR10296
+  shop: tilleuls
+  type: goods
+  id: FR10296
+  title: Granola bio
+  concept: snack_food
+  status: Épuisé
+  price: 10.4
+  date: '2026-05-31'
+- key: tilleuls:goods:FR10333
+  shop: tilleuls
+  type: goods
+  id: FR10333
+  title: Lanterne LED rechargeable
+  concept: outdoor
+  status: En vente
+  price: 20.9
+  date: '2026-02-20'
+- key: tilleuls:goods:FR10370
+  shop: tilleuls
+  type: goods
+  id: FR10370
+  title: Chaise de camping légère
+  concept: outdoor
+  status: Épuisé
+  price: 26.85
+  date: '2026-08-13'
+- key: tilleuls:goods:FR10407
+  shop: tilleuls
+  type: goods
+  id: FR10407
+  title: Set d'ustensiles en silicone
+  concept: cooking
+  status: Brouillon
+  price: 20.4
+  date: '2026-05-16'
+- key: tilleuls:goods:FR10444
+  shop: tilleuls
+  type: goods
+  id: FR10444
+  title: Chargeur rapide 65 W
+  concept: audio_power
+  status: En vente
+  price: 25.7
+  date: '2026-03-31'
+- key: tilleuls:goods:FR10481
+  shop: tilleuls
+  type: goods
+  id: FR10481
+  title: Plaid en microfibre
+  concept: cold_weather
+  status: En vente
+  price: 17.45
+  date: '2026-03-01'
+- key: tilleuls:goods:FR10518
+  shop: tilleuls
+  type: goods
+  id: FR10518
+  title: Mixeur plongeant
+  concept: cooking
+  status: En vente
+  price: 29.05
+  date: '2026-01-23'
+- key: tilleuls:goods:FR10555
+  shop: tilleuls
+  type: goods
+  id: FR10555
+  title: Essence réparatrice pour cheveux
+  concept: skincare
+  status: En vente
+  price: 13.45
+  date: '2026-01-15'
+- key: tilleuls:goods:FR10592
+  shop: tilleuls
+  type: goods
+  id: FR10592
+  title: Griffoir pour chat
+  concept: pet
+  status: En vente
+  price: 12.05
+  date: '2026-03-14'
+- key: tilleuls:goods:FR10629
+  shop: tilleuls
+  type: goods
+  id: FR10629
+  title: Enceinte Bluetooth étanche
+  concept: audio_power
+  status: Épuisé
+  price: 38.05
+  date: '2026-08-01'
+- key: tilleuls:goods:FR10666
+  shop: tilleuls
+  type: goods
+  id: FR10666
+  title: Mousse nettoyante à pH bas
+  concept: skincare
+  status: Épuisé
+  price: 10.55
+  date: '2026-07-25'
+- key: tilleuls:goods:FR10703
+  shop: tilleuls
+  type: goods
+  id: FR10703
+  title: Brosse de toilettage pour animaux
+  concept: pet
+  status: En vente
+  price: 9.7
+  date: '2026-05-07'
+- key: tilleuls:goods:FR10740
+  shop: tilleuls
+  type: goods
+  id: FR10740
+  title: Ombrelle anti-UV
+  concept: hot_weather
+  status: Brouillon
+  price: 18.55
+  date: '2026-05-24'
+- key: tilleuls:goods:FR10777
+  shop: tilleuls
+  type: goods
+  id: FR10777
+  title: Coffret vaisselle pour tout-petits
+  concept: kids
+  status: En vente
+  price: 18.2
+  date: '2026-03-06'
+- key: tilleuls:goods:FR10814
+  shop: tilleuls
+  type: goods
+  id: FR10814
+  title: Doudoune sans manches légère
+  concept: cold_weather
+  status: En vente
+  price: 47.65
+  date: '2026-06-09'
+- key: tilleuls:goods:FR10851
+  shop: tilleuls
+  type: goods
+  id: FR10851
+  title: Jus de mandarine de Jeju
+  concept: snack_food
+  status: En vente
+  price: 11.5
+  date: '2026-06-26'
+- key: tilleuls:goods:FR10888
+  shop: tilleuls
+  type: goods
+  id: FR10888
+  title: Clavier mécanique silencieux
+  concept: desk_work
+  status: En vente
+  price: 65.1
+  date: '2026-05-02'
+- key: tilleuls:order:20260708-100053
+  shop: tilleuls
+  type: order
+  id: 20260708-100053
+  title: Crème hydratante barrière
+  status: En préparation
+  amount: 66.4
+  date: '2026-07-08'
+  buyer: Théo Fournier
+  tracking: null
+  goods_ids:
+  - FR11295
+  - FR10111
+- key: tilleuls:order:20260604-100106
+  shop: tilleuls
+  type: order
+  id: 20260604-100106
+  title: Enceinte Bluetooth étanche
+  status: Livrée
+  amount: 182.07
+  date: '2026-06-04'
+  buyer: Clara Lefèvre
+  tracking: '539448320835'
+  goods_ids:
+  - FR10629
+  - FR10592
+- key: tilleuls:order:20260512-100159
+  shop: tilleuls
+  type: order
+  id: 20260512-100159
+  title: Coffret vaisselle pour tout-petits
+  status: Payée
+  amount: 20.25
+  date: '2026-05-12'
+  buyer: Jules Roux
+  tracking: null
+  goods_ids:
+  - FR10777
+- key: tilleuls:order:20260428-100212
+  shop: tilleuls
+  type: order
+  id: 20260428-100212
+  title: Lait corporel sans parfum
+  status: Payée
+  amount: 14.6
+  date: '2026-04-28'
+  buyer: Jules Bernard
+  tracking: null
+  goods_ids:
+  - FR11517
+- key: tilleuls:order:20260407-100265
+  shop: tilleuls
+  type: order
+  id: 20260407-100265
+  title: Hub USB-C multiport
+  status: Expédiée
+  amount: 84.05
+  date: '2026-04-07'
+  buyer: Arthur Moreau
+  tracking: '597573966324'
+  goods_ids:
+  - FR11554
+  - FR11036
+- key: tilleuls:order:20260909-100318
+  shop: tilleuls
+  type: order
+  id: 20260909-100318
+  title: Chauffe-mains rechargeable
+  status: Livrée
+  amount: 165.1
+  date: '2026-09-09'
+  buyer: Lucas Lefèvre
+  tracking: '449741588837'
+  goods_ids:
+  - FR10074
+  - FR10370
+  - FR10111
+- key: tilleuls:order:20260822-100371
+  shop: tilleuls
+  type: order
+  id: 20260822-100371
+  title: Crème solaire minérale
+  status: Expédiée
+  amount: 52.2
+  date: '2026-08-22'
+  buyer: Léa Roux
+  tracking: '561575292501'
+  goods_ids:
+  - FR11221
+- key: tilleuls:order:20260430-100424
+  shop: tilleuls
+  type: order
+  id: 20260430-100424
+  title: Couteau de chef en céramique
+  status: Retournée
+  amount: 49.4
+  date: '2026-04-30'
+  buyer: Hugo Martin
+  tracking: '184080256535'
+  goods_ids:
+  - FR10925
+- key: tilleuls:order:20260507-100477
+  shop: tilleuls
+  type: order
+  id: 20260507-100477
+  title: Ombrelle anti-UV
+  status: Livrée
+  amount: 92.75
+  date: '2026-05-07'
+  buyer: Lucas Girard
+  tracking: '747722967027'
+  goods_ids:
+  - FR10740
+- key: tilleuls:order:20260706-100530
+  shop: tilleuls
+  type: order
+  id: 20260706-100530
+  title: Griffoir pour chat
+  status: Expédiée
+  amount: 60.25
+  date: '2026-07-06'
+  buyer: Inès Moreau
+  tracking: '235605522885'
+  goods_ids:
+  - FR10592
+- key: tilleuls:order:20260705-100583
+  shop: tilleuls
+  type: order
+  id: 20260705-100583
+  title: Lot de boîtes hermétiques en verre
+  status: En préparation
+  amount: 93.3
+  date: '2026-07-05'
+  buyer: Clara Dubois
+  tracking: null
+  goods_ids:
+  - FR10999
+  - FR11332
+  - FR10740
+- key: tilleuls:order:20260511-100636
+  shop: tilleuls
+  type: order
+  id: 20260511-100636
+  title: Granola bio
+  status: Livrée
+  amount: 45.05
+  date: '2026-05-11'
+  buyer: Camille Martin
+  tracking: '870933789728'
+  goods_ids:
+  - FR10296
+  - FR10666
+  - FR11036
+- key: tilleuls:order:20261007-100689
+  shop: tilleuls
+  type: order
+  id: 20261007-100689
+  title: Mousse nettoyante à pH bas
+  status: En préparation
+  amount: 33.7
+  date: '2026-10-07'
+  buyer: Inès Roux
+  tracking: null
+  goods_ids:
+  - FR10666
+- key: tilleuls:order:20260410-100742
+  shop: tilleuls
+  type: order
+  id: 20260410-100742
+  title: Ombrelle anti-UV
+  status: Retournée
+  amount: 20.6
+  date: '2026-04-10'
+  buyer: Louis Laurent
+  tracking: '438015734903'
+  goods_ids:
+  - FR10740
+- key: tilleuls:order:20260921-100795
+  shop: tilleuls
+  type: order
+  id: 20260921-100795
+  title: Harnais pour chien
+  status: Annulée
+  amount: 81.5
+  date: '2026-09-21'
+  buyer: Jules Martin
+  tracking: null
+  goods_ids:
+  - FR11443
+- key: tilleuls:order:20260810-100848
+  shop: tilleuls
+  type: order
+  id: 20260810-100848
+  title: Tente dôme deux places
+  status: En préparation
+  amount: 505.08
+  date: '2026-08-10'
+  buyer: Hugo Bernard
+  tracking: null
+  goods_ids:
+  - FR10259
+  - FR10481
+  - FR10592
+- key: tilleuls:order:20260816-100901
+  shop: tilleuls
+  type: order
+  id: 20260816-100901
+  title: Lait corporel sans parfum
+  status: Annulée
+  amount: 13.35
+  date: '2026-08-16'
+  buyer: Clara Bernard
+  tracking: null
+  goods_ids:
+  - FR11517
+- key: tilleuls:order:20260801-100954
+  shop: tilleuls
+  type: order
+  id: 20260801-100954
+  title: Lapin en peluche
+  status: Livrée
+  amount: 17.2
+  date: '2026-08-01'
+  buyer: Arthur Bonnet
+  tracking: '827021041677'
+  goods_ids:
+  - FR10148
+- key: tilleuls:order:20260910-101007
+  shop: tilleuls
+  type: order
+  id: 20260910-101007
+  title: Plaid en microfibre
+  status: Expédiée
+  amount: 43.52
+  date: '2026-09-10'
+  buyer: Inès Laurent
+  tracking: '504286360173'
+  goods_ids:
+  - FR10481
+  - FR10555
+- key: tilleuls:order:20260421-101060
+  shop: tilleuls
+  type: order
+  id: 20260421-101060
+  title: Hub USB-C multiport
+  status: En attente de paiement
+  amount: 51.7
+  date: '2026-04-21'
+  buyer: Jules Girard
+  tracking: null
+  goods_ids:
+  - FR11554
+- key: tilleuls:order:20260910-101113
+  shop: tilleuls
+  type: order
+  id: 20260910-101113
+  title: Ombrelle anti-UV
+  status: Expédiée
+  amount: 130.8
+  date: '2026-09-10'
+  buyer: Théo Girard
+  tracking: '441038064284'
+  goods_ids:
+  - FR10740
+  - FR10629
+- key: tilleuls:order:20260830-101166
+  shop: tilleuls
+  type: order
+  id: 20260830-101166
+  title: Trottinette pour enfant
+  status: Payée
+  amount: 47.05
+  date: '2026-08-30'
+  buyer: Lucas Dubois
+  tracking: null
+  goods_ids:
+  - FR10185
+- key: tilleuls:order:20260708-101219
+  shop: tilleuls
+  type: order
+  id: 20260708-101219
+  title: Kit robot de codage
+  status: En préparation
+  amount: 52.7
+  date: '2026-07-08'
+  buyer: Clara Bonnet
+  tracking: null
+  goods_ids:
+  - FR10962
+- key: tilleuls:order:20260817-101272
+  shop: tilleuls
+  type: order
+  id: 20260817-101272
+  title: Mixeur plongeant
+  status: Livrée
+  amount: 110.8
+  date: '2026-08-17'
+  buyer: Jules Dubois
+  tracking: '158510597672'
+  goods_ids:
+  - FR10518
+  - FR10962
+- key: tilleuls:tracking:539448320835
+  shop: tilleuls
+  type: tracking
+  id: '539448320835'
+  title: Enceinte Bluetooth étanche
+  status: Livrée
+  date: '2026-06-05'
+  carrier: Fret Azur
+  order_id: 20260604-100106
+- key: tilleuls:tracking:597573966324
+  shop: tilleuls
+  type: tracking
+  id: '597573966324'
+  title: Hub USB-C multiport
+  status: Expédiée
+  date: '2026-04-08'
+  carrier: Fret Azur
+  order_id: 20260407-100265
+- key: tilleuls:tracking:449741588837
+  shop: tilleuls
+  type: tracking
+  id: '449741588837'
+  title: Chauffe-mains rechargeable
+  status: Livrée
+  date: '2026-09-12'
+  carrier: Colis Éclair
+  order_id: 20260909-100318
+- key: tilleuls:tracking:561575292501
+  shop: tilleuls
+  type: tracking
+  id: '561575292501'
+  title: Crème solaire minérale
+  status: Expédiée
+  date: '2026-08-24'
+  carrier: Colis Éclair
+  order_id: 20260822-100371
+- key: tilleuls:tracking:184080256535
+  shop: tilleuls
+  type: tracking
+  id: '184080256535'
+  title: Couteau de chef en céramique
+  status: Retournée
+  date: '2026-05-03'
+  carrier: Colis Éclair
+  order_id: 20260430-100424
+- key: tilleuls:tracking:747722967027
+  shop: tilleuls
+  type: tracking
+  id: '747722967027'
+  title: Ombrelle anti-UV
+  status: Livrée
+  date: '2026-05-10'
+  carrier: Messagerie du Rhône
+  order_id: 20260507-100477
+- key: tilleuls:tracking:235605522885
+  shop: tilleuls
+  type: tracking
+  id: '235605522885'
+  title: Griffoir pour chat
+  status: Expédiée
+  date: '2026-07-09'
+  carrier: Messagerie du Rhône
+  order_id: 20260706-100530
+- key: tilleuls:tracking:870933789728
+  shop: tilleuls
+  type: tracking
+  id: '870933789728'
+  title: Granola bio
+  status: Livrée
+  date: '2026-05-13'
+  carrier: Colis Éclair
+  order_id: 20260511-100636
+- key: tilleuls:tracking:438015734903
+  shop: tilleuls
+  type: tracking
+  id: '438015734903'
+  title: Ombrelle anti-UV
+  status: Retournée
+  date: '2026-04-11'
+  carrier: Transports Lavande
+  order_id: 20260410-100742
+- key: tilleuls:tracking:827021041677
+  shop: tilleuls
+  type: tracking
+  id: '827021041677'
+  title: Lapin en peluche
+  status: Livrée
+  date: '2026-08-04'
+  carrier: Fret Azur
+  order_id: 20260801-100954
+- key: tilleuls:tracking:504286360173
+  shop: tilleuls
+  type: tracking
+  id: '504286360173'
+  title: Plaid en microfibre
+  status: Expédiée
+  date: '2026-09-11'
+  carrier: Colis Éclair
+  order_id: 20260910-101007
+- key: tilleuls:tracking:441038064284
+  shop: tilleuls
+  type: tracking
+  id: '441038064284'
+  title: Ombrelle anti-UV
+  status: Expédiée
+  date: '2026-09-11'
+  carrier: Colis Éclair
+  order_id: 20260910-101113
+- key: tilleuls:tracking:158510597672
+  shop: tilleuls
+  type: tracking
+  id: '158510597672'
+  title: Mixeur plongeant
+  status: Livrée
+  date: '2026-08-19'
+  carrier: Colis Éclair
+  order_id: 20260817-101272
+- key: tilleuls:tracking:107108748943
+  shop: tilleuls
+  type: tracking
+  id: '107108748943'
+  title: Crème hydratante barrière
+  status: Expédiée
+  date: '2026-05-12'
+  carrier: Fret Azur
+  order_id: 20260509-101325
+- key: tilleuls:tracking:316008261906
+  shop: tilleuls
+  type: tracking
+  id: '316008261906'
+  title: Essence réparatrice pour cheveux
+  status: Livrée
+  date: '2026-06-13'
+  carrier: Transports Lavande
+  order_id: 20260610-101431
+- key: tilleuls:tracking:222761027545
+  shop: tilleuls
+  type: tracking
+  id: '222761027545'
+  title: Lapin en peluche
+  status: Retournée
+  date: '2026-09-29'
+  carrier: Fret Azur
+  order_id: 20260926-101484
+- key: tilleuls:tracking:461279713013
+  shop: tilleuls
+  type: tracking
+  id: '461279713013'
+  title: Sweat zippé doublé polaire
+  status: Livrée
+  date: '2026-07-15'
+  carrier: Transports Lavande
+  order_id: 20260714-101590
+- key: tilleuls:tracking:439397791326
+  shop: tilleuls
+  type: tracking
+  id: '439397791326'
+  title: Tente dôme deux places
+  status: Expédiée
+  date: '2026-06-21'
+  carrier: Colis Éclair
+  order_id: 20260620-101802
+- key: tilleuls:tracking:294254945140
+  shop: tilleuls
+  type: tracking
+  id: '294254945140'
+  title: Boîte range-câbles
+  status: Expédiée
+  date: '2026-07-12'
+  carrier: Transports Lavande
+  order_id: 20260710-101855
+- key: tilleuls:tracking:779925383094
+  shop: tilleuls
+  type: tracking
+  id: '779925383094'
+  title: Couteau de chef en céramique
+  status: Retournée
+  date: '2026-08-02'
+  carrier: Colis Éclair
+  order_id: 20260729-101908
+- key: tilleuls:tracking:780667686677
+  shop: tilleuls
+  type: tracking
+  id: '780667686677'
+  title: Chargeur rapide 65 W
+  status: Livrée
+  date: '2026-04-30'
+  carrier: Fret Azur
+  order_id: 20260428-102014
+- key: tilleuls:tracking:705845684109
+  shop: tilleuls
+  type: tracking
+  id: '705845684109'
+  title: Tente dôme deux places
+  status: Expédiée
+  date: '2026-05-29'
+  carrier: Colis Éclair
+  order_id: 20260527-102067
+- key: tilleuls:tracking:160654044699
+  shop: tilleuls
+  type: tracking
+  id: '160654044699'
+  title: Popote de camping
+  status: Livrée
+  date: '2026-07-29'
+  carrier: Fret Azur
+  order_id: 20260728-102120
+- key: tilleuls:tracking:863433822683
+  shop: tilleuls
+  type: tracking
+  id: '863433822683'
+  title: Sandales aérées
+  status: Expédiée
+  date: '2026-08-09'
+  carrier: Fret Azur
+  order_id: 20260808-102226
+- key: faro:goods:IT10037
+  shop: faro
+  type: goods
+  id: IT10037
+  title: Mandorle tostate
+  concept: snack_food
+  status: Bozza
+  price: 8.0
+  date: '2026-05-15'
+- key: faro:goods:IT10074
+  shop: faro
+  type: goods
+  id: IT10074
+  title: Essenza riparatrice per capelli
+  concept: skincare
+  status: Esaurito
+  price: 12.6
+  date: '2026-03-28'
+- key: faro:goods:IT10111
+  shop: faro
+  type: goods
+  id: IT10111
+  title: Sandali traspiranti
+  concept: hot_weather
+  status: Bozza
+  price: 25.45
+  date: '2026-07-07'
+- key: faro:goods:IT10148
+  shop: faro
+  type: goods
+  id: IT10148
+  title: Siero alla vitamina C
+  concept: skincare
+  status: Bozza
+  price: 28.75
+  date: '2026-07-14'
+- key: faro:goods:IT10185
+  shop: faro
+  type: goods
+  id: IT10185
+  title: Concentrato di caffè cold brew
+  concept: snack_food
+  status: In vendita
+  price: 12.3
+  date: '2026-04-06'
+- key: faro:goods:IT10222
+  shop: faro
+  type: goods
+  id: IT10222
+  title: Bicchiere termico sottovuoto
+  concept: outdoor
+  status: Bozza
+  price: 17.15
+  date: '2026-06-11'
+- key: faro:goods:IT10259
+  shop: faro
+  type: goods
+  id: IT10259
+  title: Auricolari wireless con cancellazione del rumore
+  concept: audio_power
+  status: Bozza
+  price: 84.15
+  date: '2026-04-16'
+- key: faro:goods:IT10296
+  shop: faro
+  type: goods
+  id: IT10296
+  title: Mouse verticale ergonomico
+  concept: desk_work
+  status: In vendita
+  price: 26.85
+  date: '2026-05-14'
+- key: faro:goods:IT10333
+  shop: faro
+  type: goods
+  id: IT10333
+  title: Schiuma detergente a pH basso
+  concept: skincare
+  status: In vendita
+  price: 10.35
+  date: '2026-01-31'
+- key: faro:goods:IT10370
+  shop: faro
+  type: goods
+  id: IT10370
+  title: Supporto rialzato per monitor
+  concept: desk_work
+  status: Bozza
+  price: 24.7
+  date: '2026-03-25'
+- key: faro:goods:IT10407
+  shop: faro
+  type: goods
+  id: IT10407
+  title: Tappetino rinfrescante in gel
+  concept: hot_weather
+  status: Esaurito
+  price: 26.15
+  date: '2026-07-29'
+- key: faro:goods:IT10444
+  shop: faro
+  type: goods
+  id: IT10444
+  title: Barretta proteica con pochi zuccheri
+  concept: snack_food
+  status: In vendita
+  price: 16.95
+  date: '2026-05-06'
+- key: faro:goods:IT10481
+  shop: faro
+  type: goods
+  id: IT10481
+  title: Granola biologica
+  concept: snack_food
+  status: Esaurito
+  price: 9.1
+  date: '2026-06-04'
+- key: faro:goods:IT10518
+  shop: faro
+  type: goods
+  id: IT10518
+  title: Trasportino per animali
+  concept: pet
+  status: In vendita
+  price: 34.75
+  date: '2026-08-23'
+- key: faro:goods:IT10555
+  shop: faro
+  type: goods
+  id: IT10555
+  title: Tastiera meccanica silenziosa
+  concept: desk_work
+  status: In vendita
+  price: 61.7
+  date: '2026-06-15'
+- key: faro:goods:IT10592
+  shop: faro
+  type: goods
+  id: IT10592
+  title: Caricatore rapido da 65 W
+  concept: audio_power
+  status: Bozza
+  price: 23.8
+  date: '2026-03-01'
+- key: faro:goods:IT10629
+  shop: faro
+  type: goods
+  id: IT10629
+  title: Scatola passacavi
+  concept: desk_work
+  status: In vendita
+  price: 11.65
+  date: '2026-09-10'
+- key: faro:goods:IT10666
+  shop: faro
+  type: goods
+  id: IT10666
+  title: Set di pentole da campeggio
+  concept: outdoor
+  status: In vendita
+  price: 29.95
+  date: '2026-05-02'
+- key: faro:goods:IT10703
+  shop: faro
+  type: goods
+  id: IT10703
+  title: Lanterna LED ricaricabile
+  concept: outdoor
+  status: Esaurito
+  price: 19.3
+  date: '2026-04-18'
+- key: faro:goods:IT10740
+  shop: faro
+  type: goods
+  id: IT10740
+  title: Bollitore a temperatura regolabile
+  concept: cooking
+  status: In vendita
+  price: 35.05
+  date: '2026-02-24'
+- key: faro:goods:IT10777
+  shop: faro
+  type: goods
+  id: IT10777
+  title: Album da colorare
+  concept: kids
+  status: Bozza
+  price: 6.15
+  date: '2026-07-12'
+- key: faro:goods:IT10814
+  shop: faro
+  type: goods
+  id: IT10814
+  title: Portadocumenti da scrivania
+  concept: desk_work
+  status: In vendita
+  price: 10.5
+  date: '2026-05-17'
+- key: faro:goods:IT10851
+  shop: faro
+  type: goods
+  id: IT10851
+  title: Ombrellino anti-UV
+  concept: hot_weather
+  status: In vendita
+  price: 18.15
+  date: '2026-07-23'
+- key: faro:goods:IT10888
+  shop: faro
+  type: goods
+  id: IT10888
+  title: Lozione corpo senza profumo
+  concept: skincare
+  status: In vendita
+  price: 11.1
+  date: '2026-04-03'
+- key: faro:order:20261006-100053
+  shop: faro
+  type: order
+  id: 20261006-100053
+  title: Spazzola per toelettatura
+  status: Pagato
+  amount: 74.75
+  date: '2026-10-06'
+  buyer: Andrea Greco
+  tracking: null
+  goods_ids:
+  - IT11073
+  - IT11110
+- key: faro:order:20260625-100106
+  shop: faro
+  type: order
+  id: 20260625-100106
+  title: Plaid in microfibra
+  status: Pagato
+  amount: 100.76
+  date: '2026-06-25'
+  buyer: Andrea Rossi
+  tracking: null
+  goods_ids:
+  - IT11443
+  - IT11517
+- key: faro:order:20260508-100159
+  shop: faro
+  type: order
+  id: 20260508-100159
+  title: Spazzola per toelettatura
+  status: In attesa di pagamento
+  amount: 48.0
+  date: '2026-05-08'
+  buyer: Chiara Bruno
+  tracking: null
+  goods_ids:
+  - IT11073
+- key: faro:order:20260829-100212
+  shop: faro
+  type: order
+  id: 20260829-100212
+  title: Essenza riparatrice per capelli
+  status: Annullato
+  amount: 27.25
+  date: '2026-08-29'
+  buyer: Davide Bianchi
+  tracking: null
+  goods_ids:
+  - IT10074
+- key: faro:order:20260416-100265
+  shop: faro
+  type: order
+  id: 20260416-100265
+  title: Frullatore a immersione
+  status: Annullato
+  amount: 135.05
+  date: '2026-04-16'
+  buyer: Marco Colombo
+  tracking: null
+  goods_ids:
+  - IT11258
+  - IT11110
+  - IT11332
+- key: faro:order:20260415-100318
+  shop: faro
+  type: order
+  id: 20260415-100318
+  title: Giacca in pile sherpa
+  status: In attesa di pagamento
+  amount: 222.12
+  date: '2026-04-15'
+  buyer: Martina Bruno
+  tracking: null
+  goods_ids:
+  - IT11147
+  - IT11554
+- key: faro:order:20260705-100371
+  shop: faro
+  type: order
+  id: 20260705-100371
+  title: Granola biologica
+  status: In attesa di pagamento
+  amount: 11.15
+  date: '2026-07-05'
+  buyer: Chiara Colombo
+  tracking: null
+  goods_ids:
+  - IT10481
+- key: faro:order:20260618-100424
+  shop: faro
+  type: order
+  id: 20260618-100424
+  title: Scaldamani ricaricabile
+  status: Spedito
+  amount: 99.5
+  date: '2026-06-18'
+  buyer: Lorenzo Marino
+  tracking: '195764898657'
+  goods_ids:
+  - IT11184
+  - IT10407
+- key: faro:order:20260606-100477
+  shop: faro
+  type: order
+  id: 20260606-100477
+  title: Crema solare minerale
+  status: Consegnato
+  amount: 26.8
+  date: '2026-06-06'
+  buyer: Elena Conti
+  tracking: '229271781691'
+  goods_ids:
+  - IT11406
+  - IT10888
+- key: faro:order:20260609-100530
+  shop: faro
+  type: order
+  id: 20260609-100530
+  title: Bicchiere termico sottovuoto
+  status: Consegnato
+  amount: 93.7
+  date: '2026-06-09'
+  buyer: Sofia Romano
+  tracking: '144797482821'
+  goods_ids:
+  - IT10222
+  - IT11480
+- key: faro:order:20260806-100583
+  shop: faro
+  type: order
+  id: 20260806-100583
+  title: Crocchette ipoallergeniche
+  status: Annullato
+  amount: 68.55
+  date: '2026-08-06'
+  buyer: Luca Romano
+  tracking: null
+  goods_ids:
+  - IT10999
+- key: faro:order:20260807-100636
+  shop: faro
+  type: order
+  id: 20260807-100636
+  title: Tenda a cupola per due persone
+  status: Consegnato
+  amount: 83.75
+  date: '2026-08-07'
+  buyer: Chiara Colombo
+  tracking: '376320179711'
+  goods_ids:
+  - IT11517
+- key: faro:order:20261011-100689
+  shop: faro
+  type: order
+  id: 20261011-100689
+  title: Power bank ad alta capacità
+  status: In lavorazione
+  amount: 103.1
+  date: '2026-10-11'
+  buyer: Andrea Ricci
+  tracking: null
+  goods_ids:
+  - IT11110
+  - IT10111
+- key: faro:order:20260602-100742
+  shop: faro
+  type: order
+  id: 20260602-100742
+  title: Lozione corpo senza profumo
+  status: In attesa di pagamento
+  amount: 52.05
+  date: '2026-06-02'
+  buyer: Matteo Rossi
+  tracking: null
+  goods_ids:
+  - IT10888
+  - IT10222
+  - IT10592
+- key: faro:order:20260518-100795
+  shop: faro
+  type: order
+  id: 20260518-100795
+  title: Mouse verticale ergonomico
+  status: Consegnato
+  amount: 53.7
+  date: '2026-05-18'
+  buyer: Sofia Rossi
+  tracking: '620893141375'
+  goods_ids:
+  - IT10296
+- key: faro:order:20260829-100848
+  shop: faro
+  type: order
+  id: 20260829-100848
+  title: Tastiera meccanica silenziosa
+  status: Consegnato
+  amount: 123.4
+  date: '2026-08-29'
+  buyer: Chiara Gallo
+  tracking: '902100197552'
+  goods_ids:
+  - IT10555
+- key: faro:order:20260422-100901
+  shop: faro
+  type: order
+  id: 20260422-100901
+  title: Spazzola per toelettatura
+  status: Restituito
+  amount: 68.76
+  date: '2026-04-22'
+  buyer: Matteo Romano
+  tracking: '586920977030'
+  goods_ids:
+  - IT11073
+  - IT10592
+- key: faro:order:20260413-100954
+  shop: faro
+  type: order
+  id: 20260413-100954
+  title: Altoparlante Bluetooth impermeabile
+  status: Consegnato
+  amount: 184.28
+  date: '2026-04-13'
+  buyer: Lorenzo Gallo
+  tracking: '720309403489'
+  goods_ids:
+  - IT11369
+- key: faro:order:20260923-101007
+  shop: faro
+  type: order
+  id: 20260923-101007
+  title: Spazzola per toelettatura
+  status: Spedito
+  amount: 74.75
+  date: '2026-09-23'
+  buyer: Martina Marino
+  tracking: '258628048469'
+  goods_ids:
+  - IT11073
+  - IT11110
+- key: faro:order:20260927-101060
+  shop: faro
+  type: order
+  id: 20260927-101060
+  title: Siero alla vitamina C
+  status: Annullato
+  amount: 57.5
+  date: '2026-09-27'
+  buyer: Chiara Ricci
+  tracking: null
+  goods_ids:
+  - IT10148
+- key: faro:order:20260608-101113
+  shop: faro
+  type: order
+  id: 20260608-101113
+  title: Costruzioni in legno
+  status: Restituito
+  amount: 448.2
+  date: '2026-06-08'
+  buyer: Andrea Bianchi
+  tracking: '285527565697'
+  goods_ids:
+  - IT11221
+  - IT10259
+- key: faro:order:20260904-101166
+  shop: faro
+  type: order
+  id: 20260904-101166
+  title: Sandali traspiranti
+  status: Consegnato
+  amount: 121.25
+  date: '2026-09-04'
+  buyer: Chiara Ricci
+  tracking: '668977632282'
+  goods_ids:
+  - IT10111
+  - IT10851
+  - IT11110
+- key: faro:order:20261012-101219
+  shop: faro
+  type: order
+  id: 20261012-101219
+  title: Mouse verticale ergonomico
+  status: Restituito
+  amount: 53.7
+  date: '2026-10-12'
+  buyer: Giulia Conti
+  tracking: '121679013111'
+  goods_ids:
+  - IT10296
+- key: faro:order:20260912-101272
+  shop: faro
+  type: order
+  id: 20260912-101272
+  title: Ombrellino anti-UV
+  status: Consegnato
+  amount: 54.45
+  date: '2026-09-12'
+  buyer: Marco Rossi
+  tracking: '957917020565'
+  goods_ids:
+  - IT10851
+- key: faro:tracking:195764898657
+  shop: faro
+  type: tracking
+  id: '195764898657'
+  title: Scaldamani ricaricabile
+  status: Spedito
+  date: '2026-06-20'
+  carrier: Pacco Veloce
+  order_id: 20260618-100424
+- key: faro:tracking:229271781691
+  shop: faro
+  type: tracking
+  id: '229271781691'
+  title: Crema solare minerale
+  status: Consegnato
+  date: '2026-06-07'
+  carrier: Pacco Veloce
+  order_id: 20260606-100477
+- key: faro:tracking:144797482821
+  shop: faro
+  type: tracking
+  id: '144797482821'
+  title: Bicchiere termico sottovuoto
+  status: Consegnato
+  date: '2026-06-12'
+  carrier: Spedizioni Aurora
+  order_id: 20260609-100530
+- key: faro:tracking:376320179711
+  shop: faro
+  type: tracking
+  id: '376320179711'
+  title: Tenda a cupola per due persone
+  status: Consegnato
+  date: '2026-08-09'
+  carrier: Pacco Veloce
+  order_id: 20260807-100636
+- key: faro:tracking:620893141375
+  shop: faro
+  type: tracking
+  id: '620893141375'
+  title: Mouse verticale ergonomico
+  status: Consegnato
+  date: '2026-05-22'
+  carrier: Pacco Veloce
+  order_id: 20260518-100795
+- key: faro:tracking:902100197552
+  shop: faro
+  type: tracking
+  id: '902100197552'
+  title: Tastiera meccanica silenziosa
+  status: Consegnato
+  date: '2026-08-30'
+  carrier: Pacco Veloce
+  order_id: 20260829-100848
+- key: faro:tracking:586920977030
+  shop: faro
+  type: tracking
+  id: '586920977030'
+  title: Spazzola per toelettatura
+  status: Restituito
+  date: '2026-04-23'
+  carrier: Trasporti Faro
+  order_id: 20260422-100901
+- key: faro:tracking:720309403489
+  shop: faro
+  type: tracking
+  id: '720309403489'
+  title: Altoparlante Bluetooth impermeabile
+  status: Consegnato
+  date: '2026-04-16'
+  carrier: Corriere Lampo
+  order_id: 20260413-100954
+- key: faro:tracking:258628048469
+  shop: faro
+  type: tracking
+  id: '258628048469'
+  title: Spazzola per toelettatura
+  status: Spedito
+  date: '2026-09-25'
+  carrier: Pacco Veloce
+  order_id: 20260923-101007
+- key: faro:tracking:285527565697
+  shop: faro
+  type: tracking
+  id: '285527565697'
+  title: Costruzioni in legno
+  status: Restituito
+  date: '2026-06-10'
+  carrier: Spedizioni Aurora
+  order_id: 20260608-101113
+- key: faro:tracking:668977632282
+  shop: faro
+  type: tracking
+  id: '668977632282'
+  title: Sandali traspiranti
+  status: Consegnato
+  date: '2026-09-07'
+  carrier: Pacco Veloce
+  order_id: 20260904-101166
+- key: faro:tracking:121679013111
+  shop: faro
+  type: tracking
+  id: '121679013111'
+  title: Mouse verticale ergonomico
+  status: Restituito
+  date: '2026-10-15'
+  carrier: Trasporti Faro
+  order_id: 20261012-101219
+- key: faro:tracking:957917020565
+  shop: faro
+  type: tracking
+  id: '957917020565'
+  title: Ombrellino anti-UV
+  status: Consegnato
+  date: '2026-09-13'
+  carrier: Spedizioni Aurora
+  order_id: 20260912-101272
+- key: faro:tracking:901279851751
+  shop: faro
+  type: tracking
+  id: '901279851751'
+  title: Pettorina per cani
+  status: Restituito
+  date: '2026-05-13'
+  carrier: Trasporti Faro
+  order_id: 20260511-101325
+- key: faro:tracking:420730325863
+  shop: faro
+  type: tracking
+  id: '420730325863'
+  title: Ombrellino anti-UV
+  status: Spedito
+  date: '2026-08-23'
+  carrier: Corriere Lampo
+  order_id: 20260820-101431
+- key: faro:tracking:738707746880
+  shop: faro
+  type: tracking
+  id: '738707746880'
+  title: Set di stoviglie per bambini
+  status: Consegnato
+  date: '2026-05-20'
+  carrier: Spedizioni Aurora
+  order_id: 20260517-101484
+- key: faro:tracking:669538078006
+  shop: faro
+  type: tracking
+  id: '669538078006'
+  title: Mouse verticale ergonomico
+  status: Restituito
+  date: '2026-08-02'
+  carrier: Spedizioni Aurora
+  order_id: 20260801-101590
+- key: faro:tracking:463281743867
+  shop: faro
+  type: tracking
+  id: '463281743867'
+  title: Costruzioni in legno
+  status: Spedito
+  date: '2026-06-13'
+  carrier: Corriere Lampo
+  order_id: 20260611-101643
+- key: faro:tracking:734411710664
+  shop: faro
+  type: tracking
+  id: '734411710664'
+  title: Mouse verticale ergonomico
+  status: Restituito
+  date: '2026-10-08'
+  carrier: Spedizioni Aurora
+  order_id: 20261005-101696
+- key: faro:tracking:150495267518
+  shop: faro
+  type: tracking
+  id: '150495267518'
+  title: Tastiera meccanica silenziosa
+  status: Consegnato
+  date: '2026-06-15'
+  carrier: Spedizioni Aurora
+  order_id: 20260613-101749
+- key: faro:tracking:499487889408
+  shop: faro
+  type: tracking
+  id: '499487889408'
+  title: Trasportino per animali
+  status: Consegnato
+  date: '2026-09-12'
+  carrier: Trasporti Faro
+  order_id: 20260910-101802
+- key: faro:tracking:573242036959
+  shop: faro
+  type: tracking
+  id: '573242036959'
+  title: Hub USB-C multiporta
+  status: Spedito
+  date: '2026-05-20'
+  carrier: Corriere Lampo
+  order_id: 20260517-101855
+- key: faro:tracking:371131988389
+  shop: faro
+  type: tracking
+  id: '371131988389'
+  title: Lanterna LED ricaricabile
+  status: Consegnato
+  date: '2026-09-08'
+  carrier: Corriere Lampo
+  order_id: 20260905-101908
+- key: faro:tracking:490989864790
+  shop: faro
+  type: tracking
+  id: '490989864790'
+  title: Hub USB-C multiporta
+  status: Consegnato
+  date: '2026-08-21'
+  carrier: Corriere Lampo
+  order_id: 20260820-102067
+- key: ribeira:goods:PT10037
+  shop: ribeira
+  type: goods
+  id: PT10037
+  title: Espuma de limpeza de pH baixo
+  concept: skincare
+  status: À venda
+  price: 10.5
+  date: '2026-05-24'
+- key: ribeira:goods:PT10074
+  shop: ribeira
+  type: goods
+  id: PT10074
+  title: Essência reparadora para cabelo
+  concept: skincare
+  status: Rascunho
+  price: 12.5
+  date: '2026-07-15'
+- key: ribeira:goods:PT10111
+  shop: ribeira
+  type: goods
+  id: PT10111
+  title: Suporte elevatório para monitor
+  concept: desk_work
+  status: À venda
+  price: 26.95
+  date: '2026-01-20'
+- key: ribeira:goods:PT10148
+  shop: ribeira
+  type: goods
+  id: PT10148
+  title: Organizador de documentos
+  concept: desk_work
+  status: À venda
+  price: 8.9
+  date: '2026-04-16'
+- key: ribeira:goods:PT10185
+  shop: ribeira
+  type: goods
+  id: PT10185
+  title: Kit de robô de programação
+  concept: kids
+  status: À venda
+  price: 52.5
+  date: '2026-02-15'
+- key: ribeira:goods:PT10222
+  shop: ribeira
+  type: goods
+  id: PT10222
+  title: Bastões de caminhada dobráveis
+  concept: outdoor
+  status: Esgotado
+  price: 34.55
+  date: '2026-05-06'
+- key: ribeira:goods:PT10259
+  shop: ribeira
+  type: goods
+  id: PT10259
+  title: Concentrado de café cold brew
+  concept: snack_food
+  status: Rascunho
+  price: 11.4
+  date: '2026-02-18'
+- key: ribeira:goods:PT10296
+  shop: ribeira
+  type: goods
+  id: PT10296
+  title: Escova de tosquia para animais
+  concept: pet
+  status: À venda
+  price: 8.85
+  date: '2026-06-22'
+- key: ribeira:goods:PT10333
+  shop: ribeira
+  type: goods
+  id: PT10333
+  title: Lanterna LED recarregável
+  concept: outdoor
+  status: Rascunho
+  price: 18.4
+  date: '2026-03-06'
+- key: ribeira:goods:PT10370
+  shop: ribeira
+  type: goods
+  id: PT10370
+  title: Caixa organizadora de cabos
+  concept: desk_work
+  status: À venda
+  price: 10.5
+  date: '2026-07-06'
+- key: ribeira:goods:PT10407
+  shop: ribeira
+  type: goods
+  id: PT10407
+  title: Manta de microfibra
+  concept: cold_weather
+  status: Esgotado
+  price: 16.3
+  date: '2026-04-29'
+- key: ribeira:goods:PT10444
+  shop: ribeira
+  type: goods
+  id: PT10444
+  title: Rato vertical ergonómico
+  concept: desk_work
+  status: Rascunho
+  price: 27.25
+  date: '2026-05-27'
+- key: ribeira:goods:PT10481
+  shop: ribeira
+  type: goods
+  id: PT10481
+  title: Powerbank de grande capacidade
+  concept: audio_power
+  status: Rascunho
+  price: 26.3
+  date: '2026-04-02'
+- key: ribeira:goods:PT10518
+  shop: ribeira
+  type: goods
+  id: PT10518
+  title: Auriculares sem fios com cancelamento de ruído
+  concept: audio_power
+  status: À venda
+  price: 83.6
+  date: '2026-05-23'
+- key: ribeira:goods:PT10555
+  shop: ribeira
+  type: goods
+  id: PT10555
+  title: Barra proteica com pouco açúcar
+  concept: snack_food
+  status: À venda
+  price: 16.85
+  date: '2026-04-05'
+- key: ribeira:goods:PT10592
+  shop: ribeira
+  type: goods
+  id: PT10592
+  title: Conjunto de utensílios de silicone
+  concept: cooking
+  status: À venda
+  price: 19.3
+  date: '2026-09-12'
+- key: ribeira:goods:PT10629
+  shop: ribeira
+  type: goods
+  id: PT10629
+  title: Ração hipoalergénica
+  concept: pet
+  status: À venda
+  price: 25.65
+  date: '2026-03-06'
+- key: ribeira:goods:PT10666
+  shop: ribeira
+  type: goods
+  id: PT10666
+  title: Conjunto de loiça infantil
+  concept: kids
+  status: À venda
+  price: 16.75
+  date: '2026-01-09'
+- key: ribeira:goods:PT10703
+  shop: ribeira
+  type: goods
+  id: PT10703
+  title: Trotinete infantil
+  concept: kids
+  status: Esgotado
+  price: 43.8
+  date: '2026-01-20'
+- key: ribeira:goods:PT10740
+  shop: ribeira
+  type: goods
+  id: PT10740
+  title: Pulseira de atividade inteligente
+  concept: audio_power
+  status: À venda
+  price: 36.9
+  date: '2026-05-09'
+- key: ribeira:goods:PT10777
+  shop: ribeira
+  type: goods
+  id: PT10777
+  title: Comedouro automático
+  concept: pet
+  status: Esgotado
+  price: 54.2
+  date: '2026-08-31'
+- key: ribeira:goods:PT10814
+  shop: ribeira
+  type: goods
+  id: PT10814
+  title: Peitoral para cão
+  concept: pet
+  status: À venda
+  price: 16.5
+  date: '2026-05-16'
+- key: ribeira:goods:PT10851
+  shop: ribeira
+  type: goods
+  id: PT10851
+  title: Coelhinho de peluche
+  concept: kids
+  status: À venda
+  price: 14.85
+  date: '2026-02-24'
+- key: ribeira:goods:PT10888
+  shop: ribeira
+  type: goods
+  id: PT10888
+  title: Conjunto de cozinha portátil
+  concept: outdoor
+  status: À venda
+  price: 29.7
+  date: '2026-07-13'
+- key: ribeira:order:20260625-100053
+  shop: ribeira
+  type: order
+  id: 20260625-100053
+  title: Manta de microfibra
+  status: Em processamento
+  amount: 210.05
+  date: '2026-06-25'
+  buyer: Rafael Martins
+  tracking: null
+  goods_ids:
+  - PT10407
+  - PT11332
+- key: ribeira:order:20260929-100106
+  shop: ribeira
+  type: order
+  id: 20260929-100106
+  title: Aquecedor de mãos recarregável
+  status: Enviado
+  amount: 122.0
+  date: '2026-09-29'
+  buyer: João Fernandes
+  tracking: '237367738412'
+  goods_ids:
+  - PT11073
+  - PT11406
+- key: ribeira:order:20260401-100159
+  shop: ribeira
+  type: order
+  id: 20260401-100159
+  title: Frigideira de aço inoxidável
+  status: Cancelado
+  amount: 185.25
+  date: '2026-04-01'
+  buyer: Rafael Rodrigues
+  tracking: null
+  goods_ids:
+  - PT11517
+- key: ribeira:order:20260909-100212
+  shop: ribeira
+  type: order
+  id: 20260909-100212
+  title: Pulseira de atividade inteligente
+  status: Devolvido
+  amount: 73.8
+  date: '2026-09-09'
+  buyer: Rodrigo Costa
+  tracking: '755149486673'
+  goods_ids:
+  - PT10740
+- key: ribeira:order:20260527-100265
+  shop: ribeira
+  type: order
+  id: 20260527-100265
+  title: Fita refrescante para o pescoço
+  status: Em processamento
+  amount: 100.55
+  date: '2026-05-27'
+  buyer: Rafael Ferreira
+  tracking: null
+  goods_ids:
+  - PT11221
+  - PT10333
+- key: ribeira:order:20260619-100318
+  shop: ribeira
+  type: order
+  id: 20260619-100318
+  title: Comedouro automático
+  status: Devolvido
+  amount: 558.1
+  date: '2026-06-19'
+  buyer: Rodrigo Fernandes
+  tracking: '502276797313'
+  goods_ids:
+  - PT10777
+  - PT10518
+  - PT10925
+- key: ribeira:order:20260905-100371
+  shop: ribeira
+  type: order
+  id: 20260905-100371
+  title: Barra proteica com pouco açúcar
+  status: Devolvido
+  amount: 17.22
+  date: '2026-09-05'
+  buyer: Mariana Ferreira
+  tracking: '732793469328'
+  goods_ids:
+  - PT10555
+- key: ribeira:order:20260708-100424
+  shop: ribeira
+  type: order
+  id: 20260708-100424
+  title: Manta de microfibra
+  status: Entregue
+  amount: 109.4
+  date: '2026-07-08'
+  buyer: Carolina Santos
+  tracking: '612856659584'
+  goods_ids:
+  - PT10407
+  - PT11406
+- key: ribeira:order:20260725-100477
+  shop: ribeira
+  type: order
+  id: 20260725-100477
+  title: Essência reparadora para cabelo
+  status: A aguardar pagamento
+  amount: 14.55
+  date: '2026-07-25'
+  buyer: Beatriz Sousa
+  tracking: null
+  goods_ids:
+  - PT10074
+- key: ribeira:order:20261012-100530
+  shop: ribeira
+  type: order
+  id: 20261012-100530
+  title: Tenda iglu para duas pessoas
+  status: A aguardar pagamento
+  amount: 142.45
+  date: '2026-10-12'
+  buyer: Mariana Pereira
+  tracking: null
+  goods_ids:
+  - PT10999
+  - PT10111
+  - PT11073
+- key: ribeira:order:20260721-100583
+  shop: ribeira
+  type: order
+  id: 20260721-100583
+  title: Fita refrescante para o pescoço
+  status: Cancelado
+  amount: 271.53
+  date: '2026-07-21'
+  buyer: Mariana Fernandes
+  tracking: null
+  goods_ids:
+  - PT11221
+  - PT10592
+  - PT10999
+- key: ribeira:order:20260625-100636
+  shop: ribeira
+  type: order
+  id: 20260625-100636
+  title: Casaco de pelo sherpa
+  status: Cancelado
+  amount: 68.13
+  date: '2026-06-25'
+  buyer: Sofia Pereira
+  tracking: null
+  goods_ids:
+  - PT11184
+- key: ribeira:order:20260414-100689
+  shop: ribeira
+  type: order
+  id: 20260414-100689
+  title: Essência reparadora para cabelo
+  status: Entregue
+  amount: 14.55
+  date: '2026-04-14'
+  buyer: Tiago Silva
+  tracking: '805390762420'
+  goods_ids:
+  - PT10074
+- key: ribeira:order:20260811-100742
+  shop: ribeira
+  type: order
+  id: 20260811-100742
+  title: Organizador de documentos
+  status: A aguardar pagamento
+  amount: 37.2
+  date: '2026-08-11'
+  buyer: Rafael Sousa
+  tracking: null
+  goods_ids:
+  - PT10148
+  - PT10370
+- key: ribeira:order:20260421-100795
+  shop: ribeira
+  type: order
+  id: 20260421-100795
+  title: Escova de tosquia para animais
+  status: A aguardar pagamento
+  amount: 28.6
+  date: '2026-04-21'
+  buyer: Rafael Santos
+  tracking: null
+  goods_ids:
+  - PT10296
+- key: ribeira:order:20260627-100848
+  shop: ribeira
+  type: order
+  id: 20260627-100848
+  title: Peitoral para cão
+  status: Em processamento
+  amount: 27.1
+  date: '2026-06-27'
+  buyer: Rodrigo Silva
+  tracking: null
+  goods_ids:
+  - PT10814
+  - PT11221
+- key: ribeira:order:20260902-100901
+  shop: ribeira
+  type: order
+  id: 20260902-100901
+  title: Caixa organizadora de cabos
+  status: A aguardar pagamento
+  amount: 20.95
+  date: '2026-09-02'
+  buyer: Rafael Silva
+  tracking: null
+  goods_ids:
+  - PT10370
+- key: ribeira:order:20260517-100954
+  shop: ribeira
+  type: order
+  id: 20260517-100954
+  title: Caixa organizadora de cabos
+  status: Pago
+  amount: 30.4
+  date: '2026-05-17'
+  buyer: Diogo Ferreira
+  tracking: null
+  goods_ids:
+  - PT10370
+- key: ribeira:order:20260415-101007
+  shop: ribeira
+  type: order
+  id: 20260415-101007
+  title: Espuma de limpeza de pH baixo
+  status: Enviado
+  amount: 12.55
+  date: '2026-04-15'
+  buyer: Leonor Oliveira
+  tracking: '798201885973'
+  goods_ids:
+  - PT10037
+- key: ribeira:order:20260514-101060
+  shop: ribeira
+  type: order
+  id: 20260514-101060
+  title: Coelhinho de peluche
+  status: Entregue
+  amount: 73.44
+  date: '2026-05-14'
+  buyer: Mariana Santos
+  tracking: '150437485746'
+  goods_ids:
+  - PT10851
+  - PT11517
+- key: ribeira:order:20260710-101113
+  shop: ribeira
+  type: order
+  id: 20260710-101113
+  title: Sérum de vitamina C
+  status: Enviado
+  amount: 143.0
+  date: '2026-07-10'
+  buyer: Rodrigo Rodrigues
+  tracking: '968748245525'
+  goods_ids:
+  - PT11443
+- key: ribeira:order:20260921-101166
+  shop: ribeira
+  type: order
+  id: 20260921-101166
+  title: Trotinete infantil
+  status: Entregue
+  amount: 60.3
+  date: '2026-09-21'
+  buyer: Rodrigo Fernandes
+  tracking: '189549122458'
+  goods_ids:
+  - PT10703
+  - PT10814
+- key: ribeira:order:20260815-101219
+  shop: ribeira
+  type: order
+  id: 20260815-101219
+  title: Coelhinho de peluche
+  status: Em processamento
+  amount: 52.7
+  date: '2026-08-15'
+  buyer: João Rodrigues
+  tracking: null
+  goods_ids:
+  - PT10851
+  - PT11184
+- key: ribeira:order:20260801-101272
+  shop: ribeira
+  type: order
+  id: 20260801-101272
+  title: Suporte para portátil
+  status: Enviado
+  amount: 47.79
+  date: '2026-08-01'
+  buyer: Leonor Pereira
+  tracking: '267950839942'
+  goods_ids:
+  - PT11110
+  - PT11554
+  - PT10037
+- key: ribeira:tracking:237367738412
+  shop: ribeira
+  type: tracking
+  id: '237367738412'
+  title: Aquecedor de mãos recarregável
+  status: Enviado
+  date: '2026-09-30'
+  carrier: Encomendas Ribeira
+  order_id: 20260929-100106
+- key: ribeira:tracking:755149486673
+  shop: ribeira
+  type: tracking
+  id: '755149486673'
+  title: Pulseira de atividade inteligente
+  status: Devolvido
+  date: '2026-09-10'
+  carrier: Transportes Atlântico
+  order_id: 20260909-100212
+- key: ribeira:tracking:502276797313
+  shop: ribeira
+  type: tracking
+  id: '502276797313'
+  title: Comedouro automático
+  status: Devolvido
+  date: '2026-06-20'
+  carrier: Correio Ligeiro
+  order_id: 20260619-100318
+- key: ribeira:tracking:732793469328
+  shop: ribeira
+  type: tracking
+  id: '732793469328'
+  title: Barra proteica com pouco açúcar
+  status: Devolvido
+  date: '2026-09-06'
+  carrier: Expresso Douro
+  order_id: 20260905-100371
+- key: ribeira:tracking:612856659584
+  shop: ribeira
+  type: tracking
+  id: '612856659584'
+  title: Manta de microfibra
+  status: Entregue
+  date: '2026-07-11'
+  carrier: Correio Ligeiro
+  order_id: 20260708-100424
+- key: ribeira:tracking:805390762420
+  shop: ribeira
+  type: tracking
+  id: '805390762420'
+  title: Essência reparadora para cabelo
+  status: Entregue
+  date: '2026-04-15'
+  carrier: Transportes Atlântico
+  order_id: 20260414-100689
+- key: ribeira:tracking:798201885973
+  shop: ribeira
+  type: tracking
+  id: '798201885973'
+  title: Espuma de limpeza de pH baixo
+  status: Enviado
+  date: '2026-04-18'
+  carrier: Transportes Atlântico
+  order_id: 20260415-101007
+- key: ribeira:tracking:150437485746
+  shop: ribeira
+  type: tracking
+  id: '150437485746'
+  title: Coelhinho de peluche
+  status: Entregue
+  date: '2026-05-18'
+  carrier: Correio Ligeiro
+  order_id: 20260514-101060
+- key: ribeira:tracking:968748245525
+  shop: ribeira
+  type: tracking
+  id: '968748245525'
+  title: Sérum de vitamina C
+  status: Enviado
+  date: '2026-07-13'
+  carrier: Encomendas Ribeira
+  order_id: 20260710-101113
+- key: ribeira:tracking:189549122458
+  shop: ribeira
+  type: tracking
+  id: '189549122458'
+  title: Trotinete infantil
+  status: Entregue
+  date: '2026-09-22'
+  carrier: Encomendas Ribeira
+  order_id: 20260921-101166
+- key: ribeira:tracking:267950839942
+  shop: ribeira
+  type: tracking
+  id: '267950839942'
+  title: Suporte para portátil
+  status: Enviado
+  date: '2026-08-04'
+  carrier: Expresso Douro
+  order_id: 20260801-101272
+- key: ribeira:tracking:364990141865
+  shop: ribeira
+  type: tracking
+  id: '364990141865'
+  title: Sandálias arejadas
+  status: Entregue
+  date: '2026-07-06'
+  carrier: Encomendas Ribeira
+  order_id: 20260704-101378
+- key: ribeira:tracking:861227573677
+  shop: ribeira
+  type: tracking
+  id: '861227573677'
+  title: Casaco de pelo sherpa
+  status: Entregue
+  date: '2026-06-14'
+  carrier: Expresso Douro
+  order_id: 20260611-101431
+- key: ribeira:tracking:646321156157
+  shop: ribeira
+  type: tracking
+  id: '646321156157'
+  title: Coluna Bluetooth à prova de água
+  status: Enviado
+  date: '2026-06-21'
+  carrier: Expresso Douro
+  order_id: 20260619-101484
+- key: ribeira:tracking:707505842788
+  shop: ribeira
+  type: tracking
+  id: '707505842788'
+  title: Trotinete infantil
+  status: Entregue
+  date: '2026-05-27'
+  carrier: Correio Ligeiro
+  order_id: 20260526-101696
+- key: ribeira:tracking:564930720580
+  shop: ribeira
+  type: tracking
+  id: '564930720580'
+  title: Conjunto de utensílios de silicone
+  status: Entregue
+  date: '2026-07-09'
+  carrier: Encomendas Ribeira
+  order_id: 20260707-101749
+- key: ribeira:tracking:942042628306
+  shop: ribeira
+  type: tracking
+  id: '942042628306'
+  title: Manta de microfibra
+  status: Entregue
+  date: '2026-09-18'
+  carrier: Transportes Atlântico
+  order_id: 20260916-102014
+- key: ribeira:tracking:594097828143
+  shop: ribeira
+  type: tracking
+  id: '594097828143'
+  title: Essência reparadora para cabelo
+  status: Entregue
+  date: '2026-06-18'
+  carrier: Transportes Atlântico
+  order_id: 20260615-102067
+- key: ribeira:tracking:601580196890
+  shop: ribeira
+  type: tracking
+  id: '601580196890'
+  title: Suporte para portátil
+  status: Entregue
+  date: '2026-08-10'
+  carrier: Correio Ligeiro
+  order_id: 20260807-102120
+- key: ribeira:tracking:870467039833
+  shop: ribeira
+  type: tracking
+  id: '870467039833'
+  title: Colete acolchoado leve
+  status: Entregue
+  date: '2026-08-17'
+  carrier: Transportes Atlântico
+  order_id: 20260815-102279
+- key: ribeira:tracking:783444228219
+  shop: ribeira
+  type: tracking
+  id: '783444228219'
+  title: Trotinete infantil
+  status: Devolvido
+  date: '2026-10-02'
+  carrier: Correio Ligeiro
+  order_id: 20260930-102385
+- key: ribeira:tracking:608464624822
+  shop: ribeira
+  type: tracking
+  id: '608464624822'
+  title: Estaladiços de arroz integral tostado
+  status: Enviado
+  date: '2026-05-15'
+  carrier: Encomendas Ribeira
+  order_id: 20260512-102438
+- key: ribeira:tracking:807540460127
+  shop: ribeira
+  type: tracking
+  id: '807540460127'
+  title: Aquecedor de mãos recarregável
+  status: Enviado
+  date: '2026-05-23'
+  carrier: Expresso Douro
+  order_id: 20260522-102491
+- key: ribeira:tracking:244045287787
+  shop: ribeira
+  type: tracking
+  id: '244045287787'
+  title: Conjunto de loiça infantil
+  status: Enviado
+  date: '2026-07-20'
+  carrier: Expresso Douro
+  order_id: 20260717-102544
+- key: dekade:goods:NL10037
+  shop: dekade
+  type: goods
+  id: NL10037
+  title: Linnen overhemd met korte mouwen
+  concept: hot_weather
+  status: Concept
+  price: 29.4
+  date: '2026-01-25'
+- key: dekade:goods:NL10074
+  shop: dekade
+  type: goods
+  id: NL10074
+  title: Stil mechanisch toetsenbord
+  concept: desk_work
+  status: Uitverkocht
+  price: 59.3
+  date: '2026-05-17'
+- key: dekade:goods:NL10111
+  shop: dekade
+  type: goods
+  id: NL10111
+  title: Houten bouwblokken
+  concept: kids
+  status: Uitverkocht
+  price: 28.3
+  date: '2026-05-17'
+- key: dekade:goods:NL10148
+  shop: dekade
+  type: goods
+  id: NL10148
+  title: Lichte bodywarmer
+  concept: cold_weather
+  status: Actief
+  price: 44.55
+  date: '2026-07-22'
+- key: dekade:goods:NL10185
+  shop: dekade
+  type: goods
+  id: NL10185
+  title: Verzorgingsborstel voor huisdieren
+  concept: pet
+  status: Actief
+  price: 8.5
+  date: '2026-03-25'
+- key: dekade:goods:NL10222
+  shop: dekade
+  type: goods
+  id: NL10222
+  title: Krokante geroosterde zilvervliesrijst
+  concept: snack_food
+  status: Uitverkocht
+  price: 7.5
+  date: '2026-06-26'
+- key: dekade:goods:NL10259
+  shop: dekade
+  type: goods
+  id: NL10259
+  title: Monitorverhoger
+  concept: desk_work
+  status: Actief
+  price: 24.2
+  date: '2026-07-03'
+- key: dekade:goods:NL10296
+  shop: dekade
+  type: goods
+  id: NL10296
+  title: Set luchtdichte glazen bakjes
+  concept: cooking
+  status: Actief
+  price: 21.7
+  date: '2026-08-02'
+- key: dekade:goods:NL10333
+  shop: dekade
+  type: goods
+  id: NL10333
+  title: Kinderservies
+  concept: kids
+  status: Concept
+  price: 19.4
+  date: '2026-01-14'
+- key: dekade:goods:NL10370
+  shop: dekade
+  type: goods
+  id: NL10370
+  title: Opvouwbare wandelstokken
+  concept: outdoor
+  status: Uitverkocht
+  price: 36.75
+  date: '2026-03-27'
+- key: dekade:goods:NL10407
+  shop: dekade
+  type: goods
+  id: NL10407
+  title: Minerale zonnebrandcrème
+  concept: skincare
+  status: Uitverkocht
+  price: 18.35
+  date: '2026-07-22'
+- key: dekade:goods:NL10444
+  shop: dekade
+  type: goods
+  id: NL10444
+  title: Documentenorganizer
+  concept: desk_work
+  status: Actief
+  price: 10.05
+  date: '2026-02-04'
+- key: dekade:goods:NL10481
+  shop: dekade
+  type: goods
+  id: NL10481
+  title: Vacuümgeïsoleerde thermobeker
+  concept: outdoor
+  status: Uitverkocht
+  price: 15.85
+  date: '2026-05-28'
+- key: dekade:goods:NL10518
+  shop: dekade
+  type: goods
+  id: NL10518
+  title: Slimme activiteitentracker
+  concept: audio_power
+  status: Actief
+  price: 32.9
+  date: '2026-02-19'
+- key: dekade:goods:NL10555
+  shop: dekade
+  type: goods
+  id: NL10555
+  title: Geroosterde amandelen
+  concept: snack_food
+  status: Actief
+  price: 8.7
+  date: '2026-08-16'
+- key: dekade:goods:NL10592
+  shop: dekade
+  type: goods
+  id: NL10592
+  title: Pluche pantoffels
+  concept: cold_weather
+  status: Concept
+  price: 13.25
+  date: '2026-02-18'
+- key: dekade:goods:NL10629
+  shop: dekade
+  type: goods
+  id: NL10629
+  title: Biologische granola
+  concept: snack_food
+  status: Uitverkocht
+  price: 9.8
+  date: '2026-04-01'
+- key: dekade:goods:NL10666
+  shop: dekade
+  type: goods
+  id: NL10666
+  title: Krabpaal
+  concept: pet
+  status: Uitverkocht
+  price: 12.35
+  date: '2026-05-31'
+- key: dekade:goods:NL10703
+  shop: dekade
+  type: goods
+  id: NL10703
+  title: Waterkoker met temperatuurregeling
+  concept: cooking
+  status: Actief
+  price: 30.7
+  date: '2026-07-20'
+- key: dekade:goods:NL10740
+  shop: dekade
+  type: goods
+  id: NL10740
+  title: Oplaadbare handwarmer
+  concept: cold_weather
+  status: Concept
+  price: 16.85
+  date: '2026-04-14'
+- key: dekade:goods:NL10777
+  shop: dekade
+  type: goods
+  id: NL10777
+  title: Snellader van 65 W
+  concept: audio_power
+  status: Actief
+  price: 24.35
+  date: '2026-07-22'
+- key: dekade:goods:NL10814
+  shop: dekade
+  type: goods
+  id: NL10814
+  title: Reinigingsschuim met lage pH
+  concept: skincare
+  status: Uitverkocht
+  price: 10.55
+  date: '2026-07-14'
+- key: dekade:goods:NL10851
+  shop: dekade
+  type: goods
+  id: NL10851
+  title: Zonneparaplu met UV-bescherming
+  concept: hot_weather
+  status: Uitverkocht
+  price: 20.5
+  date: '2026-07-11'
+- key: dekade:goods:NL10888
+  shop: dekade
+  type: goods
+  id: NL10888
+  title: Herstellende haaressence
+  concept: skincare
+  status: Actief
+  price: 12.95
+  date: '2026-06-12'
+- key: dekade:order:20260502-100053
+  shop: dekade
+  type: order
+  id: 20260502-100053
+  title: Lichte bodywarmer
+  status: Verzonden
+  amount: 159.55
+  date: '2026-05-02'
+  buyer: Emma Jansen
+  tracking: '173660812230'
+  goods_ids:
+  - NL10148
+  - NL10888
+- key: dekade:order:20260404-100106
+  shop: dekade
+  type: order
+  id: 20260404-100106
+  title: Lichte bodywarmer
+  status: Bezorgd
+  amount: 68.25
+  date: '2026-04-04'
+  buyer: Bram Visser
+  tracking: '460642418407'
+  goods_ids:
+  - NL10148
+  - NL11406
+- key: dekade:order:20260421-100159
+  shop: dekade
+  type: order
+  id: 20260421-100159
+  title: Set luchtdichte glazen bakjes
+  status: Bezorgd
+  amount: 21.58
+  date: '2026-04-21'
+  buyer: Fleur Bakker
+  tracking: '674240535101'
+  goods_ids:
+  - NL10296
+- key: dekade:order:20260519-100212
+  shop: dekade
+  type: order
+  id: 20260519-100212
+  title: Pluche pantoffels
+  status: Bezorgd
+  amount: 13.98
+  date: '2026-05-19'
+  buyer: Lotte Mulder
+  tracking: '188518492242'
+  goods_ids:
+  - NL10592
+- key: dekade:order:20260612-100265
+  shop: dekade
+  type: order
+  id: 20260612-100265
+  title: Draagbare kookset
+  status: Betaald
+  amount: 91.8
+  date: '2026-06-12'
+  buyer: Lars de Boer
+  tracking: null
+  goods_ids:
+  - NL11036
+- key: dekade:order:20260715-100318
+  shop: dekade
+  type: order
+  id: 20260715-100318
+  title: Ergonomische verticale muis
+  status: Verzonden
+  amount: 110.3
+  date: '2026-07-15'
+  buyer: Sanne Bakker
+  tracking: '736910782044'
+  goods_ids:
+  - NL11517
+  - NL10962
+  - NL10111
+- key: dekade:order:20260824-100371
+  shop: dekade
+  type: order
+  id: 20260824-100371
+  title: Automatische voerbak
+  status: Verzonden
+  amount: 49.45
+  date: '2026-08-24'
+  buyer: Jesse Bakker
+  tracking: '827150714647'
+  goods_ids:
+  - NL11480
+- key: dekade:order:20260628-100424
+  shop: dekade
+  type: order
+  id: 20260628-100424
+  title: Kinderservies
+  status: Bezorgd
+  amount: 116.6
+  date: '2026-06-28'
+  buyer: Lotte de Groot
+  tracking: '408526865618'
+  goods_ids:
+  - NL10333
+  - NL10629
+- key: dekade:order:20260916-100477
+  shop: dekade
+  type: order
+  id: 20260916-100477
+  title: Stil mechanisch toetsenbord
+  status: Bezorgd
+  amount: 126.27
+  date: '2026-09-16'
+  buyer: Thijs Meijer
+  tracking: '214506429829'
+  goods_ids:
+  - NL10074
+  - NL10296
+- key: dekade:order:20260711-100530
+  shop: dekade
+  type: order
+  id: 20260711-100530
+  title: Oplaadbare handwarmer
+  status: Geretourneerd
+  amount: 79.83
+  date: '2026-07-11'
+  buyer: Noor Visser
+  tracking: '815495466995'
+  goods_ids:
+  - NL10740
+  - NL10925
+- key: dekade:order:20260413-100583
+  shop: dekade
+  type: order
+  id: 20260413-100583
+  title: Set siliconen keukengerei
+  status: Geretourneerd
+  amount: 51.8
+  date: '2026-04-13'
+  buyer: Sanne de Vries
+  tracking: '394516776075'
+  goods_ids:
+  - NL11332
+  - NL10222
+  - NL10962
+- key: dekade:order:20260516-100636
+  shop: dekade
+  type: order
+  id: 20260516-100636
+  title: Slimme activiteitentracker
+  status: Wacht op betaling
+  amount: 69.65
+  date: '2026-05-16'
+  buyer: Emma de Groot
+  tracking: null
+  goods_ids:
+  - NL10518
+  - NL10370
+- key: dekade:order:20260725-100689
+  shop: dekade
+  type: order
+  id: 20260725-100689
+  title: Reinigingsschuim met lage pH
+  status: Bezorgd
+  amount: 11.55
+  date: '2026-07-25'
+  buyer: Thijs Meijer
+  tracking: '253386056561'
+  goods_ids:
+  - NL10814
+- key: dekade:order:20261002-100742
+  shop: dekade
+  type: order
+  id: 20261002-100742
+  title: Herstellende haaressence
+  status: Bezorgd
+  amount: 64.75
+  date: '2026-10-02'
+  buyer: Lotte Visser
+  tracking: '171472747058'
+  goods_ids:
+  - NL10888
+- key: dekade:order:20260623-100795
+  shop: dekade
+  type: order
+  id: 20260623-100795
+  title: Parfumvrije bodylotion
+  status: Bezorgd
+  amount: 56.52
+  date: '2026-06-23'
+  buyer: Thijs Meijer
+  tracking: '975799942039'
+  goods_ids:
+  - NL11073
+  - NL10888
+- key: dekade:order:20260805-100848
+  shop: dekade
+  type: order
+  id: 20260805-100848
+  title: Kleurboek
+  status: Geretourneerd
+  amount: 38.43
+  date: '2026-08-05'
+  buyer: Daan Jansen
+  tracking: '677277045812'
+  goods_ids:
+  - NL11110
+  - NL11406
+  - NL10888
+- key: dekade:order:20260522-100901
+  shop: dekade
+  type: order
+  id: 20260522-100901
+  title: Staafmixer
+  status: Verzonden
+  amount: 136.44
+  date: '2026-05-22'
+  buyer: Thijs Jansen
+  tracking: '580303850628'
+  goods_ids:
+  - NL11184
+  - NL11406
+- key: dekade:order:20260617-100954
+  shop: dekade
+  type: order
+  id: 20260617-100954
+  title: Herstellende haaressence
+  status: Bezorgd
+  amount: 15.0
+  date: '2026-06-17'
+  buyer: Fleur Visser
+  tracking: '847949005859'
+  goods_ids:
+  - NL10888
+- key: dekade:order:20260809-101007
+  shop: dekade
+  type: order
+  id: 20260809-101007
+  title: Koepeltent voor twee personen
+  status: Bezorgd
+  amount: 270.2
+  date: '2026-08-09'
+  buyer: Emma Visser
+  tracking: '684870459184'
+  goods_ids:
+  - NL11147
+  - NL11036
+  - NL10703
+- key: dekade:order:20260725-101060
+  shop: dekade
+  type: order
+  id: 20260725-101060
+  title: Kinderservies
+  status: Geannuleerd
+  amount: 180.3
+  date: '2026-07-25'
+  buyer: Jesse Meijer
+  tracking: null
+  goods_ids:
+  - NL10333
+  - NL10111
+- key: dekade:order:20260812-101113
+  shop: dekade
+  type: order
+  id: 20260812-101113
+  title: Minerale zonnebrandcrème
+  status: Verzonden
+  amount: 79.55
+  date: '2026-08-12'
+  buyer: Lotte Mulder
+  tracking: '190173761801'
+  goods_ids:
+  - NL10407
+  - NL11036
+- key: dekade:order:20260801-101166
+  shop: dekade
+  type: order
+  id: 20260801-101166
+  title: Houten bouwblokken
+  status: Verzonden
+  amount: 105.3
+  date: '2026-08-01'
+  buyer: Thijs de Boer
+  tracking: '102438716747'
+  goods_ids:
+  - NL10111
+  - NL10777
+- key: dekade:order:20260913-101219
+  shop: dekade
+  type: order
+  id: 20260913-101219
+  title: Draadloze oordopjes met ruisonderdrukking
+  status: Betaald
+  amount: 90.35
+  date: '2026-09-13'
+  buyer: Bram Bakker
+  tracking: null
+  goods_ids:
+  - NL11258
+- key: dekade:order:20261001-101272
+  shop: dekade
+  type: order
+  id: 20261001-101272
+  title: Powerbank met grote capaciteit
+  status: Wacht op betaling
+  amount: 35.15
+  date: '2026-10-01'
+  buyer: Ruben de Vries
+  tracking: null
+  goods_ids:
+  - NL11369
+  - NL10222
+- key: dekade:tracking:173660812230
+  shop: dekade
+  type: tracking
+  id: '173660812230'
+  title: Lichte bodywarmer
+  status: Verzonden
+  date: '2026-05-05'
+  carrier: Polderkoerier
+  order_id: 20260502-100053
+- key: dekade:tracking:460642418407
+  shop: dekade
+  type: tracking
+  id: '460642418407'
+  title: Lichte bodywarmer
+  status: Bezorgd
+  date: '2026-04-07'
+  carrier: Kade Pakketdienst
+  order_id: 20260404-100106
+- key: dekade:tracking:674240535101
+  shop: dekade
+  type: tracking
+  id: '674240535101'
+  title: Set luchtdichte glazen bakjes
+  status: Bezorgd
+  date: '2026-04-24'
+  carrier: Polderkoerier
+  order_id: 20260421-100159
+- key: dekade:tracking:188518492242
+  shop: dekade
+  type: tracking
+  id: '188518492242'
+  title: Pluche pantoffels
+  status: Bezorgd
+  date: '2026-05-21'
+  carrier: Duinvracht
+  order_id: 20260519-100212
+- key: dekade:tracking:736910782044
+  shop: dekade
+  type: tracking
+  id: '736910782044'
+  title: Ergonomische verticale muis
+  status: Verzonden
+  date: '2026-07-18'
+  carrier: Duinvracht
+  order_id: 20260715-100318
+- key: dekade:tracking:827150714647
+  shop: dekade
+  type: tracking
+  id: '827150714647'
+  title: Automatische voerbak
+  status: Verzonden
+  date: '2026-08-26'
+  carrier: Grachtenexpres
+  order_id: 20260824-100371
+- key: dekade:tracking:408526865618
+  shop: dekade
+  type: tracking
+  id: '408526865618'
+  title: Kinderservies
+  status: Bezorgd
+  date: '2026-06-30'
+  carrier: Duinvracht
+  order_id: 20260628-100424
+- key: dekade:tracking:214506429829
+  shop: dekade
+  type: tracking
+  id: '214506429829'
+  title: Stil mechanisch toetsenbord
+  status: Bezorgd
+  date: '2026-09-17'
+  carrier: Grachtenexpres
+  order_id: 20260916-100477
+- key: dekade:tracking:815495466995
+  shop: dekade
+  type: tracking
+  id: '815495466995'
+  title: Oplaadbare handwarmer
+  status: Geretourneerd
+  date: '2026-07-15'
+  carrier: Kade Pakketdienst
+  order_id: 20260711-100530
+- key: dekade:tracking:394516776075
+  shop: dekade
+  type: tracking
+  id: '394516776075'
+  title: Set siliconen keukengerei
+  status: Geretourneerd
+  date: '2026-04-14'
+  carrier: Polderkoerier
+  order_id: 20260413-100583
+- key: dekade:tracking:253386056561
+  shop: dekade
+  type: tracking
+  id: '253386056561'
+  title: Reinigingsschuim met lage pH
+  status: Bezorgd
+  date: '2026-07-28'
+  carrier: Grachtenexpres
+  order_id: 20260725-100689
+- key: dekade:tracking:171472747058
+  shop: dekade
+  type: tracking
+  id: '171472747058'
+  title: Herstellende haaressence
+  status: Bezorgd
+  date: '2026-10-05'
+  carrier: Polderkoerier
+  order_id: 20261002-100742
+- key: dekade:tracking:975799942039
+  shop: dekade
+  type: tracking
+  id: '975799942039'
+  title: Parfumvrije bodylotion
+  status: Bezorgd
+  date: '2026-06-25'
+  carrier: Polderkoerier
+  order_id: 20260623-100795
+- key: dekade:tracking:677277045812
+  shop: dekade
+  type: tracking
+  id: '677277045812'
+  title: Kleurboek
+  status: Geretourneerd
+  date: '2026-08-07'
+  carrier: Polderkoerier
+  order_id: 20260805-100848
+- key: dekade:tracking:580303850628
+  shop: dekade
+  type: tracking
+  id: '580303850628'
+  title: Staafmixer
+  status: Verzonden
+  date: '2026-05-25'
+  carrier: Duinvracht
+  order_id: 20260522-100901
+- key: dekade:tracking:847949005859
+  shop: dekade
+  type: tracking
+  id: '847949005859'
+  title: Herstellende haaressence
+  status: Bezorgd
+  date: '2026-06-19'
+  carrier: Polderkoerier
+  order_id: 20260617-100954
+- key: dekade:tracking:684870459184
+  shop: dekade
+  type: tracking
+  id: '684870459184'
+  title: Koepeltent voor twee personen
+  status: Bezorgd
+  date: '2026-08-10'
+  carrier: Duinvracht
+  order_id: 20260809-101007
+- key: dekade:tracking:190173761801
+  shop: dekade
+  type: tracking
+  id: '190173761801'
+  title: Minerale zonnebrandcrème
+  status: Verzonden
+  date: '2026-08-16'
+  carrier: Duinvracht
+  order_id: 20260812-101113
+- key: dekade:tracking:102438716747
+  shop: dekade
+  type: tracking
+  id: '102438716747'
+  title: Houten bouwblokken
+  status: Verzonden
+  date: '2026-08-03'
+  carrier: Duinvracht
+  order_id: 20260801-101166
+- key: dekade:tracking:547359172289
+  shop: dekade
+  type: tracking
+  id: '547359172289'
+  title: Koepeltent voor twee personen
+  status: Bezorgd
+  date: '2026-08-16'
+  carrier: Kade Pakketdienst
+  order_id: 20260813-101325
+- key: dekade:tracking:659679191178
+  shop: dekade
+  type: tracking
+  id: '659679191178'
+  title: Kleurboek
+  status: Bezorgd
+  date: '2026-05-09'
+  carrier: Duinvracht
+  order_id: 20260506-101378
+- key: dekade:tracking:983972516869
+  shop: dekade
+  type: tracking
+  id: '983972516869'
+  title: Vacuümgeïsoleerde thermobeker
+  status: Verzonden
+  date: '2026-04-09'
+  carrier: Polderkoerier
+  order_id: 20260406-101484
+- key: dekade:tracking:350721594216
+  shop: dekade
+  type: tracking
+  id: '350721594216'
+  title: Set luchtdichte glazen bakjes
+  status: Geretourneerd
+  date: '2026-04-18'
+  carrier: Grachtenexpres
+  order_id: 20260414-101537
+- key: dekade:tracking:182768707748
+  shop: dekade
+  type: tracking
+  id: '182768707748'
+  title: Krabpaal
+  status: Verzonden
+  date: '2026-05-25'
+  carrier: Duinvracht
+  order_id: 20260524-101696
+- key: ulipy:goods:CZ10037
+  shop: ulipy
+  type: goods
+  id: CZ10037
+  title: Skládací trekové hole
+  concept: outdoor
+  status: Koncept
+  price: 860
+  date: '2026-08-14'
+- key: ulipy:goods:CZ10074
+  shop: ulipy
+  type: goods
+  id: CZ10074
+  title: Škrabadlo pro kočky
+  concept: pet
+  status: V prodeji
+  price: 350
+  date: '2026-08-05'
+- key: ulipy:goods:CZ10111
+  shop: ulipy
+  type: goods
+  id: CZ10111
+  title: Ochranný hydratační krém
+  concept: skincare
+  status: V prodeji
+  price: 500
+  date: '2026-05-02'
+- key: ulipy:goods:CZ10148
+  shop: ulipy
+  type: goods
+  id: CZ10148
+  title: Omalovánky
+  concept: kids
+  status: Koncept
+  price: 150
+  date: '2026-06-21'
+- key: ulipy:goods:CZ10185
+  shop: ulipy
+  type: goods
+  id: CZ10185
+  title: Nerezová pánev
+  concept: cooking
+  status: V prodeji
+  price: 930
+  date: '2026-01-25'
+- key: ulipy:goods:CZ10222
+  shop: ulipy
+  type: goods
+  id: CZ10222
+  title: Chladicí gelová podložka
+  concept: hot_weather
+  status: Koncept
+  price: 710
+  date: '2026-04-04'
+- key: ulipy:goods:CZ10259
+  shop: ulipy
+  type: goods
+  id: CZ10259
+  title: Chladicí pásek na krk
+  concept: hot_weather
+  status: V prodeji
+  price: 190
+  date: '2026-05-08'
+- key: ulipy:goods:CZ10296
+  shop: ulipy
+  type: goods
+  id: CZ10296
+  title: Automatické krmítko
+  concept: pet
+  status: Koncept
+  price: 1260
+  date: '2026-03-29'
+- key: ulipy:goods:CZ10333
+  shop: ulipy
+  type: goods
+  id: CZ10333
+  title: Regenerační esence na vlasy
+  concept: skincare
+  status: V prodeji
+  price: 300
+  date: '2026-08-09'
+- key: ulipy:goods:CZ10370
+  shop: ulipy
+  type: goods
+  id: CZ10370
+  title: Nabíjecí ohřívač rukou
+  concept: cold_weather
+  status: V prodeji
+  price: 380
+  date: '2026-08-28'
+- key: ulipy:goods:CZ10407
+  shop: ulipy
+  type: goods
+  id: CZ10407
+  title: Plyšové bačkory
+  concept: cold_weather
+  status: V prodeji
+  price: 300
+  date: '2026-07-10'
+- key: ulipy:goods:CZ10444
+  shop: ulipy
+  type: goods
+  id: CZ10444
+  title: Sérum s vitaminem C
+  concept: skincare
+  status: Koncept
+  price: 640
+  date: '2026-02-24'
+- key: ulipy:goods:CZ10481
+  shop: ulipy
+  type: goods
+  id: CZ10481
+  title: Ergonomická vertikální myš
+  concept: desk_work
+  status: V prodeji
+  price: 780
+  date: '2026-02-19'
+- key: ulipy:goods:CZ10518
+  shop: ulipy
+  type: goods
+  id: CZ10518
+  title: Iglú stan pro dvě osoby
+  concept: outdoor
+  status: Koncept
+  price: 2330
+  date: '2026-03-02'
+- key: ulipy:goods:CZ10555
+  shop: ulipy
+  type: goods
+  id: CZ10555
+  title: Bio granola
+  concept: snack_food
+  status: V prodeji
+  price: 250
+  date: '2026-05-28'
+- key: ulipy:goods:CZ10592
+  shop: ulipy
+  type: goods
+  id: CZ10592
+  title: Lehká prošívaná vesta
+  concept: cold_weather
+  status: Vyprodáno
+  price: 1140
+  date: '2026-08-15'
+- key: ulipy:goods:CZ10629
+  shop: ulipy
+  type: goods
+  id: CZ10629
+  title: Proteinová tyčinka s nízkým obsahem cukru
+  concept: snack_food
+  status: Koncept
+  price: 350
+  date: '2026-07-14'
+- key: ulipy:goods:CZ10666
+  shop: ulipy
+  type: goods
+  id: CZ10666
+  title: Podstavec pod monitor
+  concept: desk_work
+  status: V prodeji
+  price: 590
+  date: '2026-02-14'
+- key: ulipy:goods:CZ10703
+  shop: ulipy
+  type: goods
+  id: CZ10703
+  title: Ruční mini ventilátor
+  concept: hot_weather
+  status: Koncept
+  price: 310
+  date: '2026-07-18'
+- key: ulipy:goods:CZ10740
+  shop: ulipy
+  type: goods
+  id: CZ10740
+  title: Přepravní taška pro mazlíčky
+  concept: pet
+  status: Koncept
+  price: 790
+  date: '2026-06-10'
+- key: ulipy:goods:CZ10777
+  shop: ulipy
+  type: goods
+  id: CZ10777
+  title: Kartáč na srst
+  concept: pet
+  status: Koncept
+  price: 240
+  date: '2026-03-17'
+- key: ulipy:goods:CZ10814
+  shop: ulipy
+  type: goods
+  id: CZ10814
+  title: Dřevěné stavebnicové kostky
+  concept: kids
+  status: Vyprodáno
+  price: 700
+  date: '2026-03-11'
+- key: ulipy:goods:CZ10851
+  shop: ulipy
+  type: goods
+  id: CZ10851
+  title: Minerální opalovací krém
+  concept: skincare
+  status: V prodeji
+  price: 430
+  date: '2026-08-14'
+- key: ulipy:goods:CZ10888
+  shop: ulipy
+  type: goods
+  id: CZ10888
+  title: Mikina na zip s fleecovou podšívkou
+  concept: cold_weather
+  status: V prodeji
+  price: 790
+  date: '2026-02-28'
+- key: ulipy:order:20260427-100053
+  shop: ulipy
+  type: order
+  id: 20260427-100053
+  title: Automatické krmítko
+  status: Doručeno
+  amount: 1260
+  date: '2026-04-27'
+  buyer: Lucie Procházková
+  tracking: '201307695671'
+  goods_ids:
+  - CZ10296
+- key: ulipy:order:20260921-100106
+  shop: ulipy
+  type: order
+  id: 20260921-100106
+  title: Lehká prošívaná vesta
+  status: Zpracovává se
+  amount: 1140
+  date: '2026-09-21'
+  buyer: Eva Procházková
+  tracking: null
+  goods_ids:
+  - CZ10592
+- key: ulipy:order:20260825-100159
+  shop: ulipy
+  type: order
+  id: 20260825-100159
+  title: Sérum s vitaminem C
+  status: Čeká na platbu
+  amount: 1458
+  date: '2026-08-25'
+  buyer: Veronika Novotná
+  tracking: null
+  goods_ids:
+  - CZ10444
+  - CZ11332
+- key: ulipy:order:20260822-100212
+  shop: ulipy
+  type: order
+  id: 20260822-100212
+  title: Minerální opalovací krém
+  status: Odesláno
+  amount: 5400
+  date: '2026-08-22'
+  buyer: Jan Kučera
+  tracking: '400828234978'
+  goods_ids:
+  - CZ10851
+  - CZ10185
+  - CZ11110
+- key: ulipy:order:20260613-100265
+  shop: ulipy
+  type: order
+  id: 20260613-100265
+  title: Rychlonabíječka 65 W
+  status: Zrušeno
+  amount: 972
+  date: '2026-06-13'
+  buyer: Tomáš Novák
+  tracking: null
+  goods_ids:
+  - CZ11258
+- key: ulipy:order:20260603-100318
+  shop: ulipy
+  type: order
+  id: 20260603-100318
+  title: Nerezová pánev
+  status: Doručeno
+  amount: 837
+  date: '2026-06-03'
+  buyer: Lukáš Novák
+  tracking: '958122719875'
+  goods_ids:
+  - CZ10185
+- key: ulipy:order:20260712-100371
+  shop: ulipy
+  type: order
+  id: 20260712-100371
+  title: Sada silikonového náčiní
+  status: Odesláno
+  amount: 1470
+  date: '2026-07-12'
+  buyer: Lukáš Procházka
+  tracking: '224585497921'
+  goods_ids:
+  - CZ11110
+- key: ulipy:order:20260702-100424
+  shop: ulipy
+  type: order
+  id: 20260702-100424
+  title: Bio granola
+  status: Odesláno
+  amount: 2150
+  date: '2026-07-02'
+  buyer: Jan Novotný
+  tracking: '238946220121'
+  goods_ids:
+  - CZ10555
+  - CZ10370
+- key: ulipy:order:20260517-100477
+  shop: ulipy
+  type: order
+  id: 20260517-100477
+  title: Škrabadlo pro kočky
+  status: Čeká na platbu
+  amount: 1110
+  date: '2026-05-17'
+  buyer: Lukáš Kučera
+  tracking: null
+  goods_ids:
+  - CZ10074
+  - CZ10925
+- key: ulipy:order:20260706-100530
+  shop: ulipy
+  type: order
+  id: 20260706-100530
+  title: Rychlonabíječka 65 W
+  status: Zaplaceno
+  amount: 1080
+  date: '2026-07-06'
+  buyer: Veronika Svobodová
+  tracking: null
+  goods_ids:
+  - CZ11258
+- key: ulipy:order:20260513-100583
+  shop: ulipy
+  type: order
+  id: 20260513-100583
+  title: Postroj pro psa
+  status: Zrušeno
+  amount: 3440
+  date: '2026-05-13'
+  buyer: Eva Nováková
+  tracking: null
+  goods_ids:
+  - CZ10925
+  - CZ11369
+  - CZ11443
+- key: ulipy:order:20261010-100636
+  shop: ulipy
+  type: order
+  id: 20261010-100636
+  title: Přepravní taška pro mazlíčky
+  status: Zrušeno
+  amount: 4790
+  date: '2026-10-10'
+  buyer: Lucie Kučerová
+  tracking: null
+  goods_ids:
+  - CZ10740
+  - CZ11480
+- key: ulipy:order:20260617-100689
+  shop: ulipy
+  type: order
+  id: 20260617-100689
+  title: Postroj pro psa
+  status: Zaplaceno
+  amount: 3380
+  date: '2026-06-17'
+  buyer: Petra Kučerová
+  tracking: null
+  goods_ids:
+  - CZ10925
+  - CZ11517
+  - CZ11443
+- key: ulipy:order:20260528-100742
+  shop: ulipy
+  type: order
+  id: 20260528-100742
+  title: Voděodolný Bluetooth reproduktor
+  status: Doručeno
+  amount: 1070
+  date: '2026-05-28'
+  buyer: Tereza Svobodová
+  tracking: '388827306797'
+  goods_ids:
+  - CZ11480
+- key: ulipy:order:20261003-100795
+  shop: ulipy
+  type: order
+  id: 20261003-100795
+  title: Plyšové bačkory
+  status: Doručeno
+  amount: 1500
+  date: '2026-10-03'
+  buyer: Kateřina Nováková
+  tracking: '558604180478'
+  goods_ids:
+  - CZ10407
+- key: ulipy:order:20260626-100848
+  shop: ulipy
+  type: order
+  id: 20260626-100848
+  title: Přepravní taška pro mazlíčky
+  status: Zpracovává se
+  amount: 840
+  date: '2026-06-26'
+  buyer: Lucie Nováková
+  tracking: null
+  goods_ids:
+  - CZ10740
+- key: ulipy:order:20260816-100901
+  shop: ulipy
+  type: order
+  id: 20260816-100901
+  title: Tichá mechanická klávesnice
+  status: Odesláno
+  amount: 4185
+  date: '2026-08-16'
+  buyer: Eva Svobodová
+  tracking: '722416942469'
+  goods_ids:
+  - CZ11147
+  - CZ10074
+- key: ulipy:order:20260818-100954
+  shop: ulipy
+  type: order
+  id: 20260818-100954
+  title: Automatické krmítko
+  status: Doručeno
+  amount: 3860
+  date: '2026-08-18'
+  buyer: Tomáš Horák
+  tracking: '902813324294'
+  goods_ids:
+  - CZ10296
+  - CZ11406
+- key: ulipy:order:20260803-101007
+  shop: ulipy
+  type: order
+  id: 20260803-101007
+  title: Nabíjecí ohřívač rukou
+  status: Vráceno
+  amount: 710
+  date: '2026-08-03'
+  buyer: Petr Dvořák
+  tracking: '714049381381'
+  goods_ids:
+  - CZ10370
+  - CZ11369
+- key: ulipy:order:20260902-101060
+  shop: ulipy
+  type: order
+  id: 20260902-101060
+  title: Ruční mini ventilátor
+  status: Zpracovává se
+  amount: 670
+  date: '2026-09-02'
+  buyer: Tereza Svobodová
+  tracking: null
+  goods_ids:
+  - CZ10703
+- key: ulipy:order:20260417-101113
+  shop: ulipy
+  type: order
+  id: 20260417-101113
+  title: Sérum s vitaminem C
+  status: Odesláno
+  amount: 3114
+  date: '2026-04-17'
+  buyer: Jakub Dvořák
+  tracking: '593676324904'
+  goods_ids:
+  - CZ10444
+  - CZ11036
+- key: ulipy:order:20260716-101166
+  shop: ulipy
+  type: order
+  id: 20260716-101166
+  title: Mikina na zip s fleecovou podšívkou
+  status: Zaplaceno
+  amount: 761
+  date: '2026-07-16'
+  buyer: Tomáš Dvořák
+  tracking: null
+  goods_ids:
+  - CZ10888
+- key: ulipy:order:20260519-101219
+  shop: ulipy
+  type: order
+  id: 20260519-101219
+  title: Mikina na zip s fleecovou podšívkou
+  status: Zaplaceno
+  amount: 4851
+  date: '2026-05-19'
+  buyer: Petra Svobodová
+  tracking: null
+  goods_ids:
+  - CZ10888
+  - CZ10814
+  - CZ10444
+- key: ulipy:order:20260523-101272
+  shop: ulipy
+  type: order
+  id: 20260523-101272
+  title: Chladicí pásek na krk
+  status: Odesláno
+  amount: 1030
+  date: '2026-05-23'
+  buyer: Petr Novotný
+  tracking: '271190590801'
+  goods_ids:
+  - CZ10259
+  - CZ11369
+- key: ulipy:tracking:201307695671
+  shop: ulipy
+  type: tracking
+  id: '201307695671'
+  title: Automatické krmítko
+  status: Doručeno
+  date: '2026-04-29'
+  carrier: Morava náklad
+  order_id: 20260427-100053
+- key: ulipy:tracking:400828234978
+  shop: ulipy
+  type: tracking
+  id: '400828234978'
+  title: Minerální opalovací krém
+  status: Odesláno
+  date: '2026-08-23'
+  carrier: Morava náklad
+  order_id: 20260822-100212
+- key: ulipy:tracking:958122719875
+  shop: ulipy
+  type: tracking
+  id: '958122719875'
+  title: Nerezová pánev
+  status: Doručeno
+  date: '2026-06-04'
+  carrier: Morava náklad
+  order_id: 20260603-100318
+- key: ulipy:tracking:224585497921
+  shop: ulipy
+  type: tracking
+  id: '224585497921'
+  title: Sada silikonového náčiní
+  status: Odesláno
+  date: '2026-07-14'
+  carrier: Lipová přeprava
+  order_id: 20260712-100371
+- key: ulipy:tracking:238946220121
+  shop: ulipy
+  type: tracking
+  id: '238946220121'
+  title: Bio granola
+  status: Odesláno
+  date: '2026-07-04'
+  carrier: Kurýr Petřín
+  order_id: 20260702-100424
+- key: ulipy:tracking:388827306797
+  shop: ulipy
+  type: tracking
+  id: '388827306797'
+  title: Voděodolný Bluetooth reproduktor
+  status: Doručeno
+  date: '2026-05-31'
+  carrier: Kurýr Petřín
+  order_id: 20260528-100742
+- key: ulipy:tracking:558604180478
+  shop: ulipy
+  type: tracking
+  id: '558604180478'
+  title: Plyšové bačkory
+  status: Doručeno
+  date: '2026-10-04'
+  carrier: Kurýr Petřín
+  order_id: 20261003-100795
+- key: ulipy:tracking:722416942469
+  shop: ulipy
+  type: tracking
+  id: '722416942469'
+  title: Tichá mechanická klávesnice
+  status: Odesláno
+  date: '2026-08-18'
+  carrier: Morava náklad
+  order_id: 20260816-100901
+- key: ulipy:tracking:902813324294
+  shop: ulipy
+  type: tracking
+  id: '902813324294'
+  title: Automatické krmítko
+  status: Doručeno
+  date: '2026-08-21'
+  carrier: Kurýr Petřín
+  order_id: 20260818-100954
+- key: ulipy:tracking:714049381381
+  shop: ulipy
+  type: tracking
+  id: '714049381381'
+  title: Nabíjecí ohřívač rukou
+  status: Vráceno
+  date: '2026-08-05'
+  carrier: Kurýr Petřín
+  order_id: 20260803-101007
+- key: ulipy:tracking:593676324904
+  shop: ulipy
+  type: tracking
+  id: '593676324904'
+  title: Sérum s vitaminem C
+  status: Odesláno
+  date: '2026-04-19'
+  carrier: Tři řeky expres
+  order_id: 20260417-101113
+- key: ulipy:tracking:271190590801
+  shop: ulipy
+  type: tracking
+  id: '271190590801'
+  title: Chladicí pásek na krk
+  status: Odesláno
+  date: '2026-05-25'
+  carrier: Lipová přeprava
+  order_id: 20260523-101272
+- key: ulipy:tracking:465691848945
+  shop: ulipy
+  type: tracking
+  id: '465691848945'
+  title: Ergonomická vertikální myš
+  status: Vráceno
+  date: '2026-05-04'
+  carrier: Tři řeky expres
+  order_id: 20260503-101325
+- key: ulipy:tracking:819506185975
+  shop: ulipy
+  type: tracking
+  id: '819506185975'
+  title: Dětská koloběžka
+  status: Vráceno
+  date: '2026-06-28'
+  carrier: Kurýr Petřín
+  order_id: 20260627-101431
+- key: ulipy:tracking:412329645333
+  shop: ulipy
+  type: tracking
+  id: '412329645333'
+  title: Postroj pro psa
+  status: Doručeno
+  date: '2026-05-10'
+  carrier: Lipová přeprava
+  order_id: 20260508-101484
+- key: ulipy:tracking:267171322320
+  shop: ulipy
+  type: tracking
+  id: '267171322320'
+  title: Tichá mechanická klávesnice
+  status: Odesláno
+  date: '2026-05-06'
+  carrier: Morava náklad
+  order_id: 20260503-101537
+- key: ulipy:tracking:850061431173
+  shop: ulipy
+  type: tracking
+  id: '850061431173'
+  title: Škrabadlo pro kočky
+  status: Doručeno
+  date: '2026-09-11'
+  carrier: Tři řeky expres
+  order_id: 20260909-101643
+- key: ulipy:tracking:712886015346
+  shop: ulipy
+  type: tracking
+  id: '712886015346'
+  title: Automatické krmítko
+  status: Odesláno
+  date: '2026-04-17'
+  carrier: Tři řeky expres
+  order_id: 20260414-101749
+- key: ulipy:tracking:353235903072
+  shop: ulipy
+  type: tracking
+  id: '353235903072'
+  title: Dřevěné stavebnicové kostky
+  status: Doručeno
+  date: '2026-10-09'
+  carrier: Kurýr Petřín
+  order_id: 20261005-101855
+- key: ulipy:tracking:709342405274
+  shop: ulipy
+  type: tracking
+  id: '709342405274'
+  title: Nerezová pánev
+  status: Doručeno
+  date: '2026-08-20'
+  carrier: Morava náklad
+  order_id: 20260819-101961
+- key: ulipy:tracking:677923632326
+  shop: ulipy
+  type: tracking
+  id: '677923632326'
+  title: Mandarinkový džus z ostrova Čedžu
+  status: Doručeno
+  date: '2026-08-05'
+  carrier: Tři řeky expres
+  order_id: 20260801-102014
+- key: ulipy:tracking:667102552166
+  shop: ulipy
+  type: tracking
+  id: '667102552166'
+  title: Rychlonabíječka 65 W
+  status: Doručeno
+  date: '2026-05-02'
+  carrier: Morava náklad
+  order_id: 20260430-102067
+- key: ulipy:tracking:744147693572
+  shop: ulipy
+  type: tracking
+  id: '744147693572'
+  title: Pražené mandle
+  status: Odesláno
+  date: '2026-09-12'
+  carrier: Tři řeky expres
+  order_id: 20260908-102226
+- key: ulipy:tracking:712542218796
+  shop: ulipy
+  type: tracking
+  id: '712542218796'
+  title: Nerezová pánev
+  status: Odesláno
+  date: '2026-04-04'
+  carrier: Lipová přeprava
+  order_id: 20260403-102332
+- key: alwaha:goods:AR10037
+  shop: alwaha
+  type: goods
+  id: AR10037
+  title: لوز محمص
+  concept: snack_food
+  status: معروض للبيع
+  price: 30.7
+  date: '2026-04-08'
+- key: alwaha:goods:AR10074
+  shop: alwaha
+  type: goods
+  id: AR10074
+  title: سوار لياقة ذكي
+  concept: audio_power
+  status: معروض للبيع
+  price: 128.75
+  date: '2026-01-13'
+- key: alwaha:goods:AR10111
+  shop: alwaha
+  type: goods
+  id: AR10111
+  title: مركز القهوة الباردة
+  concept: snack_food
+  status: معروض للبيع
+  price: 47.95
+  date: '2026-01-28'
+- key: alwaha:goods:AR10148
+  shop: alwaha
+  type: goods
+  id: AR10148
+  title: مظلة شمسية بحماية من الأشعة فوق البنفسجية
+  concept: hot_weather
+  status: معروض للبيع
+  price: 85.75
+  date: '2026-02-13'
+- key: alwaha:goods:AR10185
+  shop: alwaha
+  type: goods
+  id: AR10185
+  title: طقم أدوات طعام للأطفال
+  concept: kids
+  status: مسودة
+  price: 78.1
+  date: '2026-01-28'
+- key: alwaha:goods:AR10222
+  shop: alwaha
+  type: goods
+  id: AR10222
+  title: خف منزلي من القطيفة
+  concept: cold_weather
+  status: معروض للبيع
+  price: 53.4
+  date: '2026-05-07'
+- key: alwaha:goods:AR10259
+  shop: alwaha
+  type: goods
+  id: AR10259
+  title: منظم ملفات المستندات
+  concept: desk_work
+  status: مسودة
+  price: 36.45
+  date: '2026-09-03'
+- key: alwaha:goods:AR10296
+  shop: alwaha
+  type: goods
+  id: AR10296
+  title: خيمة قبة لشخصين
+  concept: outdoor
+  status: معروض للبيع
+  price: 386.05
+  date: '2026-09-12'
+- key: alwaha:goods:AR10333
+  shop: alwaha
+  type: goods
+  id: AR10333
+  title: رباط تبريد للرقبة
+  concept: hot_weather
+  status: معروض للبيع
+  price: 32.6
+  date: '2026-03-25'
+- key: alwaha:goods:AR10370
+  shop: alwaha
+  type: goods
+  id: AR10370
+  title: كرسي تخييم خفيف
+  concept: outdoor
+  status: مسودة
+  price: 109.05
+  date: '2026-09-11'
+- key: alwaha:goods:AR10407
+  shop: alwaha
+  type: goods
+  id: AR10407
+  title: مجموعة روبوت لتعلم البرمجة
+  concept: kids
+  status: معروض للبيع
+  price: 220.25
+  date: '2026-06-03'
+- key: alwaha:goods:AR10444
+  shop: alwaha
+  type: goods
+  id: AR10444
+  title: هودي بسحاب ببطانة صوفية
+  concept: cold_weather
+  status: معروض للبيع
+  price: 132.05
+  date: '2026-03-19'
+- key: alwaha:goods:AR10481
+  shop: alwaha
+  type: goods
+  id: AR10481
+  title: شاحن سريع 65 واط
+  concept: audio_power
+  status: مسودة
+  price: 85.75
+  date: '2026-06-29'
+- key: alwaha:goods:AR10518
+  shop: alwaha
+  type: goods
+  id: AR10518
+  title: كريم مرطب واقٍ للبشرة
+  concept: skincare
+  status: معروض للبيع
+  price: 84.65
+  date: '2026-01-31'
+- key: alwaha:goods:AR10555
+  shop: alwaha
+  type: goods
+  id: AR10555
+  title: جاكيت فرو شيربا
+  concept: cold_weather
+  status: معروض للبيع
+  price: 170.15
+  date: '2026-05-16'
+- key: alwaha:goods:AR10592
+  shop: alwaha
+  type: goods
+  id: AR10592
+  title: رقائق أرز بني محمص
+  concept: snack_food
+  status: معروض للبيع
+  price: 30.95
+  date: '2026-01-17'
+- key: alwaha:goods:AR10629
+  shop: alwaha
+  type: goods
+  id: AR10629
+  title: سيروم إصلاح الشعر
+  concept: skincare
+  status: مسودة
+  price: 52.05
+  date: '2026-08-03'
+- key: alwaha:goods:AR10666
+  shop: alwaha
+  type: goods
+  id: AR10666
+  title: غلاية بتحكم في درجة الحرارة
+  concept: cooking
+  status: معروض للبيع
+  price: 145.75
+  date: '2026-01-12'
+- key: alwaha:goods:AR10703
+  shop: alwaha
+  type: goods
+  id: AR10703
+  title: طعام جاف مضاد للحساسية
+  concept: pet
+  status: مسودة
+  price: 99.45
+  date: '2026-09-06'
+- key: alwaha:goods:AR10740
+  shop: alwaha
+  type: goods
+  id: AR10740
+  title: موزع USB-C متعدد المنافذ
+  concept: audio_power
+  status: معروض للبيع
+  price: 95.9
+  date: '2026-04-24'
+- key: alwaha:goods:AR10777
+  shop: alwaha
+  type: goods
+  id: AR10777
+  title: فأرة عمودية مريحة
+  concept: desk_work
+  status: معروض للبيع
+  price: 108.75
+  date: '2026-04-25'
+- key: alwaha:goods:AR10814
+  shop: alwaha
+  type: goods
+  id: AR10814
+  title: جرانولا عضوية
+  concept: snack_food
+  status: معروض للبيع
+  price: 36.7
+  date: '2026-06-13'
+- key: alwaha:goods:AR10851
+  shop: alwaha
+  type: goods
+  id: AR10851
+  title: بطانية مايكروفايبر
+  concept: cold_weather
+  status: مسودة
+  price: 73.15
+  date: '2026-02-28'
+- key: alwaha:goods:AR10888
+  shop: alwaha
+  type: goods
+  id: AR10888
+  title: رغوة تنظيف بدرجة حموضة منخفضة
+  concept: skincare
+  status: معروض للبيع
+  price: 42.2
+  date: '2026-06-17'
+- key: alwaha:order:20260530-100053
+  shop: alwaha
+  type: order
+  id: 20260530-100053
+  title: موزع USB-C متعدد المنافذ
+  status: تم التوصيل
+  amount: 427.4
+  date: '2026-05-30'
+  buyer: عبدالله الزهراني
+  tracking: '481102287050'
+  goods_ids:
+  - AR10740
+  - AR11406
+- key: alwaha:order:20260604-100106
+  shop: alwaha
+  type: order
+  id: 20260604-100106
+  title: جرانولا عضوية
+  status: ملغى
+  amount: 214.2
+  date: '2026-06-04'
+  buyer: ريم القحطاني
+  tracking: null
+  goods_ids:
+  - AR10814
+  - AR11554
+- key: alwaha:order:20260506-100159
+  shop: alwaha
+  type: order
+  id: 20260506-100159
+  title: فأرة عمودية مريحة
+  status: تم الشحن
+  amount: 918.8
+  date: '2026-05-06'
+  buyer: سلطان الحربي
+  tracking: '612860245088'
+  goods_ids:
+  - AR10777
+  - AR11147
+  - AR11443
+- key: alwaha:order:20260723-100212
+  shop: alwaha
+  type: order
+  id: 20260723-100212
+  title: سيروم إصلاح الشعر
+  status: تم التوصيل
+  amount: 234.23
+  date: '2026-07-23'
+  buyer: ريم العنزي
+  tracking: '886468616431'
+  goods_ids:
+  - AR10629
+- key: alwaha:order:20260924-100265
+  shop: alwaha
+  type: order
+  id: 20260924-100265
+  title: بطانية مايكروفايبر
+  status: مدفوع
+  amount: 74.04
+  date: '2026-09-24'
+  buyer: هند المطيري
+  tracking: null
+  goods_ids:
+  - AR10851
+- key: alwaha:order:20260428-100318
+  shop: alwaha
+  type: order
+  id: 20260428-100318
+  title: سيروم إصلاح الشعر
+  status: تم الشحن
+  amount: 580.25
+  date: '2026-04-28'
+  buyer: عبدالله المطيري
+  tracking: '407509526790'
+  goods_ids:
+  - AR10629
+  - AR10703
+  - AR10592
+- key: alwaha:order:20260512-100371
+  shop: alwaha
+  type: order
+  id: 20260512-100371
+  title: لوز محمص
+  status: تم التوصيل
+  amount: 422.75
+  date: '2026-05-12'
+  buyer: عبدالله الغامدي
+  tracking: '855188322504'
+  goods_ids:
+  - AR10037
+  - AR10629
+  - AR10481
+- key: alwaha:order:20260628-100424
+  shop: alwaha
+  type: order
+  id: 20260628-100424
+  title: طعام جاف مضاد للحساسية
+  status: مرتجع
+  amount: 179.01
+  date: '2026-06-28'
+  buyer: سلطان الغامدي
+  tracking: '745565994216'
+  goods_ids:
+  - AR10703
+- key: alwaha:order:20261005-100477
+  shop: alwaha
+  type: order
+  id: 20261005-100477
+  title: حامل رافع للشاشة
+  status: بانتظار الدفع
+  amount: 882.36
+  date: '2026-10-05'
+  buyer: خالد الزهراني
+  tracking: null
+  goods_ids:
+  - AR11517
+  - AR11554
+  - AR11110
+- key: alwaha:order:20260724-100530
+  shop: alwaha
+  type: order
+  id: 20260724-100530
+  title: رباط تبريد للرقبة
+  status: قيد المعالجة
+  amount: 163.0
+  date: '2026-07-24'
+  buyer: عمر الزهراني
+  tracking: null
+  goods_ids:
+  - AR10333
+- key: alwaha:order:20260902-100583
+  shop: alwaha
+  type: order
+  id: 20260902-100583
+  title: لوحة مفاتيح ميكانيكية صامتة
+  status: تم التوصيل
+  amount: 616.15
+  date: '2026-09-02'
+  buyer: لمى الشمري
+  tracking: '994766072500'
+  goods_ids:
+  - AR11369
+  - AR10259
+- key: alwaha:order:20260716-100636
+  shop: alwaha
+  type: order
+  id: 20260716-100636
+  title: مدفأة يد قابلة لإعادة الشحن
+  status: تم الشحن
+  amount: 419.45
+  date: '2026-07-16'
+  buyer: عبدالله الحربي
+  tracking: '512369266957'
+  goods_ids:
+  - AR11036
+  - AR10074
+  - AR10111
+- key: alwaha:order:20260712-100689
+  shop: alwaha
+  type: order
+  id: 20260712-100689
+  title: سوار لياقة ذكي
+  status: تم التوصيل
+  amount: 606.8
+  date: '2026-07-12'
+  buyer: ريم الغامدي
+  tracking: '271611447605'
+  goods_ids:
+  - AR10074
+  - AR10111
+  - AR11369
+- key: alwaha:order:20260918-100742
+  shop: alwaha
+  type: order
+  id: 20260918-100742
+  title: جاكيت فرو شيربا
+  status: قيد المعالجة
+  amount: 510.45
+  date: '2026-09-18'
+  buyer: فيصل الدوسري
+  tracking: null
+  goods_ids:
+  - AR10555
+- key: alwaha:order:20260830-100795
+  shop: alwaha
+  type: order
+  id: 20260830-100795
+  title: حامل رافع للشاشة
+  status: قيد المعالجة
+  amount: 103.8
+  date: '2026-08-30'
+  buyer: هند المطيري
+  tracking: null
+  goods_ids:
+  - AR11517
+- key: alwaha:order:20261003-100848
+  shop: alwaha
+  type: order
+  id: 20261003-100848
+  title: خلاط يدوي غاطس
+  status: تم التوصيل
+  amount: 109.05
+  date: '2026-10-03'
+  buyer: لمى المطيري
+  tracking: '793273036706'
+  goods_ids:
+  - AR11443
+- key: alwaha:order:20260526-100901
+  shop: alwaha
+  type: order
+  id: 20260526-100901
+  title: طقم حافظات زجاجية محكمة الإغلاق
+  status: مرتجع
+  amount: 84.88
+  date: '2026-05-26'
+  buyer: سارة القحطاني
+  tracking: '972974430596'
+  goods_ids:
+  - AR11110
+- key: alwaha:order:20260408-100954
+  shop: alwaha
+  type: order
+  id: 20260408-100954
+  title: لوشن جسم خالٍ من العطور
+  status: مرتجع
+  amount: 99.2
+  date: '2026-04-08'
+  buyer: فيصل الحربي
+  tracking: '446089182612'
+  goods_ids:
+  - AR11073
+- key: alwaha:order:20260615-101007
+  shop: alwaha
+  type: order
+  id: 20260615-101007
+  title: عصير يوسفي من جيجو
+  status: بانتظار الدفع
+  amount: 57.75
+  date: '2026-06-15'
+  buyer: عبدالله الحربي
+  tracking: null
+  goods_ids:
+  - AR11480
+- key: alwaha:order:20261005-101060
+  shop: alwaha
+  type: order
+  id: 20261005-101060
+  title: بطانية مايكروفايبر
+  status: قيد المعالجة
+  amount: 219.45
+  date: '2026-10-05'
+  buyer: فيصل الشمري
+  tracking: null
+  goods_ids:
+  - AR10851
+- key: alwaha:order:20260720-101113
+  shop: alwaha
+  type: order
+  id: 20260720-101113
+  title: خف منزلي من القطيفة
+  status: تم الشحن
+  amount: 115.0
+  date: '2026-07-20'
+  buyer: نورة المطيري
+  tracking: '683359608236'
+  goods_ids:
+  - AR10222
+- key: alwaha:order:20260512-101166
+  shop: alwaha
+  type: order
+  id: 20260512-101166
+  title: طقم أدوات مطبخ من السيليكون
+  status: ملغى
+  amount: 125.73
+  date: '2026-05-12'
+  buyer: عمر الزهراني
+  tracking: null
+  goods_ids:
+  - AR11258
+- key: alwaha:order:20260717-101219
+  shop: alwaha
+  type: order
+  id: 20260717-101219
+  title: طقم أدوات طعام للأطفال
+  status: تم التوصيل
+  amount: 78.49
+  date: '2026-07-17'
+  buyer: خالد الزهراني
+  tracking: '594936428586'
+  goods_ids:
+  - AR10185
+- key: alwaha:order:20260703-101272
+  shop: alwaha
+  type: order
+  id: 20260703-101272
+  title: لوحة مفاتيح ميكانيكية صامتة
+  status: تم الشحن
+  amount: 456.12
+  date: '2026-07-03'
+  buyer: خالد الشمري
+  tracking: '556596334523'
+  goods_ids:
+  - AR11369
+- key: alwaha:tracking:481102287050
+  shop: alwaha
+  type: tracking
+  id: '481102287050'
+  title: موزع USB-C متعدد المنافذ
+  status: تم التوصيل
+  date: '2026-06-02'
+  carrier: ناقل الكثبان
+  order_id: 20260530-100053
+- key: alwaha:tracking:612860245088
+  shop: alwaha
+  type: tracking
+  id: '612860245088'
+  title: فأرة عمودية مريحة
+  status: تم الشحن
+  date: '2026-05-07'
+  carrier: بريد النخيل السريع
+  order_id: 20260506-100159
+- key: alwaha:tracking:886468616431
+  shop: alwaha
+  type: tracking
+  id: '886468616431'
+  title: سيروم إصلاح الشعر
+  status: تم التوصيل
+  date: '2026-07-24'
+  carrier: توصيل السراب
+  order_id: 20260723-100212
+- key: alwaha:tracking:407509526790
+  shop: alwaha
+  type: tracking
+  id: '407509526790'
+  title: سيروم إصلاح الشعر
+  status: تم الشحن
+  date: '2026-05-01'
+  carrier: ناقل الكثبان
+  order_id: 20260428-100318
+- key: alwaha:tracking:855188322504
+  shop: alwaha
+  type: tracking
+  id: '855188322504'
+  title: لوز محمص
+  status: تم التوصيل
+  date: '2026-05-14'
+  carrier: شحن الواحة
+  order_id: 20260512-100371
+- key: alwaha:tracking:745565994216
+  shop: alwaha
+  type: tracking
+  id: '745565994216'
+  title: طعام جاف مضاد للحساسية
+  status: مرتجع
+  date: '2026-07-02'
+  carrier: شحن الواحة
+  order_id: 20260628-100424
+- key: alwaha:tracking:994766072500
+  shop: alwaha
+  type: tracking
+  id: '994766072500'
+  title: لوحة مفاتيح ميكانيكية صامتة
+  status: تم التوصيل
+  date: '2026-09-04'
+  carrier: توصيل السراب
+  order_id: 20260902-100583
+- key: alwaha:tracking:512369266957
+  shop: alwaha
+  type: tracking
+  id: '512369266957'
+  title: مدفأة يد قابلة لإعادة الشحن
+  status: تم الشحن
+  date: '2026-07-19'
+  carrier: توصيل السراب
+  order_id: 20260716-100636
+- key: alwaha:tracking:271611447605
+  shop: alwaha
+  type: tracking
+  id: '271611447605'
+  title: سوار لياقة ذكي
+  status: تم التوصيل
+  date: '2026-07-15'
+  carrier: شحن الواحة
+  order_id: 20260712-100689
+- key: alwaha:tracking:793273036706
+  shop: alwaha
+  type: tracking
+  id: '793273036706'
+  title: خلاط يدوي غاطس
+  status: تم التوصيل
+  date: '2026-10-04'
+  carrier: توصيل السراب
+  order_id: 20261003-100848
+- key: alwaha:tracking:972974430596
+  shop: alwaha
+  type: tracking
+  id: '972974430596'
+  title: طقم حافظات زجاجية محكمة الإغلاق
+  status: مرتجع
+  date: '2026-05-29'
+  carrier: بريد النخيل السريع
+  order_id: 20260526-100901
+- key: alwaha:tracking:446089182612
+  shop: alwaha
+  type: tracking
+  id: '446089182612'
+  title: لوشن جسم خالٍ من العطور
+  status: مرتجع
+  date: '2026-04-09'
+  carrier: ناقل الكثبان
+  order_id: 20260408-100954
+- key: alwaha:tracking:683359608236
+  shop: alwaha
+  type: tracking
+  id: '683359608236'
+  title: خف منزلي من القطيفة
+  status: تم الشحن
+  date: '2026-07-22'
+  carrier: ناقل الكثبان
+  order_id: 20260720-101113
+- key: alwaha:tracking:594936428586
+  shop: alwaha
+  type: tracking
+  id: '594936428586'
+  title: طقم أدوات طعام للأطفال
+  status: تم التوصيل
+  date: '2026-07-18'
+  carrier: شحن الواحة
+  order_id: 20260717-101219
+- key: alwaha:tracking:556596334523
+  shop: alwaha
+  type: tracking
+  id: '556596334523'
+  title: لوحة مفاتيح ميكانيكية صامتة
+  status: تم الشحن
+  date: '2026-07-05'
+  carrier: شحن الواحة
+  order_id: 20260703-101272
+- key: alwaha:tracking:260875986992
+  shop: alwaha
+  type: tracking
+  id: '260875986992'
+  title: كريم مرطب واقٍ للبشرة
+  status: تم التوصيل
+  date: '2026-07-06'
+  carrier: شحن الواحة
+  order_id: 20260705-101431
+- key: alwaha:tracking:601256970269
+  shop: alwaha
+  type: tracking
+  id: '601256970269'
+  title: حقيبة نقل للحيوانات الأليفة
+  status: تم الشحن
+  date: '2026-08-08'
+  carrier: شحن الواحة
+  order_id: 20260805-101484
+- key: alwaha:tracking:398320055173
+  shop: alwaha
+  type: tracking
+  id: '398320055173'
+  title: مجموعة روبوت لتعلم البرمجة
+  status: مرتجع
+  date: '2026-06-14'
+  carrier: شحن الواحة
+  order_id: 20260611-101590
+- key: alwaha:tracking:276481386481
+  shop: alwaha
+  type: tracking
+  id: '276481386481'
+  title: طقم أدوات مطبخ من السيليكون
+  status: تم التوصيل
+  date: '2026-06-09'
+  carrier: توصيل السراب
+  order_id: 20260607-101855
+- key: alwaha:tracking:741015824201
+  shop: alwaha
+  type: tracking
+  id: '741015824201'
+  title: بطانية مايكروفايبر
+  status: تم الشحن
+  date: '2026-04-04'
+  carrier: بريد النخيل السريع
+  order_id: 20260402-101908
+- key: alwaha:tracking:640223485527
+  shop: alwaha
+  type: tracking
+  id: '640223485527'
+  title: مقلاة من الفولاذ المقاوم للصدأ
+  status: تم التوصيل
+  date: '2026-07-21'
+  carrier: شحن الواحة
+  order_id: 20260717-101961
+- key: alwaha:tracking:182528930449
+  shop: alwaha
+  type: tracking
+  id: '182528930449'
+  title: جاكيت فرو شيربا
+  status: مرتجع
+  date: '2026-09-25'
+  carrier: توصيل السراب
+  order_id: 20260924-102067
+- key: alwaha:tracking:191659160991
+  shop: alwaha
+  type: tracking
+  id: '191659160991'
+  title: طقم حافظات زجاجية محكمة الإغلاق
+  status: تم التوصيل
+  date: '2026-04-20'
+  carrier: بريد النخيل السريع
+  order_id: 20260418-102120
+- key: alwaha:tracking:264238888063
+  shop: alwaha
+  type: tracking
+  id: '264238888063'
+  title: موزع USB-C متعدد المنافذ
+  status: تم الشحن
+  date: '2026-07-31'
+  carrier: توصيل السراب
+  order_id: 20260729-102173
+- key: sakura:goods:JP10037
+  shop: sakura
+  type: goods
+  id: JP10037
+  title: 低アレルゲンドライフード
+  concept: pet
+  status: 販売中
+  price: 3640
+  date: '2026-03-08'
+- key: sakura:goods:JP10074
+  shop: sakura
+  type: goods
+  id: JP10074
+  title: ヘアリペアエッセンス
+  concept: skincare
+  status: 売り切れ
+  price: 2300
+  date: '2026-03-14'
+- key: sakura:goods:JP10111
+  shop: sakura
+  type: goods
+  id: JP10111
+  title: リネン半袖シャツ
+  concept: hot_weather
+  status: 販売中
+  price: 5050
+  date: '2026-03-10'
+- key: sakura:goods:JP10148
+  shop: sakura
+  type: goods
+  id: JP10148
+  title: モニター台
+  concept: desk_work
+  status: 販売中
+  price: 3920
+  date: '2026-08-30'
+- key: sakura:goods:JP10185
+  shop: sakura
+  type: goods
+  id: JP10185
+  title: ペットキャリーバッグ
+  concept: pet
+  status: 販売中
+  price: 4660
+  date: '2026-01-21'
+- key: sakura:goods:JP10222
+  shop: sakura
+  type: goods
+  id: JP10222
+  title: コールドブリュー濃縮コーヒー
+  concept: snack_food
+  status: 販売中
+  price: 1730
+  date: '2026-03-31'
+- key: sakura:goods:JP10259
+  shop: sakura
+  type: goods
+  id: JP10259
+  title: 充電式LEDランタン
+  concept: outdoor
+  status: 下書き
+  price: 3480
+  date: '2026-04-20'
+- key: sakura:goods:JP10296
+  shop: sakura
+  type: goods
+  id: JP10296
+  title: 自動給餌器
+  concept: pet
+  status: 販売中
+  price: 7570
+  date: '2026-04-29'
+- key: sakura:goods:JP10333
+  shop: sakura
+  type: goods
+  id: JP10333
+  title: ステンレスフライパン
+  concept: cooking
+  status: 売り切れ
+  price: 6490
+  date: '2026-02-24'
+- key: sakura:goods:JP10370
+  shop: sakura
+  type: goods
+  id: JP10370
+  title: ビタミンC美容液
+  concept: skincare
+  status: 販売中
+  price: 4230
+  date: '2026-06-22'
+- key: sakura:goods:JP10407
+  shop: sakura
+  type: goods
+  id: JP10407
+  title: 65W急速充電器
+  concept: audio_power
+  status: 下書き
+  price: 3420
+  date: '2026-06-18'
+- key: sakura:goods:JP10444
+  shop: sakura
+  type: goods
+  id: JP10444
+  title: シリコン調理器具セット
+  concept: cooking
+  status: 販売中
+  price: 3140
+  date: '2026-07-21'
+- key: sakura:goods:JP10481
+  shop: sakura
+  type: goods
+  id: JP10481
+  title: 素焼きアーモンド
+  concept: snack_food
+  status: 販売中
+  price: 1260
+  date: '2026-05-29'
+- key: sakura:goods:JP10518
+  shop: sakura
+  type: goods
+  id: JP10518
+  title: 2人用ドームテント
+  concept: outdoor
+  status: 販売中
+  price: 14530
+  date: '2026-04-05'
+- key: sakura:goods:JP10555
+  shop: sakura
+  type: goods
+  id: JP10555
+  title: ひんやりジェルマット
+  concept: hot_weather
+  status: 販売中
+  price: 4460
+  date: '2026-08-14'
+- key: sakura:goods:JP10592
+  shop: sakura
+  type: goods
+  id: JP10592
+  title: ノンケミカル日焼け止め
+  concept: skincare
+  status: 販売中
+  price: 2700
+  date: '2026-09-02'
+- key: sakura:goods:JP10629
+  shop: sakura
+  type: goods
+  id: JP10629
+  title: 犬用ハーネス
+  concept: pet
+  status: 販売中
+  price: 2580
+  date: '2026-08-06'
+- key: sakura:goods:JP10666
+  shop: sakura
+  type: goods
+  id: JP10666
+  title: プログラミングロボットキット
+  concept: kids
+  status: 販売中
+  price: 8030
+  date: '2026-05-06'
+- key: sakura:goods:JP10703
+  shop: sakura
+  type: goods
+  id: JP10703
+  title: 防水Bluetoothスピーカー
+  concept: audio_power
+  status: 下書き
+  price: 6340
+  date: '2026-01-27'
+- key: sakura:goods:JP10740
+  shop: sakura
+  type: goods
+  id: JP10740
+  title: 密閉ガラス保存容器セット
+  concept: cooking
+  status: 販売中
+  price: 3540
+  date: '2026-06-06'
+- key: sakura:goods:JP10777
+  shop: sakura
+  type: goods
+  id: JP10777
+  title: 弱酸性洗顔フォーム
+  concept: skincare
+  status: 販売中
+  price: 1600
+  date: '2026-07-01'
+- key: sakura:goods:JP10814
+  shop: sakura
+  type: goods
+  id: JP10814
+  title: うさぎのぬいぐるみ
+  concept: kids
+  status: 下書き
+  price: 2530
+  date: '2026-08-03'
+- key: sakura:goods:JP10851
+  shop: sakura
+  type: goods
+  id: JP10851
+  title: バリア保湿クリーム
+  concept: skincare
+  status: 売り切れ
+  price: 3630
+  date: '2026-01-20'
+- key: sakura:goods:JP10888
+  shop: sakura
+  type: goods
+  id: JP10888
+  title: 猫用爪とぎポール
+  concept: pet
+  status: 販売中
+  price: 2210
+  date: '2026-07-11'
+- key: sakura:order:20260408-100053
+  shop: sakura
+  type: order
+  id: 20260408-100053
+  title: コールドブリュー濃縮コーヒー
+  status: 返品
+  amount: 8650
+  date: '2026-04-08'
+  buyer: 中村 陽菜
+  tracking: '465019825630'
+  goods_ids:
+  - JP10222
+- key: sakura:order:20260513-100106
+  shop: sakura
+  type: order
+  id: 20260513-100106
+  title: 充電式LEDランタン
+  status: 処理中
+  amount: 17400
+  date: '2026-05-13'
+  buyer: 加藤 芽依
+  tracking: null
+  goods_ids:
+  - JP10259
+- key: sakura:order:20260727-100159
+  shop: sakura
+  type: order
+  id: 20260727-100159
+  title: リネン半袖シャツ
+  status: キャンセル
+  amount: 4875
+  date: '2026-07-27'
+  buyer: 渡辺 大翔
+  tracking: null
+  goods_ids:
+  - JP10111
+- key: sakura:order:20261007-100212
+  shop: sakura
+  type: order
+  id: 20261007-100212
+  title: 軽量ダウンベスト
+  status: 発送済み
+  amount: 24840
+  date: '2026-10-07'
+  buyer: 鈴木 陽菜
+  tracking: '416875405476'
+  goods_ids:
+  - JP11406
+- key: sakura:order:20260715-100265
+  shop: sakura
+  type: order
+  id: 20260715-100265
+  title: ステンレスフライパン
+  status: 配達完了
+  amount: 33710
+  date: '2026-07-15'
+  buyer: 田中 陽菜
+  tracking: '291120818873'
+  goods_ids:
+  - JP10333
+  - JP11184
+- key: sakura:order:20260414-100318
+  shop: sakura
+  type: order
+  id: 20260414-100318
+  title: 防水Bluetoothスピーカー
+  status: キャンセル
+  amount: 16910
+  date: '2026-04-14'
+  buyer: 鈴木 大翔
+  tracking: null
+  goods_ids:
+  - JP10703
+  - JP10370
+- key: sakura:order:20260402-100371
+  shop: sakura
+  type: order
+  id: 20260402-100371
+  title: リネン半袖シャツ
+  status: 入金済み
+  amount: 10100
+  date: '2026-04-02'
+  buyer: 伊藤 大翔
+  tracking: null
+  goods_ids:
+  - JP10111
+- key: sakura:order:20260922-100424
+  shop: sakura
+  type: order
+  id: 20260922-100424
+  title: ペットキャリーバッグ
+  status: 処理中
+  amount: 15552
+  date: '2026-09-22'
+  buyer: 渡辺 悠真
+  tracking: null
+  goods_ids:
+  - JP10185
+  - JP10222
+  - JP10851
+- key: sakura:order:20260726-100477
+  shop: sakura
+  type: order
+  id: 20260726-100477
+  title: バリア保湿クリーム
+  status: キャンセル
+  amount: 3960
+  date: '2026-07-26'
+  buyer: 鈴木 大翔
+  tracking: null
+  goods_ids:
+  - JP10851
+- key: sakura:order:20260420-100530
+  shop: sakura
+  type: order
+  id: 20260420-100530
+  title: 密閉ガラス保存容器セット
+  status: 配達完了
+  amount: 7080
+  date: '2026-04-20'
+  buyer: 加藤 葵
+  tracking: '251625343135'
+  goods_ids:
+  - JP10740
+- key: sakura:order:20260802-100583
+  shop: sakura
+  type: order
+  id: 20260802-100583
+  title: アウトドアクッカーセット
+  status: 処理中
+  amount: 17090
+  date: '2026-08-02'
+  buyer: 中村 結衣
+  tracking: null
+  goods_ids:
+  - JP11110
+  - JP10333
+- key: sakura:order:20260516-100636
+  shop: sakura
+  type: order
+  id: 20260516-100636
+  title: ハンディミニ扇風機
+  status: 配達完了
+  amount: 4164
+  date: '2026-05-16'
+  buyer: 伊藤 葵
+  tracking: '310373445099'
+  goods_ids:
+  - JP10962
+- key: sakura:order:20260810-100689
+  shop: sakura
+  type: order
+  id: 20260810-100689
+  title: 65W急速充電器
+  status: 配達完了
+  amount: 6156
+  date: '2026-08-10'
+  buyer: 山本 結衣
+  tracking: '763848459408'
+  goods_ids:
+  - JP10407
+- key: sakura:order:20260822-100742
+  shop: sakura
+  type: order
+  id: 20260822-100742
+  title: ノイズキャンセリングワイヤレスイヤホン
+  status: 処理中
+  amount: 11349
+  date: '2026-08-22'
+  buyer: 加藤 健太
+  tracking: null
+  goods_ids:
+  - JP11036
+- key: sakura:order:20260616-100795
+  shop: sakura
+  type: order
+  id: 20260616-100795
+  title: リネン半袖シャツ
+  status: 配達完了
+  amount: 25250
+  date: '2026-06-16'
+  buyer: 田中 結衣
+  tracking: '384833376389'
+  goods_ids:
+  - JP10111
+- key: sakura:order:20260529-100848
+  shop: sakura
+  type: order
+  id: 20260529-100848
+  title: 低アレルゲンドライフード
+  status: 配達完了
+  amount: 26350
+  date: '2026-05-29'
+  buyer: 加藤 美咲
+  tracking: '521514086167'
+  goods_ids:
+  - JP10037
+  - JP10296
+- key: sakura:order:20261002-100901
+  shop: sakura
+  type: order
+  id: 20261002-100901
+  title: マイクロファイバーブランケット
+  status: 処理中
+  amount: 5136
+  date: '2026-10-02'
+  buyer: 加藤 健太
+  tracking: null
+  goods_ids:
+  - JP11517
+- key: sakura:order:20260901-100954
+  shop: sakura
+  type: order
+  id: 20260901-100954
+  title: 大容量モバイルバッテリー
+  status: 入金待ち
+  amount: 25686
+  date: '2026-09-01'
+  buyer: 山本 葵
+  tracking: null
+  goods_ids:
+  - JP10925
+  - JP10074
+  - JP10037
+- key: sakura:order:20260629-101007
+  shop: sakura
+  type: order
+  id: 20260629-101007
+  title: キッズキックスクーター
+  status: 入金待ち
+  amount: 6300
+  date: '2026-06-29'
+  buyer: 加藤 美咲
+  tracking: null
+  goods_ids:
+  - JP11147
+- key: sakura:order:20260408-101060
+  shop: sakura
+  type: order
+  id: 20260408-101060
+  title: ペットキャリーバッグ
+  status: 配達完了
+  amount: 4524
+  date: '2026-04-08'
+  buyer: 田中 陽菜
+  tracking: '100081643320'
+  goods_ids:
+  - JP10185
+- key: sakura:order:20260616-101113
+  shop: sakura
+  type: order
+  id: 20260616-101113
+  title: マイクロファイバーブランケット
+  status: 入金待ち
+  amount: 4260
+  date: '2026-06-16'
+  buyer: 加藤 葵
+  tracking: null
+  goods_ids:
+  - JP11517
+  - JP10481
+- key: sakura:order:20260730-101166
+  shop: sakura
+  type: order
+  id: 20260730-101166
+  title: リネン半袖シャツ
+  status: 発送済み
+  amount: 5380
+  date: '2026-07-30'
+  buyer: 中村 凛
+  tracking: '870526923875'
+  goods_ids:
+  - JP10111
+- key: sakura:order:20260527-101219
+  shop: sakura
+  type: order
+  id: 20260527-101219
+  title: 子ども用食器セット
+  status: 発送済み
+  amount: 9630
+  date: '2026-05-27'
+  buyer: 田中 湊
+  tracking: '264411927937'
+  goods_ids:
+  - JP11443
+  - JP10259
+- key: sakura:order:20260713-101272
+  shop: sakura
+  type: order
+  id: 20260713-101272
+  title: 大容量モバイルバッテリー
+  status: 発送済み
+  amount: 16690
+  date: '2026-07-13'
+  buyer: 渡辺 颯太
+  tracking: '999432351314'
+  goods_ids:
+  - JP10925
+  - JP10222
+- key: sakura:tracking:465019825630
+  shop: sakura
+  type: tracking
+  id: '465019825630'
+  title: コールドブリュー濃縮コーヒー
+  status: 返品
+  date: '2026-04-11'
+  carrier: はやぶさ運輸
+  order_id: 20260408-100053
+- key: sakura:tracking:416875405476
+  shop: sakura
+  type: tracking
+  id: '416875405476'
+  title: 軽量ダウンベスト
+  status: 発送済み
+  date: '2026-10-10'
+  carrier: つばめ配送
+  order_id: 20261007-100212
+- key: sakura:tracking:291120818873
+  shop: sakura
+  type: tracking
+  id: '291120818873'
+  title: ステンレスフライパン
+  status: 配達完了
+  date: '2026-07-18'
+  carrier: さくら便
+  order_id: 20260715-100265
+- key: sakura:tracking:251625343135
+  shop: sakura
+  type: tracking
+  id: '251625343135'
+  title: 密閉ガラス保存容器セット
+  status: 配達完了
+  date: '2026-04-23'
+  carrier: さくら便
+  order_id: 20260420-100530
+- key: sakura:tracking:310373445099
+  shop: sakura
+  type: tracking
+  id: '310373445099'
+  title: ハンディミニ扇風機
+  status: 配達完了
+  date: '2026-05-19'
+  carrier: つばめ配送
+  order_id: 20260516-100636
+- key: sakura:tracking:763848459408
+  shop: sakura
+  type: tracking
+  id: '763848459408'
+  title: 65W急速充電器
+  status: 配達完了
+  date: '2026-08-13'
+  carrier: さくら便
+  order_id: 20260810-100689
+- key: sakura:tracking:384833376389
+  shop: sakura
+  type: tracking
+  id: '384833376389'
+  title: リネン半袖シャツ
+  status: 配達完了
+  date: '2026-06-19'
+  carrier: さくら便
+  order_id: 20260616-100795
+- key: sakura:tracking:521514086167
+  shop: sakura
+  type: tracking
+  id: '521514086167'
+  title: 低アレルゲンドライフード
+  status: 配達完了
+  date: '2026-05-31'
+  carrier: さくら便
+  order_id: 20260529-100848
+- key: sakura:tracking:100081643320
+  shop: sakura
+  type: tracking
+  id: '100081643320'
+  title: ペットキャリーバッグ
+  status: 配達完了
+  date: '2026-04-10'
+  carrier: みなと急便
+  order_id: 20260408-101060
+- key: sakura:tracking:870526923875
+  shop: sakura
+  type: tracking
+  id: '870526923875'
+  title: リネン半袖シャツ
+  status: 発送済み
+  date: '2026-07-31'
+  carrier: みなと急便
+  order_id: 20260730-101166
+- key: sakura:tracking:264411927937
+  shop: sakura
+  type: tracking
+  id: '264411927937'
+  title: 子ども用食器セット
+  status: 発送済み
+  date: '2026-05-29'
+  carrier: つばめ配送
+  order_id: 20260527-101219
+- key: sakura:tracking:999432351314
+  shop: sakura
+  type: tracking
+  id: '999432351314'
+  title: 大容量モバイルバッテリー
+  status: 発送済み
+  date: '2026-07-17'
+  carrier: はやぶさ運輸
+  order_id: 20260713-101272
+- key: sakura:tracking:628500540359
+  shop: sakura
+  type: tracking
+  id: '628500540359'
+  title: スマートフィットネスバンド
+  status: 発送済み
+  date: '2026-04-28'
+  carrier: みなと急便
+  order_id: 20260425-101431
+- key: sakura:tracking:333002348424
+  shop: sakura
+  type: tracking
+  id: '333002348424'
+  title: ペットキャリーバッグ
+  status: 配達完了
+  date: '2026-08-19'
+  carrier: みなと急便
+  order_id: 20260818-101484
+- key: sakura:tracking:942942230625
+  shop: sakura
+  type: tracking
+  id: '942942230625'
+  title: ネッククーラーバンド
+  status: 配達完了
+  date: '2026-05-16'
+  carrier: みなと急便
+  order_id: 20260514-101696
+- key: sakura:tracking:865661620064
+  shop: sakura
+  type: tracking
+  id: '865661620064'
+  title: 真空断熱タンブラー
+  status: 配達完了
+  date: '2026-09-06'
+  carrier: さくら便
+  order_id: 20260904-101749
+- key: sakura:tracking:485515133682
+  shop: sakura
+  type: tracking
+  id: '485515133682'
+  title: 大容量モバイルバッテリー
+  status: 発送済み
+  date: '2026-06-30'
+  carrier: はやぶさ運輸
+  order_id: 20260629-101802
+- key: sakura:tracking:291298734613
+  shop: sakura
+  type: tracking
+  id: '291298734613'
+  title: ハンディミニ扇風機
+  status: 発送済み
+  date: '2026-06-30'
+  carrier: つばめ配送
+  order_id: 20260628-102014
+- key: sakura:tracking:959967605536
+  shop: sakura
+  type: tracking
+  id: '959967605536'
+  title: 低アレルゲンドライフード
+  status: 配達完了
+  date: '2026-08-02'
+  carrier: みなと急便
+  order_id: 20260730-102067
+- key: sakura:tracking:636947368051
+  shop: sakura
+  type: tracking
+  id: '636947368051'
+  title: ケーブル収納ボックス
+  status: 返品
+  date: '2026-08-23'
+  carrier: つばめ配送
+  order_id: 20260821-102173
+- key: sakura:tracking:939550828824
+  shop: sakura
+  type: tracking
+  id: '939550828824'
+  title: リネン半袖シャツ
+  status: 配達完了
+  date: '2026-07-15'
+  carrier: つばめ配送
+  order_id: 20260713-102279
+- key: sakura:tracking:533985164976
+  shop: sakura
+  type: tracking
+  id: '533985164976'
+  title: 2人用ドームテント
+  status: 配達完了
+  date: '2026-07-09'
+  carrier: みなと急便
+  order_id: 20260706-102491
+- key: sakura:tracking:775887873148
+  shop: sakura
+  type: tracking
+  id: '775887873148'
+  title: スマートフィットネスバンド
+  status: 発送済み
+  date: '2026-07-14'
+  carrier: はやぶさ運輸
+  order_id: 20260712-102544
+- key: yunshan:goods:CN10037
+  shop: yunshan
+  type: goods
+  id: CN10037
+  title: 65W快充充电器
+  concept: audio_power
+  status: 已售罄
+  price: 200.0
+  date: '2026-05-12'
+- key: yunshan:goods:CN10074
+  shop: yunshan
+  type: goods
+  id: CN10074
+  title: 加绒拉链卫衣
+  concept: cold_weather
+  status: 已售罄
+  price: 288.4
+  date: '2026-06-10'
+- key: yunshan:goods:CN10111
+  shop: yunshan
+  type: goods
+  id: CN10111
+  title: 显示器增高架
+  concept: desk_work
+  status: 草稿
+  price: 199.45
+  date: '2026-05-12'
+- key: yunshan:goods:CN10148
+  shop: yunshan
+  type: goods
+  id: CN10148
+  title: 便携户外锅具套装
+  concept: outdoor
+  status: 在售
+  price: 219.45
+  date: '2026-09-01'
+- key: yunshan:goods:CN10185
+  shop: yunshan
+  type: goods
+  id: CN10185
+  title: 低糖蛋白棒
+  concept: snack_food
+  status: 草稿
+  price: 126.85
+  date: '2026-06-15'
+- key: yunshan:goods:CN10222
+  shop: yunshan
+  type: goods
+  id: CN10222
+  title: 冷萃咖啡浓缩液
+  concept: snack_food
+  status: 已售罄
+  price: 90.0
+  date: '2026-05-07'
+- key: yunshan:goods:CN10259
+  shop: yunshan
+  type: goods
+  id: CN10259
+  title: 宠物外出包
+  concept: pet
+  status: 在售
+  price: 229.45
+  date: '2026-01-16'
+- key: yunshan:goods:CN10296
+  shop: yunshan
+  type: goods
+  id: CN10296
+  title: 防水蓝牙音箱
+  concept: audio_power
+  status: 已售罄
+  price: 340.0
+  date: '2026-08-06'
+- key: yunshan:goods:CN10333
+  shop: yunshan
+  type: goods
+  id: CN10333
+  title: 不锈钢煎锅
+  concept: cooking
+  status: 已售罄
+  price: 283.7
+  date: '2026-04-07'
+- key: yunshan:goods:CN10370
+  shop: yunshan
+  type: goods
+  id: CN10370
+  title: 毛绒兔子玩偶
+  concept: kids
+  status: 在售
+  price: 108.95
+  date: '2026-04-07'
+- key: yunshan:goods:CN10407
+  shop: yunshan
+  type: goods
+  id: CN10407
+  title: 透气凉鞋
+  concept: hot_weather
+  status: 已售罄
+  price: 183.15
+  date: '2026-03-23'
+- key: yunshan:goods:CN10444
+  shop: yunshan
+  type: goods
+  id: CN10444
+  title: 亚麻短袖衬衫
+  concept: hot_weather
+  status: 草稿
+  price: 233.7
+  date: '2026-05-21'
+- key: yunshan:goods:CN10481
+  shop: yunshan
+  type: goods
+  id: CN10481
+  title: 控温电水壶
+  concept: cooking
+  status: 在售
+  price: 247.35
+  date: '2026-05-16'
+- key: yunshan:goods:CN10518
+  shop: yunshan
+  type: goods
+  id: CN10518
+  title: 充电LED营地灯
+  concept: outdoor
+  status: 在售
+  price: 157.35
+  date: '2026-05-05'
+- key: yunshan:goods:CN10555
+  shop: yunshan
+  type: goods
+  id: CN10555
+  title: 有机格兰诺拉麦片
+  concept: snack_food
+  status: 草稿
+  price: 74.2
+  date: '2026-05-18'
+- key: yunshan:goods:CN10592
+  shop: yunshan
+  type: goods
+  id: CN10592
+  title: 静音机械键盘
+  concept: desk_work
+  status: 已售罄
+  price: 478.95
+  date: '2026-04-11'
+- key: yunshan:goods:CN10629
+  shop: yunshan
+  type: goods
+  id: CN10629
+  title: 烘烤杏仁
+  concept: snack_food
+  status: 在售
+  price: 68.4
+  date: '2026-04-05'
+- key: yunshan:goods:CN10666
+  shop: yunshan
+  type: goods
+  id: CN10666
+  title: 狗狗胸背带
+  concept: pet
+  status: 草稿
+  price: 122.1
+  date: '2026-05-10'
+- key: yunshan:goods:CN10703
+  shop: yunshan
+  type: goods
+  id: CN10703
+  title: 手持迷你风扇
+  concept: hot_weather
+  status: 在售
+  price: 101.6
+  date: '2026-06-04'
+- key: yunshan:goods:CN10740
+  shop: yunshan
+  type: goods
+  id: CN10740
+  title: 防晒遮阳伞
+  concept: hot_weather
+  status: 草稿
+  price: 149.45
+  date: '2026-08-28'
+- key: yunshan:goods:CN10777
+  shop: yunshan
+  type: goods
+  id: CN10777
+  title: 充电暖手宝
+  concept: cold_weather
+  status: 在售
+  price: 113.7
+  date: '2026-02-27'
+- key: yunshan:goods:CN10814
+  shop: yunshan
+  type: goods
+  id: CN10814
+  title: 降噪无线耳机
+  concept: audio_power
+  status: 已售罄
+  price: 648.4
+  date: '2026-04-03'
+- key: yunshan:goods:CN10851
+  shop: yunshan
+  type: goods
+  id: CN10851
+  title: 双人圆顶帐篷
+  concept: outdoor
+  status: 在售
+  price: 643.7
+  date: '2026-07-31'
+- key: yunshan:goods:CN10888
+  shop: yunshan
+  type: goods
+  id: CN10888
+  title: 物理防晒霜
+  concept: skincare
+  status: 在售
+  price: 134.75
+  date: '2026-04-13'
+- key: yunshan:order:20260828-100053
+  shop: yunshan
+  type: order
+  id: 20260828-100053
+  title: 轻量露营椅
+  status: 已发货
+  amount: 197.4
+  date: '2026-08-28'
+  buyer: 王欣怡
+  tracking: '148167768001'
+  goods_ids:
+  - CN11147
+- key: yunshan:order:20260916-100106
+  shop: yunshan
+  type: order
+  id: 20260916-100106
+  title: 冰凉颈带
+  status: 待付款
+  amount: 596.3
+  date: '2026-09-16'
+  buyer: 周洋
+  tracking: null
+  goods_ids:
+  - CN11332
+  - CN10407
+  - CN10222
+- key: yunshan:order:20260422-100159
+  shop: yunshan
+  type: order
+  id: 20260422-100159
+  title: 双人圆顶帐篷
+  status: 已签收
+  amount: 953.15
+  date: '2026-04-22'
+  buyer: 杨芳
+  tracking: '229389811173'
+  goods_ids:
+  - CN10851
+  - CN10148
+  - CN10222
+- key: yunshan:order:20260404-100212
+  shop: yunshan
+  type: order
+  id: 20260404-100212
+  title: 维C精华液
+  status: 已发货
+  amount: 683.51
+  date: '2026-04-04'
+  buyer: 杨磊
+  tracking: '677625882099'
+  goods_ids:
+  - CN11517
+  - CN11443
+  - CN10518
+- key: yunshan:order:20260805-100265
+  shop: yunshan
+  type: order
+  id: 20260805-100265
+  title: 冷萃咖啡浓缩液
+  status: 已取消
+  amount: 105.8
+  date: '2026-08-05'
+  buyer: 吴伟
+  tracking: null
+  goods_ids:
+  - CN10222
+- key: yunshan:order:20260529-100318
+  shop: yunshan
+  type: order
+  id: 20260529-100318
+  title: 双人圆顶帐篷
+  status: 已签收
+  amount: 1050.55
+  date: '2026-05-29'
+  buyer: 杨宇轩
+  tracking: '536639637574'
+  goods_ids:
+  - CN10851
+  - CN11369
+- key: yunshan:order:20260722-100371
+  shop: yunshan
+  type: order
+  id: 20260722-100371
+  title: 修护护发精华
+  status: 处理中
+  amount: 226.85
+  date: '2026-07-22'
+  buyer: 李婷
+  tracking: null
+  goods_ids:
+  - CN11406
+  - CN10777
+- key: yunshan:order:20260901-100424
+  shop: yunshan
+  type: order
+  id: 20260901-100424
+  title: 毛绒兔子玩偶
+  status: 已取消
+  amount: 671.6
+  date: '2026-09-01'
+  buyer: 陈洋
+  tracking: null
+  goods_ids:
+  - CN10370
+  - CN10185
+- key: yunshan:order:20260622-100477
+  shop: yunshan
+  type: order
+  id: 20260622-100477
+  title: 轻薄羽绒马甲
+  status: 已付款
+  amount: 1015.8
+  date: '2026-06-22'
+  buyer: 王宇轩
+  tracking: null
+  goods_ids:
+  - CN11443
+  - CN11036
+- key: yunshan:order:20260421-100530
+  shop: yunshan
+  type: order
+  id: 20260421-100530
+  title: 便携户外锅具套装
+  status: 待付款
+  amount: 399.45
+  date: '2026-04-21'
+  buyer: 张娜
+  tracking: null
+  goods_ids:
+  - CN10148
+  - CN10222
+- key: yunshan:order:20260612-100583
+  shop: yunshan
+  type: order
+  id: 20260612-100583
+  title: 控温电水壶
+  status: 待付款
+  amount: 1353.65
+  date: '2026-06-12'
+  buyer: 张欣怡
+  tracking: null
+  goods_ids:
+  - CN10481
+  - CN10666
+  - CN11036
+- key: yunshan:order:20260413-100636
+  shop: yunshan
+  type: order
+  id: 20260413-100636
+  title: 弱酸性洁面泡沫
+  status: 已签收
+  amount: 920.0
+  date: '2026-04-13'
+  buyer: 周伟
+  tracking: '775541733202'
+  goods_ids:
+  - CN11221
+  - CN10296
+- key: yunshan:order:20260905-100689
+  shop: yunshan
+  type: order
+  id: 20260905-100689
+  title: 降噪无线耳机
+  status: 待付款
+  amount: 5168.25
+  date: '2026-09-05'
+  buyer: 王伟
+  tracking: null
+  goods_ids:
+  - CN10814
+  - CN11443
+- key: yunshan:order:20261008-100742
+  shop: yunshan
+  type: order
+  id: 20261008-100742
+  title: 真空保温杯
+  status: 已取消
+  amount: 485.85
+  date: '2026-10-08'
+  buyer: 李洋
+  tracking: null
+  goods_ids:
+  - CN11036
+  - CN11147
+- key: yunshan:order:20260522-100795
+  shop: yunshan
+  type: order
+  id: 20260522-100795
+  title: 烘烤杏仁
+  status: 已签收
+  amount: 152.6
+  date: '2026-05-22'
+  buyer: 赵宇轩
+  tracking: '427640629113'
+  goods_ids:
+  - CN10629
+- key: yunshan:order:20260726-100848
+  shop: yunshan
+  type: order
+  id: 20260726-100848
+  title: 降噪无线耳机
+  status: 已签收
+  amount: 583.56
+  date: '2026-07-26'
+  buyer: 王娜
+  tracking: '487705207625'
+  goods_ids:
+  - CN10814
+- key: yunshan:order:20260425-100901
+  shop: yunshan
+  type: order
+  id: 20260425-100901
+  title: 65W快充充电器
+  status: 已取消
+  amount: 195.8
+  date: '2026-04-25'
+  buyer: 吴敏
+  tracking: null
+  goods_ids:
+  - CN10037
+- key: yunshan:order:20260923-100954
+  shop: yunshan
+  type: order
+  id: 20260923-100954
+  title: 手持料理棒
+  status: 待付款
+  amount: 654.25
+  date: '2026-09-23'
+  buyer: 吴芳
+  tracking: null
+  goods_ids:
+  - CN11295
+  - CN11110
+- key: yunshan:order:20260716-101007
+  shop: yunshan
+  type: order
+  id: 20260716-101007
+  title: 冷萃咖啡浓缩液
+  status: 已取消
+  amount: 265.8
+  date: '2026-07-16'
+  buyer: 陈伟
+  tracking: null
+  goods_ids:
+  - CN10222
+  - CN11221
+- key: yunshan:order:20260730-101060
+  shop: yunshan
+  type: order
+  id: 20260730-101060
+  title: 65W快充充电器
+  status: 已付款
+  amount: 195.8
+  date: '2026-07-30'
+  buyer: 杨静
+  tracking: null
+  goods_ids:
+  - CN10037
+- key: yunshan:order:20260718-101113
+  shop: yunshan
+  type: order
+  id: 20260718-101113
+  title: 低糖蛋白棒
+  status: 处理中
+  amount: 142.65
+  date: '2026-07-18'
+  buyer: 吴浩然
+  tracking: null
+  goods_ids:
+  - CN10185
+- key: yunshan:order:20260727-101166
+  shop: yunshan
+  type: order
+  id: 20260727-101166
+  title: 烘烤杏仁
+  status: 已退货
+  amount: 77.36
+  date: '2026-07-27'
+  buyer: 黄婷
+  tracking: '699478560193'
+  goods_ids:
+  - CN10629
+- key: yunshan:order:20260923-101219
+  shop: yunshan
+  type: order
+  id: 20260923-101219
+  title: 轻薄羽绒马甲
+  status: 待付款
+  amount: 1733.63
+  date: '2026-09-23'
+  buyer: 周娜
+  tracking: null
+  goods_ids:
+  - CN11443
+- key: yunshan:order:20260418-101272
+  shop: yunshan
+  type: order
+  id: 20260418-101272
+  title: 充电LED营地灯
+  status: 已发货
+  amount: 173.15
+  date: '2026-04-18'
+  buyer: 黄宇轩
+  tracking: '348739916393'
+  goods_ids:
+  - CN10518
+- key: yunshan:tracking:148167768001
+  shop: yunshan
+  type: tracking
+  id: '148167768001'
+  title: 轻量露营椅
+  status: 已发货
+  date: '2026-08-31'
+  carrier: 飞燕快运
+  order_id: 20260828-100053
+- key: yunshan:tracking:229389811173
+  shop: yunshan
+  type: tracking
+  id: '229389811173'
+  title: 双人圆顶帐篷
+  status: 已签收
+  date: '2026-04-26'
+  carrier: 云杉快递
+  order_id: 20260422-100159
+- key: yunshan:tracking:677625882099
+  shop: yunshan
+  type: tracking
+  id: '677625882099'
+  title: 维C精华液
+  status: 已发货
+  date: '2026-04-05'
+  carrier: 云杉快递
+  order_id: 20260404-100212
+- key: yunshan:tracking:536639637574
+  shop: yunshan
+  type: tracking
+  id: '536639637574'
+  title: 双人圆顶帐篷
+  status: 已签收
+  date: '2026-05-31'
+  carrier: 青松速运
+  order_id: 20260529-100318
+- key: yunshan:tracking:775541733202
+  shop: yunshan
+  type: tracking
+  id: '775541733202'
+  title: 弱酸性洁面泡沫
+  status: 已签收
+  date: '2026-04-16'
+  carrier: 云杉快递
+  order_id: 20260413-100636
+- key: yunshan:tracking:427640629113
+  shop: yunshan
+  type: tracking
+  id: '427640629113'
+  title: 烘烤杏仁
+  status: 已签收
+  date: '2026-05-25'
+  carrier: 飞燕快运
+  order_id: 20260522-100795
+- key: yunshan:tracking:487705207625
+  shop: yunshan
+  type: tracking
+  id: '487705207625'
+  title: 降噪无线耳机
+  status: 已签收
+  date: '2026-07-29'
+  carrier: 云杉快递
+  order_id: 20260726-100848
+- key: yunshan:tracking:699478560193
+  shop: yunshan
+  type: tracking
+  id: '699478560193'
+  title: 烘烤杏仁
+  status: 已退货
+  date: '2026-07-29'
+  carrier: 白鹭物流
+  order_id: 20260727-101166
+- key: yunshan:tracking:348739916393
+  shop: yunshan
+  type: tracking
+  id: '348739916393'
+  title: 充电LED营地灯
+  status: 已发货
+  date: '2026-04-20'
+  carrier: 白鹭物流
+  order_id: 20260418-101272
+- key: yunshan:tracking:827556015900
+  shop: yunshan
+  type: tracking
+  id: '827556015900'
+  title: 轻薄羽绒马甲
+  status: 已退货
+  date: '2026-05-09'
+  carrier: 飞燕快运
+  order_id: 20260507-101378
+- key: yunshan:tracking:566565115552
+  shop: yunshan
+  type: tracking
+  id: '566565115552'
+  title: 烘烤杏仁
+  status: 已签收
+  date: '2026-07-05'
+  carrier: 飞燕快运
+  order_id: 20260704-101431
+- key: yunshan:tracking:187761248942
+  shop: yunshan
+  type: tracking
+  id: '187761248942'
+  title: 编程机器人套件
+  status: 已签收
+  date: '2026-09-14'
+  carrier: 青松速运
+  order_id: 20260911-101484
+- key: yunshan:tracking:709571558262
+  shop: yunshan
+  type: tracking
+  id: '709571558262'
+  title: 硅胶厨具套装
+  status: 已退货
+  date: '2026-06-29'
+  carrier: 云杉快递
+  order_id: 20260626-101537
+- key: yunshan:tracking:535933258171
+  shop: yunshan
+  type: tracking
+  id: '535933258171'
+  title: 弱酸性洁面泡沫
+  status: 已退货
+  date: '2026-07-08'
+  carrier: 白鹭物流
+  order_id: 20260705-101590
+- key: yunshan:tracking:503933807431
+  shop: yunshan
+  type: tracking
+  id: '503933807431'
+  title: 透气凉鞋
+  status: 已退货
+  date: '2026-05-24'
+  carrier: 青松速运
+  order_id: 20260523-101643
+- key: yunshan:tracking:841222295166
+  shop: yunshan
+  type: tracking
+  id: '841222295166'
+  title: 加绒拉链卫衣
+  status: 已签收
+  date: '2026-05-28'
+  carrier: 白鹭物流
+  order_id: 20260527-101696
+- key: yunshan:tracking:114254110753
+  shop: yunshan
+  type: tracking
+  id: '114254110753'
+  title: 轻薄羽绒马甲
+  status: 已发货
+  date: '2026-09-01'
+  carrier: 云杉快递
+  order_id: 20260831-101749
+- key: yunshan:tracking:301552425780
+  shop: yunshan
+  type: tracking
+  id: '301552425780'
+  title: 防晒遮阳伞
+  status: 已发货
+  date: '2026-04-04'
+  carrier: 白鹭物流
+  order_id: 20260402-101802
+- key: yunshan:tracking:494466311912
+  shop: yunshan
+  type: tracking
+  id: '494466311912'
+  title: 冰凉颈带
+  status: 已发货
+  date: '2026-07-11'
+  carrier: 云杉快递
+  order_id: 20260710-101855
+- key: yunshan:tracking:675553377682
+  shop: yunshan
+  type: tracking
+  id: '675553377682'
+  title: 降噪无线耳机
+  status: 已签收
+  date: '2026-08-27'
+  carrier: 飞燕快运
+  order_id: 20260824-101908
+- key: yunshan:tracking:683857796074
+  shop: yunshan
+  type: tracking
+  id: '683857796074'
+  title: 防水蓝牙音箱
+  status: 已签收
+  date: '2026-05-31'
+  carrier: 云杉快递
+  order_id: 20260528-101961
+- key: yunshan:tracking:771440855137
+  shop: yunshan
+  type: tracking
+  id: '771440855137'
+  title: 维C精华液
+  status: 已签收
+  date: '2026-08-17'
+  carrier: 青松速运
+  order_id: 20260814-102014
+- key: yunshan:tracking:771650625952
+  shop: yunshan
+  type: tracking
+  id: '771650625952'
+  title: 狗狗胸背带
+  status: 已签收
+  date: '2026-04-14'
+  carrier: 飞燕快运
+  order_id: 20260411-102120
+- key: yunshan:tracking:498992036780
+  shop: yunshan
+  type: tracking
+  id: '498992036780'
+  title: 防水蓝牙音箱
+  status: 已发货
+  date: '2026-10-08'
+  carrier: 青松速运
+  order_id: 20261006-102279

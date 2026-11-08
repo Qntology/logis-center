@@ -1,0 +1,29 @@
+page_id: yunshan-order-detail-20260404-100212
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/my/orders/20260404-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260404-100212
+  registration_date: '2026-04-04'
+  status: 已发货
+  goods: 维C精华液
+  tracking_number: '677625882099'
+  sender_name: 杨磊
+  recipient_name: 杨磊
+  quantity: 3
+  amount: 683.51
+  shipping_fee: 0.0
+  payment_method: 信用卡
+  sender_phone: 136 7090 0157
+  sender_address: 北京市朝阳区解放路58号6栋1406室
+  recipient_phone: 136 7090 0157
+  recipient_address: 北京市朝阳区解放路58号6栋1406室
+  payment_origin: 云杉支付
+  payment_date: '2026-04-04'
+  card: 云杉信用卡
+title: 订单详情

@@ -1,0 +1,138 @@
+page_id: alwaha-order-list-2
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/orders?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20260712-100689
+  registration_date: '2026-07-12'
+  status: تم التوصيل
+  goods: سوار لياقة ذكي
+  tracking_number: '271611447605'
+  sender_name: ريم الغامدي
+  recipient_name: ريم الغامدي
+  quantity: 5
+  amount: 606.8
+  shipping_fee: 0.0
+  payment_method: محفظة رقمية
+- id,link: 20260918-100742
+  registration_date: '2026-09-18'
+  status: قيد المعالجة
+  goods: جاكيت فرو شيربا
+  sender_name: فيصل الدوسري
+  recipient_name: فيصل الدوسري
+  quantity: 3
+  amount: 510.45
+  shipping_fee: 0.0
+  payment_method: بطاقة ائتمان
+- id,link: 20260830-100795
+  registration_date: '2026-08-30'
+  status: قيد المعالجة
+  goods: حامل رافع للشاشة
+  sender_name: هند المطيري
+  recipient_name: هند المطيري
+  quantity: 1
+  amount: 103.8
+  shipping_fee: 8.2
+  payment_method: بطاقة ائتمان
+- id,link: 20261003-100848
+  registration_date: '2026-10-03'
+  status: تم التوصيل
+  goods: خلاط يدوي غاطس
+  tracking_number: '793273036706'
+  sender_name: لمى المطيري
+  recipient_name: لمى المطيري
+  quantity: 1
+  amount: 109.05
+  shipping_fee: 8.2
+  payment_method: بطاقة ائتمان
+- id,link: 20260526-100901
+  registration_date: '2026-05-26'
+  status: مرتجع
+  goods: طقم حافظات زجاجية محكمة الإغلاق
+  tracking_number: '972974430596'
+  sender_name: سارة القحطاني
+  recipient_name: خالد المطيري
+  quantity: 1
+  amount: 84.88
+  shipping_fee: 8.2
+  payment_method: محفظة رقمية
+- id,link: 20260408-100954
+  registration_date: '2026-04-08'
+  status: مرتجع
+  goods: لوشن جسم خالٍ من العطور
+  tracking_number: '446089182612'
+  sender_name: فيصل الحربي
+  recipient_name: فيصل الحربي
+  quantity: 2
+  amount: 99.2
+  shipping_fee: 8.2
+  payment_method: تحويل بنكي
+- id,link: 20260615-101007
+  registration_date: '2026-06-15'
+  status: بانتظار الدفع
+  goods: عصير يوسفي من جيجو
+  sender_name: عبدالله الحربي
+  recipient_name: عبدالله الغامدي
+  quantity: 1
+  amount: 57.75
+  shipping_fee: 8.2
+  payment_method: تحويل بنكي
+- id,link: 20261005-101060
+  registration_date: '2026-10-05'
+  status: قيد المعالجة
+  goods: بطانية مايكروفايبر
+  sender_name: فيصل الشمري
+  recipient_name: فيصل الزهراني
+  quantity: 3
+  amount: 219.45
+  shipping_fee: 0.0
+  payment_method: بطاقة ائتمان
+- id,link: 20260720-101113
+  registration_date: '2026-07-20'
+  status: تم الشحن
+  goods: خف منزلي من القطيفة
+  tracking_number: '683359608236'
+  sender_name: نورة المطيري
+  recipient_name: سلطان الحربي
+  quantity: 2
+  amount: 115.0
+  shipping_fee: 8.2
+  payment_method: بطاقة ائتمان
+- id,link: 20260512-101166
+  registration_date: '2026-05-12'
+  status: ملغى
+  goods: طقم أدوات مطبخ من السيليكون
+  sender_name: عمر الزهراني
+  recipient_name: سلطان الحربي
+  quantity: 2
+  amount: 125.73
+  shipping_fee: 0.0
+  payment_method: محفظة رقمية
+- id,link: 20260717-101219
+  registration_date: '2026-07-17'
+  status: تم التوصيل
+  goods: طقم أدوات طعام للأطفال
+  tracking_number: '594936428586'
+  sender_name: خالد الزهراني
+  recipient_name: خالد الزهراني
+  quantity: 1
+  amount: 78.49
+  shipping_fee: 8.2
+  payment_method: بطاقة ائتمان
+- id,link: 20260703-101272
+  registration_date: '2026-07-03'
+  status: تم الشحن
+  goods: لوحة مفاتيح ميكانيكية صامتة
+  tracking_number: '556596334523'
+  sender_name: خالد الشمري
+  recipient_name: عبدالله الحربي
+  quantity: 2
+  amount: 456.12
+  shipping_fee: 0.0
+  payment_method: تحويل بنكي
+title: الطلبات

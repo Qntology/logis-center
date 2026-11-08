@@ -1,0 +1,28 @@
+page_id: alameda-order-detail-20260629-100053
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/orders/20260629-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260629-100053
+  registration_date: '2026-06-29'
+  status: En proceso
+  goods: Ratón vertical ergonómico
+  sender_name: Paula Ruiz
+  recipient_name: Paula Ruiz
+  quantity: 1
+  amount: 31.15
+  shipping_fee: 2.05
+  payment_method: Tarjeta de crédito
+  sender_phone: +34 691 808 737
+  sender_address: Calle del Sol 54, 29005 Málaga
+  recipient_phone: +34 691 808 737
+  recipient_address: Calle del Sol 54, 29005 Málaga
+  payment_origin: PagoPuente
+  payment_date: '2026-06-29'
+  card: Tarjeta Alameda
+title: Detalle del pedido

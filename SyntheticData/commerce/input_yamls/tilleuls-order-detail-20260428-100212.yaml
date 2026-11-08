@@ -1,0 +1,28 @@
+page_id: tilleuls-order-detail-20260428-100212
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/order/view?id=20260428-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260428-100212
+  registration_date: '2026-04-28'
+  status: Payée
+  goods: Lait corporel sans parfum
+  sender_name: Jules Bernard
+  recipient_name: Jules Bernard
+  quantity: 1
+  amount: 14.6
+  shipping_fee: 2.05
+  payment_method: Carte bancaire
+  sender_phone: +33 6 54 30 38 37
+  sender_address: 33 rue du Moulin, 75011 Paris
+  recipient_phone: +33 6 54 30 38 37
+  recipient_address: 33 rue du Moulin, 75011 Paris
+  payment_origin: RéglExpress
+  payment_date: '2026-04-28'
+  card: Carte Saint-Roch
+title: Détail de la commande

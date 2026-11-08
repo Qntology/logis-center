@@ -1,0 +1,31 @@
+page_id: faro-goods-detail-IT10111
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/products/IT10111
+page_type: goods
+layout: detail
+fields:
+  id,link: IT10111
+  title: Sandali traspiranti
+  status: Bozza
+  category: Abbigliamento
+  sale_price: 25.45
+  compare_at_price: 30.54
+  quantity: 7
+  registration_date: '2026-07-07'
+  brand_name: 솔빛
+  code: IT-HOT-103
+  stock_keeping_unit: ITHO1003
+  model_name: HO-522
+  manufacturer: 다온랩스
+  origin_country: Polonia
+  color: Grigio chiaro
+  barcode: '8820789089897'
+  supply_price: 14.2
+  low_stock_threshold: 20
+  shipping_fee: 2.05
+  description: La tomaia forata evita che i piedi si sentano soffocare.
+title: Scheda prodotto

@@ -1,0 +1,29 @@
+page_id: sakura-order-detail-20261007-100212
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/order/view?id=20261007-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20261007-100212
+  registration_date: '2026-10-07'
+  status: 発送済み
+  goods: 軽量ダウンベスト
+  tracking_number: '416875405476'
+  sender_name: 鈴木 陽菜
+  recipient_name: 小林 結衣
+  quantity: 3
+  amount: 24840
+  shipping_fee: 0
+  payment_method: クレジットカード
+  sender_phone: 090-1260-8870
+  sender_address: 〒231-0011 神奈川県横浜市中区栄町9-24-14
+  recipient_phone: 090-7006-4760
+  recipient_address: 〒060-0001 北海道札幌市中央区緑町2-18-17
+  payment_origin: ペイみなと
+  payment_date: '2026-10-07'
+  card: ひばりカード
+title: 注文詳細

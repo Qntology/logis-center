@@ -1,0 +1,30 @@
+page_id: tilleuls-tracking-detail-449741588837
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/shipping/view?id=449741588837
+page_type: tracking
+layout: detail
+fields:
+  id,link: '449741588837'
+  carrier: Colis Éclair
+  status: Livrée
+  title: Chauffe-mains rechargeable
+  shipping_date: '2026-09-12'
+  recipient_name: Lucas Lefèvre
+  registration_date: '2026-09-09'
+  sender_name: Comptoir des Tilleuls SARL
+  sender_address: 12 rue des Lilas, 69003 Lyon
+  sender_phone: +33 4 55 50 12 34
+  recipient_address: 45 rue du Moulin, 69002 Lyon
+  recipient_phone: +33 6 16 60 90 45
+  weight: 1.2
+  width: 53
+  height: 28
+  length: 31
+  shipping_method: Standard
+  shipping_duration: 1
+  shipping_fee: 0.0
+title: Détail de l'expédition

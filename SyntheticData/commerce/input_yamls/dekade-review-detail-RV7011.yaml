@@ -1,0 +1,16 @@
+page_id: dekade-review-detail-RV7011
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/review/view?id=RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: Goedgekeurd
+  title: Goed verpakt en over het geheel licht.
+  name: Sanne Jansen
+  registration_date: '2026-05-20'
+title: Beoordeling

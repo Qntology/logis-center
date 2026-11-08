@@ -1,0 +1,138 @@
+page_id: alameda-order-list-2
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/orders?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20260830-100689
+  registration_date: '2026-08-30'
+  status: En proceso
+  goods: Elevador para monitor
+  sender_name: Paula Sánchez
+  recipient_name: Paula Sánchez
+  quantity: 3
+  amount: 70.74
+  shipping_fee: 0.0
+  payment_method: Monedero digital
+- id,link: 20260624-100742
+  registration_date: '2026-06-24'
+  status: Entregado
+  goods: Esterilla refrescante de gel
+  tracking_number: '646254842893'
+  sender_name: Diego Torres
+  recipient_name: Diego Torres
+  quantity: 4
+  amount: 134.75
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+- id,link: 20260610-100795
+  registration_date: '2026-06-10'
+  status: Entregado
+  goods: Elevador para monitor
+  tracking_number: '538226403596'
+  sender_name: Martina Navarro
+  recipient_name: Martina Navarro
+  quantity: 5
+  amount: 133.75
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+- id,link: 20260612-100848
+  registration_date: '2026-06-12'
+  status: En proceso
+  goods: Arnés para perro
+  sender_name: Hugo López
+  recipient_name: Hugo López
+  quantity: 3
+  amount: 57.25
+  shipping_fee: 0.0
+  payment_method: Monedero digital
+- id,link: 20260703-100901
+  registration_date: '2026-07-03'
+  status: Entregado
+  goods: Cuaderno para colorear
+  tracking_number: '987797516600'
+  sender_name: Mateo Torres
+  recipient_name: Álvaro Torres
+  quantity: 3
+  amount: 38.05
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+- id,link: 20260609-100954
+  registration_date: '2026-06-09'
+  status: Cancelado
+  goods: Cuaderno para colorear
+  sender_name: Carmen López
+  recipient_name: Carmen López
+  quantity: 10
+  amount: 114.0
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+- id,link: 20260814-101007
+  registration_date: '2026-08-14'
+  status: Entregado
+  goods: Comedero automático
+  tracking_number: '323086276054'
+  sender_name: Martina Torres
+  recipient_name: Martina Torres
+  quantity: 2
+  amount: 88.92
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+- id,link: 20260419-101060
+  registration_date: '2026-04-19'
+  status: En proceso
+  goods: Ratón vertical ergonómico
+  sender_name: Hugo Ruiz
+  recipient_name: Hugo Ruiz
+  quantity: 1
+  amount: 31.15
+  shipping_fee: 2.05
+  payment_method: Transferencia bancaria
+- id,link: 20260608-101113
+  registration_date: '2026-06-08'
+  status: Cancelado
+  goods: Sudadera con cremallera forrada de polar
+  sender_name: Daniel Navarro
+  recipient_name: Daniel Navarro
+  quantity: 2
+  amount: 72.1
+  shipping_fee: 0.0
+  payment_method: Monedero digital
+- id,link: 20260702-101166
+  registration_date: '2026-07-02'
+  status: Enviado
+  goods: Elevador para monitor
+  tracking_number: '769902159902'
+  sender_name: Elena Ruiz
+  recipient_name: Elena Ruiz
+  quantity: 4
+  amount: 94.7
+  shipping_fee: 0.0
+  payment_method: Monedero digital
+- id,link: 20260813-101219
+  registration_date: '2026-08-13'
+  status: Enviado
+  goods: Silla de camping ligera
+  tracking_number: '285104724787'
+  sender_name: Elena Navarro
+  recipient_name: Elena Navarro
+  quantity: 4
+  amount: 88.15
+  shipping_fee: 0.0
+  payment_method: Transferencia bancaria
+- id,link: 20260515-101272
+  registration_date: '2026-05-15'
+  status: Enviado
+  goods: Almendras tostadas
+  tracking_number: '159147579628'
+  sender_name: Carmen López
+  recipient_name: Carmen López
+  quantity: 2
+  amount: 20.15
+  shipping_fee: 2.05
+  payment_method: Tarjeta de crédito
+title: Pedidos

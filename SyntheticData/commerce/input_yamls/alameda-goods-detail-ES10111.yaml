@@ -1,0 +1,31 @@
+page_id: alameda-goods-detail-ES10111
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/products/ES10111
+page_type: goods
+layout: detail
+fields:
+  id,link: ES10111
+  title: Juego de cocina portátil
+  status: Borrador
+  category: Aire libre
+  sale_price: 29.1
+  compare_at_price: 34.92
+  quantity: 120
+  registration_date: '2026-06-21'
+  brand_name: Oakfern
+  code: ES-OUT-103
+  stock_keeping_unit: ESOU1003
+  model_name: OU-458
+  manufacturer: 하람제작소
+  origin_country: Corea
+  color: Crema
+  barcode: '8848755299684'
+  supply_price: 19.07
+  low_stock_threshold: 5
+  shipping_fee: 2.05
+  description: Una olla y una sartén que se guardan una dentro de otra.
+title: Detalle del producto

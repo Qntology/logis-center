@@ -3515,3 +3515,5776 @@
   query: 콜드브루 원액
   relevant:
   - lantern:goods:BL10777
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: de
+  domain: goods
+  query: etwas, das mich warm hält, wenn es eiskalt ist
+  relevant:
+  - lindenhof:goods:DE10148
+  - lindenhof:goods:DE10740
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - lindenhof:goods:DE10148
+  - lindenhof:goods:DE10740
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: de
+  domain: goods
+  query: Produkte, die mir an einem drückend heißen Tag Abkühlung verschaffen
+  relevant:
+  - lindenhof:goods:DE10481
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - lindenhof:goods:DE10481
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: de
+  domain: goods
+  query: Zubehör für einen aufgeräumten, bequemen Schreibtisch im Homeoffice
+  relevant:
+  - lindenhof:goods:DE10074
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - lindenhof:goods:DE10074
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: de
+  domain: goods
+  query: Werkzeuge, die ich beim Kochen des Abendessens benutzen würde
+  relevant:
+  - lindenhof:goods:DE10333
+  - lindenhof:goods:DE10555
+  - lindenhof:goods:DE10666
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - lindenhof:goods:DE10333
+  - lindenhof:goods:DE10555
+  - lindenhof:goods:DE10666
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: de
+  domain: goods
+  query: ein Geschenk für ein kleines Kind
+  relevant:
+  - lindenhof:goods:DE10222
+  - lindenhof:goods:DE10518
+  - lindenhof:goods:DE10629
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - lindenhof:goods:DE10222
+  - lindenhof:goods:DE10518
+  - lindenhof:goods:DE10629
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: de
+  domain: goods
+  query: Dinge, die ich für meinen Hund oder meine Katze brauche
+  relevant:
+  - lindenhof:goods:DE10185
+  - lindenhof:goods:DE10592
+  - lindenhof:goods:DE10777
+  - lindenhof:goods:DE10888
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - lindenhof:goods:DE10185
+  - lindenhof:goods:DE10592
+  - lindenhof:goods:DE10777
+  - lindenhof:goods:DE10888
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: de
+  domain: goods
+  query: Ausrüstung für einen Campingausflug am Wochenende
+  relevant:
+  - lindenhof:goods:DE10259
+  - lindenhof:goods:DE10703
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - lindenhof:goods:DE10259
+  - lindenhof:goods:DE10703
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: de
+  domain: goods
+  query: Produkte zur Pflege trockener Haut
+  relevant:
+  - lindenhof:goods:DE10037
+  - lindenhof:goods:DE10296
+  - lindenhof:goods:DE10407
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - lindenhof:goods:DE10037
+  - lindenhof:goods:DE10296
+  - lindenhof:goods:DE10407
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: de
+  domain: goods
+  query: etwas zu essen oder zu trinken für den kleinen Hunger
+  relevant:
+  - lindenhof:goods:DE10111
+  - lindenhof:goods:DE10370
+  - lindenhof:goods:DE10814
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - lindenhof:goods:DE10111
+  - lindenhof:goods:DE10370
+  - lindenhof:goods:DE10814
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: de
+  domain: goods
+  query: Geräte, um unterwegs Musik zu hören oder Geräte zu laden
+  relevant:
+  - lindenhof:goods:DE10444
+  - lindenhof:goods:DE10851
+- split: ml
+  shop: lindenhof
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - lindenhof:goods:DE10444
+  - lindenhof:goods:DE10851
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: order
+  query: Bestellung 20260517-101219 anzeigen
+  relevant:
+  - lindenhof:order:20260517-101219
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: order
+  query: Bestellung 20260923-100901 anzeigen
+  relevant:
+  - lindenhof:order:20260923-100901
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: order
+  query: Bestellung 20260928-101007 anzeigen
+  relevant:
+  - lindenhof:order:20260928-101007
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: order
+  query: Bestellung 20260728-100689 anzeigen
+  relevant:
+  - lindenhof:order:20260728-100689
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: order
+  query: Bestellung 20260525-100371 anzeigen
+  relevant:
+  - lindenhof:order:20260525-100371
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: tracking
+  query: wo ist die Sendung 340030207536
+  relevant:
+  - lindenhof:tracking:340030207536
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: tracking
+  query: wo ist die Sendung 540539657243
+  relevant:
+  - lindenhof:tracking:540539657243
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: tracking
+  query: wo ist die Sendung 172007067867
+  relevant:
+  - lindenhof:tracking:172007067867
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: tracking
+  query: wo ist die Sendung 306304270433
+  relevant:
+  - lindenhof:tracking:306304270433
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: tracking
+  query: wo ist die Sendung 296101417557
+  relevant:
+  - lindenhof:tracking:296101417557
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: goods
+  query: Lagerbestand für Artikel DE10148
+  relevant:
+  - lindenhof:goods:DE10148
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: goods
+  query: Lagerbestand für Artikel DE10259
+  relevant:
+  - lindenhof:goods:DE10259
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: goods
+  query: Lagerbestand für Artikel DE10666
+  relevant:
+  - lindenhof:goods:DE10666
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: goods
+  query: Lagerbestand für Artikel DE10444
+  relevant:
+  - lindenhof:goods:DE10444
+- split: ml
+  shop: lindenhof
+  kind: identifier
+  lang: de
+  domain: goods
+  query: Lagerbestand für Artikel DE10407
+  relevant:
+  - lindenhof:goods:DE10407
+- split: ml
+  shop: lindenhof
+  kind: status
+  lang: de
+  domain: order
+  query: Bestellungen mit Status Bezahlt
+  relevant:
+  - lindenhof:order:20260403-100477
+  - lindenhof:order:20260507-100159
+  - lindenhof:order:20260602-100742
+  - lindenhof:order:20260620-100318
+- split: ml
+  shop: lindenhof
+  kind: status
+  lang: de
+  domain: order
+  query: Bestellungen mit Status In Bearbeitung
+  relevant:
+  - lindenhof:order:20260517-101219
+  - lindenhof:order:20260811-101113
+- split: ml
+  shop: lindenhof
+  kind: status
+  lang: de
+  domain: order
+  query: Bestellungen mit Status Storniert
+  relevant:
+  - lindenhof:order:20260706-100424
+  - lindenhof:order:20260726-100053
+  - lindenhof:order:20261003-100212
+- split: ml
+  shop: lindenhof
+  kind: status
+  lang: de
+  domain: order
+  query: Bestellungen mit Status Unterwegs
+  relevant:
+  - lindenhof:order:20260612-100848
+  - lindenhof:order:20260721-100795
+  - lindenhof:order:20260928-101007
+- split: ml
+  shop: lindenhof
+  kind: status
+  lang: de
+  domain: order
+  query: Bestellungen mit Status Zahlung ausstehend
+  relevant:
+  - lindenhof:order:20260512-100265
+  - lindenhof:order:20260901-100583
+- split: ml
+  shop: lindenhof
+  kind: status
+  lang: de
+  domain: order
+  query: Bestellungen mit Status Zugestellt
+  relevant:
+  - lindenhof:order:20260409-100530
+  - lindenhof:order:20260411-100636
+  - lindenhof:order:20260430-101060
+  - lindenhof:order:20260517-100954
+  - lindenhof:order:20260525-100371
+  - lindenhof:order:20260728-100689
+  - lindenhof:order:20260808-101272
+- split: ml
+  shop: lindenhof
+  kind: status
+  lang: de
+  domain: order
+  query: Bestellungen mit Status Zurückgesendet
+  relevant:
+  - lindenhof:order:20260402-101166
+  - lindenhof:order:20260513-100106
+  - lindenhof:order:20260923-100901
+- split: ml
+  shop: lindenhof
+  kind: person
+  lang: de
+  domain: order
+  query: Bestellungen von Anna Hoffmann finden
+  relevant:
+  - lindenhof:order:20260808-101272
+- split: ml
+  shop: lindenhof
+  kind: person
+  lang: de
+  domain: order
+  query: Bestellungen von Jonas Neumann finden
+  relevant:
+  - lindenhof:order:20260706-100424
+- split: ml
+  shop: lindenhof
+  kind: person
+  lang: de
+  domain: order
+  query: Bestellungen von Sophie Wolf finden
+  relevant:
+  - lindenhof:order:20260525-100371
+- split: ml
+  shop: lindenhof
+  kind: person
+  lang: de
+  domain: order
+  query: Bestellungen von Jonas Braun finden
+  relevant:
+  - lindenhof:order:20260612-100848
+- split: ml
+  shop: lindenhof
+  kind: person
+  lang: de
+  domain: order
+  query: Bestellungen von Hannah Schneider finden
+  relevant:
+  - lindenhof:order:20260728-100689
+- split: ml
+  shop: lindenhof
+  kind: amount
+  lang: de
+  domain: order
+  query: Bestellungen ab 144,50 €
+  relevant:
+  - lindenhof:order:20260513-100106
+  - lindenhof:order:20260602-100742
+  - lindenhof:order:20260726-100053
+  - lindenhof:order:20260923-100901
+- split: ml
+  shop: lindenhof
+  kind: period
+  lang: de
+  domain: order
+  query: Bestellungen im Mai 2026
+  relevant:
+  - lindenhof:order:20260507-100159
+  - lindenhof:order:20260512-100265
+  - lindenhof:order:20260513-100106
+  - lindenhof:order:20260517-100954
+  - lindenhof:order:20260517-101219
+  - lindenhof:order:20260525-100371
+- split: ml
+  shop: lindenhof
+  kind: period
+  lang: de
+  domain: order
+  query: Bestellungen im Juli 2026
+  relevant:
+  - lindenhof:order:20260706-100424
+  - lindenhof:order:20260721-100795
+  - lindenhof:order:20260726-100053
+  - lindenhof:order:20260728-100689
+- split: ml
+  shop: lindenhof
+  kind: period
+  lang: de
+  domain: order
+  query: Bestellungen im September 2026
+  relevant:
+  - lindenhof:order:20260901-100583
+  - lindenhof:order:20260923-100901
+  - lindenhof:order:20260928-101007
+- split: ml
+  shop: lindenhof
+  kind: goods_in_order
+  lang: de
+  domain: order
+  query: Bestellungen mit Kuppelzelt für zwei Personen
+  relevant:
+  - lindenhof:order:20260525-100371
+  - lindenhof:order:20260923-100901
+- split: ml
+  shop: lindenhof
+  kind: goods_exact
+  lang: de
+  domain: goods
+  query: Kuppelzelt für zwei Personen
+  relevant:
+  - lindenhof:goods:DE10259
+- split: ml
+  shop: lindenhof
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Two-person dome tent
+  relevant:
+  - lindenhof:goods:DE10259
+- split: ml
+  shop: lindenhof
+  kind: goods_in_order
+  lang: de
+  domain: order
+  query: Bestellungen mit Kratzsäule für Katzen
+  relevant:
+  - lindenhof:order:20260403-100477
+- split: ml
+  shop: lindenhof
+  kind: goods_exact
+  lang: de
+  domain: goods
+  query: Kratzsäule für Katzen
+  relevant:
+  - lindenhof:goods:DE10592
+- split: ml
+  shop: lindenhof
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Cat scratching post
+  relevant:
+  - lindenhof:goods:DE10592
+- split: ml
+  shop: lindenhof
+  kind: goods_exact
+  lang: de
+  domain: goods
+  query: Vitamin-C-Serum
+  relevant:
+  - lindenhof:goods:DE10407
+- split: ml
+  shop: lindenhof
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Vitamin C serum
+  relevant:
+  - lindenhof:goods:DE10407
+- split: ml
+  shop: lindenhof
+  kind: goods_in_order
+  lang: de
+  domain: order
+  query: Bestellungen mit Geröstete Naturreis-Chips
+  relevant:
+  - lindenhof:order:20260901-100583
+- split: ml
+  shop: lindenhof
+  kind: goods_exact
+  lang: de
+  domain: goods
+  query: Geröstete Naturreis-Chips
+  relevant:
+  - lindenhof:goods:DE10370
+- split: ml
+  shop: lindenhof
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Scorched brown rice crisps
+  relevant:
+  - lindenhof:goods:DE10370
+- split: ml
+  shop: lindenhof
+  kind: goods_exact
+  lang: de
+  domain: goods
+  query: Edelstahl-Bratpfanne
+  relevant:
+  - lindenhof:goods:DE10333
+- split: ml
+  shop: lindenhof
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Stainless steel frying pan
+  relevant:
+  - lindenhof:goods:DE10333
+- split: ml
+  shop: lindenhof
+  kind: goods_in_order
+  lang: de
+  domain: order
+  query: Bestellungen mit Kindergeschirr-Set
+  relevant:
+  - lindenhof:order:20260706-100424
+- split: ml
+  shop: lindenhof
+  kind: goods_exact
+  lang: de
+  domain: goods
+  query: Kindergeschirr-Set
+  relevant:
+  - lindenhof:goods:DE10222
+- split: ml
+  shop: lindenhof
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Toddler tableware set
+  relevant:
+  - lindenhof:goods:DE10222
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: es
+  domain: goods
+  query: algo que me mantenga caliente cuando hace mucho frío
+  relevant:
+  - alameda:goods:ES10148
+  - alameda:goods:ES10222
+  - alameda:goods:ES10259
+  - alameda:goods:ES10851
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - alameda:goods:ES10148
+  - alameda:goods:ES10222
+  - alameda:goods:ES10259
+  - alameda:goods:ES10851
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: es
+  domain: goods
+  query: productos que me ayuden a refrescarme en un día sofocante
+  relevant:
+  - alameda:goods:ES10666
+  - alameda:goods:ES10740
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - alameda:goods:ES10666
+  - alameda:goods:ES10740
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: es
+  domain: goods
+  query: accesorios para un escritorio de teletrabajo más ordenado y cómodo
+  relevant:
+  - alameda:goods:ES10074
+  - alameda:goods:ES10481
+  - alameda:goods:ES10592
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - alameda:goods:ES10074
+  - alameda:goods:ES10481
+  - alameda:goods:ES10592
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: es
+  domain: goods
+  query: utensilios que usaría para cocinar la cena
+  relevant:
+  - alameda:goods:ES10444
+  - alameda:goods:ES10518
+  - alameda:goods:ES10814
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - alameda:goods:ES10444
+  - alameda:goods:ES10518
+  - alameda:goods:ES10814
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: es
+  domain: goods
+  query: un regalo para un niño pequeño
+  relevant:
+  - alameda:goods:ES10333
+  - alameda:goods:ES10777
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - alameda:goods:ES10333
+  - alameda:goods:ES10777
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: es
+  domain: goods
+  query: cosas que necesito para mi perro o mi gato
+  relevant:
+  - alameda:goods:ES10407
+  - alameda:goods:ES10703
+  - alameda:goods:ES10888
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - alameda:goods:ES10407
+  - alameda:goods:ES10703
+  - alameda:goods:ES10888
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: es
+  domain: goods
+  query: equipo para llevar a una acampada de fin de semana
+  relevant:
+  - alameda:goods:ES10111
+  - alameda:goods:ES10185
+  - alameda:goods:ES10370
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - alameda:goods:ES10111
+  - alameda:goods:ES10185
+  - alameda:goods:ES10370
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: es
+  domain: goods
+  query: algo de comer o beber para picar
+  relevant:
+  - alameda:goods:ES10296
+  - alameda:goods:ES10555
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - alameda:goods:ES10296
+  - alameda:goods:ES10555
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: es
+  domain: goods
+  query: aparatos para escuchar música o cargar dispositivos fuera de casa
+  relevant:
+  - alameda:goods:ES10037
+  - alameda:goods:ES10629
+- split: ml
+  shop: alameda
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - alameda:goods:ES10037
+  - alameda:goods:ES10629
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: order
+  query: consultar el pedido 20260817-100530
+  relevant:
+  - alameda:order:20260817-100530
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: order
+  query: consultar el pedido 20260416-100159
+  relevant:
+  - alameda:order:20260416-100159
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: order
+  query: consultar el pedido 20260807-100424
+  relevant:
+  - alameda:order:20260807-100424
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: order
+  query: consultar el pedido 20260916-100212
+  relevant:
+  - alameda:order:20260916-100212
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: order
+  query: consultar el pedido 20260703-100583
+  relevant:
+  - alameda:order:20260703-100583
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: tracking
+  query: dónde está el envío 662499719297
+  relevant:
+  - alameda:tracking:662499719297
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: tracking
+  query: dónde está el envío 353124270906
+  relevant:
+  - alameda:tracking:353124270906
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: tracking
+  query: dónde está el envío 473668249852
+  relevant:
+  - alameda:tracking:473668249852
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: tracking
+  query: dónde está el envío 344373122572
+  relevant:
+  - alameda:tracking:344373122572
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: tracking
+  query: dónde está el envío 277930917322
+  relevant:
+  - alameda:tracking:277930917322
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: goods
+  query: existencias del producto ES10037
+  relevant:
+  - alameda:goods:ES10037
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: goods
+  query: existencias del producto ES10629
+  relevant:
+  - alameda:goods:ES10629
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: goods
+  query: existencias del producto ES10333
+  relevant:
+  - alameda:goods:ES10333
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: goods
+  query: existencias del producto ES10111
+  relevant:
+  - alameda:goods:ES10111
+- split: ml
+  shop: alameda
+  kind: identifier
+  lang: es
+  domain: goods
+  query: existencias del producto ES10148
+  relevant:
+  - alameda:goods:ES10148
+- split: ml
+  shop: alameda
+  kind: status
+  lang: es
+  domain: order
+  query: pedidos con estado Cancelado
+  relevant:
+  - alameda:order:20260608-101113
+  - alameda:order:20260609-100954
+  - alameda:order:20260816-100318
+- split: ml
+  shop: alameda
+  kind: status
+  lang: es
+  domain: order
+  query: pedidos con estado Devuelto
+  relevant:
+  - alameda:order:20260817-100530
+- split: ml
+  shop: alameda
+  kind: status
+  lang: es
+  domain: order
+  query: pedidos con estado En proceso
+  relevant:
+  - alameda:order:20260419-101060
+  - alameda:order:20260612-100848
+  - alameda:order:20260629-100053
+  - alameda:order:20260703-100583
+  - alameda:order:20260830-100689
+- split: ml
+  shop: alameda
+  kind: status
+  lang: es
+  domain: order
+  query: pedidos con estado Entregado
+  relevant:
+  - alameda:order:20260504-100371
+  - alameda:order:20260610-100795
+  - alameda:order:20260624-100742
+  - alameda:order:20260703-100901
+  - alameda:order:20260804-100265
+  - alameda:order:20260807-100424
+  - alameda:order:20260814-101007
+  - alameda:order:20260822-100636
+  - alameda:order:20260916-100212
+- split: ml
+  shop: alameda
+  kind: status
+  lang: es
+  domain: order
+  query: pedidos con estado Enviado
+  relevant:
+  - alameda:order:20260515-101272
+  - alameda:order:20260529-100106
+  - alameda:order:20260702-101166
+  - alameda:order:20260813-101219
+  - alameda:order:20260919-100477
+- split: ml
+  shop: alameda
+  kind: status
+  lang: es
+  domain: order
+  query: pedidos con estado Pendiente de pago
+  relevant:
+  - alameda:order:20260416-100159
+- split: ml
+  shop: alameda
+  kind: person
+  lang: es
+  domain: order
+  query: buscar pedidos de Elena Ruiz
+  relevant:
+  - alameda:order:20260702-101166
+- split: ml
+  shop: alameda
+  kind: person
+  lang: es
+  domain: order
+  query: buscar pedidos de Pablo López
+  relevant:
+  - alameda:order:20260703-100583
+- split: ml
+  shop: alameda
+  kind: person
+  lang: es
+  domain: order
+  query: buscar pedidos de Paula Ruiz
+  relevant:
+  - alameda:order:20260629-100053
+- split: ml
+  shop: alameda
+  kind: person
+  lang: es
+  domain: order
+  query: buscar pedidos de Sofía Torres
+  relevant:
+  - alameda:order:20260416-100159
+  - alameda:order:20260807-100424
+- split: ml
+  shop: alameda
+  kind: person
+  lang: es
+  domain: order
+  query: buscar pedidos de Paula Sánchez
+  relevant:
+  - alameda:order:20260830-100689
+- split: ml
+  shop: alameda
+  kind: amount
+  lang: es
+  domain: order
+  query: pedidos de 107,35 € o más
+  relevant:
+  - alameda:order:20260609-100954
+  - alameda:order:20260610-100795
+  - alameda:order:20260624-100742
+  - alameda:order:20260807-100424
+- split: ml
+  shop: alameda
+  kind: period
+  lang: es
+  domain: order
+  query: pedidos de mayo de 2026
+  relevant:
+  - alameda:order:20260504-100371
+  - alameda:order:20260515-101272
+  - alameda:order:20260529-100106
+- split: ml
+  shop: alameda
+  kind: period
+  lang: es
+  domain: order
+  query: pedidos de julio de 2026
+  relevant:
+  - alameda:order:20260702-101166
+  - alameda:order:20260703-100583
+  - alameda:order:20260703-100901
+- split: ml
+  shop: alameda
+  kind: period
+  lang: es
+  domain: order
+  query: pedidos de septiembre de 2026
+  relevant:
+  - alameda:order:20260916-100212
+  - alameda:order:20260919-100477
+- split: ml
+  shop: alameda
+  kind: goods_exact
+  lang: es
+  domain: goods
+  query: Banda refrescante para el cuello
+  relevant:
+  - alameda:goods:ES10666
+- split: ml
+  shop: alameda
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Cooling neck band
+  relevant:
+  - alameda:goods:ES10666
+- split: ml
+  shop: alameda
+  kind: goods_exact
+  lang: es
+  domain: goods
+  query: Auriculares inalámbricos con cancelación de ruido
+  relevant:
+  - alameda:goods:ES10037
+- split: ml
+  shop: alameda
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Noise-cancelling wireless earbuds
+  relevant:
+  - alameda:goods:ES10037
+- split: ml
+  shop: alameda
+  kind: goods_exact
+  lang: es
+  domain: goods
+  query: Sartén de acero inoxidable
+  relevant:
+  - alameda:goods:ES10814
+- split: ml
+  shop: alameda
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Stainless steel frying pan
+  relevant:
+  - alameda:goods:ES10814
+- split: ml
+  shop: alameda
+  kind: goods_exact
+  lang: es
+  domain: goods
+  query: Miniventilador de mano
+  relevant:
+  - alameda:goods:ES10740
+- split: ml
+  shop: alameda
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Handheld mini fan
+  relevant:
+  - alameda:goods:ES10740
+- split: ml
+  shop: alameda
+  kind: goods_exact
+  lang: es
+  domain: goods
+  query: Chaqueta de borreguillo
+  relevant:
+  - alameda:goods:ES10851
+- split: ml
+  shop: alameda
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Sherpa fleece jacket
+  relevant:
+  - alameda:goods:ES10851
+- split: ml
+  shop: alameda
+  kind: goods_exact
+  lang: es
+  domain: goods
+  query: Cuchillo de cocinero de cerámica
+  relevant:
+  - alameda:goods:ES10518
+- split: ml
+  shop: alameda
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Ceramic chef knife
+  relevant:
+  - alameda:goods:ES10518
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: fr
+  domain: goods
+  query: quelque chose pour me tenir chaud quand il gèle
+  relevant:
+  - tilleuls:goods:FR10074
+  - tilleuls:goods:FR10481
+  - tilleuls:goods:FR10814
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - tilleuls:goods:FR10074
+  - tilleuls:goods:FR10481
+  - tilleuls:goods:FR10814
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: fr
+  domain: goods
+  query: des produits qui m'aident à me rafraîchir par une journée étouffante
+  relevant:
+  - tilleuls:goods:FR10111
+  - tilleuls:goods:FR10740
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - tilleuls:goods:FR10111
+  - tilleuls:goods:FR10740
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: fr
+  domain: goods
+  query: des accessoires pour un bureau de télétravail plus rangé et plus confortable
+  relevant:
+  - tilleuls:goods:FR10888
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - tilleuls:goods:FR10888
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: fr
+  domain: goods
+  query: les ustensiles que j'utiliserais pour préparer le dîner
+  relevant:
+  - tilleuls:goods:FR10407
+  - tilleuls:goods:FR10518
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - tilleuls:goods:FR10407
+  - tilleuls:goods:FR10518
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: fr
+  domain: goods
+  query: un cadeau pour un jeune enfant
+  relevant:
+  - tilleuls:goods:FR10148
+  - tilleuls:goods:FR10185
+  - tilleuls:goods:FR10777
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - tilleuls:goods:FR10148
+  - tilleuls:goods:FR10185
+  - tilleuls:goods:FR10777
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: fr
+  domain: goods
+  query: des choses dont j'ai besoin pour mon chien ou mon chat
+  relevant:
+  - tilleuls:goods:FR10037
+  - tilleuls:goods:FR10592
+  - tilleuls:goods:FR10703
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - tilleuls:goods:FR10037
+  - tilleuls:goods:FR10592
+  - tilleuls:goods:FR10703
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: fr
+  domain: goods
+  query: du matériel à emporter pour un week-end de camping
+  relevant:
+  - tilleuls:goods:FR10222
+  - tilleuls:goods:FR10259
+  - tilleuls:goods:FR10333
+  - tilleuls:goods:FR10370
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - tilleuls:goods:FR10222
+  - tilleuls:goods:FR10259
+  - tilleuls:goods:FR10333
+  - tilleuls:goods:FR10370
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: fr
+  domain: goods
+  query: des produits pour prendre soin d'une peau sèche
+  relevant:
+  - tilleuls:goods:FR10555
+  - tilleuls:goods:FR10666
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - tilleuls:goods:FR10555
+  - tilleuls:goods:FR10666
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: fr
+  domain: goods
+  query: quelque chose à manger ou à boire pour une petite faim
+  relevant:
+  - tilleuls:goods:FR10296
+  - tilleuls:goods:FR10851
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - tilleuls:goods:FR10296
+  - tilleuls:goods:FR10851
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: fr
+  domain: goods
+  query: des appareils pour écouter de la musique ou recharger mes appareils en déplacement
+  relevant:
+  - tilleuls:goods:FR10444
+  - tilleuls:goods:FR10629
+- split: ml
+  shop: tilleuls
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - tilleuls:goods:FR10444
+  - tilleuls:goods:FR10629
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: order
+  query: afficher la commande 20260921-100795
+  relevant:
+  - tilleuls:order:20260921-100795
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: order
+  query: afficher la commande 20260410-100742
+  relevant:
+  - tilleuls:order:20260410-100742
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: order
+  query: afficher la commande 20260708-101219
+  relevant:
+  - tilleuls:order:20260708-101219
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: order
+  query: afficher la commande 20260706-100530
+  relevant:
+  - tilleuls:order:20260706-100530
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: order
+  query: afficher la commande 20260604-100106
+  relevant:
+  - tilleuls:order:20260604-100106
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: tracking
+  query: où est le colis 107108748943
+  relevant:
+  - tilleuls:tracking:107108748943
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: tracking
+  query: où est le colis 294254945140
+  relevant:
+  - tilleuls:tracking:294254945140
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: tracking
+  query: où est le colis 779925383094
+  relevant:
+  - tilleuls:tracking:779925383094
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: tracking
+  query: où est le colis 539448320835
+  relevant:
+  - tilleuls:tracking:539448320835
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: tracking
+  query: où est le colis 439397791326
+  relevant:
+  - tilleuls:tracking:439397791326
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: goods
+  query: stock du produit FR10481
+  relevant:
+  - tilleuls:goods:FR10481
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: goods
+  query: stock du produit FR10518
+  relevant:
+  - tilleuls:goods:FR10518
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: goods
+  query: stock du produit FR10037
+  relevant:
+  - tilleuls:goods:FR10037
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: goods
+  query: stock du produit FR10666
+  relevant:
+  - tilleuls:goods:FR10666
+- split: ml
+  shop: tilleuls
+  kind: identifier
+  lang: fr
+  domain: goods
+  query: stock du produit FR10148
+  relevant:
+  - tilleuls:goods:FR10148
+- split: ml
+  shop: tilleuls
+  kind: status
+  lang: fr
+  domain: order
+  query: commandes au statut Annulée
+  relevant:
+  - tilleuls:order:20260816-100901
+  - tilleuls:order:20260921-100795
+- split: ml
+  shop: tilleuls
+  kind: status
+  lang: fr
+  domain: order
+  query: commandes au statut En attente de paiement
+  relevant:
+  - tilleuls:order:20260421-101060
+- split: ml
+  shop: tilleuls
+  kind: status
+  lang: fr
+  domain: order
+  query: commandes au statut En préparation
+  relevant:
+  - tilleuls:order:20260705-100583
+  - tilleuls:order:20260708-100053
+  - tilleuls:order:20260708-101219
+  - tilleuls:order:20260810-100848
+  - tilleuls:order:20261007-100689
+- split: ml
+  shop: tilleuls
+  kind: status
+  lang: fr
+  domain: order
+  query: commandes au statut Expédiée
+  relevant:
+  - tilleuls:order:20260407-100265
+  - tilleuls:order:20260706-100530
+  - tilleuls:order:20260822-100371
+  - tilleuls:order:20260910-101007
+  - tilleuls:order:20260910-101113
+- split: ml
+  shop: tilleuls
+  kind: status
+  lang: fr
+  domain: order
+  query: commandes au statut Livrée
+  relevant:
+  - tilleuls:order:20260507-100477
+  - tilleuls:order:20260511-100636
+  - tilleuls:order:20260604-100106
+  - tilleuls:order:20260801-100954
+  - tilleuls:order:20260817-101272
+  - tilleuls:order:20260909-100318
+- split: ml
+  shop: tilleuls
+  kind: status
+  lang: fr
+  domain: order
+  query: commandes au statut Payée
+  relevant:
+  - tilleuls:order:20260428-100212
+  - tilleuls:order:20260512-100159
+  - tilleuls:order:20260830-101166
+- split: ml
+  shop: tilleuls
+  kind: status
+  lang: fr
+  domain: order
+  query: commandes au statut Retournée
+  relevant:
+  - tilleuls:order:20260410-100742
+  - tilleuls:order:20260430-100424
+- split: ml
+  shop: tilleuls
+  kind: person
+  lang: fr
+  domain: order
+  query: trouver les commandes de Théo Girard
+  relevant:
+  - tilleuls:order:20260910-101113
+- split: ml
+  shop: tilleuls
+  kind: person
+  lang: fr
+  domain: order
+  query: trouver les commandes de Jules Dubois
+  relevant:
+  - tilleuls:order:20260817-101272
+- split: ml
+  shop: tilleuls
+  kind: person
+  lang: fr
+  domain: order
+  query: trouver les commandes de Louis Laurent
+  relevant:
+  - tilleuls:order:20260410-100742
+- split: ml
+  shop: tilleuls
+  kind: person
+  lang: fr
+  domain: order
+  query: trouver les commandes de Clara Dubois
+  relevant:
+  - tilleuls:order:20260705-100583
+- split: ml
+  shop: tilleuls
+  kind: person
+  lang: fr
+  domain: order
+  query: trouver les commandes de Lucas Dubois
+  relevant:
+  - tilleuls:order:20260830-101166
+- split: ml
+  shop: tilleuls
+  kind: amount
+  lang: fr
+  domain: order
+  query: commandes de 130,80 € ou plus
+  relevant:
+  - tilleuls:order:20260604-100106
+  - tilleuls:order:20260810-100848
+  - tilleuls:order:20260909-100318
+  - tilleuls:order:20260910-101113
+- split: ml
+  shop: tilleuls
+  kind: period
+  lang: fr
+  domain: order
+  query: commandes de mai 2026
+  relevant:
+  - tilleuls:order:20260507-100477
+  - tilleuls:order:20260511-100636
+  - tilleuls:order:20260512-100159
+- split: ml
+  shop: tilleuls
+  kind: period
+  lang: fr
+  domain: order
+  query: commandes de juillet 2026
+  relevant:
+  - tilleuls:order:20260705-100583
+  - tilleuls:order:20260706-100530
+  - tilleuls:order:20260708-100053
+  - tilleuls:order:20260708-101219
+- split: ml
+  shop: tilleuls
+  kind: period
+  lang: fr
+  domain: order
+  query: commandes de septembre 2026
+  relevant:
+  - tilleuls:order:20260909-100318
+  - tilleuls:order:20260910-101007
+  - tilleuls:order:20260910-101113
+  - tilleuls:order:20260921-100795
+- split: ml
+  shop: tilleuls
+  kind: goods_exact
+  lang: fr
+  domain: goods
+  query: Brosse de toilettage pour animaux
+  relevant:
+  - tilleuls:goods:FR10703
+- split: ml
+  shop: tilleuls
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Pet grooming brush
+  relevant:
+  - tilleuls:goods:FR10703
+- split: ml
+  shop: tilleuls
+  kind: goods_in_order
+  lang: fr
+  domain: order
+  query: commandes contenant Tente dôme deux places
+  relevant:
+  - tilleuls:order:20260810-100848
+- split: ml
+  shop: tilleuls
+  kind: goods_exact
+  lang: fr
+  domain: goods
+  query: Tente dôme deux places
+  relevant:
+  - tilleuls:goods:FR10259
+- split: ml
+  shop: tilleuls
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Two-person dome tent
+  relevant:
+  - tilleuls:goods:FR10259
+- split: ml
+  shop: tilleuls
+  kind: goods_exact
+  lang: fr
+  domain: goods
+  query: Gobelet isotherme sous vide
+  relevant:
+  - tilleuls:goods:FR10222
+- split: ml
+  shop: tilleuls
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Vacuum insulated tumbler
+  relevant:
+  - tilleuls:goods:FR10222
+- split: ml
+  shop: tilleuls
+  kind: goods_in_order
+  lang: fr
+  domain: order
+  query: commandes contenant Mousse nettoyante à pH bas
+  relevant:
+  - tilleuls:order:20260511-100636
+  - tilleuls:order:20261007-100689
+- split: ml
+  shop: tilleuls
+  kind: goods_exact
+  lang: fr
+  domain: goods
+  query: Mousse nettoyante à pH bas
+  relevant:
+  - tilleuls:goods:FR10666
+- split: ml
+  shop: tilleuls
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Low-pH cleansing foam
+  relevant:
+  - tilleuls:goods:FR10666
+- split: ml
+  shop: tilleuls
+  kind: goods_in_order
+  lang: fr
+  domain: order
+  query: commandes contenant Essence réparatrice pour cheveux
+  relevant:
+  - tilleuls:order:20260910-101007
+- split: ml
+  shop: tilleuls
+  kind: goods_exact
+  lang: fr
+  domain: goods
+  query: Essence réparatrice pour cheveux
+  relevant:
+  - tilleuls:goods:FR10555
+- split: ml
+  shop: tilleuls
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Repair hair essence
+  relevant:
+  - tilleuls:goods:FR10555
+- split: ml
+  shop: tilleuls
+  kind: goods_in_order
+  lang: fr
+  domain: order
+  query: commandes contenant Lapin en peluche
+  relevant:
+  - tilleuls:order:20260801-100954
+- split: ml
+  shop: tilleuls
+  kind: goods_exact
+  lang: fr
+  domain: goods
+  query: Lapin en peluche
+  relevant:
+  - tilleuls:goods:FR10148
+- split: ml
+  shop: tilleuls
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Plush bunny doll
+  relevant:
+  - tilleuls:goods:FR10148
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: it
+  domain: goods
+  query: prodotti che mi aiutano a rinfrescarmi in una giornata afosa
+  relevant:
+  - faro:goods:IT10111
+  - faro:goods:IT10407
+  - faro:goods:IT10851
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - faro:goods:IT10111
+  - faro:goods:IT10407
+  - faro:goods:IT10851
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: it
+  domain: goods
+  query: accessori per una scrivania da smart working più ordinata e comoda
+  relevant:
+  - faro:goods:IT10296
+  - faro:goods:IT10370
+  - faro:goods:IT10555
+  - faro:goods:IT10629
+  - faro:goods:IT10814
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - faro:goods:IT10296
+  - faro:goods:IT10370
+  - faro:goods:IT10555
+  - faro:goods:IT10629
+  - faro:goods:IT10814
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: it
+  domain: goods
+  query: utensili che userei per cucinare la cena
+  relevant:
+  - faro:goods:IT10740
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - faro:goods:IT10740
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: it
+  domain: goods
+  query: un regalo per un bambino piccolo
+  relevant:
+  - faro:goods:IT10777
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - faro:goods:IT10777
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: it
+  domain: goods
+  query: cose di cui ho bisogno per il mio cane o il mio gatto
+  relevant:
+  - faro:goods:IT10518
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - faro:goods:IT10518
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: it
+  domain: goods
+  query: attrezzatura da portare in un weekend in campeggio
+  relevant:
+  - faro:goods:IT10222
+  - faro:goods:IT10666
+  - faro:goods:IT10703
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - faro:goods:IT10222
+  - faro:goods:IT10666
+  - faro:goods:IT10703
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: it
+  domain: goods
+  query: prodotti per la cura della pelle secca
+  relevant:
+  - faro:goods:IT10074
+  - faro:goods:IT10148
+  - faro:goods:IT10333
+  - faro:goods:IT10888
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - faro:goods:IT10074
+  - faro:goods:IT10148
+  - faro:goods:IT10333
+  - faro:goods:IT10888
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: it
+  domain: goods
+  query: qualcosa da mangiare o da bere per uno spuntino
+  relevant:
+  - faro:goods:IT10037
+  - faro:goods:IT10185
+  - faro:goods:IT10444
+  - faro:goods:IT10481
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - faro:goods:IT10037
+  - faro:goods:IT10185
+  - faro:goods:IT10444
+  - faro:goods:IT10481
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: it
+  domain: goods
+  query: dispositivi per ascoltare musica o ricaricare gli apparecchi fuori casa
+  relevant:
+  - faro:goods:IT10259
+  - faro:goods:IT10592
+- split: ml
+  shop: faro
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - faro:goods:IT10259
+  - faro:goods:IT10592
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: order
+  query: cerca l'ordine 20260518-100795
+  relevant:
+  - faro:order:20260518-100795
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: order
+  query: cerca l'ordine 20260927-101060
+  relevant:
+  - faro:order:20260927-101060
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: order
+  query: cerca l'ordine 20261012-101219
+  relevant:
+  - faro:order:20261012-101219
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: order
+  query: cerca l'ordine 20260807-100636
+  relevant:
+  - faro:order:20260807-100636
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: order
+  query: cerca l'ordine 20260829-100848
+  relevant:
+  - faro:order:20260829-100848
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: tracking
+  query: dove si trova la spedizione 901279851751
+  relevant:
+  - faro:tracking:901279851751
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: tracking
+  query: dove si trova la spedizione 738707746880
+  relevant:
+  - faro:tracking:738707746880
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: tracking
+  query: dove si trova la spedizione 499487889408
+  relevant:
+  - faro:tracking:499487889408
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: tracking
+  query: dove si trova la spedizione 229271781691
+  relevant:
+  - faro:tracking:229271781691
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: tracking
+  query: dove si trova la spedizione 376320179711
+  relevant:
+  - faro:tracking:376320179711
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: goods
+  query: giacenza del prodotto IT10185
+  relevant:
+  - faro:goods:IT10185
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: goods
+  query: giacenza del prodotto IT10148
+  relevant:
+  - faro:goods:IT10148
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: goods
+  query: giacenza del prodotto IT10074
+  relevant:
+  - faro:goods:IT10074
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: goods
+  query: giacenza del prodotto IT10592
+  relevant:
+  - faro:goods:IT10592
+- split: ml
+  shop: faro
+  kind: identifier
+  lang: it
+  domain: goods
+  query: giacenza del prodotto IT10037
+  relevant:
+  - faro:goods:IT10037
+- split: ml
+  shop: faro
+  kind: status
+  lang: it
+  domain: order
+  query: ordini con stato Annullato
+  relevant:
+  - faro:order:20260416-100265
+  - faro:order:20260806-100583
+  - faro:order:20260829-100212
+  - faro:order:20260927-101060
+- split: ml
+  shop: faro
+  kind: status
+  lang: it
+  domain: order
+  query: ordini con stato Consegnato
+  relevant:
+  - faro:order:20260413-100954
+  - faro:order:20260518-100795
+  - faro:order:20260606-100477
+  - faro:order:20260609-100530
+  - faro:order:20260807-100636
+  - faro:order:20260829-100848
+  - faro:order:20260904-101166
+  - faro:order:20260912-101272
+- split: ml
+  shop: faro
+  kind: status
+  lang: it
+  domain: order
+  query: ordini con stato In attesa di pagamento
+  relevant:
+  - faro:order:20260415-100318
+  - faro:order:20260508-100159
+  - faro:order:20260602-100742
+  - faro:order:20260705-100371
+- split: ml
+  shop: faro
+  kind: status
+  lang: it
+  domain: order
+  query: ordini con stato In lavorazione
+  relevant:
+  - faro:order:20261011-100689
+- split: ml
+  shop: faro
+  kind: status
+  lang: it
+  domain: order
+  query: ordini con stato Pagato
+  relevant:
+  - faro:order:20260625-100106
+  - faro:order:20261006-100053
+- split: ml
+  shop: faro
+  kind: status
+  lang: it
+  domain: order
+  query: ordini con stato Restituito
+  relevant:
+  - faro:order:20260422-100901
+  - faro:order:20260608-101113
+  - faro:order:20261012-101219
+- split: ml
+  shop: faro
+  kind: status
+  lang: it
+  domain: order
+  query: ordini con stato Spedito
+  relevant:
+  - faro:order:20260618-100424
+  - faro:order:20260923-101007
+- split: ml
+  shop: faro
+  kind: person
+  lang: it
+  domain: order
+  query: trova gli ordini di Matteo Romano
+  relevant:
+  - faro:order:20260422-100901
+- split: ml
+  shop: faro
+  kind: person
+  lang: it
+  domain: order
+  query: trova gli ordini di Chiara Ricci
+  relevant:
+  - faro:order:20260904-101166
+  - faro:order:20260927-101060
+- split: ml
+  shop: faro
+  kind: person
+  lang: it
+  domain: order
+  query: trova gli ordini di Andrea Bianchi
+  relevant:
+  - faro:order:20260608-101113
+- split: ml
+  shop: faro
+  kind: person
+  lang: it
+  domain: order
+  query: trova gli ordini di Chiara Gallo
+  relevant:
+  - faro:order:20260829-100848
+- split: ml
+  shop: faro
+  kind: person
+  lang: it
+  domain: order
+  query: trova gli ordini di Davide Bianchi
+  relevant:
+  - faro:order:20260829-100212
+- split: ml
+  shop: faro
+  kind: amount
+  lang: it
+  domain: order
+  query: ordini da € 135,05 in su
+  relevant:
+  - faro:order:20260413-100954
+  - faro:order:20260415-100318
+  - faro:order:20260416-100265
+  - faro:order:20260608-101113
+- split: ml
+  shop: faro
+  kind: period
+  lang: it
+  domain: order
+  query: ordini di maggio 2026
+  relevant:
+  - faro:order:20260508-100159
+  - faro:order:20260518-100795
+- split: ml
+  shop: faro
+  kind: period
+  lang: it
+  domain: order
+  query: ordini di luglio 2026
+  relevant:
+  - faro:order:20260705-100371
+- split: ml
+  shop: faro
+  kind: period
+  lang: it
+  domain: order
+  query: ordini di settembre 2026
+  relevant:
+  - faro:order:20260904-101166
+  - faro:order:20260912-101272
+  - faro:order:20260923-101007
+  - faro:order:20260927-101060
+- split: ml
+  shop: faro
+  kind: goods_exact
+  lang: it
+  domain: goods
+  query: Scatola passacavi
+  relevant:
+  - faro:goods:IT10629
+- split: ml
+  shop: faro
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Cable management box
+  relevant:
+  - faro:goods:IT10629
+- split: ml
+  shop: faro
+  kind: goods_exact
+  lang: it
+  domain: goods
+  query: Supporto rialzato per monitor
+  relevant:
+  - faro:goods:IT10370
+- split: ml
+  shop: faro
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Monitor riser stand
+  relevant:
+  - faro:goods:IT10370
+- split: ml
+  shop: faro
+  kind: goods_in_order
+  lang: it
+  domain: order
+  query: ordini che contengono Mouse verticale ergonomico
+  relevant:
+  - faro:order:20260518-100795
+  - faro:order:20261012-101219
+- split: ml
+  shop: faro
+  kind: goods_exact
+  lang: it
+  domain: goods
+  query: Mouse verticale ergonomico
+  relevant:
+  - faro:goods:IT10296
+- split: ml
+  shop: faro
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Ergonomic vertical mouse
+  relevant:
+  - faro:goods:IT10296
+- split: ml
+  shop: faro
+  kind: goods_exact
+  lang: it
+  domain: goods
+  query: Concentrato di caffè cold brew
+  relevant:
+  - faro:goods:IT10185
+- split: ml
+  shop: faro
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Cold brew concentrate
+  relevant:
+  - faro:goods:IT10185
+- split: ml
+  shop: faro
+  kind: goods_in_order
+  lang: it
+  domain: order
+  query: ordini che contengono Siero alla vitamina C
+  relevant:
+  - faro:order:20260927-101060
+- split: ml
+  shop: faro
+  kind: goods_exact
+  lang: it
+  domain: goods
+  query: Siero alla vitamina C
+  relevant:
+  - faro:goods:IT10148
+- split: ml
+  shop: faro
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Vitamin C serum
+  relevant:
+  - faro:goods:IT10148
+- split: ml
+  shop: faro
+  kind: goods_exact
+  lang: it
+  domain: goods
+  query: Barretta proteica con pochi zuccheri
+  relevant:
+  - faro:goods:IT10444
+- split: ml
+  shop: faro
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Low-sugar protein bar
+  relevant:
+  - faro:goods:IT10444
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: pt
+  domain: goods
+  query: algo para me manter aquecido quando está muito frio
+  relevant:
+  - ribeira:goods:PT10407
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - ribeira:goods:PT10407
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: pt
+  domain: goods
+  query: acessórios para uma secretária de teletrabalho mais arrumada e confortável
+  relevant:
+  - ribeira:goods:PT10111
+  - ribeira:goods:PT10148
+  - ribeira:goods:PT10370
+  - ribeira:goods:PT10444
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - ribeira:goods:PT10111
+  - ribeira:goods:PT10148
+  - ribeira:goods:PT10370
+  - ribeira:goods:PT10444
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: pt
+  domain: goods
+  query: utensílios que eu usaria para preparar o jantar
+  relevant:
+  - ribeira:goods:PT10592
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - ribeira:goods:PT10592
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: pt
+  domain: goods
+  query: um presente para uma criança pequena
+  relevant:
+  - ribeira:goods:PT10185
+  - ribeira:goods:PT10666
+  - ribeira:goods:PT10703
+  - ribeira:goods:PT10851
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - ribeira:goods:PT10185
+  - ribeira:goods:PT10666
+  - ribeira:goods:PT10703
+  - ribeira:goods:PT10851
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: pt
+  domain: goods
+  query: coisas de que preciso para o meu cão ou o meu gato
+  relevant:
+  - ribeira:goods:PT10296
+  - ribeira:goods:PT10629
+  - ribeira:goods:PT10777
+  - ribeira:goods:PT10814
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - ribeira:goods:PT10296
+  - ribeira:goods:PT10629
+  - ribeira:goods:PT10777
+  - ribeira:goods:PT10814
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: pt
+  domain: goods
+  query: equipamento para levar num fim de semana de campismo
+  relevant:
+  - ribeira:goods:PT10222
+  - ribeira:goods:PT10333
+  - ribeira:goods:PT10888
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - ribeira:goods:PT10222
+  - ribeira:goods:PT10333
+  - ribeira:goods:PT10888
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: pt
+  domain: goods
+  query: produtos para cuidar da pele seca
+  relevant:
+  - ribeira:goods:PT10037
+  - ribeira:goods:PT10074
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - ribeira:goods:PT10037
+  - ribeira:goods:PT10074
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: pt
+  domain: goods
+  query: algo para comer ou beber num lanche rápido
+  relevant:
+  - ribeira:goods:PT10259
+  - ribeira:goods:PT10555
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - ribeira:goods:PT10259
+  - ribeira:goods:PT10555
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: pt
+  domain: goods
+  query: aparelhos para ouvir música ou carregar dispositivos fora de casa
+  relevant:
+  - ribeira:goods:PT10481
+  - ribeira:goods:PT10518
+  - ribeira:goods:PT10740
+- split: ml
+  shop: ribeira
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - ribeira:goods:PT10481
+  - ribeira:goods:PT10518
+  - ribeira:goods:PT10740
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: order
+  query: consultar a encomenda 20260401-100159
+  relevant:
+  - ribeira:order:20260401-100159
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: order
+  query: consultar a encomenda 20260517-100954
+  relevant:
+  - ribeira:order:20260517-100954
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: order
+  query: consultar a encomenda 20261012-100530
+  relevant:
+  - ribeira:order:20261012-100530
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: order
+  query: consultar a encomenda 20260921-101166
+  relevant:
+  - ribeira:order:20260921-101166
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: order
+  query: consultar a encomenda 20260619-100318
+  relevant:
+  - ribeira:order:20260619-100318
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: tracking
+  query: onde está a encomenda com o número de seguimento 612856659584
+  relevant:
+  - ribeira:tracking:612856659584
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: tracking
+  query: onde está a encomenda com o número de seguimento 594097828143
+  relevant:
+  - ribeira:tracking:594097828143
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: tracking
+  query: onde está a encomenda com o número de seguimento 601580196890
+  relevant:
+  - ribeira:tracking:601580196890
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: tracking
+  query: onde está a encomenda com o número de seguimento 807540460127
+  relevant:
+  - ribeira:tracking:807540460127
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: tracking
+  query: onde está a encomenda com o número de seguimento 267950839942
+  relevant:
+  - ribeira:tracking:267950839942
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: goods
+  query: stock do produto PT10185
+  relevant:
+  - ribeira:goods:PT10185
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: goods
+  query: stock do produto PT10777
+  relevant:
+  - ribeira:goods:PT10777
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: goods
+  query: stock do produto PT10222
+  relevant:
+  - ribeira:goods:PT10222
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: goods
+  query: stock do produto PT10333
+  relevant:
+  - ribeira:goods:PT10333
+- split: ml
+  shop: ribeira
+  kind: identifier
+  lang: pt
+  domain: goods
+  query: stock do produto PT10370
+  relevant:
+  - ribeira:goods:PT10370
+- split: ml
+  shop: ribeira
+  kind: status
+  lang: pt
+  domain: order
+  query: encomendas com estado A aguardar pagamento
+  relevant:
+  - ribeira:order:20260421-100795
+  - ribeira:order:20260725-100477
+  - ribeira:order:20260811-100742
+  - ribeira:order:20260902-100901
+  - ribeira:order:20261012-100530
+- split: ml
+  shop: ribeira
+  kind: status
+  lang: pt
+  domain: order
+  query: encomendas com estado Cancelado
+  relevant:
+  - ribeira:order:20260401-100159
+  - ribeira:order:20260625-100636
+  - ribeira:order:20260721-100583
+- split: ml
+  shop: ribeira
+  kind: status
+  lang: pt
+  domain: order
+  query: encomendas com estado Devolvido
+  relevant:
+  - ribeira:order:20260619-100318
+  - ribeira:order:20260905-100371
+  - ribeira:order:20260909-100212
+- split: ml
+  shop: ribeira
+  kind: status
+  lang: pt
+  domain: order
+  query: encomendas com estado Em processamento
+  relevant:
+  - ribeira:order:20260527-100265
+  - ribeira:order:20260625-100053
+  - ribeira:order:20260627-100848
+  - ribeira:order:20260815-101219
+- split: ml
+  shop: ribeira
+  kind: status
+  lang: pt
+  domain: order
+  query: encomendas com estado Entregue
+  relevant:
+  - ribeira:order:20260414-100689
+  - ribeira:order:20260514-101060
+  - ribeira:order:20260708-100424
+  - ribeira:order:20260921-101166
+- split: ml
+  shop: ribeira
+  kind: status
+  lang: pt
+  domain: order
+  query: encomendas com estado Enviado
+  relevant:
+  - ribeira:order:20260415-101007
+  - ribeira:order:20260710-101113
+  - ribeira:order:20260801-101272
+  - ribeira:order:20260929-100106
+- split: ml
+  shop: ribeira
+  kind: status
+  lang: pt
+  domain: order
+  query: encomendas com estado Pago
+  relevant:
+  - ribeira:order:20260517-100954
+- split: ml
+  shop: ribeira
+  kind: person
+  lang: pt
+  domain: order
+  query: encontrar encomendas de Rafael Silva
+  relevant:
+  - ribeira:order:20260902-100901
+- split: ml
+  shop: ribeira
+  kind: person
+  lang: pt
+  domain: order
+  query: encontrar encomendas de Rodrigo Fernandes
+  relevant:
+  - ribeira:order:20260619-100318
+  - ribeira:order:20260921-101166
+- split: ml
+  shop: ribeira
+  kind: person
+  lang: pt
+  domain: order
+  query: encontrar encomendas de Rodrigo Fernandes
+  relevant:
+  - ribeira:order:20260619-100318
+  - ribeira:order:20260921-101166
+- split: ml
+  shop: ribeira
+  kind: person
+  lang: pt
+  domain: order
+  query: encontrar encomendas de Rafael Rodrigues
+  relevant:
+  - ribeira:order:20260401-100159
+- split: ml
+  shop: ribeira
+  kind: person
+  lang: pt
+  domain: order
+  query: encontrar encomendas de João Rodrigues
+  relevant:
+  - ribeira:order:20260815-101219
+- split: ml
+  shop: ribeira
+  kind: amount
+  lang: pt
+  domain: order
+  query: encomendas de 185,25 € ou mais
+  relevant:
+  - ribeira:order:20260401-100159
+  - ribeira:order:20260619-100318
+  - ribeira:order:20260625-100053
+  - ribeira:order:20260721-100583
+- split: ml
+  shop: ribeira
+  kind: period
+  lang: pt
+  domain: order
+  query: encomendas de maio de 2026
+  relevant:
+  - ribeira:order:20260514-101060
+  - ribeira:order:20260517-100954
+  - ribeira:order:20260527-100265
+- split: ml
+  shop: ribeira
+  kind: period
+  lang: pt
+  domain: order
+  query: encomendas de julho de 2026
+  relevant:
+  - ribeira:order:20260708-100424
+  - ribeira:order:20260710-101113
+  - ribeira:order:20260721-100583
+  - ribeira:order:20260725-100477
+- split: ml
+  shop: ribeira
+  kind: period
+  lang: pt
+  domain: order
+  query: encomendas de setembro de 2026
+  relevant:
+  - ribeira:order:20260902-100901
+  - ribeira:order:20260905-100371
+  - ribeira:order:20260909-100212
+  - ribeira:order:20260921-101166
+  - ribeira:order:20260929-100106
+- split: ml
+  shop: ribeira
+  kind: goods_exact
+  lang: pt
+  domain: goods
+  query: Powerbank de grande capacidade
+  relevant:
+  - ribeira:goods:PT10481
+- split: ml
+  shop: ribeira
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: High-capacity power bank
+  relevant:
+  - ribeira:goods:PT10481
+- split: ml
+  shop: ribeira
+  kind: goods_in_order
+  lang: pt
+  domain: order
+  query: encomendas com Auriculares sem fios com cancelamento de ruído
+  relevant:
+  - ribeira:order:20260619-100318
+- split: ml
+  shop: ribeira
+  kind: goods_exact
+  lang: pt
+  domain: goods
+  query: Auriculares sem fios com cancelamento de ruído
+  relevant:
+  - ribeira:goods:PT10518
+- split: ml
+  shop: ribeira
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Noise-cancelling wireless earbuds
+  relevant:
+  - ribeira:goods:PT10518
+- split: ml
+  shop: ribeira
+  kind: goods_in_order
+  lang: pt
+  domain: order
+  query: encomendas com Escova de tosquia para animais
+  relevant:
+  - ribeira:order:20260421-100795
+- split: ml
+  shop: ribeira
+  kind: goods_exact
+  lang: pt
+  domain: goods
+  query: Escova de tosquia para animais
+  relevant:
+  - ribeira:goods:PT10296
+- split: ml
+  shop: ribeira
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Pet grooming brush
+  relevant:
+  - ribeira:goods:PT10296
+- split: ml
+  shop: ribeira
+  kind: goods_in_order
+  lang: pt
+  domain: order
+  query: encomendas com Conjunto de utensílios de silicone
+  relevant:
+  - ribeira:order:20260721-100583
+- split: ml
+  shop: ribeira
+  kind: goods_exact
+  lang: pt
+  domain: goods
+  query: Conjunto de utensílios de silicone
+  relevant:
+  - ribeira:goods:PT10592
+- split: ml
+  shop: ribeira
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Silicone utensil set
+  relevant:
+  - ribeira:goods:PT10592
+- split: ml
+  shop: ribeira
+  kind: goods_in_order
+  lang: pt
+  domain: order
+  query: encomendas com Lanterna LED recarregável
+  relevant:
+  - ribeira:order:20260527-100265
+- split: ml
+  shop: ribeira
+  kind: goods_exact
+  lang: pt
+  domain: goods
+  query: Lanterna LED recarregável
+  relevant:
+  - ribeira:goods:PT10333
+- split: ml
+  shop: ribeira
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Rechargeable LED lantern
+  relevant:
+  - ribeira:goods:PT10333
+- split: ml
+  shop: ribeira
+  kind: goods_in_order
+  lang: pt
+  domain: order
+  query: encomendas com Coelhinho de peluche
+  relevant:
+  - ribeira:order:20260514-101060
+  - ribeira:order:20260815-101219
+- split: ml
+  shop: ribeira
+  kind: goods_exact
+  lang: pt
+  domain: goods
+  query: Coelhinho de peluche
+  relevant:
+  - ribeira:goods:PT10851
+- split: ml
+  shop: ribeira
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Plush bunny doll
+  relevant:
+  - ribeira:goods:PT10851
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: nl
+  domain: goods
+  query: iets om warm te blijven als het ijskoud is
+  relevant:
+  - dekade:goods:NL10148
+  - dekade:goods:NL10592
+  - dekade:goods:NL10740
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - dekade:goods:NL10148
+  - dekade:goods:NL10592
+  - dekade:goods:NL10740
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: nl
+  domain: goods
+  query: spullen om af te koelen op een benauwde dag
+  relevant:
+  - dekade:goods:NL10037
+  - dekade:goods:NL10851
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - dekade:goods:NL10037
+  - dekade:goods:NL10851
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: nl
+  domain: goods
+  query: accessoires voor een opgeruimdere en comfortabelere thuiswerkplek
+  relevant:
+  - dekade:goods:NL10074
+  - dekade:goods:NL10259
+  - dekade:goods:NL10444
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - dekade:goods:NL10074
+  - dekade:goods:NL10259
+  - dekade:goods:NL10444
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: nl
+  domain: goods
+  query: keukengerei dat ik zou gebruiken om het avondeten te koken
+  relevant:
+  - dekade:goods:NL10296
+  - dekade:goods:NL10703
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - dekade:goods:NL10296
+  - dekade:goods:NL10703
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: nl
+  domain: goods
+  query: een cadeau voor een klein kind
+  relevant:
+  - dekade:goods:NL10111
+  - dekade:goods:NL10333
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - dekade:goods:NL10111
+  - dekade:goods:NL10333
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: nl
+  domain: goods
+  query: dingen die ik nodig heb voor mijn hond of kat
+  relevant:
+  - dekade:goods:NL10185
+  - dekade:goods:NL10666
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - dekade:goods:NL10185
+  - dekade:goods:NL10666
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: nl
+  domain: goods
+  query: spullen om mee te nemen op een kampeerweekend
+  relevant:
+  - dekade:goods:NL10370
+  - dekade:goods:NL10481
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - dekade:goods:NL10370
+  - dekade:goods:NL10481
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: nl
+  domain: goods
+  query: producten om een droge huid te verzorgen
+  relevant:
+  - dekade:goods:NL10407
+  - dekade:goods:NL10814
+  - dekade:goods:NL10888
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - dekade:goods:NL10407
+  - dekade:goods:NL10814
+  - dekade:goods:NL10888
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: nl
+  domain: goods
+  query: iets om te eten of te drinken als snelle snack
+  relevant:
+  - dekade:goods:NL10222
+  - dekade:goods:NL10555
+  - dekade:goods:NL10629
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - dekade:goods:NL10222
+  - dekade:goods:NL10555
+  - dekade:goods:NL10629
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: nl
+  domain: goods
+  query: apparaten om onderweg muziek te luisteren of op te laden
+  relevant:
+  - dekade:goods:NL10518
+  - dekade:goods:NL10777
+- split: ml
+  shop: dekade
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - dekade:goods:NL10518
+  - dekade:goods:NL10777
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: order
+  query: bestelling 20260516-100636 opzoeken
+  relevant:
+  - dekade:order:20260516-100636
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: order
+  query: bestelling 20260617-100954 opzoeken
+  relevant:
+  - dekade:order:20260617-100954
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: order
+  query: bestelling 20260404-100106 opzoeken
+  relevant:
+  - dekade:order:20260404-100106
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: order
+  query: bestelling 20260805-100848 opzoeken
+  relevant:
+  - dekade:order:20260805-100848
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: order
+  query: bestelling 20260522-100901 opzoeken
+  relevant:
+  - dekade:order:20260522-100901
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: tracking
+  query: waar is de zending met zendingsnummer 547359172289
+  relevant:
+  - dekade:tracking:547359172289
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: tracking
+  query: waar is de zending met zendingsnummer 684870459184
+  relevant:
+  - dekade:tracking:684870459184
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: tracking
+  query: waar is de zending met zendingsnummer 460642418407
+  relevant:
+  - dekade:tracking:460642418407
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: tracking
+  query: waar is de zending met zendingsnummer 847949005859
+  relevant:
+  - dekade:tracking:847949005859
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: tracking
+  query: waar is de zending met zendingsnummer 983972516869
+  relevant:
+  - dekade:tracking:983972516869
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: goods
+  query: voorraad van product NL10037
+  relevant:
+  - dekade:goods:NL10037
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: goods
+  query: voorraad van product NL10259
+  relevant:
+  - dekade:goods:NL10259
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: goods
+  query: voorraad van product NL10222
+  relevant:
+  - dekade:goods:NL10222
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: goods
+  query: voorraad van product NL10481
+  relevant:
+  - dekade:goods:NL10481
+- split: ml
+  shop: dekade
+  kind: identifier
+  lang: nl
+  domain: goods
+  query: voorraad van product NL10888
+  relevant:
+  - dekade:goods:NL10888
+- split: ml
+  shop: dekade
+  kind: status
+  lang: nl
+  domain: order
+  query: bestellingen met status Betaald
+  relevant:
+  - dekade:order:20260612-100265
+  - dekade:order:20260913-101219
+- split: ml
+  shop: dekade
+  kind: status
+  lang: nl
+  domain: order
+  query: bestellingen met status Bezorgd
+  relevant:
+  - dekade:order:20260404-100106
+  - dekade:order:20260421-100159
+  - dekade:order:20260519-100212
+  - dekade:order:20260617-100954
+  - dekade:order:20260623-100795
+  - dekade:order:20260628-100424
+  - dekade:order:20260725-100689
+  - dekade:order:20260809-101007
+  - dekade:order:20260916-100477
+  - dekade:order:20261002-100742
+- split: ml
+  shop: dekade
+  kind: status
+  lang: nl
+  domain: order
+  query: bestellingen met status Geannuleerd
+  relevant:
+  - dekade:order:20260725-101060
+- split: ml
+  shop: dekade
+  kind: status
+  lang: nl
+  domain: order
+  query: bestellingen met status Geretourneerd
+  relevant:
+  - dekade:order:20260413-100583
+  - dekade:order:20260711-100530
+  - dekade:order:20260805-100848
+- split: ml
+  shop: dekade
+  kind: status
+  lang: nl
+  domain: order
+  query: bestellingen met status Verzonden
+  relevant:
+  - dekade:order:20260502-100053
+  - dekade:order:20260522-100901
+  - dekade:order:20260715-100318
+  - dekade:order:20260801-101166
+  - dekade:order:20260812-101113
+  - dekade:order:20260824-100371
+- split: ml
+  shop: dekade
+  kind: status
+  lang: nl
+  domain: order
+  query: bestellingen met status Wacht op betaling
+  relevant:
+  - dekade:order:20260516-100636
+  - dekade:order:20261001-101272
+- split: ml
+  shop: dekade
+  kind: person
+  lang: nl
+  domain: order
+  query: bestellingen van Emma Jansen zoeken
+  relevant:
+  - dekade:order:20260502-100053
+- split: ml
+  shop: dekade
+  kind: person
+  lang: nl
+  domain: order
+  query: bestellingen van Ruben de Vries zoeken
+  relevant:
+  - dekade:order:20261001-101272
+- split: ml
+  shop: dekade
+  kind: person
+  lang: nl
+  domain: order
+  query: bestellingen van Noor Visser zoeken
+  relevant:
+  - dekade:order:20260711-100530
+- split: ml
+  shop: dekade
+  kind: person
+  lang: nl
+  domain: order
+  query: bestellingen van Lotte Mulder zoeken
+  relevant:
+  - dekade:order:20260519-100212
+  - dekade:order:20260812-101113
+- split: ml
+  shop: dekade
+  kind: person
+  lang: nl
+  domain: order
+  query: bestellingen van Fleur Visser zoeken
+  relevant:
+  - dekade:order:20260617-100954
+- split: ml
+  shop: dekade
+  kind: amount
+  lang: nl
+  domain: order
+  query: bestellingen van € 136,44 of meer
+  relevant:
+  - dekade:order:20260502-100053
+  - dekade:order:20260522-100901
+  - dekade:order:20260725-101060
+  - dekade:order:20260809-101007
+- split: ml
+  shop: dekade
+  kind: period
+  lang: nl
+  domain: order
+  query: bestellingen uit mei 2026
+  relevant:
+  - dekade:order:20260502-100053
+  - dekade:order:20260516-100636
+  - dekade:order:20260519-100212
+  - dekade:order:20260522-100901
+- split: ml
+  shop: dekade
+  kind: period
+  lang: nl
+  domain: order
+  query: bestellingen uit juli 2026
+  relevant:
+  - dekade:order:20260711-100530
+  - dekade:order:20260715-100318
+  - dekade:order:20260725-100689
+  - dekade:order:20260725-101060
+- split: ml
+  shop: dekade
+  kind: period
+  lang: nl
+  domain: order
+  query: bestellingen uit september 2026
+  relevant:
+  - dekade:order:20260913-101219
+  - dekade:order:20260916-100477
+- split: ml
+  shop: dekade
+  kind: goods_exact
+  lang: nl
+  domain: goods
+  query: Documentenorganizer
+  relevant:
+  - dekade:goods:NL10444
+- split: ml
+  shop: dekade
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Document file organizer
+  relevant:
+  - dekade:goods:NL10444
+- split: ml
+  shop: dekade
+  kind: goods_exact
+  lang: nl
+  domain: goods
+  query: Verzorgingsborstel voor huisdieren
+  relevant:
+  - dekade:goods:NL10185
+- split: ml
+  shop: dekade
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Pet grooming brush
+  relevant:
+  - dekade:goods:NL10185
+- split: ml
+  shop: dekade
+  kind: goods_in_order
+  lang: nl
+  domain: order
+  query: bestellingen met Biologische granola
+  relevant:
+  - dekade:order:20260628-100424
+- split: ml
+  shop: dekade
+  kind: goods_exact
+  lang: nl
+  domain: goods
+  query: Biologische granola
+  relevant:
+  - dekade:goods:NL10629
+- split: ml
+  shop: dekade
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Organic granola
+  relevant:
+  - dekade:goods:NL10629
+- split: ml
+  shop: dekade
+  kind: goods_in_order
+  lang: nl
+  domain: order
+  query: bestellingen met Houten bouwblokken
+  relevant:
+  - dekade:order:20260715-100318
+  - dekade:order:20260725-101060
+  - dekade:order:20260801-101166
+- split: ml
+  shop: dekade
+  kind: goods_exact
+  lang: nl
+  domain: goods
+  query: Houten bouwblokken
+  relevant:
+  - dekade:goods:NL10111
+- split: ml
+  shop: dekade
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Wooden building blocks
+  relevant:
+  - dekade:goods:NL10111
+- split: ml
+  shop: dekade
+  kind: goods_exact
+  lang: nl
+  domain: goods
+  query: Vacuümgeïsoleerde thermobeker
+  relevant:
+  - dekade:goods:NL10481
+- split: ml
+  shop: dekade
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Vacuum insulated tumbler
+  relevant:
+  - dekade:goods:NL10481
+- split: ml
+  shop: dekade
+  kind: goods_in_order
+  lang: nl
+  domain: order
+  query: bestellingen met Reinigingsschuim met lage pH
+  relevant:
+  - dekade:order:20260725-100689
+- split: ml
+  shop: dekade
+  kind: goods_exact
+  lang: nl
+  domain: goods
+  query: Reinigingsschuim met lage pH
+  relevant:
+  - dekade:goods:NL10814
+- split: ml
+  shop: dekade
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Low-pH cleansing foam
+  relevant:
+  - dekade:goods:NL10814
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: cs
+  domain: goods
+  query: něco, co mě zahřeje, když je velká zima
+  relevant:
+  - ulipy:goods:CZ10370
+  - ulipy:goods:CZ10407
+  - ulipy:goods:CZ10592
+  - ulipy:goods:CZ10888
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - ulipy:goods:CZ10370
+  - ulipy:goods:CZ10407
+  - ulipy:goods:CZ10592
+  - ulipy:goods:CZ10888
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: cs
+  domain: goods
+  query: věci, které mě ochladí v dusném dni
+  relevant:
+  - ulipy:goods:CZ10222
+  - ulipy:goods:CZ10259
+  - ulipy:goods:CZ10703
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - ulipy:goods:CZ10222
+  - ulipy:goods:CZ10259
+  - ulipy:goods:CZ10703
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: cs
+  domain: goods
+  query: doplňky pro úhlednější a pohodlnější pracovní stůl při práci z domova
+  relevant:
+  - ulipy:goods:CZ10481
+  - ulipy:goods:CZ10666
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - ulipy:goods:CZ10481
+  - ulipy:goods:CZ10666
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: cs
+  domain: goods
+  query: náčiní na vaření večeře
+  relevant:
+  - ulipy:goods:CZ10185
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - ulipy:goods:CZ10185
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: cs
+  domain: goods
+  query: dárek pro malé dítě
+  relevant:
+  - ulipy:goods:CZ10148
+  - ulipy:goods:CZ10814
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - ulipy:goods:CZ10148
+  - ulipy:goods:CZ10814
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: cs
+  domain: goods
+  query: věci, které potřebuji pro svého psa nebo kočku
+  relevant:
+  - ulipy:goods:CZ10074
+  - ulipy:goods:CZ10296
+  - ulipy:goods:CZ10740
+  - ulipy:goods:CZ10777
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - ulipy:goods:CZ10074
+  - ulipy:goods:CZ10296
+  - ulipy:goods:CZ10740
+  - ulipy:goods:CZ10777
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: cs
+  domain: goods
+  query: vybavení na víkend pod stanem
+  relevant:
+  - ulipy:goods:CZ10037
+  - ulipy:goods:CZ10518
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - ulipy:goods:CZ10037
+  - ulipy:goods:CZ10518
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: cs
+  domain: goods
+  query: přípravky na péči o suchou pleť
+  relevant:
+  - ulipy:goods:CZ10111
+  - ulipy:goods:CZ10333
+  - ulipy:goods:CZ10444
+  - ulipy:goods:CZ10851
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - ulipy:goods:CZ10111
+  - ulipy:goods:CZ10333
+  - ulipy:goods:CZ10444
+  - ulipy:goods:CZ10851
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: cs
+  domain: goods
+  query: něco k jídlu nebo pití na rychlou svačinu
+  relevant:
+  - ulipy:goods:CZ10555
+  - ulipy:goods:CZ10629
+- split: ml
+  shop: ulipy
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - ulipy:goods:CZ10555
+  - ulipy:goods:CZ10629
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: order
+  query: vyhledat objednávku 20260706-100530
+  relevant:
+  - ulipy:order:20260706-100530
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: order
+  query: vyhledat objednávku 20260613-100265
+  relevant:
+  - ulipy:order:20260613-100265
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: order
+  query: vyhledat objednávku 20260519-101219
+  relevant:
+  - ulipy:order:20260519-101219
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: order
+  query: vyhledat objednávku 20260603-100318
+  relevant:
+  - ulipy:order:20260603-100318
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: order
+  query: vyhledat objednávku 20260816-100901
+  relevant:
+  - ulipy:order:20260816-100901
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: tracking
+  query: kde je zásilka se sledovacím číslem 712886015346
+  relevant:
+  - ulipy:tracking:712886015346
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: tracking
+  query: kde je zásilka se sledovacím číslem 902813324294
+  relevant:
+  - ulipy:tracking:902813324294
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: tracking
+  query: kde je zásilka se sledovacím číslem 412329645333
+  relevant:
+  - ulipy:tracking:412329645333
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: tracking
+  query: kde je zásilka se sledovacím číslem 238946220121
+  relevant:
+  - ulipy:tracking:238946220121
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: tracking
+  query: kde je zásilka se sledovacím číslem 712542218796
+  relevant:
+  - ulipy:tracking:712542218796
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: goods
+  query: skladová zásoba produktu CZ10037
+  relevant:
+  - ulipy:goods:CZ10037
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: goods
+  query: skladová zásoba produktu CZ10777
+  relevant:
+  - ulipy:goods:CZ10777
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: goods
+  query: skladová zásoba produktu CZ10518
+  relevant:
+  - ulipy:goods:CZ10518
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: goods
+  query: skladová zásoba produktu CZ10740
+  relevant:
+  - ulipy:goods:CZ10740
+- split: ml
+  shop: ulipy
+  kind: identifier
+  lang: cs
+  domain: goods
+  query: skladová zásoba produktu CZ10555
+  relevant:
+  - ulipy:goods:CZ10555
+- split: ml
+  shop: ulipy
+  kind: status
+  lang: cs
+  domain: order
+  query: objednávky ve stavu Doručeno
+  relevant:
+  - ulipy:order:20260427-100053
+  - ulipy:order:20260528-100742
+  - ulipy:order:20260603-100318
+  - ulipy:order:20260818-100954
+  - ulipy:order:20261003-100795
+- split: ml
+  shop: ulipy
+  kind: status
+  lang: cs
+  domain: order
+  query: objednávky ve stavu Odesláno
+  relevant:
+  - ulipy:order:20260417-101113
+  - ulipy:order:20260523-101272
+  - ulipy:order:20260702-100424
+  - ulipy:order:20260712-100371
+  - ulipy:order:20260816-100901
+  - ulipy:order:20260822-100212
+- split: ml
+  shop: ulipy
+  kind: status
+  lang: cs
+  domain: order
+  query: objednávky ve stavu Vráceno
+  relevant:
+  - ulipy:order:20260803-101007
+- split: ml
+  shop: ulipy
+  kind: status
+  lang: cs
+  domain: order
+  query: objednávky ve stavu Zaplaceno
+  relevant:
+  - ulipy:order:20260519-101219
+  - ulipy:order:20260617-100689
+  - ulipy:order:20260706-100530
+  - ulipy:order:20260716-101166
+- split: ml
+  shop: ulipy
+  kind: status
+  lang: cs
+  domain: order
+  query: objednávky ve stavu Zpracovává se
+  relevant:
+  - ulipy:order:20260626-100848
+  - ulipy:order:20260902-101060
+  - ulipy:order:20260921-100106
+- split: ml
+  shop: ulipy
+  kind: status
+  lang: cs
+  domain: order
+  query: objednávky ve stavu Zrušeno
+  relevant:
+  - ulipy:order:20260513-100583
+  - ulipy:order:20260613-100265
+  - ulipy:order:20261010-100636
+- split: ml
+  shop: ulipy
+  kind: status
+  lang: cs
+  domain: order
+  query: objednávky ve stavu Čeká na platbu
+  relevant:
+  - ulipy:order:20260517-100477
+  - ulipy:order:20260825-100159
+- split: ml
+  shop: ulipy
+  kind: person
+  lang: cs
+  domain: order
+  query: objednávky zákazníka se jménem Petra Svobodová
+  relevant:
+  - ulipy:order:20260519-101219
+- split: ml
+  shop: ulipy
+  kind: person
+  lang: cs
+  domain: order
+  query: objednávky zákazníka se jménem Kateřina Nováková
+  relevant:
+  - ulipy:order:20261003-100795
+- split: ml
+  shop: ulipy
+  kind: person
+  lang: cs
+  domain: order
+  query: objednávky zákazníka se jménem Tomáš Horák
+  relevant:
+  - ulipy:order:20260818-100954
+- split: ml
+  shop: ulipy
+  kind: person
+  lang: cs
+  domain: order
+  query: objednávky zákazníka se jménem Lukáš Procházka
+  relevant:
+  - ulipy:order:20260712-100371
+- split: ml
+  shop: ulipy
+  kind: person
+  lang: cs
+  domain: order
+  query: objednávky zákazníka se jménem Jan Novotný
+  relevant:
+  - ulipy:order:20260702-100424
+- split: ml
+  shop: ulipy
+  kind: amount
+  lang: cs
+  domain: order
+  query: objednávky v hodnotě 4 185 Kč a více
+  relevant:
+  - ulipy:order:20260519-101219
+  - ulipy:order:20260816-100901
+  - ulipy:order:20260822-100212
+  - ulipy:order:20261010-100636
+- split: ml
+  shop: ulipy
+  kind: period
+  lang: cs
+  domain: order
+  query: objednávky za květen 2026
+  relevant:
+  - ulipy:order:20260513-100583
+  - ulipy:order:20260517-100477
+  - ulipy:order:20260519-101219
+  - ulipy:order:20260523-101272
+  - ulipy:order:20260528-100742
+- split: ml
+  shop: ulipy
+  kind: period
+  lang: cs
+  domain: order
+  query: objednávky za červenec 2026
+  relevant:
+  - ulipy:order:20260702-100424
+  - ulipy:order:20260706-100530
+  - ulipy:order:20260712-100371
+  - ulipy:order:20260716-101166
+- split: ml
+  shop: ulipy
+  kind: period
+  lang: cs
+  domain: order
+  query: objednávky za září 2026
+  relevant:
+  - ulipy:order:20260902-101060
+  - ulipy:order:20260921-100106
+- split: ml
+  shop: ulipy
+  kind: goods_exact
+  lang: cs
+  domain: goods
+  query: Iglú stan pro dvě osoby
+  relevant:
+  - ulipy:goods:CZ10518
+- split: ml
+  shop: ulipy
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Two-person dome tent
+  relevant:
+  - ulipy:goods:CZ10518
+- split: ml
+  shop: ulipy
+  kind: goods_in_order
+  lang: cs
+  domain: order
+  query: objednávky s položkou „Ruční mini ventilátor“
+  relevant:
+  - ulipy:order:20260902-101060
+- split: ml
+  shop: ulipy
+  kind: goods_exact
+  lang: cs
+  domain: goods
+  query: Ruční mini ventilátor
+  relevant:
+  - ulipy:goods:CZ10703
+- split: ml
+  shop: ulipy
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Handheld mini fan
+  relevant:
+  - ulipy:goods:CZ10703
+- split: ml
+  shop: ulipy
+  kind: goods_exact
+  lang: cs
+  domain: goods
+  query: Skládací trekové hole
+  relevant:
+  - ulipy:goods:CZ10037
+- split: ml
+  shop: ulipy
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Folding trekking poles
+  relevant:
+  - ulipy:goods:CZ10037
+- split: ml
+  shop: ulipy
+  kind: goods_in_order
+  lang: cs
+  domain: order
+  query: objednávky s položkou „Chladicí pásek na krk“
+  relevant:
+  - ulipy:order:20260523-101272
+- split: ml
+  shop: ulipy
+  kind: goods_exact
+  lang: cs
+  domain: goods
+  query: Chladicí pásek na krk
+  relevant:
+  - ulipy:goods:CZ10259
+- split: ml
+  shop: ulipy
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Cooling neck band
+  relevant:
+  - ulipy:goods:CZ10259
+- split: ml
+  shop: ulipy
+  kind: goods_exact
+  lang: cs
+  domain: goods
+  query: Regenerační esence na vlasy
+  relevant:
+  - ulipy:goods:CZ10333
+- split: ml
+  shop: ulipy
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Repair hair essence
+  relevant:
+  - ulipy:goods:CZ10333
+- split: ml
+  shop: ulipy
+  kind: goods_exact
+  lang: cs
+  domain: goods
+  query: Podstavec pod monitor
+  relevant:
+  - ulipy:goods:CZ10666
+- split: ml
+  shop: ulipy
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Monitor riser stand
+  relevant:
+  - ulipy:goods:CZ10666
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: ar
+  domain: goods
+  query: شيء يبقيني دافئًا عندما يكون الجو شديد البرودة
+  relevant:
+  - alwaha:goods:AR10222
+  - alwaha:goods:AR10444
+  - alwaha:goods:AR10555
+  - alwaha:goods:AR10851
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - alwaha:goods:AR10222
+  - alwaha:goods:AR10444
+  - alwaha:goods:AR10555
+  - alwaha:goods:AR10851
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: ar
+  domain: goods
+  query: منتجات تساعدني على التبريد في يوم حار ورطب
+  relevant:
+  - alwaha:goods:AR10148
+  - alwaha:goods:AR10333
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - alwaha:goods:AR10148
+  - alwaha:goods:AR10333
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: ar
+  domain: goods
+  query: إكسسوارات لمكتب عمل منزلي أكثر ترتيبًا وراحة
+  relevant:
+  - alwaha:goods:AR10259
+  - alwaha:goods:AR10777
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - alwaha:goods:AR10259
+  - alwaha:goods:AR10777
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: ar
+  domain: goods
+  query: أدوات أستخدمها لطهي العشاء
+  relevant:
+  - alwaha:goods:AR10666
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - alwaha:goods:AR10666
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: ar
+  domain: goods
+  query: هدية لطفل صغير
+  relevant:
+  - alwaha:goods:AR10185
+  - alwaha:goods:AR10407
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - alwaha:goods:AR10185
+  - alwaha:goods:AR10407
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: ar
+  domain: goods
+  query: أشياء أحتاجها لكلبي أو قطتي
+  relevant:
+  - alwaha:goods:AR10703
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - alwaha:goods:AR10703
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: ar
+  domain: goods
+  query: معدات لعطلة نهاية أسبوع في التخييم
+  relevant:
+  - alwaha:goods:AR10296
+  - alwaha:goods:AR10370
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - alwaha:goods:AR10296
+  - alwaha:goods:AR10370
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: ar
+  domain: goods
+  query: منتجات للعناية بالبشرة الجافة
+  relevant:
+  - alwaha:goods:AR10518
+  - alwaha:goods:AR10629
+  - alwaha:goods:AR10888
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - alwaha:goods:AR10518
+  - alwaha:goods:AR10629
+  - alwaha:goods:AR10888
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: ar
+  domain: goods
+  query: شيء آكله أو أشربه كوجبة خفيفة سريعة
+  relevant:
+  - alwaha:goods:AR10037
+  - alwaha:goods:AR10111
+  - alwaha:goods:AR10592
+  - alwaha:goods:AR10814
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - alwaha:goods:AR10037
+  - alwaha:goods:AR10111
+  - alwaha:goods:AR10592
+  - alwaha:goods:AR10814
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: ar
+  domain: goods
+  query: أجهزة للاستماع إلى الموسيقى أو الشحن خارج المنزل
+  relevant:
+  - alwaha:goods:AR10074
+  - alwaha:goods:AR10481
+  - alwaha:goods:AR10740
+- split: ml
+  shop: alwaha
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - alwaha:goods:AR10074
+  - alwaha:goods:AR10481
+  - alwaha:goods:AR10740
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: order
+  query: البحث عن الطلب 20260716-100636
+  relevant:
+  - alwaha:order:20260716-100636
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: order
+  query: البحث عن الطلب 20260724-100530
+  relevant:
+  - alwaha:order:20260724-100530
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: order
+  query: البحث عن الطلب 20260703-101272
+  relevant:
+  - alwaha:order:20260703-101272
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: order
+  query: البحث عن الطلب 20260512-101166
+  relevant:
+  - alwaha:order:20260512-101166
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: order
+  query: البحث عن الطلب 20260526-100901
+  relevant:
+  - alwaha:order:20260526-100901
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: tracking
+  query: أين الشحنة ذات رقم التتبع 594936428586
+  relevant:
+  - alwaha:tracking:594936428586
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: tracking
+  query: أين الشحنة ذات رقم التتبع 683359608236
+  relevant:
+  - alwaha:tracking:683359608236
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: tracking
+  query: أين الشحنة ذات رقم التتبع 886468616431
+  relevant:
+  - alwaha:tracking:886468616431
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: tracking
+  query: أين الشحنة ذات رقم التتبع 446089182612
+  relevant:
+  - alwaha:tracking:446089182612
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: tracking
+  query: أين الشحنة ذات رقم التتبع 855188322504
+  relevant:
+  - alwaha:tracking:855188322504
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: goods
+  query: مخزون المنتج AR10777
+  relevant:
+  - alwaha:goods:AR10777
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: goods
+  query: مخزون المنتج AR10370
+  relevant:
+  - alwaha:goods:AR10370
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: goods
+  query: مخزون المنتج AR10666
+  relevant:
+  - alwaha:goods:AR10666
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: goods
+  query: مخزون المنتج AR10074
+  relevant:
+  - alwaha:goods:AR10074
+- split: ml
+  shop: alwaha
+  kind: identifier
+  lang: ar
+  domain: goods
+  query: مخزون المنتج AR10444
+  relevant:
+  - alwaha:goods:AR10444
+- split: ml
+  shop: alwaha
+  kind: status
+  lang: ar
+  domain: order
+  query: الطلبات بحالة بانتظار الدفع
+  relevant:
+  - alwaha:order:20260615-101007
+  - alwaha:order:20261005-100477
+- split: ml
+  shop: alwaha
+  kind: status
+  lang: ar
+  domain: order
+  query: الطلبات بحالة تم التوصيل
+  relevant:
+  - alwaha:order:20260512-100371
+  - alwaha:order:20260530-100053
+  - alwaha:order:20260712-100689
+  - alwaha:order:20260717-101219
+  - alwaha:order:20260723-100212
+  - alwaha:order:20260902-100583
+  - alwaha:order:20261003-100848
+- split: ml
+  shop: alwaha
+  kind: status
+  lang: ar
+  domain: order
+  query: الطلبات بحالة تم الشحن
+  relevant:
+  - alwaha:order:20260428-100318
+  - alwaha:order:20260506-100159
+  - alwaha:order:20260703-101272
+  - alwaha:order:20260716-100636
+  - alwaha:order:20260720-101113
+- split: ml
+  shop: alwaha
+  kind: status
+  lang: ar
+  domain: order
+  query: الطلبات بحالة قيد المعالجة
+  relevant:
+  - alwaha:order:20260724-100530
+  - alwaha:order:20260830-100795
+  - alwaha:order:20260918-100742
+  - alwaha:order:20261005-101060
+- split: ml
+  shop: alwaha
+  kind: status
+  lang: ar
+  domain: order
+  query: الطلبات بحالة مدفوع
+  relevant:
+  - alwaha:order:20260924-100265
+- split: ml
+  shop: alwaha
+  kind: status
+  lang: ar
+  domain: order
+  query: الطلبات بحالة مرتجع
+  relevant:
+  - alwaha:order:20260408-100954
+  - alwaha:order:20260526-100901
+  - alwaha:order:20260628-100424
+- split: ml
+  shop: alwaha
+  kind: status
+  lang: ar
+  domain: order
+  query: الطلبات بحالة ملغى
+  relevant:
+  - alwaha:order:20260512-101166
+  - alwaha:order:20260604-100106
+- split: ml
+  shop: alwaha
+  kind: person
+  lang: ar
+  domain: order
+  query: طلبات العميل لمى الشمري
+  relevant:
+  - alwaha:order:20260902-100583
+- split: ml
+  shop: alwaha
+  kind: person
+  lang: ar
+  domain: order
+  query: طلبات العميل عبدالله الحربي
+  relevant:
+  - alwaha:order:20260615-101007
+  - alwaha:order:20260716-100636
+- split: ml
+  shop: alwaha
+  kind: person
+  lang: ar
+  domain: order
+  query: طلبات العميل هند المطيري
+  relevant:
+  - alwaha:order:20260830-100795
+  - alwaha:order:20260924-100265
+- split: ml
+  shop: alwaha
+  kind: person
+  lang: ar
+  domain: order
+  query: طلبات العميل عبدالله الزهراني
+  relevant:
+  - alwaha:order:20260530-100053
+- split: ml
+  shop: alwaha
+  kind: person
+  lang: ar
+  domain: order
+  query: طلبات العميل ريم الغامدي
+  relevant:
+  - alwaha:order:20260712-100689
+- split: ml
+  shop: alwaha
+  kind: amount
+  lang: ar
+  domain: order
+  query: الطلبات بقيمة 606.80 ر.س أو أكثر
+  relevant:
+  - alwaha:order:20260506-100159
+  - alwaha:order:20260712-100689
+  - alwaha:order:20260902-100583
+  - alwaha:order:20261005-100477
+- split: ml
+  shop: alwaha
+  kind: period
+  lang: ar
+  domain: order
+  query: طلبات شهر مايو 2026
+  relevant:
+  - alwaha:order:20260506-100159
+  - alwaha:order:20260512-100371
+  - alwaha:order:20260512-101166
+  - alwaha:order:20260526-100901
+  - alwaha:order:20260530-100053
+- split: ml
+  shop: alwaha
+  kind: period
+  lang: ar
+  domain: order
+  query: طلبات شهر يوليو 2026
+  relevant:
+  - alwaha:order:20260703-101272
+  - alwaha:order:20260712-100689
+  - alwaha:order:20260716-100636
+  - alwaha:order:20260717-101219
+  - alwaha:order:20260720-101113
+  - alwaha:order:20260723-100212
+  - alwaha:order:20260724-100530
+- split: ml
+  shop: alwaha
+  kind: period
+  lang: ar
+  domain: order
+  query: طلبات شهر سبتمبر 2026
+  relevant:
+  - alwaha:order:20260902-100583
+  - alwaha:order:20260918-100742
+  - alwaha:order:20260924-100265
+- split: ml
+  shop: alwaha
+  kind: goods_exact
+  lang: ar
+  domain: goods
+  query: هودي بسحاب ببطانة صوفية
+  relevant:
+  - alwaha:goods:AR10444
+- split: ml
+  shop: alwaha
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Fleece-lined zip hoodie
+  relevant:
+  - alwaha:goods:AR10444
+- split: ml
+  shop: alwaha
+  kind: goods_in_order
+  lang: ar
+  domain: order
+  query: الطلبات التي تحتوي على جاكيت فرو شيربا
+  relevant:
+  - alwaha:order:20260918-100742
+- split: ml
+  shop: alwaha
+  kind: goods_exact
+  lang: ar
+  domain: goods
+  query: جاكيت فرو شيربا
+  relevant:
+  - alwaha:goods:AR10555
+- split: ml
+  shop: alwaha
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Sherpa fleece jacket
+  relevant:
+  - alwaha:goods:AR10555
+- split: ml
+  shop: alwaha
+  kind: goods_exact
+  lang: ar
+  domain: goods
+  query: مجموعة روبوت لتعلم البرمجة
+  relevant:
+  - alwaha:goods:AR10407
+- split: ml
+  shop: alwaha
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Coding robot kit
+  relevant:
+  - alwaha:goods:AR10407
+- split: ml
+  shop: alwaha
+  kind: goods_in_order
+  lang: ar
+  domain: order
+  query: الطلبات التي تحتوي على خف منزلي من القطيفة
+  relevant:
+  - alwaha:order:20260720-101113
+- split: ml
+  shop: alwaha
+  kind: goods_exact
+  lang: ar
+  domain: goods
+  query: خف منزلي من القطيفة
+  relevant:
+  - alwaha:goods:AR10222
+- split: ml
+  shop: alwaha
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Plush house slippers
+  relevant:
+  - alwaha:goods:AR10222
+- split: ml
+  shop: alwaha
+  kind: goods_in_order
+  lang: ar
+  domain: order
+  query: الطلبات التي تحتوي على طعام جاف مضاد للحساسية
+  relevant:
+  - alwaha:order:20260428-100318
+  - alwaha:order:20260628-100424
+- split: ml
+  shop: alwaha
+  kind: goods_exact
+  lang: ar
+  domain: goods
+  query: طعام جاف مضاد للحساسية
+  relevant:
+  - alwaha:goods:AR10703
+- split: ml
+  shop: alwaha
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Hypoallergenic kibble
+  relevant:
+  - alwaha:goods:AR10703
+- split: ml
+  shop: alwaha
+  kind: goods_in_order
+  lang: ar
+  domain: order
+  query: الطلبات التي تحتوي على رباط تبريد للرقبة
+  relevant:
+  - alwaha:order:20260724-100530
+- split: ml
+  shop: alwaha
+  kind: goods_exact
+  lang: ar
+  domain: goods
+  query: رباط تبريد للرقبة
+  relevant:
+  - alwaha:goods:AR10333
+- split: ml
+  shop: alwaha
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Cooling neck band
+  relevant:
+  - alwaha:goods:AR10333
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: ja
+  domain: goods
+  query: 蒸し暑い日に涼しくなれるグッズ
+  relevant:
+  - sakura:goods:JP10111
+  - sakura:goods:JP10555
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - sakura:goods:JP10111
+  - sakura:goods:JP10555
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: ja
+  domain: goods
+  query: 在宅勤務のデスクをすっきり快適にするアイテム
+  relevant:
+  - sakura:goods:JP10148
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - sakura:goods:JP10148
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: ja
+  domain: goods
+  query: 夕飯を作るときに使う調理道具
+  relevant:
+  - sakura:goods:JP10333
+  - sakura:goods:JP10444
+  - sakura:goods:JP10740
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - sakura:goods:JP10333
+  - sakura:goods:JP10444
+  - sakura:goods:JP10740
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: ja
+  domain: goods
+  query: 小さな子どもへのプレゼント
+  relevant:
+  - sakura:goods:JP10666
+  - sakura:goods:JP10814
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - sakura:goods:JP10666
+  - sakura:goods:JP10814
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: ja
+  domain: goods
+  query: 犬や猫のために必要なもの
+  relevant:
+  - sakura:goods:JP10037
+  - sakura:goods:JP10185
+  - sakura:goods:JP10296
+  - sakura:goods:JP10629
+  - sakura:goods:JP10888
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - sakura:goods:JP10037
+  - sakura:goods:JP10185
+  - sakura:goods:JP10296
+  - sakura:goods:JP10629
+  - sakura:goods:JP10888
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: ja
+  domain: goods
+  query: 週末のキャンプに持っていく道具
+  relevant:
+  - sakura:goods:JP10259
+  - sakura:goods:JP10518
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - sakura:goods:JP10259
+  - sakura:goods:JP10518
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: ja
+  domain: goods
+  query: 乾燥肌をケアする化粧品
+  relevant:
+  - sakura:goods:JP10074
+  - sakura:goods:JP10370
+  - sakura:goods:JP10592
+  - sakura:goods:JP10777
+  - sakura:goods:JP10851
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - sakura:goods:JP10074
+  - sakura:goods:JP10370
+  - sakura:goods:JP10592
+  - sakura:goods:JP10777
+  - sakura:goods:JP10851
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: ja
+  domain: goods
+  query: 小腹が空いたときにさっと食べたり飲んだりできるもの
+  relevant:
+  - sakura:goods:JP10222
+  - sakura:goods:JP10481
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - sakura:goods:JP10222
+  - sakura:goods:JP10481
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: ja
+  domain: goods
+  query: 外出先で音楽を聴いたり充電したりする機器
+  relevant:
+  - sakura:goods:JP10407
+  - sakura:goods:JP10703
+- split: ml
+  shop: sakura
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - sakura:goods:JP10407
+  - sakura:goods:JP10703
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: order
+  query: 注文20260901-100954を確認
+  relevant:
+  - sakura:order:20260901-100954
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: order
+  query: 注文20260408-100053を確認
+  relevant:
+  - sakura:order:20260408-100053
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: order
+  query: 注文20260713-101272を確認
+  relevant:
+  - sakura:order:20260713-101272
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: order
+  query: 注文20260527-101219を確認
+  relevant:
+  - sakura:order:20260527-101219
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: order
+  query: 注文20260529-100848を確認
+  relevant:
+  - sakura:order:20260529-100848
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: tracking
+  query: 追跡番号763848459408の荷物はどこ
+  relevant:
+  - sakura:tracking:763848459408
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: tracking
+  query: 追跡番号628500540359の荷物はどこ
+  relevant:
+  - sakura:tracking:628500540359
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: tracking
+  query: 追跡番号533985164976の荷物はどこ
+  relevant:
+  - sakura:tracking:533985164976
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: tracking
+  query: 追跡番号999432351314の荷物はどこ
+  relevant:
+  - sakura:tracking:999432351314
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: tracking
+  query: 追跡番号521514086167の荷物はどこ
+  relevant:
+  - sakura:tracking:521514086167
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: goods
+  query: 商品JP10185の在庫
+  relevant:
+  - sakura:goods:JP10185
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: goods
+  query: 商品JP10592の在庫
+  relevant:
+  - sakura:goods:JP10592
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: goods
+  query: 商品JP10074の在庫
+  relevant:
+  - sakura:goods:JP10074
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: goods
+  query: 商品JP10851の在庫
+  relevant:
+  - sakura:goods:JP10851
+- split: ml
+  shop: sakura
+  kind: identifier
+  lang: ja
+  domain: goods
+  query: 商品JP10222の在庫
+  relevant:
+  - sakura:goods:JP10222
+- split: ml
+  shop: sakura
+  kind: status
+  lang: ja
+  domain: order
+  query: ステータスがキャンセルの注文
+  relevant:
+  - sakura:order:20260414-100318
+  - sakura:order:20260726-100477
+  - sakura:order:20260727-100159
+- split: ml
+  shop: sakura
+  kind: status
+  lang: ja
+  domain: order
+  query: ステータスが入金待ちの注文
+  relevant:
+  - sakura:order:20260616-101113
+  - sakura:order:20260629-101007
+  - sakura:order:20260901-100954
+- split: ml
+  shop: sakura
+  kind: status
+  lang: ja
+  domain: order
+  query: ステータスが入金済みの注文
+  relevant:
+  - sakura:order:20260402-100371
+- split: ml
+  shop: sakura
+  kind: status
+  lang: ja
+  domain: order
+  query: ステータスが処理中の注文
+  relevant:
+  - sakura:order:20260513-100106
+  - sakura:order:20260802-100583
+  - sakura:order:20260822-100742
+  - sakura:order:20260922-100424
+  - sakura:order:20261002-100901
+- split: ml
+  shop: sakura
+  kind: status
+  lang: ja
+  domain: order
+  query: ステータスが発送済みの注文
+  relevant:
+  - sakura:order:20260527-101219
+  - sakura:order:20260713-101272
+  - sakura:order:20260730-101166
+  - sakura:order:20261007-100212
+- split: ml
+  shop: sakura
+  kind: status
+  lang: ja
+  domain: order
+  query: ステータスが返品の注文
+  relevant:
+  - sakura:order:20260408-100053
+- split: ml
+  shop: sakura
+  kind: status
+  lang: ja
+  domain: order
+  query: ステータスが配達完了の注文
+  relevant:
+  - sakura:order:20260408-101060
+  - sakura:order:20260420-100530
+  - sakura:order:20260516-100636
+  - sakura:order:20260529-100848
+  - sakura:order:20260616-100795
+  - sakura:order:20260715-100265
+  - sakura:order:20260810-100689
+- split: ml
+  shop: sakura
+  kind: person
+  lang: ja
+  domain: order
+  query: 伊藤 葵さんの注文を検索
+  relevant:
+  - sakura:order:20260516-100636
+- split: ml
+  shop: sakura
+  kind: person
+  lang: ja
+  domain: order
+  query: 山本 葵さんの注文を検索
+  relevant:
+  - sakura:order:20260901-100954
+- split: ml
+  shop: sakura
+  kind: person
+  lang: ja
+  domain: order
+  query: 鈴木 陽菜さんの注文を検索
+  relevant:
+  - sakura:order:20261007-100212
+- split: ml
+  shop: sakura
+  kind: person
+  lang: ja
+  domain: order
+  query: 渡辺 大翔さんの注文を検索
+  relevant:
+  - sakura:order:20260727-100159
+- split: ml
+  shop: sakura
+  kind: person
+  lang: ja
+  domain: order
+  query: 渡辺 颯太さんの注文を検索
+  relevant:
+  - sakura:order:20260713-101272
+- split: ml
+  shop: sakura
+  kind: amount
+  lang: ja
+  domain: order
+  query: ¥25,250以上の注文
+  relevant:
+  - sakura:order:20260529-100848
+  - sakura:order:20260616-100795
+  - sakura:order:20260715-100265
+  - sakura:order:20260901-100954
+- split: ml
+  shop: sakura
+  kind: period
+  lang: ja
+  domain: order
+  query: 2026年5月の注文
+  relevant:
+  - sakura:order:20260513-100106
+  - sakura:order:20260516-100636
+  - sakura:order:20260527-101219
+  - sakura:order:20260529-100848
+- split: ml
+  shop: sakura
+  kind: period
+  lang: ja
+  domain: order
+  query: 2026年7月の注文
+  relevant:
+  - sakura:order:20260713-101272
+  - sakura:order:20260715-100265
+  - sakura:order:20260726-100477
+  - sakura:order:20260727-100159
+  - sakura:order:20260730-101166
+- split: ml
+  shop: sakura
+  kind: period
+  lang: ja
+  domain: order
+  query: 2026年9月の注文
+  relevant:
+  - sakura:order:20260901-100954
+  - sakura:order:20260922-100424
+- split: ml
+  shop: sakura
+  kind: goods_exact
+  lang: ja
+  domain: goods
+  query: ひんやりジェルマット
+  relevant:
+  - sakura:goods:JP10555
+- split: ml
+  shop: sakura
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Ice gel cooling mat
+  relevant:
+  - sakura:goods:JP10555
+- split: ml
+  shop: sakura
+  kind: goods_exact
+  lang: ja
+  domain: goods
+  query: 弱酸性洗顔フォーム
+  relevant:
+  - sakura:goods:JP10777
+- split: ml
+  shop: sakura
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Low-pH cleansing foam
+  relevant:
+  - sakura:goods:JP10777
+- split: ml
+  shop: sakura
+  kind: goods_exact
+  lang: ja
+  domain: goods
+  query: 犬用ハーネス
+  relevant:
+  - sakura:goods:JP10629
+- split: ml
+  shop: sakura
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Dog harness
+  relevant:
+  - sakura:goods:JP10629
+- split: ml
+  shop: sakura
+  kind: goods_in_order
+  lang: ja
+  domain: order
+  query: ヘアリペアエッセンスを含む注文
+  relevant:
+  - sakura:order:20260901-100954
+- split: ml
+  shop: sakura
+  kind: goods_exact
+  lang: ja
+  domain: goods
+  query: ヘアリペアエッセンス
+  relevant:
+  - sakura:goods:JP10074
+- split: ml
+  shop: sakura
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Repair hair essence
+  relevant:
+  - sakura:goods:JP10074
+- split: ml
+  shop: sakura
+  kind: goods_exact
+  lang: ja
+  domain: goods
+  query: うさぎのぬいぐるみ
+  relevant:
+  - sakura:goods:JP10814
+- split: ml
+  shop: sakura
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Plush bunny doll
+  relevant:
+  - sakura:goods:JP10814
+- split: ml
+  shop: sakura
+  kind: goods_in_order
+  lang: ja
+  domain: order
+  query: 65W急速充電器を含む注文
+  relevant:
+  - sakura:order:20260810-100689
+- split: ml
+  shop: sakura
+  kind: goods_exact
+  lang: ja
+  domain: goods
+  query: 65W急速充電器
+  relevant:
+  - sakura:goods:JP10407
+- split: ml
+  shop: sakura
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: 65W fast charger
+  relevant:
+  - sakura:goods:JP10407
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: zh-hans
+  domain: goods
+  query: 天寒地冻时能让我保暖的东西
+  relevant:
+  - yunshan:goods:CN10074
+  - yunshan:goods:CN10777
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to keep me warm when it is freezing
+  relevant:
+  - yunshan:goods:CN10074
+  - yunshan:goods:CN10777
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: zh-hans
+  domain: goods
+  query: 闷热天气里帮我降温的产品
+  relevant:
+  - yunshan:goods:CN10407
+  - yunshan:goods:CN10444
+  - yunshan:goods:CN10703
+  - yunshan:goods:CN10740
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products that help me cool off on a sweltering day
+  relevant:
+  - yunshan:goods:CN10407
+  - yunshan:goods:CN10444
+  - yunshan:goods:CN10703
+  - yunshan:goods:CN10740
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: zh-hans
+  domain: goods
+  query: 让居家办公桌更整洁舒适的配件
+  relevant:
+  - yunshan:goods:CN10111
+  - yunshan:goods:CN10592
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gear for a tidier, more comfortable home office desk
+  relevant:
+  - yunshan:goods:CN10111
+  - yunshan:goods:CN10592
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: zh-hans
+  domain: goods
+  query: 做晚饭时会用到的厨具
+  relevant:
+  - yunshan:goods:CN10333
+  - yunshan:goods:CN10481
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: en
+  domain: goods
+  query: tools I would use while cooking dinner
+  relevant:
+  - yunshan:goods:CN10333
+  - yunshan:goods:CN10481
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: zh-hans
+  domain: goods
+  query: 送给小朋友的礼物
+  relevant:
+  - yunshan:goods:CN10370
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: en
+  domain: goods
+  query: a gift for a young child
+  relevant:
+  - yunshan:goods:CN10370
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: zh-hans
+  domain: goods
+  query: 我的狗或猫需要的东西
+  relevant:
+  - yunshan:goods:CN10259
+  - yunshan:goods:CN10666
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: en
+  domain: goods
+  query: things I need for my dog or cat
+  relevant:
+  - yunshan:goods:CN10259
+  - yunshan:goods:CN10666
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: zh-hans
+  domain: goods
+  query: 周末露营要带的装备
+  relevant:
+  - yunshan:goods:CN10148
+  - yunshan:goods:CN10518
+  - yunshan:goods:CN10851
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: en
+  domain: goods
+  query: equipment to pack for a weekend camping trip
+  relevant:
+  - yunshan:goods:CN10148
+  - yunshan:goods:CN10518
+  - yunshan:goods:CN10851
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: zh-hans
+  domain: goods
+  query: 护理干性皮肤的产品
+  relevant:
+  - yunshan:goods:CN10888
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: en
+  domain: goods
+  query: products for looking after dry skin
+  relevant:
+  - yunshan:goods:CN10888
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: zh-hans
+  domain: goods
+  query: 饿的时候可以随手吃喝的东西
+  relevant:
+  - yunshan:goods:CN10185
+  - yunshan:goods:CN10222
+  - yunshan:goods:CN10555
+  - yunshan:goods:CN10629
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: en
+  domain: goods
+  query: something to eat or drink for a quick bite
+  relevant:
+  - yunshan:goods:CN10185
+  - yunshan:goods:CN10222
+  - yunshan:goods:CN10555
+  - yunshan:goods:CN10629
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: zh-hans
+  domain: goods
+  query: 在外面听音乐或充电用的设备
+  relevant:
+  - yunshan:goods:CN10037
+  - yunshan:goods:CN10296
+  - yunshan:goods:CN10814
+- split: ml
+  shop: yunshan
+  kind: semantic
+  lang: en
+  domain: goods
+  query: gadgets for listening to music or charging devices on the go
+  relevant:
+  - yunshan:goods:CN10037
+  - yunshan:goods:CN10296
+  - yunshan:goods:CN10814
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: order
+  query: 查询订单20260418-101272
+  relevant:
+  - yunshan:order:20260418-101272
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: order
+  query: 查询订单20260622-100477
+  relevant:
+  - yunshan:order:20260622-100477
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: order
+  query: 查询订单20260923-101219
+  relevant:
+  - yunshan:order:20260923-101219
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: order
+  query: 查询订单20260901-100424
+  relevant:
+  - yunshan:order:20260901-100424
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: order
+  query: 查询订单20260923-100954
+  relevant:
+  - yunshan:order:20260923-100954
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: tracking
+  query: 运单号775541733202的包裹在哪里
+  relevant:
+  - yunshan:tracking:775541733202
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: tracking
+  query: 运单号675553377682的包裹在哪里
+  relevant:
+  - yunshan:tracking:675553377682
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: tracking
+  query: 运单号301552425780的包裹在哪里
+  relevant:
+  - yunshan:tracking:301552425780
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: tracking
+  query: 运单号709571558262的包裹在哪里
+  relevant:
+  - yunshan:tracking:709571558262
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: tracking
+  query: 运单号683857796074的包裹在哪里
+  relevant:
+  - yunshan:tracking:683857796074
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: goods
+  query: 商品CN10703的库存
+  relevant:
+  - yunshan:goods:CN10703
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: goods
+  query: 商品CN10777的库存
+  relevant:
+  - yunshan:goods:CN10777
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: goods
+  query: 商品CN10074的库存
+  relevant:
+  - yunshan:goods:CN10074
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: goods
+  query: 商品CN10370的库存
+  relevant:
+  - yunshan:goods:CN10370
+- split: ml
+  shop: yunshan
+  kind: identifier
+  lang: zh-hans
+  domain: goods
+  query: 商品CN10444的库存
+  relevant:
+  - yunshan:goods:CN10444
+- split: ml
+  shop: yunshan
+  kind: status
+  lang: zh-hans
+  domain: order
+  query: 状态为处理中的订单
+  relevant:
+  - yunshan:order:20260718-101113
+  - yunshan:order:20260722-100371
+- split: ml
+  shop: yunshan
+  kind: status
+  lang: zh-hans
+  domain: order
+  query: 状态为已付款的订单
+  relevant:
+  - yunshan:order:20260622-100477
+  - yunshan:order:20260730-101060
+- split: ml
+  shop: yunshan
+  kind: status
+  lang: zh-hans
+  domain: order
+  query: 状态为已发货的订单
+  relevant:
+  - yunshan:order:20260404-100212
+  - yunshan:order:20260418-101272
+  - yunshan:order:20260828-100053
+- split: ml
+  shop: yunshan
+  kind: status
+  lang: zh-hans
+  domain: order
+  query: 状态为已取消的订单
+  relevant:
+  - yunshan:order:20260425-100901
+  - yunshan:order:20260716-101007
+  - yunshan:order:20260805-100265
+  - yunshan:order:20260901-100424
+  - yunshan:order:20261008-100742
+- split: ml
+  shop: yunshan
+  kind: status
+  lang: zh-hans
+  domain: order
+  query: 状态为已签收的订单
+  relevant:
+  - yunshan:order:20260413-100636
+  - yunshan:order:20260422-100159
+  - yunshan:order:20260522-100795
+  - yunshan:order:20260529-100318
+  - yunshan:order:20260726-100848
+- split: ml
+  shop: yunshan
+  kind: status
+  lang: zh-hans
+  domain: order
+  query: 状态为已退货的订单
+  relevant:
+  - yunshan:order:20260727-101166
+- split: ml
+  shop: yunshan
+  kind: status
+  lang: zh-hans
+  domain: order
+  query: 状态为待付款的订单
+  relevant:
+  - yunshan:order:20260421-100530
+  - yunshan:order:20260612-100583
+  - yunshan:order:20260905-100689
+  - yunshan:order:20260916-100106
+  - yunshan:order:20260923-100954
+  - yunshan:order:20260923-101219
+- split: ml
+  shop: yunshan
+  kind: person
+  lang: zh-hans
+  domain: order
+  query: 查找杨静的订单
+  relevant:
+  - yunshan:order:20260730-101060
+- split: ml
+  shop: yunshan
+  kind: person
+  lang: zh-hans
+  domain: order
+  query: 查找周娜的订单
+  relevant:
+  - yunshan:order:20260923-101219
+- split: ml
+  shop: yunshan
+  kind: person
+  lang: zh-hans
+  domain: order
+  query: 查找张欣怡的订单
+  relevant:
+  - yunshan:order:20260612-100583
+- split: ml
+  shop: yunshan
+  kind: person
+  lang: zh-hans
+  domain: order
+  query: 查找吴敏的订单
+  relevant:
+  - yunshan:order:20260425-100901
+- split: ml
+  shop: yunshan
+  kind: person
+  lang: zh-hans
+  domain: order
+  query: 查找王娜的订单
+  relevant:
+  - yunshan:order:20260726-100848
+- split: ml
+  shop: yunshan
+  kind: amount
+  lang: zh-hans
+  domain: order
+  query: ¥1,050.55以上的订单
+  relevant:
+  - yunshan:order:20260529-100318
+  - yunshan:order:20260612-100583
+  - yunshan:order:20260905-100689
+  - yunshan:order:20260923-101219
+- split: ml
+  shop: yunshan
+  kind: period
+  lang: zh-hans
+  domain: order
+  query: 2026年5月的订单
+  relevant:
+  - yunshan:order:20260522-100795
+  - yunshan:order:20260529-100318
+- split: ml
+  shop: yunshan
+  kind: period
+  lang: zh-hans
+  domain: order
+  query: 2026年7月的订单
+  relevant:
+  - yunshan:order:20260716-101007
+  - yunshan:order:20260718-101113
+  - yunshan:order:20260722-100371
+  - yunshan:order:20260726-100848
+  - yunshan:order:20260727-101166
+  - yunshan:order:20260730-101060
+- split: ml
+  shop: yunshan
+  kind: period
+  lang: zh-hans
+  domain: order
+  query: 2026年9月的订单
+  relevant:
+  - yunshan:order:20260901-100424
+  - yunshan:order:20260905-100689
+  - yunshan:order:20260916-100106
+  - yunshan:order:20260923-100954
+  - yunshan:order:20260923-101219
+- split: ml
+  shop: yunshan
+  kind: goods_in_order
+  lang: zh-hans
+  domain: order
+  query: 包含毛绒兔子玩偶的订单
+  relevant:
+  - yunshan:order:20260901-100424
+- split: ml
+  shop: yunshan
+  kind: goods_exact
+  lang: zh-hans
+  domain: goods
+  query: 毛绒兔子玩偶
+  relevant:
+  - yunshan:goods:CN10370
+- split: ml
+  shop: yunshan
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Plush bunny doll
+  relevant:
+  - yunshan:goods:CN10370
+- split: ml
+  shop: yunshan
+  kind: goods_exact
+  lang: zh-hans
+  domain: goods
+  query: 有机格兰诺拉麦片
+  relevant:
+  - yunshan:goods:CN10555
+- split: ml
+  shop: yunshan
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Organic granola
+  relevant:
+  - yunshan:goods:CN10555
+- split: ml
+  shop: yunshan
+  kind: goods_exact
+  lang: zh-hans
+  domain: goods
+  query: 防晒遮阳伞
+  relevant:
+  - yunshan:goods:CN10740
+- split: ml
+  shop: yunshan
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: UV-blocking parasol
+  relevant:
+  - yunshan:goods:CN10740
+- split: ml
+  shop: yunshan
+  kind: goods_in_order
+  lang: zh-hans
+  domain: order
+  query: 包含降噪无线耳机的订单
+  relevant:
+  - yunshan:order:20260726-100848
+  - yunshan:order:20260905-100689
+- split: ml
+  shop: yunshan
+  kind: goods_exact
+  lang: zh-hans
+  domain: goods
+  query: 降噪无线耳机
+  relevant:
+  - yunshan:goods:CN10814
+- split: ml
+  shop: yunshan
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Noise-cancelling wireless earbuds
+  relevant:
+  - yunshan:goods:CN10814
+- split: ml
+  shop: yunshan
+  kind: goods_in_order
+  lang: zh-hans
+  domain: order
+  query: 包含充电暖手宝的订单
+  relevant:
+  - yunshan:order:20260722-100371
+- split: ml
+  shop: yunshan
+  kind: goods_exact
+  lang: zh-hans
+  domain: goods
+  query: 充电暖手宝
+  relevant:
+  - yunshan:goods:CN10777
+- split: ml
+  shop: yunshan
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Rechargeable hand warmer
+  relevant:
+  - yunshan:goods:CN10777
+- split: ml
+  shop: yunshan
+  kind: goods_in_order
+  lang: zh-hans
+  domain: order
+  query: 包含充电LED营地灯的订单
+  relevant:
+  - yunshan:order:20260404-100212
+  - yunshan:order:20260418-101272
+- split: ml
+  shop: yunshan
+  kind: goods_exact
+  lang: zh-hans
+  domain: goods
+  query: 充电LED营地灯
+  relevant:
+  - yunshan:goods:CN10518
+- split: ml
+  shop: yunshan
+  kind: goods_crosslang
+  lang: en
+  domain: goods
+  query: Rechargeable LED lantern
+  relevant:
+  - yunshan:goods:CN10518

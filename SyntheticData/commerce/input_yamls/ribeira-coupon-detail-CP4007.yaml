@@ -1,0 +1,21 @@
+page_id: ribeira-coupon-detail-CP4007
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/coupons/CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: RIB127
+  title: Vantagem para clientes habituais 1
+  type: Percentagem
+  discount: 20%
+  started_at: '2026-04-14'
+  expired_at: '2026-04-21'
+  status: Agendado
+  quantity: 100
+  min_order_amount: 20.7
+title: Código de desconto

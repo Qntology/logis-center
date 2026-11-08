@@ -1,0 +1,28 @@
+page_id: sakura-order-detail-20260727-100159
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/order/view?id=20260727-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260727-100159
+  registration_date: '2026-07-27'
+  status: キャンセル
+  goods: リネン半袖シャツ
+  sender_name: 渡辺 大翔
+  recipient_name: 伊藤 結衣
+  quantity: 1
+  amount: 4875
+  shipping_fee: 330
+  payment_method: クレジットカード
+  sender_phone: 090-0202-2431
+  sender_address: 〒530-0001 大阪府大阪市北区桜丘4-10-8
+  recipient_phone: 090-6962-0561
+  recipient_address: 〒231-0011 神奈川県横浜市中区桜丘8-1-12
+  payment_origin: かんたん決済
+  payment_date: '2026-07-27'
+  card: あおばカード
+title: 注文詳細

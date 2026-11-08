@@ -1,0 +1,28 @@
+page_id: lindenhof-order-detail-20260507-100159
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/order/view?id=20260507-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260507-100159
+  registration_date: '2026-05-07'
+  status: Bezahlt
+  goods: Fellpflegebürste
+  sender_name: Anna Schneider
+  recipient_name: Anna Schneider
+  quantity: 5
+  amount: 88.95
+  shipping_fee: 0.0
+  payment_method: Überweisung
+  sender_phone: +49 138 84175416
+  sender_address: Bahnhofstraße 95, 04109 Leipzig
+  recipient_phone: +49 138 84175416
+  recipient_address: Bahnhofstraße 95, 04109 Leipzig
+  payment_origin: ZahlBrücke
+  payment_date: '2026-05-07'
+  bank: Spargenossenschaft Mittelwald
+title: Bestelldetails

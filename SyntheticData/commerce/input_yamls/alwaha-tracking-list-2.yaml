@@ -1,0 +1,83 @@
+page_id: alwaha-tracking-list-2
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/shipments?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '683359608236'
+  carrier: ناقل الكثبان
+  status: تم الشحن
+  title: خف منزلي من القطيفة
+  shipping_date: '2026-07-22'
+  recipient_name: سلطان الحربي
+- id,link: '594936428586'
+  carrier: شحن الواحة
+  status: تم التوصيل
+  title: طقم أدوات طعام للأطفال
+  shipping_date: '2026-07-18'
+  recipient_name: خالد الزهراني
+- id,link: '556596334523'
+  carrier: شحن الواحة
+  status: تم الشحن
+  title: لوحة مفاتيح ميكانيكية صامتة
+  shipping_date: '2026-07-05'
+  recipient_name: عبدالله الحربي
+- id,link: '260875986992'
+  carrier: شحن الواحة
+  status: تم التوصيل
+  title: كريم مرطب واقٍ للبشرة
+  shipping_date: '2026-07-06'
+  recipient_name: عمر الدوسري
+- id,link: '601256970269'
+  carrier: شحن الواحة
+  status: تم الشحن
+  title: حقيبة نقل للحيوانات الأليفة
+  shipping_date: '2026-08-08'
+  recipient_name: عمر العتيبي
+- id,link: '398320055173'
+  carrier: شحن الواحة
+  status: مرتجع
+  title: مجموعة روبوت لتعلم البرمجة
+  shipping_date: '2026-06-14'
+  recipient_name: عبدالله السبيعي
+- id,link: '276481386481'
+  carrier: توصيل السراب
+  status: تم التوصيل
+  title: طقم أدوات مطبخ من السيليكون
+  shipping_date: '2026-06-09'
+  recipient_name: سلطان السبيعي
+- id,link: '741015824201'
+  carrier: بريد النخيل السريع
+  status: تم الشحن
+  title: بطانية مايكروفايبر
+  shipping_date: '2026-04-04'
+  recipient_name: عبدالله الشمري
+- id,link: '640223485527'
+  carrier: شحن الواحة
+  status: تم التوصيل
+  title: مقلاة من الفولاذ المقاوم للصدأ
+  shipping_date: '2026-07-21'
+  recipient_name: نورة العتيبي
+- id,link: '182528930449'
+  carrier: توصيل السراب
+  status: مرتجع
+  title: جاكيت فرو شيربا
+  shipping_date: '2026-09-25'
+  recipient_name: سارة الحربي
+- id,link: '191659160991'
+  carrier: بريد النخيل السريع
+  status: تم التوصيل
+  title: طقم حافظات زجاجية محكمة الإغلاق
+  shipping_date: '2026-04-20'
+  recipient_name: فيصل المطيري
+- id,link: '264238888063'
+  carrier: توصيل السراب
+  status: تم الشحن
+  title: موزع USB-C متعدد المنافذ
+  shipping_date: '2026-07-31'
+  recipient_name: عمر الزهراني
+title: الشحنات

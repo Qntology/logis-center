@@ -1,0 +1,16 @@
+page_id: yunshan-review-detail-RV7011
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/reviews/RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: 已通过
+  title: 第二次购买了，依然很轻便。
+  name: 周洋
+  registration_date: '2026-06-10'
+title: 评价内容

@@ -1,0 +1,27 @@
+page_id: sakura-order-detail-20260513-100106
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/order/view?id=20260513-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260513-100106
+  registration_date: '2026-05-13'
+  status: 処理中
+  goods: 充電式LEDランタン
+  sender_name: 加藤 芽依
+  recipient_name: 加藤 芽依
+  quantity: 5
+  amount: 17400
+  shipping_fee: 0
+  payment_method: 電子マネー
+  sender_phone: 090-6341-9466
+  sender_address: 〒460-0008 愛知県名古屋市中区中央7-22-12
+  recipient_phone: 090-6341-9466
+  recipient_address: 〒460-0008 愛知県名古屋市中区中央7-22-12
+  payment_origin: さくらペイメント
+  payment_date: '2026-05-13'
+title: 注文詳細

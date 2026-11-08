@@ -1,0 +1,137 @@
+page_id: ribeira-order-list-2
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/orders?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20260414-100689
+  registration_date: '2026-04-14'
+  status: Entregue
+  goods: Essência reparadora para cabelo
+  tracking_number: '805390762420'
+  sender_name: Tiago Silva
+  recipient_name: Tiago Silva
+  quantity: 1
+  amount: 14.55
+  shipping_fee: 2.05
+  payment_method: Cartão de crédito
+- id,link: 20260811-100742
+  registration_date: '2026-08-11'
+  status: A aguardar pagamento
+  goods: Organizador de documentos
+  sender_name: Rafael Sousa
+  recipient_name: Rafael Sousa
+  quantity: 4
+  amount: 37.2
+  shipping_fee: 0.0
+  payment_method: Transferência bancária
+- id,link: 20260421-100795
+  registration_date: '2026-04-21'
+  status: A aguardar pagamento
+  goods: Escova de tosquia para animais
+  sender_name: Rafael Santos
+  recipient_name: Rafael Silva
+  quantity: 3
+  amount: 28.6
+  shipping_fee: 2.05
+  payment_method: Cartão de crédito
+- id,link: 20260627-100848
+  registration_date: '2026-06-27'
+  status: Em processamento
+  goods: Peitoral para cão
+  sender_name: Rodrigo Silva
+  recipient_name: Rodrigo Costa
+  quantity: 2
+  amount: 27.1
+  shipping_fee: 2.05
+  payment_method: Carteira digital
+- id,link: 20260902-100901
+  registration_date: '2026-09-02'
+  status: A aguardar pagamento
+  goods: Caixa organizadora de cabos
+  sender_name: Rafael Silva
+  recipient_name: Rafael Silva
+  quantity: 2
+  amount: 20.95
+  shipping_fee: 2.05
+  payment_method: Cartão de crédito
+- id,link: 20260517-100954
+  registration_date: '2026-05-17'
+  status: Pago
+  goods: Caixa organizadora de cabos
+  sender_name: Diogo Ferreira
+  recipient_name: Sofia Ferreira
+  quantity: 3
+  amount: 30.4
+  shipping_fee: 2.05
+  payment_method: Transferência bancária
+- id,link: 20260415-101007
+  registration_date: '2026-04-15'
+  status: Enviado
+  goods: Espuma de limpeza de pH baixo
+  tracking_number: '798201885973'
+  sender_name: Leonor Oliveira
+  recipient_name: Leonor Oliveira
+  quantity: 1
+  amount: 12.55
+  shipping_fee: 2.05
+  payment_method: Transferência bancária
+- id,link: 20260514-101060
+  registration_date: '2026-05-14'
+  status: Entregue
+  goods: Coelhinho de peluche
+  tracking_number: '150437485746'
+  sender_name: Mariana Santos
+  recipient_name: Mariana Santos
+  quantity: 4
+  amount: 73.44
+  shipping_fee: 0.0
+  payment_method: Cartão de crédito
+- id,link: 20260710-101113
+  registration_date: '2026-07-10'
+  status: Enviado
+  goods: Sérum de vitamina C
+  tracking_number: '968748245525'
+  sender_name: Rodrigo Rodrigues
+  recipient_name: Mariana Santos
+  quantity: 5
+  amount: 143.0
+  shipping_fee: 0.0
+  payment_method: Cartão de crédito
+- id,link: 20260921-101166
+  registration_date: '2026-09-21'
+  status: Entregue
+  goods: Trotinete infantil
+  tracking_number: '189549122458'
+  sender_name: Rodrigo Fernandes
+  recipient_name: Rodrigo Fernandes
+  quantity: 2
+  amount: 60.3
+  shipping_fee: 0.0
+  payment_method: Transferência bancária
+- id,link: 20260815-101219
+  registration_date: '2026-08-15'
+  status: Em processamento
+  goods: Coelhinho de peluche
+  sender_name: João Rodrigues
+  recipient_name: João Rodrigues
+  quantity: 2
+  amount: 52.7
+  shipping_fee: 0.0
+  payment_method: Cartão de crédito
+- id,link: 20260801-101272
+  registration_date: '2026-08-01'
+  status: Enviado
+  goods: Suporte para portátil
+  tracking_number: '267950839942'
+  sender_name: Leonor Pereira
+  recipient_name: Leonor Pereira
+  quantity: 5
+  amount: 47.79
+  shipping_fee: 0.0
+  payment_method: Carteira digital
+title: Encomendas

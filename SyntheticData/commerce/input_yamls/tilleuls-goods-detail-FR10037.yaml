@@ -1,0 +1,29 @@
+page_id: tilleuls-goods-detail-FR10037
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/goods/view?id=FR10037
+page_type: goods
+layout: detail
+fields:
+  id,link: FR10037
+  title: Distributeur de croquettes automatique
+  status: En vente
+  category: Animaux
+  sale_price: 54.55
+  quantity: 120
+  registration_date: '2026-06-04'
+  brand_name: 마루공방
+  code: FR-PET-101
+  stock_keeping_unit: FRPE1001
+  model_name: PE-656
+  manufacturer: 다온랩스
+  origin_country: Thaïlande
+  color: Olive
+  barcode: '8846678404438'
+  supply_price: 34.23
+  low_stock_threshold: 10
+  description: Distribue les croquettes à heures fixes.
+title: Fiche produit

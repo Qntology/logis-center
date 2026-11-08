@@ -1,0 +1,27 @@
+page_id: ulipy-order-detail-20260921-100106
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/order/view?id=20260921-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260921-100106
+  registration_date: '2026-09-21'
+  status: Zpracovává se
+  goods: Lehká prošívaná vesta
+  sender_name: Eva Procházková
+  recipient_name: Eva Novotná
+  quantity: 1
+  amount: 1140
+  shipping_fee: 0
+  payment_method: Digitální peněženka
+  sender_phone: +420 705 675 843
+  sender_address: Školní 77, 110 00 Praha
+  recipient_phone: +420 764 312 732
+  recipient_address: Husova 135, 779 00 Olomouc
+  payment_origin: Rychlá pokladna
+  payment_date: '2026-09-21'
+title: Detail objednávky

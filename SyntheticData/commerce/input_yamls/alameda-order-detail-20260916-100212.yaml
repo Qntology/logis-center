@@ -1,0 +1,29 @@
+page_id: alameda-order-detail-20260916-100212
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/orders/20260916-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260916-100212
+  registration_date: '2026-09-16'
+  status: Entregado
+  goods: Ratón vertical ergonómico
+  tracking_number: '695952291446'
+  sender_name: Pablo Navarro
+  recipient_name: Elena Torres
+  quantity: 2
+  amount: 52.38
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+  sender_phone: +34 687 652 837
+  sender_address: Avenida de la Paz 138, 50001 Zaragoza
+  recipient_phone: +34 610 033 439
+  recipient_address: Paseo de las Acacias 101, 28013 Madrid
+  payment_origin: PagoPuente
+  payment_date: '2026-09-16'
+  card: Norte Crédito
+title: Detalle del pedido

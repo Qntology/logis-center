@@ -1,0 +1,47 @@
+page_id: lindenhof-event-list-1
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/event/list?page=1
+page_type: event
+layout: list
+items:
+- id,link: EV303
+  title: Frühlingsspaziergang
+  type: Produkttest
+  started_at: '2026-06-05'
+  expired_at: '2026-06-15'
+  status: Läuft
+- id,link: EV306
+  title: Bereit für den Sommerurlaub
+  type: Gewinnspiel
+  started_at: '2026-04-03'
+  expired_at: '2026-05-18'
+  status: Läuft
+- id,link: EV309
+  title: Geschenkideen zur Erntezeit
+  type: Gewinnspiel
+  started_at: '2026-04-13'
+  expired_at: '2026-04-23'
+  status: Beendet
+- id,link: EV312
+  title: Jahresendfest
+  type: Themenwelt
+  started_at: '2026-02-12'
+  expired_at: '2026-03-29'
+  status: Läuft
+- id,link: EV315
+  title: Neuheiten-Testprogramm
+  type: Gewinnspiel
+  started_at: '2026-09-12'
+  expired_at: '2026-09-22'
+  status: Läuft
+- id,link: EV318
+  title: Wettbewerb der besten Bewertung
+  type: Themenwelt
+  started_at: '2026-09-15'
+  expired_at: '2026-09-25'
+  status: Geplant
+title: Aktionen

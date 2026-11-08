@@ -1,0 +1,71 @@
+page_id: ulipy-review-list-1
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/review/list?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: Schváleno
+  title: Lepší, než jsem čekal(a), opravdu v krásné barvě.
+  name: Lucie Veselá
+  registration_date: '2026-07-03'
+- id,link: RV7022
+  status: Čeká na schválení
+  title: Kupuji podruhé a pořád lehké.
+  name: Petr Procházka
+  registration_date: '2026-05-22'
+- id,link: RV7033
+  status: Schváleno
+  title: Lepší, než jsem čekal(a), opravdu v krásné barvě.
+  name: Eva Svobodová
+  registration_date: '2026-05-03'
+- id,link: RV7044
+  status: Skryto
+  title: Lepší, než jsem čekal(a), opravdu lehké.
+  name: Petra Novotná
+  registration_date: '2026-08-24'
+- id,link: RV7055
+  status: Schváleno
+  title: Kupuji podruhé a pořád pevné.
+  name: Lukáš Svoboda
+  registration_date: '2026-07-18'
+- id,link: RV7066
+  status: Schváleno
+  title: Kupuji podruhé a pořád v krásné barvě.
+  name: Veronika Černá
+  registration_date: '2026-08-17'
+- id,link: RV7077
+  status: Schváleno
+  title: Dobře zabalené a celkově pěkně zpracované.
+  name: Lucie Svobodová
+  registration_date: '2026-05-23'
+- id,link: RV7088
+  status: Skryto
+  title: Lepší, než jsem čekal(a), opravdu pevné.
+  name: Kateřina Procházková
+  registration_date: '2026-09-17'
+- id,link: RV7099
+  status: Čeká na schválení
+  title: Kupuji podruhé a pořád v krásné barvě.
+  name: Kateřina Procházková
+  registration_date: '2026-07-16'
+- id,link: RV7110
+  status: Čeká na schválení
+  title: Kupuji podruhé a pořád pevné.
+  name: Petr Novotný
+  registration_date: '2026-08-16'
+- id,link: RV7121
+  status: Skryto
+  title: Lepší, než jsem čekal(a), opravdu pevné.
+  name: Veronika Dvořáková
+  registration_date: '2026-07-16'
+- id,link: RV7132
+  status: Skryto
+  title: Kupuji podruhé a pořád lehké.
+  name: Martin Novák
+  registration_date: '2026-09-11'
+title: Recenze produktů

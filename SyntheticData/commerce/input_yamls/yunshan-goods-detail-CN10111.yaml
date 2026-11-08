@@ -1,0 +1,30 @@
+page_id: yunshan-goods-detail-CN10111
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/products/CN10111
+page_type: goods
+layout: detail
+fields:
+  id,link: CN10111
+  title: 显示器增高架
+  status: 草稿
+  category: 办公
+  sale_price: 199.45
+  quantity: 350
+  registration_date: '2026-05-12'
+  brand_name: 다온랩
+  code: CN-DES-103
+  stock_keeping_unit: CNDE1003
+  model_name: DE-701
+  manufacturer: 다온랩스
+  origin_country: 葡萄牙
+  color: 奶油色
+  barcode: '8830356764866'
+  supply_price: 118.33
+  low_stock_threshold: 10
+  shipping_fee: 15.8
+  description: 把屏幕抬到视线高度，下方可以收纳键盘。
+title: 商品详情

@@ -1,0 +1,21 @@
+page_id: yunshan-coupon-detail-CP4007
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/my/coupons/CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: YUN965
+  title: 新人首单券 1
+  type: 立减
+  discount: ¥15.80
+  started_at: '2026-09-10'
+  expired_at: '2026-09-17'
+  status: 未开始
+  quantity: 1000
+  min_order_amount: 52.65
+title: 优惠券

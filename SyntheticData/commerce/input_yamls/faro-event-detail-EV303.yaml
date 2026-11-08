@@ -1,0 +1,17 @@
+page_id: faro-event-detail-EV303
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/events/EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: Passeggiata di primavera
+  type: Tester
+  started_at: '2026-09-08'
+  expired_at: '2026-09-18'
+  status: Programmato
+title: Campagna

@@ -1,0 +1,26 @@
+page_id: ulipy-order-detail-20260825-100159
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/order/view?id=20260825-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260825-100159
+  registration_date: '2026-08-25'
+  status: Čeká na platbu
+  goods: Sérum s vitaminem C
+  sender_name: Veronika Novotná
+  recipient_name: Veronika Novotná
+  quantity: 4
+  amount: 1458
+  shipping_fee: 0
+  payment_method: Digitální peněženka
+  sender_phone: +420 772 987 155
+  sender_address: Školní 104, 110 00 Praha
+  recipient_phone: +420 772 987 155
+  recipient_address: Školní 104, 110 00 Praha
+  payment_origin: PayVltava
+title: Detail objednávky

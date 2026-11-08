@@ -1,0 +1,47 @@
+page_id: tilleuls-event-list-1
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/event/list?page=1
+page_type: event
+layout: list
+items:
+- id,link: EV303
+  title: Balade de printemps
+  type: Vitrine
+  started_at: '2026-02-10'
+  expired_at: '2026-02-20'
+  status: En cours
+- id,link: EV306
+  title: Préparatifs des vacances d'été
+  type: Jeu-concours
+  started_at: '2026-08-24'
+  expired_at: '2026-10-08'
+  status: Programmé
+- id,link: EV309
+  title: Idées cadeaux des récoltes
+  type: Vitrine
+  started_at: '2026-09-25'
+  expired_at: '2026-10-05'
+  status: Terminé
+- id,link: EV312
+  title: Fête de fin d'année
+  type: Testeurs
+  started_at: '2026-09-26'
+  expired_at: '2026-10-06'
+  status: Terminé
+- id,link: EV315
+  title: Programme de test des nouveautés
+  type: Testeurs
+  started_at: '2026-06-29'
+  expired_at: '2026-08-13'
+  status: Terminé
+- id,link: EV318
+  title: Concours du meilleur avis
+  type: Vitrine
+  started_at: '2026-09-24'
+  expired_at: '2026-10-14'
+  status: Terminé
+title: Campagnes

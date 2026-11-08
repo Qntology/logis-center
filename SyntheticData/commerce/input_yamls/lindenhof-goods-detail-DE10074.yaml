@@ -1,0 +1,31 @@
+page_id: lindenhof-goods-detail-DE10074
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/goods/view?id=DE10074
+page_type: goods
+layout: detail
+fields:
+  id,link: DE10074
+  title: Ergonomische Vertikalmaus
+  status: Aktiv
+  category: Elektronik
+  sale_price: 27.45
+  compare_at_price: 32.94
+  quantity: 350
+  registration_date: '2026-01-06'
+  brand_name: 하람
+  code: DE-DES-102
+  stock_keeping_unit: DEDE1002
+  model_name: DE-807
+  manufacturer: 누리온산업
+  origin_country: Korea
+  color: Anthrazit
+  barcode: '8827251736819'
+  supply_price: 17.45
+  low_stock_threshold: 5
+  shipping_fee: 2.05
+  description: Ein Handschlag-Griff, der das Handgelenk entlastet.
+title: Produktdetails

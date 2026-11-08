@@ -1,0 +1,16 @@
+page_id: alameda-review-detail-RV7011
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/reviews/RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: Aprobada
+  title: Mejor de lo esperado, muy de un color precioso.
+  name: Diego Torres
+  registration_date: '2026-09-18'
+title: Reseña

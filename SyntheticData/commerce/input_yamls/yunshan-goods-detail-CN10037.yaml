@@ -1,0 +1,31 @@
+page_id: yunshan-goods-detail-CN10037
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/products/CN10037
+page_type: goods
+layout: detail
+fields:
+  id,link: CN10037
+  title: 65W快充充电器
+  status: 已售罄
+  category: 数码
+  sale_price: 200.0
+  compare_at_price: 240.0
+  quantity: 0
+  registration_date: '2026-05-12'
+  brand_name: Tidewell
+  code: CN-AUD-101
+  stock_keeping_unit: CNAU1001
+  model_name: AU-375
+  manufacturer: Oakfern Works
+  origin_country: 泰国
+  color: 奶油色
+  barcode: '8863879155274'
+  supply_price: 111.45
+  low_stock_threshold: 20
+  shipping_fee: 15.8
+  description: 氮化镓充电器，功率足以为笔记本供电。
+title: 商品详情

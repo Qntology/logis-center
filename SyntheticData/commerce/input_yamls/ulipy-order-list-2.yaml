@@ -1,0 +1,138 @@
+page_id: ulipy-order-list-2
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/order/list?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20260617-100689
+  registration_date: '2026-06-17'
+  status: Zaplaceno
+  goods: Postroj pro psa
+  sender_name: Petra Kučerová
+  recipient_name: Petra Kučerová
+  quantity: 5
+  amount: 3380
+  shipping_fee: 0
+  payment_method: Platební karta
+- id,link: 20260528-100742
+  registration_date: '2026-05-28'
+  status: Doručeno
+  goods: Voděodolný Bluetooth reproduktor
+  tracking_number: '388827306797'
+  sender_name: Tereza Svobodová
+  recipient_name: Lukáš Veselý
+  quantity: 1
+  amount: 1070
+  shipping_fee: 0
+  payment_method: Platební karta
+- id,link: 20261003-100795
+  registration_date: '2026-10-03'
+  status: Doručeno
+  goods: Plyšové bačkory
+  tracking_number: '558604180478'
+  sender_name: Kateřina Nováková
+  recipient_name: Kateřina Nováková
+  quantity: 5
+  amount: 1500
+  shipping_fee: 0
+  payment_method: Bankovní převod
+- id,link: 20260626-100848
+  registration_date: '2026-06-26'
+  status: Zpracovává se
+  goods: Přepravní taška pro mazlíčky
+  sender_name: Lucie Nováková
+  recipient_name: Lucie Nováková
+  quantity: 1
+  amount: 840
+  shipping_fee: 50
+  payment_method: Digitální peněženka
+- id,link: 20260816-100901
+  registration_date: '2026-08-16'
+  status: Odesláno
+  goods: Tichá mechanická klávesnice
+  tracking_number: '722416942469'
+  sender_name: Eva Svobodová
+  recipient_name: Jakub Kučera
+  quantity: 7
+  amount: 4185
+  shipping_fee: 0
+  payment_method: Bankovní převod
+- id,link: 20260818-100954
+  registration_date: '2026-08-18'
+  status: Doručeno
+  goods: Automatické krmítko
+  tracking_number: '902813324294'
+  sender_name: Tomáš Horák
+  recipient_name: Tomáš Horák
+  quantity: 6
+  amount: 3860
+  shipping_fee: 0
+  payment_method: Platební karta
+- id,link: 20260803-101007
+  registration_date: '2026-08-03'
+  status: Vráceno
+  goods: Nabíjecí ohřívač rukou
+  tracking_number: '714049381381'
+  sender_name: Petr Dvořák
+  recipient_name: Petr Dvořák
+  quantity: 2
+  amount: 710
+  shipping_fee: 50
+  payment_method: Bankovní převod
+- id,link: 20260902-101060
+  registration_date: '2026-09-02'
+  status: Zpracovává se
+  goods: Ruční mini ventilátor
+  sender_name: Tereza Svobodová
+  recipient_name: Tereza Svobodová
+  quantity: 2
+  amount: 670
+  shipping_fee: 50
+  payment_method: Platební karta
+- id,link: 20260417-101113
+  registration_date: '2026-04-17'
+  status: Odesláno
+  goods: Sérum s vitaminem C
+  tracking_number: '593676324904'
+  sender_name: Jakub Dvořák
+  recipient_name: Jakub Dvořák
+  quantity: 6
+  amount: 3114
+  shipping_fee: 0
+  payment_method: Bankovní převod
+- id,link: 20260716-101166
+  registration_date: '2026-07-16'
+  status: Zaplaceno
+  goods: Mikina na zip s fleecovou podšívkou
+  sender_name: Tomáš Dvořák
+  recipient_name: Veronika Dvořáková
+  quantity: 1
+  amount: 761
+  shipping_fee: 50
+  payment_method: Digitální peněženka
+- id,link: 20260519-101219
+  registration_date: '2026-05-19'
+  status: Zaplaceno
+  goods: Mikina na zip s fleecovou podšívkou
+  sender_name: Petra Svobodová
+  recipient_name: Petra Svobodová
+  quantity: 8
+  amount: 4851
+  shipping_fee: 0
+  payment_method: Digitální peněženka
+- id,link: 20260523-101272
+  registration_date: '2026-05-23'
+  status: Odesláno
+  goods: Chladicí pásek na krk
+  tracking_number: '271190590801'
+  sender_name: Petr Novotný
+  recipient_name: Petr Novotný
+  quantity: 4
+  amount: 1030
+  shipping_fee: 0
+  payment_method: Platební karta
+title: Objednávky

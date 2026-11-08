@@ -1,0 +1,21 @@
+page_id: alwaha-coupon-detail-CP4007
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/coupons/CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: ALW672
+  title: عرض نهاية الأسبوع فقط 1
+  type: نسبة مئوية
+  discount: 20%
+  started_at: '2026-07-24'
+  expired_at: '2026-08-23'
+  status: مجدولة
+  quantity: 100
+  min_order_amount: 82.2
+title: رمز الخصم

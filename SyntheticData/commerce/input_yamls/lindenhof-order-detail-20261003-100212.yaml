@@ -1,0 +1,28 @@
+page_id: lindenhof-order-detail-20261003-100212
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/order/view?id=20261003-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20261003-100212
+  registration_date: '2026-10-03'
+  status: Storniert
+  goods: Kurzarmhemd aus Leinen
+  sender_name: Jonas Richter
+  recipient_name: Jonas Richter
+  quantity: 3
+  amount: 89.85
+  shipping_fee: 0.0
+  payment_method: Kreditkarte
+  sender_phone: +49 136 06940390
+  sender_address: Schillerstraße 9, 04109 Leipzig
+  recipient_phone: +49 136 06940390
+  recipient_address: Schillerstraße 9, 04109 Leipzig
+  payment_origin: ZahlBrücke
+  payment_date: '2026-10-03'
+  card: Lindencard
+title: Bestelldetails

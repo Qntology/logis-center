@@ -1,0 +1,30 @@
+page_id: faro-goods-detail-IT10074
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/products/IT10074
+page_type: goods
+layout: detail
+fields:
+  id,link: IT10074
+  title: Essenza riparatrice per capelli
+  status: Esaurito
+  category: Bellezza
+  sale_price: 12.6
+  quantity: 0
+  registration_date: '2026-03-28'
+  brand_name: Tidewell
+  code: IT-SKI-102
+  stock_keeping_unit: ITSK1002
+  model_name: SK-518
+  manufacturer: 다온랩스
+  origin_country: Thailandia
+  color: Grigio chiaro
+  barcode: '8891017620991'
+  supply_price: 7.92
+  low_stock_threshold: 5
+  shipping_fee: 2.05
+  description: Liscia i capelli danneggiati.
+title: Scheda prodotto

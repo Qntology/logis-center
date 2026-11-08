@@ -1,0 +1,30 @@
+page_id: lindenhof-tracking-detail-626436664173
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/shipping/view?id=626436664173
+page_type: tracking
+layout: detail
+fields:
+  id,link: '626436664173'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Leichter Campingstuhl
+  shipping_date: '2026-04-13'
+  recipient_name: Leon Schneider
+  registration_date: '2026-04-11'
+  sender_name: Lindenhof Handels GmbH
+  sender_address: Hafenstraße 18, 20457 Hamburg
+  sender_phone: +49 40 5550 1842
+  recipient_address: Bahnhofstraße 98, 79098 Freiburg
+  recipient_phone: +49 154 59350142
+  weight: 5.3
+  width: 55
+  height: 34
+  length: 26
+  shipping_method: Standardversand
+  shipping_duration: 3
+  shipping_fee: 0.0
+title: Sendungsdetails

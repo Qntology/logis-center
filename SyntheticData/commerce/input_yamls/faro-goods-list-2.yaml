@@ -1,0 +1,114 @@
+page_id: faro-goods-list-2
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/products?page=2
+page_type: goods
+layout: list
+items:
+- id,link: IT10481
+  title: Granola biologica
+  status: Esaurito
+  category: Alimentari
+  sale_price: 9.1
+  quantity: 0
+  registration_date: '2026-06-04'
+  brand_name: 다온랩
+- id,link: IT10518
+  title: Trasportino per animali
+  status: In vendita
+  category: Animali
+  sale_price: 34.75
+  compare_at_price: 41.7
+  quantity: 42
+  registration_date: '2026-08-23'
+  brand_name: Marlow & Finch
+- id,link: IT10555
+  title: Tastiera meccanica silenziosa
+  status: In vendita
+  category: Elettronica
+  sale_price: 61.7
+  compare_at_price: 74.04
+  quantity: 350
+  registration_date: '2026-06-15'
+  brand_name: 버들
+- id,link: IT10592
+  title: Caricatore rapido da 65 W
+  status: Bozza
+  category: Elettronica
+  sale_price: 23.8
+  compare_at_price: 28.56
+  quantity: 120
+  registration_date: '2026-03-01'
+  brand_name: 누리온
+- id,link: IT10629
+  title: Scatola passacavi
+  status: In vendita
+  category: Ufficio
+  sale_price: 11.65
+  compare_at_price: 13.98
+  quantity: 96
+  registration_date: '2026-09-10'
+  brand_name: Marlow & Finch
+- id,link: IT10666
+  title: Set di pentole da campeggio
+  status: In vendita
+  category: Tempo libero
+  sale_price: 29.95
+  compare_at_price: 35.94
+  quantity: 7
+  registration_date: '2026-05-02'
+  brand_name: 하람
+- id,link: IT10703
+  title: Lanterna LED ricaricabile
+  status: Esaurito
+  category: Tempo libero
+  sale_price: 19.3
+  quantity: 0
+  registration_date: '2026-04-18'
+  brand_name: 다온랩
+- id,link: IT10740
+  title: Bollitore a temperatura regolabile
+  status: In vendita
+  category: Elettrodomestici
+  sale_price: 35.05
+  quantity: 3
+  registration_date: '2026-02-24'
+  brand_name: 버들
+- id,link: IT10777
+  title: Album da colorare
+  status: Bozza
+  category: Giocattoli
+  sale_price: 6.15
+  compare_at_price: 7.38
+  quantity: 18
+  registration_date: '2026-07-12'
+  brand_name: Tidewell
+- id,link: IT10814
+  title: Portadocumenti da scrivania
+  status: In vendita
+  category: Ufficio
+  sale_price: 10.5
+  quantity: 42
+  registration_date: '2026-05-17'
+  brand_name: Tidewell
+- id,link: IT10851
+  title: Ombrellino anti-UV
+  status: In vendita
+  category: Casa
+  sale_price: 18.15
+  quantity: 120
+  registration_date: '2026-07-23'
+  brand_name: 다온랩
+- id,link: IT10888
+  title: Lozione corpo senza profumo
+  status: In vendita
+  category: Bellezza
+  sale_price: 11.1
+  compare_at_price: 13.32
+  quantity: 350
+  registration_date: '2026-04-03'
+  brand_name: 버들
+title: Prodotti

@@ -1,0 +1,30 @@
+page_id: faro-goods-detail-IT10148
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/products/IT10148
+page_type: goods
+layout: detail
+fields:
+  id,link: IT10148
+  title: Siero alla vitamina C
+  status: Bozza
+  category: Bellezza
+  sale_price: 28.75
+  quantity: 7
+  registration_date: '2026-07-14'
+  brand_name: Marlow & Finch
+  code: IT-SKI-104
+  stock_keeping_unit: ITSK1004
+  model_name: SK-139
+  manufacturer: 누리온산업
+  origin_country: Thailandia
+  color: Sabbia
+  barcode: '8899651525215'
+  supply_price: 17.03
+  low_stock_threshold: 5
+  shipping_fee: 2.05
+  description: Uniforma un incarnato spento.
+title: Scheda prodotto

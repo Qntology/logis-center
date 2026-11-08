@@ -1,0 +1,71 @@
+page_id: ribeira-review-list-1
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/reviews?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: Pendente
+  title: Segunda compra e continua de uma cor linda.
+  name: Leonor Silva
+  registration_date: '2026-06-23'
+- id,link: RV7022
+  status: Oculta
+  title: Melhor do que esperava, mesmo bem acabado.
+  name: Carolina Santos
+  registration_date: '2026-08-29'
+- id,link: RV7033
+  status: Aprovada
+  title: Melhor do que esperava, mesmo leve.
+  name: João Rodrigues
+  registration_date: '2026-05-11'
+- id,link: RV7044
+  status: Pendente
+  title: Melhor do que esperava, mesmo leve.
+  name: Mariana Silva
+  registration_date: '2026-09-03'
+- id,link: RV7055
+  status: Aprovada
+  title: Bem embalado e, no geral, leve.
+  name: Inês Rodrigues
+  registration_date: '2026-07-24'
+- id,link: RV7066
+  status: Oculta
+  title: Bem embalado e, no geral, leve.
+  name: Miguel Pereira
+  registration_date: '2026-06-06'
+- id,link: RV7077
+  status: Pendente
+  title: Melhor do que esperava, mesmo bem acabado.
+  name: Rodrigo Oliveira
+  registration_date: '2026-06-01'
+- id,link: RV7088
+  status: Aprovada
+  title: Melhor do que esperava, mesmo resistente.
+  name: Rodrigo Rodrigues
+  registration_date: '2026-08-13'
+- id,link: RV7099
+  status: Aprovada
+  title: Bem embalado e, no geral, de uma cor linda.
+  name: Beatriz Santos
+  registration_date: '2026-07-29'
+- id,link: RV7110
+  status: Pendente
+  title: Bem embalado e, no geral, bem acabado.
+  name: Miguel Pereira
+  registration_date: '2026-07-13'
+- id,link: RV7121
+  status: Aprovada
+  title: Segunda compra e continua resistente.
+  name: João Pereira
+  registration_date: '2026-05-08'
+- id,link: RV7132
+  status: Aprovada
+  title: Bem embalado e, no geral, bem acabado.
+  name: Beatriz Rodrigues
+  registration_date: '2026-06-05'
+title: Avaliações de produtos

@@ -1,0 +1,30 @@
+page_id: yunshan-goods-detail-CN10074
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/products/CN10074
+page_type: goods
+layout: detail
+fields:
+  id,link: CN10074
+  title: 加绒拉链卫衣
+  status: 已售罄
+  category: 服饰
+  sale_price: 288.4
+  compare_at_price: 346.08
+  quantity: 0
+  registration_date: '2026-06-10'
+  brand_name: Tidewell
+  code: CN-COL-102
+  stock_keeping_unit: CNCO1002
+  model_name: CO-116
+  manufacturer: 하람제작소
+  origin_country: 葡萄牙
+  color: 橄榄绿
+  barcode: '8835134642226'
+  supply_price: 185.36
+  low_stock_threshold: 10
+  description: 内里加绒的拉链卫衣，袖口为罗纹收口。
+title: 商品详情

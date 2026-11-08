@@ -1,0 +1,71 @@
+page_id: faro-review-list-1
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/reviews?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: Approvata
+  title: Meglio del previsto, davvero ben rifinito.
+  name: Sara Gallo
+  registration_date: '2026-06-15'
+- id,link: RV7022
+  status: In attesa
+  title: Meglio del previsto, davvero ben rifinito.
+  name: Andrea Romano
+  registration_date: '2026-07-25'
+- id,link: RV7033
+  status: Nascosta
+  title: Meglio del previsto, davvero di un bel colore.
+  name: Giulia Greco
+  registration_date: '2026-05-28'
+- id,link: RV7044
+  status: Approvata
+  title: Meglio del previsto, davvero di un bel colore.
+  name: Andrea Ricci
+  registration_date: '2026-06-22'
+- id,link: RV7055
+  status: Approvata
+  title: Imballato con cura e nel complesso di un bel colore.
+  name: Chiara Conti
+  registration_date: '2026-08-25'
+- id,link: RV7066
+  status: In attesa
+  title: Secondo acquisto e ancora leggero.
+  name: Elena Romano
+  registration_date: '2026-06-17'
+- id,link: RV7077
+  status: In attesa
+  title: Imballato con cura e nel complesso robusto.
+  name: Martina Gallo
+  registration_date: '2026-08-17'
+- id,link: RV7088
+  status: Approvata
+  title: Imballato con cura e nel complesso robusto.
+  name: Marco Gallo
+  registration_date: '2026-08-22'
+- id,link: RV7099
+  status: Nascosta
+  title: Meglio del previsto, davvero leggero.
+  name: Giulia Romano
+  registration_date: '2026-05-21'
+- id,link: RV7110
+  status: In attesa
+  title: Meglio del previsto, davvero leggero.
+  name: Elena Ricci
+  registration_date: '2026-06-17'
+- id,link: RV7121
+  status: Nascosta
+  title: Imballato con cura e nel complesso leggero.
+  name: Luca Greco
+  registration_date: '2026-05-18'
+- id,link: RV7132
+  status: Approvata
+  title: Meglio del previsto, davvero ben rifinito.
+  name: Luca Bianchi
+  registration_date: '2026-09-17'
+title: Recensioni prodotti

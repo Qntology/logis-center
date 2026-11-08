@@ -1,0 +1,83 @@
+page_id: faro-tracking-list-2
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/shipments?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '957917020565'
+  carrier: Spedizioni Aurora
+  status: Consegnato
+  title: Ombrellino anti-UV
+  shipping_date: '2026-09-13'
+  recipient_name: Giulia Ricci
+- id,link: '901279851751'
+  carrier: Trasporti Faro
+  status: Restituito
+  title: Pettorina per cani
+  shipping_date: '2026-05-13'
+  recipient_name: Andrea Bianchi
+- id,link: '420730325863'
+  carrier: Corriere Lampo
+  status: Spedito
+  title: Ombrellino anti-UV
+  shipping_date: '2026-08-23'
+  recipient_name: Marco Rossi
+- id,link: '738707746880'
+  carrier: Spedizioni Aurora
+  status: Consegnato
+  title: Set di stoviglie per bambini
+  shipping_date: '2026-05-20'
+  recipient_name: Martina Greco
+- id,link: '669538078006'
+  carrier: Spedizioni Aurora
+  status: Restituito
+  title: Mouse verticale ergonomico
+  shipping_date: '2026-08-02'
+  recipient_name: Martina Rossi
+- id,link: '463281743867'
+  carrier: Corriere Lampo
+  status: Spedito
+  title: Costruzioni in legno
+  shipping_date: '2026-06-13'
+  recipient_name: Davide Gallo
+- id,link: '734411710664'
+  carrier: Spedizioni Aurora
+  status: Restituito
+  title: Mouse verticale ergonomico
+  shipping_date: '2026-10-08'
+  recipient_name: Luca Ricci
+- id,link: '150495267518'
+  carrier: Spedizioni Aurora
+  status: Consegnato
+  title: Tastiera meccanica silenziosa
+  shipping_date: '2026-06-15'
+  recipient_name: Lorenzo Rossi
+- id,link: '499487889408'
+  carrier: Trasporti Faro
+  status: Consegnato
+  title: Trasportino per animali
+  shipping_date: '2026-09-12'
+  recipient_name: Sara Gallo
+- id,link: '573242036959'
+  carrier: Corriere Lampo
+  status: Spedito
+  title: Hub USB-C multiporta
+  shipping_date: '2026-05-20'
+  recipient_name: Luca Bruno
+- id,link: '371131988389'
+  carrier: Corriere Lampo
+  status: Consegnato
+  title: Lanterna LED ricaricabile
+  shipping_date: '2026-09-08'
+  recipient_name: Davide Greco
+- id,link: '490989864790'
+  carrier: Corriere Lampo
+  status: Consegnato
+  title: Hub USB-C multiporta
+  shipping_date: '2026-08-21'
+  recipient_name: Martina Bianchi
+title: Spedizioni

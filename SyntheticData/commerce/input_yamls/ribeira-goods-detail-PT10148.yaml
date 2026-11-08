@@ -1,0 +1,30 @@
+page_id: ribeira-goods-detail-PT10148
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/products/PT10148
+page_type: goods
+layout: detail
+fields:
+  id,link: PT10148
+  title: Organizador de documentos
+  status: À venda
+  category: Escritório
+  sale_price: 8.9
+  quantity: 96
+  registration_date: '2026-04-16'
+  brand_name: 마루공방
+  code: PT-DES-104
+  stock_keeping_unit: PTDE1004
+  model_name: DE-185
+  manufacturer: 누리온산업
+  origin_country: Coreia
+  color: Azeitona
+  barcode: '8872416759877'
+  supply_price: 5.24
+  low_stock_threshold: 5
+  shipping_fee: 2.05
+  description: Mantém as folhas A4 de pé em divisórias identificadas.
+title: Detalhes do produto

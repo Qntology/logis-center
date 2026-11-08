@@ -1,0 +1,30 @@
+page_id: dekade-goods-detail-NL10074
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/goods/view?id=NL10074
+page_type: goods
+layout: detail
+fields:
+  id,link: NL10074
+  title: Stil mechanisch toetsenbord
+  status: Uitverkocht
+  category: Elektronica
+  sale_price: 59.3
+  compare_at_price: 71.16
+  quantity: 0
+  registration_date: '2026-05-17'
+  brand_name: 다온랩
+  code: NL-DES-102
+  stock_keeping_unit: NLDE1002
+  model_name: DE-245
+  manufacturer: Tidewell Supply
+  origin_country: Portugal
+  color: Zand
+  barcode: '8845486332492'
+  supply_price: 38.22
+  low_stock_threshold: 20
+  description: Een toetsenbord met 87 toetsen en stille schakelaars.
+title: Productgegevens

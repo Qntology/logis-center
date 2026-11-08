@@ -1,0 +1,71 @@
+page_id: alwaha-review-list-1
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/reviews?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: معتمد
+  title: أفضل مما توقعت، خفيف فعلًا.
+  name: نورة الحربي
+  registration_date: '2026-08-04'
+- id,link: RV7022
+  status: قيد المراجعة
+  title: اشتريته للمرة الثانية وما زال خفيف.
+  name: فاطمة السبيعي
+  registration_date: '2026-06-08'
+- id,link: RV7033
+  status: قيد المراجعة
+  title: اشتريته للمرة الثانية وما زال لونه جميل.
+  name: سارة العنزي
+  registration_date: '2026-06-27'
+- id,link: RV7044
+  status: معتمد
+  title: أفضل مما توقعت، خفيف فعلًا.
+  name: هند الحربي
+  registration_date: '2026-08-21'
+- id,link: RV7055
+  status: مخفي
+  title: أفضل مما توقعت، خفيف فعلًا.
+  name: لمى العنزي
+  registration_date: '2026-05-17'
+- id,link: RV7066
+  status: معتمد
+  title: أفضل مما توقعت، جيد التشطيب فعلًا.
+  name: خالد السبيعي
+  registration_date: '2026-09-06'
+- id,link: RV7077
+  status: مخفي
+  title: اشتريته للمرة الثانية وما زال جيد التشطيب.
+  name: خالد السبيعي
+  registration_date: '2026-05-24'
+- id,link: RV7088
+  status: معتمد
+  title: تغليف ممتاز وبشكل عام متين.
+  name: ريم الدوسري
+  registration_date: '2026-05-21'
+- id,link: RV7099
+  status: قيد المراجعة
+  title: أفضل مما توقعت، متين فعلًا.
+  name: عبدالله العنزي
+  registration_date: '2026-07-22'
+- id,link: RV7110
+  status: قيد المراجعة
+  title: اشتريته للمرة الثانية وما زال جيد التشطيب.
+  name: ريم العتيبي
+  registration_date: '2026-05-08'
+- id,link: RV7121
+  status: مخفي
+  title: تغليف ممتاز وبشكل عام لونه جميل.
+  name: نورة القحطاني
+  registration_date: '2026-08-11'
+- id,link: RV7132
+  status: قيد المراجعة
+  title: أفضل مما توقعت، متين فعلًا.
+  name: خالد الزهراني
+  registration_date: '2026-07-07'
+title: مراجعات المنتجات

@@ -1,0 +1,83 @@
+page_id: lindenhof-tracking-list-2
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '540539657243'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Cold-Brew-Konzentrat
+  shipping_date: '2026-08-10'
+  recipient_name: Anna Hoffmann
+- id,link: '733671615506'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Transporttasche für Haustiere
+  shipping_date: '2026-08-21'
+  recipient_name: Emil Becker
+- id,link: '198060551822'
+  carrier: Rheinfracht
+  status: Zurückgesendet
+  title: Hundegeschirr
+  shipping_date: '2026-07-01'
+  recipient_name: Anna Hoffmann
+- id,link: '296101417557'
+  carrier: Nordkurier Logistik
+  status: Unterwegs
+  title: Proteinriegel mit wenig Zucker
+  shipping_date: '2026-10-14'
+  recipient_name: Hannah Braun
+- id,link: '515295661252'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Faltbare Trekkingstöcke
+  shipping_date: '2026-07-13'
+  recipient_name: Emil Wolf
+- id,link: '432123660780'
+  carrier: Nordkurier Logistik
+  status: Unterwegs
+  title: Mineralische Sonnencreme
+  shipping_date: '2026-06-30'
+  recipient_name: Jonas Neumann
+- id,link: '669168731552'
+  carrier: Nordkurier Logistik
+  status: Zugestellt
+  title: Mikrofaser-Kuscheldecke
+  shipping_date: '2026-05-03'
+  recipient_name: Emil Wolf
+- id,link: '238791797118'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Parfümfreie Bodylotion
+  shipping_date: '2026-06-10'
+  recipient_name: Felix Richter
+- id,link: '306304270433'
+  carrier: Kiefernexpress
+  status: Unterwegs
+  title: Aufladbarer Handwärmer
+  shipping_date: '2026-07-04'
+  recipient_name: Paul Schulz
+- id,link: '695305814678'
+  carrier: Blitzpaket
+  status: Zurückgesendet
+  title: Mini-Handventilator
+  shipping_date: '2026-05-10'
+  recipient_name: Emil Richter
+- id,link: '796408461698'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: Geröstete Mandeln
+  shipping_date: '2026-07-24'
+  recipient_name: Anna Wagner
+- id,link: '910839281992'
+  carrier: Rheinfracht
+  status: Unterwegs
+  title: Transporttasche für Haustiere
+  shipping_date: '2026-05-30'
+  recipient_name: Felix Schneider
+title: Sendungen

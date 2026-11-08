@@ -1,0 +1,141 @@
+page_id: dekade-order-list-1
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/order/list?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20260502-100053
+  registration_date: '2026-05-02'
+  status: Verzonden
+  goods: Lichte bodywarmer
+  tracking_number: '173660812230'
+  sender_name: Emma Jansen
+  recipient_name: Emma Jansen
+  quantity: 5
+  amount: 159.55
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+- id,link: 20260404-100106
+  registration_date: '2026-04-04'
+  status: Bezorgd
+  goods: Lichte bodywarmer
+  tracking_number: '460642418407'
+  sender_name: Bram Visser
+  recipient_name: Bram Visser
+  quantity: 3
+  amount: 68.25
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+- id,link: 20260421-100159
+  registration_date: '2026-04-21'
+  status: Bezorgd
+  goods: Set luchtdichte glazen bakjes
+  tracking_number: '674240535101'
+  sender_name: Fleur Bakker
+  recipient_name: Iris Mulder
+  quantity: 1
+  amount: 21.58
+  shipping_fee: 2.05
+  payment_method: Creditcard
+- id,link: 20260519-100212
+  registration_date: '2026-05-19'
+  status: Bezorgd
+  goods: Pluche pantoffels
+  tracking_number: '188518492242'
+  sender_name: Lotte Mulder
+  recipient_name: Lars Meijer
+  quantity: 1
+  amount: 13.98
+  shipping_fee: 2.05
+  payment_method: Creditcard
+- id,link: 20260612-100265
+  registration_date: '2026-06-12'
+  status: Betaald
+  goods: Draagbare kookset
+  sender_name: Lars de Boer
+  recipient_name: Fleur Bakker
+  quantity: 3
+  amount: 91.8
+  shipping_fee: 0.0
+  payment_method: Digitale portemonnee
+- id,link: 20260715-100318
+  registration_date: '2026-07-15'
+  status: Verzonden
+  goods: Ergonomische verticale muis
+  tracking_number: '736910782044'
+  sender_name: Sanne Bakker
+  recipient_name: Sanne Bakker
+  quantity: 4
+  amount: 110.3
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+- id,link: 20260824-100371
+  registration_date: '2026-08-24'
+  status: Verzonden
+  goods: Automatische voerbak
+  tracking_number: '827150714647'
+  sender_name: Jesse Bakker
+  recipient_name: Jesse Bakker
+  quantity: 1
+  amount: 49.45
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+- id,link: 20260628-100424
+  registration_date: '2026-06-28'
+  status: Bezorgd
+  goods: Kinderservies
+  tracking_number: '408526865618'
+  sender_name: Lotte de Groot
+  recipient_name: Lotte de Groot
+  quantity: 7
+  amount: 116.6
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+- id,link: 20260916-100477
+  registration_date: '2026-09-16'
+  status: Bezorgd
+  goods: Stil mechanisch toetsenbord
+  tracking_number: '214506429829'
+  sender_name: Thijs Meijer
+  recipient_name: Thijs Meijer
+  quantity: 3
+  amount: 126.27
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+- id,link: 20260711-100530
+  registration_date: '2026-07-11'
+  status: Geretourneerd
+  goods: Oplaadbare handwarmer
+  tracking_number: '815495466995'
+  sender_name: Noor Visser
+  recipient_name: Fleur de Groot
+  quantity: 4
+  amount: 79.83
+  shipping_fee: 0.0
+  payment_method: Creditcard
+- id,link: 20260413-100583
+  registration_date: '2026-04-13'
+  status: Geretourneerd
+  goods: Set siliconen keukengerei
+  tracking_number: '394516776075'
+  sender_name: Sanne de Vries
+  recipient_name: Sanne de Vries
+  quantity: 4
+  amount: 51.8
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+- id,link: 20260516-100636
+  registration_date: '2026-05-16'
+  status: Wacht op betaling
+  goods: Slimme activiteitentracker
+  sender_name: Emma de Groot
+  recipient_name: Noor Bakker
+  quantity: 2
+  amount: 69.65
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+title: Bestellingen

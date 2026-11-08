@@ -1,0 +1,139 @@
+page_id: alameda-order-list-1
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/orders?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20260629-100053
+  registration_date: '2026-06-29'
+  status: En proceso
+  goods: Ratón vertical ergonómico
+  sender_name: Paula Ruiz
+  recipient_name: Paula Ruiz
+  quantity: 1
+  amount: 31.15
+  shipping_fee: 2.05
+  payment_method: Tarjeta de crédito
+- id,link: 20260529-100106
+  registration_date: '2026-05-29'
+  status: Enviado
+  goods: Bloques de construcción de madera
+  tracking_number: '894459860597'
+  sender_name: Sofía García
+  recipient_name: Álvaro Moreno
+  quantity: 1
+  amount: 25.5
+  shipping_fee: 2.05
+  payment_method: Monedero digital
+- id,link: 20260416-100159
+  registration_date: '2026-04-16'
+  status: Pendiente de pago
+  goods: Bloques de construcción de madera
+  sender_name: Sofía Torres
+  recipient_name: Sofía Torres
+  quantity: 3
+  amount: 77.75
+  shipping_fee: 0.0
+  payment_method: Transferencia bancaria
+- id,link: 20260916-100212
+  registration_date: '2026-09-16'
+  status: Entregado
+  goods: Ratón vertical ergonómico
+  tracking_number: '695952291446'
+  sender_name: Pablo Navarro
+  recipient_name: Elena Torres
+  quantity: 2
+  amount: 52.38
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+- id,link: 20260804-100265
+  registration_date: '2026-08-04'
+  status: Entregado
+  goods: Zumo de mandarina de Jeju
+  tracking_number: '645838296899'
+  sender_name: Mateo Sánchez
+  recipient_name: Mateo Sánchez
+  quantity: 3
+  amount: 35.55
+  shipping_fee: 0.0
+  payment_method: Monedero digital
+- id,link: 20260816-100318
+  registration_date: '2026-08-16'
+  status: Cancelado
+  goods: Arnés para perro
+  sender_name: Pablo Ruiz
+  recipient_name: Pablo Ruiz
+  quantity: 6
+  amount: 92.3
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+- id,link: 20260504-100371
+  registration_date: '2026-05-04'
+  status: Entregado
+  goods: Rascador para gatos
+  tracking_number: '114354088541'
+  sender_name: Carmen Moreno
+  recipient_name: Carmen Moreno
+  quantity: 2
+  amount: 23.92
+  shipping_fee: 2.05
+  payment_method: Transferencia bancaria
+- id,link: 20260807-100424
+  registration_date: '2026-08-07'
+  status: Entregado
+  goods: Bastones de trekking plegables
+  tracking_number: '886083831935'
+  sender_name: Sofía Torres
+  recipient_name: Sofía Torres
+  quantity: 3
+  amount: 107.35
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+- id,link: 20260919-100477
+  registration_date: '2026-09-19'
+  status: Enviado
+  goods: Esterilla refrescante de gel
+  tracking_number: '662499719297'
+  sender_name: Paula García
+  recipient_name: Paula López
+  quantity: 2
+  amount: 37.45
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+- id,link: 20260817-100530
+  registration_date: '2026-08-17'
+  status: Devuelto
+  goods: Manta de microfibra
+  tracking_number: '608254314982'
+  sender_name: Martina Moreno
+  recipient_name: Martina Moreno
+  quantity: 2
+  amount: 44.35
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+- id,link: 20260703-100583
+  registration_date: '2026-07-03'
+  status: En proceso
+  goods: Almendras tostadas
+  sender_name: Pablo López
+  recipient_name: Pablo López
+  quantity: 3
+  amount: 29.2
+  shipping_fee: 2.05
+  payment_method: Transferencia bancaria
+- id,link: 20260822-100636
+  registration_date: '2026-08-22'
+  status: Entregado
+  goods: Bloques de construcción de madera
+  tracking_number: '939211234506'
+  sender_name: Carmen Torres
+  recipient_name: Carmen Torres
+  quantity: 3
+  amount: 87.93
+  shipping_fee: 0.0
+  payment_method: Tarjeta de crédito
+title: Pedidos

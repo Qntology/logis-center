@@ -1,0 +1,83 @@
+page_id: ulipy-tracking-list-1
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '201307695671'
+  carrier: Morava náklad
+  status: Doručeno
+  title: Automatické krmítko
+  shipping_date: '2026-04-29'
+  recipient_name: Lucie Procházková
+- id,link: '400828234978'
+  carrier: Morava náklad
+  status: Odesláno
+  title: Minerální opalovací krém
+  shipping_date: '2026-08-23'
+  recipient_name: Jan Kučera
+- id,link: '958122719875'
+  carrier: Morava náklad
+  status: Doručeno
+  title: Nerezová pánev
+  shipping_date: '2026-06-04'
+  recipient_name: Lukáš Novák
+- id,link: '224585497921'
+  carrier: Lipová přeprava
+  status: Odesláno
+  title: Sada silikonového náčiní
+  shipping_date: '2026-07-14'
+  recipient_name: Lukáš Procházka
+- id,link: '238946220121'
+  carrier: Kurýr Petřín
+  status: Odesláno
+  title: Bio granola
+  shipping_date: '2026-07-04'
+  recipient_name: Jan Novotný
+- id,link: '388827306797'
+  carrier: Kurýr Petřín
+  status: Doručeno
+  title: Voděodolný Bluetooth reproduktor
+  shipping_date: '2026-05-31'
+  recipient_name: Lukáš Veselý
+- id,link: '558604180478'
+  carrier: Kurýr Petřín
+  status: Doručeno
+  title: Plyšové bačkory
+  shipping_date: '2026-10-04'
+  recipient_name: Kateřina Nováková
+- id,link: '722416942469'
+  carrier: Morava náklad
+  status: Odesláno
+  title: Tichá mechanická klávesnice
+  shipping_date: '2026-08-18'
+  recipient_name: Jakub Kučera
+- id,link: '902813324294'
+  carrier: Kurýr Petřín
+  status: Doručeno
+  title: Automatické krmítko
+  shipping_date: '2026-08-21'
+  recipient_name: Tomáš Horák
+- id,link: '714049381381'
+  carrier: Kurýr Petřín
+  status: Vráceno
+  title: Nabíjecí ohřívač rukou
+  shipping_date: '2026-08-05'
+  recipient_name: Petr Dvořák
+- id,link: '593676324904'
+  carrier: Tři řeky expres
+  status: Odesláno
+  title: Sérum s vitaminem C
+  shipping_date: '2026-04-19'
+  recipient_name: Jakub Dvořák
+- id,link: '271190590801'
+  carrier: Lipová přeprava
+  status: Odesláno
+  title: Chladicí pásek na krk
+  shipping_date: '2026-05-25'
+  recipient_name: Petr Novotný
+title: Zásilky
