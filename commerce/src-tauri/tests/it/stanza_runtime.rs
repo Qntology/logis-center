@@ -181,3 +181,33 @@ fn real_models_match_pytorch_reference() {
     }
     assert!(bad.is_empty(), "{}건 어긋남", bad.len());
 }
+
+/// 받는 주소: 저장소 루트(format 1)는 이미 배포된 앱 몫이고, 새 실행기는 main 의 format2/ 를 읽습니다.
+#[test]
+fn remote_base_is_format2_folder() {
+    assert_eq!(
+        tauri_app_lib::stanza::remote_base("zh-hans"),
+        "https://huggingface.co/Qntology/stanza-zh-hans/resolve/main/format2"
+    );
+}
+
+/// 올린 변환본 확인 (네트워크): 12개 언어 저장소의 format2/vocab.json 이 format 2 이고, 목록의 파일이 모두 받아지는지
+#[test]
+#[ignore = "네트워크 (huggingface.co)"]
+fn hub_format2_manifests() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let client = reqwest::Client::new();
+    for code in tauri_app_lib::stanza::LANGS {
+        let base = tauri_app_lib::stanza::remote_base(code);
+        let files = rt
+            .block_on(tauri_app_lib::stanza::remote_manifest(&base))
+            .unwrap_or_else(|e| panic!("{code}: {e:#}"));
+        assert!(files.iter().any(|f| f == "tokenizer.onnx"), "{code}: {files:?}");
+        for f in &files {
+            let url = format!("{base}/{f}");
+            let res = rt.block_on(client.head(&url).send()).unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert!(res.status().is_success() || res.status().is_redirection(), "{url}: {}", res.status());
+        }
+        println!("{code}: 파일 {}개", files.len());
+    }
+}

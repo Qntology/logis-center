@@ -166,6 +166,14 @@ pub const UI_LANGS: [(&str, &str); 12] = [
 
 /// 변환본을 받는 Hugging Face 저장소 (이전 이름 PopupLink/stanza-<lang> 은 여기로 넘어감)
 pub const HF_REPO_PREFIX: &str = "https://huggingface.co/Qntology/stanza-";
+/// format 2 변환본을 두는 main 의 폴더. 루트의 format 1 파일은 이미 배포된 앱이 PopupLink 주소
+/// (→ Qntology 리다이렉트)로 받으므로 그대로 둡니다.
+pub const HF_REPO_SUBDIR: &str = "format2";
+
+/// 언어 하나의 변환본 주소. 이 아래의 vocab.json 이 받을 파일 목록입니다.
+pub fn remote_base(code: &str) -> String {
+    format!("{HF_REPO_PREFIX}{code}/resolve/main/{HF_REPO_SUBDIR}")
+}
 
 /// vocab.json 의 `files` (처리기별 파일 목록)을 펼칩니다. vocab.json 자신은 넣지 않습니다.
 pub fn manifest_files(vocab: &Value) -> Vec<String> {
