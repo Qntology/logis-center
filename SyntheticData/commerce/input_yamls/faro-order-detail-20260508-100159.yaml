@@ -1,0 +1,26 @@
+page_id: faro-order-detail-20260508-100159
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/orders/20260508-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260508-100159
+  registration_date: '2026-05-08'
+  status: In attesa di pagamento
+  goods: Spazzola per toelettatura
+  sender_name: Chiara Bruno
+  recipient_name: Sara Colombo
+  quantity: 5
+  amount: 48.0
+  shipping_fee: 0.0
+  payment_method: Portafoglio digitale
+  sender_phone: +39 360 899 6752
+  sender_address: Via Mazzini 104, 10121 Torino
+  recipient_phone: +39 345 824 3822
+  recipient_address: Via dei Fiori 9, 20121 Milano
+  payment_origin: PagaPonte
+title: Dettaglio ordine

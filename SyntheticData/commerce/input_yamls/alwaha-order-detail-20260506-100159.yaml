@@ -1,0 +1,28 @@
+page_id: alwaha-order-detail-20260506-100159
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/orders/20260506-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260506-100159
+  registration_date: '2026-05-06'
+  status: تم الشحن
+  goods: فأرة عمودية مريحة
+  tracking_number: '612860245088'
+  sender_name: سلطان الحربي
+  recipient_name: سلطان الحربي
+  quantity: 11
+  amount: 918.8
+  shipping_fee: 0.0
+  payment_method: محفظة رقمية
+  sender_phone: +966 56 605 8750
+  sender_address: شارع الندى 75، الخبر 34428
+  recipient_phone: +966 56 605 8750
+  recipient_address: شارع الندى 75، الخبر 34428
+  payment_origin: دفع الواحة
+  payment_date: '2026-05-06'
+title: تفاصيل الطلب

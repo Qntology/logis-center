@@ -1,0 +1,29 @@
+page_id: tilleuls-order-detail-20260604-100106
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/order/view?id=20260604-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260604-100106
+  registration_date: '2026-06-04'
+  status: Livrée
+  goods: Enceinte Bluetooth étanche
+  tracking_number: '539448320835'
+  sender_name: Clara Lefèvre
+  recipient_name: Clara Lefèvre
+  quantity: 6
+  amount: 182.07
+  shipping_fee: 0.0
+  payment_method: Carte bancaire
+  sender_phone: +33 6 70 13 71 46
+  sender_address: 112 rue du Moulin, 44000 Nantes
+  recipient_phone: +33 6 70 13 71 46
+  recipient_address: 112 rue du Moulin, 44000 Nantes
+  payment_origin: PaiementPont
+  payment_date: '2026-06-04'
+  card: Carte Saint-Roch
+title: Détail de la commande

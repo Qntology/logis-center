@@ -1,0 +1,29 @@
+page_id: dekade-goods-detail-NL10148
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/goods/view?id=NL10148
+page_type: goods
+layout: detail
+fields:
+  id,link: NL10148
+  title: Lichte bodywarmer
+  status: Actief
+  category: Kleding
+  sale_price: 44.55
+  quantity: 120
+  registration_date: '2026-07-22'
+  brand_name: 다온랩
+  code: NL-COL-104
+  stock_keeping_unit: NLCO1004
+  model_name: CO-566
+  manufacturer: Tidewell Supply
+  origin_country: Portugal
+  color: Olijfgroen
+  barcode: '8879427425600'
+  supply_price: 28.27
+  low_stock_threshold: 5
+  description: Dunne vulling van ganzendons om onder een jas te dragen.
+title: Productgegevens

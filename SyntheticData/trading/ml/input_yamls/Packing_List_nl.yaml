@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: nl
+document_title: Paklijst
+metadata:
+  packing_list_number: PL-NL-2609-679
+  issue_date: '2026-09-27'
+  related_invoice_number: CI-NL-2609-280
+  related_po_number: PO-NL-65999
+  related_bl_number: BL-NL93718156
+parties:
+  shipper_exporter:
+    name: Kwekerij Duinzicht B.V.
+    address: Heereweg 210, 2161 BR Lisse, Nederland
+  consignee:
+    name: Yeoreum Garden Co., Ltd.
+    address: 58 Sejong-daero, Jung-gu, Seoel, Zuid-Korea
+shipping_details:
+  vessel_flight: NOORDERZON V.517E
+  port_of_loading: Rotterdam, Nederland
+  port_of_discharge: Busan, Zuid-Korea
+packing_details:
+- item_code: TUL-12
+  description: Tulpenbollen maat 12/+
+  quantity: 200000
+  unit: st.
+  packages: 400
+  package_type: kartons
+  net_weight_kg: 4000.0
+  gross_weight_kg: 4600.0
+  measurement_cbm: 20.0
+- item_code: HYA-17
+  description: Hyacintenbollen maat 17/18
+  quantity: 40000
+  unit: st.
+  packages: 100
+  package_type: kartons
+  net_weight_kg: 1600.0
+  gross_weight_kg: 1900.0
+  measurement_cbm: 6.0
+summary:
+  total_packages: 500
+  total_net_weight_kg: 5600.0
+  total_gross_weight_kg: 6500.0
+  total_measurement_cbm: 26.0

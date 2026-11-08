@@ -1,0 +1,77 @@
+page_id: sakura-tracking-list-2
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '628500540359'
+  carrier: みなと急便
+  status: 発送済み
+  title: スマートフィットネスバンド
+  shipping_date: '2026-04-28'
+  recipient_name: 佐藤 大翔
+- id,link: '333002348424'
+  carrier: みなと急便
+  status: 配達完了
+  title: ペットキャリーバッグ
+  shipping_date: '2026-08-19'
+  recipient_name: 渡辺 陽菜
+- id,link: '942942230625'
+  carrier: みなと急便
+  status: 配達完了
+  title: ネッククーラーバンド
+  shipping_date: '2026-05-16'
+  recipient_name: 佐藤 蓮
+- id,link: '865661620064'
+  carrier: さくら便
+  status: 配達完了
+  title: 真空断熱タンブラー
+  shipping_date: '2026-09-06'
+  recipient_name: 渡辺 芽依
+- id,link: '485515133682'
+  carrier: はやぶさ運輸
+  status: 発送済み
+  title: 大容量モバイルバッテリー
+  shipping_date: '2026-06-30'
+  recipient_name: 佐藤 大翔
+- id,link: '291298734613'
+  carrier: つばめ配送
+  status: 発送済み
+  title: ハンディミニ扇風機
+  shipping_date: '2026-06-30'
+  recipient_name: 小林 美咲
+- id,link: '959967605536'
+  carrier: みなと急便
+  status: 配達完了
+  title: 低アレルゲンドライフード
+  shipping_date: '2026-08-02'
+  recipient_name: 小林 悠真
+- id,link: '636947368051'
+  carrier: つばめ配送
+  status: 返品
+  title: ケーブル収納ボックス
+  shipping_date: '2026-08-23'
+  recipient_name: 山本 芽依
+- id,link: '939550828824'
+  carrier: つばめ配送
+  status: 配達完了
+  title: リネン半袖シャツ
+  shipping_date: '2026-07-15'
+  recipient_name: 山本 湊
+- id,link: '533985164976'
+  carrier: みなと急便
+  status: 配達完了
+  title: 2人用ドームテント
+  shipping_date: '2026-07-09'
+  recipient_name: 伊藤 葵
+- id,link: '775887873148'
+  carrier: はやぶさ運輸
+  status: 発送済み
+  title: スマートフィットネスバンド
+  shipping_date: '2026-07-14'
+  recipient_name: 佐藤 陽菜
+title: 出荷一覧

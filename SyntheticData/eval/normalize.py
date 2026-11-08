@@ -9,12 +9,18 @@ import re
 from datetime import datetime
 
 MONEY_CHARS = re.compile(r"[,\s₩$€£¥원]")
+CURRENCY_WORDS = re.compile(r"Kč|ر\.س|円|元")
+# 유럽식 숫자: 1.234,50 · 1.234.567 · 2 840,0 · 174,42 (쉼표 뒤 1~2자리는 소수점, 3자리는 영어식 천 단위)
+EU_NUMBER = re.compile(r"-?\d{1,3}(\.\d{3})+,\d+|-?\d{1,3}(\.\d{3}){2,}|-?\d{1,3}( \d{3})+(,\d+)?|-?\d+,\d{1,2}")
 DATE_PATTERNS = (
     (re.compile(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})"), "ymd"),
     (re.compile(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일"), "ymd"),
+    (re.compile(r"(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日"), "ymd"),
     (re.compile(r"\b(\d{2})[-.](\d{1,2})[-.](\d{1,2})\b"), "ymd2"),
     (re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b"), "mdy"),
     (re.compile(r"\b([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})\b"), "bdy"),
+    (re.compile(r"\b(\d{1,2})\.\s?(\d{1,2})\.\s?(\d{4})\b"), "dmy"),   # 26.07.2026 · 26. 7. 2026
+    (re.compile(r"\b(\d{1,2})-(\d{1,2})-(\d{4})\b"), "dmy"),           # 26-07-2026
 )
 MONTHS = {m: i + 1 for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split())}
 
@@ -27,7 +33,12 @@ def to_number(v):
         return float(v)
     if not isinstance(v, str):
         return None
-    t = MONEY_CHARS.sub("", v.strip())
+    s = CURRENCY_WORDS.sub("", v).replace(" ", " ").replace(" ", " ")
+    s = re.sub(r"[₩$€£¥원]", "", s).strip()
+    s = re.sub(r"\s*(kg|KG|cm|CM|CBM|cbm|m³)$", "", s)
+    if EU_NUMBER.fullmatch(s):
+        s = s.replace(".", "").replace(" ", "").replace(",", ".")
+    t = MONEY_CHARS.sub("", s)
     t = re.sub(r"(kg|KG|cm|CM|일|days?|CBM|cbm)$", "", t)
     if re.fullmatch(r"-?\d+(\.\d+)?", t):
         return float(t)
@@ -50,8 +61,12 @@ def to_date(v):
                 return f"{int(a):04d}-{int(b):02d}-{int(c):02d}"
             if kind == "ymd2":
                 return f"{2000 + int(a):04d}-{int(b):02d}-{int(c):02d}"
+            if kind == "mdy" and int(a) > 12:  # 26/07/2026 은 일/월/연
+                return f"{int(c):04d}-{int(b):02d}-{int(a):02d}"
             if kind == "mdy":
                 return f"{int(c):04d}-{int(a):02d}-{int(b):02d}"
+            if kind == "dmy":
+                return f"{int(c):04d}-{int(b):02d}-{int(a):02d}"
             return f"{int(c):04d}-{MONTHS[a]:02d}-{int(b):02d}"
         except (KeyError, ValueError):
             return None

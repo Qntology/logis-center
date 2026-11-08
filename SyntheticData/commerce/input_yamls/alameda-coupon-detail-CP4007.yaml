@@ -1,0 +1,21 @@
+page_id: alameda-coupon-detail-CP4007
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/coupons/CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: ALA683
+  title: Bienvenida a tu primer pedido 1
+  type: Porcentaje
+  discount: 15%
+  started_at: '2026-03-13'
+  expired_at: '2026-04-12'
+  status: Finalizado
+  quantity: 500
+  min_order_amount: 6.9
+title: Código de descuento

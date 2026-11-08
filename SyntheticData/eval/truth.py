@@ -14,6 +14,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 COMMERCE = ROOT / "commerce"
 TRADING = ROOT / "trading"
+TRADING_ML = TRADING / "ml"
 
 
 def read_yaml(path: Path):
@@ -116,6 +117,15 @@ def trading_docs() -> list:
             "split": trading_split(p.stem), "truth": trade_truth(y), "raw": y,
             "pdf": str((TRADING / "output_pdfs" / f"{p.stem}.pdf").as_posix()),
         })
+    # 분할 ml: 11개 언어 서류 (trading/ml/generate_trading_ml.py). 키는 영어 서식과 같고 값 · PDF 라벨이 그 언어입니다.
+    # 영어 45건 뒤에 붙여 기존 순번(질의 id)을 지킵니다.
+    for p in sorted((TRADING_ML / "input_yamls").glob("*.yaml")):
+        y = read_yaml(p)
+        docs.append({
+            "stem": p.stem, "code": y["document_code"], "title": y["document_type"], "split": "ml",
+            "lang": y["language"], "truth": trade_truth(y), "raw": y,
+            "pdf": str((TRADING_ML / "output_pdfs" / f"{p.stem}.pdf").as_posix()),
+        })
     return docs
 
 
@@ -165,12 +175,18 @@ TRADE_PURPOSE_KO = {
 def trading_queries() -> list:
     out = []
     for d in trading_docs():
+        if d["split"] == "ml":
+            continue
         code, number = d["code"], d["truth"]["doc_number"][0]
         common = {"split": d["split"], "domain": "shipping", "relevant": [d["stem"]]}
         out.append({**common, "kind": "identifier", "lang": "ko", "query": f"문서번호 {number} 찾아줘"})
         out.append({**common, "kind": "doc_title", "lang": "en", "query": d["title"]})
         out.append({**common, "kind": "doc_title", "lang": "ko", "query": TRADE_NAMES_KO[code]})
         out.append({**common, "kind": "doc_purpose", "lang": "ko", "query": TRADE_PURPOSE_KO[code]})
+    # 분할 ml 질의는 생성기가 그 언어로 써 둔 것 (식별자 · 서식 이름 · 용도 · 당사자 · 품목). 서식 이름 · 용도의 정답은
+    # 모든 언어의 같은 서식입니다.
+    if (TRADING_ML / "queries.yaml").exists():
+        out += read_yaml(TRADING_ML / "queries.yaml")
     return out
 
 
@@ -187,6 +203,26 @@ def commerce_queries() -> list:
 
 def commerce_records() -> list:
     return read_yaml(COMMERCE / "records.yaml")
+
+
+# ──────────────────────────────────────────────
+# 12개 언어 검색 시나리오 (eval/queries_12lang.yaml)
+# Stanza 변환본 12개 언어가 검색 경로에서 도는지 보려고 같은 정답 집합의 질의를 12개 언어로 씁니다.
+# 계획 id 는 이 목록의 순번입니다 (커머스 · 무역 따로).
+# ──────────────────────────────────────────────
+LANGS_12 = ["en", "ko", "de", "es", "fr", "it", "pt", "nl", "cs", "ar", "ja", "zh-hans"]
+
+
+def multilingual_queries(domain: str) -> list:
+    spec = read_yaml(Path(__file__).resolve().parent / "queries_12lang.yaml")
+    out = []
+    for entry in spec["commerce" if domain == "commerce" else "shipping"]:
+        for lang in LANGS_12:
+            out.append({
+                "split": "12lang", "shop": entry.get("shop", ""), "kind": entry["kind"], "key": entry["key"],
+                "lang": lang, "domain": domain, "query": entry["query"][lang], "relevant": list(entry["relevant"]),
+            })
+    return out
 
 
 if __name__ == "__main__":

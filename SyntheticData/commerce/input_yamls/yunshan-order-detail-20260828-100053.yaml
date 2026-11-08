@@ -1,0 +1,29 @@
+page_id: yunshan-order-detail-20260828-100053
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/my/orders/20260828-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260828-100053
+  registration_date: '2026-08-28'
+  status: 已发货
+  goods: 轻量露营椅
+  tracking_number: '148167768001'
+  sender_name: 王欣怡
+  recipient_name: 周静
+  quantity: 1
+  amount: 197.4
+  shipping_fee: 15.8
+  payment_method: 银行转账
+  sender_phone: 138 7936 7420
+  sender_address: 上海市浦东新区和平街26号3栋1203室
+  recipient_phone: 139 7491 2518
+  recipient_address: 浙江省杭州市西湖区建设路177号7栋207室
+  payment_origin: 白鹭钱包
+  payment_date: '2026-08-28'
+  bank: 白鹭农商银行
+title: 订单详情

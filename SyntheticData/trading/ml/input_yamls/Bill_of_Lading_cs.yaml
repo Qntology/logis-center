@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: cs
+document_title: Konosament
+metadata:
+  bl_number: BL-CZ29101749
+  issue_date: '2026-10-10'
+  related_invoice_number: CI-CZ-2610-218
+  related_po_number: PO-CZ-83137
+  related_lc_number: LC-CZ9182102
+  freight_term: Dopravné placeno v místě určení
+parties:
+  shipper:
+    name: Ložiska Tři řeky s.r.o.
+    address: Průmyslová 7, 301 00 Plzeň, Česko
+  consignee:
+    name: Hanul Precision Co., Ltd.
+    address: 33 Gongdan-ro, Gumi, Jižní Korea
+  notify_party:
+    name: Hanul Precision Co., Ltd.
+    address: 33 Gongdan-ro, Gumi, Jižní Korea
+  carrier:
+    name: Labe Shipping s.r.o.
+shipping_details:
+  vessel_flight: ELBE BRIDGE V.226E
+  port_of_loading: Hamburk, Německo
+  port_of_discharge: Pusan, Jižní Korea
+  place_of_receipt: Plzeň, Česko
+  place_of_delivery: Gumi, Jižní Korea
+cargo_details:
+  container_number: LBSU3850152
+  seal_number: SL352079
+  marks_and_numbers: HANUL / GUMI / VYROBENO V ČESKU
+  number_of_packages: 16 beden
+  description_of_goods: Kuličková a kuželíková ložiska
+  gross_weight_kg: 5740.0
+  measurement_cbm: 6.4

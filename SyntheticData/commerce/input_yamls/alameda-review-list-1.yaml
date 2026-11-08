@@ -1,0 +1,71 @@
+page_id: alameda-review-list-1
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/reviews?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: Aprobada
+  title: Mejor de lo esperado, muy de un color precioso.
+  name: Diego Torres
+  registration_date: '2026-09-18'
+- id,link: RV7022
+  status: Aprobada
+  title: Bien embalado y resistente en general.
+  name: Hugo Sánchez
+  registration_date: '2026-07-04'
+- id,link: RV7033
+  status: Aprobada
+  title: Segunda compra y sigue siendo de un color precioso.
+  name: Daniel Torres
+  registration_date: '2026-06-27'
+- id,link: RV7044
+  status: Aprobada
+  title: Segunda compra y sigue siendo de un color precioso.
+  name: Mateo García
+  registration_date: '2026-05-20'
+- id,link: RV7055
+  status: Pendiente
+  title: Mejor de lo esperado, muy bien acabado.
+  name: Elena García
+  registration_date: '2026-08-01'
+- id,link: RV7066
+  status: Aprobada
+  title: Bien embalado y resistente en general.
+  name: Hugo Castillo
+  registration_date: '2026-05-31'
+- id,link: RV7077
+  status: Pendiente
+  title: Bien embalado y de un color precioso en general.
+  name: Pablo Torres
+  registration_date: '2026-05-07'
+- id,link: RV7088
+  status: Oculto
+  title: Bien embalado y ligero en general.
+  name: Pablo López
+  registration_date: '2026-09-19'
+- id,link: RV7099
+  status: Aprobada
+  title: Bien embalado y bien acabado en general.
+  name: Hugo Martínez
+  registration_date: '2026-06-12'
+- id,link: RV7110
+  status: Pendiente
+  title: Segunda compra y sigue siendo ligero.
+  name: Diego López
+  registration_date: '2026-05-24'
+- id,link: RV7121
+  status: Aprobada
+  title: Segunda compra y sigue siendo resistente.
+  name: Daniel García
+  registration_date: '2026-08-03'
+- id,link: RV7132
+  status: Aprobada
+  title: Mejor de lo esperado, muy resistente.
+  name: Lucía Ruiz
+  registration_date: '2026-05-20'
+title: Reseñas de productos

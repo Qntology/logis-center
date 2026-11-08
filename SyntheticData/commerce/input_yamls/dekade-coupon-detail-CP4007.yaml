@@ -1,0 +1,21 @@
+page_id: dekade-coupon-detail-CP4007
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/coupon/view?id=CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: DEK197
+  title: Alleen dit weekend 1
+  type: Percentage
+  discount: 5%
+  started_at: '2026-09-02'
+  expired_at: '2026-09-16'
+  status: Gepland
+  quantity: 300
+  min_order_amount: 34.5
+title: Kortingscode

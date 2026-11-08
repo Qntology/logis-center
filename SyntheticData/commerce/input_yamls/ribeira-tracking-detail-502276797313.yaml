@@ -1,0 +1,30 @@
+page_id: ribeira-tracking-detail-502276797313
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/shipments/502276797313
+page_type: tracking
+layout: detail
+fields:
+  id,link: '502276797313'
+  carrier: Correio Ligeiro
+  status: Devolvido
+  title: Comedouro automático
+  shipping_date: '2026-06-20'
+  recipient_name: Miguel Costa
+  registration_date: '2026-06-19'
+  sender_name: Ribeira Comércio, Lda.
+  sender_address: Rua das Flores 32, 4050-262 Porto
+  sender_phone: +351 22 555 0142
+  recipient_address: Rua das Oliveiras, 102, 4700-321 Braga
+  recipient_phone: +351 909 755 572
+  weight: 0.8
+  width: 29
+  height: 17
+  length: 34
+  shipping_method: Transporte de carga
+  shipping_duration: 4
+  shipping_fee: 0.0
+title: Detalhes do envio

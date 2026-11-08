@@ -1,0 +1,16 @@
+page_id: alwaha-review-detail-RV7011
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/reviews/RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: معتمد
+  title: أفضل مما توقعت، خفيف فعلًا.
+  name: نورة الحربي
+  registration_date: '2026-08-04'
+title: المراجعة

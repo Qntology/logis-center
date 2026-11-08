@@ -1,0 +1,30 @@
+page_id: yunshan-tracking-detail-677625882099
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/my/shipments/677625882099
+page_type: tracking
+layout: detail
+fields:
+  id,link: '677625882099'
+  carrier: 云杉快递
+  status: 已发货
+  title: 维C精华液
+  shipping_date: '2026-04-05'
+  recipient_name: 杨磊
+  registration_date: '2026-04-04'
+  sender_name: 云杉商贸有限公司
+  sender_address: 上海市徐汇区云杉路88号6楼
+  sender_phone: 021-5555 0142
+  recipient_address: 北京市朝阳区解放路58号6栋1406室
+  recipient_phone: 136 7090 0157
+  weight: 1.7
+  width: 45
+  height: 12
+  length: 30
+  shipping_method: 大件物流
+  shipping_duration: 3
+  shipping_fee: 0.0
+title: 物流详情

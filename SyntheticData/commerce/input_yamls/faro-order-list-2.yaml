@@ -1,0 +1,140 @@
+page_id: faro-order-list-2
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/orders?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20261011-100689
+  registration_date: '2026-10-11'
+  status: In lavorazione
+  goods: Power bank ad alta capacità
+  sender_name: Andrea Ricci
+  recipient_name: Andrea Ricci
+  quantity: 4
+  amount: 103.1
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20260602-100742
+  registration_date: '2026-06-02'
+  status: In attesa di pagamento
+  goods: Lozione corpo senza profumo
+  sender_name: Matteo Rossi
+  recipient_name: Matteo Rossi
+  quantity: 3
+  amount: 52.05
+  shipping_fee: 0.0
+  payment_method: Portafoglio digitale
+- id,link: 20260518-100795
+  registration_date: '2026-05-18'
+  status: Consegnato
+  goods: Mouse verticale ergonomico
+  tracking_number: '620893141375'
+  sender_name: Sofia Rossi
+  recipient_name: Sofia Rossi
+  quantity: 2
+  amount: 53.7
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20260829-100848
+  registration_date: '2026-08-29'
+  status: Consegnato
+  goods: Tastiera meccanica silenziosa
+  tracking_number: '902100197552'
+  sender_name: Chiara Gallo
+  recipient_name: Chiara Gallo
+  quantity: 2
+  amount: 123.4
+  shipping_fee: 0.0
+  payment_method: Portafoglio digitale
+- id,link: 20260422-100901
+  registration_date: '2026-04-22'
+  status: Restituito
+  goods: Spazzola per toelettatura
+  tracking_number: '586920977030'
+  sender_name: Matteo Romano
+  recipient_name: Matteo Romano
+  quantity: 5
+  amount: 68.76
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20260413-100954
+  registration_date: '2026-04-13'
+  status: Consegnato
+  goods: Altoparlante Bluetooth impermeabile
+  tracking_number: '720309403489'
+  sender_name: Lorenzo Gallo
+  recipient_name: Marco Conti
+  quantity: 5
+  amount: 184.28
+  shipping_fee: 0.0
+  payment_method: Portafoglio digitale
+- id,link: 20260923-101007
+  registration_date: '2026-09-23'
+  status: Spedito
+  goods: Spazzola per toelettatura
+  tracking_number: '258628048469'
+  sender_name: Martina Marino
+  recipient_name: Martina Marino
+  quantity: 6
+  amount: 74.75
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20260927-101060
+  registration_date: '2026-09-27'
+  status: Annullato
+  goods: Siero alla vitamina C
+  sender_name: Chiara Ricci
+  recipient_name: Chiara Ricci
+  quantity: 2
+  amount: 57.5
+  shipping_fee: 0.0
+  payment_method: Bonifico
+- id,link: 20260608-101113
+  registration_date: '2026-06-08'
+  status: Restituito
+  goods: Costruzioni in legno
+  tracking_number: '285527565697'
+  sender_name: Andrea Bianchi
+  recipient_name: Sara Gallo
+  quantity: 6
+  amount: 448.2
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20260904-101166
+  registration_date: '2026-09-04'
+  status: Consegnato
+  goods: Sandali traspiranti
+  tracking_number: '668977632282'
+  sender_name: Chiara Ricci
+  recipient_name: Chiara Ricci
+  quantity: 5
+  amount: 121.25
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20261012-101219
+  registration_date: '2026-10-12'
+  status: Restituito
+  goods: Mouse verticale ergonomico
+  tracking_number: '121679013111'
+  sender_name: Giulia Conti
+  recipient_name: Marco Marino
+  quantity: 2
+  amount: 53.7
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20260912-101272
+  registration_date: '2026-09-12'
+  status: Consegnato
+  goods: Ombrellino anti-UV
+  tracking_number: '957917020565'
+  sender_name: Marco Rossi
+  recipient_name: Giulia Ricci
+  quantity: 3
+  amount: 54.45
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+title: Ordini

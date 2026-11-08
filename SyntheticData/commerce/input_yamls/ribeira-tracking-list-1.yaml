@@ -1,0 +1,83 @@
+page_id: ribeira-tracking-list-1
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/shipments?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '237367738412'
+  carrier: Encomendas Ribeira
+  status: Enviado
+  title: Aquecedor de mãos recarregável
+  shipping_date: '2026-09-30'
+  recipient_name: João Fernandes
+- id,link: '755149486673'
+  carrier: Transportes Atlântico
+  status: Devolvido
+  title: Pulseira de atividade inteligente
+  shipping_date: '2026-09-10'
+  recipient_name: Beatriz Santos
+- id,link: '502276797313'
+  carrier: Correio Ligeiro
+  status: Devolvido
+  title: Comedouro automático
+  shipping_date: '2026-06-20'
+  recipient_name: Miguel Costa
+- id,link: '732793469328'
+  carrier: Expresso Douro
+  status: Devolvido
+  title: Barra proteica com pouco açúcar
+  shipping_date: '2026-09-06'
+  recipient_name: Mariana Ferreira
+- id,link: '612856659584'
+  carrier: Correio Ligeiro
+  status: Entregue
+  title: Manta de microfibra
+  shipping_date: '2026-07-11'
+  recipient_name: Carolina Santos
+- id,link: '805390762420'
+  carrier: Transportes Atlântico
+  status: Entregue
+  title: Essência reparadora para cabelo
+  shipping_date: '2026-04-15'
+  recipient_name: Tiago Silva
+- id,link: '798201885973'
+  carrier: Transportes Atlântico
+  status: Enviado
+  title: Espuma de limpeza de pH baixo
+  shipping_date: '2026-04-18'
+  recipient_name: Leonor Oliveira
+- id,link: '150437485746'
+  carrier: Correio Ligeiro
+  status: Entregue
+  title: Coelhinho de peluche
+  shipping_date: '2026-05-18'
+  recipient_name: Mariana Santos
+- id,link: '968748245525'
+  carrier: Encomendas Ribeira
+  status: Enviado
+  title: Sérum de vitamina C
+  shipping_date: '2026-07-13'
+  recipient_name: Mariana Santos
+- id,link: '189549122458'
+  carrier: Encomendas Ribeira
+  status: Entregue
+  title: Trotinete infantil
+  shipping_date: '2026-09-22'
+  recipient_name: Rodrigo Fernandes
+- id,link: '267950839942'
+  carrier: Expresso Douro
+  status: Enviado
+  title: Suporte para portátil
+  shipping_date: '2026-08-04'
+  recipient_name: Leonor Pereira
+- id,link: '364990141865'
+  carrier: Encomendas Ribeira
+  status: Entregue
+  title: Sandálias arejadas
+  shipping_date: '2026-07-06'
+  recipient_name: Rodrigo Santos
+title: Envios

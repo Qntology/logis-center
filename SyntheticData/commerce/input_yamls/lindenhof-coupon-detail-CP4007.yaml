@@ -1,0 +1,21 @@
+page_id: lindenhof-coupon-detail-CP4007
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/coupon/view?id=CP4007
+page_type: coupon
+layout: detail
+fields:
+  id,link: CP4007
+  code: LIN526
+  title: Herbstliches Dankeschön 1
+  type: Festbetrag
+  discount: 3,45 €
+  started_at: '2026-09-04'
+  expired_at: '2026-10-04'
+  status: Läuft
+  quantity: 500
+  min_order_amount: 20.7
+title: Gutscheincode

@@ -17,10 +17,13 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from urllib.parse import urlparse
 
+import yaml
+
 from normalize import contains_value, same_value
 from truth import ROOT, commerce_pages
 
 BIAS = ROOT.parent / "commerce" / "src-tauri" / "src" / "utils" / "bias.json"
+STATUS_WORDS = ROOT / "commerce" / "status_words.yaml"
 STATUS_CODE = {
     "progress": 1, "stop": 2, "cancel": 3, "refund": 4, "return": 5, "error": 6, "expire": 7,
     "exchange": 8, "complete": 9, "draft": 10, "show": 11, "hide": 12,
@@ -52,6 +55,12 @@ def status_table() -> dict:
         for word in node.get("exact_match", []):
             out.setdefault(word.lower(), (name,))
     out.update(STATUS_EXTRA)
+    # 언어 팩 쇼핑몰(분할 ml)의 상태어는 같은 뜻의 영어 상태어를 따릅니다 (generate_commerce_pages.py 가 씀).
+    if STATUS_WORDS.exists():
+        for words in yaml.safe_load(STATUS_WORDS.read_text(encoding="utf-8")).values():
+            for word, english in words.items():
+                if english.lower() in out:
+                    out.setdefault(word.lower(), out[english.lower()])
     return out
 
 

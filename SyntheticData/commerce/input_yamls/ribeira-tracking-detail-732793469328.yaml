@@ -1,0 +1,30 @@
+page_id: ribeira-tracking-detail-732793469328
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/shipments/732793469328
+page_type: tracking
+layout: detail
+fields:
+  id,link: '732793469328'
+  carrier: Expresso Douro
+  status: Devolvido
+  title: Barra proteica com pouco açúcar
+  shipping_date: '2026-09-06'
+  recipient_name: Mariana Ferreira
+  registration_date: '2026-09-05'
+  sender_name: Ribeira Comércio, Lda.
+  sender_address: Rua das Flores 32, 4050-262 Porto
+  sender_phone: +351 22 555 0142
+  recipient_address: Rua do Comércio, 152, 4000-322 Porto
+  recipient_phone: +351 974 606 350
+  weight: 5.7
+  width: 30
+  height: 26
+  length: 29
+  shipping_method: Normal
+  shipping_duration: 2
+  shipping_fee: 2.05
+title: Detalhes do envio

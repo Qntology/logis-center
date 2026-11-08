@@ -1,0 +1,91 @@
+page_id: tilleuls-coupon-list-1
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: TIL983
+  title: Offre exclusive appli 1
+  type: Pourcentage
+  discount: 10%
+  started_at: '2026-06-08'
+  expired_at: '2026-07-08'
+  status: En cours
+- id,link: CP4014
+  code: TIL808
+  title: Offre exclusive appli 2
+  type: Montant fixe
+  discount: 3,45 €
+  started_at: '2026-03-12'
+  expired_at: '2026-04-11'
+  status: En cours
+- id,link: CP4021
+  code: TIL628
+  title: Sauvetage du panier 3
+  type: Montant fixe
+  discount: 1,40 €
+  started_at: '2026-06-17'
+  expired_at: '2026-06-24'
+  status: En cours
+- id,link: CP4028
+  code: TIL577
+  title: Bienvenue pour la première commande 4
+  type: Montant fixe
+  discount: 2,05 €
+  started_at: '2026-06-04'
+  expired_at: '2026-06-11'
+  status: Programmé
+- id,link: CP4035
+  code: TIL880
+  title: Avantage client fidèle 5
+  type: Montant fixe
+  discount: 2,05 €
+  started_at: '2026-06-05'
+  expired_at: '2026-07-05'
+  status: Programmé
+- id,link: CP4042
+  code: TIL806
+  title: Offre exclusive appli 6
+  type: Montant fixe
+  discount: 1,40 €
+  started_at: '2026-07-28'
+  expired_at: '2026-08-27'
+  status: Terminé
+- id,link: CP4049
+  code: TIL747
+  title: Offre du week-end 7
+  type: Pourcentage
+  discount: 20%
+  started_at: '2026-04-24'
+  expired_at: '2026-05-08'
+  status: Programmé
+- id,link: CP4056
+  code: TIL899
+  title: Offre exclusive appli 8
+  type: Montant fixe
+  discount: 1,40 €
+  started_at: '2026-06-04'
+  expired_at: '2026-06-11'
+  status: Terminé
+- id,link: CP4063
+  code: TIL568
+  title: Offre du week-end 9
+  type: Montant fixe
+  discount: 3,45 €
+  started_at: '2026-04-22'
+  expired_at: '2026-05-22'
+  status: Programmé
+- id,link: CP4070
+  code: TIL429
+  title: Bienvenue pour la première commande 10
+  type: Pourcentage
+  discount: 15%
+  started_at: '2026-03-27'
+  expired_at: '2026-04-03'
+  status: Terminé
+title: Codes promo

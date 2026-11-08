@@ -1,0 +1,29 @@
+page_id: ulipy-order-detail-20260427-100053
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/order/view?id=20260427-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260427-100053
+  registration_date: '2026-04-27'
+  status: Doručeno
+  goods: Automatické krmítko
+  tracking_number: '201307695671'
+  sender_name: Lucie Procházková
+  recipient_name: Lucie Procházková
+  quantity: 1
+  amount: 1260
+  shipping_fee: 0
+  payment_method: Platební karta
+  sender_phone: +420 733 201 990
+  sender_address: Zahradní 16, 301 00 Plzeň
+  recipient_phone: +420 733 201 990
+  recipient_address: Zahradní 16, 301 00 Plzeň
+  payment_origin: Rychlá pokladna
+  payment_date: '2026-04-27'
+  card: Karta Lípa
+title: Detail objednávky

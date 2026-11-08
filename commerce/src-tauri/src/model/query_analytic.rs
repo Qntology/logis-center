@@ -134,7 +134,8 @@ impl crate::model::LogisModel {
         // =====================================================================
         // STEP 2 : Stanza 형태소 토큰화 (UPOS + Lemma)
         // =====================================================================
-        let stanza_code = crate::analytic::stanza_lang_code(language);
+        // 앱 언어가 아니라 질의 글의 언어로 고릅니다 (독일어 질의에 한국어 모델을 돌리지 않게).
+        let stanza_code = crate::stanza::detect_query_lang(&query, language).unwrap_or("");
         let tokens = crate::analytic::tokenize_query_with_morphology(&query, stanza_code).await;
         if tokens.is_empty() {
             emit_term("   ⚠️ [TOKENIZE] 분석 가능한 토큰이 없습니다. 전체 스코프로 검색합니다.");
@@ -155,7 +156,7 @@ impl crate::model::LogisModel {
         // 🌟 [DUAL AXIS] 드롭 대상 품사도 '청크 후보' 에는 남깁니다.
         //    '클릭한' 이 VERB 로 판정되어도 그것이 event 판정의 유일한 근거이기 때문입니다.
         //    드롭은 keywords / target 산출 시에만 적용합니다.
-        const DROP_TAGS: [&str; 7] = crate::utils::ai_utils::STANZA_DROP_TAGS;
+        const DROP_TAGS: &[&str] = crate::utils::ai_utils::STANZA_DROP_TAGS;
         let all_words: Vec<String> = tokens.iter().map(|(w, _, _)| w.clone()).collect();
         let content_flags: Vec<bool> = tokens
             .iter()

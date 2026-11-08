@@ -1,0 +1,30 @@
+page_id: tilleuls-tracking-detail-561575292501
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/shipping/view?id=561575292501
+page_type: tracking
+layout: detail
+fields:
+  id,link: '561575292501'
+  carrier: Colis Éclair
+  status: Expédiée
+  title: Crème solaire minérale
+  shipping_date: '2026-08-24'
+  recipient_name: Léa Roux
+  registration_date: '2026-08-22'
+  sender_name: Comptoir des Tilleuls SARL
+  sender_address: 12 rue des Lilas, 69003 Lyon
+  sender_phone: +33 4 55 50 12 34
+  recipient_address: 54 avenue Victor-Hugo, 75011 Paris
+  recipient_phone: +33 6 66 77 25 23
+  weight: 2.9
+  width: 36
+  height: 14
+  length: 40
+  shipping_method: Retrait en magasin
+  shipping_duration: 2
+  shipping_fee: 0.0
+title: Détail de l'expédition

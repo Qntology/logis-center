@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: zh-hans
+document_title: 装箱单
+metadata:
+  packing_list_number: PL-CN-2610-152
+  issue_date: '2026-10-03'
+  related_invoice_number: CI-CN-2610-722
+  related_po_number: PO-CN-19966
+  related_bl_number: BL-CN22569071
+parties:
+  shipper_exporter:
+    name: 海星新能源科技有限公司
+    address: 浙江省宁波市鄞州区海星路88号
+  consignee:
+    name: Sinhan Battery Co., Ltd.
+    address: 45 Saneop-ro, Heungdeok-gu, Cheongju, 韩国
+shipping_details:
+  vessel_flight: HAI XING V.903E
+  port_of_loading: 宁波，中国
+  port_of_discharge: 釜山，韩国
+packing_details:
+- item_code: LFP-280
+  description: 磷酸铁锂电池模组 280Ah
+  quantity: 600
+  unit: 套
+  packages: 50
+  package_type: 木托
+  net_weight_kg: 18600.0
+  gross_weight_kg: 19800.0
+  measurement_cbm: 48.0
+- item_code: BMS-16S
+  description: 电池管理系统控制板
+  quantity: 600
+  unit: 套
+  packages: 6
+  package_type: 木托
+  net_weight_kg: 420.0
+  gross_weight_kg: 560.0
+  measurement_cbm: 3.0
+summary:
+  total_packages: 56
+  total_net_weight_kg: 19020.0
+  total_gross_weight_kg: 20360.0
+  total_measurement_cbm: 51.0

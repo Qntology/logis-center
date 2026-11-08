@@ -1,0 +1,91 @@
+page_id: lindenhof-coupon-list-1
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: LIN526
+  title: Herbstliches Dankeschön 1
+  type: Festbetrag
+  discount: 3,45 €
+  started_at: '2026-09-04'
+  expired_at: '2026-10-04'
+  status: Läuft
+- id,link: CP4014
+  code: LIN608
+  title: Willkommen zur ersten Bestellung 2
+  type: Prozentrabatt
+  discount: 20%
+  started_at: '2026-03-04'
+  expired_at: '2026-04-03'
+  status: Beendet
+- id,link: CP4021
+  code: LIN945
+  title: Herbstliches Dankeschön 3
+  type: Prozentrabatt
+  discount: 5%
+  started_at: '2026-08-17'
+  expired_at: '2026-08-31'
+  status: Läuft
+- id,link: CP4028
+  code: LIN738
+  title: Bonus für Stammkunden 4
+  type: Festbetrag
+  discount: 3,45 €
+  started_at: '2026-07-19'
+  expired_at: '2026-07-26'
+  status: Läuft
+- id,link: CP4035
+  code: LIN920
+  title: Nur am Wochenende 5
+  type: Festbetrag
+  discount: 2,05 €
+  started_at: '2026-04-13'
+  expired_at: '2026-04-20'
+  status: Beendet
+- id,link: CP4042
+  code: LIN932
+  title: Willkommen zur ersten Bestellung 6
+  type: Festbetrag
+  discount: 2,05 €
+  started_at: '2026-08-01'
+  expired_at: '2026-08-31'
+  status: Läuft
+- id,link: CP4049
+  code: LIN780
+  title: Warenkorb-Rettung 7
+  type: Festbetrag
+  discount: 3,45 €
+  started_at: '2026-03-31'
+  expired_at: '2026-04-14'
+  status: Geplant
+- id,link: CP4056
+  code: LIN773
+  title: Nur in der App 8
+  type: Prozentrabatt
+  discount: 5%
+  started_at: '2026-09-07'
+  expired_at: '2026-10-07'
+  status: Beendet
+- id,link: CP4063
+  code: LIN312
+  title: Herbstliches Dankeschön 9
+  type: Festbetrag
+  discount: 1,40 €
+  started_at: '2026-08-20'
+  expired_at: '2026-09-03'
+  status: Geplant
+- id,link: CP4070
+  code: LIN720
+  title: Bonus für Stammkunden 10
+  type: Festbetrag
+  discount: 1,40 €
+  started_at: '2026-07-15'
+  expired_at: '2026-07-22'
+  status: Beendet
+title: Gutscheincodes

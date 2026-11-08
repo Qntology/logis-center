@@ -1,0 +1,30 @@
+page_id: faro-tracking-detail-144797482821
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/shipments/144797482821
+page_type: tracking
+layout: detail
+fields:
+  id,link: '144797482821'
+  carrier: Spedizioni Aurora
+  status: Consegnato
+  title: Bicchiere termico sottovuoto
+  shipping_date: '2026-06-12'
+  recipient_name: Sofia Romano
+  registration_date: '2026-06-09'
+  sender_name: Bottega del Faro S.r.l.
+  sender_address: Via dei Mille 15, 40121 Bologna
+  sender_phone: +39 051 555 0142
+  recipient_address: Via Mazzini 10, 00184 Roma
+  recipient_phone: +39 306 865 9140
+  weight: 5.1
+  width: 23
+  height: 20
+  length: 21
+  shipping_method: Ritiro in negozio
+  shipping_duration: 1
+  shipping_fee: 0.0
+title: Dettaglio spedizione

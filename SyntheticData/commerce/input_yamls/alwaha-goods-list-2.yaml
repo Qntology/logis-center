@@ -1,0 +1,113 @@
+page_id: alwaha-goods-list-2
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/products?page=2
+page_type: goods
+layout: list
+items:
+- id,link: AR10481
+  title: شاحن سريع 65 واط
+  status: مسودة
+  category: إلكترونيات
+  sale_price: 85.75
+  compare_at_price: 102.9
+  quantity: 350
+  registration_date: '2026-06-29'
+  brand_name: 버들
+- id,link: AR10518
+  title: كريم مرطب واقٍ للبشرة
+  status: معروض للبيع
+  category: العناية والجمال
+  sale_price: 84.65
+  compare_at_price: 101.58
+  quantity: 96
+  registration_date: '2026-01-31'
+  brand_name: 하람
+- id,link: AR10555
+  title: جاكيت فرو شيربا
+  status: معروض للبيع
+  category: ملابس
+  sale_price: 170.15
+  compare_at_price: 204.18
+  quantity: 18
+  registration_date: '2026-05-16'
+  brand_name: Kestrel Lane
+- id,link: AR10592
+  title: رقائق أرز بني محمص
+  status: معروض للبيع
+  category: بقالة
+  sale_price: 30.95
+  compare_at_price: 37.14
+  quantity: 42
+  registration_date: '2026-01-17'
+  brand_name: 누리온
+- id,link: AR10629
+  title: سيروم إصلاح الشعر
+  status: مسودة
+  category: العناية والجمال
+  sale_price: 52.05
+  quantity: 96
+  registration_date: '2026-08-03'
+  brand_name: 하람
+- id,link: AR10666
+  title: غلاية بتحكم في درجة الحرارة
+  status: معروض للبيع
+  category: أجهزة منزلية
+  sale_price: 145.75
+  quantity: 42
+  registration_date: '2026-01-12'
+  brand_name: Marlow & Finch
+- id,link: AR10703
+  title: طعام جاف مضاد للحساسية
+  status: مسودة
+  category: الحيوانات الأليفة
+  sale_price: 99.45
+  quantity: 7
+  registration_date: '2026-09-06'
+  brand_name: 하람
+- id,link: AR10740
+  title: موزع USB-C متعدد المنافذ
+  status: معروض للبيع
+  category: إلكترونيات
+  sale_price: 95.9
+  quantity: 7
+  registration_date: '2026-04-24'
+  brand_name: Oakfern
+- id,link: AR10777
+  title: فأرة عمودية مريحة
+  status: معروض للبيع
+  category: إلكترونيات
+  sale_price: 108.75
+  quantity: 96
+  registration_date: '2026-04-25'
+  brand_name: 버들
+- id,link: AR10814
+  title: جرانولا عضوية
+  status: معروض للبيع
+  category: بقالة
+  sale_price: 36.7
+  compare_at_price: 44.04
+  quantity: 7
+  registration_date: '2026-06-13'
+  brand_name: 마루공방
+- id,link: AR10851
+  title: بطانية مايكروفايبر
+  status: مسودة
+  category: المنزل
+  sale_price: 73.15
+  compare_at_price: 87.78
+  quantity: 3
+  registration_date: '2026-02-28'
+  brand_name: Kestrel Lane
+- id,link: AR10888
+  title: رغوة تنظيف بدرجة حموضة منخفضة
+  status: معروض للبيع
+  category: العناية والجمال
+  sale_price: 42.2
+  quantity: 18
+  registration_date: '2026-06-17'
+  brand_name: 버들
+title: المنتجات

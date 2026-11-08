@@ -1,0 +1,16 @@
+page_id: faro-review-detail-RV7011
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/reviews/RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: Approvata
+  title: Meglio del previsto, davvero ben rifinito.
+  name: Sara Gallo
+  registration_date: '2026-06-15'
+title: Recensione

@@ -1,0 +1,16 @@
+page_id: sakura-review-detail-RV7011
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/review/view?id=RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: 承認済み
+  title: 梱包も丁寧で、全体的に色がきれいです。
+  name: 渡辺 大翔
+  registration_date: '2026-07-07'
+title: レビュー

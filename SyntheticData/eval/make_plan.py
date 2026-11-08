@@ -5,10 +5,13 @@
 tests/it/synthetic_eval.rs 가 읽는 JSONL 계획을 씁니다.
 
   python make_plan.py commerce --split dev --out plan.jsonl
+  python make_plan.py commerce --split ml --out plan.jsonl   (10개 언어 쇼핑몰, 같은 꼴로 search · seeds 도)
   python make_plan.py trading  --split dev --out plan.jsonl
   python make_plan.py images   --split dev --pages-dir <PNG 폴더> --out plan.jsonl
   python make_plan.py search   --split dev --out plan.jsonl
   python make_plan.py shipsearch --split dev --out plan.jsonl
+  python make_plan.py ml12 --out plan.jsonl       (12개 언어 커머스 질의, queries_12lang.yaml)
+  python make_plan.py mlship12 --out plan.jsonl   (12개 언어 무역 질의)
   python make_plan.py seeds    --split dev --out plan.jsonl   (정답 레코드를 바로 색인)
 
 --only 는 id 부분 문자열 필터입니다(쉼표로 여러 개). --limit 은 앞에서 N 건만 씁니다.
@@ -20,7 +23,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from score_commerce import STATUS_CODE, status_table
-from truth import COMMERCE, commerce_pages, commerce_queries, trading_docs, trading_queries
+from truth import COMMERCE, commerce_pages, commerce_queries, multilingual_queries, trading_docs, trading_queries
+
+sys.path.insert(0, str(COMMERCE))
+from lang_packs import PACKS  # noqa: E402
+
+# 쇼핑몰 언어 → 통화 (언어 팩 쇼핑몰은 팩의 통화)
+CURRENCY = {"ko": "KRW", "en": "USD", **{lang: pk["shop"]["currency"] for lang, pk in PACKS.items()}}
 
 
 def commerce_plan(split: str) -> list:
@@ -59,7 +68,7 @@ def search_plan(split: str) -> list:
             continue
         out.append({
             "id": f"q{i:04d}", "kind": "search", "query": q["query"], "mode": "commerce",
-            "language": "korean", "host": hosts[q["shop"]], "truth_index": i,
+            "language": "korean", "host": hosts[q["shop"]], "truth_index": i, "lang": q["lang"],
         })
     return out
 
@@ -74,6 +83,16 @@ def ship_search_plan(split: str) -> list:
             "language": "korean", "host": "", "truth_index": i,
         })
     return out
+
+
+def ml_search_plan(domain: str) -> list:
+    """12개 언어 시나리오 (queries_12lang.yaml). 앱 언어는 한국어로 두고 질의 글에서 언어를 고르게 합니다."""
+    hosts = {p["shop"]: urlparse(p["url"]).hostname for p in commerce_pages()}
+    prefix, mode = ("m", "commerce") if domain == "commerce" else ("n", "shipping")
+    return [{
+        "id": f"{prefix}{i:04d}", "kind": "search", "query": q["query"], "mode": mode, "language": "korean",
+        "host": hosts.get(q["shop"], "") if domain == "commerce" else "", "truth_index": i, "lang": q["lang"],
+    } for i, q in enumerate(multilingual_queries(domain))]
 
 
 def seed_plan(split: str) -> list:
@@ -98,7 +117,7 @@ def seed_plan(split: str) -> list:
         data["link"] = f"https://{host}/{kind}/{rid}"
         # 번호는 앱이 저장하는 칸에도 둡니다. 없으면 식별자 조건이 정답을 지워 검색이 부당하게 나빠 보입니다.
         data.setdefault({"order": "no", "tracking": "tracking_number"}.get(kind, "code"), rid)
-        data["currency"] = "KRW" if rec["page"]["lang"] == "ko" else "USD"
+        data["currency"] = CURRENCY[rec["page"]["lang"]]
         if "goods" in data:
             data["goods_title"] = data.pop("goods")
         out.append({
@@ -111,8 +130,9 @@ def seed_plan(split: str) -> list:
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["commerce", "trading", "images", "search", "shipsearch", "seeds"])
-    ap.add_argument("--split", default="dev", choices=["dev", "test", "all"])
+    ap.add_argument("what", choices=["commerce", "trading", "images", "search", "shipsearch", "seeds", "ml12", "mlship12"])
+    ap.add_argument("--split", default="dev", choices=["dev", "test", "ml", "all"],
+                    help="ml: 한국어 · 영어 밖 10개 언어 (커머스 언어 팩 쇼핑몰 · 무역 다국어 문서)")
     ap.add_argument("--pages-dir", type=Path)
     ap.add_argument("--only", default="")
     ap.add_argument("--limit", type=int, default=0)
@@ -124,6 +144,8 @@ def main() -> int:
         plan = trading_plan(a.split)
     elif a.what == "images":
         plan = image_plan(a.split, a.pages_dir)
+    elif a.what in ("ml12", "mlship12"):
+        plan = ml_search_plan("commerce" if a.what == "ml12" else "shipping")
     elif a.what == "shipsearch":
         plan = ship_search_plan(a.split)
     elif a.what == "seeds":

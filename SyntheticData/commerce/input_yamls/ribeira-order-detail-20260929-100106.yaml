@@ -1,0 +1,29 @@
+page_id: ribeira-order-detail-20260929-100106
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/orders/20260929-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260929-100106
+  registration_date: '2026-09-29'
+  status: Enviado
+  goods: Aquecedor de mãos recarregável
+  tracking_number: '237367738412'
+  sender_name: João Fernandes
+  recipient_name: João Fernandes
+  quantity: 6
+  amount: 122.0
+  shipping_fee: 0.0
+  payment_method: Cartão de crédito
+  sender_phone: +351 926 445 648
+  sender_address: Rua das Oliveiras, 61, 4700-321 Braga
+  recipient_phone: +351 926 445 648
+  recipient_address: Rua das Oliveiras, 61, 4700-321 Braga
+  payment_origin: PagaFácil Ribeira
+  payment_date: '2026-09-29'
+  card: Cartão Ribeira
+title: Detalhes da encomenda

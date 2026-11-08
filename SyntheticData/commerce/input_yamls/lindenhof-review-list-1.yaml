@@ -1,0 +1,71 @@
+page_id: lindenhof-review-list-1
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/review/list?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: Ausstehend
+  title: Zweiter Kauf und immer noch farblich wunderschön.
+  name: Leon Neumann
+  registration_date: '2026-08-31'
+- id,link: RV7022
+  status: Ausstehend
+  title: Besser als erwartet, wirklich robust.
+  name: Lena Hoffmann
+  registration_date: '2026-09-23'
+- id,link: RV7033
+  status: Freigegeben
+  title: Besser als erwartet, wirklich farblich wunderschön.
+  name: Anna Neumann
+  registration_date: '2026-05-10'
+- id,link: RV7044
+  status: Freigegeben
+  title: Besser als erwartet, wirklich farblich wunderschön.
+  name: Anna Keller
+  registration_date: '2026-05-03'
+- id,link: RV7055
+  status: Freigegeben
+  title: Zweiter Kauf und immer noch farblich wunderschön.
+  name: Felix Neumann
+  registration_date: '2026-09-28'
+- id,link: RV7066
+  status: Ausstehend
+  title: Besser als erwartet, wirklich leicht.
+  name: Marie Becker
+  registration_date: '2026-06-03'
+- id,link: RV7077
+  status: Ausstehend
+  title: Zweiter Kauf und immer noch sauber verarbeitet.
+  name: Jonas Hoffmann
+  registration_date: '2026-07-08'
+- id,link: RV7088
+  status: Freigegeben
+  title: Zweiter Kauf und immer noch leicht.
+  name: Lukas Neumann
+  registration_date: '2026-05-04'
+- id,link: RV7099
+  status: Ausstehend
+  title: Besser als erwartet, wirklich robust.
+  name: Paul Braun
+  registration_date: '2026-07-10'
+- id,link: RV7110
+  status: Ausgeblendet
+  title: Zweiter Kauf und immer noch sauber verarbeitet.
+  name: Paul Schneider
+  registration_date: '2026-05-30'
+- id,link: RV7121
+  status: Freigegeben
+  title: Zweiter Kauf und immer noch leicht.
+  name: Marie Becker
+  registration_date: '2026-07-29'
+- id,link: RV7132
+  status: Ausstehend
+  title: Zweiter Kauf und immer noch farblich wunderschön.
+  name: Felix Schulz
+  registration_date: '2026-07-05'
+title: Produktbewertungen

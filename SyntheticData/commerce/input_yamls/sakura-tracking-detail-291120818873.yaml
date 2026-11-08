@@ -1,0 +1,30 @@
+page_id: sakura-tracking-detail-291120818873
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/shipping/view?id=291120818873
+page_type: tracking
+layout: detail
+fields:
+  id,link: '291120818873'
+  carrier: さくら便
+  status: 配達完了
+  title: ステンレスフライパン
+  shipping_date: '2026-07-18'
+  recipient_name: 鈴木 蓮
+  registration_date: '2026-07-15'
+  sender_name: 株式会社さくら商店
+  sender_address: 東京都台東区桜橋2-14-8 さくらビル3階
+  sender_phone: 03-5555-0142
+  recipient_address: 〒154-0015 東京都世田谷区中央3-18-12
+  recipient_phone: 090-0568-9781
+  weight: 0.8
+  width: 59
+  height: 33
+  length: 21
+  shipping_method: 店舗受け取り
+  shipping_duration: 2
+  shipping_fee: 0
+title: 出荷詳細

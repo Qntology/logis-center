@@ -1,0 +1,30 @@
+page_id: dekade-tracking-detail-460642418407
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/shipping/view?id=460642418407
+page_type: tracking
+layout: detail
+fields:
+  id,link: '460642418407'
+  carrier: Kade Pakketdienst
+  status: Bezorgd
+  title: Lichte bodywarmer
+  shipping_date: '2026-04-07'
+  recipient_name: Bram Visser
+  registration_date: '2026-04-04'
+  sender_name: De Kade Handel B.V.
+  sender_address: Kadestraat 18, 3512 AB Utrecht
+  sender_phone: +31 30 555 0142
+  recipient_address: Stationsweg 143, 3511 LX Utrecht
+  recipient_phone: +31 6 8675 7955
+  weight: 4.0
+  width: 20
+  height: 21
+  length: 12
+  shipping_method: Standaard
+  shipping_duration: 4
+  shipping_fee: 0.0
+title: Zendinggegevens

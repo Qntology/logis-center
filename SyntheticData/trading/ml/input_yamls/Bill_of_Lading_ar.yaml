@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: ar
+document_title: بوليصة الشحن
+metadata:
+  bl_number: BL-SA92992380
+  issue_date: '2026-10-03'
+  related_invoice_number: CI-SA-2610-806
+  related_po_number: PO-SA-12044
+  related_lc_number: LC-SA7357768
+  freight_term: أجرة الشحن مدفوعة مسبقًا
+parties:
+  shipper:
+    name: شركة الواحة للبتروكيماويات
+    address: شارع الصناعة 12، الجبيل الصناعية 35514، المملكة العربية السعودية
+  consignee:
+    name: Seorin Polymer Co., Ltd.
+    address: 19 Yeosusandan-ro، يوسو، كوريا الجنوبية
+  notify_party:
+    name: Seorin Polymer Co., Ltd.
+    address: 19 Yeosusandan-ro، يوسو، كوريا الجنوبية
+  carrier:
+    name: خطوط الخليج البحرية
+shipping_details:
+  vessel_flight: AL JUBAIL PEARL V.044E
+  port_of_loading: الجبيل، المملكة العربية السعودية
+  port_of_discharge: يوسو، كوريا الجنوبية
+  place_of_receipt: الجبيل الصناعية، المملكة العربية السعودية
+  place_of_delivery: يوسو، كوريا الجنوبية
+cargo_details:
+  container_number: KGLU3347231
+  seal_number: SL447641
+  marks_and_numbers: SEORIN / YEOSU / صنع في السعودية
+  number_of_packages: 24000 كيس
+  description_of_goods: حبيبات بولي إيثيلين وبولي بروبيلين
+  gross_weight_kg: 602400.0
+  measurement_cbm: 840.0

@@ -1,0 +1,16 @@
+page_id: ribeira-review-detail-RV7011
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/reviews/RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: Pendente
+  title: Segunda compra e continua de uma cor linda.
+  name: Leonor Silva
+  registration_date: '2026-06-23'
+title: Avaliação

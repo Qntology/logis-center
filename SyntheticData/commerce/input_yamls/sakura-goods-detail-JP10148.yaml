@@ -1,0 +1,31 @@
+page_id: sakura-goods-detail-JP10148
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/goods/view?id=JP10148
+page_type: goods
+layout: detail
+fields:
+  id,link: JP10148
+  title: モニター台
+  status: 販売中
+  category: オフィス用品
+  sale_price: 3920
+  compare_at_price: 4704
+  quantity: 18
+  registration_date: '2026-08-30'
+  brand_name: 버들
+  code: JP-DES-104
+  stock_keeping_unit: JPDE1004
+  model_name: DE-325
+  manufacturer: Tidewell Supply
+  origin_country: ポルトガル
+  color: ライトグレー
+  barcode: '8879819143519'
+  supply_price: 2240
+  low_stock_threshold: 5
+  shipping_fee: 330
+  description: 画面を目の高さに上げ、下にキーボードを収納できます。
+title: 商品詳細

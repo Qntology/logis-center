@@ -80,6 +80,7 @@ impl crate::model::LogisModel {
                 whatlang::Lang::Ita => "it".to_string(),
                 whatlang::Lang::Por => "pt".to_string(),
                 whatlang::Lang::Nld => "nl".to_string(),
+                whatlang::Lang::Ces => "cs".to_string(),
                 whatlang::Lang::Vie => "vi".to_string(),
                 _ => language.to_string(),
             })
@@ -171,372 +172,93 @@ impl crate::model::LogisModel {
                 .unwrap_or_else(|_| vec![vec![0.0; 384]; op_bank_texts.len()])
         };
 
-        // 🌟 [추가] Stanza 기반 형태소 분석으로 검색어(query) 정밀 분할 반영
+        // 🌟 [STANZA] 검색어 형태 분석 — stanza-onnx-export format 2 변환본 (12개 언어, PyTorch Stanza 와 원문 끝에서 끝 일치).
+        //    공백으로 낱말을 나누는 언어는 공백 어절이 단위입니다 (창 · NMS 좌표계가 공백 어절 기준). 어절 안의 Stanza 토큰 ·
+        //    MWT 낱말(du → de le, zum → zu dem, للعملاء → ل + العملاء) 중 첫 내용어의 품사 · 어간 · 관계를 어절에 붙입니다.
+        //    일본어 · 중국어는 공백이 없어 Stanza 토큰이 단위입니다 (이전에는 질의 전체가 한 낱말이었음).
+        //    기능어 품사(STANZA_DROP_TAGS) 어절은 Plinko 앞에서 빼고, 부정 · 하향 · 가격 경계 · 정렬 표시는 빼기 전 전체 어절로 잽니다.
         let mut ext_words_string: Vec<String> = Vec::new();
         let mut stanza_lemmas: Option<Vec<String>> = None;
         let mut stanza_deprels: Option<Vec<String>> = None;
-        // 🌟 [POS TAG STORAGE] Stanza POS 태그를 저장하여 ACTION VERB 판정에 사용합니다.
-        //    기존에는 POS 태그를 debug_pos_log 에만 출력하고 실제 판정에는 사용하지 않았습니다.
-        //    (log2: '니트' PROPN, '가디건' NOUN 이라는 확정 정보가 코사인 경쟁에서 무시됨)
+        // 🌟 [POS TAG STORAGE] Stanza POS 태그 · 형태 자질을 ACTION VERB 판정에 씁니다.
         let mut stanza_pos_tags: Option<Vec<String>> = None;
+        let mut stanza_feats: Option<Vec<String>> = None;
         let mut stanza_negated: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut stanza_downward: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut stanza_order: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut stanza_bound: std::collections::HashSet<String> = std::collections::HashSet::new();
-        
-        let stanza_lang_code = crate::analytic::stanza_lang_code(query_lang.as_str());
 
-        let stanza_base_dir = crate::utils::get_app_dir().join("models").join("stanza");
-        let stanza_lang_dir = stanza_base_dir.join(stanza_lang_code);
-
-        if stanza_lang_dir.exists() {
-            emit_term(&format!("[STANZA] 🧠 Loading Stanza ONNX models for Search Query ('{}')...", stanza_lang_code));
-            
-            struct UnsafePipelineWrapper(crate::stanza::StanzaPipeline);
-            unsafe impl Send for UnsafePipelineWrapper {}
-            
-            let base_dir_clone = stanza_base_dir.clone();
-            let lang_code_clone = stanza_lang_code.to_string();
-            
-            // StanzaPipeline::new는 async 함수이므로 await를 호출하여 결과를 기다려야 합니다.
-            // 불필요한 OS 스레드 생성(std::thread::spawn) 및 채널을 제거하고, 현재의 비동기 런타임에서 직접 처리합니다.
-            let pipeline_res = crate::stanza::StanzaPipeline::new(base_dir_clone, &lang_code_clone)
-                .await
-                .map(UnsafePipelineWrapper);
-
-            match pipeline_res {
-                Ok(wrapper) => {
-                    let mut stanza = wrapper.0;
-                    let chars: Vec<char> = query.chars().collect();
-                    
-                    let whitespace_split: Vec<String> = query.split_whitespace().map(|s| s.to_string()).collect();
-                    let mut stanza_split: Vec<String> = Vec::new();
-
-                    // 🌟 [CRITICAL FIX] "베이지 가디건" (공백 트랙)과 "베이", "지" (형태소 트랙)을 모두 살리는 투트랙(Dual-Track) 전략!
-                    // 두 가지 방식으로 자른 단어들을 하나의 배열로 합쳐서 Plinko 윈도우에 던지면, 
-                    // NMS 배틀이 알아서 문맥(Context Score)이 더 높은 진짜 덩어리를 승자로 채택하게 됩니다.
-                    
-                    if !chars.is_empty() {
-                        let seq_len = chars.len();
-                        let mut char_ids = Vec::with_capacity(seq_len);
-                        for c in &chars {
-                            let id = if !stanza.preprocessor.tok_char_vocab.is_empty() {
-                                *stanza.preprocessor.tok_char_vocab.get(c).unwrap_or(&stanza.preprocessor.tok_char_unk_id)
-                            } else {
-                                *stanza.preprocessor.char_vocab.get(c).unwrap_or(&stanza.preprocessor.char_unk_id)
-                            };
-                            char_ids.push(id);
-                        }
-                        
-                        if let Ok(char_tensor) = ndarray::Array2::from_shape_vec((1, seq_len), char_ids) {
-                            // 🌟 [CRITICAL FIX] 모델이 요구하는 feature_dim을 직접 읽어와서 동적 생성 (한국어는 0)
-                            let mut feature_dim = 0;
-                            for input_meta in &stanza.tokenize_session.inputs {
-                                if input_meta.name == "f" || input_meta.name == "char_features" {
-                                    if let Some(&Some(d)) = input_meta.dimensions.get(2) {
-                                        feature_dim = d as usize;
-                                    }
-                                }
-                            }
-                            // 🌟 [디버깅 & 픽스] feature_dim이 0일 경우 빈 텐서가 생성되어 ONNX Runtime에서 Shape 에러가 발생할 수 있으므로 최소 1 이상의 더미 차원을 부여합니다.
-                            if feature_dim == 0 {
-                                feature_dim = 32;
-                            }
-                            
-                            let char_features = ndarray::Array3::<i64>::zeros((1, seq_len, feature_dim));
-                            let seq_lengths = ndarray::Array1::<i64>::from_vec(vec![seq_len as i64]);
-                            
-                            let mut tensor_pool = std::collections::HashMap::new();
-                            tensor_pool.insert("x", char_tensor.clone().into_dyn());
-                            tensor_pool.insert("f", char_features.clone().into_dyn());
-                            tensor_pool.insert("char_tensor", char_tensor.into_dyn());
-                            tensor_pool.insert("char_features", char_features.into_dyn());
-                            tensor_pool.insert("seq_lengths", seq_lengths.clone().into_dyn());
-                            tensor_pool.insert("l", seq_lengths.into_dyn()); // 🌟 Tokenizer 입력 'l' 추가
-                            
-                            use onnxruntime::mixed::{DynInput, SessionMixedExt};
-
-                            // 🌟 [CRITICAL FIX] E0597 & E0502 해결:
-                            // tokenize_session.inputs 와 outputs 에 대한 불변 참조(immutable borrow)를 
-                            // run_mixed 의 가변 참조(mutable borrow)와 분리하기 위해 
-                            // 문자열을 별도의 로컬 캐시(Vec<String>)로 복제하여 라이프타임을 독립시킵니다.
-                            let input_names_cache: Vec<String> = stanza.tokenize_session.inputs.iter().map(|i| i.name.clone()).collect();
-                            let mut mixed_inputs = Vec::new();
-                            
-                            for exact_name in &input_names_cache {
-                                if let Some(tensor) = tensor_pool.get(exact_name.as_str()) {
-                                    // 🌟 [핵심] f32를 요구하는 피처 텐서와 i64를 요구하는 문자 텐서를 구분하여 다이나믹 타입으로 묶어버립니다.
-                                    if exact_name == "f" || exact_name == "char_features" {
-                                        mixed_inputs.push((exact_name.as_str(), DynInput::F32(tensor.mapv(|x| x as f32))));
-                                    } else {
-                                        mixed_inputs.push((exact_name.as_str(), DynInput::I64(tensor.clone())));
-                                    }
-                                } else {
-                                    emit_term(&format!("[STANZA-WARN] Tokenizer 모델에 정의되지 않은 입력 생략: {}", exact_name));
-                                }
-                            }
-                            
-                            macro_rules! process_tok_outputs {
-                                ($outputs:expr) => {
-                                    let output_tensor = &$outputs[0];
-                                    let shape = output_tensor.shape();
-                                    let num_classes = *shape.last().unwrap() as usize;
-                                    let is_3d = shape.len() == 3;
-                                    
-                                    let mut current_word = String::new();
-                                    for i in 0..seq_len {
-                                        current_word.push(chars[i]);
-                                        
-                                        let mut max_val = std::f32::MIN;
-                                        let mut max_idx = 0;
-                                        for c_idx in 0..num_classes {
-                                            let val = if is_3d { output_tensor[[0, i, c_idx]] } else { output_tensor[[i, c_idx]] };
-                                            if val > max_val { max_val = val; max_idx = c_idx; }
-                                        }
-                                        
-                                        if max_idx > 0 || i == seq_len - 1 {
-                                            let token_str = current_word.trim().to_string();
-                                            if !token_str.is_empty() {
-                                                stanza_split.push(token_str);
-                                            }
-                                            current_word.clear();
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 🌟 [문제 해결] 핑퐁 로직을 완전히 파기하고, 자체 구현한 확장 메서드(run_mixed)를 통해 혼합 타입을 C API 직통으로 발사합니다!
-                            let out_names_cache: Vec<String> = stanza.tokenize_session.outputs.iter().map(|o| o.name.clone()).collect();
-                            let out_names: Vec<&str> = out_names_cache.iter().map(|s| s.as_str()).collect();
-                            match stanza.tokenize_session.run_mixed(mixed_inputs, out_names) {
-                                Ok(outputs) => {
-                                    emit_term("[STANZA] ✅ Tokenizer ONNX 혼합 타입(Mixed) 추론 100% 성공!");
-                                    process_tok_outputs!(outputs);
-                                },
-                                Err(e) => {
-                                    emit_term(&format!("  ⚠️ [STANZA-WARN] Tokenizer ONNX 혼합 타입 실행 실패: {:?}", e));
-                                }
+        // 12개 언어 밖(키릴 · 태국 문자 …)이면 빈 코드 → analyze_query 가 건너뜀
+        let stanza_lang_code = crate::stanza::detect_query_lang(&query, language).unwrap_or("");
+        emit_term(&format!("[STANZA] 🧠 검색어 형태 분석 ('{}')...", stanza_lang_code));
+        let stanza_res = {
+            let q = query.clone();
+            let code = stanza_lang_code.to_string();
+            tokio::task::spawn_blocking(move || crate::stanza::analyze_query(&q, &code)).await
+        };
+        match stanza_res {
+            Ok(Ok(qa)) => {
+                emit_term(&format!(
+                    "  🧠 [STANZA-POS-LOG] 검색어 형태소 분석 결과 ({}, {} ms, 단위: {}): {:?}",
+                    qa.lang,
+                    qa.elapsed_ms,
+                    if qa.whitespace_units { "공백 어절" } else { "Stanza 토큰" },
+                    qa.describe()
+                ));
+                let surfaces = qa.surfaces();
+                {
+                    let marks = crate::utils::ai_utils::qualifier_marks(&surfaces, &|_: usize| false);
+                    let copy_marks = |idx: &std::collections::HashSet<usize>, set: &mut std::collections::HashSet<String>| {
+                        for j in idx.iter() {
+                            if let Some(t) = surfaces.get(*j) {
+                                set.insert(t.clone());
                             }
                         }
+                    };
+                    copy_marks(&marks.negated, &mut stanza_negated);
+                    copy_marks(&marks.downward, &mut stanza_downward);
+                    copy_marks(&marks.ordered, &mut stanza_order);
+                    copy_marks(&marks.price_bound, &mut stanza_bound);
+                }
+                let drop_tags = crate::utils::ai_utils::STANZA_DROP_TAGS;
+                let mut dropped_log = Vec::new();
+                let mut filtered_words = Vec::new();
+                let mut filtered_lemmas = Vec::new();
+                let mut filtered_deprels = Vec::new();
+                let mut filtered_pos_tags: Vec<String> = Vec::new();
+                let mut filtered_feats: Vec<String> = Vec::new();
+                for u in qa.units.iter() {
+                    // 내용어가 하나도 없는 단위만 뺍니다 (한국어 '따뜻하게' 는 UD 상 SCONJ 지만 실질 형태소가 있어 남김)
+                    if u.functional && drop_tags.contains(&u.upos.as_str()) {
+                        dropped_log.push(format!("{}({})", u.surface, u.upos));
+                        continue;
                     }
-
-                    // 🌟 단일 트랙 병합 로직 (Single-Track Merge)
-                    // Dual-Track 배열 이어붙이기는 NMS Battle에서 인덱스 좌표계를 파괴하여(1번 트랙과 2번 트랙이 겹치지 않는 별개의 문장으로 인식됨)
-                    // 문장이 두 번 반복되거나 "이", "벤트로" 같은 파편이 결과에 중복 결합되는 치명적 버그를 유발합니다.
-                    // 임베딩 모델이 자체 서브워드 토크나이저를 내장하고 있으므로, 어절(공백) 단위 분할인 whitespace_split을 기준으로 
-                    // Stanza의 POS/Lemma 필터링만 적용하는 것이 가장 정확합니다.
-                    if stanza_split.is_empty() {
-                        ext_words_string = whitespace_split;
-                    } else if whitespace_split == stanza_split {
-                        ext_words_string = whitespace_split;
-                        emit_term("  💡 [STANZA-INFO] 공백 분할과 Tokenizer 분할 결과가 동일하여 단일 트랙으로 진행합니다.");
-                    } else {
-                        emit_term("  💡 [STANZA-INFO] Stanza 토크나이저의 과잉 분할(예: 이벤트로 -> 이+벤트로) 방지 및 NMS 좌표계 보호를 위해 공백 분할(Whitespace)을 메인 트랙으로 사용합니다.");
-                        ext_words_string = whitespace_split;
-                    }
-
-                    // 🌟 [STANZA POS 사전 필터링 & 로그 출력]
-                    // "찾아줘", "알려줘" 등 무의미한 동사(VERB), 조사(ADP) 등을 Plinko 벡터 매칭 전에 원천 차단합니다.
-                    if !ext_words_string.is_empty() {
-                        let ext_words_refs: Vec<&str> = ext_words_string.iter().map(|s| s.as_str()).collect();
-                        let mut chunk_size = ext_words_refs.len();
-                        
-                        for input_meta in &stanza.pos_session.inputs {
-                            let dims = &input_meta.dimensions;
-                            if dims.len() == 2 && dims.get(1) == Some(&Some(32)) {
-                                if let Some(&Some(fixed_seq)) = dims.get(0) {
-                                    chunk_size = fixed_seq as usize;
-                                }
-                            }
-                        }
-                        if chunk_size == 0 { chunk_size = ext_words_refs.len(); }
-
-                        let mut padded_chunk = ext_words_refs.clone();
-                        let valid_len = padded_chunk.len();
-                        while padded_chunk.len() < chunk_size {
-                            padded_chunk.push("<pad>");
-                        }
-
-                        match stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.pos_session, None, None) {
-                            Ok(pos_inputs) => {
-                                match stanza.pos_session.run::<'_, '_, '_, i64, f32, _>(pos_inputs) {
-                                    Ok(pos_outputs) => {
-                                        let output_tensor = &pos_outputs[0];
-                                        let shape = output_tensor.shape();
-                                        let mut pos_tags = Vec::new();
-                                        let mut pos_ids = Vec::new(); // 🌟 Lemma 전달용 POS ID 수집 배열 추가
-
-                                        let num_classes = if shape.len() == 3 { shape[2] as usize } else { shape[1] as usize };
-                                        for i in 0..valid_len {
-                                            let mut max_val = std::f32::MIN;
-                                            let mut max_idx = 0;
-                                            for c in 0..num_classes {
-                                                let val = if shape.len() == 3 { output_tensor[[0, i, c]] } else { output_tensor[[i, c]] };
-                                                if val > max_val { max_val = val; max_idx = c; }
-                                            }
-                                            let tag = stanza.preprocessor.upos_vocab.get(max_idx as usize).map(|s| s.as_str()).unwrap_or("X");
-                                            pos_tags.push(tag);
-                                            pos_ids.push(max_idx as i64); // 🌟 산출된 POS 태그의 Index ID 보존
-                                        }
-
-                                        // 🌟 [로그 추가] 형태소 분석 결과 전체 로그 출력
-                                        let mut debug_pos_log = Vec::new();
-                                        let drop_tags = crate::utils::ai_utils::STANZA_DROP_TAGS;
-                                        // 🌟 [POS RELIABILITY] 태그를 믿을 수 없으면 낱말을 지우지 않습니다. 'cat' 이 PART, 'skin' 이 ADP 로 나와
-                                        //    'products for looking after dry skin' 이 'for' 만 남았습니다.
-                                        let pos_reliable = stanza.preprocessor.pos_reliable;
-                                        let mut dropped_log = Vec::new();
-                                        let mut filtered_words = Vec::new();
-
-                                        // 🌟 [수정] 한글 하드코딩 배열을 제거하고 Stanza의 lemma_session을 직접 사용하여 동적으로 커팅합니다.
-                                        let mut lemma_words: Vec<String> = vec![String::new(); valid_len];
-                                        if let Ok(lemma_inputs) = stanza.preprocessor.encode_to_tensor(&padded_chunk, &stanza.lemma_session, Some(&pos_ids), None) { // 🌟 수집된 pos_ids 전달
-                                            if let Ok(lemma_outputs) = stanza.lemma_session.run::<'_, '_, '_, i64, f32, _>(lemma_inputs) {
-                                                let output_tensor = &lemma_outputs[0];
-                                                let shape = output_tensor.shape();
-                                                
-                                                if shape.len() == 3 || shape.len() == 4 {
-                                                    let is_4d = shape.len() == 4;
-                                                    let max_char_len = if is_4d { shape[2] as usize } else { shape[1] as usize };
-                                                    let num_classes = if is_4d { shape[3] as usize } else { shape[2] as usize };
-                                                    
-                                                    for i in 0..valid_len {
-                                                        let mut lemma_str = String::new();
-                                                        for j in 0..max_char_len {
-                                                            let mut max_val = std::f32::MIN;
-                                                            let mut max_idx = 0;
-                                                            for c in 0..num_classes {
-                                                                let val = if is_4d { output_tensor[[0, i, j, c]] } else { output_tensor[[i, j, c]] };
-                                                                if val > max_val { max_val = val; max_idx = c; }
-                                                            }
-                                                            if let Some(&ch) = stanza.preprocessor.id_to_char.get(&(max_idx as i64)) {
-                                                                // 패딩이나 특수 토큰('<', '>')은 제외하고 실제 문자만 조합
-                                                                if ch != '<' && ch != '>' && ch != '_' {
-                                                                    lemma_str.push(ch);
-                                                                }
-                                                            }
-                                                        }
-                                                        lemma_words[i] = lemma_str.trim().to_string();
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        let depparse_opt = if pos_reliable {
-                                            crate::utils::ai_utils::run_depparse_deprels(&stanza.preprocessor, &mut stanza.depparse_session, &padded_chunk, &pos_ids)
-                                        } else {
-                                            None
-                                        };
-                                        let mut filtered_lemmas = Vec::new();
-                                        let mut filtered_deprels = Vec::new();
-                                        // 🌟 [POS TAG COLLECT] 필터링을 통과한 단어의 POS 태그를 함께 수집합니다.
-                                        let mut filtered_pos_tags: Vec<String> = Vec::new();
-                                        {
-                                            let marks = crate::utils::ai_utils::qualifier_marks(&ext_words_string, &|_: usize| false);
-                                            let copy_marks = |idx: &std::collections::HashSet<usize>, set: &mut std::collections::HashSet<String>| {
-                                                for j in idx.iter() {
-                                                    if let Some(t) = ext_words_string.get(*j) {
-                                                        set.insert(t.clone());
-                                                    }
-                                                }
-                                            };
-                                            copy_marks(&marks.negated, &mut stanza_negated);
-                                            copy_marks(&marks.downward, &mut stanza_downward);
-                                            copy_marks(&marks.ordered, &mut stanza_order);
-                                            copy_marks(&marks.price_bound, &mut stanza_bound);
-                                        }
-                                        for (i, word) in ext_words_string.iter().enumerate() {
-                                            let tag = if pos_reliable { pos_tags[i] } else { "" };
-                                            let lemma = if !pos_reliable {
-                                                String::new()
-                                            } else if let Some(l) = lemma_words.get(i) {
-                                                l.clone()
-                                            } else {
-                                                String::new()
-                                            };
-                                            
-                                            debug_pos_log.push(format!("{}(tag:{}, lemma:{})", word, tag, lemma));
-                                            
-                                            // 1차: 기본 품사(동사, 조사 등) 드롭
-                                            if drop_tags.contains(&tag) {
-                                                dropped_log.push(format!("{}({})", word, tag));
-                                                continue;
-                                            }
-
-                                            let mut clean_word = word.clone();
-                                            let mut is_stripped = false;
-
-                                            // 2차: Stanza 모델에서 도출된 Lemma를 있는 그대로 활용하여 한 덩어리로 묶인 꼬리 자르기
-                                            // 형태소 분석기가 실패해서 "가디건찾아줘"가 한 단어로 들어왔을 때, 
-                                            // Lemma가 "찾아줘" 혹은 "찾다" 등으로 도출되면 해당 문자열을 찾아 정확하게 도려냅니다.
-                                            if !lemma.is_empty() && word.ends_with(&lemma) && word.len() > lemma.len() {
-                                                let new_len = word.len() - lemma.len();
-                                                clean_word = word[..new_len].to_string();
-                                                is_stripped = true;
-                                            } else if !lemma.is_empty() && word.contains(&lemma) && word.len() > lemma.len() {
-                                                if let Some(idx) = word.rfind(&lemma) {
-                                                    if idx >= 3 { // 최소 1글자(UTF-8 3바이트 이상) 보장하여 명사 원형 보호
-                                                        clean_word = word[..idx].to_string();
-                                                        is_stripped = true;
-                                                    }
-                                                }
-                                            }
-
-                                            if is_stripped {
-                                                dropped_log.push(format!("{}(Lemma-Stripped->{})", word, clean_word));
-                                            }
-
-                                            if !clean_word.trim().is_empty() {
-                                                filtered_words.push(clean_word);
-                                                filtered_lemmas.push(lemma.clone());
-                                                // 🌟 [POS TAG COLLECT] 이 단어의 POS 태그를 저장합니다.
-                                                //    drop_tags 로 걸러지지 않은 단어만 여기에 도달하므로
-                                                //    filtered_words 와 filtered_pos_tags 는 항상 같은 길이입니다.
-                                                filtered_pos_tags.push(tag.to_string());
-                                                if let Some(ref d) = depparse_opt {
-                                                    if i < d.len() {
-                                                        filtered_deprels.push(d[i].clone());
-                                                    } else {
-                                                        filtered_deprels.push(String::new());
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        
-                                        emit_term(&format!("  🧠 [STANZA-POS-LOG] 검색어 형태소 분석 결과: {:?}", debug_pos_log));
-
-                                        if !dropped_log.is_empty() {
-                                            emit_term(&format!("  ✂️ [STANZA-SEARCH-POS] 검색어에서 무의미한 단어 사전 제거 완료: {:?}", dropped_log));
-                                        }
-                                        
-                                        // 🌟 필터링 결과가 전부 다 날아가버리면 원본을 유지 (과잉 삭제로 인한 크래시 방어)
-                                        if !filtered_words.is_empty() {
-                                            ext_words_string = filtered_words;
-                                            stanza_lemmas = Some(filtered_lemmas);
-                                            // 🌟 [POS TAG STORE] POS 태그를 저장합니다.
-                                            stanza_pos_tags = Some(filtered_pos_tags);
-                                            if depparse_opt.is_some() {
-                                                stanza_deprels = Some(filtered_deprels);
-                                            }
-                                        }
-                                    },
-                                    Err(e) => {
-                                        emit_term(&format!("  ⚠️ [STANZA-POS-ERROR] POS session run failed: {:?}", e));
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                emit_term(&format!("  ⚠️ [STANZA-POS-ERROR] POS encode_to_tensor failed: {:?}", e));
-                            }
-                        }
-                    }
-                },
-                Err(e) => {
-                    emit_term(&format!("[STANZA] ⚠️ Failed to load Stanza models for '{}' (상세 원인): {:?}", stanza_lang_code, e));
+                    filtered_words.push(u.surface.clone());
+                    filtered_lemmas.push(u.stem.clone());
+                    filtered_deprels.push(u.deprel.clone());
+                    filtered_pos_tags.push(u.upos.clone());
+                    filtered_feats.push(u.feats.clone());
+                }
+                if !dropped_log.is_empty() {
+                    emit_term(&format!("  ✂️ [STANZA-SEARCH-POS] 검색어에서 기능어 품사 어절 제거: {:?}", dropped_log));
+                }
+                if filtered_words.is_empty() {
+                    // 🌟 전부 기능어로 나오면 단위를 그대로 씁니다 (과잉 삭제 방어)
+                    ext_words_string = surfaces;
+                } else {
+                    ext_words_string = filtered_words;
+                    stanza_lemmas = Some(filtered_lemmas);
+                    stanza_deprels = Some(filtered_deprels);
+                    stanza_pos_tags = Some(filtered_pos_tags);
+                    stanza_feats = Some(filtered_feats);
                 }
             }
-        } else {
-            emit_term(&format!("[STANZA] ⚠️ Stanza model directory not found: {:?}. Falling back to whitespace splitting.", stanza_lang_dir));
+            Ok(Err(e)) => {
+                emit_term(&format!("[STANZA] ⚠️ 형태 분석을 건너뜁니다 ('{}'): {:#}. 공백 분할로 진행합니다.", stanza_lang_code, e));
+            }
+            Err(e) => {
+                emit_term(&format!("[STANZA] ⚠️ 형태 분석 작업이 끝나지 않았습니다 ('{}'): {}. 공백 분할로 진행합니다.", stanza_lang_code, e));
+            }
         }
         // 🌟 [WORD-POS MAP] ext_words_string 의 각 단어에 대응하는 POS 태그를
         //    HashMap 으로 구축합니다. PLINKO 루프의 words 는 current_text.split_whitespace()
@@ -550,6 +272,18 @@ impl crate::model::LogisModel {
                 for (i, w) in ext_words_string.iter().enumerate() {
                     if let Some(tag) = tags.get(i) {
                         m.insert(w.clone(), tag.clone());
+                    }
+                }
+            }
+            m
+        };
+
+        let word_feats_map: std::collections::HashMap<String, String> = {
+            let mut m = std::collections::HashMap::new();
+            if let Some(ref feats) = stanza_feats {
+                for (i, w) in ext_words_string.iter().enumerate() {
+                    if let Some(f) = feats.get(i) {
+                        m.insert(w.clone(), f.clone());
                     }
                 }
             }
@@ -2097,9 +1831,9 @@ impl crate::model::LogisModel {
                     //    Stanza POS 태그를 1차 판정으로 사용하고, 코사인 경쟁은 폴백으로만 동작합니다.
                     //
                     //    판정 규칙:
-                    //    ① POS = VERB / AUX
+                    //    ① POS = AUX 또는 명령형(Mood=Imp) VERB
                     //       → ACTION VERB 확정. 코사인 불필요.
-                    //       Stanza 가 용언으로 판정한 단어는 구조적으로 명령어/서술어입니다.
+                    //       그 밖의 VERB 는 명령어 뱅크가 경쟁 뱅크를 이길 때만 (내용 동사는 값일 수 있음).
                     //
                     //    ② POS = NOUN / PROPN / ADJ / NUM
                     //       → 원칙적으로 ACTION VERB 아님.
@@ -2114,11 +1848,17 @@ impl crate::model::LogisModel {
                     //       → 코사인 폴백 (기존 4중 역검증 결과 사용).
                     //       이 경우에도 action_sim > rival_max 조건 유지.
                     let word_pos = word_pos_map.get(word).map(|s| s.as_str()).unwrap_or("");
+                    let word_feats = word_feats_map.get(word).map(|s| s.as_str()).unwrap_or("");
                     let is_action_verb = if word == "|" || word_has_digit {
                         false
                     } else {
                         match word_pos {
-                            "VERB" | "AUX" => true,
+                            // 명령형 동사('find' · 'zeig' · 'busca' · 'trouve')는 검색 명령어입니다.
+                            "VERB" if word_feats.split('|').any(|f| f == "Mood=Imp") => true,
+                            "AUX" => true,
+                            // 품사가 맞게 나오면서 'cancelled' · 'expiring' · '식히는' 같은 내용 동사도 VERB 입니다. 상태 · 용도 값일 수 있어
+                            // 명령어 뱅크가 경쟁 뱅크를 이길 때만 명령어로 봅니다 ('찾아줘' 처럼 한국어 명령 어미는 자질이 없음).
+                            "VERB" => action_sim > rival_max,
                             // 품사를 모를 때도 값 명사와 같은 기준을 씁니다. 동률에 가까운 '식히는' · '충전하는' 을 명령어로 지우면 안 됩니다.
                             "NOUN" | "PROPN" | "ADJ" | "NUM" | "" => {
                                 action_sim > rival_max && action_sim > rival_max * 1.10

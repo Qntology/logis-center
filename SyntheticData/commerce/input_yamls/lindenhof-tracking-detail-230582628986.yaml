@@ -1,0 +1,30 @@
+page_id: lindenhof-tracking-detail-230582628986
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/shipping/view?id=230582628986
+page_type: tracking
+layout: detail
+fields:
+  id,link: '230582628986'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Kuppelzelt für zwei Personen
+  shipping_date: '2026-05-28'
+  recipient_name: Sophie Wolf
+  registration_date: '2026-05-25'
+  sender_name: Lindenhof Handels GmbH
+  sender_address: Hafenstraße 18, 20457 Hamburg
+  sender_phone: +49 40 5550 1842
+  recipient_address: Bahnhofstraße 171, 04109 Leipzig
+  recipient_phone: +49 180 39302128
+  weight: 3.9
+  width: 37
+  height: 36
+  length: 32
+  shipping_method: Standardversand
+  shipping_duration: 1
+  shipping_fee: 0.0
+title: Sendungsdetails

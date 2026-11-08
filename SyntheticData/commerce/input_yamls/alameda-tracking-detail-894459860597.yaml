@@ -1,0 +1,30 @@
+page_id: alameda-tracking-detail-894459860597
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/shipments/894459860597
+page_type: tracking
+layout: detail
+fields:
+  id,link: '894459860597'
+  carrier: Paquetería Veloz
+  status: Enviado
+  title: Bloques de construcción de madera
+  shipping_date: '2026-05-31'
+  recipient_name: Álvaro Moreno
+  registration_date: '2026-05-29'
+  sender_name: Alameda Comercio S.L.
+  sender_address: Calle del Olmo 24, 28012 Madrid
+  sender_phone: +34 910 555 142
+  recipient_address: Paseo de las Acacias 10, 41004 Sevilla
+  recipient_phone: +34 640 646 912
+  weight: 7.1
+  width: 52
+  height: 23
+  length: 24
+  shipping_method: Envío de carga
+  shipping_duration: 4
+  shipping_fee: 2.05
+title: Detalle del envío

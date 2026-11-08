@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: ar
+document_title: فاتورة تجارية
+metadata:
+  invoice_number: CI-SA-2610-806
+  issue_date: '2026-10-01'
+  reference_po_number: PO-SA-12044
+  related_bl_number: BL-SA92992380
+  related_lc_number: LC-SA7357768
+  currency: USD
+parties:
+  shipper_exporter:
+    name: شركة الواحة للبتروكيماويات
+    address: شارع الصناعة 12، الجبيل الصناعية 35514، المملكة العربية السعودية
+    contact_number: +966 13 555 0142
+    tax_id: '300456789100003'
+  consignee:
+    name: Seorin Polymer Co., Ltd.
+    address: 19 Yeosusandan-ro، يوسو، كوريا الجنوبية
+    contact_number: +82 61 555 0146
+    tax_id: 417-81-52063
+shipping_details:
+  port_of_loading: الجبيل، المملكة العربية السعودية
+  port_of_discharge: يوسو، كوريا الجنوبية
+  vessel_flight: AL JUBAIL PEARL V.044E
+  incoterms: CFR Yeosu
+line_items:
+- item_code: HDPE-5502
+  description: حبيبات بولي إيثيلين عالي الكثافة
+  quantity: 400
+  unit: طن
+  unit_price: 1150.0
+  total_amount: 460000.0
+  hs_code: '3901.20'
+- item_code: PP-H030
+  description: حبيبات بولي بروبيلين متجانس
+  quantity: 200
+  unit: طن
+  unit_price: 1080.0
+  total_amount: 216000.0
+  hs_code: '3902.10'
+summary:
+  total_quantity: 600
+  total_items_amount: 676000.0
+  freight_charge: 33800.0
+  insurance: 0.0
+  grand_total_amount: 709800.0

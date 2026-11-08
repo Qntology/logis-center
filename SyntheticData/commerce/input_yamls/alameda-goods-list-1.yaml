@@ -1,0 +1,111 @@
+page_id: alameda-goods-list-1
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/products?page=1
+page_type: goods
+layout: list
+items:
+- id,link: ES10037
+  title: Auriculares inalámbricos con cancelación de ruido
+  status: Activo
+  category: Electrónica
+  sale_price: 89.25
+  quantity: 7
+  registration_date: '2026-07-20'
+  brand_name: 솔빛
+- id,link: ES10074
+  title: Caja organizadora de cables
+  status: Borrador
+  category: Oficina
+  sale_price: 10.85
+  compare_at_price: 13.02
+  quantity: 42
+  registration_date: '2026-04-24'
+  brand_name: 솔빛
+- id,link: ES10111
+  title: Juego de cocina portátil
+  status: Borrador
+  category: Aire libre
+  sale_price: 29.1
+  compare_at_price: 34.92
+  quantity: 120
+  registration_date: '2026-06-21'
+  brand_name: Oakfern
+- id,link: ES10148
+  title: Calentador de manos recargable
+  status: Activo
+  category: Hogar
+  sale_price: 16.75
+  quantity: 7
+  registration_date: '2026-04-19'
+  brand_name: Marlow & Finch
+- id,link: ES10185
+  title: Bastones de trekking plegables
+  status: Activo
+  category: Aire libre
+  sale_price: 33.65
+  quantity: 7
+  registration_date: '2026-07-25'
+  brand_name: 하람
+- id,link: ES10222
+  title: Sudadera con cremallera forrada de polar
+  status: Borrador
+  category: Ropa
+  sale_price: 36.05
+  compare_at_price: 43.26
+  quantity: 42
+  registration_date: '2026-06-17'
+  brand_name: Marlow & Finch
+- id,link: ES10259
+  title: Manta de microfibra
+  status: Activo
+  category: Hogar
+  sale_price: 16.05
+  quantity: 350
+  registration_date: '2026-07-11'
+  brand_name: 하람
+- id,link: ES10296
+  title: Zumo de mandarina de Jeju
+  status: Activo
+  category: Alimentación
+  sale_price: 11.85
+  quantity: 120
+  registration_date: '2026-03-14'
+  brand_name: Oakfern
+- id,link: ES10333
+  title: Kit de robot de programación
+  status: Activo
+  category: Juguetes
+  sale_price: 50.6
+  quantity: 96
+  registration_date: '2026-04-14'
+  brand_name: 다온랩
+- id,link: ES10370
+  title: Vaso térmico al vacío
+  status: Borrador
+  category: Cocina
+  sale_price: 15.25
+  quantity: 42
+  registration_date: '2026-02-28'
+  brand_name: Tidewell
+- id,link: ES10407
+  title: Arnés para perro
+  status: Activo
+  category: Mascotas
+  sale_price: 16.05
+  quantity: 7
+  registration_date: '2026-02-07'
+  brand_name: 마루공방
+- id,link: ES10444
+  title: Juego de recipientes herméticos de vidrio
+  status: Activo
+  category: Cocina
+  sale_price: 21.25
+  compare_at_price: 25.5
+  quantity: 18
+  registration_date: '2026-08-18'
+  brand_name: Kestrel Lane
+title: Productos

@@ -1,0 +1,114 @@
+page_id: tilleuls-goods-list-1
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/goods/list?page=1
+page_type: goods
+layout: list
+items:
+- id,link: FR10037
+  title: Distributeur de croquettes automatique
+  status: En vente
+  category: Animaux
+  sale_price: 54.55
+  quantity: 120
+  registration_date: '2026-06-04'
+  brand_name: 마루공방
+- id,link: FR10074
+  title: Chauffe-mains rechargeable
+  status: En vente
+  category: Maison
+  sale_price: 14.15
+  quantity: 96
+  registration_date: '2026-07-11'
+  brand_name: 솔빛
+- id,link: FR10111
+  title: Sandales aérées
+  status: Brouillon
+  category: Vêtements
+  sale_price: 22.5
+  compare_at_price: 27.0
+  quantity: 7
+  registration_date: '2026-08-17'
+  brand_name: 다온랩
+- id,link: FR10148
+  title: Lapin en peluche
+  status: Brouillon
+  category: Jouets
+  sale_price: 15.15
+  compare_at_price: 18.18
+  quantity: 18
+  registration_date: '2026-02-03'
+  brand_name: Marlow & Finch
+- id,link: FR10185
+  title: Trottinette pour enfant
+  status: Épuisé
+  category: Jouets
+  sale_price: 47.05
+  compare_at_price: 56.46
+  quantity: 0
+  registration_date: '2026-04-20'
+  brand_name: 다온랩
+- id,link: FR10222
+  title: Gobelet isotherme sous vide
+  status: En vente
+  category: Cuisine
+  sale_price: 15.85
+  compare_at_price: 19.02
+  quantity: 120
+  registration_date: '2026-01-29'
+  brand_name: Tidewell
+- id,link: FR10259
+  title: Tente dôme deux places
+  status: Épuisé
+  category: Plein air
+  sale_price: 96.7
+  compare_at_price: 116.04
+  quantity: 0
+  registration_date: '2026-06-20'
+  brand_name: Tidewell
+- id,link: FR10296
+  title: Granola bio
+  status: Épuisé
+  category: Épicerie
+  sale_price: 10.4
+  quantity: 0
+  registration_date: '2026-05-31'
+  brand_name: 하람
+- id,link: FR10333
+  title: Lanterne LED rechargeable
+  status: En vente
+  category: Plein air
+  sale_price: 20.9
+  compare_at_price: 25.08
+  quantity: 3
+  registration_date: '2026-02-20'
+  brand_name: 누리온
+- id,link: FR10370
+  title: Chaise de camping légère
+  status: Épuisé
+  category: Plein air
+  sale_price: 26.85
+  quantity: 0
+  registration_date: '2026-08-13'
+  brand_name: Tidewell
+- id,link: FR10407
+  title: Set d'ustensiles en silicone
+  status: Brouillon
+  category: Cuisine
+  sale_price: 20.4
+  compare_at_price: 24.48
+  quantity: 42
+  registration_date: '2026-05-16'
+  brand_name: Marlow & Finch
+- id,link: FR10444
+  title: Chargeur rapide 65 W
+  status: En vente
+  category: Électronique
+  sale_price: 25.7
+  quantity: 350
+  registration_date: '2026-03-31'
+  brand_name: Marlow & Finch
+title: Produits

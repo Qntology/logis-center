@@ -1,0 +1,30 @@
+page_id: sakura-goods-detail-JP10111
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/goods/view?id=JP10111
+page_type: goods
+layout: detail
+fields:
+  id,link: JP10111
+  title: リネン半袖シャツ
+  status: 販売中
+  category: ファッション
+  sale_price: 5050
+  quantity: 96
+  registration_date: '2026-03-10'
+  brand_name: 마루공방
+  code: JP-HOT-103
+  stock_keeping_unit: JPHO1003
+  model_name: HO-169
+  manufacturer: Tidewell Supply
+  origin_country: マレーシア
+  color: ボルドー
+  barcode: '8825643897130'
+  supply_price: 2943
+  low_stock_threshold: 5
+  shipping_fee: 330
+  description: 通気性のよいリネンで、汗をかいても肌に張り付きません。
+title: 商品詳細

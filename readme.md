@@ -197,16 +197,14 @@ cron-logis-center/
 │   └── runtime-q4km/               # Generated locally on first use
 │       ├── model-q4km.gguf         # Q4_K_M runtime weights
 │       └── READY                   # Conversion recipe key (re-converts if it changes)
-└── stanza/                          # NLP Pipeline
-├── ko/
-│   ├── vocab.json
-│   ├── tokenizer.onnx
-│   ├── pos.onnx
-│   ├── lemma.onnx
-│   └── depparse.onnx
-├── en/
-├── ja/
-└── zh-hans/
+└── stanza/                          # NLP Pipeline (stanza-onnx-export format 2, 12 languages)
+    ├── en/ de/ es/ fr/ it/ pt/ nl/ cs/ ar/ ko/ ja/ zh-hans/
+    │   ├── vocab.json               # "format": 2, "files" lists every file below for this language
+    │   ├── tokenizer.onnx · pos.onnx · depparse.onnx
+    │   ├── lemma_encoder.onnx · lemma_decoder.onnx · lemma_dict.json · pretrain_vocab.json
+    │   ├── mwt_encoder.onnx · mwt_decoder.onnx · mwt_dict.json   # MWT languages (en: mwt_classifier.onnx)
+    │   └── tokenize_lexicon.json    # ja · zh-hans tokenizer dictionary features
+    └── <lang>.format1/              # previous (format 1) export, moved aside by the downloader
 
 ```
 
@@ -223,7 +221,7 @@ cron-logis-center/
 | **AlphaEdge Qwen3.5-4B-{code}** | ~7.9GB download → Q4_K_M runtime | Language-specialized transliteration, list/detail synthesis and field extraction for non-Latin documents | On demand (routed) |
 | **granite-embedding-97m** | ~380MB | 384-dimensional multilingual embeddings (vector search) | Indexing/Search |
 | **SigLIP2** | ~2.2GB | Vision patch × text anchor cosine (Heatmap) | Trade documents |
-| **Stanza** | ~50MB/lang | Tokenization, POS, Lemma, Dependency syntax | Transliteration preprocessing |
+| **Stanza** | 0.3–0.8GB/lang (CPU, ONNX Runtime) | Tokenization, MWT, POS, Lemma, Dependency syntax (12 languages) | Search query analysis (commerce · trade · analytics) |
 
 ### Inference Pipeline Flow
 
@@ -556,6 +554,17 @@ npm test
 
 Base models are downloaded from the Settings tab upon first launch.
 For manual downloads, place them in the [Model File Paths](#model-file-paths) directory specified above.
+
+Stanza models are the format 2 export of [stanza-onnx-export](https://github.com/Qntology/stanza-onnx-export) (`onnx_final/<lang>/`), verified end to end
+(raw text → tokens → MWT → POS → lemma → dependencies) against PyTorch Stanza for all 12 languages. The downloader reads `vocab.json` from
+`huggingface.co/Qntology/stanza-<lang>` first and fetches the files it lists; a format 1 repository is reported as an error instead of being installed.
+`LOGIS_STANZA_DIR=<folder>` makes the app read `<folder>/<lang>/` instead of the app data folder (evaluation, development).
+
+### Domain Dictionary (`bias.json` / `full_bias.json`)
+
+Debug builds (`tauri dev`, `cargo test`) embed `src/utils/bias.json` (shared sections + Korean / English). Release builds (`tauri build`) embed
+`src/utils/full_bias.json` (the same shared sections + every language section). Enable the `full-bias` Cargo feature to embed the full dictionary
+in a debug build. `tests/it/bias_source.rs` checks that the shared sections of the two files stay identical.
 
 AlphaEdge Qwen3.5-4B language models are **not** part of the initial download. They are fetched automatically in the background the first time a non-Latin document language needs them (about 7.9GB per language), then converted to `runtime-q4km/model-q4km.gguf`. To pre-install manually, download `alphaedge-ai/Qwen3.5-4B-{code}-16384` into `{AppData}/logis-center/models/Qwen3.5-4B-{code}-16384/`; the GGUF conversion runs on first use.
 

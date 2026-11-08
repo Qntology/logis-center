@@ -1,0 +1,30 @@
+page_id: dekade-tracking-detail-674240535101
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/shipping/view?id=674240535101
+page_type: tracking
+layout: detail
+fields:
+  id,link: '674240535101'
+  carrier: Polderkoerier
+  status: Bezorgd
+  title: Set luchtdichte glazen bakjes
+  shipping_date: '2026-04-24'
+  recipient_name: Iris Mulder
+  registration_date: '2026-04-21'
+  sender_name: De Kade Handel B.V.
+  sender_address: Kadestraat 18, 3512 AB Utrecht
+  sender_phone: +31 30 555 0142
+  recipient_address: Lindelaan 61, 3011 AD Rotterdam
+  recipient_phone: +31 6 7155 9365
+  weight: 6.8
+  width: 43
+  height: 41
+  length: 34
+  shipping_method: Standaard
+  shipping_duration: 3
+  shipping_fee: 2.05
+title: Zendinggegevens

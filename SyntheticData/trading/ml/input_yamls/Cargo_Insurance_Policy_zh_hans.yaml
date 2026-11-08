@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: zh-hans
+document_title: 货物运输保险单
+metadata:
+  policy_number: IP-CN-653275
+  issue_date: '2026-10-04'
+  effective_date: '2026-10-05'
+  related_invoice_number: CI-CN-2610-722
+  related_bl_number: BL-CN22569071
+  related_lc_number: LC-CN8832551
+  related_po_number: PO-CN-19966
+parties:
+  insurer:
+    name: 海星财产保险股份有限公司
+    address: 浙江省宁波市江北区海星大道66号
+  insured:
+    name: Sinhan Battery Co., Ltd.
+    address: 45 Saneop-ro, Heungdeok-gu, Cheongju, 韩国
+coverage_details:
+  sum_insured: 1040160.0
+  currency: USD
+  valuation_basis: 发票金额加成10%
+  coverage_conditions: 协会货物条款（A）一切险
+  premium_amount: 2600.4
+  claims_payable_at: 釜山，韩国
+transport_details:
+  vessel_flight: HAI XING V.903E
+  port_of_loading: 宁波，中国
+  port_of_discharge: 釜山，韩国
+cargo_details:
+- mark_and_numbers: SINHAN / CHEONGJU / MADE IN CHINA
+  description_of_goods: 磷酸铁锂电池模组及电池管理系统控制板
+  number_of_packages: 56托
+  gross_weight_kg: 20360.0

@@ -1,0 +1,27 @@
+page_id: alameda-order-detail-20260416-100159
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/orders/20260416-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260416-100159
+  registration_date: '2026-04-16'
+  status: Pendiente de pago
+  goods: Bloques de construcción de madera
+  sender_name: Sofía Torres
+  recipient_name: Sofía Torres
+  quantity: 3
+  amount: 77.75
+  shipping_fee: 0.0
+  payment_method: Transferencia bancaria
+  sender_phone: +34 646 956 695
+  sender_address: Calle Real 34, 46002 Valencia
+  recipient_phone: +34 646 956 695
+  recipient_address: Calle Real 34, 46002 Valencia
+  payment_origin: PagoPuente
+  bank: Banco Alameda
+title: Detalle del pedido

@@ -1,0 +1,28 @@
+page_id: ribeira-order-detail-20260401-100159
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/orders/20260401-100159
+page_type: order
+layout: detail
+fields:
+  id,link: 20260401-100159
+  registration_date: '2026-04-01'
+  status: Cancelado
+  goods: Frigideira de aço inoxidável
+  sender_name: Rafael Rodrigues
+  recipient_name: Rafael Rodrigues
+  quantity: 5
+  amount: 185.25
+  shipping_fee: 0.0
+  payment_method: Cartão de crédito
+  sender_phone: +351 922 879 507
+  sender_address: Rua das Oliveiras, 77, 3000-123 Coimbra
+  recipient_phone: +351 922 879 507
+  recipient_address: Rua das Oliveiras, 77, 3000-123 Coimbra
+  payment_origin: Caixa Rápida
+  payment_date: '2026-04-01'
+  card: Cartão Ribeira
+title: Detalhes da encomenda

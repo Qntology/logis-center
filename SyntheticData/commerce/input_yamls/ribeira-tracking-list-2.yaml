@@ -1,0 +1,83 @@
+page_id: ribeira-tracking-list-2
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/shipments?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '861227573677'
+  carrier: Expresso Douro
+  status: Entregue
+  title: Casaco de pelo sherpa
+  shipping_date: '2026-06-14'
+  recipient_name: Carolina Martins
+- id,link: '646321156157'
+  carrier: Expresso Douro
+  status: Enviado
+  title: Coluna Bluetooth à prova de água
+  shipping_date: '2026-06-21'
+  recipient_name: Diogo Pereira
+- id,link: '707505842788'
+  carrier: Correio Ligeiro
+  status: Entregue
+  title: Trotinete infantil
+  shipping_date: '2026-05-27'
+  recipient_name: Diogo Oliveira
+- id,link: '564930720580'
+  carrier: Encomendas Ribeira
+  status: Entregue
+  title: Conjunto de utensílios de silicone
+  shipping_date: '2026-07-09'
+  recipient_name: João Oliveira
+- id,link: '942042628306'
+  carrier: Transportes Atlântico
+  status: Entregue
+  title: Manta de microfibra
+  shipping_date: '2026-09-18'
+  recipient_name: Carolina Martins
+- id,link: '594097828143'
+  carrier: Transportes Atlântico
+  status: Entregue
+  title: Essência reparadora para cabelo
+  shipping_date: '2026-06-18'
+  recipient_name: Sofia Costa
+- id,link: '601580196890'
+  carrier: Correio Ligeiro
+  status: Entregue
+  title: Suporte para portátil
+  shipping_date: '2026-08-10'
+  recipient_name: Miguel Fernandes
+- id,link: '870467039833'
+  carrier: Transportes Atlântico
+  status: Entregue
+  title: Colete acolchoado leve
+  shipping_date: '2026-08-17'
+  recipient_name: Rodrigo Rodrigues
+- id,link: '783444228219'
+  carrier: Correio Ligeiro
+  status: Devolvido
+  title: Trotinete infantil
+  shipping_date: '2026-10-02'
+  recipient_name: Diogo Fernandes
+- id,link: '608464624822'
+  carrier: Encomendas Ribeira
+  status: Enviado
+  title: Estaladiços de arroz integral tostado
+  shipping_date: '2026-05-15'
+  recipient_name: Diogo Pereira
+- id,link: '807540460127'
+  carrier: Expresso Douro
+  status: Enviado
+  title: Aquecedor de mãos recarregável
+  shipping_date: '2026-05-23'
+  recipient_name: Tiago Fernandes
+- id,link: '244045287787'
+  carrier: Expresso Douro
+  status: Enviado
+  title: Conjunto de loiça infantil
+  shipping_date: '2026-07-20'
+  recipient_name: João Rodrigues
+title: Envios

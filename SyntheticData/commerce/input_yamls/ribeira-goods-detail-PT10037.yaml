@@ -1,0 +1,30 @@
+page_id: ribeira-goods-detail-PT10037
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/products/PT10037
+page_type: goods
+layout: detail
+fields:
+  id,link: PT10037
+  title: Espuma de limpeza de pH baixo
+  status: À venda
+  category: Beleza
+  sale_price: 10.5
+  quantity: 96
+  registration_date: '2026-05-24'
+  brand_name: 누리온
+  code: PT-SKI-101
+  stock_keeping_unit: PTSK1001
+  model_name: SK-915
+  manufacturer: Tidewell Supply
+  origin_country: Coreia
+  color: Azeitona
+  barcode: '8849193224753'
+  supply_price: 7.37
+  low_stock_threshold: 20
+  shipping_fee: 2.05
+  description: Uma espuma de limpeza que não deixa a pele repuxada.
+title: Detalhes do produto

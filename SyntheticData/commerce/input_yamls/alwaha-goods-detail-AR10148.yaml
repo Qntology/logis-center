@@ -1,0 +1,31 @@
+page_id: alwaha-goods-detail-AR10148
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/products/AR10148
+page_type: goods
+layout: detail
+fields:
+  id,link: AR10148
+  title: مظلة شمسية بحماية من الأشعة فوق البنفسجية
+  status: معروض للبيع
+  category: المنزل
+  sale_price: 85.75
+  compare_at_price: 102.9
+  quantity: 18
+  registration_date: '2026-02-13'
+  brand_name: Tidewell
+  code: AR-HOT-104
+  stock_keeping_unit: ARHO1004
+  model_name: HO-201
+  manufacturer: Oakfern Works
+  origin_country: بولندا
+  color: كريمي
+  barcode: '8849312876525'
+  supply_price: 51.82
+  low_stock_threshold: 5
+  shipping_fee: 8.2
+  description: مظلة خفيفة تحجب أشعة الشمس القوية.
+title: تفاصيل المنتج

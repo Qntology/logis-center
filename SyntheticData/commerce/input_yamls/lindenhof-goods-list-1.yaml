@@ -1,0 +1,114 @@
+page_id: lindenhof-goods-list-1
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/goods/list?page=1
+page_type: goods
+layout: list
+items:
+- id,link: DE10037
+  title: Parfümfreie Bodylotion
+  status: Aktiv
+  category: Kosmetik
+  sale_price: 11.25
+  compare_at_price: 13.5
+  quantity: 120
+  registration_date: '2026-01-08'
+  brand_name: Oakfern
+- id,link: DE10074
+  title: Ergonomische Vertikalmaus
+  status: Aktiv
+  category: Elektronik
+  sale_price: 27.45
+  compare_at_price: 32.94
+  quantity: 350
+  registration_date: '2026-01-06'
+  brand_name: 하람
+- id,link: DE10111
+  title: Proteinriegel mit wenig Zucker
+  status: Ausverkauft
+  category: Lebensmittel
+  sale_price: 15.5
+  compare_at_price: 18.6
+  quantity: 0
+  registration_date: '2026-08-10'
+  brand_name: 버들
+- id,link: DE10148
+  title: Mikrofaser-Kuscheldecke
+  status: Aktiv
+  category: Wohnen
+  sale_price: 17.6
+  quantity: 350
+  registration_date: '2026-04-17'
+  brand_name: 마루공방
+- id,link: DE10185
+  title: Hypoallergenes Trockenfutter
+  status: Ausverkauft
+  category: Haustiere
+  sale_price: 23.3
+  quantity: 0
+  registration_date: '2026-08-01'
+  brand_name: 누리온
+- id,link: DE10222
+  title: Kindergeschirr-Set
+  status: Ausverkauft
+  category: Baby
+  sale_price: 20.0
+  compare_at_price: 24.0
+  quantity: 0
+  registration_date: '2026-07-11'
+  brand_name: Oakfern
+- id,link: DE10259
+  title: Kuppelzelt für zwei Personen
+  status: Aktiv
+  category: Outdoor
+  sale_price: 93.15
+  quantity: 120
+  registration_date: '2026-08-25'
+  brand_name: Marlow & Finch
+- id,link: DE10296
+  title: Mineralische Sonnencreme
+  status: Aktiv
+  category: Kosmetik
+  sale_price: 16.35
+  quantity: 96
+  registration_date: '2026-03-01'
+  brand_name: 마루공방
+- id,link: DE10333
+  title: Edelstahl-Bratpfanne
+  status: Aktiv
+  category: Küche
+  sale_price: 38.95
+  compare_at_price: 46.74
+  quantity: 18
+  registration_date: '2026-07-12'
+  brand_name: Tidewell
+- id,link: DE10370
+  title: Geröstete Naturreis-Chips
+  status: Ausverkauft
+  category: Lebensmittel
+  sale_price: 8.2
+  compare_at_price: 9.84
+  quantity: 0
+  registration_date: '2026-04-03'
+  brand_name: Oakfern
+- id,link: DE10407
+  title: Vitamin-C-Serum
+  status: Entwurf
+  category: Kosmetik
+  sale_price: 26.55
+  compare_at_price: 31.86
+  quantity: 42
+  registration_date: '2026-06-08'
+  brand_name: 마루공방
+- id,link: DE10444
+  title: Smartes Fitnessarmband
+  status: Ausverkauft
+  category: Elektronik
+  sale_price: 32.6
+  quantity: 0
+  registration_date: '2026-03-28'
+  brand_name: Marlow & Finch
+title: Produkte

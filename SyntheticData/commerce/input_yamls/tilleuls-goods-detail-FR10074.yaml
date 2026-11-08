@@ -1,0 +1,30 @@
+page_id: tilleuls-goods-detail-FR10074
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/goods/view?id=FR10074
+page_type: goods
+layout: detail
+fields:
+  id,link: FR10074
+  title: Chauffe-mains rechargeable
+  status: En vente
+  category: Maison
+  sale_price: 14.15
+  quantity: 96
+  registration_date: '2026-07-11'
+  brand_name: 솔빛
+  code: FR-COL-102
+  stock_keeping_unit: FRCO1002
+  model_name: CO-352
+  manufacturer: 솔빛리빙
+  origin_country: Thaïlande
+  color: Bordeaux
+  barcode: '8878209519634'
+  supply_price: 7.91
+  low_stock_threshold: 5
+  shipping_fee: 2.05
+  description: Une pochette chauffante rechargeable qui tient dans la poche.
+title: Fiche produit

@@ -1,0 +1,170 @@
+ar:
+  بانتظار الدفع: Awaiting payment
+  تم التوصيل: Delivered
+  تم الشحن: Shipped
+  جارية: Live
+  قيد المراجعة: Pending
+  قيد المعالجة: Processing
+  مجدولة: Scheduled
+  مخفي: Hidden
+  مدفوع: Paid
+  مرتجع: Returned
+  مسودة: Draft
+  معتمد: Approved
+  معروض للبيع: Active
+  ملغى: Cancelled
+  منتهية: Ended
+  نفد المخزون: Sold out
+cs:
+  Doručeno: Delivered
+  Koncept: Draft
+  Naplánováno: Scheduled
+  Odesláno: Shipped
+  Probíhá: Live
+  Schváleno: Approved
+  Skryto: Hidden
+  Ukončeno: Ended
+  V prodeji: Active
+  Vráceno: Returned
+  Vyprodáno: Sold out
+  Zaplaceno: Paid
+  Zpracovává se: Processing
+  Zrušeno: Cancelled
+  Čeká na platbu: Awaiting payment
+  Čeká na schválení: Pending
+de:
+  Aktiv: Active
+  Ausgeblendet: Hidden
+  Ausstehend: Pending
+  Ausverkauft: Sold out
+  Beendet: Ended
+  Bezahlt: Paid
+  Entwurf: Draft
+  Freigegeben: Approved
+  Geplant: Scheduled
+  In Bearbeitung: Processing
+  Läuft: Live
+  Storniert: Cancelled
+  Unterwegs: Shipped
+  Zahlung ausstehend: Awaiting payment
+  Zugestellt: Delivered
+  Zurückgesendet: Returned
+es:
+  Activo: Active
+  Agotado: Sold out
+  Aprobada: Approved
+  Borrador: Draft
+  Cancelado: Cancelled
+  Devuelto: Returned
+  En curso: Live
+  En proceso: Processing
+  Entregado: Delivered
+  Enviado: Shipped
+  Finalizado: Ended
+  Oculto: Hidden
+  Pagado: Paid
+  Pendiente: Pending
+  Pendiente de pago: Awaiting payment
+  Programado: Scheduled
+fr:
+  Annulée: Cancelled
+  Approuvé: Approved
+  Brouillon: Draft
+  En attente: Pending
+  En attente de paiement: Awaiting payment
+  En cours: Live
+  En préparation: Processing
+  En vente: Active
+  Expédiée: Shipped
+  Livrée: Delivered
+  Masqué: Hidden
+  Payée: Paid
+  Programmé: Scheduled
+  Retournée: Returned
+  Terminé: Ended
+  Épuisé: Sold out
+it:
+  Annullato: Cancelled
+  Approvata: Approved
+  Attivo: Live
+  Bozza: Draft
+  Concluso: Ended
+  Consegnato: Delivered
+  Esaurito: Sold out
+  In attesa: Pending
+  In attesa di pagamento: Awaiting payment
+  In lavorazione: Processing
+  In vendita: Active
+  Nascosta: Hidden
+  Pagato: Paid
+  Programmato: Scheduled
+  Restituito: Returned
+  Spedito: Shipped
+ja:
+  キャンセル: Cancelled
+  下書き: Draft
+  入金待ち: Awaiting payment
+  入金済み: Paid
+  処理中: Processing
+  売り切れ: Sold out
+  承認待ち: Pending
+  承認済み: Approved
+  発送済み: Shipped
+  終了: Ended
+  販売中: Active
+  返品: Returned
+  配達完了: Delivered
+  開催中: Live
+  開催予定: Scheduled
+  非表示: Hidden
+nl:
+  Actief: Active
+  Afgelopen: Ended
+  Betaald: Paid
+  Bezorgd: Delivered
+  Concept: Draft
+  Geannuleerd: Cancelled
+  Gepland: Scheduled
+  Geretourneerd: Returned
+  Goedgekeurd: Approved
+  In afwachting: Pending
+  In behandeling: Processing
+  Lopend: Live
+  Uitverkocht: Sold out
+  Verborgen: Hidden
+  Verzonden: Shipped
+  Wacht op betaling: Awaiting payment
+pt:
+  A aguardar pagamento: Awaiting payment
+  Agendado: Scheduled
+  Aprovada: Approved
+  Ativo: Live
+  Cancelado: Cancelled
+  Devolvido: Returned
+  Em processamento: Processing
+  Entregue: Delivered
+  Enviado: Shipped
+  Esgotado: Sold out
+  Oculta: Hidden
+  Pago: Paid
+  Pendente: Pending
+  Rascunho: Draft
+  Terminado: Ended
+  À venda: Active
+zh-hans:
+  在售: Active
+  处理中: Processing
+  已付款: Paid
+  已发货: Shipped
+  已取消: Cancelled
+  已售罄: Sold out
+  已签收: Delivered
+  已结束: Ended
+  已退货: Returned
+  已通过: Approved
+  已隐藏: Hidden
+  待付款: Awaiting payment
+  待审核: Pending
+  未开始: Scheduled
+  草稿: Draft
+  进行中: Live

@@ -1,0 +1,30 @@
+page_id: alwaha-tracking-detail-407509526790
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/shipments/407509526790
+page_type: tracking
+layout: detail
+fields:
+  id,link: '407509526790'
+  carrier: ناقل الكثبان
+  status: تم الشحن
+  title: سيروم إصلاح الشعر
+  shipping_date: '2026-05-01'
+  recipient_name: عبدالله المطيري
+  registration_date: '2026-04-28'
+  sender_name: شركة الواحة للتجارة
+  sender_address: شارع النخيل 45، حي الورود، الرياض 12251
+  sender_phone: +966 11 555 0142
+  recipient_address: شارع النخيل 119، المدينة المنورة 42311
+  recipient_phone: +966 50 239 0188
+  weight: 2.8
+  width: 59
+  height: 28
+  length: 7
+  shipping_method: عادي
+  shipping_duration: 2
+  shipping_fee: 0.0
+title: تفاصيل الشحنة

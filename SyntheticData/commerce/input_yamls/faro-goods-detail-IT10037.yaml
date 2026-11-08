@@ -1,0 +1,30 @@
+page_id: faro-goods-detail-IT10037
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/products/IT10037
+page_type: goods
+layout: detail
+fields:
+  id,link: IT10037
+  title: Mandorle tostate
+  status: Bozza
+  category: Alimentari
+  sale_price: 8.0
+  quantity: 350
+  registration_date: '2026-05-15'
+  brand_name: Marlow & Finch
+  code: IT-SNA-101
+  stock_keeping_unit: ITSN1001
+  model_name: SN-592
+  manufacturer: 누리온산업
+  origin_country: Malesia
+  color: Bordeaux
+  barcode: '8881464633989'
+  supply_price: 5.54
+  low_stock_threshold: 20
+  shipping_fee: 2.05
+  description: Tostate senza olio, dal gusto di frutta secca.
+title: Scheda prodotto

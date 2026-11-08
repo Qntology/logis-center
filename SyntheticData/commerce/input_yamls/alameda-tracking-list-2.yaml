@@ -1,0 +1,83 @@
+page_id: alameda-tracking-list-2
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/shipments?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '769902159902'
+  carrier: Envíos Brisa
+  status: Enviado
+  title: Elevador para monitor
+  shipping_date: '2026-07-03'
+  recipient_name: Elena Ruiz
+- id,link: '285104724787'
+  carrier: Correo Ágil
+  status: Enviado
+  title: Silla de camping ligera
+  shipping_date: '2026-08-15'
+  recipient_name: Elena Navarro
+- id,link: '159147579628'
+  carrier: Envíos Brisa
+  status: Enviado
+  title: Almendras tostadas
+  shipping_date: '2026-05-18'
+  recipient_name: Carmen López
+- id,link: '277930917322'
+  carrier: Correo Ágil
+  status: Entregado
+  title: Hub USB-C multipuerto
+  shipping_date: '2026-08-06'
+  recipient_name: Carmen López
+- id,link: '400755153808'
+  carrier: Correo Ágil
+  status: Entregado
+  title: Esterilla refrescante de gel
+  shipping_date: '2026-04-28'
+  recipient_name: Sofía Torres
+- id,link: '353124270906'
+  carrier: Paquetería Veloz
+  status: Entregado
+  title: Sandalias transpirables
+  shipping_date: '2026-05-17'
+  recipient_name: Martina Romero
+- id,link: '473668249852'
+  carrier: Paquetería Veloz
+  status: Devuelto
+  title: Almendras tostadas
+  shipping_date: '2026-08-01'
+  recipient_name: Daniel Castillo
+- id,link: '344373122572'
+  carrier: Envíos Brisa
+  status: Entregado
+  title: Sartén de acero inoxidable
+  shipping_date: '2026-08-26'
+  recipient_name: Pablo García
+- id,link: '388151046414'
+  carrier: Envíos Brisa
+  status: Devuelto
+  title: Transportín para mascotas
+  shipping_date: '2026-06-28'
+  recipient_name: Paula Sánchez
+- id,link: '663416674814'
+  carrier: Paquetería Veloz
+  status: Devuelto
+  title: Sudadera con cremallera forrada de polar
+  shipping_date: '2026-07-09'
+  recipient_name: Mateo López
+- id,link: '403629389953'
+  carrier: Envíos Brisa
+  status: Entregado
+  title: Pulsera de actividad inteligente
+  shipping_date: '2026-08-15'
+  recipient_name: Daniel Ruiz
+- id,link: '562851739184'
+  carrier: Rutas del Sur
+  status: Entregado
+  title: Soporte para portátil
+  shipping_date: '2026-06-08'
+  recipient_name: Mateo Martínez
+title: Envíos

@@ -1,0 +1,30 @@
+page_id: alwaha-tracking-detail-886468616431
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/shipments/886468616431
+page_type: tracking
+layout: detail
+fields:
+  id,link: '886468616431'
+  carrier: توصيل السراب
+  status: تم التوصيل
+  title: سيروم إصلاح الشعر
+  shipping_date: '2026-07-24'
+  recipient_name: هند القحطاني
+  registration_date: '2026-07-23'
+  sender_name: شركة الواحة للتجارة
+  sender_address: شارع النخيل 45، حي الورود، الرياض 12251
+  sender_phone: +966 11 555 0142
+  recipient_address: شارع الندى 126، جدة 21442
+  recipient_phone: +966 59 869 9872
+  weight: 1.5
+  width: 34
+  height: 32
+  length: 13
+  shipping_method: شحن البضائع الكبيرة
+  shipping_duration: 1
+  shipping_fee: 0.0
+title: تفاصيل الشحنة

@@ -1,0 +1,29 @@
+page_id: alwaha-order-detail-20260530-100053
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/orders/20260530-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260530-100053
+  registration_date: '2026-05-30'
+  status: تم التوصيل
+  goods: موزع USB-C متعدد المنافذ
+  tracking_number: '481102287050'
+  sender_name: عبدالله الزهراني
+  recipient_name: عبدالله الزهراني
+  quantity: 4
+  amount: 427.4
+  shipping_fee: 0.0
+  payment_method: بطاقة ائتمان
+  sender_phone: +966 58 855 8079
+  sender_address: شارع السلام 22، الخبر 34428
+  recipient_phone: +966 58 855 8079
+  recipient_address: شارع السلام 22، الخبر 34428
+  payment_origin: الصندوق السريع
+  payment_date: '2026-05-30'
+  card: بطاقة الكثبان
+title: تفاصيل الطلب

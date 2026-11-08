@@ -1,0 +1,83 @@
+page_id: faro-tracking-list-1
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/shipments?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '195764898657'
+  carrier: Pacco Veloce
+  status: Spedito
+  title: Scaldamani ricaricabile
+  shipping_date: '2026-06-20'
+  recipient_name: Lorenzo Marino
+- id,link: '229271781691'
+  carrier: Pacco Veloce
+  status: Consegnato
+  title: Crema solare minerale
+  shipping_date: '2026-06-07'
+  recipient_name: Elena Conti
+- id,link: '144797482821'
+  carrier: Spedizioni Aurora
+  status: Consegnato
+  title: Bicchiere termico sottovuoto
+  shipping_date: '2026-06-12'
+  recipient_name: Sofia Romano
+- id,link: '376320179711'
+  carrier: Pacco Veloce
+  status: Consegnato
+  title: Tenda a cupola per due persone
+  shipping_date: '2026-08-09'
+  recipient_name: Chiara Colombo
+- id,link: '620893141375'
+  carrier: Pacco Veloce
+  status: Consegnato
+  title: Mouse verticale ergonomico
+  shipping_date: '2026-05-22'
+  recipient_name: Sofia Rossi
+- id,link: '902100197552'
+  carrier: Pacco Veloce
+  status: Consegnato
+  title: Tastiera meccanica silenziosa
+  shipping_date: '2026-08-30'
+  recipient_name: Chiara Gallo
+- id,link: '586920977030'
+  carrier: Trasporti Faro
+  status: Restituito
+  title: Spazzola per toelettatura
+  shipping_date: '2026-04-23'
+  recipient_name: Matteo Romano
+- id,link: '720309403489'
+  carrier: Corriere Lampo
+  status: Consegnato
+  title: Altoparlante Bluetooth impermeabile
+  shipping_date: '2026-04-16'
+  recipient_name: Marco Conti
+- id,link: '258628048469'
+  carrier: Pacco Veloce
+  status: Spedito
+  title: Spazzola per toelettatura
+  shipping_date: '2026-09-25'
+  recipient_name: Martina Marino
+- id,link: '285527565697'
+  carrier: Spedizioni Aurora
+  status: Restituito
+  title: Costruzioni in legno
+  shipping_date: '2026-06-10'
+  recipient_name: Sara Gallo
+- id,link: '668977632282'
+  carrier: Pacco Veloce
+  status: Consegnato
+  title: Sandali traspiranti
+  shipping_date: '2026-09-07'
+  recipient_name: Chiara Ricci
+- id,link: '121679013111'
+  carrier: Trasporti Faro
+  status: Restituito
+  title: Mouse verticale ergonomico
+  shipping_date: '2026-10-15'
+  recipient_name: Marco Marino
+title: Spedizioni

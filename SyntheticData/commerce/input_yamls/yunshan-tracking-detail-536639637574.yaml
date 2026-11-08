@@ -1,0 +1,30 @@
+page_id: yunshan-tracking-detail-536639637574
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/my/shipments/536639637574
+page_type: tracking
+layout: detail
+fields:
+  id,link: '536639637574'
+  carrier: 青松速运
+  status: 已签收
+  title: 双人圆顶帐篷
+  shipping_date: '2026-05-31'
+  recipient_name: 杨宇轩
+  registration_date: '2026-05-29'
+  sender_name: 云杉商贸有限公司
+  sender_address: 上海市徐汇区云杉路88号6楼
+  sender_phone: 021-5555 0142
+  recipient_address: 浙江省杭州市西湖区建设路113号2栋1602室
+  recipient_phone: 135 9791 3217
+  weight: 7.0
+  width: 25
+  height: 11
+  length: 17
+  shipping_method: 普通快递
+  shipping_duration: 1
+  shipping_fee: 0.0
+title: 物流详情

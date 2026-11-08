@@ -1,0 +1,138 @@
+page_id: sakura-order-list-2
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/order/list?page=2
+page_type: order
+layout: list
+items:
+- id,link: 20260810-100689
+  registration_date: '2026-08-10'
+  status: 配達完了
+  goods: 65W急速充電器
+  tracking_number: '763848459408'
+  sender_name: 山本 結衣
+  recipient_name: 山本 結衣
+  quantity: 2
+  amount: 6156
+  shipping_fee: 0
+  payment_method: クレジットカード
+- id,link: 20260822-100742
+  registration_date: '2026-08-22'
+  status: 処理中
+  goods: ノイズキャンセリングワイヤレスイヤホン
+  sender_name: 加藤 健太
+  recipient_name: 加藤 健太
+  quantity: 1
+  amount: 11349
+  shipping_fee: 0
+  payment_method: 電子マネー
+- id,link: 20260616-100795
+  registration_date: '2026-06-16'
+  status: 配達完了
+  goods: リネン半袖シャツ
+  tracking_number: '384833376389'
+  sender_name: 田中 結衣
+  recipient_name: 田中 結衣
+  quantity: 5
+  amount: 25250
+  shipping_fee: 0
+  payment_method: 電子マネー
+- id,link: 20260529-100848
+  registration_date: '2026-05-29'
+  status: 配達完了
+  goods: 低アレルゲンドライフード
+  tracking_number: '521514086167'
+  sender_name: 加藤 美咲
+  recipient_name: 加藤 美咲
+  quantity: 4
+  amount: 26350
+  shipping_fee: 0
+  payment_method: クレジットカード
+- id,link: 20261002-100901
+  registration_date: '2026-10-02'
+  status: 処理中
+  goods: マイクロファイバーブランケット
+  sender_name: 加藤 健太
+  recipient_name: 渡辺 颯太
+  quantity: 2
+  amount: 5136
+  shipping_fee: 330
+  payment_method: クレジットカード
+- id,link: 20260901-100954
+  registration_date: '2026-09-01'
+  status: 入金待ち
+  goods: 大容量モバイルバッテリー
+  sender_name: 山本 葵
+  recipient_name: 山本 葵
+  quantity: 8
+  amount: 25686
+  shipping_fee: 0
+  payment_method: 電子マネー
+- id,link: 20260629-101007
+  registration_date: '2026-06-29'
+  status: 入金待ち
+  goods: キッズキックスクーター
+  sender_name: 加藤 美咲
+  recipient_name: 加藤 美咲
+  quantity: 1
+  amount: 6300
+  shipping_fee: 0
+  payment_method: クレジットカード
+- id,link: 20260408-101060
+  registration_date: '2026-04-08'
+  status: 配達完了
+  goods: ペットキャリーバッグ
+  tracking_number: '100081643320'
+  sender_name: 田中 陽菜
+  recipient_name: 田中 陽菜
+  quantity: 1
+  amount: 4524
+  shipping_fee: 330
+  payment_method: クレジットカード
+- id,link: 20260616-101113
+  registration_date: '2026-06-16'
+  status: 入金待ち
+  goods: マイクロファイバーブランケット
+  sender_name: 加藤 葵
+  recipient_name: 加藤 葵
+  quantity: 2
+  amount: 4260
+  shipping_fee: 330
+  payment_method: クレジットカード
+- id,link: 20260730-101166
+  registration_date: '2026-07-30'
+  status: 発送済み
+  goods: リネン半袖シャツ
+  tracking_number: '870526923875'
+  sender_name: 中村 凛
+  recipient_name: 山本 悠真
+  quantity: 1
+  amount: 5380
+  shipping_fee: 330
+  payment_method: クレジットカード
+- id,link: 20260527-101219
+  registration_date: '2026-05-27'
+  status: 発送済み
+  goods: 子ども用食器セット
+  tracking_number: '264411927937'
+  sender_name: 田中 湊
+  recipient_name: 田中 湊
+  quantity: 3
+  amount: 9630
+  shipping_fee: 0
+  payment_method: クレジットカード
+- id,link: 20260713-101272
+  registration_date: '2026-07-13'
+  status: 発送済み
+  goods: 大容量モバイルバッテリー
+  tracking_number: '999432351314'
+  sender_name: 渡辺 颯太
+  recipient_name: 渡辺 颯太
+  quantity: 7
+  amount: 16690
+  shipping_fee: 0
+  payment_method: 銀行振込
+title: 注文一覧

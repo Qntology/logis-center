@@ -1,0 +1,83 @@
+page_id: lindenhof-tracking-list-1
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '440326034407'
+  carrier: Kiefernexpress
+  status: Zurückgesendet
+  title: Holzbausteine
+  shipping_date: '2026-05-15'
+  recipient_name: Lena Neumann
+- id,link: '230582628986'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Kuppelzelt für zwei Personen
+  shipping_date: '2026-05-28'
+  recipient_name: Sophie Wolf
+- id,link: '889306078818'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Wasserkocher mit Temperaturwahl
+  shipping_date: '2026-04-11'
+  recipient_name: Clara Keller
+- id,link: '626436664173'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Leichter Campingstuhl
+  shipping_date: '2026-04-13'
+  recipient_name: Leon Schneider
+- id,link: '802171983974'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Leichter Campingstuhl
+  shipping_date: '2026-07-30'
+  recipient_name: Hannah Schneider
+- id,link: '340030207536'
+  carrier: Blitzpaket
+  status: Unterwegs
+  title: Hypoallergenes Trockenfutter
+  shipping_date: '2026-07-22'
+  recipient_name: Marie Becker
+- id,link: '395491810511'
+  carrier: Nordkurier Logistik
+  status: Unterwegs
+  title: Transporttasche für Haustiere
+  shipping_date: '2026-06-13'
+  recipient_name: Hannah Neumann
+- id,link: '372080525796'
+  carrier: Rheinfracht
+  status: Zurückgesendet
+  title: Kuppelzelt für zwei Personen
+  shipping_date: '2026-09-27'
+  recipient_name: Paul Wagner
+- id,link: '195286810252'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: Ergonomische Vertikalmaus
+  shipping_date: '2026-05-18'
+  recipient_name: Felix Schulz
+- id,link: '771602916348'
+  carrier: Nordkurier Logistik
+  status: Unterwegs
+  title: Tragbares Kochgeschirr-Set
+  shipping_date: '2026-10-02'
+  recipient_name: Leon Hoffmann
+- id,link: '624666179356'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Silikon-Küchenhelfer-Set
+  shipping_date: '2026-05-02'
+  recipient_name: Felix Wagner
+- id,link: '172007067867'
+  carrier: Nordkurier Logistik
+  status: Zurückgesendet
+  title: USB-C-Multiport-Hub
+  shipping_date: '2026-04-04'
+  recipient_name: Emil Schulz
+title: Sendungen

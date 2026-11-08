@@ -1,0 +1,30 @@
+page_id: alameda-tracking-detail-695952291446
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/shipments/695952291446
+page_type: tracking
+layout: detail
+fields:
+  id,link: '695952291446'
+  carrier: Envíos Brisa
+  status: Entregado
+  title: Ratón vertical ergonómico
+  shipping_date: '2026-09-19'
+  recipient_name: Elena Torres
+  registration_date: '2026-09-16'
+  sender_name: Alameda Comercio S.L.
+  sender_address: Calle del Olmo 24, 28012 Madrid
+  sender_phone: +34 910 555 142
+  recipient_address: Paseo de las Acacias 101, 28013 Madrid
+  recipient_phone: +34 610 033 439
+  weight: 1.1
+  width: 53
+  height: 28
+  length: 21
+  shipping_method: Envío de carga
+  shipping_duration: 1
+  shipping_fee: 0.0
+title: Detalle del envío

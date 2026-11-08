@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: cs
+document_title: Obchodní faktura
+metadata:
+  invoice_number: CI-CZ-2610-218
+  issue_date: '2026-10-08'
+  reference_po_number: PO-CZ-83137
+  related_bl_number: BL-CZ29101749
+  related_lc_number: LC-CZ9182102
+  currency: EUR
+parties:
+  shipper_exporter:
+    name: Ložiska Tři řeky s.r.o.
+    address: Průmyslová 7, 301 00 Plzeň, Česko
+    contact_number: +420 377 555 014
+    tax_id: CZ28145690
+  consignee:
+    name: Hanul Precision Co., Ltd.
+    address: 33 Gongdan-ro, Gumi, Jižní Korea
+    contact_number: +82 54 555 0119
+    tax_id: 513-81-60294
+shipping_details:
+  port_of_loading: Hamburk, Německo
+  port_of_discharge: Pusan, Jižní Korea
+  vessel_flight: ELBE BRIDGE V.226E
+  incoterms: FCA Plzeň
+line_items:
+- item_code: 6205-2RS
+  description: Kuličková ložiska 6205-2RS
+  quantity: 20000
+  unit: ks
+  unit_price: 1.85
+  total_amount: 37000.0
+  hs_code: '8482.10'
+- item_code: KL-30205
+  description: Kuželíková ložiska 30205
+  quantity: 8000
+  unit: ks
+  unit_price: 3.9
+  total_amount: 31200.0
+  hs_code: '8482.20'
+summary:
+  total_quantity: 28000
+  total_items_amount: 68200.0
+  freight_charge: 0.0
+  insurance: 0.0
+  grand_total_amount: 68200.0

@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: es
+document_title: Certificado de origen
+metadata:
+  certificate_number: CO-2026-ES-7692
+  issue_date: '2026-10-02'
+  related_invoice_number: CI-ES-2610-707
+  related_bl_number: BL-ES68027868
+  related_lc_number: LC-ES5284106
+parties:
+  exporter:
+    name: Olivares del Alba S.L.
+    address: Calle Mayor 21, 23001 Jaén, España
+  importer_consignee:
+    name: Hanmaru Foods Co., Ltd.
+    address: 77 Jungang-daero, Jung-gu, Busan, Corea del Sur
+  issuing_authority:
+    name: Cámara de Comercio del Alto Guadalquivir
+    address: Plaza de la Constitución 4, 23001 Jaén, España
+transport_details:
+  vessel_flight: ALBORAN STAR V.208E
+  port_of_loading: Valencia, España
+  port_of_discharge: Busan, Corea del Sur
+cargo_details:
+- marks_and_numbers: HANMARU / BUSAN / HECHO EN ESPAÑA
+  description_of_goods: Aceite de oliva virgen extra en garrafas de 5 l (AOV-5L)
+  hs_code: '1509.20'
+  quantity: 2.400 uds.
+  gross_weight_kg: 11650.0
+  origin_criterion: Obtenido íntegramente en España
+- marks_and_numbers: HANMARU / BUSAN / HECHO EN ESPAÑA
+  description_of_goods: Aceitunas de mesa en tarros de 1 kg (ACT-1K)
+  hs_code: '2005.70'
+  quantity: 3.600 uds.
+  gross_weight_kg: 4320.0
+  origin_criterion: Obtenido íntegramente en España
+declaration:
+  statement: Se certifica que las mercancías arriba descritas son originarias de España.

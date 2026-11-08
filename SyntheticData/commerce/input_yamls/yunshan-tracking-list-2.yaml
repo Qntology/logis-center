@@ -1,0 +1,83 @@
+page_id: yunshan-tracking-list-2
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/my/shipments?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '709571558262'
+  carrier: 云杉快递
+  status: 已退货
+  title: 硅胶厨具套装
+  shipping_date: '2026-06-29'
+  recipient_name: 黄欣怡
+- id,link: '535933258171'
+  carrier: 白鹭物流
+  status: 已退货
+  title: 弱酸性洁面泡沫
+  shipping_date: '2026-07-08'
+  recipient_name: 周娜
+- id,link: '503933807431'
+  carrier: 青松速运
+  status: 已退货
+  title: 透气凉鞋
+  shipping_date: '2026-05-24'
+  recipient_name: 李洋
+- id,link: '841222295166'
+  carrier: 白鹭物流
+  status: 已签收
+  title: 加绒拉链卫衣
+  shipping_date: '2026-05-28'
+  recipient_name: 刘敏
+- id,link: '114254110753'
+  carrier: 云杉快递
+  status: 已发货
+  title: 轻薄羽绒马甲
+  shipping_date: '2026-09-01'
+  recipient_name: 周磊
+- id,link: '301552425780'
+  carrier: 白鹭物流
+  status: 已发货
+  title: 防晒遮阳伞
+  shipping_date: '2026-04-04'
+  recipient_name: 吴浩然
+- id,link: '494466311912'
+  carrier: 云杉快递
+  status: 已发货
+  title: 冰凉颈带
+  shipping_date: '2026-07-11'
+  recipient_name: 赵磊
+- id,link: '675553377682'
+  carrier: 飞燕快运
+  status: 已签收
+  title: 降噪无线耳机
+  shipping_date: '2026-08-27'
+  recipient_name: 张静
+- id,link: '683857796074'
+  carrier: 云杉快递
+  status: 已签收
+  title: 防水蓝牙音箱
+  shipping_date: '2026-05-31'
+  recipient_name: 周磊
+- id,link: '771440855137'
+  carrier: 青松速运
+  status: 已签收
+  title: 维C精华液
+  shipping_date: '2026-08-17'
+  recipient_name: 陈欣怡
+- id,link: '771650625952'
+  carrier: 飞燕快运
+  status: 已签收
+  title: 狗狗胸背带
+  shipping_date: '2026-04-14'
+  recipient_name: 黄芳
+- id,link: '498992036780'
+  carrier: 青松速运
+  status: 已发货
+  title: 防水蓝牙音箱
+  shipping_date: '2026-10-08'
+  recipient_name: 吴芳
+title: 发货列表

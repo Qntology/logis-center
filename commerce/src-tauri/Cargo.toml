@@ -108,6 +108,9 @@ metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 flash-attn = ["dep:candle-flash-attn", "candle-flash-attn/flash-attn", "candle-core/flash-attn", "candle-nn/flash-attn"]
 # TurboQuant / NVFP4 / MXFP4 / MXFP8 / FP8 quantization kernels (candle_nn::turbo_quant).
 turbo-quant = ["candle-core/turbo-quant", "candle-nn/turbo-quant"]
+# 디버그 빌드에서도 모든 언어 도메인 사전(full_bias.json)을 넣습니다. 릴리스 빌드는 이 기능 없이도 full_bias.json 입니다
+# (src/utils/bias_schema.rs BIAS_SOURCE). 개발 빌드 기본값은 한국어 · 영어만 담은 bias.json 입니다.
+full-bias = []
 
 # candle-rocm-vulkan 포크는 Qntology 원격 master 브랜치를 따라갑니다(master 가 메인). 어느 커밋을 쓰는지는 Cargo.lock 이 고정하고,
 # 새 커밋을 받으려면 cargo update 로 포크 패키지(candle-core · candle-nn · candle-flash-attn · candle-rocm)를 갱신하세요.

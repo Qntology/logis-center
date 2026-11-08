@@ -1,0 +1,71 @@
+page_id: tilleuls-review-list-1
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/review/list?page=1
+page_type: review
+layout: list
+items:
+- id,link: RV7011
+  status: En attente
+  title: Mieux que prévu, vraiment bien fini.
+  name: Arthur Bernard
+  registration_date: '2026-08-18'
+- id,link: RV7022
+  status: En attente
+  title: Mieux que prévu, vraiment d'une jolie couleur.
+  name: Lucas Martin
+  registration_date: '2026-08-26'
+- id,link: RV7033
+  status: Masqué
+  title: Mieux que prévu, vraiment léger.
+  name: Manon Bonnet
+  registration_date: '2026-08-11'
+- id,link: RV7044
+  status: Approuvé
+  title: Mieux que prévu, vraiment bien fini.
+  name: Chloé Bonnet
+  registration_date: '2026-08-23'
+- id,link: RV7055
+  status: Masqué
+  title: Emballé avec soin et léger dans l'ensemble.
+  name: Arthur Roux
+  registration_date: '2026-09-27'
+- id,link: RV7066
+  status: Masqué
+  title: Deuxième achat et toujours léger.
+  name: Clara Bernard
+  registration_date: '2026-07-19'
+- id,link: RV7077
+  status: Approuvé
+  title: Mieux que prévu, vraiment léger.
+  name: Inès Lefèvre
+  registration_date: '2026-08-16'
+- id,link: RV7088
+  status: En attente
+  title: Deuxième achat et toujours léger.
+  name: Camille Laurent
+  registration_date: '2026-09-16'
+- id,link: RV7099
+  status: Approuvé
+  title: Emballé avec soin et bien fini dans l'ensemble.
+  name: Lucas Roux
+  registration_date: '2026-05-05'
+- id,link: RV7110
+  status: En attente
+  title: Emballé avec soin et solide dans l'ensemble.
+  name: Lucas Fournier
+  registration_date: '2026-09-20'
+- id,link: RV7121
+  status: Masqué
+  title: Emballé avec soin et solide dans l'ensemble.
+  name: Jules Roux
+  registration_date: '2026-07-07'
+- id,link: RV7132
+  status: Approuvé
+  title: Mieux que prévu, vraiment léger.
+  name: Arthur Dubois
+  registration_date: '2026-05-25'
+title: Avis produits

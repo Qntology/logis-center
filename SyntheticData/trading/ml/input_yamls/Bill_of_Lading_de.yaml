@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: de
+document_title: Konnossement
+metadata:
+  bl_number: BL-DE23591658
+  issue_date: '2026-09-07'
+  related_invoice_number: CI-DE-2609-360
+  related_po_number: PO-DE-72911
+  related_lc_number: LC-DE2403039
+  freight_term: Fracht zahlbar am Bestimmungsort
+parties:
+  shipper:
+    name: Talwerk Hydraulik GmbH
+    address: Talstraße 14, 70173 Stuttgart, Deutschland
+  consignee:
+    name: Daehan Fluid Power Co., Ltd.
+    address: 15 Gongdan-ro, Seongsan-gu, Changwon, Südkorea
+  notify_party:
+    name: Daehan Fluid Power Co., Ltd.
+    address: 15 Gongdan-ro, Seongsan-gu, Changwon, Südkorea
+  carrier:
+    name: Nordsee Linien GmbH
+shipping_details:
+  vessel_flight: NORDLICHT V.412E
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Busan, Südkorea
+  place_of_receipt: Stuttgart, Deutschland
+  place_of_delivery: Changwon, Südkorea
+cargo_details:
+  container_number: NSLU8971022
+  seal_number: SL927822
+  marks_and_numbers: DAEHAN / CHANGWON / MADE IN GERMANY
+  number_of_packages: 16 Paletten
+  description_of_goods: Hydraulische Zahnradpumpen und Dichtungssätze
+  gross_weight_kg: 3730.0
+  measurement_cbm: 12.0

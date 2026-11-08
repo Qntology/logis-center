@@ -1,0 +1,30 @@
+page_id: dekade-goods-detail-NL10111
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/goods/view?id=NL10111
+page_type: goods
+layout: detail
+fields:
+  id,link: NL10111
+  title: Houten bouwblokken
+  status: Uitverkocht
+  category: Speelgoed
+  sale_price: 28.3
+  quantity: 0
+  registration_date: '2026-05-17'
+  brand_name: 버들
+  code: NL-KID-103
+  stock_keeping_unit: NLKI1003
+  model_name: KI-268
+  manufacturer: 다온랩스
+  origin_country: Thailand
+  color: Zand
+  barcode: '8845276612352'
+  supply_price: 19.9
+  low_stock_threshold: 5
+  shipping_fee: 2.05
+  description: Honderd blokken met afgeronde hoeken.
+title: Productgegevens

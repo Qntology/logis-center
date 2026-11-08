@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: ja
+document_title: 包装明細書
+metadata:
+  packing_list_number: PL-JP-2609-813
+  issue_date: '2026-09-02'
+  related_invoice_number: CI-JP-2609-343
+  related_po_number: PO-JP-57075
+  related_bl_number: BL-JP34178511
+parties:
+  shipper_exporter:
+    name: 北斗精機株式会社
+    address: 〒460-0008 愛知県名古屋市中区栄3-5-12
+  consignee:
+    name: Daon Robotics Co., Ltd.
+    address: 27 Gongdan-ro, Seongsan-gu, Changwon, 韓国
+shipping_details:
+  vessel_flight: HOKUTO MARU V.712W
+  port_of_loading: 名古屋、日本
+  port_of_discharge: 釜山、韓国
+packing_details:
+- item_code: RA-6X
+  description: 6軸産業用ロボットアーム
+  quantity: 24
+  unit: 台
+  packages: 24
+  package_type: 木箱
+  net_weight_kg: 4320.0
+  gross_weight_kg: 5280.0
+  measurement_cbm: 57.6
+- item_code: SV-750
+  description: ACサーボモーター 750W
+  quantity: 300
+  unit: 台
+  packages: 15
+  package_type: 木箱
+  net_weight_kg: 1050.0
+  gross_weight_kg: 1260.0
+  measurement_cbm: 4.5
+summary:
+  total_packages: 39
+  total_net_weight_kg: 5370.0
+  total_gross_weight_kg: 6540.0
+  total_measurement_cbm: 62.1

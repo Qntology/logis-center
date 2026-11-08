@@ -1,0 +1,113 @@
+page_id: sakura-goods-list-2
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/goods/list?page=2
+page_type: goods
+layout: list
+items:
+- id,link: JP10481
+  title: 素焼きアーモンド
+  status: 販売中
+  category: 食品
+  sale_price: 1260
+  compare_at_price: 1512
+  quantity: 120
+  registration_date: '2026-05-29'
+  brand_name: Oakfern
+- id,link: JP10518
+  title: 2人用ドームテント
+  status: 販売中
+  category: アウトドア
+  sale_price: 14530
+  compare_at_price: 17436
+  quantity: 96
+  registration_date: '2026-04-05'
+  brand_name: 솔빛
+- id,link: JP10555
+  title: ひんやりジェルマット
+  status: 販売中
+  category: 生活雑貨
+  sale_price: 4460
+  quantity: 350
+  registration_date: '2026-08-14'
+  brand_name: 누리온
+- id,link: JP10592
+  title: ノンケミカル日焼け止め
+  status: 販売中
+  category: コスメ
+  sale_price: 2700
+  quantity: 18
+  registration_date: '2026-09-02'
+  brand_name: Kestrel Lane
+- id,link: JP10629
+  title: 犬用ハーネス
+  status: 販売中
+  category: ペット
+  sale_price: 2580
+  quantity: 18
+  registration_date: '2026-08-06'
+  brand_name: Oakfern
+- id,link: JP10666
+  title: プログラミングロボットキット
+  status: 販売中
+  category: おもちゃ
+  sale_price: 8030
+  compare_at_price: 9636
+  quantity: 96
+  registration_date: '2026-05-06'
+  brand_name: 마루공방
+- id,link: JP10703
+  title: 防水Bluetoothスピーカー
+  status: 下書き
+  category: デジタル
+  sale_price: 6340
+  quantity: 96
+  registration_date: '2026-01-27'
+  brand_name: 하람
+- id,link: JP10740
+  title: 密閉ガラス保存容器セット
+  status: 販売中
+  category: キッチン
+  sale_price: 3540
+  compare_at_price: 4248
+  quantity: 18
+  registration_date: '2026-06-06'
+  brand_name: Tidewell
+- id,link: JP10777
+  title: 弱酸性洗顔フォーム
+  status: 販売中
+  category: コスメ
+  sale_price: 1600
+  quantity: 42
+  registration_date: '2026-07-01'
+  brand_name: 하람
+- id,link: JP10814
+  title: うさぎのぬいぐるみ
+  status: 下書き
+  category: おもちゃ
+  sale_price: 2530
+  compare_at_price: 3036
+  quantity: 120
+  registration_date: '2026-08-03'
+  brand_name: 다온랩
+- id,link: JP10851
+  title: バリア保湿クリーム
+  status: 売り切れ
+  category: コスメ
+  sale_price: 3630
+  quantity: 0
+  registration_date: '2026-01-20'
+  brand_name: 마루공방
+- id,link: JP10888
+  title: 猫用爪とぎポール
+  status: 販売中
+  category: ペット
+  sale_price: 2210
+  compare_at_price: 2652
+  quantity: 42
+  registration_date: '2026-07-11'
+  brand_name: Kestrel Lane
+title: 商品一覧

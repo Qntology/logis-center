@@ -1,0 +1,136 @@
+page_id: ulipy-order-list-1
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/order/list?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20260427-100053
+  registration_date: '2026-04-27'
+  status: Doručeno
+  goods: Automatické krmítko
+  tracking_number: '201307695671'
+  sender_name: Lucie Procházková
+  recipient_name: Lucie Procházková
+  quantity: 1
+  amount: 1260
+  shipping_fee: 0
+  payment_method: Platební karta
+- id,link: 20260921-100106
+  registration_date: '2026-09-21'
+  status: Zpracovává se
+  goods: Lehká prošívaná vesta
+  sender_name: Eva Procházková
+  recipient_name: Eva Novotná
+  quantity: 1
+  amount: 1140
+  shipping_fee: 0
+  payment_method: Digitální peněženka
+- id,link: 20260825-100159
+  registration_date: '2026-08-25'
+  status: Čeká na platbu
+  goods: Sérum s vitaminem C
+  sender_name: Veronika Novotná
+  recipient_name: Veronika Novotná
+  quantity: 4
+  amount: 1458
+  shipping_fee: 0
+  payment_method: Digitální peněženka
+- id,link: 20260822-100212
+  registration_date: '2026-08-22'
+  status: Odesláno
+  goods: Minerální opalovací krém
+  tracking_number: '400828234978'
+  sender_name: Jan Kučera
+  recipient_name: Jan Kučera
+  quantity: 8
+  amount: 5400
+  shipping_fee: 0
+  payment_method: Platební karta
+- id,link: 20260613-100265
+  registration_date: '2026-06-13'
+  status: Zrušeno
+  goods: Rychlonabíječka 65 W
+  sender_name: Tomáš Novák
+  recipient_name: Tereza Novotná
+  quantity: 2
+  amount: 972
+  shipping_fee: 0
+  payment_method: Platební karta
+- id,link: 20260603-100318
+  registration_date: '2026-06-03'
+  status: Doručeno
+  goods: Nerezová pánev
+  tracking_number: '958122719875'
+  sender_name: Lukáš Novák
+  recipient_name: Lukáš Novák
+  quantity: 1
+  amount: 837
+  shipping_fee: 0
+  payment_method: Platební karta
+- id,link: 20260712-100371
+  registration_date: '2026-07-12'
+  status: Odesláno
+  goods: Sada silikonového náčiní
+  tracking_number: '224585497921'
+  sender_name: Lukáš Procházka
+  recipient_name: Lukáš Procházka
+  quantity: 3
+  amount: 1470
+  shipping_fee: 0
+  payment_method: Bankovní převod
+- id,link: 20260702-100424
+  registration_date: '2026-07-02'
+  status: Odesláno
+  goods: Bio granola
+  tracking_number: '238946220121'
+  sender_name: Jan Novotný
+  recipient_name: Jan Novotný
+  quantity: 6
+  amount: 2150
+  shipping_fee: 0
+  payment_method: Digitální peněženka
+- id,link: 20260517-100477
+  registration_date: '2026-05-17'
+  status: Čeká na platbu
+  goods: Škrabadlo pro kočky
+  sender_name: Lukáš Kučera
+  recipient_name: Petra Kučerová
+  quantity: 3
+  amount: 1110
+  shipping_fee: 0
+  payment_method: Digitální peněženka
+- id,link: 20260706-100530
+  registration_date: '2026-07-06'
+  status: Zaplaceno
+  goods: Rychlonabíječka 65 W
+  sender_name: Veronika Svobodová
+  recipient_name: Veronika Svobodová
+  quantity: 2
+  amount: 1080
+  shipping_fee: 0
+  payment_method: Platební karta
+- id,link: 20260513-100583
+  registration_date: '2026-05-13'
+  status: Zrušeno
+  goods: Postroj pro psa
+  sender_name: Eva Nováková
+  recipient_name: Eva Nováková
+  quantity: 5
+  amount: 3440
+  shipping_fee: 0
+  payment_method: Platební karta
+- id,link: 20261010-100636
+  registration_date: '2026-10-10'
+  status: Zrušeno
+  goods: Přepravní taška pro mazlíčky
+  sender_name: Lucie Kučerová
+  recipient_name: Tereza Novotná
+  quantity: 5
+  amount: 4790
+  shipping_fee: 0
+  payment_method: Bankovní převod
+title: Objednávky

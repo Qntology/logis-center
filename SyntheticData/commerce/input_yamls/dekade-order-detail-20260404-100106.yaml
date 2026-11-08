@@ -1,0 +1,29 @@
+page_id: dekade-order-detail-20260404-100106
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/order/view?id=20260404-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260404-100106
+  registration_date: '2026-04-04'
+  status: Bezorgd
+  goods: Lichte bodywarmer
+  tracking_number: '460642418407'
+  sender_name: Bram Visser
+  recipient_name: Bram Visser
+  quantity: 3
+  amount: 68.25
+  shipping_fee: 0.0
+  payment_method: Bankoverschrijving
+  sender_phone: +31 6 8675 7955
+  sender_address: Stationsweg 143, 3511 LX Utrecht
+  recipient_phone: +31 6 8675 7955
+  recipient_address: Stationsweg 143, 3511 LX Utrecht
+  payment_origin: PayPolder
+  payment_date: '2026-04-05'
+  bank: Waddenbank
+title: Bestelgegevens

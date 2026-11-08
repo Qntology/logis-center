@@ -1,0 +1,28 @@
+page_id: ribeira-order-detail-20260909-100212
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/orders/20260909-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260909-100212
+  registration_date: '2026-09-09'
+  status: Devolvido
+  goods: Pulseira de atividade inteligente
+  tracking_number: '755149486673'
+  sender_name: Rodrigo Costa
+  recipient_name: Beatriz Santos
+  quantity: 2
+  amount: 73.8
+  shipping_fee: 0.0
+  payment_method: Carteira digital
+  sender_phone: +351 913 429 590
+  sender_address: Avenida da Liberdade, 140, 3800-200 Aveiro
+  recipient_phone: +351 915 103 316
+  recipient_address: Rua das Oliveiras, 35, 1100-053 Lisboa
+  payment_origin: Caixa Rápida
+  payment_date: '2026-09-09'
+title: Detalhes da encomenda

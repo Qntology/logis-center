@@ -1,0 +1,31 @@
+page_id: lindenhof-goods-detail-DE10037
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/goods/view?id=DE10037
+page_type: goods
+layout: detail
+fields:
+  id,link: DE10037
+  title: Parfümfreie Bodylotion
+  status: Aktiv
+  category: Kosmetik
+  sale_price: 11.25
+  compare_at_price: 13.5
+  quantity: 120
+  registration_date: '2026-01-08'
+  brand_name: Oakfern
+  code: DE-SKI-101
+  stock_keeping_unit: DESK1001
+  model_name: SK-792
+  manufacturer: Oakfern Works
+  origin_country: Korea
+  color: Creme
+  barcode: '8887846041100'
+  supply_price: 7.06
+  low_stock_threshold: 20
+  shipping_fee: 2.05
+  description: Reine Feuchtigkeit ohne zugesetzten Duft.
+title: Produktdetails

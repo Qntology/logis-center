@@ -1,0 +1,16 @@
+page_id: tilleuls-review-detail-RV7011
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/review/view?id=RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: En attente
+  title: Mieux que prévu, vraiment bien fini.
+  name: Arthur Bernard
+  registration_date: '2026-08-18'
+title: Avis

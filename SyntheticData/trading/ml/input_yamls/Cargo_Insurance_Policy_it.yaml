@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: it
+document_title: Polizza di assicurazione merci
+metadata:
+  policy_number: IP-IT-797609
+  issue_date: '2026-09-16'
+  effective_date: '2026-09-17'
+  related_invoice_number: CI-IT-2609-622
+  related_bl_number: BL-IT74203367
+  related_lc_number: LC-IT9700023
+  related_po_number: PO-IT-40256
+parties:
+  insurer:
+    name: Assicurazioni Marittime Tirrene S.p.A.
+    address: Via XX Settembre 15, 16121 Genova, Italia
+  insured:
+    name: Dabin Coffee Equipment Co., Ltd.
+    address: 112 Teheran-ro, Gangnam-gu, Seul, Corea del Sud
+coverage_details:
+  sum_insured: 371580.0
+  currency: EUR
+  valuation_basis: Valore della fattura maggiorato del 10 %
+  coverage_conditions: Institute Cargo Clauses (A) – tutti i rischi
+  premium_amount: 928.95
+  claims_payable_at: Seul, Corea del Sud
+transport_details:
+  vessel_flight: STELLA DEL TIRRENO V.330E
+  port_of_loading: Genova, Italia
+  port_of_discharge: Busan, Corea del Sud
+cargo_details:
+- mark_and_numbers: DABIN / SEUL / PRODOTTO IN ITALIA
+  description_of_goods: Macchine per caffè espresso e macinacaffè
+  number_of_packages: 80 casse
+  gross_weight_kg: 6660.0

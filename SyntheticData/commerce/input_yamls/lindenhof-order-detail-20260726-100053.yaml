@@ -1,0 +1,28 @@
+page_id: lindenhof-order-detail-20260726-100053
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/order/view?id=20260726-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260726-100053
+  registration_date: '2026-07-26'
+  status: Storniert
+  goods: Wasserkocher mit Temperaturwahl
+  sender_name: Clara Richter
+  recipient_name: Marie Wagner
+  quantity: 6
+  amount: 174.42
+  shipping_fee: 0.0
+  payment_method: Kreditkarte
+  sender_phone: +49 164 53197375
+  sender_address: Bahnhofstraße 148, 79098 Freiburg
+  recipient_phone: +49 110 20175125
+  recipient_address: Schillerstraße 94, 28195 Bremen
+  payment_origin: ZahlBrücke
+  payment_date: '2026-07-26'
+  card: Mittelwald Card
+title: Bestelldetails

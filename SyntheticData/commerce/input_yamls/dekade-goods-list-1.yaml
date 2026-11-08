@@ -1,0 +1,114 @@
+page_id: dekade-goods-list-1
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/goods/list?page=1
+page_type: goods
+layout: list
+items:
+- id,link: NL10037
+  title: Linnen overhemd met korte mouwen
+  status: Concept
+  category: Kleding
+  sale_price: 29.4
+  compare_at_price: 35.28
+  quantity: 96
+  registration_date: '2026-01-25'
+  brand_name: Oakfern
+- id,link: NL10074
+  title: Stil mechanisch toetsenbord
+  status: Uitverkocht
+  category: Elektronica
+  sale_price: 59.3
+  compare_at_price: 71.16
+  quantity: 0
+  registration_date: '2026-05-17'
+  brand_name: 다온랩
+- id,link: NL10111
+  title: Houten bouwblokken
+  status: Uitverkocht
+  category: Speelgoed
+  sale_price: 28.3
+  quantity: 0
+  registration_date: '2026-05-17'
+  brand_name: 버들
+- id,link: NL10148
+  title: Lichte bodywarmer
+  status: Actief
+  category: Kleding
+  sale_price: 44.55
+  quantity: 120
+  registration_date: '2026-07-22'
+  brand_name: 다온랩
+- id,link: NL10185
+  title: Verzorgingsborstel voor huisdieren
+  status: Actief
+  category: Huisdieren
+  sale_price: 8.5
+  compare_at_price: 10.2
+  quantity: 350
+  registration_date: '2026-03-25'
+  brand_name: Kestrel Lane
+- id,link: NL10222
+  title: Krokante geroosterde zilvervliesrijst
+  status: Uitverkocht
+  category: Levensmiddelen
+  sale_price: 7.5
+  quantity: 0
+  registration_date: '2026-06-26'
+  brand_name: Oakfern
+- id,link: NL10259
+  title: Monitorverhoger
+  status: Actief
+  category: Kantoor
+  sale_price: 24.2
+  quantity: 120
+  registration_date: '2026-07-03'
+  brand_name: 하람
+- id,link: NL10296
+  title: Set luchtdichte glazen bakjes
+  status: Actief
+  category: Keuken
+  sale_price: 21.7
+  compare_at_price: 26.04
+  quantity: 350
+  registration_date: '2026-08-02'
+  brand_name: 하람
+- id,link: NL10333
+  title: Kinderservies
+  status: Concept
+  category: Baby
+  sale_price: 19.4
+  compare_at_price: 23.28
+  quantity: 350
+  registration_date: '2026-01-14'
+  brand_name: Tidewell
+- id,link: NL10370
+  title: Opvouwbare wandelstokken
+  status: Uitverkocht
+  category: Buitensport
+  sale_price: 36.75
+  quantity: 0
+  registration_date: '2026-03-27'
+  brand_name: Marlow & Finch
+- id,link: NL10407
+  title: Minerale zonnebrandcrème
+  status: Uitverkocht
+  category: Verzorging
+  sale_price: 18.35
+  compare_at_price: 22.02
+  quantity: 0
+  registration_date: '2026-07-22'
+  brand_name: 누리온
+- id,link: NL10444
+  title: Documentenorganizer
+  status: Actief
+  category: Kantoor
+  sale_price: 10.05
+  compare_at_price: 12.06
+  quantity: 7
+  registration_date: '2026-02-04'
+  brand_name: 솔빛
+title: Producten

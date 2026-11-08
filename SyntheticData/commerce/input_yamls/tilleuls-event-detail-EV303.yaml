@@ -1,0 +1,17 @@
+page_id: tilleuls-event-detail-EV303
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/event/view?id=EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: Balade de printemps
+  type: Vitrine
+  started_at: '2026-02-10'
+  expired_at: '2026-02-20'
+  status: En cours
+title: Campagne

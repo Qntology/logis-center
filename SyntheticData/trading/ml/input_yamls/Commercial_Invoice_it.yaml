@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: it
+document_title: Fattura commerciale
+metadata:
+  invoice_number: CI-IT-2609-622
+  issue_date: '2026-09-15'
+  reference_po_number: PO-IT-40256
+  related_bl_number: BL-IT74203367
+  related_lc_number: LC-IT9700023
+  currency: EUR
+parties:
+  shipper_exporter:
+    name: Officine Caffè Aurora S.r.l.
+    address: Via Torino 48, 20123 Milano, Italia
+    contact_number: +39 02 5550 1420
+    tax_id: IT 08123450964
+  consignee:
+    name: Dabin Coffee Equipment Co., Ltd.
+    address: 112 Teheran-ro, Gangnam-gu, Seul, Corea del Sud
+    contact_number: +82 2 555 0129
+    tax_id: 220-87-61234
+shipping_details:
+  port_of_loading: Genova, Italia
+  port_of_discharge: Busan, Corea del Sud
+  vessel_flight: STELLA DEL TIRRENO V.330E
+  incoterms: FOB Genova
+line_items:
+- item_code: ESP-2G
+  description: Macchine per caffè espresso a due gruppi
+  quantity: 60
+  unit: pz
+  unit_price: 4250.0
+  total_amount: 255000.0
+  hs_code: '8516.71'
+- item_code: MAC-64
+  description: Macinacaffè elettrici professionali
+  quantity: 120
+  unit: pz
+  unit_price: 690.0
+  total_amount: 82800.0
+  hs_code: '8509.40'
+summary:
+  total_quantity: 180
+  total_items_amount: 337800.0
+  freight_charge: 0.0
+  insurance: 0.0
+  grand_total_amount: 337800.0

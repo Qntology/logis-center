@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: it
+document_title: Polizza di carico
+metadata:
+  bl_number: BL-IT74203367
+  issue_date: '2026-09-17'
+  related_invoice_number: CI-IT-2609-622
+  related_po_number: PO-IT-40256
+  related_lc_number: LC-IT9700023
+  freight_term: Nolo pagabile a destino
+parties:
+  shipper:
+    name: Officine Caffè Aurora S.r.l.
+    address: Via Torino 48, 20123 Milano, Italia
+  consignee:
+    name: Dabin Coffee Equipment Co., Ltd.
+    address: 112 Teheran-ro, Gangnam-gu, Seul, Corea del Sud
+  notify_party:
+    name: Dabin Coffee Equipment Co., Ltd.
+    address: 112 Teheran-ro, Gangnam-gu, Seul, Corea del Sud
+  carrier:
+    name: Linee Marittime Tirreno S.p.A.
+shipping_details:
+  vessel_flight: STELLA DEL TIRRENO V.330E
+  port_of_loading: Genova, Italia
+  port_of_discharge: Busan, Corea del Sud
+  place_of_receipt: Milano, Italia
+  place_of_delivery: Seul, Corea del Sud
+cargo_details:
+  container_number: LMTU8514810
+  seal_number: SL645023
+  marks_and_numbers: DABIN / SEUL / PRODOTTO IN ITALIA
+  number_of_packages: 80 casse
+  description_of_goods: Macchine per caffè espresso e macinacaffè
+  gross_weight_kg: 6660.0
+  measurement_cbm: 39.0

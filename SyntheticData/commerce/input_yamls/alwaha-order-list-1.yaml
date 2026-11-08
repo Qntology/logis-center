@@ -1,0 +1,139 @@
+page_id: alwaha-order-list-1
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/my/orders?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20260530-100053
+  registration_date: '2026-05-30'
+  status: تم التوصيل
+  goods: موزع USB-C متعدد المنافذ
+  tracking_number: '481102287050'
+  sender_name: عبدالله الزهراني
+  recipient_name: عبدالله الزهراني
+  quantity: 4
+  amount: 427.4
+  shipping_fee: 0.0
+  payment_method: بطاقة ائتمان
+- id,link: 20260604-100106
+  registration_date: '2026-06-04'
+  status: ملغى
+  goods: جرانولا عضوية
+  sender_name: ريم القحطاني
+  recipient_name: ريم القحطاني
+  quantity: 3
+  amount: 214.2
+  shipping_fee: 0.0
+  payment_method: بطاقة ائتمان
+- id,link: 20260506-100159
+  registration_date: '2026-05-06'
+  status: تم الشحن
+  goods: فأرة عمودية مريحة
+  tracking_number: '612860245088'
+  sender_name: سلطان الحربي
+  recipient_name: سلطان الحربي
+  quantity: 11
+  amount: 918.8
+  shipping_fee: 0.0
+  payment_method: محفظة رقمية
+- id,link: 20260723-100212
+  registration_date: '2026-07-23'
+  status: تم التوصيل
+  goods: سيروم إصلاح الشعر
+  tracking_number: '886468616431'
+  sender_name: ريم العنزي
+  recipient_name: هند القحطاني
+  quantity: 5
+  amount: 234.23
+  shipping_fee: 0.0
+  payment_method: بطاقة ائتمان
+- id,link: 20260924-100265
+  registration_date: '2026-09-24'
+  status: مدفوع
+  goods: بطانية مايكروفايبر
+  sender_name: هند المطيري
+  recipient_name: هند المطيري
+  quantity: 1
+  amount: 74.04
+  shipping_fee: 8.2
+  payment_method: بطاقة ائتمان
+- id,link: 20260428-100318
+  registration_date: '2026-04-28'
+  status: تم الشحن
+  goods: سيروم إصلاح الشعر
+  tracking_number: '407509526790'
+  sender_name: عبدالله المطيري
+  recipient_name: عبدالله المطيري
+  quantity: 7
+  amount: 580.25
+  shipping_fee: 0.0
+  payment_method: محفظة رقمية
+- id,link: 20260512-100371
+  registration_date: '2026-05-12'
+  status: تم التوصيل
+  goods: لوز محمص
+  tracking_number: '855188322504'
+  sender_name: عبدالله الغامدي
+  recipient_name: سلطان المطيري
+  quantity: 7
+  amount: 422.75
+  shipping_fee: 0.0
+  payment_method: بطاقة ائتمان
+- id,link: 20260628-100424
+  registration_date: '2026-06-28'
+  status: مرتجع
+  goods: طعام جاف مضاد للحساسية
+  tracking_number: '745565994216'
+  sender_name: سلطان الغامدي
+  recipient_name: سلطان الغامدي
+  quantity: 2
+  amount: 179.01
+  shipping_fee: 0.0
+  payment_method: تحويل بنكي
+- id,link: 20261005-100477
+  registration_date: '2026-10-05'
+  status: بانتظار الدفع
+  goods: حامل رافع للشاشة
+  sender_name: خالد الزهراني
+  recipient_name: فاطمة الزهراني
+  quantity: 8
+  amount: 882.36
+  shipping_fee: 0.0
+  payment_method: محفظة رقمية
+- id,link: 20260724-100530
+  registration_date: '2026-07-24'
+  status: قيد المعالجة
+  goods: رباط تبريد للرقبة
+  sender_name: عمر الزهراني
+  recipient_name: عمر الزهراني
+  quantity: 5
+  amount: 163.0
+  shipping_fee: 0.0
+  payment_method: تحويل بنكي
+- id,link: 20260902-100583
+  registration_date: '2026-09-02'
+  status: تم التوصيل
+  goods: لوحة مفاتيح ميكانيكية صامتة
+  tracking_number: '994766072500'
+  sender_name: لمى الشمري
+  recipient_name: لمى الشمري
+  quantity: 5
+  amount: 616.15
+  shipping_fee: 0.0
+  payment_method: بطاقة ائتمان
+- id,link: 20260716-100636
+  registration_date: '2026-07-16'
+  status: تم الشحن
+  goods: مدفأة يد قابلة لإعادة الشحن
+  tracking_number: '512369266957'
+  sender_name: عبدالله الحربي
+  recipient_name: عبدالله الحربي
+  quantity: 5
+  amount: 419.45
+  shipping_fee: 0.0
+  payment_method: تحويل بنكي
+title: الطلبات

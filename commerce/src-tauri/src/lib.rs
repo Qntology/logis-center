@@ -5352,17 +5352,6 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
         }
     };
     
-    // 🌟 [추가] Stanza 모델 체크용 함수 추가
-    let has_valid_stanza = |dir: &std::path::PathBuf| -> bool {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            entries.flatten().any(|e| {
-                e.path().extension().map_or(false, |ext| ext == "onnx") && e.metadata().map(|m| m.len()).unwrap_or(0) > 1_000_000
-            })
-        } else {
-            false
-        }
-    };
-
     let qwen3_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
     let qwen3_5_dir = base_path.join("Qwen3.5-2B-Instruct-gguf");
     let granite_dir = base_path.join("granite-4.0-h-350m");
@@ -5377,36 +5366,10 @@ async fn check_model_status() -> Result<serde_json::Value, String> {
     status_map.insert("Embedding".to_string(), serde_json::json!(has_valid_model(&embed_dir)));
     status_map.insert("SigLIP2".to_string(), serde_json::json!(has_valid_model(&siglip2_dir)));
 
-    let supported_stanza_langs = [
-        "korean", "english", "japanese", "chinese", "french", "german", "spanish", 
-        "italian", "portuguese", "dutch", "russian", "arabic", "thai", "hindi", 
-        "bengali", "greek", "hebrew", "vietnamese"
-    ];
-
-    for lang in supported_stanza_langs.iter() {
-        let lang_code = match *lang {
-            "korean" => "ko",
-            "english" => "en",
-            "japanese" => "ja",
-            "chinese" => "zh-hans",
-            "french" => "fr",
-            "german" => "de",
-            "spanish" => "es",
-            "italian" => "it",
-            "portuguese" => "pt",
-            "dutch" => "nl",
-            "russian" => "ru",
-            "arabic" => "ar",
-            "thai" => "th",
-            "hindi" => "hi",
-            "bengali" => "bn",
-            "greek" => "el",
-            "hebrew" => "he",
-            "vietnamese" => "vi",
-            _ => "en",
-        };
-        let stanza_dir = base_path.join(format!("stanza/{}", lang_code));
-        status_map.insert(format!("stanza_{}", lang), serde_json::json!(has_valid_stanza(&stanza_dir)));
+    // 🌟 [STANZA] 변환본이 있는 12개 언어 (stanza-onnx-export format 2). vocab.json 과 그 파일 목록이 모두 있어야 설치로 봅니다.
+    for (lang, code) in crate::stanza::UI_LANGS.iter() {
+        let stanza_dir = base_path.join("stanza").join(code);
+        status_map.insert(format!("stanza_{}", lang), serde_json::json!(crate::stanza::is_installed(&stanza_dir)));
     }
 
     Ok(serde_json::Value::Object(status_map))
@@ -5479,28 +5442,7 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
         // 🌟 [수정] stanza 다운로드 경로 동적 맵핑 (models/stanza/{lang} 구조 지원)
         let folder_name = if model_name.starts_with("stanza_") {
             let lang = model_name.replace("stanza_", "");
-            let lang_code = match lang.as_str() {
-                "korean" => "ko",
-                "english" => "en",
-                "japanese" => "ja",
-                "chinese" => "zh-hans",
-                "french" => "fr",
-                "german" => "de",
-                "spanish" => "es",
-                "italian" => "it",
-                "portuguese" => "pt",
-                "dutch" => "nl",
-                "russian" => "ru",
-                "arabic" => "ar",
-                "thai" => "th",
-                "hindi" => "hi",
-                "bengali" => "bn",
-                "greek" => "el",
-                "hebrew" => "he",
-                "vietnamese" => "vi",
-                _ => "en",
-            };
-            format!("stanza/{}", lang_code)
+            format!("stanza/{}", crate::stanza::lang_code(&lang).unwrap_or("en"))
         } else {
             match model_name.as_str() {
                 "Qwen3" => "Qwen3-0.6B-Instruct-gguf".to_string(),
@@ -5521,34 +5463,25 @@ async fn download_model(app_handle: tauri::AppHandle, model_name: String) -> Res
         // 🌟 [수정] 문자열 타입(String)으로 변환하여 다국어 url을 생성할 수 있도록 확장
         let files_to_download: Vec<(String, String)> = if model_name.starts_with("stanza_") {
             let lang = model_name.replace("stanza_", "");
-            let lang_code = match lang.as_str() {
-                "korean" => "ko",
-                "english" => "en",
-                "japanese" => "ja",
-                "chinese" => "zh-hans",
-                "french" => "fr",
-                "german" => "de",
-                "spanish" => "es",
-                "italian" => "it",
-                "portuguese" => "pt",
-                "dutch" => "nl",
-                "russian" => "ru",
-                "arabic" => "ar",
-                "thai" => "th",
-                "hindi" => "hi",
-                "bengali" => "bn",
-                "greek" => "el",
-                "hebrew" => "he",
-                "vietnamese" => "vi",
-                _ => "en",
-            };
-            vec![
-                (format!("https://huggingface.co/PopupLink/stanza-{}/resolve/main/vocab.json", lang_code), "vocab.json".to_string()),
-                (format!("https://huggingface.co/PopupLink/stanza-{}/resolve/main/pos.onnx", lang_code), "pos.onnx".to_string()),
-                (format!("https://huggingface.co/PopupLink/stanza-{}/resolve/main/tokenizer.onnx", lang_code), "tokenizer.onnx".to_string()),
-                (format!("https://huggingface.co/PopupLink/stanza-{}/resolve/main/depparse.onnx", lang_code), "depparse.onnx".to_string()),
-                (format!("https://huggingface.co/PopupLink/stanza-{}/resolve/main/lemma.onnx", lang_code), "lemma.onnx".to_string()),
-            ]
+            let code = crate::stanza::lang_code(&lang).unwrap_or("en");
+            // 이전 판(format 1) 폴더는 이름을 바꿔 둡니다. 같은 이름(pos.onnx …)의 옛 파일이 있으면 아래 루프가 받지 않고 건너뜁니다.
+            let local_vocab = dir_path.join("vocab.json");
+            if local_vocab.exists() && !crate::stanza::is_installed(&dir_path) {
+                let backup = dir_path.with_file_name(format!("{}.format1", code));
+                let _ = std::fs::remove_dir_all(&backup);
+                if std::fs::rename(&dir_path, &backup).is_ok() {
+                    println!("[DOWNLOAD] 이전 Stanza 변환본을 {:?} 로 옮겼습니다", backup);
+                }
+                let _ = std::fs::create_dir_all(&dir_path);
+            }
+            let base = format!("{}{}/resolve/main", crate::stanza::HF_REPO_PREFIX, code);
+            match crate::stanza::remote_manifest(&base).await {
+                Ok(files) => files.into_iter().map(|f| (format!("{}/{}", base, f), f)).collect(),
+                Err(e) => {
+                    let _ = app_handle.emit("download_error", serde_json::json!({"model": model_name, "error": format!("{:#}", e)}));
+                    return;
+                }
+            }
         } else {
             match model_name.as_str() {
                 "Qwen3" => vec![

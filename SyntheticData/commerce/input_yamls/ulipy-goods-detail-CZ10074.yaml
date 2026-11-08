@@ -1,0 +1,30 @@
+page_id: ulipy-goods-detail-CZ10074
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/goods/view?id=CZ10074
+page_type: goods
+layout: detail
+fields:
+  id,link: CZ10074
+  title: Škrabadlo pro kočky
+  status: V prodeji
+  category: Mazlíčci
+  sale_price: 350
+  quantity: 42
+  registration_date: '2026-08-05'
+  brand_name: Kestrel Lane
+  code: CZ-PET-102
+  stock_keeping_unit: CZPE1002
+  model_name: PE-545
+  manufacturer: 누리온산업
+  origin_country: Polsko
+  color: Antracitová
+  barcode: '8842165994437'
+  supply_price: 235
+  low_stock_threshold: 10
+  shipping_fee: 50
+  description: Válcový sloupek z vlnité lepenky.
+title: Detail produktu

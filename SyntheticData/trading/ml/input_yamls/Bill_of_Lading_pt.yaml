@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: pt
+document_title: Conhecimento de embarque
+metadata:
+  bl_number: BL-PT56145092
+  issue_date: '2026-09-23'
+  related_invoice_number: CI-PT-2609-197
+  related_po_number: PO-PT-74235
+  related_lc_number: LC-PT3608203
+  freight_term: Frete pago na origem
+parties:
+  shipper:
+    name: Corticeira Vale Verde, Lda.
+    address: Rua do Sobreiro 9, 4520-123 Santa Maria da Feira, Portugal
+  consignee:
+    name: Hwain Interior Co., Ltd.
+    address: 27 Haeun-daero, Haeundae-gu, Busan, Coreia do Sul
+  notify_party:
+    name: Hwain Interior Co., Ltd.
+    address: 27 Haeun-daero, Haeundae-gu, Busan, Coreia do Sul
+  carrier:
+    name: Transportes Marítimos Atlântico, S.A.
+shipping_details:
+  vessel_flight: ATLANTICO NORTE V.091E
+  port_of_loading: Leixões, Portugal
+  port_of_discharge: Busan, Coreia do Sul
+  place_of_receipt: Santa Maria da Feira, Portugal
+  place_of_delivery: Busan, Coreia do Sul
+cargo_details:
+  container_number: TMAU7489465
+  seal_number: SL470663
+  marks_and_numbers: HWAIN / BUSAN / FABRICADO EM PORTUGAL
+  number_of_packages: 26 paletes
+  description_of_goods: Rolhas de cortiça natural e painéis de aglomerado de cortiça
+  gross_weight_kg: 8750.0
+  measurement_cbm: 39.6

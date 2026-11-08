@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: ar
+document_title: قائمة التعبئة
+metadata:
+  packing_list_number: PL-SA-2610-276
+  issue_date: '2026-10-01'
+  related_invoice_number: CI-SA-2610-806
+  related_po_number: PO-SA-12044
+  related_bl_number: BL-SA92992380
+parties:
+  shipper_exporter:
+    name: شركة الواحة للبتروكيماويات
+    address: شارع الصناعة 12، الجبيل الصناعية 35514، المملكة العربية السعودية
+  consignee:
+    name: Seorin Polymer Co., Ltd.
+    address: 19 Yeosusandan-ro، يوسو، كوريا الجنوبية
+shipping_details:
+  vessel_flight: AL JUBAIL PEARL V.044E
+  port_of_loading: الجبيل، المملكة العربية السعودية
+  port_of_discharge: يوسو، كوريا الجنوبية
+packing_details:
+- item_code: HDPE-5502
+  description: حبيبات بولي إيثيلين عالي الكثافة
+  quantity: 400
+  unit: طن
+  packages: 16000
+  package_type: أكياس
+  net_weight_kg: 400000.0
+  gross_weight_kg: 401600.0
+  measurement_cbm: 560.0
+- item_code: PP-H030
+  description: حبيبات بولي بروبيلين متجانس
+  quantity: 200
+  unit: طن
+  packages: 8000
+  package_type: أكياس
+  net_weight_kg: 200000.0
+  gross_weight_kg: 200800.0
+  measurement_cbm: 280.0
+summary:
+  total_packages: 24000
+  total_net_weight_kg: 600000.0
+  total_gross_weight_kg: 602400.0
+  total_measurement_cbm: 840.0

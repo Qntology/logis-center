@@ -19,6 +19,11 @@
   · 실제 페이지에 있는 함정을 넣습니다: 상태 필터 탭, 푸터 회사 주소, 추천 상품 위젯, 주문 상세의 상품 표,
     두 줄짜리 행, 라벨 없는 카드, 해시 CSS 클래스, input 안의 값, <br> 로 끊긴 주소, 적립금 · 할인 같은 스키마 밖 숫자 열.
 
+다국어 (lang_packs)
+  · 한국어 · 영어 쇼핑몰 6곳(dev · test) 밖에 독일어 · 스페인어 · 프랑스어 · 이탈리아어 · 포르투갈어 · 네덜란드어 · 체코어 ·
+    아랍어 · 일본어 · 중국어 쇼핑몰을 하나씩 둡니다 (분할 ml). 화면 문구 · 상태어 · 상품명 · 사람 · 주소 · 금액 · 날짜 표기 ·
+    질의를 lang_packs/<언어>.py 에서 가져오고, 한국어 · 영어 쇼핑몰의 출력은 바뀌지 않습니다 (--check).
+
 사용법
   python generate_commerce_pages.py            # 전체 생성
   python generate_commerce_pages.py --check    # 다시 생성해 파일이 같은지만 확인
@@ -34,6 +39,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import yaml
+
+from lang_packs import PACKS, PRODUCT_KEYS
 
 ROOT = Path(__file__).resolve().parent
 SEED = 20261103
@@ -105,6 +112,8 @@ PRODUCTS = [
     ("스마트 밴드", "Smart fitness band", "audio_power", "디지털", "걸음 수와 수면을 기록합니다.", "Tracks steps and sleep.", 49000),
     ("USB-C 멀티 허브", "USB-C multiport hub", "audio_power", "디지털", "HDMI 와 USB 포트를 늘려 줍니다.", "Adds HDMI and USB ports.", 37000),
 ]
+
+assert [p[1] for p in PRODUCTS] == list(PRODUCT_KEYS), "lang_packs.PRODUCT_NAMES_EN 이 PRODUCTS 와 다릅니다"
 
 CATEGORY_EN = {
     "의류": "Apparel", "생활": "Home", "가전": "Appliances", "사무": "Office", "디지털": "Electronics",
@@ -179,6 +188,10 @@ SHOPS = [
          "88 Quarry Road, Duluth, MN 55802", "+1-218-555-0177", "USD", "us_long", "dollar"),
 ]
 
+# ── ml: 언어별 쇼핑몰 (lang_packs). dev · test 수치에 섞이지 않게 분할을 따로 둡니다.
+SHOPS += [Shop(**{k: v for k, v in pk["shop"].items() if k != "code_prefix"}) for pk in PACKS.values()]
+LOCAL_SHOP = {"ko", "en"}
+
 THEME_DESC = {
     "admin_twin": "관리자 표. 레코드 하나가 두 개의 <tr> 로 나뉩니다.",
     "admin_grid": "ARIA 역할과 해시 CSS 클래스만 있는 div 그리드.",
@@ -213,7 +226,26 @@ def fmt_date(d, style: str, with_time: bool = False) -> str:
         return dt.strftime("%y-%m-%d") + t
     if style == "us_long":
         return dt.strftime("%b ") + f"{dt.day}, {dt.year}" + t
+    if style == "dmy_dot":
+        return dt.strftime("%d.%m.%Y") + t
+    if style == "dmy_slash":
+        return dt.strftime("%d/%m/%Y") + t
+    if style == "dmy_dash":
+        return dt.strftime("%d-%m-%Y") + t
+    if style == "cs_dot":
+        return f"{dt.day}. {dt.month}. {dt.year}" + t
+    if style == "ymd_slash":
+        return dt.strftime("%Y/%m/%d") + t
+    if style == "ja_long":
+        return f"{dt.year}年{dt.month}月{dt.day}日" + t
+    if style == "iso":
+        return dt.strftime("%Y-%m-%d") + t
     raise ValueError(style)
+
+
+def _eu(amount_minor: int) -> str:
+    """1.234,56 (유럽식 천 단위 · 소수점)"""
+    return f"{amount_minor / 100:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
 
 
 def fmt_money(amount, style: str) -> str:
@@ -225,22 +257,69 @@ def fmt_money(amount, style: str) -> str:
         return f"₩{amount:,}"
     if style == "dollar":
         return f"${amount / 100:,.2f}"
+    if style == "eur_suffix":
+        return f"{_eu(amount)} €"
+    if style == "eur_fr":
+        return f"{_eu(amount).replace('.', ' ')} €"
+    if style == "eur_prefix":
+        return f"€ {_eu(amount)}"
+    if style == "czk":
+        return f"{amount:,} Kč".replace(",", " ")
+    if style == "sar":
+        return f"{amount / 100:,.2f} ر.س"
+    if style == "yen":
+        return f"¥{amount:,}"
+    if style == "yuan":
+        return f"¥{amount / 100:,.2f}"
     raise ValueError(style)
 
 
+# 원화 기준가를 쇼핑몰 통화로: (1 단위 = 원, 보조 단위 배수). USD · KRW 는 위 식 그대로입니다.
+CURRENCY = {"EUR": (1450, 100), "JPY": (9.2, 1), "CNY": (190, 100), "CZK": (60, 1), "SAR": (365, 100)}
+
+
 def price_of(base_won: int, shop: Shop) -> int:
-    """KRW 는 원, USD 는 센트 단위 정수로 저장합니다."""
+    """KRW 는 원, USD 는 센트 단위 정수로 저장합니다. 다른 통화는 CURRENCY (EUR · CNY · SAR 은 보조 단위, JPY · CZK 는 1 단위)."""
+    if shop.currency in CURRENCY:
+        rate, minor = CURRENCY[shop.currency]
+        return int(round(base_won / rate * 100 / 5)) * 5 if minor == 100 else int(round(base_won / rate / 10)) * 10
     return int(round(base_won / 1300 * 100 / 5)) * 5 if shop.currency == "USD" else base_won
 
 
 def money_truth(amount: int, shop: Shop):
+    if shop.currency in CURRENCY:
+        return round(amount / 100, 2) if CURRENCY[shop.currency][1] == 100 else amount
     return round(amount / 100, 2) if shop.currency == "USD" else amount
 
 
 # ──────────────────────────────────────────────
 # 4. 세계 생성
 # ──────────────────────────────────────────────
+def pack(shop: Shop) -> dict:
+    return PACKS[shop.lang]
+
+
+def tr(shop: Shop, en: str) -> str:
+    """영어 화면 문구 · 상태어 → 언어 팩 번역 (한국어 · 영어 쇼핑몰에서는 부르지 않습니다)."""
+    return pack(shop)["tr"][en]
+
+
+def pack_person(shop: Shop, r: random.Random) -> dict:
+    pp = pack(shop)["person"]
+    first, last = r.choice(pp["first"]), r.choice(pp["last"])
+    if first in pp.get("first_f", ()):
+        last = pp["last_f"][pp["last"].index(last)]
+    place = r.choice(pp["places"])
+    street = r.choice(pp["streets"]) if pp["streets"] else ""
+    addr = pp["address"].format(street=street, num=r.randint(1, 180), a=r.randint(1, 9), b=r.randint(1, 30),
+                                c=r.randint(1, 20), **place)
+    phone = "".join(str(r.randint(0, 9)) if ch == "#" else ch for ch in pp["phone"])
+    return {"name": pp["name"].format(first=first, last=last), "address": addr, "phone": phone}
+
+
 def person(shop: Shop, r: random.Random) -> dict:
+    if shop.lang not in LOCAL_SHOP:
+        return pack_person(shop, r)
     if shop.lang == "ko":
         si, gu, road = r.choice(ROADS_KO)
         name = r.choice(SURNAMES_KO) + r.choice(GIVEN_KO)
@@ -268,23 +347,26 @@ def build_goods(shop: Shop) -> list:
         price = price_of(int(round(base * gr.uniform(0.92, 1.12) / 100)) * 100, shop)
         compare_at = price + (price // 5 if gr.random() < 0.45 else 0)
         stock = gr.choice([0, 0, 3, 7, 18, 42, 96, 120, 350])
-        code_prefix = {"haneul": "HN", "moa": "MA", "soop": "SP", "harbor": "HP", "ttukbaegi": "TB", "lantern": "BL"}[shop.key]
+        code_prefix = {"haneul": "HN", "moa": "MA", "soop": "SP", "harbor": "HP", "ttukbaegi": "TB", "lantern": "BL"}.get(shop.key) \
+            or pack(shop)["shop"]["code_prefix"]
+        loc = None if shop.lang in LOCAL_SHOP else pack(shop)
+        local = loc["products"][PRODUCT_KEYS[name_en]] if loc else None
         status_ko = "품절" if stock == 0 else gr.choice(["판매중", "판매중", "판매중", "진열안함"])
         status_en = "Sold out" if stock == 0 else gr.choice(["Active", "Active", "Active", "Draft"])
         goods.append({
             "seq": i,
             "id": f"{code_prefix}{10000 + i * 37}",
             "code": f"{code_prefix}-{concept[:3].upper()}-{100 + i}",
-            "status": status_ko if ko else status_en,
-            "title": name_ko if ko else name_en,
-            "title_alt": name_en if ko else name_ko,
+            "status": status_ko if ko else (tr(shop, status_en) if loc else status_en),
+            "title": name_ko if ko else (local[0] if loc else name_en),
+            "title_alt": name_en if ko or loc else name_ko,
             "concept": concept,
-            "category": cat_ko if ko else CATEGORY_EN[cat_ko],
+            "category": cat_ko if ko else (tr(shop, CATEGORY_EN[cat_ko]) if loc else CATEGORY_EN[cat_ko]),
             "registration_date": reg,
             "brand_name": gr.choice(BRANDS),
             "manufacturer": gr.choice(MAKERS),
-            "origin_country": (ORIGINS_KO if ko else ORIGINS_EN)[gr.randrange(5)],
-            "color": (COLORS_KO if ko else COLORS_EN)[gr.randrange(7)],
+            "origin_country": (ORIGINS_KO if ko else (loc["origins"] if loc else ORIGINS_EN))[gr.randrange(5)],
+            "color": (COLORS_KO if ko else (loc["colors"] if loc else COLORS_EN))[gr.randrange(7)],
             "sale_price": price,
             "supply_price": int(price * gr.uniform(0.55, 0.72)),
             "compare_at_price": compare_at,
@@ -293,9 +375,9 @@ def build_goods(shop: Shop) -> list:
             "stock_keeping_unit": f"{code_prefix}{concept[:2].upper()}{1000 + i}",
             "barcode": f"88{gr.randint(10 ** 10, 10 ** 11 - 1)}",
             "model_name": f"{concept[:2].upper()}-{gr.randint(100, 999)}",
-            "description": desc_ko if ko else desc_en,
+            "description": desc_ko if ko else (local[1] if loc else desc_en),
             "shipping_fee": 0 if price >= price_of(50000, shop) else price_of(3000, shop),
-            "condition": "새상품" if ko else "New",
+            "condition": "새상품" if ko else (tr(shop, "New") if loc else "New"),
         })
     return goods
 
@@ -308,7 +390,8 @@ def build_orders(shop: Shop, goods: list) -> list:
         if ko else
         ["Awaiting payment", "Paid", "Processing", "Shipped", "Shipped", "Delivered", "Delivered", "Delivered", "Cancelled", "Returned"]
     )
-    carriers = CARRIERS_KO if ko else CARRIERS_EN
+    loc = None if shop.lang in LOCAL_SHOP else pack(shop)
+    carriers = CARRIERS_KO if ko else (loc["carriers"] if loc else CARRIERS_EN)
     for i in range(1, 49):
         r = rng_for(shop.key, "order", i)
         when = datetime(2026, 4, 1, 8, 0) + timedelta(minutes=r.randint(0, 60 * 24 * 195))
@@ -332,13 +415,16 @@ def build_orders(shop: Shop, goods: list) -> list:
         title = lines[0]["goods"]["title"]
         extra = len(lines) - 1
         if extra:
-            title_disp = f"{title} 외 {extra}건" if ko else f"{title} + {extra} more"
+            if loc:
+                title_disp = loc["more"].format(title=title, n=extra, total=extra + 1)
+            else:
+                title_disp = f"{title} 외 {extra}건" if ko else f"{title} + {extra} more"
         else:
             title_disp = title
         orders.append({
             "seq": i,
             "id": f"{when:%Y%m%d}-{100000 + i * 53}",
-            "status": status,
+            "status": tr(shop, status) if loc else status,
             "when": when,
             "paid_at": None if status in ("입금대기", "Awaiting payment") else when + timedelta(minutes=r.randint(1, 240)),
             "buyer": buyer,
@@ -353,17 +439,18 @@ def build_orders(shop: Shop, goods: list) -> list:
             "shipping_fee": ship_fee,
             "amount": subtotal - discount + ship_fee,
             "method": method,
-            "payment_method": method_label,
-            "bank": r.choice(BANKS_KO if ko else BANKS_EN) if method == "bank" else None,
-            "card": r.choice(CARDS_KO if ko else CARDS_EN) if method == "card" else None,
-            "payment_origin": r.choice(PG_KO if ko else PG_EN),
+            "payment_method": tr(shop, method_label) if loc else method_label,
+            "bank": r.choice(BANKS_KO if ko else (loc["banks"] if loc else BANKS_EN)) if method == "bank" else None,
+            "card": r.choice(CARDS_KO if ko else (loc["cards"] if loc else CARDS_EN)) if method == "card" else None,
+            "payment_origin": r.choice(PG_KO if ko else (loc["pg"] if loc else PG_EN)),
             "tracking": tracking,
             "carrier": r.choice(carriers) if tracking else None,
             "ship_at": ship_at,
             "weight": round(r.uniform(0.3, 7.5), 1),
             "dims": (r.randint(18, 60), r.randint(10, 45), r.randint(6, 40)),
             "shipping_method": (
-                r.choice(["일반택배", "화물배송", "방문수령"]) if ko else r.choice(["Standard", "Freight", "Store pickup"])
+                r.choice(["일반택배", "화물배송", "방문수령"]) if ko else
+                (tr(shop, r.choice(["Standard", "Freight", "Store pickup"])) if loc else r.choice(["Standard", "Freight", "Store pickup"]))
             ),
             "duration_days": r.randint(1, 5),
         })
@@ -376,6 +463,9 @@ def build_reviews(shop: Shop, goods: list) -> list:
     tmpl_en = ["Better than expected, really %s.", "Second purchase and still %s.", "Packed with care and %s overall."]
     adj_ko = ["튼튼해서", "가벼워서", "마감이 좋아서", "색이 예뻐서"]
     adj_en = ["sturdy", "lightweight", "well finished", "lovely in colour"]
+    loc = None if shop.lang in LOCAL_SHOP else pack(shop)
+    if loc:
+        tmpl_en, adj_en = loc["review_tmpl"], loc["review_adj"]
     out = []
     for i in range(1, 21):
         r = rng_for(shop.key, "review", i)
@@ -383,7 +473,7 @@ def build_reviews(shop: Shop, goods: list) -> list:
         out.append({
             "seq": i,
             "id": f"RV{7000 + i * 11}",
-            "status": r.choice(["승인", "승인", "대기중", "숨김"] if ko else ["Approved", "Approved", "Pending", "Hidden"]),
+            "status": (lambda s: tr(shop, s) if loc else s)(r.choice(["승인", "승인", "대기중", "숨김"] if ko else ["Approved", "Approved", "Pending", "Hidden"])),
             "title": (r.choice(tmpl_ko) % r.choice(adj_ko)) if ko else (r.choice(tmpl_en) % r.choice(adj_en)),
             "goods": g["title"],
             "name": person(shop, r)["name"],
@@ -397,6 +487,9 @@ def build_coupons(shop: Shop) -> list:
     ko = shop.lang == "ko"
     names_ko = ["첫 구매 환영 혜택", "가을 맞이 감사제", "주말 한정 할인", "재구매 고객 감사", "앱 전용 혜택", "장바구니 응원"]
     names_en = ["First order welcome", "Autumn thank-you sale", "Weekend-only offer", "Returning customer perk", "App-exclusive deal", "Cart rescue offer"]
+    loc = None if shop.lang in LOCAL_SHOP else pack(shop)
+    if loc:
+        names_en = loc["coupon_names"]
     out = []
     for i in range(1, 11):
         r = rng_for(shop.key, "coupon", i)
@@ -407,11 +500,11 @@ def build_coupons(shop: Shop) -> list:
             "id": f"CP{4000 + i * 7}",
             "code": f"{shop.key[:3].upper()}{r.randint(100, 999)}",
             "title": r.choice(names_ko if ko else names_en) + f" {i}" + ("차" if ko else ""),
-            "type": ("정률" if pct else "정액") if ko else ("Percent off" if pct else "Fixed amount"),
+            "type": ("정률" if pct else "정액") if ko else (lambda s: tr(shop, s) if loc else s)("Percent off" if pct else "Fixed amount"),
             "discount": f"{r.choice([5, 10, 15, 20])}%" if pct else fmt_money(price_of(r.choice([2000, 3000, 5000]), shop), shop.money_style),
             "started_at": start,
             "expired_at": start + timedelta(days=r.choice([7, 14, 30])),
-            "status": r.choice(["진행중", "종료", "대기중"] if ko else ["Live", "Ended", "Scheduled"]),
+            "status": (lambda s: tr(shop, s) if loc else s)(r.choice(["진행중", "종료", "대기중"] if ko else ["Live", "Ended", "Scheduled"])),
             "quantity": r.choice([100, 300, 500, 1000]),
             "min_order_amount": price_of(r.choice([10000, 30000, 50000]), shop),
         })
@@ -422,6 +515,9 @@ def build_events(shop: Shop) -> list:
     ko = shop.lang == "ko"
     names_ko = ["봄 산책 기획전", "여름 휴가 준비전", "추석 선물 모음", "연말 감사 축제", "신상품 체험단 모집", "리뷰 왕 선발"]
     names_en = ["Spring stroll showcase", "Summer getaway picks", "Harvest gift guide", "Year-end celebration", "New arrivals tester program", "Top reviewer contest"]
+    loc = None if shop.lang in LOCAL_SHOP else pack(shop)
+    if loc:
+        names_en = loc["event_names"]
     out = []
     for i in range(1, 7):
         r = rng_for(shop.key, "event", i)
@@ -430,10 +526,10 @@ def build_events(shop: Shop) -> list:
             "seq": i,
             "id": f"EV{300 + i * 3}",
             "title": (names_ko if ko else names_en)[i - 1],
-            "type": r.choice(["기획전", "응모", "체험단"] if ko else ["Showcase", "Sweepstakes", "Tester"]),
+            "type": (lambda s: tr(shop, s) if loc else s)(r.choice(["기획전", "응모", "체험단"] if ko else ["Showcase", "Sweepstakes", "Tester"])),
             "started_at": start,
             "expired_at": start + timedelta(days=r.choice([10, 20, 45])),
-            "status": r.choice(["진행중", "종료", "대기중"] if ko else ["Live", "Ended", "Scheduled"]),
+            "status": (lambda s: tr(shop, s) if loc else s)(r.choice(["진행중", "종료", "대기중"] if ko else ["Live", "Ended", "Scheduled"])),
         })
     return out
 
@@ -519,16 +615,36 @@ STATUS_TABS = {
 }
 
 
+def chrome(shop: Shop) -> dict:
+    return CHROME.get(shop.lang) or pack(shop)["chrome"]
+
+
+def page_title(shop: Shop, ptype: str, layout: str) -> str:
+    if shop.lang in LOCAL_SHOP:
+        return PAGE_TITLE[(ptype, layout, shop.lang)]
+    return tr(shop, PAGE_TITLE[(ptype, layout, "en")])
+
+
+def status_tabs(shop: Shop, ptype: str) -> list:
+    if shop.lang in LOCAL_SHOP:
+        return STATUS_TABS[ptype].get(shop.lang)
+    return [tr(shop, x) for x in STATUS_TABS[ptype]["en"]]
+
+
 def css_hash(*parts) -> str:
     return "css-" + hashlib.md5("|".join(map(str, parts)).encode()).hexdigest()[:7]
 
 
+def rtl_attr(shop: Shop) -> str:
+    return ' dir="rtl"' if shop.lang == "ar" else ""
+
+
 def admin_chrome(shop: Shop, ptype: str, body: str, title: str) -> str:
-    c = CHROME[shop.lang]
+    c = chrome(shop)
     nav = "".join(f'<li class="gnb-item"><a href="/admin/{i}">{E(n)}</a></li>' for i, n in enumerate(c["nav"]))
     side = "".join(f'<li><a href="/admin/{ptype}/{i}">{E(n)}</a></li>' for i, n in enumerate(c["side"][ptype]))
     return (
-        f'<!doctype html><html lang="{shop.lang}"><head><meta charset="utf-8"><title>{E(title)} | {E(shop.name)}</title></head>'
+        f'<!doctype html><html lang="{shop.lang}"{rtl_attr(shop)}><head><meta charset="utf-8"><title>{E(title)} | {E(shop.name)}</title></head>'
         f'<body class="admin"><header id="hd"><h1 class="logo"><a href="/admin">{E(shop.name)} ADMIN</a></h1>'
         f'<nav id="gnb"><ul>{nav}</ul></nav></header>'
         f'<div id="wrapper"><aside id="snb"><h2>{E(c["nav"][1])}</h2><ul>{side}</ul></aside>'
@@ -541,10 +657,10 @@ def admin_chrome(shop: Shop, ptype: str, body: str, title: str) -> str:
 
 
 def store_chrome(shop: Shop, ptype: str, body: str, title: str) -> str:
-    c = CHROME[shop.lang]
+    c = chrome(shop)
     links = "".join(f'<a href="/p/{i}">{E(n)}</a>' for i, n in enumerate(c["foot"]))
     return (
-        f'<!doctype html><html lang="{shop.lang}"><head><meta charset="utf-8"><title>{E(title)} - {E(shop.name)}</title></head>'
+        f'<!doctype html><html lang="{shop.lang}"{rtl_attr(shop)}><head><meta charset="utf-8"><title>{E(title)} - {E(shop.name)}</title></head>'
         f'<body><div class="top-banner">{E(c["banner"])}</div>'
         f'<header class="site-header"><a class="brand" href="/">{E(shop.name)}</a>'
         f'<form class="site-search" action="/search"><input name="q" placeholder="{E(c["search"])}"></form>'
@@ -565,12 +681,12 @@ def chrome_for(shop: Shop, ptype: str, body: str, title: str) -> str:
 
 def toolbar(shop: Shop, ptype: str, count: int) -> str:
     """상태 필터 탭과 건수. 상태 어휘가 표 밖에도 잔뜩 나타나는 실제 페이지의 함정입니다."""
-    c = CHROME[shop.lang]
+    c = chrome(shop)
     tabs = "".join(
         f'<a class="tab" href="?status={i}">{E(t)}<em>({(count * (9 - i)) // 7})</em></a>'
-        for i, t in enumerate(STATUS_TABS[ptype][shop.lang])
+        for i, t in enumerate(status_tabs(shop, ptype))
     )
-    opts = "".join(f"<option>{E(t)}</option>" for t in STATUS_TABS[ptype][shop.lang])
+    opts = "".join(f"<option>{E(t)}</option>" for t in status_tabs(shop, ptype))
     return (
         f'<div class="status-tabs">{tabs}</div>'
         f'<form class="filter"><select name="status">{opts}</select><input name="q">'
@@ -580,7 +696,7 @@ def toolbar(shop: Shop, ptype: str, count: int) -> str:
 
 
 def pager(shop: Shop, page: int) -> str:
-    c = CHROME[shop.lang]
+    c = chrome(shop)
     nums = "".join(f'<a href="?page={i}"{" class=on" if i == page else ""}>{i}</a>' for i in range(1, 6))
     return f'<nav class="pager"><a href="?page={max(1, page - 1)}">{E(c["prev"])}</a>{nums}<a href="?page={page + 1}">{E(c["next"])}</a></nav>'
 
@@ -601,7 +717,18 @@ class Col:
 
 
 def L(shop: Shop, ko: str, en: str) -> str:
-    return ko if shop.lang == "ko" else en
+    if shop.lang in LOCAL_SHOP:
+        return ko if shop.lang == "ko" else en
+    return tr(shop, en)
+
+
+def days_text(shop: Shop, n: int) -> str:
+    if shop.lang in LOCAL_SHOP:
+        return L(shop, f"{n}일", f"{n} days")
+    days = pack(shop)["days"]
+    if isinstance(days, dict):
+        days = days.get(n, days["other"])
+    return days.format(n=n)
 
 
 def iso(d) -> str:
@@ -710,7 +837,7 @@ def tracking_cols(shop: Shop, o: dict, detail: bool) -> list:
         Col(L(shop, "세로", "Height"), f"{h}cm", "height", h),
         Col(L(shop, "길이", "Length"), f"{l}cm", "length", l),
         Col(L(shop, "배송방법", "Method"), o["shipping_method"], "shipping_method", o["shipping_method"]),
-        Col(L(shop, "소요일", "Transit time"), L(shop, f"{o['duration_days']}일", f"{o['duration_days']} days"), "shipping_duration", o["duration_days"]),
+        Col(L(shop, "소요일", "Transit time"), days_text(shop, o['duration_days']), "shipping_duration", o["duration_days"]),
         Col(L(shop, "운임", "Freight charge"), fmt_money(o["shipping_fee"], ms), "shipping_fee", money_truth(o["shipping_fee"], shop)),
     ]
     return cols
@@ -783,7 +910,7 @@ def list_admin_twin(shop: Shop, rows: list, ptype: str) -> str:
     out = [
         f'<div class="tbl_head01"><table id="sodr_list" class="tablef"><thead>'
         f'<tr><th rowspan="2"><input type="checkbox"></th><th rowspan="2">No</th>{head1}</tr>'
-        f'<tr>{head2}<th>{E(CHROME[shop.lang]["edit"])}</th></tr></thead><tbody>'
+        f'<tr>{head2}<th>{E(chrome(shop)["edit"])}</th></tr></thead><tbody>'
     ]
     for i, cols in enumerate(rows):
         cl = "list" + str(i % 2)
@@ -792,7 +919,7 @@ def list_admin_twin(shop: Shop, rows: list, ptype: str) -> str:
         out.append(
             f'<tr class="{cl}"><td rowspan="2"><input type="checkbox" name="chk[]" value="{i}"></td>'
             f'<td rowspan="2">{len(rows) - i}</td>{top}</tr>'
-            f'<tr class="{cl}">{bottom}<td><a class="btn" href="#">{E(CHROME[shop.lang]["edit"])}</a></td></tr>'
+            f'<tr class="{cl}">{bottom}<td><a class="btn" href="#">{E(chrome(shop)["edit"])}</a></td></tr>'
         )
     out.append("</tbody></table></div>")
     return "".join(out)
@@ -832,7 +959,7 @@ def list_store_cards(shop: Shop, rows: list, ptype: str) -> str:
         out.append(
             f'<li class="card"><div class="card-head">{head}</div>'
             f'<div class="card-body"><img src="/img/thumb.jpg" alt="">{title}{rest_plain}</div>'
-            f'<ul class="card-meta">{labelled}</ul><div class="card-foot"><button>{E(CHROME[shop.lang]["view"])}</button></div></li>'
+            f'<ul class="card-meta">{labelled}</ul><div class="card-foot"><button>{E(chrome(shop)["view"])}</button></div></li>'
         )
     out.append("</ul>")
     return "".join(out)
@@ -881,7 +1008,7 @@ def detail_admin_twin(shop: Shop, cols: list, ptype: str) -> str:
         f'<tr><th scope="row"><label for="f{i}">{E(c.label)}</label></th><td>{input_html(c, i)}</td></tr>'
         for i, c in enumerate(cols)
     )
-    return f'<form class="frm"><div class="tbl_frm01"><table>{rows}</table></div><button>{E(CHROME[shop.lang]["edit"])}</button></form>'
+    return f'<form class="frm"><div class="tbl_frm01"><table>{rows}</table></div><button>{E(chrome(shop)["edit"])}</button></form>'
 
 
 def detail_admin_grid(shop: Shop, cols: list, ptype: str) -> str:
@@ -936,7 +1063,7 @@ def recommend_widget(shop: Shop, world: dict, exclude_title: str, seed_key) -> s
         f'<em>{E(fmt_money(g["sale_price"], shop.money_style))}</em></li>'
         for g in picks
     )
-    return f'<section class="recommend"><h3>{E(CHROME[shop.lang]["recent"])}</h3><ul>{items}</ul></section>'
+    return f'<section class="recommend"><h3>{E(chrome(shop)["recent"])}</h3><ul>{items}</ul></section>'
 
 
 def line_items_table(shop: Shop, o: dict) -> str:
@@ -990,14 +1117,14 @@ def make_list_page(shop: Shop, world: dict, ptype: str, records: list, page: int
     for cols in rows:
         by = {c.label: c for c in cols}
         aligned.append([by.get(x, Col(x, "-")) for x in labels])
-    title = PAGE_TITLE[(ptype, "list", shop.lang)]
+    title = page_title(shop, ptype, "list")
     body = toolbar(shop, ptype, len(records) * 7) + LIST_RENDERERS[shop.theme](shop, aligned, ptype) + pager(shop, page)
     return chrome_for(shop, ptype, body, title), [truth_of(c) for c in rows], title
 
 
 def make_detail_page(shop: Shop, world: dict, ptype: str, rec: dict) -> tuple:
     cols = COLS_OF[ptype](shop, rec, True)
-    title = PAGE_TITLE[(ptype, "detail", shop.lang)]
+    title = page_title(shop, ptype, "detail")
     body = DETAIL_RENDERERS[shop.theme](shop, cols, ptype)
     if ptype == "order":
         body += line_items_table(shop, rec)
@@ -1079,6 +1206,11 @@ def queries_for(shop: Shop, world: dict) -> list:
                 "query": text, "relevant": sorted(set(relevant)),
             })
 
+    loc = None if shop.lang in LOCAL_SHOP else pack(shop)
+    if loc:
+        queries_for_pack(shop, world, loc, add)
+        return q
+
     # ① 의미 검색: 페이지에 없는 말로 묻습니다. 영어 질의는 언어를 건너가는 경우입니다.
     for concept, (q_ko, q_en) in CONCEPT_QUERIES.items():
         rel = [rec_key(shop, "goods", g["id"]) for g in goods if g["concept"] == concept]
@@ -1123,6 +1255,50 @@ def queries_for(shop: Shop, world: dict) -> list:
         add("goods_exact", shop.lang, g["title"], [rec_key(shop, "goods", g["id"])], "goods")
         add("goods_crosslang", "en" if ko else "ko", g["title_alt"], [rec_key(shop, "goods", g["id"])], "goods")
     return q
+
+
+def queries_for_pack(shop: Shop, world: dict, loc: dict, add) -> list:
+    """언어 팩 쇼핑몰: 같은 종류의 질의를 그 언어로 씁니다. 의미 검색은 그 언어 + 영어(언어 건너기), 상품명 건너기는 영어 이름."""
+    seen = visible_records(world)
+    goods, orders, shipped = seen["goods"], seen["orders"], seen["shipped"]
+    q = loc["queries"]
+    lang = shop.lang
+    for concept, (_, q_en) in CONCEPT_QUERIES.items():
+        rel = [rec_key(shop, "goods", g["id"]) for g in goods if g["concept"] == concept]
+        add("semantic", lang, loc["concepts"][concept], rel, "goods")
+        add("semantic", "en", q_en, rel, "goods")
+    r = rng_for(shop.key, "queries")
+    for o in r.sample(orders, 5):
+        add("identifier", lang, q["order"].format(id=o["id"]), [rec_key(shop, "order", o["id"])], "order")
+    for o in r.sample(shipped, min(5, len(shipped))):
+        add("identifier", lang, q["tracking"].format(tracking=o["tracking"]), [rec_key(shop, "tracking", o["tracking"])], "tracking")
+    for g in r.sample(goods, 5):
+        add("identifier", lang, q["goods"].format(id=g["id"]), [rec_key(shop, "goods", g["id"])], "goods")
+    for s in sorted({o["status"] for o in orders}):
+        rel = [rec_key(shop, "order", o["id"]) for o in orders if o["status"] == s]
+        add("status", lang, q["status"].format(status=s), rel, "order")
+    for o in r.sample(orders, 5):
+        name = o["buyer"]["name"]
+        rel = [rec_key(shop, "order", x["id"]) for x in orders if x["buyer"]["name"] == name]
+        add("person", lang, q["person"].format(name=name), rel, "order")
+    amounts = sorted(o["amount"] for o in orders)
+    threshold = amounts[int(len(amounts) * 0.85)]
+    rel = [rec_key(shop, "order", o["id"]) for o in orders if o["amount"] >= threshold]
+    add("amount", lang, q["amount"].format(amount=fmt_money(threshold, shop.money_style)), rel, "order")
+    for month in (5, 7, 9):
+        rel = [rec_key(shop, "order", o["id"]) for o in orders if o["when"].month == month]
+        add("period", lang, q["period"].format(month=loc["months"][month - 1], n=month), rel, "order")
+    for g in r.sample(goods, 6):
+        rel = [rec_key(shop, "order", o["id"]) for o in orders if any(l["goods"]["id"] == g["id"] for l in o["lines"])]
+        add("goods_in_order", lang, q["goods_in_order"].format(title=g["title"]), rel, "order")
+        add("goods_exact", lang, g["title"], [rec_key(shop, "goods", g["id"])], "goods")
+        add("goods_crosslang", "en", g["title_alt"], [rec_key(shop, "goods", g["id"])], "goods")
+
+
+def status_words() -> dict:
+    """언어 팩 상태어 → 영어 상태어. 평가 도구(score_commerce.status_table)가 시드의 상태 코드를 정할 때 씁니다."""
+    english = sorted({x for tabs in STATUS_TABS.values() for x in tabs["en"] if x != "All"})
+    return {lang: {pk["tr"][e]: e for e in english} for lang, pk in PACKS.items()}
 
 
 # ──────────────────────────────────────────────
@@ -1185,6 +1361,8 @@ def generate(out_root: Path) -> dict:
         yaml.safe_dump(queries, allow_unicode=True, sort_keys=False, width=1000), encoding="utf-8")
     (out_root / "records.yaml").write_text(
         yaml.safe_dump(records, allow_unicode=True, sort_keys=False, width=1000), encoding="utf-8")
+    (out_root / "status_words.yaml").write_text(
+        yaml.safe_dump(status_words(), allow_unicode=True, sort_keys=True, width=1000), encoding="utf-8")
     return {"pages": len(manifest), "queries": len(queries), "records": len(records)}
 
 
@@ -1206,7 +1384,7 @@ def main() -> int:
         for sub in ("input_yamls", "output_html"):
             cmp = filecmp.dircmp(tmp_root / sub, ROOT / sub)
             diffs += cmp.diff_files + cmp.left_only + cmp.right_only
-        for name in ("manifest.yaml", "queries.yaml", "records.yaml"):
+        for name in ("manifest.yaml", "queries.yaml", "records.yaml", "status_words.yaml"):
             if not filecmp.cmp(tmp_root / name, ROOT / name, shallow=False):
                 diffs.append(name)
     print("같음" if not diffs else f"다름 {len(diffs)}건: {diffs[:10]}")

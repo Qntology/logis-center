@@ -1,0 +1,28 @@
+page_id: alameda-order-detail-20260529-100106
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/my/orders/20260529-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260529-100106
+  registration_date: '2026-05-29'
+  status: Enviado
+  goods: Bloques de construcción de madera
+  tracking_number: '894459860597'
+  sender_name: Sofía García
+  recipient_name: Álvaro Moreno
+  quantity: 1
+  amount: 25.5
+  shipping_fee: 2.05
+  payment_method: Monedero digital
+  sender_phone: +34 617 950 443
+  sender_address: Avenida de la Paz 40, 28013 Madrid
+  recipient_phone: +34 640 646 912
+  recipient_address: Paseo de las Acacias 10, 41004 Sevilla
+  payment_origin: TPV Sereno
+  payment_date: '2026-05-30'
+title: Detalle del pedido

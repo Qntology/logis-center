@@ -917,11 +917,11 @@
   },
   "search_bridge": {
     "domain_words": {
-      "order": ["purchase", "주문", "구매"],
-      "tracking": ["shipment", "shipping", "delivery", "parcel", "배송", "택배", "송장", "운송"],
-      "review": ["리뷰", "후기"],
-      "coupon": ["voucher", "쿠폰"],
-      "event": ["campaign", "promotion", "이벤트", "기획전", "프로모션", "캠페인"]
+      "order": ["purchase", "주문", "구매", "bestellung", "pedido", "commande", "ordin", "l'ordin", "encomenda", "bestelling", "objednávk", "طلب", "注文", "订单"],
+      "tracking": ["shipment", "shipping", "delivery", "parcel", "배송", "택배", "송장", "운송", "sendung", "lieferung", "paket", "envío", "envio", "paquete", "colis", "expédition", "livraison", "spedizion", "pacco", "pacchi", "remessa", "seguimento", "zending", "pakket", "zásilk", "balík", "شحن", "تتبع", "荷物", "配送", "追跡", "発送", "包裹", "快递", "运单", "物流"],
+      "review": ["리뷰", "후기", "bewertung", "rezension", "reseña", "opinión", "avis", "recension", "avaliaç", "beoordeling", "recensie", "recenz", "مراجع", "レビュー", "口コミ", "评价", "评论"],
+      "coupon": ["voucher", "쿠폰", "gutschein", "rabattcode", "cupón", "cupon", "cupão", "cupom", "kortingscode", "waardebon", "kupón", "slevov", "قسيمة", "كوبون", "クーポン", "优惠券"],
+      "event": ["campaign", "promotion", "이벤트", "기획전", "프로모션", "캠페인", "kampagne", "aktion", "campaña", "promoci", "campagne", "campagn", "promozion", "campanha", "promoç", "kampaň", "akce", "حملة", "حملات", "キャンペーン", "イベント", "活动"]
     },
     "path_alias": {
       "amount": ["amount_total", "total_amount", "grand_total_amount", "price", "total_price_sum"],
@@ -1335,18 +1335,18 @@
     }
   },
   "status_filters": {
-    "draft": { "bias": "draft, preparation, pending pickup, cart", "prejudice": "complete, delivered, closed, running, active", "exact_match": ["draft", "drafts", "임시저장", "작성중", "초안", "下書き", "草稿", "Entwurf", "borrador", "brouillon", "bozza", "rascunho", "koncept", "مسودة"] },
-    "progress": { "bias": "progress, processing, active, running, transit, in transit", "prejudice": "draft, complete, error, stop, pause", "exact_match": ["in progress", "processing", "in transit", "진행중", "진행 중", "처리중", "처리 중", "배송중", "배송 중", "배송준비중", "배송 준비중", "상품준비중", "발송중", "결제완료", "進行中", "処理中", "配送中", "発送準備中", "进行中", "处理中", "运输中", "in Bearbeitung", "unterwegs", "en proceso", "en tránsito", "en cours", "en transit", "in corso", "in lavorazione", "in transito", "em andamento", "em processamento", "em trânsito", "in behandeling", "onderweg", "na cestě", "قيد المعالجة", "قيد التوصيل"] },
+    "draft": { "bias": "draft, preparation, pending pickup, cart", "prejudice": "complete, delivered, closed, running, active", "exact_match": ["draft", "drafts", "임시저장", "작성중", "초안", "下書き", "草稿", "Entwurf", "borrador", "brouillon", "bozza", "rascunho", "koncept", "مسودة", "awaiting payment", "zahlung ausstehend", "pendiente de pago", "en attente de paiement", "in attesa di pagamento", "a aguardar pagamento", "wacht op betaling", "čeká na platbu", "بانتظار الدفع", "入金待ち", "待付款", "entwurf", "concept", "pending", "ausstehend", "pendiente", "en attente", "in attesa", "pendente", "in afwachting", "čeká na schválení", "قيد المراجعة", "承認待ち", "待审核", "scheduled", "geplant", "programado", "programmé", "programmato", "agendado", "gepland", "naplánováno", "مجدولة", "開催予定", "未开始"] },
+    "progress": { "bias": "progress, processing, active, running, transit, in transit", "prejudice": "draft, complete, error, stop, pause", "exact_match": ["in progress", "processing", "in transit", "진행중", "진행 중", "처리중", "처리 중", "배송중", "배송 중", "배송준비중", "배송 준비중", "상품준비중", "발송중", "결제완료", "進行中", "処理中", "配送中", "発送準備中", "进行中", "处理中", "运输中", "in Bearbeitung", "unterwegs", "en proceso", "en tránsito", "en cours", "en transit", "in corso", "in lavorazione", "in transito", "em andamento", "em processamento", "em trânsito", "in behandeling", "onderweg", "na cestě", "قيد المعالجة", "قيد التوصيل", "paid", "bezahlt", "pagado", "payée", "pagato", "pago", "betaald", "zaplaceno", "مدفوع", "入金済み", "已付款", "in bearbeitung", "en préparation", "zpracovává se", "shipped", "enviado", "expédiée", "spedito", "verzonden", "odesláno", "تم الشحن", "発送済み", "已发货", "live", "läuft", "en curso", "attivo", "ativo", "lopend", "probíhá", "جارية", "開催中"] },
     "return": { "bias": "return, returning, returned", "prejudice": "progress, complete, draft", "exact_match": ["returned", "반품", "반품완료", "반품됨", "반품된", "返品", "返品済み", "已退货", "退货", "zurückgesendet", "retourniert", "devuelto", "retourné", "restituito", "devolvido", "geretourneerd", "vráceno", "مرتجع", "retournée", "retournées", "retournés", "devuelta", "devueltas", "devueltos", "restituita", "restituiti"] },
-    "complete": { "bias": "complete, delivered, closed, finished, published", "prejudice": "draft, progress, error, stop, return", "exact_match": ["completed", "delivered", "finished", "배송완료", "배달완료", "구매확정", "거래완료", "처리완료", "수령완료", "完了", "配達完了", "配送完了", "已完成", "已送达", "已签收", "abgeschlossen", "zugestellt", "completado", "entregado", "terminé", "livré", "completato", "consegnato", "concluído", "entregue", "voltooid", "afgeleverd", "bezorgd", "dokončeno", "doručeno", "مكتمل", "تم التسليم", "완료", "zugestellte", "abgeschlossene", "livrée", "livrées", "livrés", "terminée", "terminées", "entregada", "entregadas", "entregados", "completada", "completadas", "completados", "consegnata", "consegnati", "consegnate", "completata"] },
+    "complete": { "bias": "complete, delivered, closed, finished, published", "prejudice": "draft, progress, error, stop, return", "exact_match": ["completed", "delivered", "finished", "배송완료", "배달완료", "구매확정", "거래완료", "처리완료", "수령완료", "完了", "配達完了", "配送完了", "已完成", "已送达", "已签收", "abgeschlossen", "zugestellt", "completado", "entregado", "terminé", "livré", "completato", "consegnato", "concluído", "entregue", "voltooid", "afgeleverd", "bezorgd", "dokončeno", "doručeno", "مكتمل", "تم التسليم", "완료", "zugestellte", "abgeschlossene", "livrée", "livrées", "livrés", "terminée", "terminées", "entregada", "entregadas", "entregados", "completada", "completadas", "completados", "consegnata", "consegnati", "consegnate", "completata", "تم التوصيل", "approved", "freigegeben", "aprobada", "approuvé", "approvata", "aprovada", "goedgekeurd", "schváleno", "معتمد", "承認済み", "已通过"] },
     "error": { "bias": "error, exception, failed, spam, blocked, rejected", "prejudice": "complete, progress, active, draft", "exact_match": ["failed", "오류", "에러", "실패", "エラー", "失敗", "错误", "失败", "fehlgeschlagen", "fallido", "échoué", "fallito", "falhou", "mislukt", "selhalo", "فشل"] },
-    "show": { "bias": "show, visible, active, displayed", "prejudice": "hide, hidden, stop", "exact_match": ["displayed", "on display", "visible", "진열", "진열중", "노출", "노출중", "전시중", "판매중", "表示中", "陳列中", "显示中", "展示中", "上架", "sichtbar", "angezeigt", "mostrado", "affiché", "visibile", "esposto", "visível", "exibido", "zichtbaar", "viditelné", "معروض"] },
-    "hide": { "bias": "hide, hidden", "prejudice": "show, visible, active, displayed", "exact_match": ["hidden", "숨김", "비노출", "미노출", "미진열", "진열안함", "노출안함", "비공개", "非表示", "非公開", "隐藏", "下架", "ausgeblendet", "versteckt", "oculto", "masqué", "caché", "nascosto", "verborgen", "skryté", "مخفي"] },
-    "stop": { "bias": "stop, hold, pause, suspended, blocked", "prejudice": "progress, active, running, complete", "exact_match": ["stopped", "suspended", "paused", "on hold", "중지", "판매중지", "일시중지", "정지", "보류", "停止", "販売停止", "一時停止", "暂停", "停售", "gestoppt", "pausiert", "angehalten", "detenido", "pausado", "suspendido", "suspendu", "en pause", "sospeso", "in pausa", "suspenso", "gestopt", "gepauzeerd", "pozastaveno", "متوقف", "معلق", "판매중단"] },
+    "show": { "bias": "show, visible, active, displayed", "prejudice": "hide, hidden, stop", "exact_match": ["displayed", "on display", "visible", "진열", "진열중", "노출", "노출중", "전시중", "판매중", "表示中", "陳列中", "显示中", "展示中", "上架", "sichtbar", "angezeigt", "mostrado", "affiché", "visibile", "esposto", "visível", "exibido", "zichtbaar", "viditelné", "معروض", "active", "aktiv", "activo", "en vente", "in vendita", "à venda", "actief", "v prodeji", "معروض للبيع", "販売中", "在售"] },
+    "hide": { "bias": "hide, hidden", "prejudice": "show, visible, active, displayed", "exact_match": ["hidden", "숨김", "비노출", "미노출", "미진열", "진열안함", "노출안함", "비공개", "非表示", "非公開", "隐藏", "下架", "ausgeblendet", "versteckt", "oculto", "masqué", "caché", "nascosto", "verborgen", "skryté", "مخفي", "nascosta", "oculta", "skryto", "已隐藏"] },
+    "stop": { "bias": "stop, hold, pause, suspended, blocked", "prejudice": "progress, active, running, complete", "exact_match": ["stopped", "suspended", "paused", "on hold", "중지", "판매중지", "일시중지", "정지", "보류", "停止", "販売停止", "一時停止", "暂停", "停售", "gestoppt", "pausiert", "angehalten", "detenido", "pausado", "suspendido", "suspendu", "en pause", "sospeso", "in pausa", "suspenso", "gestopt", "gepauzeerd", "pozastaveno", "متوقف", "معلق", "판매중단", "sold out", "ausverkauft", "agotado", "épuisé", "esaurito", "esgotado", "uitverkocht", "vyprodáno", "نفد المخزون", "売り切れ", "已售罄"] },
     "cancel": { "bias": "cancel, cancelled, deleted, withdrawn, discontinued", "prejudice": "progress, complete, draft, active", "exact_match": ["cancelled", "canceled", "취소", "주문취소", "취소완료", "취소됨", "취소된", "단종", "キャンセル", "キャンセル済み", "取消", "已取消", "storniert", "cancelado", "annulé", "annullato", "geannuleerd", "zrušeno", "ملغى", "ملغي", "stornierte", "storniertes", "stornierten", "annulée", "annulées", "annulés", "cancelada", "canceladas", "cancelados", "annullata", "annullate", "annullati"] },
     "refund": { "bias": "refund, refunded", "prejudice": "progress, active, complete", "exact_match": ["refunded", "환불", "환불완료", "환불됨", "환불된", "返金", "返金済み", "已退款", "退款", "erstattet", "rückerstattet", "reembolsado", "remboursé", "rimborsato", "terugbetaald", "مسترد", "erstattete", "remboursée", "remboursées", "remboursés", "reembolsada", "reembolsadas", "reembolsados", "rimborsata", "rimborsati"] },
     "exchange": { "bias": "exchange, exchanged", "prejudice": "refund, return, complete", "exact_match": ["exchanged", "교환", "교환완료", "교환됨", "교환된", "交換", "交換済み", "已换货", "换货", "umgetauscht", "intercambiado", "échangé", "sostituito", "trocado", "omgeruild", "vyměněno", "مستبدل"] },
-    "expire": { "bias": "expire, expired", "prejudice": "progress, active, complete", "exact_match": ["expired", "만료", "기간만료", "만료됨", "만료된", "期限切れ", "已过期", "过期", "abgelaufen", "caducado", "vencido", "expirado", "expiré", "scaduto", "verlopen", "prošlé", "منتهي الصلاحية"] },
+    "expire": { "bias": "expire, expired", "prejudice": "progress, active, complete", "exact_match": ["expired", "만료", "기간만료", "만료됨", "만료된", "期限切れ", "已过期", "过期", "abgelaufen", "caducado", "vencido", "expirado", "expiré", "scaduto", "verlopen", "prošlé", "منتهي الصلاحية", "ended", "beendet", "finalizado", "concluso", "terminado", "afgelopen", "ukončeno", "منتهية", "終了", "已结束"] },
     "remove": { "bias": "remove, deleted", "prejudice": "show, complete, draft", "exact_match": ["removed", "삭제", "삭제됨", "삭제된", "削除", "削除済み", "已删除", "删除", "gelöscht", "entfernt", "eliminado", "supprimé", "eliminato", "rimosso", "excluído", "removido", "verwijderd", "odstraněno", "smazáno", "محذوف"] }
   },
   "substantial_filters": {
@@ -3673,6 +3673,1154 @@
         "semantic": "Status",
         "bias": "{TYPE} status, {TYPE} progress, normal, pending, error, completed",
         "prejudice": "identifier, link, address, number, code, title, name, announcement, product info, event"
+      }
+    }
+  },
+  "de": {
+    "tracking": {
+      "layout_list": {
+        "semantic": "Liste mit mehreren Sendungen, Versandtabelle, Sendungsübersicht",
+        "bias": "Sendungsliste, Lieferliste, Versandtabelle, Massenversand, Versandhistorie, Lieferstatus, Liste offener Sendungen, Sammelversand",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "layout_form": {
+        "semantic": "Versandformularseite zum Anzeigen oder Erfassen der Details einer einzelnen Sendung",
+        "bias": "Versanddetails, Versandformular, Versanderfassung, Versand bearbeiten, Frachtbrief bearbeiten, Einzelsendung verfolgen, Adresse korrigieren, Retoure bearbeiten, Detailansicht",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "id,link": {
+        "semantic": "Kennung, Link, Sendungsnummer, Frachtbrief",
+        "bias": "Sendungs-ID, Sendungsnummer, Tracking-Code, 1Z9999999999999999, 00340434161234567890, 381234567891",
+        "prejudice": "Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Absender, Versender, Verkäufer, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "status": {
+        "semantic": "Status, Lieferstatus, Fortschritt",
+        "bias": "Versandstatus, Lieferfortschritt, in Versandvorbereitung, abgeholt, im Paketzentrum bearbeitet, unterwegs, in Zustellung, zugestellt, retourniert",
+        "prejudice": "Sendungsnummer, Frachtbrief, Kennung, Nummer, Code, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Absender, Versender, Verkäufer, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "title": {
+        "semantic": "Produktname, Name des Kleidungsstücks, Artikelname, Artikel, Name, Titel",
+        "bias": "Produktname der Sendung, Artikeltitel der Sendung, Artikelname der Sendung, Nike Air Force, Samsung Galaxy Book, iPhone-Hülle, Kleid-Set",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "registration_date": {
+        "semantic": "Datum, Erfassungsdatum, Eingangsdatum",
+        "bias": "Versanddatum, Absendedatum, {TYPE}-Erfassungsdatum, 2026-03-15, 20.05.2026, 01.01.26",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Absender, Versender, Verkäufer, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Kombiversand, gebündelter Versand"
+      },
+      "shipping_date": {
+        "semantic": "Absendedatum, Versanddatum, Abfahrtsdatum",
+        "bias": "Absendedatum, Versanddatum, Laufzeit, 2026-03-16, 21.05.2026",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Absender, Versender, Verkäufer, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Kombiversand, gebündelter Versand"
+      },
+      "sender_name": {
+        "semantic": "Absender, Versender, Verkäufer, Name",
+        "bias": "Absender, versendendes Unternehmen, Versender, Max Mustermann, Amazon, Samsung Electronics, ASOS",
+        "prejudice": "Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "sender_address": {
+        "semantic": "Adresse des Bestellers, Adresse des Käufers, Absenderadresse, Versandort",
+        "bias": "Adresse, Hausnummer, Straßenname, Allee, Straße, Etage, Gebäude, Adresszusatz, Wohnung, Postleitzahl, Deutschland, Stadt, Bundesland, Landkreis, Friedrichstraße 123 10117 Berlin, Mönckebergstraße 45 20095 Hamburg, Kaufingerstraße 78 80331 München",
+        "prejudice": "@, .com, .net, .de, Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Absender, Versender, Verkäufer, Vor- und Nachname, Name, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "sender_phone": {
+        "semantic": "Kontakt des Absenders, Telefonnummer, Mobilnummer",
+        "bias": "0171 2345678, +49 30 1234567, 030 9876543",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Absender, Versender, Verkäufer, Vor- und Nachname, Name, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Empfänger, Warenempfänger, Käufer, Kontakt, Telefonnummer, Mobil, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "recipient_name": {
+        "semantic": "Empfänger, Warenempfänger, Name des Käufers",
+        "bias": "Empfänger, Warenempfänger, Name des Käufers, Erika Mustermann, Michael Schmidt, Sabine Wagner",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Absender, Versender, Verkäufer, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Versandziel, Lieferadresse, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "recipient_address": {
+        "semantic": "Empfängeradresse, Versandziel, Lieferadresse, Standort",
+        "bias": "Adresse, Hausnummer, Straßenname, Allee, Straße, Etage, Gebäude, Adresszusatz, Wohnung, Postleitzahl, Deutschland, Stadt, Bundesland, Landkreis, Hohe Straße 32 50667 Köln, Zeil 65 60313 Frankfurt am Main, Königsallee 98 40212 Düsseldorf",
+        "prejudice": "@, .com, .net, .de, Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Absender, Versender, Verkäufer, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Vor- und Nachname, Name, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "recipient_phone": {
+        "semantic": "Kontakt des Empfängers, Telefonnummer, Mobilnummer",
+        "bias": "0151 98765432, 089 1234567",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Absender, Versender, Verkäufer, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Vor- und Nachname, Name, Adresse, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "width": {
+        "semantic": "Breite",
+        "bias": "25 cm, 25.5, 50 cm",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Absender, Versender, Verkäufer, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "height": {
+        "semantic": "Höhe",
+        "bias": "38 cm, 30.5, 40 cm",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Absender, Versender, Verkäufer, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Breite, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "length": {
+        "semantic": "Länge, Tiefe",
+        "bias": "51 cm, 100, 15.5 cm",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Absender, Versender, Verkäufer, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Breite, Höhe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "weight": {
+        "semantic": "Gewicht, Masse",
+        "bias": "680 g, 500 g, 10.5 kg",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Absender, Versender, Verkäufer, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Breite, Höhe, Länge, Tiefe, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "carrier": {
+        "semantic": "Versanddienstleister, Kurierdienst, Paketdienst",
+        "bias": "UPS, FedEx, USPS, DHL, DPD, Royal Mail",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Vor- und Nachname, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "shipping_fee": {
+        "semantic": "Versandkosten, Tarif",
+        "bias": "3.00 €, 2.50, Kostenloser Versand, Nachnahme 5.00 €",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Vor- und Nachname, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "shipping_method": {
+        "semantic": "Versandart, Lieferart",
+        "bias": "Standardversand, Lieferung am nächsten Werktag, Premiumversand, Lieferung am selben Tag, Abholung im Geschäft",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Vor- und Nachname, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "shipping_duration": {
+        "semantic": "Versanddauer, Laufzeit",
+        "bias": "1 Tag, 2 Tage, 3-5 Werktage",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Vor- und Nachname, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Kombiversand, gebündelter Versand"
+      },
+      "bundle_shipping": {
+        "semantic": "Kombiversand, gebündelter Versand",
+        "bias": "Kombiversand möglich, nicht verfügbar, Sammelverpackung",
+        "prejudice": "Kennung, Link, Sendungsnummer, Frachtbrief, Nummer, Code, Lieferstatus, Fortschritt, Produktname, Artikel, Name, Titel, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Vor- und Nachname, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit"
+      }
+    },
+    "goods": {
+      "layout_list": {
+        "semantic": "Liste mit mehreren Produkten, Tabelle, Produktübersicht",
+        "bias": "Produktliste, Artikelliste, Katalogverwaltung, Bestandsverwaltung",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "layout_form": {
+        "semantic": "Formularseite zum Anzeigen oder Erfassen der Details eines einzelnen Produkts",
+        "bias": "Produktdetails, Produktformular, Produkterfassung, Produkt bearbeiten, Produkt anlegen, Artikel bearbeiten, Optionen hinzufügen, Rich-Text-Editor, Vorschaubild hochladen, ähnliche Produkte einrichten, input, select, textarea",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "id,link": {
+        "semantic": "Kennung, Link, Adresse",
+        "bias": "Produkt-ID, Produktnummer, Produktcode, PROD-001, ART_9921, /produkt/ansicht?id=123",
+        "prejudice": "Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "code": {
+        "semantic": "Produktcode, Artikelnummer, Modellnummer",
+        "bias": "Produkt-ID, Produktnummer, Produktcode, SKU-12345, ABC-9981, NK-AF1-001",
+        "prejudice": "Kennung, Adresse, Link, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "status": {
+        "semantic": "Status, Verkaufsstatus, Anzeigestatus, Anzeigezustand, Sichtbarkeit",
+        "bias": "Produktstatus, Artikelstatus, im Verkauf, nicht vorrätig, ausgeblendet, beendet, nicht verfügbar, angezeigt",
+        "prejudice": "Kennung, Link, Adresse, Code, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "title": {
+        "semantic": "Produktname, Name des Kleidungsstücks, Artikelname, Name",
+        "bias": "Produktname, Produkttitel, Artikelname, Kabellose Premium-Kopfhörer, Smartwatch 2026, Leder-Geldbörse für Herren",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "registration_date": {
+        "semantic": "Erfassungsdatum, Erstellungsdatum",
+        "bias": "Produktdatum, Artikeldatum, Erfassungsdatum des Produkts, 2026-03-15T12:00:00, 2026-05-20",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "payment_method": {
+        "semantic": "Zahlungsart, Zahlungsoption",
+        "bias": "Kreditkarte, Banküberweisung, PayPal, Apple Pay, Google Pay, Stripe",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "bank": {
+        "semantic": "Bank, Konto, Zahlungseingang, Überweisung",
+        "bias": "Chase Bank 123456789, Bank of America, Wells Fargo, Citi",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "card": {
+        "semantic": "Karte, Kreditkarte, Zahlungskarte",
+        "bias": "Visa, Mastercard, American Express, Discover, JCB",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "model_name": {
+        "semantic": "Modellname",
+        "bias": "Produktname, Produkttitel, Artikelname, Modell-X, V2.0, SM-G998B",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "brand_name": {
+        "semantic": "Markenname, Hersteller",
+        "bias": "Produktname, Produkttitel, Artikelname, Samsung, Apple, Nike, Sony",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "condition": {
+        "semantic": "Produktzustand, gebraucht, neu",
+        "bias": "brandneu, gebraucht, generalüberholt, B-Ware",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheit, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "description": {
+        "semantic": "Detailbeschreibung, Fließtext",
+        "bias": "Dieses Produkt ist ein Premiummodell aus hochwertigen Materialien...",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "short_description": {
+        "semantic": "Kurzbeschreibung, Zusammenfassung",
+        "bias": "Hochwertige Materialien, schneller Versand, limitiertes Angebot",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "tags": {
+        "semantic": "Schlagwörter, Schlüsselwörter, Suchbegriffe",
+        "bias": "Elektronik, Wohndeko, Sonderangebot, Technik & Multimedia",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "category": {
+        "semantic": "Kategorie, Produktkategorie, Klassifizierung, Kategoriename, Kategoriepfad",
+        "bias": "Mode, Bekleidung, Accessoires, Beauty & Pflege, Elektronik, Unterhaltungselektronik, Computer, Notebooks, Lebensmittel, Haushalt",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Änderungsdatum, Zahlungsart, Bank, Konto, Überweisung, Karte, Modellname, Markenname, Hersteller, Lieferant, Lieferantenname, Lieferantennummer, Produktzustand, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Suchbegriffe, Ursprungsland, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Marktpreis, Punkte, Rang, Selbstkostenpreis, Währung, Menge, Lagerbestand, Bestandsmenge, Einheit, Hauptbild, Vorschaubild, Versanddienstleister/Frachtführer, Versandkosten, Versandart, Optionen, Zusatzartikel, ähnliches Produkt"
+      },
+      "color": {
+        "semantic": "Farbe, Farbton",
+        "bias": "Produktfarbe, Farbe, beige, schwarz, weiß, rot, blau, grün, gelb, rosa, braun, grau, lila, marineblau, elfenbein, silber, gold",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "origin_country": {
+        "semantic": "Herkunftsland, hergestellt in",
+        "bias": "Deutschland, China, Vietnam, Großbritannien, Japan, Made in Germany",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Produzent, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "manufacturer": {
+        "semantic": "Hersteller, Produzent",
+        "bias": "Samsung Electronics, Apple Inc., Sony Corporation",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "release_date": {
+        "semantic": "Erscheinungsdatum, Einführungsdatum",
+        "bias": "Produktdatum, Artikeldatum, Artikelzeit, 2026-01-01, 2025-10-15",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "manufacture_date": {
+        "semantic": "Herstellungsdatum, Produktionsdatum",
+        "bias": "Produktdatum, Artikeldatum, Artikelzeit, 2025-12-01, 2026-02-28",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "expired_at": {
+        "semantic": "Ablaufdatum, gültig bis",
+        "bias": "Produktdatum, Artikeldatum, Artikelzeit, 2028-12-31, 2027-06-30",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "gtin": {
+        "semantic": "Barcode, Identifikationsnummer, GTIN",
+        "bias": "Produkt-ID, Produktnummer, Produktcode, 4001234567890",
+        "prejudice": "Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "mpn": {
+        "semantic": "Herstellerartikelnummer, Teilenummer",
+        "bias": "Produkt-ID, Produktnummer, Produktcode, PN-1234, PT-98765",
+        "prejudice": "Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "barcode": {
+        "semantic": "Barcode",
+        "bias": "Produkt-ID, Produktnummer, Produktcode, 4012345678901",
+        "prejudice": "Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "sale_price": {
+        "semantic": "Verkaufspreis, reduzierter Preis, Preis",
+        "bias": "15.00, 29.99 €, 1500.00 €",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheit, Einheitsbezeichnung, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "supply_price": {
+        "semantic": "Lieferantenpreis, Selbstkostenpreis, Einkaufspreis",
+        "bias": "10.00, 20.00, 1200.00",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheit, Einheitsbezeichnung, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "currency": {
+        "semantic": "Währung, Währungseinheit",
+        "bias": "USD, $, EUR, €, GBP, £",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheit, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "compare_at_price": {
+        "semantic": "Normalpreis, UVP, Originalpreis, Marktpreis, Listenpreis",
+        "bias": "20.00, 35.00 €, 1800.00 €",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheit, Einheitsbezeichnung, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "quantity": {
+        "semantic": "Menge, Lagerbestand, Bestandsmenge",
+        "bias": "100, 50, 0, 999",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Normalpreis, UVP, Originalpreis, Einheit, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "stock_keeping_unit": {
+        "semantic": "SKU, interne Artikelnummer",
+        "bias": "SKU-123, ART-001",
+        "prejudice": "Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "low_stock_threshold": {
+        "semantic": "Warnung bei geringem Bestand, Schwellenwert",
+        "bias": "10, 5, 20",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Normalpreis, UVP, Originalpreis, Einheit, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "unit": {
+        "semantic": "Einheit, Einheitsbezeichnung",
+        "bias": "Stück, Karton, Set, Paar",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "tax_included": {
+        "semantic": "Steuerpflichtig, Steuer, MwSt.",
+        "bias": "inkl. MwSt., steuerfrei, zollfrei",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "tax_code": {
+        "semantic": "Steuerschlüssel",
+        "bias": "TAX-001, MwSt-19",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "main_image_url": {
+        "semantic": "Hauptbild, Vorschaubild, Titelbild",
+        "bias": "https://beispiel.de/img1.jpg, /bilder/hauptbild.png",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "additional_image_url": {
+        "semantic": "Zusatzbild, Detailbild",
+        "bias": "https://beispiel.de/img2.jpg, /bilder/detail1.png",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "video_url": {
+        "semantic": "Video, Bewegtbild, Clip",
+        "bias": "https://youtube.com/watch?v=123",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "carrier": {
+        "semantic": "Versanddienstleister, Kurierdienst, Paketdienst",
+        "bias": "UPS, FedEx, USPS, DHL",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "shipping_fee": {
+        "semantic": "Versandkosten",
+        "bias": "3.00 €, 2.50, Kostenlos",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheit, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "shipping_method": {
+        "semantic": "Versandart, Lieferart",
+        "bias": "Standardversand, Lieferung am nächsten Werktag, Premiumversand, Lieferung am selben Tag, Abholung im Geschäft",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "shipping_duration": {
+        "semantic": "Versanddauer, Laufzeit",
+        "bias": "1 Tag, 2 Tage, Versand am selben Tag",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "bundle_shipping": {
+        "semantic": "Kombiversand, gebündelter Versand",
+        "bias": "Kombiversand möglich, nicht verfügbar",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Lieferzeit, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten, Zusatzartikel, ähnliches Produkt"
+      },
+      "options": {
+        "semantic": "Optionen, Auswahlmöglichkeiten, Optionswerte",
+        "bias": "Option, Optionsname, Größe, Farbauswahl, Mengenauswahl, Pflichtoption, Zusatzoption",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Zusatzartikel, ähnliches Produkt"
+      },
+      "additional_goods": {
+        "semantic": "Zusatzprodukte, ähnliche Produkte, gebündelte Artikel",
+        "bias": "Zusatzartikel, ähnliches Produkt, Bundle-Produkt, Set-Artikel, häufig zusammen gekauft, Cross-Selling",
+        "prejudice": "Kennung, Link, Adresse, Code, Verkaufsstatus, Anzeigestatus, Produktname, Artikelname, Name, Erfassungsdatum, Erstellungsdatum, Zahlungsart, Bank, Konto, Zahlungseingang, Überweisung, Karte, Kreditkarte, Modellname, Markenname, Hersteller, Produktzustand, gebraucht, Detailbeschreibung, Fließtext, Kurzbeschreibung, Schlagwörter, Schlüsselwörter, Ursprungsland, Erscheinungsdatum, Herstellungsdatum, Ablaufdatum, Verkaufspreis, reduzierter Preis, Preis, Lieferantenpreis, Selbstkostenpreis, Einkaufspreis, Währung, Einheit, Normalpreis, UVP, Originalpreis, Menge, Lagerbestand, Bestandsmenge, Warnung bei geringem Bestand, Einheitsbezeichnung, steuerpflichtig, Steuer, MwSt., Steuerschlüssel, Hauptbild, Vorschaubild, Zusatzbild, Video, Clip, Versanddienstleister/Frachtführer, Kurierdienst, Versandkosten, Versandart, Lieferart, Laufzeit, Kombiversand, gebündelter Versand, Breite, Höhe, Länge, Gewicht, Masse, Optionen, Auswahlmöglichkeiten"
+      }
+    },
+    "order": {
+      "layout_list": {
+        "semantic": "Liste mit mehreren Bestellungen, Bestelltabelle, Bestellübersicht",
+        "bias": "Bestellliste, Bestelltabelle, Bestellhistorie, Storno-/Erstattungsliste, alle Bestellungen, Bestellverwaltung",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "layout_form": {
+        "semantic": "Formularseite zum Anzeigen oder Erfassen der Details einer einzelnen Bestellung",
+        "bias": "Bestelldetails, Bestellformular, Bestellerfassung, Bestellung bearbeiten, Bestellhistorie, Bestelldetails bearbeiten, Detailinformationen, Lieferadresse bearbeiten, Teilstornierung, Zahlung bearbeiten, Empfänger ändern, interne Notiz",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "id,link": {
+        "semantic": "Kennung, Link, Bestellnummer",
+        "bias": "Bestell-ID, Bestellnummer, Bestellcode, BEST-2026-0001, 20260315-123456, 12345-67890",
+        "prejudice": "Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "tracking_number": {
+        "semantic": "Sendungsnummer, Frachtbrief",
+        "bias": "Sendungsnummer, Frachtbriefnummer, Sendungsverfolgung, 1Z9999999999999999, 00340434161234567890, 381234567891",
+        "prejudice": "Nummer, Reihenfolge, laufende Nummer, Zeilennummer, Listennummer, Index, Nr., Link, Bestellnummer, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, Menge, Anzahl, Artikelbetrag, Gesamtbestellwert, Versandkosten, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "status": {
+        "semantic": "Bestellstatus, Lieferstatus, Status",
+        "bias": "Bestellstatus, Bestellfortschritt, Zahlung abgeschlossen, in Versandvorbereitung, unterwegs, zugestellt, storniert, retourniert, umgetauscht, erstattet",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "registration_date": {
+        "semantic": "Bestelldatum, Zahlungsdatum, Datum",
+        "bias": "Bestelldatum und -uhrzeit, Bestelldatum, Bestellzeitpunkt, Erfassungsdatum der Bestellung, 2026-03-15T14:16:35, 20.05.2026, 15.03.26 14:16",
+        "prejudice": "Nummer, Reihenfolge, laufende Nummer, Zeilennummer, Index, Menge, Anzahl, Artikelbetrag, Gesamtbestellwert, Zahlungsbetrag, Versandkosten, Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "goods": {
+        "semantic": "Bestellter Artikel, Produktname, Artikelname, Artikel",
+        "bias": "iPhone, 15, kabellos, Tastatur, Nike, Sneaker, Kleid, Strick, T-Shirt, Bestellbezeichnung, Bestelltitel, Name des Hauptartikels, Artikelname und 2 weitere",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "sender_name": {
+        "semantic": "Besteller, Käufer, Absender, Name",
+        "bias": "Max Mustermann, Anna Schmidt, GmbH, Mitglied, Gast",
+        "prejudice": "Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Kontakt, Telefonnummer, Mobil, Adresse, Standort, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "sender_address": {
+        "semantic": "Adresse des Bestellers, Adresse des Käufers, Käuferadresse, Absenderadresse, Standort",
+        "bias": "Adresse, Hausnummer, Straßenname, Allee, Straße, Etage, Gebäude, Adresszusatz, Wohnung, Postleitzahl, Deutschland, Stadt, Bundesland, Landkreis, Friedrichstraße 123 10117 Berlin, Mönckebergstraße 45 20095 Hamburg, Kaufingerstraße 78 80331 München",
+        "prejudice": "@, .com, .net, .de, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Absender, Vor- und Nachname, Name, Erfassungsdatum, Eingangsdatum, Absendedatum, Abfahrtsdatum, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Käufer, Breite, Höhe, Länge, Tiefe, Gewicht, Masse, Versanddienstleister/Frachtführer, Kurierdienst, Paketdienst, Versandkosten, Tarif, Versandart, Lieferart, Laufzeit, Lieferzeit, Kombiversand, gebündelter Versand"
+      },
+      "sender_phone": {
+        "semantic": "Kontakt des Bestellers, Telefonnummer, Mobilnummer",
+        "bias": "0170 1234567, +49 30 1234567, 040 7654321",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Empfänger, Warenempfänger, Name, Adresse, Standort, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "recipient_name": {
+        "semantic": "Empfänger, Warenempfänger, Name",
+        "bias": "Erika Mustermann, Michael Schmidt, Laura Braun",
+        "prejudice": "Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "recipient_address": {
+        "semantic": "Versandziel, Lieferadresse, Empfängeradresse, Standort",
+        "bias": "Adresse, Hausnummer, Straßenname, Allee, Straße, Etage, Gebäude, Adresszusatz, Wohnung, Postleitzahl, Deutschland, Stadt, Bundesland, Landkreis, Hohe Straße 32 50667 Köln, Zeil 65 60313 Frankfurt am Main, Königsallee 98 40212 Düsseldorf",
+        "prejudice": "@, .com, .net, .de, Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "recipient_phone": {
+        "semantic": "Kontakt des Empfängers, Telefonnummer des Empfängers, Mobilnummer",
+        "bias": "0151 98765432, 089 1234567",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "bank": {
+        "semantic": "Bank, Zahlungseingang, Konto, Überweisung",
+        "bias": "Chase Bank, 123456789, Bank of America, Wells Fargo, Citi",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Karte, Kreditkarte, Zahlungskarte, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "card": {
+        "semantic": "Karte, Kreditkarte, Zahlungskarte",
+        "bias": "Visa, Mastercard, American Express, Discover, JCB",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Datum der Bestellung, Zahlungseingangsdatum, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "order_date": {
+        "semantic": "Bestelldatum, Datum der Bestellung",
+        "bias": "Bestelldatum, Bestellzeitpunkt, 2026-03-15, 20.05.2026",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "payment_date": {
+        "semantic": "Zahlungsdatum, Zahlungseingangsdatum",
+        "bias": "Bestelldatum, Bestellzeitpunkt, 2026-03-15T14:20:00, 20.05.2026",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Bank, Zahlungseingang, Konto, Überweisung, Karte, Kreditkarte, Zahlungskarte, Zahlungsart, Zahlungsoption, Zahlungsanbieter, PG, Zahlungsweg"
+      },
+      "payment_method": {
+        "semantic": "Zahlungsart, Zahlungsoption",
+        "bias": "Kreditkarte, Banküberweisung, Echtzeitüberweisung, PayPal, Apple Pay, Google Pay, Stripe",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Datum der Bestellung, Zahlungseingangsdatum"
+      },
+      "payment_origin": {
+        "semantic": "Zahlungsanbieter, PG, Zahlungsweg",
+        "bias": "Stripe, PayPal, Square, Adyen, Braintree, Authorize.Net",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Standort, Kontakt, Telefonnummer, Mobil, Empfänger, Warenempfänger, Datum der Bestellung, Zahlungseingangsdatum"
+      },
+      "quantity": {
+        "semantic": "Menge, Bestellmenge, Anz., Anzahl bestellter Artikel",
+        "bias": "1, 2, 3, 10",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Zeilennummer, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Absender, Name, Adresse, Kontakt, Telefonnummer, Empfänger, Warenempfänger, Bank, Konto, Überweisung, Karte, Zahlungsart, Zahlungsoption, Artikelbetrag, Bestellbetrag, Bestellsumme, Zahlungsbetrag, Versandkosten, Verkaufspreis, Preis, Verkäufer, Filiale"
+      },
+      "amount": {
+        "semantic": "Bestellsumme, Bestellbetrag, Zahlungsbetrag, bezahlter Gesamtbetrag, Gesamtsumme",
+        "bias": "15.00, 29.99 €, 1500.00 €",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Zeilennummer, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Name, Adresse, Kontakt, Telefonnummer, Empfänger, Bank, Konto, Überweisung, Karte, Zahlungsart, Zahlungsoption, Menge, Bestellmenge, Anz., Versandkosten, Artikelbetrag, Verkaufspreis, Einzelpreis, Verkäufer, Filiale"
+      },
+      "shipping_fee": {
+        "semantic": "Versandkosten, Liefergebühr",
+        "bias": "3.00 €, 2.50, 0, Kostenlos",
+        "prejudice": "Kennung, Link, Bestellnummer, Sendungsnummer, Frachtbrief, Zeilennummer, Bestellstatus, Lieferstatus, Status, Bestelldatum, Zahlungsdatum, Datum, bestellter Artikel, Produktname, Artikelname, Artikel, Besteller, Käufer, Name, Adresse, Kontakt, Telefonnummer, Empfänger, Bank, Konto, Überweisung, Karte, Zahlungsart, Zahlungsoption, Menge, Bestellmenge, Anz., Bestellsumme, Bestellbetrag, Zahlungsbetrag, Artikelbetrag, Verkaufspreis, Verkäufer, Filiale"
+      }
+    },
+    "review": {
+      "layout_list": {
+        "semantic": "Liste mit mehreren Bewertungen, Bewertungstabelle, Bewertungsübersicht",
+        "bias": "Bewertungsliste, Bewertungstabelle, Bewertungs-Massenbearbeitung, Liste der Bewertungen, Sammelfreigabe, unbeantwortete Beiträge",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "layout_form": {
+        "semantic": "Formularseite zum Anzeigen oder Erfassen der Details einer einzelnen Bewertung",
+        "bias": "Bewertungsdetails, Bewertungsformular, Bewertungserfassung, Bewertung bearbeiten, Antwort schreiben, Bewertung ausblenden, Sperrung",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "id,link": {
+        "semantic": "Kennung, Link, Adresse",
+        "bias": "Bewertungs-ID, Bewertungsnummer, Bewertungscode, BEW-001, 9921, /bewertung/ansicht?id=123",
+        "prejudice": "Bewertungsstatus, freigegeben, abgelehnt, ausstehend, ausgeblendet, gesperrt, Bewerter, Verfasser, Name, Titel, Produktname, Bewertungstitel, verifizierter Kauf, abgeschlossen, Erfassungsdatum, verfasst am, Datum"
+      },
+      "status": {
+        "semantic": "Status, Bewertungsstatus",
+        "bias": "Bewertungsstatus, Bewertungsfortschritt, freigegeben, abgelehnt, ausstehend, ausgeblendet, gesperrt",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Bewerter, Verfasser, Name, Titel, Produktname, Bewertungstitel, verifizierter Kauf, abgeschlossen, Erfassungsdatum, verfasst am, Datum"
+      },
+      "name": {
+        "semantic": "Verfasser, Bewerter, Name",
+        "bias": "Bewertungsname, Bewertungstitel, Max Mustermann, Anna Schmidt, Michael",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Bewertungsstatus, freigegeben, abgelehnt, ausstehend, ausgeblendet, gesperrt, Titel, Produktname, Bewertungstitel, verifizierter Kauf, abgeschlossen, Erfassungsdatum, verfasst am, Datum"
+      },
+      "title": {
+        "semantic": "Titel, Name des Kleidungsstücks, Produktname, Artikelname, Bewertungstitel",
+        "bias": "Bewertungsname, Bewertungstitel, Schneller Versand, Tolles Produkt, Sehr empfehlenswert, Würde wieder kaufen",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Bewertungsstatus, freigegeben, abgelehnt, ausstehend, ausgeblendet, gesperrt, Bewerter, Verfasser, Name, verifizierter Kauf, abgeschlossen, Erfassungsdatum, verfasst am, Datum"
+      },
+      "completed": {
+        "semantic": "Verifizierter Kauf, abgeschlossen",
+        "bias": "true, false",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Bewertungsstatus, freigegeben, abgelehnt, ausstehend, ausgeblendet, gesperrt, Bewerter, Verfasser, Name, Titel, Produktname, Bewertungstitel, Erfassungsdatum, verfasst am, Datum"
+      },
+      "registration_date": {
+        "semantic": "Erfassungsdatum, verfasst am, Datum",
+        "bias": "Bewertungsdatum, Erfassungsdatum der Bewertung, 2026-03-15, 20.05.2026",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Bewertungsstatus, freigegeben, abgelehnt, ausstehend, ausgeblendet, gesperrt, Bewerter, Verfasser, Name, Titel, Produktname, Bewertungstitel, verifizierter Kauf, abgeschlossen"
+      }
+    },
+    "coupon": {
+      "layout_list": {
+        "semantic": "Liste mit mehreren Gutscheinen, Gutscheintabelle, Gutscheinübersicht",
+        "bias": "Gutscheinliste, Gutscheintabelle, Gutschein-Massenerstellung, Ausgabestatus, Nutzungsverlauf",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "layout_form": {
+        "semantic": "Formularseite zum Anzeigen oder Erfassen der Details eines einzelnen Gutscheins",
+        "bias": "Gutscheindetails, Gutscheinformular, Gutschein erstellen, Bedingungen festlegen, Rabattsatz eingeben, Einzelausgabe, Zielgruppe festlegen, input, select, textarea",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "id,link": {
+        "semantic": "Kennung, Link, Adresse",
+        "bias": "Gutschein-ID, Gutscheinnummer, Gutscheincode, EVT-001, GUTSCHEIN_9921",
+        "prejudice": "Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Adresse, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "type": {
+        "semantic": "Typ, Kategorie",
+        "bias": "Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Gratiszugabe",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "status": {
+        "semantic": "Status, Fortschrittsstatus",
+        "bias": "Gutscheinstatus, Fortschritt, aktiv, beendet, ausstehend, wird ausgegeben, Ausgabe beendet",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "title": {
+        "semantic": "Titel, Name, Gutscheinname, Aktionsname",
+        "bias": "Gutscheinname, Gutscheintitel, Frühlings-Sale, Willkommensgutschein, Wochenendangebot",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "started_at": {
+        "semantic": "Startdatum, Startzeit, Ausstellungsdatum",
+        "bias": "Gutscheindatum, Gutscheinzeit, 2026-03-01T00:00:00",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "expired_at": {
+        "semantic": "Enddatum, Ablaufdatum, Frist",
+        "bias": "Gutscheindatum, Gutscheinzeit, 2026-03-31T23:59:59",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "code": {
+        "semantic": "Codenummer, Gutscheincode",
+        "bias": "Gutschein-ID, Gutscheinnummer, FRUEHLING26, WILLKOMMEN100, RABATT50",
+        "prejudice": "Kennung, Link, Adresse, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "discount": {
+        "semantic": "Rabatt, Rabattbetrag, Rabattsatz",
+        "bias": "10 %, 5.00 €, 3.00 €, 15 Prozent",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "quantity": {
+        "semantic": "Menge, ausgegebene Menge",
+        "bias": "1000, 500, 9999",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "usage_limit": {
+        "semantic": "Nutzungslimit, maximale Nutzung",
+        "bias": "1000, 5000",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "usage_per": {
+        "semantic": "Limit pro Nutzer",
+        "bias": "1, 2, 3",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "new_customer_only": {
+        "semantic": "Neukunde, Neuregistrierung",
+        "bias": "true, false",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "first_purchase_only": {
+        "semantic": "Erstkauf, Erstbestellung",
+        "bias": "true, false",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "min_order_amount": {
+        "semantic": "Mindestbestellwert, Zahlungsbedingung",
+        "bias": "10.00 €, 30.00 €, 50.00 €",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "max_order_amount": {
+        "semantic": "Höchstbestellwert",
+        "bias": "100.00 €, 500.00 €",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "max_discount_amount": {
+        "semantic": "Maximaler Rabattbetrag, Rabattobergrenze",
+        "bias": "5.00 €, 10.00 €, 20.00 €",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "region_restrictions": {
+        "semantic": "Regionale Einschränkungen, nicht belieferbar",
+        "bias": "Ausgenommen Inseln, Ausgenommen Helgoland/Büsingen",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "number": {
+        "semantic": "Telefonnummer, Kontakt, Anfrage",
+        "bias": "0800 1234567, 0170 1234567",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "address": {
+        "semantic": "Adresse, Standort, Ort",
+        "bias": "Berlin, 10115, München, 80331, Hauptstraße 123",
+        "prejudice": "Kennung, Link, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Erfassungsdatum, Erstellungsdatum"
+      },
+      "registration_date": {
+        "semantic": "Erfassungsdatum, Erstellungsdatum",
+        "bias": "Gutscheindatum, Erfassungsdatum des Gutscheins, 2026-02-15",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort"
+      }
+    },
+    "event": {
+      "layout_list": {
+        "semantic": "Liste mit mehreren Aktionen, Aktionstabelle, Aktionsübersicht",
+        "bias": "Aktionsliste, Aktionstabelle, Aktions-Massenbearbeitung, Kampagnenliste, Liste der Werbeaktionen, Ausgabestatus, Nutzungsverlauf",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "layout_form": {
+        "semantic": "Formularseite zum Anzeigen oder Erfassen der Details einer einzelnen Aktion",
+        "bias": "Aktionsdetails, Aktionsformular, Aktion erstellen, Kampagnendetails, Details der Werbeaktion, Bedingungen festlegen, Rabattsatz eingeben, Einzelausgabe, Zielgruppe festlegen, input, select, textarea",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "id,link": {
+        "semantic": "Kennung, Link, Adresse",
+        "bias": "Aktions-ID, Aktionsnummer, Aktionscode, EVT-001, GUTSCHEIN_9921",
+        "prejudice": "Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Adresse, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "type": {
+        "semantic": "Typ, Kategorie",
+        "bias": "Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Gratiszugabe",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "status": {
+        "semantic": "Status, Fortschrittsstatus",
+        "bias": "Aktionsstatus, Fortschritt, aktiv, beendet, ausstehend, wird ausgegeben, Ausgabe beendet",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "title": {
+        "semantic": "Titel, Name, Gutscheinname, Aktionsname",
+        "bias": "Aktionsname, Aktionstitel, Frühlings-Sale, Willkommensgutschein, Wochenendangebot",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "started_at": {
+        "semantic": "Startdatum, Startzeit, Ausstellungsdatum",
+        "bias": "Aktionsdatum, Aktionszeit, 2026-03-01T00:00:00",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "expired_at": {
+        "semantic": "Enddatum, Ablaufdatum, Frist",
+        "bias": "Aktionsdatum, Aktionszeit, 2026-03-31T23:59:59",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "code": {
+        "semantic": "Codenummer, Gutscheincode",
+        "bias": "Aktions-ID, Aktionsnummer, FRUEHLING26, WILLKOMMEN100, RABATT50",
+        "prejudice": "Kennung, Link, Adresse, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "discount": {
+        "semantic": "Rabatt, Rabattbetrag, Rabattsatz",
+        "bias": "10 %, 5.00 €, 3.00 €, 15 Prozent",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "quantity": {
+        "semantic": "Menge, ausgegebene Menge",
+        "bias": "1000, 500, 9999",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "usage_limit": {
+        "semantic": "Nutzungslimit, maximale Nutzung",
+        "bias": "1000, 5000",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "usage_per": {
+        "semantic": "Limit pro Nutzer",
+        "bias": "1, 2, 3",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "new_customer_only": {
+        "semantic": "Neukunde, Neuregistrierung",
+        "bias": "true, false",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "first_purchase_only": {
+        "semantic": "Erstkauf, Erstbestellung",
+        "bias": "true, false",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "min_order_amount": {
+        "semantic": "Mindestbestellwert, Zahlungsbedingung",
+        "bias": "10.00 €, 30.00 €, 50.00 €",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "max_order_amount": {
+        "semantic": "Höchstbestellwert",
+        "bias": "100.00 €, 500.00 €",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "max_discount_amount": {
+        "semantic": "Maximaler Rabattbetrag, Rabattobergrenze",
+        "bias": "5.00 €, 10.00 €, 20.00 €",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "region_restrictions": {
+        "semantic": "Regionale Einschränkungen, nicht belieferbar",
+        "bias": "Ausgenommen Inseln, Ausgenommen Helgoland/Büsingen",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, Telefonnummer, Kontakt, Anfrage, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "number": {
+        "semantic": "Telefonnummer, Kontakt, Anfrage",
+        "bias": "0800 1234567, 0170 1234567",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Standort, Ort, Erfassungsdatum, Erstellungsdatum"
+      },
+      "address": {
+        "semantic": "Adresse, Standort, Ort",
+        "bias": "Berlin, 10115, München, 80331, Hauptstraße 123",
+        "prejudice": "Kennung, Link, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Erfassungsdatum, Erstellungsdatum"
+      },
+      "registration_date": {
+        "semantic": "Erfassungsdatum, Erstellungsdatum",
+        "bias": "Aktionsdatum, Erfassungsdatum der Aktion, 2026-02-15",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Festbetragsrabatt, Prozentrabatt, kostenloser Versand, Typ, Kategorie, Status, Fortschritt, Gutscheinname, Aktionsname, Startdatum, Startzeit, Ausstellungsdatum, Enddatum, Ablaufdatum, Frist, Gutscheincode, Rabattbetrag, Rabattsatz, Menge, ausgegebene Menge, Nutzungslimit, maximale Nutzung, Limit pro Nutzer, Neukunde, Neuregistrierung, Erstkauf, Erstbestellung, Mindestbestellwert, Zahlungsbedingung, Höchstbestellwert, maximaler Rabattbetrag, Rabattobergrenze, regionale Einschränkungen, nicht belieferbar, Telefonnummer, Kontakt, Anfrage, Standort, Ort"
+      }
+    },
+    "shipping_doc": {
+      "layout_list": {
+        "semantic": "Liste mit mehreren Handelsdokumenten, Tabelle, Dokumentenübersicht",
+        "bias": "Dokumentenliste, Liste der Versanddokumente, Liste der Handelsdokumente, Rechnungsliste",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "layout_form": {
+        "semantic": "Formularseite zum Anzeigen oder Erfassen der Details eines einzelnen Handelsdokuments",
+        "bias": "Dokumentdetails, Versanddokument-Formular, Rechnungsdetails, input, select, textarea",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "id,link": {
+        "semantic": "Kennung, Link, Dokumentnummer",
+        "bias": "Dokumentnummer, Dok.-Nr., Referenznummer, B/L-Nr., AWB-Nr., Rechnungs-Nr., Bestell-Nr.",
+        "prejudice": "Versanddatum, Ausstellungsdatum, Absender, Empfänger, Versanddienstleister/Frachtführer, Hafen, Containernummer, Plombennummer, Gewicht, Betrag, Währung, Zolltarifnummer (HS-Code), Incoterms, Zahlungsbedingungen"
+      },
+      "doc_number": {
+        "semantic": "Dokumentnummer, Hauptidentifikationsnummer",
+        "bias": "Dokumentnummer, Konnossementsnummer, Luftfrachtbriefnummer, Rechnungsnummer, Vertragsnummer, HBL, MBL",
+        "prejudice": "Containernummer, Plombennummer, Zolltarifnummer (HS-Code), Buchungsnummer, Akkreditivnummer, Ausstellungsdatum, Versanddatum, Gewicht, Betrag"
+      },
+      "reference_number": {
+        "semantic": "Referenznummer, Exportreferenz, unser Zeichen",
+        "bias": "Referenznummer, Exportreferenz, Exportref., unser Zeichen, Ihr Zeichen, Ref.-Nr., Referenz-Nr., Bestellreferenz, Auftragsnummer, Aktenzeichen, Versenderreferenz",
+        "prejudice": "Rechnungsnummer, Dokumentnummer, Konnossementsnummer, Luftfrachtbriefnummer, Einkaufsbestellnummer, Ausstellungsdatum, Betrag, Gewicht, USt-IdNr., EORI-Nummer"
+      },
+      "reference_po": {
+        "semantic": "In diesem Dokument referenzierte Bestellnummer (PO-Nummer)",
+        "bias": "Einkaufsbestellnummer, PO-Nummer, Bestellnummer, Bestellnummer des Käufers, Kundenbestellnummer",
+        "prejudice": "Rechnungsnummer, Dokumentnummer, Konnossementsnummer, Exportreferenz, Ausstellungsdatum, Betrag, Gewicht"
+      },
+      "signatory_name": {
+        "semantic": "Name des Unterzeichners, Name der das Dokument unterzeichnenden Person",
+        "bias": "Name des Unterzeichners, unterzeichnet von, Zeichnungsberechtigter, Name des Unterzeichnenden, Name in Druckbuchstaben, Unterzeichner",
+        "prejudice": "unterzeichnendes Unternehmen, Firmenname, Rolle des Beteiligten, Adresse, Datum, Dokumentnummer, Betrag"
+      },
+      "doc_type": {
+        "semantic": "Dokumentart, Dokumentkategorie",
+        "bias": "Dokumentart, Konnossement, Luftfrachtbrief, Handelsrechnung, Packliste, Ursprungszeugnis, Akkreditiv",
+        "prejudice": "Dokumentnummer, Ausstellungsdatum, Versanddatum, Absender, Empfänger, Hafen, Gewicht, Betrag, Währung"
+      },
+      "status": {
+        "semantic": "Status, Fortschritt",
+        "bias": "Dokumentstatus, Fortschritt, ausgestellt, unterwegs, zollabgefertigt, zugestellt, storniert",
+        "prejudice": "Dokumentnummer, Ausstellungsdatum, Versanddatum, Absender, Empfänger, Versanddienstleister/Frachtführer, Hafen, Containernummer, Gewicht, Betrag, Währung, Zolltarifnummer (HS-Code)"
+      },
+      "issue_date": {
+        "semantic": "Ausstellungsdatum, Datum der Ausstellung",
+        "bias": "Ausstellungsdatum, Datum der Ausstellung, ausgestellt am, 2026-03-15",
+        "prejudice": "Versanddatum, Abfahrtsdatum, Ankunftsdatum, Verfalldatum, gültig bis, Dokumentnummer, Absender, Empfänger, Hafen, Gewicht, Betrag"
+      },
+      "sender_name": {
+        "semantic": "Versender, Exporteur, Verkäufer, Name des Absenders",
+        "bias": "Ablader, Exporteur, Verkäufer, Lieferant, Absender, Anbieter",
+        "prejudice": "Empfänger, Importeur, Käufer, Meldeadresse, Versanddienstleister/Frachtführer, Spediteur, Spedition, NVOCC, Reederei, Schiffsagent, Agent, Linienreederei, Seefrachtführer, Luftfrachtführer, Logistikdienstleister, Lagerhalter, Zollagent, eröffnende Bank, avisierende Bank, Versicherer, Sachverständiger, Hafen, Dokumentnummer, Ausstellungsdatum, Gewicht, Betrag, Containernummer"
+      },
+      "recipient_name": {
+        "semantic": "Empfänger, Importeur, Name des Käufers",
+        "bias": "Empfänger, Importeur, Käufer, Warenempfänger, an die Order von",
+        "prejudice": "Ablader, Exporteur, Verkäufer, Absender, Meldeadresse, Versanddienstleister/Frachtführer, Spediteur, Spedition, NVOCC, Reederei, Schiffsagent, Agent, Linienreederei, Seefrachtführer, Luftfrachtführer, Logistikdienstleister, Lagerhalter, Zollagent, eröffnende Bank, avisierende Bank, Versicherer, Sachverständiger, Hafen, Dokumentnummer, Ausstellungsdatum, Gewicht, Betrag, Containernummer"
+      },
+      "vessel": {
+        "semantic": "Schiffsname, Flugnummer, Name des Transportmittels",
+        "bias": "Schiff, Schiffsname, Seeschiff, Flugnummer, Name des Frachtführers, MS, MSC, MAERSK, HMM, EVERGREEN",
+        "prejudice": "Reisenummer, Hafen, Verladehafen, Löschhafen, Dokumentnummer, Ausstellungsdatum, Absender, Empfänger, Gewicht, Betrag, Containernummer, Zolltarifnummer (HS-Code)"
+      },
+      "pol": {
+        "semantic": "Verladehafen, Abgangshafen, Abflughafen",
+        "bias": "Verladehafen, POL, Abgangshafen, Abgangsflughafen, Ladehafen, BUSAN, INCHEON, SHANGHAI, NINGBO, SINGAPUR, ROTTERDAM, HAMBURG, LOS ANGELES",
+        "prejudice": "Löschhafen, Bestimmungshafen, Ankunftsflughafen, Lieferort, Übernahmeort, Schiff, Reisenummer, Dokumentnummer, Ausstellungsdatum, Gewicht, Betrag"
+      },
+      "pod": {
+        "semantic": "Löschhafen, Bestimmungshafen, Ankunftsflughafen",
+        "bias": "Löschhafen, POD, Bestimmungshafen, Bestimmungsflughafen, Entladehafen, LONG BEACH, NEW YORK, ANTWERPEN, DUBAI, HO-CHI-MINH-STADT",
+        "prejudice": "Verladehafen, Abgangshafen, Abflughafen, Übernahmeort, Schiff, Reisenummer, Dokumentnummer, Ausstellungsdatum, Gewicht, Betrag"
+      },
+      "etd": {
+        "semantic": "Voraussichtliche Abfahrtszeit, ETD",
+        "bias": "ETD, voraussichtliche Abfahrtszeit, Abfahrtsdatum, Auslaufdatum",
+        "prejudice": "ETA, voraussichtliche Ankunftszeit, Ausstellungsdatum, Verfalldatum, Dokumentnummer, Absender, Empfänger, Hafen, Gewicht, Betrag"
+      },
+      "eta": {
+        "semantic": "Voraussichtliche Ankunftszeit, ETA",
+        "bias": "ETA, voraussichtliche Ankunftszeit, Ankunftsdatum",
+        "prejudice": "ETD, voraussichtliche Abfahrtszeit, Abfahrtsdatum, Ausstellungsdatum, Verfalldatum, Dokumentnummer, Absender, Empfänger, Hafen, Gewicht, Betrag"
+      },
+      "incoterms": {
+        "semantic": "Incoterms, Handelsklauseln, Preisstellung",
+        "bias": "Incoterms, Handelsklauseln, Preisstellung, Lieferbedingungen, EXW, FCA, FAS, FOB, CFR, CIF, CPT, CIP, DAP, DPU, DDP",
+        "prejudice": "Zahlungsbedingungen, Frachtbedingungen, Währung, Betrag, Gewicht, Dokumentnummer, Ausstellungsdatum, Hafen, Schiff, Containernummer"
+      },
+      "currency": {
+        "semantic": "Währung, Währungseinheit",
+        "bias": "Währung, Währungscode, USD, EUR, JPY, CNY, KRW, GBP",
+        "prejudice": "Betrag, Gesamtbetrag, Fracht, Versicherung, Gewicht, Menge, Dokumentnummer, Ausstellungsdatum, Hafen, Schiff, Incoterms"
+      },
+      "amount": {
+        "semantic": "Gesamtbetrag, Gesamtsumme, Rechnungswert",
+        "bias": "Gesamtbetrag, Gesamtsumme, Rechnungswert, Gesamtwert, Betrag",
+        "prejudice": "Fracht, Versicherung, lokale Gebühren, Steuer, Einzelpreis, Gewicht, Menge, Währung, Dokumentnummer, Ausstellungsdatum, Hafen"
+      },
+      "container_number": {
+        "semantic": "Containernummer",
+        "bias": "Containernummer, Container-Nr., CNTR-Nr., MSCU1234567, TGHU7654321",
+        "prejudice": "Plombennummer, Dokumentnummer, Buchungsnummer, Zolltarifnummer (HS-Code), Gewicht, Betrag, Ausstellungsdatum, Hafen, Schiff, Absender, Empfänger"
+      },
+      "seal_number": {
+        "semantic": "Plombennummer",
+        "bias": "Plombennummer, Plomben-Nr., PLOMBE",
+        "prejudice": "Containernummer, Dokumentnummer, Buchungsnummer, Zolltarifnummer (HS-Code), Gewicht, Betrag, Ausstellungsdatum, Hafen, Schiff"
+      },
+      "weight_gross": {
+        "semantic": "Bruttogewicht",
+        "bias": "Bruttogewicht, Bruttogew., Gesamtbruttogewicht, KGS, LBS, MT",
+        "prejudice": "Nettogewicht, Volumen, Maß, Menge, Anzahl Packstücke, Betrag, Währung, Dokumentnummer, Ausstellungsdatum, Hafen, Containernummer"
+      },
+      "weight_net": {
+        "semantic": "Nettogewicht",
+        "bias": "Nettogewicht, Nettogew., Gesamtnettogewicht, KGS, LBS",
+        "prejudice": "Bruttogewicht, Volumen, Maß, Menge, Anzahl Packstücke, Betrag, Währung, Dokumentnummer, Ausstellungsdatum, Hafen, Containernummer"
+      },
+      "volume": {
+        "semantic": "Volumen, Maß",
+        "bias": "Volumen, Maß, CBM, M3",
+        "prejudice": "Bruttogewicht, Nettogewicht, Menge, Anzahl Packstücke, Betrag, Währung, Dokumentnummer, Ausstellungsdatum, Hafen, Containernummer"
+      },
+      "package_count": {
+        "semantic": "Anzahl Packstücke, Anzahl Kartons",
+        "bias": "Anzahl Packstücke, Packstückzahl, CTNS, PKGS, PLT, Kartons",
+        "prejudice": "Bruttogewicht, Nettogewicht, Volumen, Betrag, Währung, Einzelpreis, Dokumentnummer, Ausstellungsdatum, Hafen, Containernummer"
+      },
+      "hs_code": {
+        "semantic": "Zolltarifnummer (HS-Code), Zolltarifnummer",
+        "bias": "Zolltarifnummer (HS-Code), HS-Nr., Zolltarifnummer, Zolltarifierung, HTS",
+        "prejudice": "Containernummer, Plombennummer, Dokumentnummer, Buchungsnummer, Gewicht, Betrag, Währung, Ausstellungsdatum, Hafen, Schiff"
+      },
+      "no": {
+        "semantic": "Laufende Nummer, Artikelnummer",
+        "bias": "Nr., Lfd. Nr., Pos.-Nr., Positionsnummer, laufende Nummer",
+        "prejudice": "Dokumentnummer, Konnossementsnummer, Rechnungsnummer, Containernummer, Plombennummer, Zolltarifnummer (HS-Code), Gewicht, Betrag, Ausstellungsdatum"
+      },
+      "expiry_date": {
+        "semantic": "Verfalldatum, gültig bis",
+        "bias": "Verfalldatum, Ablaufdatum, gültig bis, Gültigkeit, spätestes Datum",
+        "prejudice": "Ausstellungsdatum, Datum der Ausstellung, Versanddatum, Abfahrtsdatum, Ankunftsdatum, Dokumentnummer, Absender, Empfänger, Hafen, Gewicht, Betrag"
+      },
+      "sender_address": {
+        "semantic": "Adresse des Versenders, Adresse des Exporteurs, Adresse des Verkäufers",
+        "bias": "Versenderadresse, Adresse des Exporteurs, Adresse des Verkäufers, Anschrift des Absenders, Anschrift des Abladers",
+        "prejudice": "Empfängeranschrift, Adresse des Importeurs, Käuferadresse, Notify-Adresse, Name des Versenders, Name des Exporteurs, Firmenname, Telefonnummer, Fax, E-Mail, Hafen, Dokumentnummer"
+      },
+      "recipient_address": {
+        "semantic": "Empfängeradresse, Adresse des Importeurs, Käuferadresse",
+        "bias": "Empfängeranschrift, Adresse des Importeurs, Käuferadresse, Anschrift des Empfängers, Lieferadresse",
+        "prejudice": "Versenderadresse, Adresse des Exporteurs, Adresse des Verkäufers, Notify-Adresse, Name des Empfängers, Name des Importeurs, Firmenname, Telefonnummer, Fax, E-Mail, Hafen, Dokumentnummer"
+      },
+      "notify_party_name": {
+        "semantic": "Meldeadresse",
+        "bias": "Meldeadresse, zu benachrichtigen, zusätzliche Meldeadresse, Benachrichtigungsadresse",
+        "prejudice": "Ablader, Exporteur, Verkäufer, Empfänger, Importeur, Käufer, Versanddienstleister/Frachtführer, Hafen, Dokumentnummer, Ausstellungsdatum, Gewicht, Betrag"
+      },
+      "voyage_number": {
+        "semantic": "Reisenummer, Flugabschnitt",
+        "bias": "Reisenummer, Reise-Nr., Reise, Flugabschnitt, Abfahrtsnummer, V.123E, 0091E, 2426W",
+        "prejudice": "Schiff, Versanddienstleister/Frachtführer, Dokumentnummer, Rechnungsnummer, Konnossementsnummer, Containernummer, Plombennummer, Verladehafen, Löschhafen, Ausstellungsdatum, Gewicht, Betrag, Menge"
+      },
+      "flight_number": {
+        "semantic": "Flugnummer",
+        "bias": "Flugnummer, Flug-Nr., Flug der Fluggesellschaft, KE001, OZ201, AF267",
+        "prejudice": "Schiff, Reisenummer, Dokumentnummer, Luftfrachtbriefnummer, Abflughafen, Ankunftsflughafen, Ausstellungsdatum, Gewicht, Betrag"
+      },
+      "place_receipt": {
+        "semantic": "Übernahmeort",
+        "bias": "Übernahmeort, übernommen in, Übernahmestelle, Abholort",
+        "prejudice": "Lieferort, Endbestimmungsort, Verladehafen, Löschhafen, Dokumentnummer, Schiff, Reisenummer, Gewicht, Betrag"
+      },
+      "place_delivery": {
+        "semantic": "Lieferort, Endbestimmungsort",
+        "bias": "Lieferort, Endbestimmungsort, Ablieferungsort, Haustürzustellung",
+        "prejudice": "Übernahmeort, Verladehafen, Löschhafen, Dokumentnummer, Schiff, Reisenummer, Gewicht, Betrag"
+      },
+      "departure_date": {
+        "semantic": "Abfahrtsdatum, Datum der Verladung an Bord",
+        "bias": "Datum der Abfahrt, ausgelaufen am, An-Bord-Datum, an Bord verladen, Abfahrtsdatum",
+        "prejudice": "Ankunftsdatum, Ausstellungsdatum, Verfalldatum, Dokumentnummer, Schiff, Reisenummer, Gewicht, Betrag"
+      },
+      "arrival_date": {
+        "semantic": "Ankunftsdatum, Löschdatum",
+        "bias": "Datum der Ankunft, angekommen am, Ankunftsdatum, gelöscht am",
+        "prejudice": "Abfahrtsdatum, Datum der Verladung an Bord, Ausstellungsdatum, Verfalldatum, Dokumentnummer, Schiff, Reisenummer, Gewicht, Betrag"
+      },
+      "transport_mode": {
+        "semantic": "Transportart",
+        "bias": "auf dem Seeweg, auf dem Luftweg, auf der Straße, auf der Schiene, Seefracht, Luftfracht, Seeverkehr, multimodal, intermodal",
+        "prejudice": "Schiff, Reisenummer, Versanddienstleister/Frachtführer, Hafen, Dokumentnummer, Incoterms, Zahlungsbedingungen, Währung, Gewicht, Betrag, Containernummer"
+      },
+      "means_of_conveyance": {
+        "semantic": "Beförderungsmittel, Fahrzeug",
+        "bias": "Beförderungsmittel, Beförderung, Fahrzeug, Lkw, Schiffstyp",
+        "prejudice": "Schiff, Reisenummer, Verkehrszweig, Hafen, Dokumentnummer, Gewicht, Betrag"
+      },
+      "payment_terms": {
+        "semantic": "Zahlungsbedingungen, Zahlungskonditionen",
+        "bias": "Zahlungsbedingungen, Zahlungskonditionen, T/T, TT, L/C, LC, D/A, D/P, bei Sicht, Nachsicht, 30 Tage netto, 60 Tage netto",
+        "prejudice": "Incoterms, Handelsklauseln, Frachtbedingungen, Fracht vorausbezahlt, Fracht zahlbar am Bestimmungsort, Währung, Betrag, Gewicht, Dokumentnummer, Ausstellungsdatum, Hafen"
+      },
+      "freight_payment_term": {
+        "semantic": "Frachtbedingungen, Frachtzahlung",
+        "bias": "Fracht vorausbezahlt, Fracht zahlbar am Bestimmungsort, vorausbezahlt, unfrei, Frachtklausel",
+        "prejudice": "Zahlungsbedingungen, Zahlungskonditionen, Incoterms, Handelsklauseln, Währung, Betrag, Gewicht, Dokumentnummer, Hafen"
+      },
+      "latest_shipment_date": {
+        "semantic": "Spätestes Verladedatum",
+        "bias": "spätestes Verladedatum, spätester Verladetag, Verladung muss erfolgen bis",
+        "prejudice": "Ausstellungsdatum, Verfalldatum, gültig bis, Abfahrtsdatum, Ankunftsdatum, Dokumentnummer, Gewicht, Betrag"
+      },
+      "partial_shipments": {
+        "semantic": "Teilverladungen erlaubt",
+        "bias": "Teilverladung, Teilverladungen erlaubt, Teilverladungen untersagt, erlaubt, nicht erlaubt",
+        "prejudice": "Umladung, spätestes Verladedatum, Ausstellungsdatum, Gewicht, Betrag, Dokumentnummer"
+      },
+      "transshipment_allowed": {
+        "semantic": "Umladung erlaubt",
+        "bias": "Umladung, Umschlag, Umladung erlaubt, Umladung untersagt, erlaubt, nicht erlaubt",
+        "prejudice": "Teilverladung, spätestes Verladedatum, Umschlaghafen, Ausstellungsdatum, Gewicht, Betrag, Dokumentnummer"
+      },
+      "special_instructions": {
+        "semantic": "Besondere Anweisungen, Bemerkungen",
+        "bias": "besondere Anweisungen, Bemerkungen, Hinweise, Zusatzinformationen, Handhabungshinweise",
+        "prejudice": "Dokumentnummer, Ausstellungsdatum, Absender, Empfänger, Hafen, Schiff, Gewicht, Betrag, Währung, Zolltarifnummer (HS-Code)"
+      },
+      "amount_subtotal": {
+        "semantic": "Zwischensumme, Nettobetrag",
+        "bias": "Zwischensumme, Teilsumme, Nettobetrag, Betrag vor Steuern, Warenwert",
+        "prejudice": "Gesamtbetrag, Gesamtsumme, Steuer, MwSt., Fracht, Versicherung, Währung, Gewicht, Menge, Dokumentnummer"
+      },
+      "amount_tax": {
+        "semantic": "Steuerbetrag, MwSt.-Betrag",
+        "bias": "Steuerbetrag, MwSt.-Betrag, Zollbetrag, zu zahlende Steuer, Umsatzsteuerbetrag, USt.-Betrag, montant de la taxe, montant de la TVA, importe del impuesto, importe del IVA, importo imposta, importo IVA, valor do imposto, valor do IVA, belastingbedrag, btw-bedrag, částka daně, částka DPH, مبلغ الضريبة, مبلغ ضريبة القيمة المضافة, 税額, 消費税額, 税额, 增值税额, 세액, 부가세액",
+        "prejudice": "Zwischensumme, Gesamtbetrag, Gesamtsumme, Fracht, Versicherung, Währung, Gewicht, Menge, Dokumentnummer, USt-IdNr., Umsatzsteuer-Identifikationsnummer, USt-IdNr./EORI, EORI-Nummer, Steuer-Identifikationsnummer, Steuer-ID, TIN, Handelsregisternummer, Zollnummer, Steuernummer, numéro de TVA, numéro EORI, numéro d'identification fiscale, número de IVA, NIF, CIF, número EORI, partita IVA, codice fiscale, numero EORI, número de contribuinte, btw-nummer, btw-identificatienummer, EORI-nummer, DIČ, daňové identifikační číslo, IČO, رقم التسجيل الضريبي, الرقم الضريبي, 法人番号, 適格請求書発行事業者登録番号, 納税者番号, 纳税人识别号, 统一社会信用代码, 海关注册编码, 사업자등록번호, 부가세번호, 통관고유부호, 수출자부호"
+      },
+      "freight_amount": {
+        "semantic": "Fracht, Frachtkosten",
+        "bias": "Fracht, Frachtkosten, Frachtbetrag, Seefracht, Luftfracht, Grundfracht",
+        "prejudice": "Versicherung, Zwischensumme, Gesamtbetrag, Gesamtsumme, lokale Gebühren, Währung, Gewicht, Menge, Dokumentnummer"
+      },
+      "insurance_amount": {
+        "semantic": "Versicherung, Versicherungsprämie",
+        "bias": "Versicherung, Versicherungsprämie, Versicherungskosten, Prämie",
+        "prejudice": "Fracht, Zwischensumme, Gesamtbetrag, Gesamtsumme, lokale Gebühren, Währung, Gewicht, Dokumentnummer"
+      },
+      "local_charges": {
+        "semantic": "Lokale Gebühren, Handlinggebühr",
+        "bias": "lokale Gebühren, Terminal-Umschlaggebühr, Dokumentengebühr, Handlinggebühr, CFS-Gebühr, Kaigeld",
+        "prejudice": "Fracht, Versicherung, Zwischensumme, Gesamtbetrag, Gesamtsumme, Währung, Gewicht, Menge, Dokumentnummer"
+      },
+      "exchange_rate": {
+        "semantic": "Wechselkurs",
+        "bias": "Wechselkurs, Devisenkurs, Umrechnungskurs, FX-Kurs, 1.25",
+        "prejudice": "Währung, Betrag, Gesamtbetrag, Steuer, Gewicht, Menge, Dokumentnummer, Ausstellungsdatum"
+      },
+      "due_date": {
+        "semantic": "Fälligkeitsdatum, Zahlungsfälligkeit",
+        "bias": "Fälligkeitsdatum, Zahlungsfälligkeit, zahlbar bis, fällig am",
+        "prejudice": "Ausstellungsdatum, Verfalldatum, gültig bis, Abfahrtsdatum, Ankunftsdatum, Dokumentnummer, Gewicht, Betrag"
+      },
+      "valid_until": {
+        "semantic": "Gültig bis, Gültigkeit",
+        "bias": "gültig bis, Gültigkeit, gültig bis einschließlich, wirksam bis",
+        "prejudice": "Ausstellungsdatum, Fälligkeitsdatum, Abfahrtsdatum, Ankunftsdatum, Dokumentnummer, Gewicht, Betrag"
+      },
+      "payment_status": {
+        "semantic": "Zahlungsstatus",
+        "bias": "Zahlungsstatus, bezahlt, unbezahlt, teilweise bezahlt, offen, beglichen, überfällig",
+        "prejudice": "Dokumentstatus, Fortschritt, zollabgefertigt, Betrag, Währung, Ausstellungsdatum, Dokumentnummer"
+      },
+      "account_number": {
+        "semantic": "Kontonummer, Bankkonto",
+        "bias": "Kontonummer, Konto-Nr., Bankkonto, IBAN, Konto des Begünstigten",
+        "prejudice": "Dokumentnummer, Containernummer, Plombennummer, Telefonnummer, USt-IdNr., Betrag, Währung, Gewicht"
+      },
+      "swift_code": {
+        "semantic": "SWIFT-Code, BIC-Code",
+        "bias": "SWIFT-Code, BIC-Code, Bank-Identifizierungscode",
+        "prejudice": "Kontonummer, Dokumentnummer, Containernummer, Telefonnummer, USt-IdNr., Betrag, Währung"
+      },
+      "package_unit": {
+        "semantic": "Verpackungseinheit, Verpackungsart",
+        "bias": "Verpackungseinheit, Verpackungsart, CTN, KARTON, PLT, PALETTE, PKG, PACKSTÜCK, SCHACHTEL, FASS, BALLEN, BUND, KISTE, ROLLE",
+        "prejudice": "Anzahl Packstücke, Menge, Gewicht, Volumen, Betrag, Währung, Dokumentnummer, Containernummer"
+      },
+      "marks_numbers": {
+        "semantic": "Versandmarkierungen, Kennzeichen und Nummern",
+        "bias": "Versandmarkierungen, Kennzeichen und Nummern, Markierungen, Kistenmarkierung, N/M, OHNE MARKIERUNG, LAUT RECHNUNG",
+        "prejudice": "Dokumentnummer, Containernummer, Plombennummer, Zolltarifnummer (HS-Code), Anzahl Packstücke, Gewicht, Volumen, Betrag, Währung, Ausstellungsdatum, Hafen, Schiff"
+      },
+      "chargeable_weight": {
+        "semantic": "Frachtpflichtiges Gewicht, Volumengewicht",
+        "bias": "frachtpflichtiges Gewicht, Abrechnungsgewicht, Volumengewicht, volumetrisches Gewicht",
+        "prejudice": "Bruttogewicht, Nettogewicht, Volumen, Anzahl Packstücke, Betrag, Währung, Dokumentnummer, Containernummer"
+      },
+      "description": {
+        "semantic": "Warenbeschreibung, Warenart",
+        "bias": "Warenbeschreibung, Beschreibung, Warenart, Warenbezeichnung, Artikelbeschreibung, Beschreibung der Waren, Art der Ware",
+        "prejudice": "Artikelcode, Zolltarifnummer (HS-Code), Menge, Einheit, Einzelpreis, Betrag, Gewicht, Dokumentnummer, Containernummer, Absender, Empfänger"
+      },
+      "item_code": {
+        "semantic": "Artikelcode, Modell-Nr., Teile-Nr.",
+        "bias": "Artikelcode, Modell-Nr., Teile-Nr., Artikel-Nr., Style-Nr., SKU, Referenz",
+        "prejudice": "Zolltarifnummer (HS-Code), Dokumentnummer, Containernummer, Plombennummer, Warenbeschreibung, Menge, Einzelpreis, Betrag, Gewicht"
+      },
+      "quantity": {
+        "semantic": "Menge, Stück",
+        "bias": "Menge, Anz., MENGE, Stück, PCS, Einheiten, Warenmenge",
+        "prejudice": "Einzelpreis, Betrag, Gesamtbetrag, Gewicht, Volumen, Anzahl Packstücke, Währung, Dokumentnummer, Zolltarifnummer (HS-Code), Containernummer"
+      },
+      "unit": {
+        "semantic": "Einheit, Maßeinheit",
+        "bias": "Einheit, Maßeinheit, ME, STK, PCS, SET, PAAR, SCHACHTEL, KG, KGS, MT, M, MTR, LTR, DTZD",
+        "prejudice": "Verpackungseinheit, Währung, Menge, Einzelpreis, Betrag, Gewicht, Dokumentnummer, Zolltarifnummer (HS-Code)"
+      },
+      "country_of_manufacture": {
+        "semantic": "Herstellungsland, Ursprungsland",
+        "bias": "Herstellungsland, Ursprungsland, gefertigt in, Ursprung, hergestellt in, KOREA, CHINA, VIETNAM, JAPAN, Deutschland, DEUTSCHLAND",
+        "prejudice": "Verladehafen, Löschhafen, Bestimmungsort, Dokumentnummer, Warenbeschreibung, Menge, Einzelpreis, Betrag, Gewicht"
+      },
+      "unit_price": {
+        "semantic": "Einzelpreis, Tarif",
+        "bias": "Einzelpreis, Stückwert, Preis pro Einheit, Tarif, E-PREIS",
+        "prejudice": "Gesamtbetrag, Gesamtsumme, Betrag, Zwischensumme, Menge, Gewicht, Währung, Dokumentnummer, Zolltarifnummer (HS-Code)"
+      },
+      "total_price": {
+        "semantic": "Positionssumme, Positionsbetrag",
+        "bias": "Gesamtpreis, Gesamtwert, Positionssumme, Betrag, Positionsbetrag",
+        "prejudice": "Einzelpreis, Gesamtbetrag, Gesamtsumme, Menge, Gewicht, Währung, Dokumentnummer, Zolltarifnummer (HS-Code)"
+      },
+      "item_net_weight": {
+        "semantic": "Nettogewicht pro Artikel",
+        "bias": "Nettogewicht, Nettogew., Nettogewicht pro Artikel",
+        "prejudice": "Gesamtbruttogewicht, Bruttogewicht pro Artikel, Volumen, Menge, Einzelpreis, Betrag"
+      },
+      "item_gross_weight": {
+        "semantic": "Bruttogewicht pro Artikel",
+        "bias": "Bruttogewicht, Bruttogew., Bruttogewicht pro Artikel",
+        "prejudice": "Gesamtnettogewicht, Nettogewicht pro Artikel, Volumen, Menge, Einzelpreis, Betrag"
+      },
+      "item_package_count": {
+        "semantic": "Packstücke pro Artikel",
+        "bias": "Packstückzahl, Packstücke pro Artikel, CTNS",
+        "prejudice": "Packstücke gesamt, Menge, Gewicht, Volumen, Einzelpreis, Betrag"
+      },
+      "item_package_type": {
+        "semantic": "Verpackungsart pro Artikel",
+        "bias": "Verpackungsart, Art der Verpackung, Verpackungstyp",
+        "prejudice": "Gesamtverpackungseinheit, Menge, Einheit, Gewicht, Volumen, Einzelpreis, Betrag"
+      },
+      "type_size": {
+        "semantic": "Containertyp und -größe",
+        "bias": "Typ und Größe, Größentyp, Containertyp, 20GP, 40GP, 40HC, 45HC, 20RF, 40RF, 20OT, 40FR, DRY, REEFER",
+        "prejudice": "Containernummer, Plombennummer, Dokumentnummer, Anzahl Packstücke, Gewicht, Volumen, Betrag, Zolltarifnummer (HS-Code)"
+      },
+      "container_package_count": {
+        "semantic": "Packstücke im Container",
+        "bias": "Packstückzahl, Packstücke im Container, CTNS pro Container",
+        "prejudice": "Packstücke gesamt, Containernummer, Plombennummer, Gewicht, Volumen, Containertyp, Betrag"
+      },
+      "container_gross_weight": {
+        "semantic": "Bruttogewicht des Containers",
+        "bias": "Bruttogewicht, Bruttogew. pro Container, Container-Bruttogewicht",
+        "prejudice": "Gesamtbruttogewicht, Nettogewicht, Containernummer, Plombennummer, Volumen, Containertyp, Anzahl Packstücke, Betrag"
+      },
+      "container_measurement": {
+        "semantic": "Containermaß, CBM",
+        "bias": "Maß, CBM pro Container, Containermaß, M3",
+        "prejudice": "Gesamtvolumen, Gewicht, Containernummer, Plombennummer, Containertyp, Anzahl Packstücke, Betrag"
+      },
+      "party_role": {
+        "semantic": "Rolle des Beteiligten",
+        "bias": "Versanddienstleister/Frachtführer, Versicherer, Versicherter, eröffnende Bank, avisierende Bank, Zollagent, Zollbehörde, Lagerhalter, Inspektionsstelle, Sachverständigenbüro, Anspruchsteller, Auftraggeber, Aussteller, Bezogener, Zahlungsempfänger, Schiffsagent, Spedition",
+        "prejudice": "Firmenname, Adresse, Telefonnummer, Dokumentnummer, Ausstellungsdatum, Hafen, Gewicht, Betrag"
+      },
+      "party_name": {
+        "semantic": "Name des Beteiligten, Firmenname",
+        "bias": "Firmenname, Name des Beteiligten, Firmenbezeichnung, Bankname",
+        "prejudice": "Rolle des Beteiligten, Adresse, Telefonnummer, Dokumentnummer, Ausstellungsdatum, Hafen, Gewicht, Betrag"
+      },
+      "party_address": {
+        "semantic": "Adresse des Beteiligten",
+        "bias": "Adresse, Adresse des Beteiligten, Standort",
+        "prejudice": "Rolle des Beteiligten, Firmenname, Telefonnummer, Dokumentnummer, Ausstellungsdatum, Hafen, Gewicht, Betrag"
+      },
+      "party_contact": {
+        "semantic": "Kontakt des Beteiligten",
+        "bias": "Kontakt, Telefon, Ansprechpartner, TEL, FAX, E-MAIL",
+        "prejudice": "Rolle des Beteiligten, Firmenname, Adresse, Dokumentnummer, Containernummer, Kontonummer, Betrag"
+      }
+    },
+    "default": {
+      "layout_list": {
+        "semantic": "Liste mit mehreren Einträgen, Tabelle, Übersichtsseite",
+        "bias": "{TYPE}-Liste, {TYPE}-Tabelle, {TYPE}-Massenbearbeitung, Liste, Tabelle, Massenbearbeitung",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "layout_form": {
+        "semantic": "Formularseite zum Anzeigen oder Erfassen der Details eines einzelnen Eintrags",
+        "bias": "{TYPE}-Details, {TYPE}-Formular, {TYPE}-Erfassung, {TYPE} bearbeiten, Details, Formular, input, bearbeiten, select, textarea",
+        "prejudice": "Hauptnavigation, Menüs, Fußzeilen, Seitenleiste."
+      },
+      "id,link": {
+        "semantic": "Kennung, Link, Adresse",
+        "bias": "{TYPE}-ID, {TYPE}-Nummer, {TYPE}-Code, ID-001, 12345, /pfad/zur/ressource",
+        "prejudice": "Titel, Name, Ankündigung, Produktinfo, Aktion, normal, ausstehend, Fehler, abgeschlossen, Status, Fortschritt"
+      },
+      "title": {
+        "semantic": "Titel, Name",
+        "bias": "{TYPE}-Name, {TYPE}-Titel, Ankündigung, Produktinfo, Aktion",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, normal, ausstehend, Fehler, abgeschlossen, Status, Fortschritt"
+      },
+      "status": {
+        "semantic": "Status",
+        "bias": "{TYPE}-Status, {TYPE}-Fortschritt, normal, ausstehend, Fehler, abgeschlossen",
+        "prejudice": "Kennung, Link, Adresse, Nummer, Code, Titel, Name, Ankündigung, Produktinfo, Aktion"
       }
     }
   },

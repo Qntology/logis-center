@@ -1,0 +1,30 @@
+page_id: ulipy-goods-detail-CZ10148
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/goods/view?id=CZ10148
+page_type: goods
+layout: detail
+fields:
+  id,link: CZ10148
+  title: Omalovánky
+  status: Koncept
+  category: Hračky
+  sale_price: 150
+  quantity: 3
+  registration_date: '2026-06-21'
+  brand_name: Kestrel Lane
+  code: CZ-KID-104
+  stock_keeping_unit: CZKI1004
+  model_name: KI-783
+  manufacturer: 하람제작소
+  origin_country: Thajsko
+  color: Vínová
+  barcode: '8845306483973'
+  supply_price: 85
+  low_stock_threshold: 10
+  shipping_fee: 50
+  description: Čtyřicet zvířecích siluet k vybarvení.
+title: Detail produktu

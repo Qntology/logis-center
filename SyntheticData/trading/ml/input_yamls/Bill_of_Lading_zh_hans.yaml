@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: zh-hans
+document_title: 海运提单
+metadata:
+  bl_number: BL-CN22569071
+  issue_date: '2026-10-05'
+  related_invoice_number: CI-CN-2610-722
+  related_po_number: PO-CN-19966
+  related_lc_number: LC-CN8832551
+  freight_term: 运费到付
+parties:
+  shipper:
+    name: 海星新能源科技有限公司
+    address: 浙江省宁波市鄞州区海星路88号
+  consignee:
+    name: Sinhan Battery Co., Ltd.
+    address: 45 Saneop-ro, Heungdeok-gu, Cheongju, 韩国
+  notify_party:
+    name: Sinhan Battery Co., Ltd.
+    address: 45 Saneop-ro, Heungdeok-gu, Cheongju, 韩国
+  carrier:
+    name: 海星远洋运输有限公司
+shipping_details:
+  vessel_flight: HAI XING V.903E
+  port_of_loading: 宁波，中国
+  port_of_discharge: 釜山，韩国
+  place_of_receipt: 宁波，中国
+  place_of_delivery: 清州，韩国
+cargo_details:
+  container_number: HXSU5559745
+  seal_number: SL974926
+  marks_and_numbers: SINHAN / CHEONGJU / MADE IN CHINA
+  number_of_packages: 56托
+  description_of_goods: 磷酸铁锂电池模组及电池管理系统控制板
+  gross_weight_kg: 20360.0
+  measurement_cbm: 51.0

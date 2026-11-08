@@ -1,0 +1,136 @@
+page_id: sakura-order-list-1
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/order/list?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20260408-100053
+  registration_date: '2026-04-08'
+  status: 返品
+  goods: コールドブリュー濃縮コーヒー
+  tracking_number: '465019825630'
+  sender_name: 中村 陽菜
+  recipient_name: 鈴木 芽依
+  quantity: 5
+  amount: 8650
+  shipping_fee: 0
+  payment_method: クレジットカード
+- id,link: 20260513-100106
+  registration_date: '2026-05-13'
+  status: 処理中
+  goods: 充電式LEDランタン
+  sender_name: 加藤 芽依
+  recipient_name: 加藤 芽依
+  quantity: 5
+  amount: 17400
+  shipping_fee: 0
+  payment_method: 電子マネー
+- id,link: 20260727-100159
+  registration_date: '2026-07-27'
+  status: キャンセル
+  goods: リネン半袖シャツ
+  sender_name: 渡辺 大翔
+  recipient_name: 伊藤 結衣
+  quantity: 1
+  amount: 4875
+  shipping_fee: 330
+  payment_method: クレジットカード
+- id,link: 20261007-100212
+  registration_date: '2026-10-07'
+  status: 発送済み
+  goods: 軽量ダウンベスト
+  tracking_number: '416875405476'
+  sender_name: 鈴木 陽菜
+  recipient_name: 小林 結衣
+  quantity: 3
+  amount: 24840
+  shipping_fee: 0
+  payment_method: クレジットカード
+- id,link: 20260715-100265
+  registration_date: '2026-07-15'
+  status: 配達完了
+  goods: ステンレスフライパン
+  tracking_number: '291120818873'
+  sender_name: 田中 陽菜
+  recipient_name: 鈴木 蓮
+  quantity: 6
+  amount: 33710
+  shipping_fee: 0
+  payment_method: 電子マネー
+- id,link: 20260414-100318
+  registration_date: '2026-04-14'
+  status: キャンセル
+  goods: 防水Bluetoothスピーカー
+  sender_name: 鈴木 大翔
+  recipient_name: 鈴木 大翔
+  quantity: 3
+  amount: 16910
+  shipping_fee: 0
+  payment_method: 銀行振込
+- id,link: 20260402-100371
+  registration_date: '2026-04-02'
+  status: 入金済み
+  goods: リネン半袖シャツ
+  sender_name: 伊藤 大翔
+  recipient_name: 伊藤 大翔
+  quantity: 2
+  amount: 10100
+  shipping_fee: 0
+  payment_method: クレジットカード
+- id,link: 20260922-100424
+  registration_date: '2026-09-22'
+  status: 処理中
+  goods: ペットキャリーバッグ
+  sender_name: 渡辺 悠真
+  recipient_name: 渡辺 悠真
+  quantity: 5
+  amount: 15552
+  shipping_fee: 0
+  payment_method: クレジットカード
+- id,link: 20260726-100477
+  registration_date: '2026-07-26'
+  status: キャンセル
+  goods: バリア保湿クリーム
+  sender_name: 鈴木 大翔
+  recipient_name: 小林 芽依
+  quantity: 1
+  amount: 3960
+  shipping_fee: 330
+  payment_method: 銀行振込
+- id,link: 20260420-100530
+  registration_date: '2026-04-20'
+  status: 配達完了
+  goods: 密閉ガラス保存容器セット
+  tracking_number: '251625343135'
+  sender_name: 加藤 葵
+  recipient_name: 加藤 葵
+  quantity: 2
+  amount: 7080
+  shipping_fee: 0
+  payment_method: クレジットカード
+- id,link: 20260802-100583
+  registration_date: '2026-08-02'
+  status: 処理中
+  goods: アウトドアクッカーセット
+  sender_name: 中村 結衣
+  recipient_name: 中村 結衣
+  quantity: 3
+  amount: 17090
+  shipping_fee: 0
+  payment_method: 電子マネー
+- id,link: 20260516-100636
+  registration_date: '2026-05-16'
+  status: 配達完了
+  goods: ハンディミニ扇風機
+  tracking_number: '310373445099'
+  sender_name: 伊藤 葵
+  recipient_name: 伊藤 葵
+  quantity: 2
+  amount: 4164
+  shipping_fee: 330
+  payment_method: 電子マネー
+title: 注文一覧

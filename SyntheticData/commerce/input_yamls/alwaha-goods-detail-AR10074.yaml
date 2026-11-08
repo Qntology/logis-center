@@ -1,0 +1,31 @@
+page_id: alwaha-goods-detail-AR10074
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/products/AR10074
+page_type: goods
+layout: detail
+fields:
+  id,link: AR10074
+  title: سوار لياقة ذكي
+  status: معروض للبيع
+  category: إلكترونيات
+  sale_price: 128.75
+  compare_at_price: 154.5
+  quantity: 96
+  registration_date: '2026-01-13'
+  brand_name: 마루공방
+  code: AR-AUD-102
+  stock_keeping_unit: ARAU1002
+  model_name: AU-452
+  manufacturer: 하람제작소
+  origin_country: تايلاند
+  color: أزرق سماوي
+  barcode: '8821602085960'
+  supply_price: 75.97
+  low_stock_threshold: 5
+  shipping_fee: 8.2
+  description: يسجل الخطوات والنوم.
+title: تفاصيل المنتج

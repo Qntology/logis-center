@@ -1,0 +1,83 @@
+page_id: ulipy-tracking-list-2
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '465691848945'
+  carrier: Tři řeky expres
+  status: Vráceno
+  title: Ergonomická vertikální myš
+  shipping_date: '2026-05-04'
+  recipient_name: Veronika Němcová
+- id,link: '819506185975'
+  carrier: Kurýr Petřín
+  status: Vráceno
+  title: Dětská koloběžka
+  shipping_date: '2026-06-28'
+  recipient_name: Petra Horáková
+- id,link: '412329645333'
+  carrier: Lipová přeprava
+  status: Doručeno
+  title: Postroj pro psa
+  shipping_date: '2026-05-10'
+  recipient_name: Kateřina Veselá
+- id,link: '267171322320'
+  carrier: Morava náklad
+  status: Odesláno
+  title: Tichá mechanická klávesnice
+  shipping_date: '2026-05-06'
+  recipient_name: Eva Nováková
+- id,link: '850061431173'
+  carrier: Tři řeky expres
+  status: Doručeno
+  title: Škrabadlo pro kočky
+  shipping_date: '2026-09-11'
+  recipient_name: Jakub Kučera
+- id,link: '712886015346'
+  carrier: Tři řeky expres
+  status: Odesláno
+  title: Automatické krmítko
+  shipping_date: '2026-04-17'
+  recipient_name: Tereza Dvořáková
+- id,link: '353235903072'
+  carrier: Kurýr Petřín
+  status: Doručeno
+  title: Dřevěné stavebnicové kostky
+  shipping_date: '2026-10-09'
+  recipient_name: Eva Němcová
+- id,link: '709342405274'
+  carrier: Morava náklad
+  status: Doručeno
+  title: Nerezová pánev
+  shipping_date: '2026-08-20'
+  recipient_name: Kateřina Nováková
+- id,link: '677923632326'
+  carrier: Tři řeky expres
+  status: Doručeno
+  title: Mandarinkový džus z ostrova Čedžu
+  shipping_date: '2026-08-05'
+  recipient_name: Martin Veselý
+- id,link: '667102552166'
+  carrier: Morava náklad
+  status: Doručeno
+  title: Rychlonabíječka 65 W
+  shipping_date: '2026-05-02'
+  recipient_name: Tomáš Horák
+- id,link: '744147693572'
+  carrier: Tři řeky expres
+  status: Odesláno
+  title: Pražené mandle
+  shipping_date: '2026-09-12'
+  recipient_name: Veronika Veselá
+- id,link: '712542218796'
+  carrier: Lipová přeprava
+  status: Odesláno
+  title: Nerezová pánev
+  shipping_date: '2026-04-04'
+  recipient_name: Petra Novotná
+title: Zásilky

@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: pt
+document_title: Apólice de seguro de transporte
+metadata:
+  policy_number: IP-PT-514982
+  issue_date: '2026-09-22'
+  effective_date: '2026-09-23'
+  related_invoice_number: CI-PT-2609-197
+  related_bl_number: BL-PT56145092
+  related_lc_number: LC-PT3608203
+  related_po_number: PO-PT-74235
+parties:
+  insurer:
+    name: Seguros Atlântico Norte, S.A.
+    address: Avenida da Boavista 1200, 4100-130 Porto, Portugal
+  insured:
+    name: Hwain Interior Co., Ltd.
+    address: 27 Haeun-daero, Haeundae-gu, Busan, Coreia do Sul
+coverage_details:
+  sum_insured: 124856.16
+  currency: EUR
+  valuation_basis: Valor CIF acrescido de 10 %
+  coverage_conditions: Institute Cargo Clauses (A) – todos os riscos
+  premium_amount: 312.14
+  claims_payable_at: Busan, Coreia do Sul
+transport_details:
+  vessel_flight: ATLANTICO NORTE V.091E
+  port_of_loading: Leixões, Portugal
+  port_of_discharge: Busan, Coreia do Sul
+cargo_details:
+- mark_and_numbers: HWAIN / BUSAN / FABRICADO EM PORTUGAL
+  description_of_goods: Rolhas de cortiça natural e painéis de aglomerado de cortiça
+  number_of_packages: 26 paletes
+  gross_weight_kg: 8750.0

@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: ko
+document_title: 포장명세서
+metadata:
+  packing_list_number: PL-KR-2609-103
+  issue_date: '2026-09-15'
+  related_invoice_number: CI-KR-2609-313
+  related_po_number: PO-KR-30263
+  related_bl_number: BL-KR90619014
+parties:
+  shipper_exporter:
+    name: (주)한빛타이어
+    address: 울산광역시 남구 산업로 123
+  consignee:
+    name: Vina Auto Parts Co., Ltd.
+    address: 25 Nguyen Van Linh, District 7, Ho Chi Minh City, Vietnam
+shipping_details:
+  vessel_flight: HANBADA V.118S
+  port_of_loading: 부산, 대한민국
+  port_of_discharge: 호찌민, 베트남
+packing_details:
+- item_code: HT-20555
+  description: 승용차용 래디얼 타이어 205/55R16
+  quantity: 4800
+  unit: 개
+  packages: 60
+  package_type: 팔레트
+  net_weight_kg: 41760.0
+  gross_weight_kg: 43200.0
+  measurement_cbm: 96.0
+- item_code: AW-1607
+  description: 알루미늄 휠 16x7J
+  quantity: 1200
+  unit: 개
+  packages: 30
+  package_type: 팔레트
+  net_weight_kg: 10800.0
+  gross_weight_kg: 11640.0
+  measurement_cbm: 36.0
+summary:
+  total_packages: 90
+  total_net_weight_kg: 52560.0
+  total_gross_weight_kg: 54840.0
+  total_measurement_cbm: 132.0

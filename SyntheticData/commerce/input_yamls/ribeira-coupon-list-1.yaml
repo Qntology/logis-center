@@ -1,0 +1,91 @@
+page_id: ribeira-coupon-list-1
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/coupons?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: RIB127
+  title: Vantagem para clientes habituais 1
+  type: Percentagem
+  discount: 20%
+  started_at: '2026-04-14'
+  expired_at: '2026-04-21'
+  status: Agendado
+- id,link: CP4014
+  code: RIB455
+  title: Resgate do carrinho 2
+  type: Percentagem
+  discount: 20%
+  started_at: '2026-06-16'
+  expired_at: '2026-07-16'
+  status: Ativo
+- id,link: CP4021
+  code: RIB801
+  title: Oferta exclusiva da app 3
+  type: Percentagem
+  discount: 15%
+  started_at: '2026-04-25'
+  expired_at: '2026-05-09'
+  status: Ativo
+- id,link: CP4028
+  code: RIB801
+  title: Oferta exclusiva da app 4
+  type: Valor fixo
+  discount: 2,05 €
+  started_at: '2026-08-21'
+  expired_at: '2026-09-20'
+  status: Agendado
+- id,link: CP4035
+  code: RIB401
+  title: Obrigado de outono 5
+  type: Valor fixo
+  discount: 2,05 €
+  started_at: '2026-05-17'
+  expired_at: '2026-05-24'
+  status: Terminado
+- id,link: CP4042
+  code: RIB877
+  title: Oferta só ao fim de semana 6
+  type: Valor fixo
+  discount: 3,45 €
+  started_at: '2026-03-23'
+  expired_at: '2026-04-22'
+  status: Agendado
+- id,link: CP4049
+  code: RIB488
+  title: Boas-vindas à primeira encomenda 7
+  type: Valor fixo
+  discount: 3,45 €
+  started_at: '2026-03-18'
+  expired_at: '2026-04-17'
+  status: Ativo
+- id,link: CP4056
+  code: RIB761
+  title: Obrigado de outono 8
+  type: Percentagem
+  discount: 20%
+  started_at: '2026-07-22'
+  expired_at: '2026-08-05'
+  status: Ativo
+- id,link: CP4063
+  code: RIB747
+  title: Boas-vindas à primeira encomenda 9
+  type: Valor fixo
+  discount: 3,45 €
+  started_at: '2026-06-22'
+  expired_at: '2026-07-06'
+  status: Ativo
+- id,link: CP4070
+  code: RIB165
+  title: Oferta só ao fim de semana 10
+  type: Valor fixo
+  discount: 3,45 €
+  started_at: '2026-03-28'
+  expired_at: '2026-04-27'
+  status: Agendado
+title: Códigos de desconto

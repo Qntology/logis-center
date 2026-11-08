@@ -1,0 +1,27 @@
+page_id: ribeira-order-detail-20260625-100053
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/my/orders/20260625-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260625-100053
+  registration_date: '2026-06-25'
+  status: Em processamento
+  goods: Manta de microfibra
+  sender_name: Rafael Martins
+  recipient_name: Rafael Martins
+  quantity: 6
+  amount: 210.05
+  shipping_fee: 0.0
+  payment_method: Carteira digital
+  sender_phone: +351 974 010 019
+  sender_address: Rua do Comércio, 13, 8000-138 Faro
+  recipient_phone: +351 974 010 019
+  recipient_address: Rua do Comércio, 13, 8000-138 Faro
+  payment_origin: PagaFácil Ribeira
+  payment_date: '2026-06-25'
+title: Detalhes da encomenda

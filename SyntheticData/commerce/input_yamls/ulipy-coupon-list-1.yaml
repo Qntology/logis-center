@@ -1,0 +1,91 @@
+page_id: ulipy-coupon-list-1
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: ULI265
+  title: Jen tento víkend 1
+  type: Procentní sleva
+  discount: 5%
+  started_at: '2026-05-19'
+  expired_at: '2026-06-02'
+  status: Probíhá
+- id,link: CP4014
+  code: ULI414
+  title: Připomínka košíku 2
+  type: Pevná částka
+  discount: 30 Kč
+  started_at: '2026-08-02'
+  expired_at: '2026-08-16'
+  status: Naplánováno
+- id,link: CP4021
+  code: ULI651
+  title: Exkluzivně v aplikaci 3
+  type: Pevná částka
+  discount: 50 Kč
+  started_at: '2026-07-06'
+  expired_at: '2026-07-13'
+  status: Ukončeno
+- id,link: CP4028
+  code: ULI786
+  title: Jen tento víkend 4
+  type: Procentní sleva
+  discount: 5%
+  started_at: '2026-04-06'
+  expired_at: '2026-04-20'
+  status: Naplánováno
+- id,link: CP4035
+  code: ULI801
+  title: Výhoda pro stálé zákazníky 5
+  type: Procentní sleva
+  discount: 15%
+  started_at: '2026-04-02'
+  expired_at: '2026-04-16'
+  status: Ukončeno
+- id,link: CP4042
+  code: ULI366
+  title: Vítejte u první objednávky 6
+  type: Procentní sleva
+  discount: 10%
+  started_at: '2026-09-04'
+  expired_at: '2026-09-18'
+  status: Naplánováno
+- id,link: CP4049
+  code: ULI391
+  title: Výhoda pro stálé zákazníky 7
+  type: Pevná částka
+  discount: 50 Kč
+  started_at: '2026-09-08'
+  expired_at: '2026-09-15'
+  status: Ukončeno
+- id,link: CP4056
+  code: ULI224
+  title: Jen tento víkend 8
+  type: Pevná částka
+  discount: 30 Kč
+  started_at: '2026-08-15'
+  expired_at: '2026-08-22'
+  status: Ukončeno
+- id,link: CP4063
+  code: ULI844
+  title: Připomínka košíku 9
+  type: Procentní sleva
+  discount: 5%
+  started_at: '2026-03-23'
+  expired_at: '2026-04-06'
+  status: Ukončeno
+- id,link: CP4070
+  code: ULI200
+  title: Připomínka košíku 10
+  type: Pevná částka
+  discount: 80 Kč
+  started_at: '2026-06-16'
+  expired_at: '2026-07-16'
+  status: Ukončeno
+title: Slevové kódy

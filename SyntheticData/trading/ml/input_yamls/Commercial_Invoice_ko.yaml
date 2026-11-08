@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: ko
+document_title: 상업송장
+metadata:
+  invoice_number: CI-KR-2609-313
+  issue_date: '2026-09-15'
+  reference_po_number: PO-KR-30263
+  related_bl_number: BL-KR90619014
+  related_lc_number: LC-KR2372314
+  currency: USD
+parties:
+  shipper_exporter:
+    name: (주)한빛타이어
+    address: 울산광역시 남구 산업로 123
+    contact_number: 052-555-0142
+    tax_id: 610-81-23456
+  consignee:
+    name: Vina Auto Parts Co., Ltd.
+    address: 25 Nguyen Van Linh, District 7, Ho Chi Minh City, Vietnam
+    contact_number: +84 28 5555 0142
+    tax_id: 0312345678
+shipping_details:
+  port_of_loading: 부산, 대한민국
+  port_of_discharge: 호찌민, 베트남
+  vessel_flight: HANBADA V.118S
+  incoterms: CIF Ho Chi Minh City
+line_items:
+- item_code: HT-20555
+  description: 승용차용 래디얼 타이어 205/55R16
+  quantity: 4800
+  unit: 개
+  unit_price: 46.5
+  total_amount: 223200.0
+  hs_code: '4011.10'
+- item_code: AW-1607
+  description: 알루미늄 휠 16x7J
+  quantity: 1200
+  unit: 개
+  unit_price: 58.0
+  total_amount: 69600.0
+  hs_code: '8708.70'
+summary:
+  total_quantity: 6000
+  total_items_amount: 292800.0
+  freight_charge: 11712.0
+  insurance: 878.4
+  grand_total_amount: 305390.4

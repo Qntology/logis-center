@@ -1,9 +1,30 @@
 use once_cell::sync::Lazy;
 use serde_json::Value;
 
-/// 도메인 사전. 내장 `bias.json` 위에 앱 폴더의 덮어쓰기 파일(있으면)을 얹은 결과입니다 ([`BIAS_OVERRIDE_FILE`]).
+// =====================================================================
+// 🌟 [BIAS SOURCE] 개발 빌드는 한국어 · 영어, 배포 빌드는 모든 언어
+// ---------------------------------------------------------------------
+//  · 개발(디버그 빌드: tauri dev · cargo test): `bias.json` — 공통 구역 + ko · en 언어 구역.
+//  · 배포(릴리스 빌드: tauri build): `full_bias.json` — 같은 공통 구역 + 모든 언어 구역(es · fr · ja · pt · ar · cs · it · nl · zh …).
+//  · 디버그 빌드에서 모든 언어가 필요하면(다국어 평가) `full-bias` 기능을 켭니다: `cargo test --features full-bias`.
+//  두 파일의 공통 구역과 ko · en 구역은 같아야 합니다 (tests/it/bias_source.rs 가 확인). 하나를 고치면 다른 쪽도 고칩니다.
+// =====================================================================
+
+/// 내장 사전 파일 이름과 내용
+#[cfg(any(not(debug_assertions), feature = "full-bias"))]
+pub const BIAS_SOURCE: (&str, &str) = ("full_bias.json", include_str!("full_bias.json"));
+/// 내장 사전 파일 이름과 내용
+#[cfg(not(any(not(debug_assertions), feature = "full-bias")))]
+pub const BIAS_SOURCE: (&str, &str) = ("bias.json", include_str!("bias.json"));
+
+/// 도메인 사전. 내장 사전([`BIAS_SOURCE`]) 위에 앱 폴더의 덮어쓰기 파일(있으면)을 얹은 결과입니다 ([`BIAS_OVERRIDE_FILE`]).
 pub static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
-    let mut dict = serde_json::from_str(include_str!("bias.json")).unwrap_or(serde_json::json!({}));
+    let mut dict: Value = serde_json::from_str(BIAS_SOURCE.1).unwrap_or(serde_json::json!({}));
+    let langs: Vec<&str> = dict
+        .as_object()
+        .map(|o| o.keys().filter(|k| k.len() <= 3 || k.contains('-')).map(|k| k.as_str()).collect())
+        .unwrap_or_default();
+    println!("[BIAS] 내장 사전 {} (언어 구역 {:?})", BIAS_SOURCE.0, langs);
     load_bias_overlay(&mut dict);
     dict
 });

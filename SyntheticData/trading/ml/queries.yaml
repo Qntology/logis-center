@@ -1,0 +1,2442 @@
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: identifier
+  query: 문서번호 CI-KR-2609-313 찾아줘
+  relevant:
+  - Commercial_Invoice_ko
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: doc_title
+  query: 상업송장
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: doc_purpose
+  query: 수입자에게 품목과 금액을 청구하는 서류
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: identifier
+  query: 문서번호 PL-KR-2609-103 찾아줘
+  relevant:
+  - Packing_List_ko
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: doc_title
+  query: 포장명세서
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: doc_purpose
+  query: 상자별 수량과 무게를 적은 서류
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: identifier
+  query: 문서번호 BL-KR90619014 찾아줘
+  relevant:
+  - Bill_of_Lading_ko
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: doc_title
+  query: 선하증권
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: doc_purpose
+  query: 선사가 화물을 받고 내주는 소유권 증권
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: identifier
+  query: 문서번호 CO-2026-KR-4268 찾아줘
+  relevant:
+  - Certificate_of_Origin_ko
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: doc_title
+  query: 원산지증명서
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: doc_purpose
+  query: 물품이 어느 나라에서 만들어졌는지 증명하는 서류
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: identifier
+  query: 문서번호 IP-KR-776702 찾아줘
+  relevant:
+  - Cargo_Insurance_Policy_ko
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: doc_title
+  query: 적하보험증권
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: doc_purpose
+  query: 운송 중 사고에 대비해 가입한 보험 서류
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: party
+  query: (주)한빛타이어 서류
+  relevant: &id001
+  - Commercial_Invoice_ko
+  - Packing_List_ko
+  - Bill_of_Lading_ko
+  - Certificate_of_Origin_ko
+  - Cargo_Insurance_Policy_ko
+- split: ml
+  domain: shipping
+  lang: ko
+  kind: goods
+  query: 승용차용 래디얼 타이어 205/55R16 선적 서류
+  relevant: *id001
+- split: ml
+  domain: shipping
+  lang: de
+  kind: identifier
+  query: Dokument CI-DE-2609-360 finden
+  relevant:
+  - Commercial_Invoice_de
+- split: ml
+  domain: shipping
+  lang: de
+  kind: doc_title
+  query: Handelsrechnung
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: de
+  kind: doc_purpose
+  query: Dokument, mit dem dem Importeur Waren und Beträge in Rechnung gestellt werden
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: de
+  kind: identifier
+  query: Dokument PL-DE-2609-663 finden
+  relevant:
+  - Packing_List_de
+- split: ml
+  domain: shipping
+  lang: de
+  kind: doc_title
+  query: Packliste
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: de
+  kind: doc_purpose
+  query: Dokument mit Menge und Gewicht je Packstück
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: de
+  kind: identifier
+  query: Dokument BL-DE23591658 finden
+  relevant:
+  - Bill_of_Lading_de
+- split: ml
+  domain: shipping
+  lang: de
+  kind: doc_title
+  query: Konnossement
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: de
+  kind: doc_purpose
+  query: Wertpapier, das die Reederei bei Übernahme der Ladung ausstellt
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: de
+  kind: identifier
+  query: Dokument CO-2026-DE-9666 finden
+  relevant:
+  - Certificate_of_Origin_de
+- split: ml
+  domain: shipping
+  lang: de
+  kind: doc_title
+  query: Ursprungszeugnis
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: de
+  kind: doc_purpose
+  query: Dokument, das bescheinigt, in welchem Land die Ware hergestellt wurde
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: de
+  kind: identifier
+  query: Dokument IP-DE-771913 finden
+  relevant:
+  - Cargo_Insurance_Policy_de
+- split: ml
+  domain: shipping
+  lang: de
+  kind: doc_title
+  query: Transportversicherungspolice
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: de
+  kind: doc_purpose
+  query: Versicherungsdokument gegen Schäden während des Transports
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: de
+  kind: party
+  query: Unterlagen von Talwerk Hydraulik GmbH
+  relevant: &id002
+  - Commercial_Invoice_de
+  - Packing_List_de
+  - Bill_of_Lading_de
+  - Certificate_of_Origin_de
+  - Cargo_Insurance_Policy_de
+- split: ml
+  domain: shipping
+  lang: de
+  kind: goods
+  query: Versandpapiere für Hydraulische Zahnradpumpen
+  relevant: *id002
+- split: ml
+  domain: shipping
+  lang: es
+  kind: identifier
+  query: buscar el documento CI-ES-2610-707
+  relevant:
+  - Commercial_Invoice_es
+- split: ml
+  domain: shipping
+  lang: es
+  kind: doc_title
+  query: Factura comercial
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: es
+  kind: doc_purpose
+  query: documento que cobra al importador las mercancías y los importes
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: es
+  kind: identifier
+  query: buscar el documento PL-ES-2610-620
+  relevant:
+  - Packing_List_es
+- split: ml
+  domain: shipping
+  lang: es
+  kind: doc_title
+  query: Lista de empaque
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: es
+  kind: doc_purpose
+  query: documento con la cantidad y el peso de cada bulto
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: es
+  kind: identifier
+  query: buscar el documento BL-ES68027868
+  relevant:
+  - Bill_of_Lading_es
+- split: ml
+  domain: shipping
+  lang: es
+  kind: doc_title
+  query: Conocimiento de embarque
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: es
+  kind: doc_purpose
+  query: título que emite la naviera al recibir la carga
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: es
+  kind: identifier
+  query: buscar el documento CO-2026-ES-7692
+  relevant:
+  - Certificate_of_Origin_es
+- split: ml
+  domain: shipping
+  lang: es
+  kind: doc_title
+  query: Certificado de origen
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: es
+  kind: doc_purpose
+  query: documento que certifica en qué país se fabricaron las mercancías
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: es
+  kind: identifier
+  query: buscar el documento IP-ES-137075
+  relevant:
+  - Cargo_Insurance_Policy_es
+- split: ml
+  domain: shipping
+  lang: es
+  kind: doc_title
+  query: Póliza de seguro de transporte
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: es
+  kind: doc_purpose
+  query: documento de seguro contratado contra accidentes durante el transporte
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: es
+  kind: party
+  query: documentos de Olivares del Alba S.L.
+  relevant: &id003
+  - Commercial_Invoice_es
+  - Packing_List_es
+  - Bill_of_Lading_es
+  - Certificate_of_Origin_es
+  - Cargo_Insurance_Policy_es
+- split: ml
+  domain: shipping
+  lang: es
+  kind: goods
+  query: documentos del envío de Aceite de oliva virgen extra en garrafas de 5 l
+  relevant: *id003
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: identifier
+  query: trouver le document CI-FR-2609-311
+  relevant:
+  - Commercial_Invoice_fr
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: doc_title
+  query: Facture commerciale
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: doc_purpose
+  query: document qui facture à l'importateur les marchandises et les montants
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: identifier
+  query: trouver le document PL-FR-2609-555
+  relevant:
+  - Packing_List_fr
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: doc_title
+  query: Liste de colisage
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: doc_purpose
+  query: document indiquant la quantité et le poids de chaque colis
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: identifier
+  query: trouver le document BL-FR22344855
+  relevant:
+  - Bill_of_Lading_fr
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: doc_title
+  query: Connaissement
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: doc_purpose
+  query: titre émis par la compagnie maritime à la prise en charge de la marchandise
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: identifier
+  query: trouver le document CO-2026-FR-8818
+  relevant:
+  - Certificate_of_Origin_fr
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: doc_title
+  query: Certificat d'origine
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: doc_purpose
+  query: document attestant dans quel pays les marchandises ont été fabriquées
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: identifier
+  query: trouver le document IP-FR-481436
+  relevant:
+  - Cargo_Insurance_Policy_fr
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: doc_title
+  query: Police d'assurance transport
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: doc_purpose
+  query: document d'assurance souscrit contre les accidents pendant le transport
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: party
+  query: documents de Laboratoires Belle-Rive SAS
+  relevant: &id004
+  - Commercial_Invoice_fr
+  - Packing_List_fr
+  - Bill_of_Lading_fr
+  - Certificate_of_Origin_fr
+  - Cargo_Insurance_Policy_fr
+- split: ml
+  domain: shipping
+  lang: fr
+  kind: goods
+  query: documents d'expédition pour Crème hydratante visage 50 ml
+  relevant: *id004
+- split: ml
+  domain: shipping
+  lang: it
+  kind: identifier
+  query: trova il documento CI-IT-2609-622
+  relevant:
+  - Commercial_Invoice_it
+- split: ml
+  domain: shipping
+  lang: it
+  kind: doc_title
+  query: Fattura commerciale
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: it
+  kind: doc_purpose
+  query: documento che addebita all'importatore le merci e gli importi
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: it
+  kind: identifier
+  query: trova il documento PL-IT-2609-892
+  relevant:
+  - Packing_List_it
+- split: ml
+  domain: shipping
+  lang: it
+  kind: doc_title
+  query: Distinta di imballaggio
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: it
+  kind: doc_purpose
+  query: documento con quantità e peso di ogni collo
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: it
+  kind: identifier
+  query: trova il documento BL-IT74203367
+  relevant:
+  - Bill_of_Lading_it
+- split: ml
+  domain: shipping
+  lang: it
+  kind: doc_title
+  query: Polizza di carico
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: it
+  kind: doc_purpose
+  query: titolo rilasciato dalla compagnia di navigazione al ricevimento del carico
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: it
+  kind: identifier
+  query: trova il documento CO-2026-IT-4302
+  relevant:
+  - Certificate_of_Origin_it
+- split: ml
+  domain: shipping
+  lang: it
+  kind: doc_title
+  query: Certificato di origine
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: it
+  kind: doc_purpose
+  query: documento che attesta in quale paese sono state prodotte le merci
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: it
+  kind: identifier
+  query: trova il documento IP-IT-797609
+  relevant:
+  - Cargo_Insurance_Policy_it
+- split: ml
+  domain: shipping
+  lang: it
+  kind: doc_title
+  query: Polizza di assicurazione merci
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: it
+  kind: doc_purpose
+  query: documento assicurativo stipulato contro i sinistri durante il trasporto
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: it
+  kind: party
+  query: documenti di Officine Caffè Aurora S.r.l.
+  relevant: &id005
+  - Commercial_Invoice_it
+  - Packing_List_it
+  - Bill_of_Lading_it
+  - Certificate_of_Origin_it
+  - Cargo_Insurance_Policy_it
+- split: ml
+  domain: shipping
+  lang: it
+  kind: goods
+  query: documenti di spedizione per Macchine per caffè espresso a due gruppi
+  relevant: *id005
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: identifier
+  query: encontrar o documento CI-PT-2609-197
+  relevant:
+  - Commercial_Invoice_pt
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: doc_title
+  query: Fatura comercial
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: doc_purpose
+  query: documento que cobra ao importador as mercadorias e os valores
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: identifier
+  query: encontrar o documento PL-PT-2609-605
+  relevant:
+  - Packing_List_pt
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: doc_title
+  query: Lista de embalagem
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: doc_purpose
+  query: documento com a quantidade e o peso de cada volume
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: identifier
+  query: encontrar o documento BL-PT56145092
+  relevant:
+  - Bill_of_Lading_pt
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: doc_title
+  query: Conhecimento de embarque
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: doc_purpose
+  query: título emitido pelo armador ao receber a carga
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: identifier
+  query: encontrar o documento CO-2026-PT-9220
+  relevant:
+  - Certificate_of_Origin_pt
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: doc_title
+  query: Certificado de origem
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: doc_purpose
+  query: documento que certifica em que país as mercadorias foram fabricadas
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: identifier
+  query: encontrar o documento IP-PT-514982
+  relevant:
+  - Cargo_Insurance_Policy_pt
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: doc_title
+  query: Apólice de seguro de transporte
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: doc_purpose
+  query: documento de seguro contratado contra acidentes durante o transporte
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: party
+  query: documentos de Corticeira Vale Verde, Lda.
+  relevant: &id006
+  - Commercial_Invoice_pt
+  - Packing_List_pt
+  - Bill_of_Lading_pt
+  - Certificate_of_Origin_pt
+  - Cargo_Insurance_Policy_pt
+- split: ml
+  domain: shipping
+  lang: pt
+  kind: goods
+  query: documentos de envio de Rolhas de cortiça natural 24 x 45 mm
+  relevant: *id006
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: identifier
+  query: document CI-NL-2609-280 opzoeken
+  relevant:
+  - Commercial_Invoice_nl
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: doc_title
+  query: Handelsfactuur
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: doc_purpose
+  query: document waarmee de importeur de goederen en bedragen in rekening worden gebracht
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: identifier
+  query: document PL-NL-2609-679 opzoeken
+  relevant:
+  - Packing_List_nl
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: doc_title
+  query: Paklijst
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: doc_purpose
+  query: document met de hoeveelheid en het gewicht per collo
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: identifier
+  query: document BL-NL93718156 opzoeken
+  relevant:
+  - Bill_of_Lading_nl
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: doc_title
+  query: Cognossement
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: doc_purpose
+  query: waardepapier dat de rederij afgeeft bij ontvangst van de lading
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: identifier
+  query: document CO-2026-NL-3020 opzoeken
+  relevant:
+  - Certificate_of_Origin_nl
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: doc_title
+  query: Certificaat van oorsprong
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: doc_purpose
+  query: document dat verklaart in welk land de goederen zijn gemaakt
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: identifier
+  query: document IP-NL-811857 opzoeken
+  relevant:
+  - Cargo_Insurance_Policy_nl
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: doc_title
+  query: Transportverzekeringspolis
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: doc_purpose
+  query: verzekeringsdocument tegen schade tijdens het transport
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: party
+  query: documenten van Kwekerij Duinzicht B.V.
+  relevant: &id007
+  - Commercial_Invoice_nl
+  - Packing_List_nl
+  - Bill_of_Lading_nl
+  - Certificate_of_Origin_nl
+  - Cargo_Insurance_Policy_nl
+- split: ml
+  domain: shipping
+  lang: nl
+  kind: goods
+  query: verzenddocumenten voor Tulpenbollen maat 12/+
+  relevant: *id007
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: identifier
+  query: najít doklad CI-CZ-2610-218
+  relevant:
+  - Commercial_Invoice_cs
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: doc_title
+  query: Obchodní faktura
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: doc_purpose
+  query: doklad, kterým se dovozci účtuje zboží a částky
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: identifier
+  query: najít doklad PL-CZ-2610-667
+  relevant:
+  - Packing_List_cs
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: doc_title
+  query: Balicí list
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: doc_purpose
+  query: doklad s množstvím a hmotností každého kusu zásilky
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: identifier
+  query: najít doklad BL-CZ29101749
+  relevant:
+  - Bill_of_Lading_cs
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: doc_title
+  query: Konosament
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: doc_purpose
+  query: cenný papír, který vystavuje rejdařství při převzetí nákladu
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: identifier
+  query: najít doklad CO-2026-CZ-8326
+  relevant:
+  - Certificate_of_Origin_cs
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: doc_title
+  query: Osvědčení o původu
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: doc_purpose
+  query: doklad potvrzující, ve které zemi bylo zboží vyrobeno
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: identifier
+  query: najít doklad IP-CZ-940419
+  relevant:
+  - Cargo_Insurance_Policy_cs
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: doc_title
+  query: Pojistka na přepravu zboží
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: doc_purpose
+  query: pojistný doklad sjednaný pro případ nehody během přepravy
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: party
+  query: doklady od firmy Ložiska Tři řeky s.r.o.
+  relevant: &id008
+  - Commercial_Invoice_cs
+  - Packing_List_cs
+  - Bill_of_Lading_cs
+  - Certificate_of_Origin_cs
+  - Cargo_Insurance_Policy_cs
+- split: ml
+  domain: shipping
+  lang: cs
+  kind: goods
+  query: přepravní doklady pro zboží Kuličková ložiska 6205-2RS
+  relevant: *id008
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: identifier
+  query: ابحث عن المستند CI-SA-2610-806
+  relevant:
+  - Commercial_Invoice_ar
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: doc_title
+  query: فاتورة تجارية
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: doc_purpose
+  query: مستند يطالب المستورد بقيمة البضائع والمبالغ
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: identifier
+  query: ابحث عن المستند PL-SA-2610-276
+  relevant:
+  - Packing_List_ar
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: doc_title
+  query: قائمة التعبئة
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: doc_purpose
+  query: مستند يبين الكمية والوزن لكل طرد
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: identifier
+  query: ابحث عن المستند BL-SA92992380
+  relevant:
+  - Bill_of_Lading_ar
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: doc_title
+  query: بوليصة الشحن
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: doc_purpose
+  query: سند ملكية تصدره شركة الملاحة عند استلام البضاعة
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: identifier
+  query: ابحث عن المستند CO-2026-SA-2124
+  relevant:
+  - Certificate_of_Origin_ar
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: doc_title
+  query: شهادة المنشأ
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: doc_purpose
+  query: مستند يثبت البلد الذي صُنعت فيه البضائع
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: identifier
+  query: ابحث عن المستند IP-SA-213792
+  relevant:
+  - Cargo_Insurance_Policy_ar
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: doc_title
+  query: وثيقة تأمين البضائع
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: doc_purpose
+  query: مستند تأمين ضد الحوادث أثناء النقل
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: party
+  query: مستندات شركة الواحة للبتروكيماويات
+  relevant: &id009
+  - Commercial_Invoice_ar
+  - Packing_List_ar
+  - Bill_of_Lading_ar
+  - Certificate_of_Origin_ar
+  - Cargo_Insurance_Policy_ar
+- split: ml
+  domain: shipping
+  lang: ar
+  kind: goods
+  query: مستندات شحنة حبيبات بولي إيثيلين عالي الكثافة
+  relevant: *id009
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: identifier
+  query: 書類CI-JP-2609-343を探して
+  relevant:
+  - Commercial_Invoice_ja
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: doc_title
+  query: 商業送り状
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: doc_purpose
+  query: 輸入者に品目と金額を請求する書類
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: identifier
+  query: 書類PL-JP-2609-813を探して
+  relevant:
+  - Packing_List_ja
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: doc_title
+  query: 包装明細書
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: doc_purpose
+  query: 梱包ごとの数量と重量を記載した書類
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: identifier
+  query: 書類BL-JP34178511を探して
+  relevant:
+  - Bill_of_Lading_ja
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: doc_title
+  query: 船荷証券
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: doc_purpose
+  query: 船会社が貨物を受け取って発行する有価証券
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: identifier
+  query: 書類CO-2026-JP-9160を探して
+  relevant:
+  - Certificate_of_Origin_ja
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: doc_title
+  query: 原産地証明書
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: doc_purpose
+  query: 貨物がどの国で作られたかを証明する書類
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: identifier
+  query: 書類IP-JP-193703を探して
+  relevant:
+  - Cargo_Insurance_Policy_ja
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: doc_title
+  query: 貨物海上保険証券
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: doc_purpose
+  query: 輸送中の事故に備えて加入した保険の書類
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: party
+  query: 北斗精機株式会社の書類
+  relevant: &id010
+  - Commercial_Invoice_ja
+  - Packing_List_ja
+  - Bill_of_Lading_ja
+  - Certificate_of_Origin_ja
+  - Cargo_Insurance_Policy_ja
+- split: ml
+  domain: shipping
+  lang: ja
+  kind: goods
+  query: 6軸産業用ロボットアームの出荷書類
+  relevant: *id010
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: identifier
+  query: 查找单据CI-CN-2610-722
+  relevant:
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: doc_title
+  query: 商业发票
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: doc_purpose
+  query: 向进口商开列货物明细和金额的单据
+  relevant:
+  - Commercial_Invoice_ko
+  - Commercial_Invoice_de
+  - Commercial_Invoice_es
+  - Commercial_Invoice_fr
+  - Commercial_Invoice_it
+  - Commercial_Invoice_pt
+  - Commercial_Invoice_nl
+  - Commercial_Invoice_cs
+  - Commercial_Invoice_ar
+  - Commercial_Invoice_ja
+  - Commercial_Invoice_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: identifier
+  query: 查找单据PL-CN-2610-152
+  relevant:
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: doc_title
+  query: 装箱单
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: doc_purpose
+  query: 列明每件包装数量和重量的单据
+  relevant:
+  - Packing_List_ko
+  - Packing_List_de
+  - Packing_List_es
+  - Packing_List_fr
+  - Packing_List_it
+  - Packing_List_pt
+  - Packing_List_nl
+  - Packing_List_cs
+  - Packing_List_ar
+  - Packing_List_ja
+  - Packing_List_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: identifier
+  query: 查找单据BL-CN22569071
+  relevant:
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: doc_title
+  query: 海运提单
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: doc_purpose
+  query: 船公司收到货物后签发的物权凭证
+  relevant:
+  - Bill_of_Lading_ko
+  - Bill_of_Lading_de
+  - Bill_of_Lading_es
+  - Bill_of_Lading_fr
+  - Bill_of_Lading_it
+  - Bill_of_Lading_pt
+  - Bill_of_Lading_nl
+  - Bill_of_Lading_cs
+  - Bill_of_Lading_ar
+  - Bill_of_Lading_ja
+  - Bill_of_Lading_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: identifier
+  query: 查找单据CO-2026-CN-1545
+  relevant:
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: doc_title
+  query: 原产地证明书
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: doc_purpose
+  query: 证明货物在哪个国家生产的单据
+  relevant:
+  - Certificate_of_Origin_ko
+  - Certificate_of_Origin_de
+  - Certificate_of_Origin_es
+  - Certificate_of_Origin_fr
+  - Certificate_of_Origin_it
+  - Certificate_of_Origin_pt
+  - Certificate_of_Origin_nl
+  - Certificate_of_Origin_cs
+  - Certificate_of_Origin_ar
+  - Certificate_of_Origin_ja
+  - Certificate_of_Origin_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: identifier
+  query: 查找单据IP-CN-653275
+  relevant:
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: doc_title
+  query: 货物运输保险单
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: doc_purpose
+  query: 为运输途中的意外投保的保险单据
+  relevant:
+  - Cargo_Insurance_Policy_ko
+  - Cargo_Insurance_Policy_de
+  - Cargo_Insurance_Policy_es
+  - Cargo_Insurance_Policy_fr
+  - Cargo_Insurance_Policy_it
+  - Cargo_Insurance_Policy_pt
+  - Cargo_Insurance_Policy_nl
+  - Cargo_Insurance_Policy_cs
+  - Cargo_Insurance_Policy_ar
+  - Cargo_Insurance_Policy_ja
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: party
+  query: 海星新能源科技有限公司的单据
+  relevant: &id011
+  - Commercial_Invoice_zh_hans
+  - Packing_List_zh_hans
+  - Bill_of_Lading_zh_hans
+  - Certificate_of_Origin_zh_hans
+  - Cargo_Insurance_Policy_zh_hans
+- split: ml
+  domain: shipping
+  lang: zh-hans
+  kind: goods
+  query: 磷酸铁锂电池模组 280Ah的出货单据
+  relevant: *id011

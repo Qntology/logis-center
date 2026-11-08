@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: de
+document_title: Handelsrechnung
+metadata:
+  invoice_number: CI-DE-2609-360
+  issue_date: '2026-09-05'
+  reference_po_number: PO-DE-72911
+  related_bl_number: BL-DE23591658
+  related_lc_number: LC-DE2403039
+  currency: EUR
+parties:
+  shipper_exporter:
+    name: Talwerk Hydraulik GmbH
+    address: Talstraße 14, 70173 Stuttgart, Deutschland
+    contact_number: +49 711 555 0142
+    tax_id: DE 281 456 903
+  consignee:
+    name: Daehan Fluid Power Co., Ltd.
+    address: 15 Gongdan-ro, Seongsan-gu, Changwon, Südkorea
+    contact_number: +82 55 555 0173
+    tax_id: 609-81-24518
+shipping_details:
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Busan, Südkorea
+  vessel_flight: NORDLICHT V.412E
+  incoterms: FOB Hamburg
+line_items:
+- item_code: HP-4100
+  description: Hydraulische Zahnradpumpen
+  quantity: 240
+  unit: Stk.
+  unit_price: 685.0
+  total_amount: 164400.0
+  hs_code: '8413.60'
+- item_code: DS-220
+  description: Dichtungssätze für Hydraulikzylinder
+  quantity: 1800
+  unit: Stk.
+  unit_price: 42.5
+  total_amount: 76500.0
+  hs_code: '8484.20'
+summary:
+  total_quantity: 2040
+  total_items_amount: 240900.0
+  freight_charge: 0.0
+  insurance: 0.0
+  grand_total_amount: 240900.0

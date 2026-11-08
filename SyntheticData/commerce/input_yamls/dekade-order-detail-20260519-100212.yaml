@@ -1,0 +1,29 @@
+page_id: dekade-order-detail-20260519-100212
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/order/view?id=20260519-100212
+page_type: order
+layout: detail
+fields:
+  id,link: 20260519-100212
+  registration_date: '2026-05-19'
+  status: Bezorgd
+  goods: Pluche pantoffels
+  tracking_number: '188518492242'
+  sender_name: Lotte Mulder
+  recipient_name: Lars Meijer
+  quantity: 1
+  amount: 13.98
+  shipping_fee: 2.05
+  payment_method: Creditcard
+  sender_phone: +31 6 6505 5018
+  sender_address: Dorpsstraat 63, 9711 LV Groningen
+  recipient_phone: +31 6 3108 7546
+  recipient_address: Lindelaan 77, 1012 AB Amsterdam
+  payment_origin: BetaalKade
+  payment_date: '2026-05-19'
+  card: Kadekaart
+title: Bestelgegevens

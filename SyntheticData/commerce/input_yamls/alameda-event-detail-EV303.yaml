@@ -1,0 +1,17 @@
+page_id: alameda-event-detail-EV303
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/events/EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: Paseo de primavera
+  type: Probadores
+  started_at: '2026-04-15'
+  expired_at: '2026-04-25'
+  status: En curso
+title: Campaña

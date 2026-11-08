@@ -1,0 +1,30 @@
+page_id: sakura-tracking-detail-416875405476
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/shipping/view?id=416875405476
+page_type: tracking
+layout: detail
+fields:
+  id,link: '416875405476'
+  carrier: つばめ配送
+  status: 発送済み
+  title: 軽量ダウンベスト
+  shipping_date: '2026-10-10'
+  recipient_name: 小林 結衣
+  registration_date: '2026-10-07'
+  sender_name: 株式会社さくら商店
+  sender_address: 東京都台東区桜橋2-14-8 さくらビル3階
+  sender_phone: 03-5555-0142
+  recipient_address: 〒060-0001 北海道札幌市中央区緑町2-18-17
+  recipient_phone: 090-7006-4760
+  weight: 6.2
+  width: 47
+  height: 37
+  length: 27
+  shipping_method: 通常配送
+  shipping_duration: 1
+  shipping_fee: 0
+title: 出荷詳細

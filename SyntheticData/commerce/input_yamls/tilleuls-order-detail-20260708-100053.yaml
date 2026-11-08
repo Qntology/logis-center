@@ -1,0 +1,27 @@
+page_id: tilleuls-order-detail-20260708-100053
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/order/view?id=20260708-100053
+page_type: order
+layout: detail
+fields:
+  id,link: 20260708-100053
+  registration_date: '2026-07-08'
+  status: En préparation
+  goods: Crème hydratante barrière
+  sender_name: Théo Fournier
+  recipient_name: Jules Girard
+  quantity: 3
+  amount: 66.4
+  shipping_fee: 0.0
+  payment_method: Portefeuille numérique
+  sender_phone: +33 6 22 87 20 80
+  sender_address: 89 rue de la Paix, 44000 Nantes
+  recipient_phone: +33 6 85 09 79 88
+  recipient_address: 103 boulevard Voltaire, 44000 Nantes
+  payment_origin: PaiementPont
+  payment_date: '2026-07-08'
+title: Détail de la commande

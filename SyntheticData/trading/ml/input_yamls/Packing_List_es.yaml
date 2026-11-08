@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: es
+document_title: Lista de empaque
+metadata:
+  packing_list_number: PL-ES-2610-620
+  issue_date: '2026-10-01'
+  related_invoice_number: CI-ES-2610-707
+  related_po_number: PO-ES-35900
+  related_bl_number: BL-ES68027868
+parties:
+  shipper_exporter:
+    name: Olivares del Alba S.L.
+    address: Calle Mayor 21, 23001 Jaén, España
+  consignee:
+    name: Hanmaru Foods Co., Ltd.
+    address: 77 Jungang-daero, Jung-gu, Busan, Corea del Sur
+shipping_details:
+  vessel_flight: ALBORAN STAR V.208E
+  port_of_loading: Valencia, España
+  port_of_discharge: Busan, Corea del Sur
+packing_details:
+- item_code: AOV-5L
+  description: Aceite de oliva virgen extra en garrafas de 5 l
+  quantity: 2400
+  unit: uds.
+  packages: 20
+  package_type: palés
+  net_weight_kg: 10800.0
+  gross_weight_kg: 11650.0
+  measurement_cbm: 24.0
+- item_code: ACT-1K
+  description: Aceitunas de mesa en tarros de 1 kg
+  quantity: 3600
+  unit: uds.
+  packages: 6
+  package_type: palés
+  net_weight_kg: 3600.0
+  gross_weight_kg: 4320.0
+  measurement_cbm: 7.2
+summary:
+  total_packages: 26
+  total_net_weight_kg: 14400.0
+  total_gross_weight_kg: 15970.0
+  total_measurement_cbm: 31.2

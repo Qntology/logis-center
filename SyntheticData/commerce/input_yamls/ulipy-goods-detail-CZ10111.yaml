@@ -1,0 +1,30 @@
+page_id: ulipy-goods-detail-CZ10111
+split: ml
+shop: ulipy
+shop_name: Obchod U Lípy
+lang: cs
+theme: admin_flat
+url: https://obchod-ulipy.test/admin/goods/view?id=CZ10111
+page_type: goods
+layout: detail
+fields:
+  id,link: CZ10111
+  title: Ochranný hydratační krém
+  status: V prodeji
+  category: Kosmetika
+  sale_price: 500
+  quantity: 7
+  registration_date: '2026-05-02'
+  brand_name: 누리온
+  code: CZ-SKI-103
+  stock_keeping_unit: CZSK1003
+  model_name: SK-638
+  manufacturer: 솔빛리빙
+  origin_country: Korea
+  color: Vínová
+  barcode: '8856498057826'
+  supply_price: 279
+  low_stock_threshold: 5
+  shipping_fee: 50
+  description: Krém bohatý na ceramidy pro suchou pleť.
+title: Detail produktu

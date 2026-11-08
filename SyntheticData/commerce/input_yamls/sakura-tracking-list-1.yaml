@@ -1,0 +1,83 @@
+page_id: sakura-tracking-list-1
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+items:
+- id,link: '465019825630'
+  carrier: はやぶさ運輸
+  status: 返品
+  title: コールドブリュー濃縮コーヒー
+  shipping_date: '2026-04-11'
+  recipient_name: 鈴木 芽依
+- id,link: '416875405476'
+  carrier: つばめ配送
+  status: 発送済み
+  title: 軽量ダウンベスト
+  shipping_date: '2026-10-10'
+  recipient_name: 小林 結衣
+- id,link: '291120818873'
+  carrier: さくら便
+  status: 配達完了
+  title: ステンレスフライパン
+  shipping_date: '2026-07-18'
+  recipient_name: 鈴木 蓮
+- id,link: '251625343135'
+  carrier: さくら便
+  status: 配達完了
+  title: 密閉ガラス保存容器セット
+  shipping_date: '2026-04-23'
+  recipient_name: 加藤 葵
+- id,link: '310373445099'
+  carrier: つばめ配送
+  status: 配達完了
+  title: ハンディミニ扇風機
+  shipping_date: '2026-05-19'
+  recipient_name: 伊藤 葵
+- id,link: '763848459408'
+  carrier: さくら便
+  status: 配達完了
+  title: 65W急速充電器
+  shipping_date: '2026-08-13'
+  recipient_name: 山本 結衣
+- id,link: '384833376389'
+  carrier: さくら便
+  status: 配達完了
+  title: リネン半袖シャツ
+  shipping_date: '2026-06-19'
+  recipient_name: 田中 結衣
+- id,link: '521514086167'
+  carrier: さくら便
+  status: 配達完了
+  title: 低アレルゲンドライフード
+  shipping_date: '2026-05-31'
+  recipient_name: 加藤 美咲
+- id,link: '100081643320'
+  carrier: みなと急便
+  status: 配達完了
+  title: ペットキャリーバッグ
+  shipping_date: '2026-04-10'
+  recipient_name: 田中 陽菜
+- id,link: '870526923875'
+  carrier: みなと急便
+  status: 発送済み
+  title: リネン半袖シャツ
+  shipping_date: '2026-07-31'
+  recipient_name: 山本 悠真
+- id,link: '264411927937'
+  carrier: つばめ配送
+  status: 発送済み
+  title: 子ども用食器セット
+  shipping_date: '2026-05-29'
+  recipient_name: 田中 湊
+- id,link: '999432351314'
+  carrier: はやぶさ運輸
+  status: 発送済み
+  title: 大容量モバイルバッテリー
+  shipping_date: '2026-07-17'
+  recipient_name: 渡辺 颯太
+title: 出荷一覧

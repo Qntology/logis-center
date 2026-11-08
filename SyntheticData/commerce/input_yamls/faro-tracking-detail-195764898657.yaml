@@ -1,0 +1,30 @@
+page_id: faro-tracking-detail-195764898657
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/shipments/195764898657
+page_type: tracking
+layout: detail
+fields:
+  id,link: '195764898657'
+  carrier: Pacco Veloce
+  status: Spedito
+  title: Scaldamani ricaricabile
+  shipping_date: '2026-06-20'
+  recipient_name: Lorenzo Marino
+  registration_date: '2026-06-18'
+  sender_name: Bottega del Faro S.r.l.
+  sender_address: Via dei Mille 15, 40121 Bologna
+  sender_phone: +39 051 555 0142
+  recipient_address: Via Roma 20, 00184 Roma
+  recipient_phone: +39 385 466 4509
+  weight: 3.7
+  width: 24
+  height: 26
+  length: 9
+  shipping_method: Trasporto merci
+  shipping_duration: 2
+  shipping_fee: 0.0
+title: Dettaglio spedizione

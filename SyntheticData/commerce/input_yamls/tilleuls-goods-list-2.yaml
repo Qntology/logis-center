@@ -1,0 +1,111 @@
+page_id: tilleuls-goods-list-2
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/goods/list?page=2
+page_type: goods
+layout: list
+items:
+- id,link: FR10481
+  title: Plaid en microfibre
+  status: En vente
+  category: Maison
+  sale_price: 17.45
+  quantity: 120
+  registration_date: '2026-03-01'
+  brand_name: Marlow & Finch
+- id,link: FR10518
+  title: Mixeur plongeant
+  status: En vente
+  category: Électroménager
+  sale_price: 29.05
+  quantity: 120
+  registration_date: '2026-01-23'
+  brand_name: Oakfern
+- id,link: FR10555
+  title: Essence réparatrice pour cheveux
+  status: En vente
+  category: Beauté
+  sale_price: 13.45
+  compare_at_price: 16.14
+  quantity: 96
+  registration_date: '2026-01-15'
+  brand_name: 하람
+- id,link: FR10592
+  title: Griffoir pour chat
+  status: En vente
+  category: Animaux
+  sale_price: 12.05
+  quantity: 3
+  registration_date: '2026-03-14'
+  brand_name: 솔빛
+- id,link: FR10629
+  title: Enceinte Bluetooth étanche
+  status: Épuisé
+  category: Électronique
+  sale_price: 38.05
+  compare_at_price: 45.66
+  quantity: 0
+  registration_date: '2026-08-01'
+  brand_name: Kestrel Lane
+- id,link: FR10666
+  title: Mousse nettoyante à pH bas
+  status: Épuisé
+  category: Beauté
+  sale_price: 10.55
+  compare_at_price: 12.66
+  quantity: 0
+  registration_date: '2026-07-25'
+  brand_name: Marlow & Finch
+- id,link: FR10703
+  title: Brosse de toilettage pour animaux
+  status: En vente
+  category: Animaux
+  sale_price: 9.7
+  compare_at_price: 11.64
+  quantity: 350
+  registration_date: '2026-05-07'
+  brand_name: Tidewell
+- id,link: FR10740
+  title: Ombrelle anti-UV
+  status: Brouillon
+  category: Maison
+  sale_price: 18.55
+  quantity: 120
+  registration_date: '2026-05-24'
+  brand_name: 마루공방
+- id,link: FR10777
+  title: Coffret vaisselle pour tout-petits
+  status: En vente
+  category: Bébé
+  sale_price: 18.2
+  quantity: 42
+  registration_date: '2026-03-06'
+  brand_name: 버들
+- id,link: FR10814
+  title: Doudoune sans manches légère
+  status: En vente
+  category: Vêtements
+  sale_price: 47.65
+  quantity: 7
+  registration_date: '2026-06-09'
+  brand_name: 하람
+- id,link: FR10851
+  title: Jus de mandarine de Jeju
+  status: En vente
+  category: Épicerie
+  sale_price: 11.5
+  quantity: 120
+  registration_date: '2026-06-26'
+  brand_name: 하람
+- id,link: FR10888
+  title: Clavier mécanique silencieux
+  status: En vente
+  category: Électronique
+  sale_price: 65.1
+  quantity: 96
+  registration_date: '2026-05-02'
+  brand_name: Marlow & Finch
+title: Produits

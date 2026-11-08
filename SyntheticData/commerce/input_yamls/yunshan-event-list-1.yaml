@@ -1,0 +1,47 @@
+page_id: yunshan-event-list-1
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/events?page=1
+page_type: event
+layout: list
+items:
+- id,link: EV303
+  title: 春日出游季
+  type: 试用
+  started_at: '2026-04-25'
+  expired_at: '2026-05-15'
+  status: 已结束
+- id,link: EV306
+  title: 暑假备货节
+  type: 专题
+  started_at: '2026-03-15'
+  expired_at: '2026-04-29'
+  status: 未开始
+- id,link: EV309
+  title: 丰收礼物指南
+  type: 专题
+  started_at: '2026-03-22'
+  expired_at: '2026-04-11'
+  status: 未开始
+- id,link: EV312
+  title: 年终狂欢
+  type: 抽奖
+  started_at: '2026-03-29'
+  expired_at: '2026-04-08'
+  status: 未开始
+- id,link: EV315
+  title: 新品试用招募
+  type: 专题
+  started_at: '2026-08-07'
+  expired_at: '2026-09-21'
+  status: 已结束
+- id,link: EV318
+  title: 最佳评价大赛
+  type: 试用
+  started_at: '2026-08-11'
+  expired_at: '2026-09-25'
+  status: 未开始
+title: 活动列表

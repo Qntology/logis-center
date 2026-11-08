@@ -1,0 +1,135 @@
+page_id: faro-order-list-1
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/orders?page=1
+page_type: order
+layout: list
+items:
+- id,link: 20261006-100053
+  registration_date: '2026-10-06'
+  status: Pagato
+  goods: Spazzola per toelettatura
+  sender_name: Andrea Greco
+  recipient_name: Andrea Greco
+  quantity: 6
+  amount: 74.75
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20260625-100106
+  registration_date: '2026-06-25'
+  status: Pagato
+  goods: Plaid in microfibra
+  sender_name: Andrea Rossi
+  recipient_name: Andrea Rossi
+  quantity: 2
+  amount: 100.76
+  shipping_fee: 0.0
+  payment_method: Bonifico
+- id,link: 20260508-100159
+  registration_date: '2026-05-08'
+  status: In attesa di pagamento
+  goods: Spazzola per toelettatura
+  sender_name: Chiara Bruno
+  recipient_name: Sara Colombo
+  quantity: 5
+  amount: 48.0
+  shipping_fee: 0.0
+  payment_method: Portafoglio digitale
+- id,link: 20260829-100212
+  registration_date: '2026-08-29'
+  status: Annullato
+  goods: Essenza riparatrice per capelli
+  sender_name: Davide Bianchi
+  recipient_name: Davide Bianchi
+  quantity: 2
+  amount: 27.25
+  shipping_fee: 2.05
+  payment_method: Bonifico
+- id,link: 20260416-100265
+  registration_date: '2026-04-16'
+  status: Annullato
+  goods: Frullatore a immersione
+  sender_name: Marco Colombo
+  recipient_name: Chiara Marino
+  quantity: 5
+  amount: 135.05
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20260415-100318
+  registration_date: '2026-04-15'
+  status: In attesa di pagamento
+  goods: Giacca in pile sherpa
+  sender_name: Martina Bruno
+  recipient_name: Chiara Romano
+  quantity: 7
+  amount: 222.12
+  shipping_fee: 0.0
+  payment_method: Portafoglio digitale
+- id,link: 20260705-100371
+  registration_date: '2026-07-05'
+  status: In attesa di pagamento
+  goods: Granola biologica
+  sender_name: Chiara Colombo
+  recipient_name: Chiara Colombo
+  quantity: 1
+  amount: 11.15
+  shipping_fee: 2.05
+  payment_method: Carta di credito
+- id,link: 20260618-100424
+  registration_date: '2026-06-18'
+  status: Spedito
+  goods: Scaldamani ricaricabile
+  tracking_number: '195764898657'
+  sender_name: Lorenzo Marino
+  recipient_name: Lorenzo Marino
+  quantity: 5
+  amount: 99.5
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20260606-100477
+  registration_date: '2026-06-06'
+  status: Consegnato
+  goods: Crema solare minerale
+  tracking_number: '229271781691'
+  sender_name: Elena Conti
+  recipient_name: Elena Conti
+  quantity: 2
+  amount: 26.8
+  shipping_fee: 2.05
+  payment_method: Bonifico
+- id,link: 20260609-100530
+  registration_date: '2026-06-09'
+  status: Consegnato
+  goods: Bicchiere termico sottovuoto
+  tracking_number: '144797482821'
+  sender_name: Sofia Romano
+  recipient_name: Sofia Romano
+  quantity: 5
+  amount: 93.7
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+- id,link: 20260806-100583
+  registration_date: '2026-08-06'
+  status: Annullato
+  goods: Crocchette ipoallergeniche
+  sender_name: Luca Romano
+  recipient_name: Luca Romano
+  quantity: 3
+  amount: 68.55
+  shipping_fee: 0.0
+  payment_method: Bonifico
+- id,link: 20260807-100636
+  registration_date: '2026-08-07'
+  status: Consegnato
+  goods: Tenda a cupola per due persone
+  tracking_number: '376320179711'
+  sender_name: Chiara Colombo
+  recipient_name: Chiara Colombo
+  quantity: 1
+  amount: 83.75
+  shipping_fee: 0.0
+  payment_method: Carta di credito
+title: Ordini

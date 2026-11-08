@@ -1,0 +1,30 @@
+page_id: sakura-tracking-detail-465019825630
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/shipping/view?id=465019825630
+page_type: tracking
+layout: detail
+fields:
+  id,link: '465019825630'
+  carrier: はやぶさ運輸
+  status: 返品
+  title: コールドブリュー濃縮コーヒー
+  shipping_date: '2026-04-11'
+  recipient_name: 鈴木 芽依
+  registration_date: '2026-04-08'
+  sender_name: 株式会社さくら商店
+  sender_address: 東京都台東区桜橋2-14-8 さくらビル3階
+  sender_phone: 03-5555-0142
+  recipient_address: 〒530-0001 大阪府大阪市北区栄町6-5-13
+  recipient_phone: 090-3079-7111
+  weight: 6.6
+  width: 47
+  height: 19
+  length: 19
+  shipping_method: 通常配送
+  shipping_duration: 1
+  shipping_fee: 0
+title: 出荷詳細

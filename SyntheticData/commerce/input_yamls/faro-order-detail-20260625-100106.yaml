@@ -1,0 +1,28 @@
+page_id: faro-order-detail-20260625-100106
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/orders/20260625-100106
+page_type: order
+layout: detail
+fields:
+  id,link: 20260625-100106
+  registration_date: '2026-06-25'
+  status: Pagato
+  goods: Plaid in microfibra
+  sender_name: Andrea Rossi
+  recipient_name: Andrea Rossi
+  quantity: 2
+  amount: 100.76
+  shipping_fee: 0.0
+  payment_method: Bonifico
+  sender_phone: +39 354 281 5153
+  sender_address: Via Roma 167, 37121 Verona
+  recipient_phone: +39 354 281 5153
+  recipient_address: Via Roma 167, 37121 Verona
+  payment_origin: PayMolo
+  payment_date: '2026-06-25'
+  bank: Banca Aurora
+title: Dettaglio ordine

@@ -1,0 +1,204 @@
+# 12개 언어 검색 시나리오 (Stanza 변환본 12개 언어 확인용)
+# 커머스: 영어 상점 harbor 의 dev 질의 6개(의미 4 · 운송장 번호 · 취소 주문)를 12개 언어로. ko · en 은 queries.yaml 의 표현 그대로.
+# 무역: 서식 이름 5개 + 문서번호 1개를 12개 언어로. 정답은 truth.py 의 trading_docs stem.
+# 번역은 사람이 쓴 자연스러운 표현이며, 관련 집합은 원래 질의와 같습니다.
+commerce:
+  - key: warm
+    kind: semantic
+    shop: harbor
+    relevant: [harbor:goods:HP10444, harbor:goods:HP10629]
+    query:
+      en: something to keep me warm when it is freezing
+      ko: 추운 날 몸을 따뜻하게 해 줄 물건
+      de: etwas, das mich warm hält, wenn es eiskalt ist
+      es: algo que me mantenga caliente cuando hace mucho frío
+      fr: quelque chose pour me tenir chaud quand il gèle
+      it: qualcosa per tenermi al caldo quando si gela
+      pt: algo para me manter aquecido quando está congelando
+      nl: iets om me warm te houden als het vriest
+      cs: něco, co mě zahřeje, když mrzne
+      ar: شيء يبقيني دافئا عندما يكون الجو متجمدا
+      ja: 凍えるほど寒い日に体を温めてくれるもの
+      zh-hans: 天寒地冻时让我保暖的东西
+  - key: cool
+    kind: semantic
+    shop: harbor
+    relevant: [harbor:goods:HP10185, harbor:goods:HP10518]
+    query:
+      en: products that help me cool off on a sweltering day
+      ko: 더위를 식히는 데 도움이 되는 제품
+      de: Produkte, die mir an einem drückend heißen Tag Abkühlung verschaffen
+      es: productos que me ayuden a refrescarme en un día sofocante
+      fr: des produits qui m'aident à me rafraîchir par une journée étouffante
+      it: prodotti che mi aiutano a rinfrescarmi in una giornata afosa
+      pt: produtos que me ajudam a me refrescar num dia abafado
+      nl: producten die me helpen afkoelen op een snikhete dag
+      cs: výrobky, které mi pomohou zchladit se v parném dni
+      ar: منتجات تساعدني على التبرد في يوم شديد الحر
+      ja: 蒸し暑い日に涼しくなれる商品
+      zh-hans: 闷热天气里帮我降温的产品
+  - key: cooking
+    kind: semantic
+    shop: harbor
+    relevant: [harbor:goods:HP10259]
+    query:
+      en: tools I would use while cooking dinner
+      ko: 요리할 때 쓰는 주방 도구
+      de: Werkzeuge, die ich beim Kochen des Abendessens benutzen würde
+      es: utensilios que usaría para cocinar la cena
+      fr: les ustensiles que j'utiliserais pour préparer le dîner
+      it: utensili che userei per cucinare la cena
+      pt: utensílios que eu usaria para preparar o jantar
+      nl: keukengerei dat ik zou gebruiken bij het koken van het avondeten
+      cs: nástroje, které bych použil při vaření večeře
+      ar: أدوات أستخدمها أثناء طهي العشاء
+      ja: 夕食を作るときに使う道具
+      zh-hans: 做晚饭时会用到的工具
+  - key: pets
+    kind: semantic
+    shop: harbor
+    relevant: [harbor:goods:HP10111, harbor:goods:HP10333, harbor:goods:HP10777]
+    query:
+      en: things I need for my dog or cat
+      ko: 강아지나 고양이를 키울 때 필요한 것
+      de: Dinge, die ich für meinen Hund oder meine Katze brauche
+      es: cosas que necesito para mi perro o mi gato
+      fr: des choses dont j'ai besoin pour mon chien ou mon chat
+      it: cose di cui ho bisogno per il mio cane o il mio gatto
+      pt: coisas de que preciso para o meu cachorro ou gato
+      nl: spullen die ik nodig heb voor mijn hond of kat
+      cs: věci, které potřebuji pro svého psa nebo kočku
+      ar: أشياء أحتاجها لكلبي أو قطتي
+      ja: 犬や猫のために必要なもの
+      zh-hans: 我的狗或猫需要的东西
+  - key: tracking
+    kind: identifier
+    shop: harbor
+    relevant: [harbor:tracking:461775815205]
+    query:
+      en: where is tracking number 461775815205
+      ko: 운송장 번호 461775815205 배송 어디쯤이야
+      de: wo ist die Sendung mit der Sendungsnummer 461775815205
+      es: dónde está el envío con número de seguimiento 461775815205
+      fr: où est le colis avec le numéro de suivi 461775815205
+      it: dove si trova la spedizione con numero di tracciamento 461775815205
+      pt: onde está a encomenda com código de rastreamento 461775815205
+      nl: waar is de zending met trackingnummer 461775815205
+      cs: kde je zásilka s číslem sledování 461775815205
+      ar: أين الشحنة برقم التتبع 461775815205
+      ja: 追跡番号461775815205の荷物はどこ
+      zh-hans: 运单号461775815205的包裹在哪里
+  - key: cancelled
+    kind: status
+    shop: harbor
+    relevant: [harbor:order:20260408-100159, harbor:order:20260425-100424, harbor:order:20260801-100848]
+    query:
+      en: orders with status Cancelled
+      ko: 취소된 주문
+      de: stornierte Bestellungen
+      es: pedidos cancelados
+      fr: les commandes annulées
+      it: ordini annullati
+      pt: pedidos cancelados
+      nl: geannuleerde bestellingen
+      cs: zrušené objednávky
+      ar: الطلبات الملغاة
+      ja: キャンセルされた注文
+      zh-hans: 已取消的订单
+shipping:
+  - key: BL
+    kind: doc_title
+    relevant: [Bill_of_Lading_Part2]
+    query:
+      en: Bill of Lading
+      ko: 선하증권
+      de: Konnossement für die Sendung
+      es: conocimiento de embarque del envío
+      fr: le connaissement de l'expédition
+      it: la polizza di carico della spedizione
+      pt: o conhecimento de embarque da remessa
+      nl: het cognossement van de zending
+      cs: konosament k zásilce
+      ar: بوليصة الشحن للبضاعة
+      ja: 貨物の船荷証券
+      zh-hans: 货物的提单
+  - key: CI
+    kind: doc_title
+    relevant: [Commercial_Invoice_Part1]
+    query:
+      en: Commercial Invoice
+      ko: 상업송장
+      de: Handelsrechnung
+      es: factura comercial
+      fr: facture commerciale
+      it: fattura commerciale
+      pt: fatura comercial
+      nl: handelsfactuur
+      cs: obchodní faktura
+      ar: الفاتورة التجارية
+      ja: 商業送り状
+      zh-hans: 商业发票
+  - key: CO
+    kind: doc_title
+    relevant: [Certificate_of_Origin_Part6]
+    query:
+      en: Certificate of Origin
+      ko: 원산지증명서
+      de: Ursprungszeugnis der Ware
+      es: certificado de origen de la mercancía
+      fr: certificat d'origine des marchandises
+      it: certificato di origine della merce
+      pt: certificado de origem da mercadoria
+      nl: certificaat van oorsprong van de goederen
+      cs: osvědčení o původu zboží
+      ar: شهادة المنشأ للبضائع
+      ja: 商品の原産地証明書
+      zh-hans: 货物的原产地证书
+  - key: PL
+    kind: doc_title
+    relevant: [Packing_List_Part3]
+    query:
+      en: Packing List
+      ko: 포장명세서
+      de: Packliste
+      es: lista de empaque
+      fr: liste de colisage
+      it: distinta di imballaggio
+      pt: lista de embalagem
+      nl: paklijst
+      cs: balicí list
+      ar: قائمة التعبئة
+      ja: 梱包明細書
+      zh-hans: 装箱单
+  - key: IP
+    kind: doc_title
+    relevant: [Cargo_Insurance_Policy_Part10]
+    query:
+      en: Cargo Insurance Policy
+      ko: 적하보험증권
+      de: Versicherungspolice für die Ladung
+      es: póliza de seguro de la carga
+      fr: police d'assurance de la cargaison
+      it: polizza assicurativa del carico
+      pt: apólice de seguro da carga
+      nl: verzekeringspolis voor de lading
+      cs: pojistka na náklad
+      ar: وثيقة التأمين على الشحنة
+      ja: 貨物の保険証券
+      zh-hans: 货物保险单
+  - key: number
+    kind: identifier
+    relevant: [Commercial_Invoice_Part1]
+    query:
+      en: find document number CI-2026-08001
+      ko: 문서번호 CI-2026-08001 찾아줘
+      de: Dokument mit der Nummer CI-2026-08001 finden
+      es: búscame el documento número CI-2026-08001
+      fr: trouve le document numéro CI-2026-08001
+      it: trova il documento numero CI-2026-08001
+      pt: encontre o documento número CI-2026-08001
+      nl: zoek document nummer CI-2026-08001
+      cs: najdi dokument číslo CI-2026-08001
+      ar: ابحث عن المستند رقم CI-2026-08001
+      ja: 文書番号CI-2026-08001を探して
+      zh-hans: 查找文件编号CI-2026-08001

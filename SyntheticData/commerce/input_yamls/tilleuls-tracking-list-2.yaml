@@ -1,0 +1,83 @@
+page_id: tilleuls-tracking-list-2
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+items:
+- id,link: '158510597672'
+  carrier: Colis Éclair
+  status: Livrée
+  title: Mixeur plongeant
+  shipping_date: '2026-08-19'
+  recipient_name: Jules Dubois
+- id,link: '107108748943'
+  carrier: Fret Azur
+  status: Expédiée
+  title: Crème hydratante barrière
+  shipping_date: '2026-05-12'
+  recipient_name: Jules Laurent
+- id,link: '316008261906'
+  carrier: Transports Lavande
+  status: Livrée
+  title: Essence réparatrice pour cheveux
+  shipping_date: '2026-06-13'
+  recipient_name: Louis Lefèvre
+- id,link: '222761027545'
+  carrier: Fret Azur
+  status: Retournée
+  title: Lapin en peluche
+  shipping_date: '2026-09-29'
+  recipient_name: Arthur Roux
+- id,link: '461279713013'
+  carrier: Transports Lavande
+  status: Livrée
+  title: Sweat zippé doublé polaire
+  shipping_date: '2026-07-15'
+  recipient_name: Hugo Martin
+- id,link: '439397791326'
+  carrier: Colis Éclair
+  status: Expédiée
+  title: Tente dôme deux places
+  shipping_date: '2026-06-21'
+  recipient_name: Camille Martin
+- id,link: '294254945140'
+  carrier: Transports Lavande
+  status: Expédiée
+  title: Boîte range-câbles
+  shipping_date: '2026-07-12'
+  recipient_name: Louis Dubois
+- id,link: '779925383094'
+  carrier: Colis Éclair
+  status: Retournée
+  title: Couteau de chef en céramique
+  shipping_date: '2026-08-02'
+  recipient_name: Arthur Dubois
+- id,link: '780667686677'
+  carrier: Fret Azur
+  status: Livrée
+  title: Chargeur rapide 65 W
+  shipping_date: '2026-04-30'
+  recipient_name: Lucas Bonnet
+- id,link: '705845684109'
+  carrier: Colis Éclair
+  status: Expédiée
+  title: Tente dôme deux places
+  shipping_date: '2026-05-29'
+  recipient_name: Jules Dubois
+- id,link: '160654044699'
+  carrier: Fret Azur
+  status: Livrée
+  title: Popote de camping
+  shipping_date: '2026-07-29'
+  recipient_name: Jules Bernard
+- id,link: '863433822683'
+  carrier: Fret Azur
+  status: Expédiée
+  title: Sandales aérées
+  shipping_date: '2026-08-09'
+  recipient_name: Inès Lefèvre
+title: Expéditions

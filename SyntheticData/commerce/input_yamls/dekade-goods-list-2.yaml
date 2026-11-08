@@ -1,0 +1,110 @@
+page_id: dekade-goods-list-2
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/goods/list?page=2
+page_type: goods
+layout: list
+items:
+- id,link: NL10481
+  title: Vacuümgeïsoleerde thermobeker
+  status: Uitverkocht
+  category: Keuken
+  sale_price: 15.85
+  quantity: 0
+  registration_date: '2026-05-28'
+  brand_name: Marlow & Finch
+- id,link: NL10518
+  title: Slimme activiteitentracker
+  status: Actief
+  category: Elektronica
+  sale_price: 32.9
+  quantity: 42
+  registration_date: '2026-02-19'
+  brand_name: 마루공방
+- id,link: NL10555
+  title: Geroosterde amandelen
+  status: Actief
+  category: Levensmiddelen
+  sale_price: 8.7
+  quantity: 18
+  registration_date: '2026-08-16'
+  brand_name: Tidewell
+- id,link: NL10592
+  title: Pluche pantoffels
+  status: Concept
+  category: Wonen
+  sale_price: 13.25
+  quantity: 350
+  registration_date: '2026-02-18'
+  brand_name: 다온랩
+- id,link: NL10629
+  title: Biologische granola
+  status: Uitverkocht
+  category: Levensmiddelen
+  sale_price: 9.8
+  quantity: 0
+  registration_date: '2026-04-01'
+  brand_name: 다온랩
+- id,link: NL10666
+  title: Krabpaal
+  status: Uitverkocht
+  category: Huisdieren
+  sale_price: 12.35
+  quantity: 0
+  registration_date: '2026-05-31'
+  brand_name: 다온랩
+- id,link: NL10703
+  title: Waterkoker met temperatuurregeling
+  status: Actief
+  category: Huishoudapparaten
+  sale_price: 30.7
+  compare_at_price: 36.84
+  quantity: 18
+  registration_date: '2026-07-20'
+  brand_name: Marlow & Finch
+- id,link: NL10740
+  title: Oplaadbare handwarmer
+  status: Concept
+  category: Wonen
+  sale_price: 16.85
+  compare_at_price: 20.22
+  quantity: 96
+  registration_date: '2026-04-14'
+  brand_name: 마루공방
+- id,link: NL10777
+  title: Snellader van 65 W
+  status: Actief
+  category: Elektronica
+  sale_price: 24.35
+  compare_at_price: 29.22
+  quantity: 7
+  registration_date: '2026-07-22'
+  brand_name: Oakfern
+- id,link: NL10814
+  title: Reinigingsschuim met lage pH
+  status: Uitverkocht
+  category: Verzorging
+  sale_price: 10.55
+  quantity: 0
+  registration_date: '2026-07-14'
+  brand_name: Marlow & Finch
+- id,link: NL10851
+  title: Zonneparaplu met UV-bescherming
+  status: Uitverkocht
+  category: Wonen
+  sale_price: 20.5
+  quantity: 0
+  registration_date: '2026-07-11'
+  brand_name: Tidewell
+- id,link: NL10888
+  title: Herstellende haaressence
+  status: Actief
+  category: Verzorging
+  sale_price: 12.95
+  quantity: 3
+  registration_date: '2026-06-12'
+  brand_name: 누리온
+title: Producten

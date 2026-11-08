@@ -1,0 +1,31 @@
+page_id: tilleuls-goods-detail-FR10148
+split: ml
+shop: tilleuls
+shop_name: Comptoir des Tilleuls
+lang: fr
+theme: admin_twin
+url: https://comptoir-tilleuls.test/admin/goods/view?id=FR10148
+page_type: goods
+layout: detail
+fields:
+  id,link: FR10148
+  title: Lapin en peluche
+  status: Brouillon
+  category: Jouets
+  sale_price: 15.15
+  compare_at_price: 18.18
+  quantity: 18
+  registration_date: '2026-02-03'
+  brand_name: Marlow & Finch
+  code: FR-KID-104
+  stock_keeping_unit: FRKI1004
+  model_name: KI-113
+  manufacturer: 솔빛리빙
+  origin_country: Portugal
+  color: Bordeaux
+  barcode: '8821427231539'
+  supply_price: 8.79
+  low_stock_threshold: 5
+  shipping_fee: 2.05
+  description: Un doudou tout doux pour l'heure du coucher.
+title: Fiche produit

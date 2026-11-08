@@ -1,0 +1,110 @@
+page_id: sakura-goods-list-1
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/goods/list?page=1
+page_type: goods
+layout: list
+items:
+- id,link: JP10037
+  title: 低アレルゲンドライフード
+  status: 販売中
+  category: ペット
+  sale_price: 3640
+  compare_at_price: 4368
+  quantity: 42
+  registration_date: '2026-03-08'
+  brand_name: 누리온
+- id,link: JP10074
+  title: ヘアリペアエッセンス
+  status: 売り切れ
+  category: コスメ
+  sale_price: 2300
+  quantity: 0
+  registration_date: '2026-03-14'
+  brand_name: 누리온
+- id,link: JP10111
+  title: リネン半袖シャツ
+  status: 販売中
+  category: ファッション
+  sale_price: 5050
+  quantity: 96
+  registration_date: '2026-03-10'
+  brand_name: 마루공방
+- id,link: JP10148
+  title: モニター台
+  status: 販売中
+  category: オフィス用品
+  sale_price: 3920
+  compare_at_price: 4704
+  quantity: 18
+  registration_date: '2026-08-30'
+  brand_name: 버들
+- id,link: JP10185
+  title: ペットキャリーバッグ
+  status: 販売中
+  category: ペット
+  sale_price: 4660
+  quantity: 7
+  registration_date: '2026-01-21'
+  brand_name: 다온랩
+- id,link: JP10222
+  title: コールドブリュー濃縮コーヒー
+  status: 販売中
+  category: 食品
+  sale_price: 1730
+  quantity: 120
+  registration_date: '2026-03-31'
+  brand_name: Marlow & Finch
+- id,link: JP10259
+  title: 充電式LEDランタン
+  status: 下書き
+  category: アウトドア
+  sale_price: 3480
+  quantity: 3
+  registration_date: '2026-04-20'
+  brand_name: 버들
+- id,link: JP10296
+  title: 自動給餌器
+  status: 販売中
+  category: ペット
+  sale_price: 7570
+  quantity: 7
+  registration_date: '2026-04-29'
+  brand_name: 마루공방
+- id,link: JP10333
+  title: ステンレスフライパン
+  status: 売り切れ
+  category: キッチン
+  sale_price: 6490
+  quantity: 0
+  registration_date: '2026-02-24'
+  brand_name: Oakfern
+- id,link: JP10370
+  title: ビタミンC美容液
+  status: 販売中
+  category: コスメ
+  sale_price: 4230
+  quantity: 3
+  registration_date: '2026-06-22'
+  brand_name: Tidewell
+- id,link: JP10407
+  title: 65W急速充電器
+  status: 下書き
+  category: デジタル
+  sale_price: 3420
+  compare_at_price: 4104
+  quantity: 96
+  registration_date: '2026-06-18'
+  brand_name: 솔빛
+- id,link: JP10444
+  title: シリコン調理器具セット
+  status: 販売中
+  category: キッチン
+  sale_price: 3140
+  quantity: 3
+  registration_date: '2026-07-21'
+  brand_name: Oakfern
+title: 商品一覧

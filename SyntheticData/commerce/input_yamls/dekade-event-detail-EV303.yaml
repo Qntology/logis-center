@@ -1,0 +1,17 @@
+page_id: dekade-event-detail-EV303
+split: ml
+shop: dekade
+shop_name: Winkel De Kade
+lang: nl
+theme: admin_grid
+url: https://dekade-winkel.test/admin/event/view?id=EV303
+page_type: event
+layout: detail
+fields:
+  id,link: EV303
+  title: Lente-uitje
+  type: Winactie
+  started_at: '2026-07-12'
+  expired_at: '2026-08-01'
+  status: Afgelopen
+title: Campagne

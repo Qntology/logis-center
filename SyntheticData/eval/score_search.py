@@ -18,7 +18,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from apply_plans import visible_ids
-from truth import commerce_queries, commerce_records, trading_docs, trading_queries
+from truth import commerce_queries, commerce_records, multilingual_queries, trading_docs, trading_queries
 
 
 def read_jsonl(path: Path) -> list:
@@ -82,7 +82,7 @@ def seed_table(path: Path, id_map: dict) -> dict:
     return table
 
 
-def score(search_results: list, truth_queries: list, id_map: dict, table: dict | None = None) -> dict:
+def score(search_results: list, truth_queries: list, id_map: dict, table: dict | None = None, by: str = "kind") -> dict:
     per_kind = defaultdict(list)
     detail = []
     for res in search_results:
@@ -100,7 +100,7 @@ def score(search_results: list, truth_queries: list, id_map: dict, table: dict |
                 seen.add(key)
                 ranked.append(key)
         m = rank_metrics(ranked, set(q["relevant"]))
-        per_kind[q["kind"]].append(m)
+        per_kind[q[by]].append(m)
         per_kind["(전체)"].append(m)
         detail.append({"query": q["query"], "kind": q["kind"], "lang": q["lang"], **m, "top": ranked[:5], "relevant": q["relevant"][:5]})
     table = {}
@@ -118,6 +118,9 @@ def main() -> int:
     ap.add_argument("--domain", default="commerce", choices=["commerce", "shipping"])
     ap.add_argument("--dump", type=Path, help="질의별 상세를 JSON 으로 씁니다")
     ap.add_argument("--seeds", type=Path, help="시드 계획. 주면 프론트엔드 조건 필터를 거친 화면 순위로 채점합니다")
+    ap.add_argument("--queries", default="default", choices=["default", "12lang"],
+                    help="12lang: queries_12lang.yaml (make_plan.py ml12 · mlship12 계획의 결과)")
+    ap.add_argument("--by", default="kind", choices=["kind", "lang", "key"], help="표를 나눌 기준")
     a = ap.parse_args()
     extractions = []
     for p in a.extractions:
@@ -126,10 +129,12 @@ def main() -> int:
         queries, id_map = commerce_queries(), commerce_id_map(extractions)
     else:
         queries, id_map = trading_queries(), trading_id_map(extractions)
+    if a.queries == "12lang":
+        queries = multilingual_queries(a.domain)
     if a.seed_map:
         id_map.update(json.loads(a.seed_map.read_text(encoding="utf-8")))
     table = seed_table(a.seeds, id_map) if a.seeds else None
-    out = score(read_jsonl(a.search), queries, id_map, table)
+    out = score(read_jsonl(a.search), queries, id_map, table, a.by)
     print(f"연결된 아이템 {len(id_map)}건")
     print(f"{'종류':18s} {'질의':>5s} {'MRR':>6s} {'R@10':>6s} {'nDCG':>6s} {'Hit@1':>6s}")
     for kind, row in sorted(out["table"].items()):

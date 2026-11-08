@@ -1,0 +1,31 @@
+page_id: ribeira-goods-detail-PT10111
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/products/PT10111
+page_type: goods
+layout: detail
+fields:
+  id,link: PT10111
+  title: Suporte elevatório para monitor
+  status: À venda
+  category: Escritório
+  sale_price: 26.95
+  compare_at_price: 32.34
+  quantity: 7
+  registration_date: '2026-01-20'
+  brand_name: Marlow & Finch
+  code: PT-DES-103
+  stock_keeping_unit: PTDE1003
+  model_name: DE-115
+  manufacturer: Tidewell Supply
+  origin_country: Polónia
+  color: Azul-celeste
+  barcode: '8874537748113'
+  supply_price: 17.32
+  low_stock_threshold: 5
+  shipping_fee: 2.05
+  description: Eleva o ecrã à altura dos olhos com espaço para o teclado por baixo.
+title: Detalhes do produto

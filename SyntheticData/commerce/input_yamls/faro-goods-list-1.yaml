@@ -1,0 +1,113 @@
+page_id: faro-goods-list-1
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/products?page=1
+page_type: goods
+layout: list
+items:
+- id,link: IT10037
+  title: Mandorle tostate
+  status: Bozza
+  category: Alimentari
+  sale_price: 8.0
+  quantity: 350
+  registration_date: '2026-05-15'
+  brand_name: Marlow & Finch
+- id,link: IT10074
+  title: Essenza riparatrice per capelli
+  status: Esaurito
+  category: Bellezza
+  sale_price: 12.6
+  quantity: 0
+  registration_date: '2026-03-28'
+  brand_name: Tidewell
+- id,link: IT10111
+  title: Sandali traspiranti
+  status: Bozza
+  category: Abbigliamento
+  sale_price: 25.45
+  compare_at_price: 30.54
+  quantity: 7
+  registration_date: '2026-07-07'
+  brand_name: 솔빛
+- id,link: IT10148
+  title: Siero alla vitamina C
+  status: Bozza
+  category: Bellezza
+  sale_price: 28.75
+  quantity: 7
+  registration_date: '2026-07-14'
+  brand_name: Marlow & Finch
+- id,link: IT10185
+  title: Concentrato di caffè cold brew
+  status: In vendita
+  category: Alimentari
+  sale_price: 12.3
+  compare_at_price: 14.76
+  quantity: 96
+  registration_date: '2026-04-06'
+  brand_name: Marlow & Finch
+- id,link: IT10222
+  title: Bicchiere termico sottovuoto
+  status: Bozza
+  category: Cucina
+  sale_price: 17.15
+  compare_at_price: 20.58
+  quantity: 120
+  registration_date: '2026-06-11'
+  brand_name: 마루공방
+- id,link: IT10259
+  title: Auricolari wireless con cancellazione del rumore
+  status: Bozza
+  category: Elettronica
+  sale_price: 84.15
+  compare_at_price: 100.98
+  quantity: 96
+  registration_date: '2026-04-16'
+  brand_name: Kestrel Lane
+- id,link: IT10296
+  title: Mouse verticale ergonomico
+  status: In vendita
+  category: Elettronica
+  sale_price: 26.85
+  quantity: 18
+  registration_date: '2026-05-14'
+  brand_name: 누리온
+- id,link: IT10333
+  title: Schiuma detergente a pH basso
+  status: In vendita
+  category: Bellezza
+  sale_price: 10.35
+  compare_at_price: 12.42
+  quantity: 350
+  registration_date: '2026-01-31'
+  brand_name: 마루공방
+- id,link: IT10370
+  title: Supporto rialzato per monitor
+  status: Bozza
+  category: Ufficio
+  sale_price: 24.7
+  compare_at_price: 29.64
+  quantity: 3
+  registration_date: '2026-03-25'
+  brand_name: 솔빛
+- id,link: IT10407
+  title: Tappetino rinfrescante in gel
+  status: Esaurito
+  category: Casa
+  sale_price: 26.15
+  quantity: 0
+  registration_date: '2026-07-29'
+  brand_name: Oakfern
+- id,link: IT10444
+  title: Barretta proteica con pochi zuccheri
+  status: In vendita
+  category: Alimentari
+  sale_price: 16.95
+  quantity: 3
+  registration_date: '2026-05-06'
+  brand_name: 버들
+title: Prodotti

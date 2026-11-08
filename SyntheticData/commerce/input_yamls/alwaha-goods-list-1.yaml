@@ -1,0 +1,115 @@
+page_id: alwaha-goods-list-1
+split: ml
+shop: alwaha
+shop_name: متجر الواحة
+lang: ar
+theme: store_cards
+url: https://alwaha-store.test/products?page=1
+page_type: goods
+layout: list
+items:
+- id,link: AR10037
+  title: لوز محمص
+  status: معروض للبيع
+  category: بقالة
+  sale_price: 30.7
+  quantity: 96
+  registration_date: '2026-04-08'
+  brand_name: 마루공방
+- id,link: AR10074
+  title: سوار لياقة ذكي
+  status: معروض للبيع
+  category: إلكترونيات
+  sale_price: 128.75
+  compare_at_price: 154.5
+  quantity: 96
+  registration_date: '2026-01-13'
+  brand_name: 마루공방
+- id,link: AR10111
+  title: مركز القهوة الباردة
+  status: معروض للبيع
+  category: بقالة
+  sale_price: 47.95
+  compare_at_price: 57.54
+  quantity: 3
+  registration_date: '2026-01-28'
+  brand_name: 솔빛
+- id,link: AR10148
+  title: مظلة شمسية بحماية من الأشعة فوق البنفسجية
+  status: معروض للبيع
+  category: المنزل
+  sale_price: 85.75
+  compare_at_price: 102.9
+  quantity: 18
+  registration_date: '2026-02-13'
+  brand_name: Tidewell
+- id,link: AR10185
+  title: طقم أدوات طعام للأطفال
+  status: مسودة
+  category: مستلزمات الأطفال
+  sale_price: 78.1
+  compare_at_price: 93.72
+  quantity: 96
+  registration_date: '2026-01-28'
+  brand_name: Kestrel Lane
+- id,link: AR10222
+  title: خف منزلي من القطيفة
+  status: معروض للبيع
+  category: المنزل
+  sale_price: 53.4
+  quantity: 3
+  registration_date: '2026-05-07'
+  brand_name: 마루공방
+- id,link: AR10259
+  title: منظم ملفات المستندات
+  status: مسودة
+  category: مستلزمات مكتبية
+  sale_price: 36.45
+  compare_at_price: 43.74
+  quantity: 96
+  registration_date: '2026-09-03'
+  brand_name: 버들
+- id,link: AR10296
+  title: خيمة قبة لشخصين
+  status: معروض للبيع
+  category: رحلات وتخييم
+  sale_price: 386.05
+  quantity: 120
+  registration_date: '2026-09-12'
+  brand_name: 다온랩
+- id,link: AR10333
+  title: رباط تبريد للرقبة
+  status: معروض للبيع
+  category: المنزل
+  sale_price: 32.6
+  compare_at_price: 39.12
+  quantity: 18
+  registration_date: '2026-03-25'
+  brand_name: 다온랩
+- id,link: AR10370
+  title: كرسي تخييم خفيف
+  status: مسودة
+  category: رحلات وتخييم
+  sale_price: 109.05
+  compare_at_price: 130.86
+  quantity: 350
+  registration_date: '2026-09-11'
+  brand_name: 버들
+- id,link: AR10407
+  title: مجموعة روبوت لتعلم البرمجة
+  status: معروض للبيع
+  category: ألعاب
+  sale_price: 220.25
+  quantity: 42
+  registration_date: '2026-06-03'
+  brand_name: Marlow & Finch
+- id,link: AR10444
+  title: هودي بسحاب ببطانة صوفية
+  status: معروض للبيع
+  category: ملابس
+  sale_price: 132.05
+  compare_at_price: 158.46
+  quantity: 7
+  registration_date: '2026-03-19'
+  brand_name: 누리온
+title: المنتجات

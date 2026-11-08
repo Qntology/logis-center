@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: de
+document_title: Ursprungszeugnis
+metadata:
+  certificate_number: CO-2026-DE-9666
+  issue_date: '2026-09-06'
+  related_invoice_number: CI-DE-2609-360
+  related_bl_number: BL-DE23591658
+  related_lc_number: LC-DE2403039
+parties:
+  exporter:
+    name: Talwerk Hydraulik GmbH
+    address: Talstraße 14, 70173 Stuttgart, Deutschland
+  importer_consignee:
+    name: Daehan Fluid Power Co., Ltd.
+    address: 15 Gongdan-ro, Seongsan-gu, Changwon, Südkorea
+  issuing_authority:
+    name: Handelskammer Neckarland
+    address: Königstraße 22, 70173 Stuttgart, Deutschland
+transport_details:
+  vessel_flight: NORDLICHT V.412E
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Busan, Südkorea
+cargo_details:
+- marks_and_numbers: DAEHAN / CHANGWON / MADE IN GERMANY
+  description_of_goods: Hydraulische Zahnradpumpen (HP-4100)
+  hs_code: '8413.60'
+  quantity: 240 Stk.
+  gross_weight_kg: 3120.0
+  origin_criterion: Vollständig in Deutschland hergestellt
+- marks_and_numbers: DAEHAN / CHANGWON / MADE IN GERMANY
+  description_of_goods: Dichtungssätze für Hydraulikzylinder (DS-220)
+  hs_code: '8484.20'
+  quantity: 1.800 Stk.
+  gross_weight_kg: 610.0
+  origin_criterion: Vollständig in Deutschland hergestellt
+declaration:
+  statement: Es wird bescheinigt, dass die oben bezeichneten Waren ihren Ursprung in Deutschland haben.

@@ -1,0 +1,113 @@
+page_id: ribeira-goods-list-2
+split: ml
+shop: ribeira
+shop_name: Loja Ribeira
+lang: pt
+theme: mobile_dl
+url: https://loja-ribeira.test/products?page=2
+page_type: goods
+layout: list
+items:
+- id,link: PT10481
+  title: Powerbank de grande capacidade
+  status: Rascunho
+  category: Eletrónica
+  sale_price: 26.3
+  quantity: 120
+  registration_date: '2026-04-02'
+  brand_name: 다온랩
+- id,link: PT10518
+  title: Auriculares sem fios com cancelamento de ruído
+  status: À venda
+  category: Eletrónica
+  sale_price: 83.6
+  compare_at_price: 100.32
+  quantity: 18
+  registration_date: '2026-05-23'
+  brand_name: 누리온
+- id,link: PT10555
+  title: Barra proteica com pouco açúcar
+  status: À venda
+  category: Mercearia
+  sale_price: 16.85
+  compare_at_price: 20.22
+  quantity: 18
+  registration_date: '2026-04-05'
+  brand_name: Tidewell
+- id,link: PT10592
+  title: Conjunto de utensílios de silicone
+  status: À venda
+  category: Cozinha
+  sale_price: 19.3
+  compare_at_price: 23.16
+  quantity: 350
+  registration_date: '2026-09-12'
+  brand_name: Kestrel Lane
+- id,link: PT10629
+  title: Ração hipoalergénica
+  status: À venda
+  category: Animais
+  sale_price: 25.65
+  compare_at_price: 30.78
+  quantity: 7
+  registration_date: '2026-03-06'
+  brand_name: Tidewell
+- id,link: PT10666
+  title: Conjunto de loiça infantil
+  status: À venda
+  category: Bebé
+  sale_price: 16.75
+  compare_at_price: 20.1
+  quantity: 350
+  registration_date: '2026-01-09'
+  brand_name: Kestrel Lane
+- id,link: PT10703
+  title: Trotinete infantil
+  status: Esgotado
+  category: Brinquedos
+  sale_price: 43.8
+  quantity: 0
+  registration_date: '2026-01-20'
+  brand_name: Marlow & Finch
+- id,link: PT10740
+  title: Pulseira de atividade inteligente
+  status: À venda
+  category: Eletrónica
+  sale_price: 36.9
+  quantity: 42
+  registration_date: '2026-05-09'
+  brand_name: 다온랩
+- id,link: PT10777
+  title: Comedouro automático
+  status: Esgotado
+  category: Animais
+  sale_price: 54.2
+  compare_at_price: 65.04
+  quantity: 0
+  registration_date: '2026-08-31'
+  brand_name: Marlow & Finch
+- id,link: PT10814
+  title: Peitoral para cão
+  status: À venda
+  category: Animais
+  sale_price: 16.5
+  quantity: 7
+  registration_date: '2026-05-16'
+  brand_name: 누리온
+- id,link: PT10851
+  title: Coelhinho de peluche
+  status: À venda
+  category: Brinquedos
+  sale_price: 14.85
+  quantity: 120
+  registration_date: '2026-02-24'
+  brand_name: Kestrel Lane
+- id,link: PT10888
+  title: Conjunto de cozinha portátil
+  status: À venda
+  category: Ar livre
+  sale_price: 29.7
+  quantity: 120
+  registration_date: '2026-07-13'
+  brand_name: Tidewell
+title: Produtos

@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: it
+document_title: Distinta di imballaggio
+metadata:
+  packing_list_number: PL-IT-2609-892
+  issue_date: '2026-09-15'
+  related_invoice_number: CI-IT-2609-622
+  related_po_number: PO-IT-40256
+  related_bl_number: BL-IT74203367
+parties:
+  shipper_exporter:
+    name: Officine Caffè Aurora S.r.l.
+    address: Via Torino 48, 20123 Milano, Italia
+  consignee:
+    name: Dabin Coffee Equipment Co., Ltd.
+    address: 112 Teheran-ro, Gangnam-gu, Seul, Corea del Sud
+shipping_details:
+  vessel_flight: STELLA DEL TIRRENO V.330E
+  port_of_loading: Genova, Italia
+  port_of_discharge: Busan, Corea del Sud
+packing_details:
+- item_code: ESP-2G
+  description: Macchine per caffè espresso a due gruppi
+  quantity: 60
+  unit: pz
+  packages: 60
+  package_type: casse
+  net_weight_kg: 4200.0
+  gross_weight_kg: 4800.0
+  measurement_cbm: 33.0
+- item_code: MAC-64
+  description: Macinacaffè elettrici professionali
+  quantity: 120
+  unit: pz
+  packages: 20
+  package_type: casse
+  net_weight_kg: 1560.0
+  gross_weight_kg: 1860.0
+  measurement_cbm: 6.0
+summary:
+  total_packages: 80
+  total_net_weight_kg: 5760.0
+  total_gross_weight_kg: 6660.0
+  total_measurement_cbm: 39.0

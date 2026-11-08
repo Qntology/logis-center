@@ -1,0 +1,91 @@
+page_id: yunshan-coupon-list-1
+split: ml
+shop: yunshan
+shop_name: 云杉小铺
+lang: zh-hans
+theme: store_sections
+url: https://yunshan-shop.test/my/coupons?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: YUN965
+  title: 新人首单券 1
+  type: 立减
+  discount: ¥15.80
+  started_at: '2026-09-10'
+  expired_at: '2026-09-17'
+  status: 未开始
+- id,link: CP4014
+  code: YUN262
+  title: 购物车召回券 2
+  type: 折扣
+  discount: 15%
+  started_at: '2026-05-18'
+  expired_at: '2026-06-01'
+  status: 已结束
+- id,link: CP4021
+  code: YUN547
+  title: 秋季回馈券 3
+  type: 立减
+  discount: ¥15.80
+  started_at: '2026-09-11'
+  expired_at: '2026-10-11'
+  status: 已结束
+- id,link: CP4028
+  code: YUN305
+  title: 秋季回馈券 4
+  type: 立减
+  discount: ¥10.55
+  started_at: '2026-03-22'
+  expired_at: '2026-03-29'
+  status: 进行中
+- id,link: CP4035
+  code: YUN368
+  title: APP专享券 5
+  type: 立减
+  discount: ¥10.55
+  started_at: '2026-05-07'
+  expired_at: '2026-05-14'
+  status: 未开始
+- id,link: CP4042
+  code: YUN342
+  title: APP专享券 6
+  type: 立减
+  discount: ¥26.30
+  started_at: '2026-07-10'
+  expired_at: '2026-08-09'
+  status: 进行中
+- id,link: CP4049
+  code: YUN479
+  title: 秋季回馈券 7
+  type: 立减
+  discount: ¥15.80
+  started_at: '2026-07-18'
+  expired_at: '2026-07-25'
+  status: 已结束
+- id,link: CP4056
+  code: YUN259
+  title: 秋季回馈券 8
+  type: 折扣
+  discount: 20%
+  started_at: '2026-07-26'
+  expired_at: '2026-08-25'
+  status: 未开始
+- id,link: CP4063
+  code: YUN804
+  title: 周末限定券 9
+  type: 折扣
+  discount: 5%
+  started_at: '2026-05-06'
+  expired_at: '2026-05-20'
+  status: 进行中
+- id,link: CP4070
+  code: YUN788
+  title: 新人首单券 10
+  type: 立减
+  discount: ¥26.30
+  started_at: '2026-06-22'
+  expired_at: '2026-07-22'
+  status: 进行中
+title: 优惠券列表

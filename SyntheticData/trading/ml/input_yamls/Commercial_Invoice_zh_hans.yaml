@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: zh-hans
+document_title: 商业发票
+metadata:
+  invoice_number: CI-CN-2610-722
+  issue_date: '2026-10-03'
+  reference_po_number: PO-CN-19966
+  related_bl_number: BL-CN22569071
+  related_lc_number: LC-CN8832551
+  currency: USD
+parties:
+  shipper_exporter:
+    name: 海星新能源科技有限公司
+    address: 浙江省宁波市鄞州区海星路88号
+    contact_number: 0574-5555 0142
+    tax_id: 91330212MA2H8K3X7Q
+  consignee:
+    name: Sinhan Battery Co., Ltd.
+    address: 45 Saneop-ro, Heungdeok-gu, Cheongju, 韩国
+    contact_number: +82 43 555 0175
+    tax_id: 301-81-90452
+shipping_details:
+  port_of_loading: 宁波，中国
+  port_of_discharge: 釜山，韩国
+  vessel_flight: HAI XING V.903E
+  incoterms: FOB Ningbo
+line_items:
+- item_code: LFP-280
+  description: 磷酸铁锂电池模组 280Ah
+  quantity: 600
+  unit: 套
+  unit_price: 1480.0
+  total_amount: 888000.0
+  hs_code: '8507.60'
+- item_code: BMS-16S
+  description: 电池管理系统控制板
+  quantity: 600
+  unit: 套
+  unit_price: 96.0
+  total_amount: 57600.0
+  hs_code: '8537.10'
+summary:
+  total_quantity: 1200
+  total_items_amount: 945600.0
+  freight_charge: 0.0
+  insurance: 0.0
+  grand_total_amount: 945600.0

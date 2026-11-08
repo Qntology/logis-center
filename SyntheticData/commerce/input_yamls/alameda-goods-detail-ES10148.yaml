@@ -1,0 +1,30 @@
+page_id: alameda-goods-detail-ES10148
+split: ml
+shop: alameda
+shop_name: Mercado Alameda
+lang: es
+theme: store_cards
+url: https://mercado-alameda.test/products/ES10148
+page_type: goods
+layout: detail
+fields:
+  id,link: ES10148
+  title: Calentador de manos recargable
+  status: Activo
+  category: Hogar
+  sale_price: 16.75
+  quantity: 7
+  registration_date: '2026-04-19'
+  brand_name: Marlow & Finch
+  code: ES-COL-104
+  stock_keeping_unit: ESCO1004
+  model_name: CO-647
+  manufacturer: Oakfern Works
+  origin_country: Corea
+  color: Crema
+  barcode: '8814831599820'
+  supply_price: 10.6
+  low_stock_threshold: 20
+  shipping_fee: 2.05
+  description: Una almohadilla térmica recargable que cabe en el bolsillo.
+title: Detalle del producto

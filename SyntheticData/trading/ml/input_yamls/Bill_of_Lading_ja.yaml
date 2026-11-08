@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: ja
+document_title: 船荷証券
+metadata:
+  bl_number: BL-JP34178511
+  issue_date: '2026-09-04'
+  related_invoice_number: CI-JP-2609-343
+  related_po_number: PO-JP-57075
+  related_lc_number: LC-JP5532891
+  freight_term: 運賃元払い
+parties:
+  shipper:
+    name: 北斗精機株式会社
+    address: 〒460-0008 愛知県名古屋市中区栄3-5-12
+  consignee:
+    name: Daon Robotics Co., Ltd.
+    address: 27 Gongdan-ro, Seongsan-gu, Changwon, 韓国
+  notify_party:
+    name: Daon Robotics Co., Ltd.
+    address: 27 Gongdan-ro, Seongsan-gu, Changwon, 韓国
+  carrier:
+    name: 北斗海運株式会社
+shipping_details:
+  vessel_flight: HOKUTO MARU V.712W
+  port_of_loading: 名古屋、日本
+  port_of_discharge: 釜山、韓国
+  place_of_receipt: 名古屋、日本
+  place_of_delivery: 昌原、韓国
+cargo_details:
+  container_number: HKTU8457160
+  seal_number: SL355231
+  marks_and_numbers: DAON / CHANGWON / MADE IN JAPAN
+  number_of_packages: 39箱
+  description_of_goods: 産業用ロボットアームおよびサーボモーター
+  gross_weight_kg: 6540.0
+  measurement_cbm: 62.1

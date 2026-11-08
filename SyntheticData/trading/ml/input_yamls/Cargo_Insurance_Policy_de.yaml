@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: de
+document_title: Transportversicherungspolice
+metadata:
+  policy_number: IP-DE-771913
+  issue_date: '2026-09-06'
+  effective_date: '2026-09-07'
+  related_invoice_number: CI-DE-2609-360
+  related_bl_number: BL-DE23591658
+  related_lc_number: LC-DE2403039
+  related_po_number: PO-DE-72911
+parties:
+  insurer:
+    name: Hanseatische Transportversicherung AG
+    address: Am Sandtorkai 9, 20457 Hamburg, Deutschland
+  insured:
+    name: Daehan Fluid Power Co., Ltd.
+    address: 15 Gongdan-ro, Seongsan-gu, Changwon, Südkorea
+coverage_details:
+  sum_insured: 264990.0
+  currency: EUR
+  valuation_basis: Rechnungswert zuzüglich 10 %
+  coverage_conditions: Institute Cargo Clauses (A) – Deckung gegen alle Gefahren
+  premium_amount: 662.48
+  claims_payable_at: Busan, Südkorea
+transport_details:
+  vessel_flight: NORDLICHT V.412E
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Busan, Südkorea
+cargo_details:
+- mark_and_numbers: DAEHAN / CHANGWON / MADE IN GERMANY
+  description_of_goods: Hydraulische Zahnradpumpen und Dichtungssätze
+  number_of_packages: 16 Paletten
+  gross_weight_kg: 3730.0

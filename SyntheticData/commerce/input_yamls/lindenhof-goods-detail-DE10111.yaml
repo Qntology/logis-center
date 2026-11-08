@@ -1,0 +1,31 @@
+page_id: lindenhof-goods-detail-DE10111
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/goods/view?id=DE10111
+page_type: goods
+layout: detail
+fields:
+  id,link: DE10111
+  title: Proteinriegel mit wenig Zucker
+  status: Ausverkauft
+  category: Lebensmittel
+  sale_price: 15.5
+  compare_at_price: 18.6
+  quantity: 0
+  registration_date: '2026-08-10'
+  brand_name: 버들
+  code: DE-SNA-103
+  stock_keeping_unit: DESN1003
+  model_name: SN-909
+  manufacturer: 누리온산업
+  origin_country: Portugal
+  color: Oliv
+  barcode: '8837907826522'
+  supply_price: 10.92
+  low_stock_threshold: 5
+  shipping_fee: 2.05
+  description: Fünfzehn Gramm Protein pro Riegel.
+title: Produktdetails

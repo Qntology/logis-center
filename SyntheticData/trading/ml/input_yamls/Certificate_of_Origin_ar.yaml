@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: ar
+document_title: شهادة المنشأ
+metadata:
+  certificate_number: CO-2026-SA-2124
+  issue_date: '2026-10-02'
+  related_invoice_number: CI-SA-2610-806
+  related_bl_number: BL-SA92992380
+  related_lc_number: LC-SA7357768
+parties:
+  exporter:
+    name: شركة الواحة للبتروكيماويات
+    address: شارع الصناعة 12، الجبيل الصناعية 35514، المملكة العربية السعودية
+  importer_consignee:
+    name: Seorin Polymer Co., Ltd.
+    address: 19 Yeosusandan-ro، يوسو، كوريا الجنوبية
+  issuing_authority:
+    name: غرفة تجارة ساحل الخليج
+    address: شارع الملك سعود 7، الجبيل 35514، المملكة العربية السعودية
+transport_details:
+  vessel_flight: AL JUBAIL PEARL V.044E
+  port_of_loading: الجبيل، المملكة العربية السعودية
+  port_of_discharge: يوسو، كوريا الجنوبية
+cargo_details:
+- marks_and_numbers: SEORIN / YEOSU / صنع في السعودية
+  description_of_goods: حبيبات بولي إيثيلين عالي الكثافة (HDPE-5502)
+  hs_code: '3901.20'
+  quantity: 400 طن
+  gross_weight_kg: 401600.0
+  origin_criterion: منتج بالكامل في المملكة العربية السعودية
+- marks_and_numbers: SEORIN / YEOSU / صنع في السعودية
+  description_of_goods: حبيبات بولي بروبيلين متجانس (PP-H030)
+  hs_code: '3902.10'
+  quantity: 200 طن
+  gross_weight_kg: 200800.0
+  origin_criterion: منتج بالكامل في المملكة العربية السعودية
+declaration:
+  statement: نشهد بأن البضائع الموصوفة أعلاه منشؤها المملكة العربية السعودية.

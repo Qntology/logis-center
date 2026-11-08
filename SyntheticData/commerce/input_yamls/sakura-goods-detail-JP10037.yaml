@@ -1,0 +1,31 @@
+page_id: sakura-goods-detail-JP10037
+split: ml
+shop: sakura
+shop_name: さくら商店
+lang: ja
+theme: admin_twin
+url: https://sakura-shoten.test/admin/goods/view?id=JP10037
+page_type: goods
+layout: detail
+fields:
+  id,link: JP10037
+  title: 低アレルゲンドライフード
+  status: 販売中
+  category: ペット
+  sale_price: 3640
+  compare_at_price: 4368
+  quantity: 42
+  registration_date: '2026-03-08'
+  brand_name: 누리온
+  code: JP-PET-101
+  stock_keeping_unit: JPPE1001
+  model_name: PE-322
+  manufacturer: 누리온산업
+  origin_country: ポルトガル
+  color: オリーブ
+  barcode: '8821419717110'
+  supply_price: 2161
+  low_stock_threshold: 10
+  shipping_fee: 330
+  description: 敏感肌向けの単一たんぱく質フードです。
+title: 商品詳細

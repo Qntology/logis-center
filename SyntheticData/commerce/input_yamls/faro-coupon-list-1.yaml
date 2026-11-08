@@ -1,0 +1,91 @@
+page_id: faro-coupon-list-1
+split: ml
+shop: faro
+shop_name: Bottega del Faro
+lang: it
+theme: store_sections
+url: https://bottega-faro.test/my/coupons?page=1
+page_type: coupon
+layout: list
+items:
+- id,link: CP4007
+  code: FAR401
+  title: Offerta esclusiva app 1
+  type: Percentuale
+  discount: 15%
+  started_at: '2026-04-01'
+  expired_at: '2026-04-15'
+  status: Attivo
+- id,link: CP4014
+  code: FAR123
+  title: Grazie d'autunno 2
+  type: Importo fisso
+  discount: € 2,05
+  started_at: '2026-03-28'
+  expired_at: '2026-04-11'
+  status: Concluso
+- id,link: CP4021
+  code: FAR995
+  title: Vantaggio clienti abituali 3
+  type: Importo fisso
+  discount: € 2,05
+  started_at: '2026-09-08'
+  expired_at: '2026-09-15'
+  status: Concluso
+- id,link: CP4028
+  code: FAR780
+  title: Salva carrello 4
+  type: Importo fisso
+  discount: € 1,40
+  started_at: '2026-08-30'
+  expired_at: '2026-09-06'
+  status: Attivo
+- id,link: CP4035
+  code: FAR695
+  title: Offerta esclusiva app 5
+  type: Percentuale
+  discount: 10%
+  started_at: '2026-05-03'
+  expired_at: '2026-05-10'
+  status: Attivo
+- id,link: CP4042
+  code: FAR229
+  title: Benvenuto al primo ordine 6
+  type: Importo fisso
+  discount: € 1,40
+  started_at: '2026-06-11'
+  expired_at: '2026-07-11'
+  status: Concluso
+- id,link: CP4049
+  code: FAR915
+  title: Grazie d'autunno 7
+  type: Percentuale
+  discount: 20%
+  started_at: '2026-09-12'
+  expired_at: '2026-09-26'
+  status: Concluso
+- id,link: CP4056
+  code: FAR634
+  title: Salva carrello 8
+  type: Importo fisso
+  discount: € 1,40
+  started_at: '2026-03-26'
+  expired_at: '2026-04-09'
+  status: Attivo
+- id,link: CP4063
+  code: FAR740
+  title: Vantaggio clienti abituali 9
+  type: Percentuale
+  discount: 10%
+  started_at: '2026-04-16'
+  expired_at: '2026-05-16'
+  status: Concluso
+- id,link: CP4070
+  code: FAR251
+  title: Salva carrello 10
+  type: Importo fisso
+  discount: € 2,05
+  started_at: '2026-06-01'
+  expired_at: '2026-06-15'
+  status: Programmato
+title: Codici sconto

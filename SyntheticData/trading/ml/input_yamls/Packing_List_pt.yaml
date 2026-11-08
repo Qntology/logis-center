@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: pt
+document_title: Lista de embalagem
+metadata:
+  packing_list_number: PL-PT-2609-605
+  issue_date: '2026-09-21'
+  related_invoice_number: CI-PT-2609-197
+  related_po_number: PO-PT-74235
+  related_bl_number: BL-PT56145092
+parties:
+  shipper_exporter:
+    name: Corticeira Vale Verde, Lda.
+    address: Rua do Sobreiro 9, 4520-123 Santa Maria da Feira, Portugal
+  consignee:
+    name: Hwain Interior Co., Ltd.
+    address: 27 Haeun-daero, Haeundae-gu, Busan, Coreia do Sul
+shipping_details:
+  vessel_flight: ATLANTICO NORTE V.091E
+  port_of_loading: Leixões, Portugal
+  port_of_discharge: Busan, Coreia do Sul
+packing_details:
+- item_code: RCN-24
+  description: Rolhas de cortiça natural 24 x 45 mm
+  quantity: 500000
+  unit: un.
+  packages: 10
+  package_type: paletes
+  net_weight_kg: 1900.0
+  gross_weight_kg: 2150.0
+  measurement_cbm: 18.0
+- item_code: PAV-60
+  description: Painéis de aglomerado de cortiça para pavimento
+  quantity: 4800
+  unit: un.
+  packages: 16
+  package_type: paletes
+  net_weight_kg: 6240.0
+  gross_weight_kg: 6600.0
+  measurement_cbm: 21.6
+summary:
+  total_packages: 26
+  total_net_weight_kg: 8140.0
+  total_gross_weight_kg: 8750.0
+  total_measurement_cbm: 39.6

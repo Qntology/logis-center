@@ -1,0 +1,16 @@
+page_id: lindenhof-review-detail-RV7011
+split: ml
+shop: lindenhof
+shop_name: Lindenhof Warenhaus
+lang: de
+theme: admin_flat
+url: https://lindenhof-waren.test/admin/review/view?id=RV7011
+page_type: review
+layout: detail
+fields:
+  id,link: RV7011
+  status: Ausstehend
+  title: Zweiter Kauf und immer noch farblich wunderschön.
+  name: Leon Neumann
+  registration_date: '2026-08-31'
+title: Bewertung
