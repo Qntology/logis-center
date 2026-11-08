@@ -1656,6 +1656,32 @@ pub fn season_range(season: &str, year: i32) -> Option<(i64, i64)> {
     Some(crate::utils::time_guide::period_ms(&utc, s, e))
 }
 
+/// 기간(시간 · 계절) 뱅크 판정의 글자 근거: 청크 낱말 하나가 그 키의 구 낱말을 품는가 (변화형 포함).
+///  · 한중일 · 아랍 문자 구 낱말: 청크 낱말이 그 낱말을 포함 (여름에 ⊃ 여름 · 夏休みに ⊃ 夏 · الصيف ⊃ صيف)
+///  · 그 밖의 문자: 앞 글자가 max(3, 낱말 길이 − 2)자 이상 같음 (summers · zomerse · létě ↔ léto). 두 글자 이하 구 낱말과
+///    숫자가 든 청크 낱말은 근거로 쓰지 않습니다 (2026 → this_year 는 절대 기간 해석기 몫).
+/// 벡터만으로는 근거 없는 기간이 붙었습니다 (v2 행동 로그 질의 중 시간 낱말이 없는 60개 중 55개: "actions on Copperleaf" →
+/// 가을 cos 0.67, "UV-blocking parasol" → 여름, "bij" → 올해). 행동 로그는 기간이 틀리면 정답이 통째로 걸러집니다.
+pub fn period_lexical_support(chunk: &str, phrases: &[&str]) -> bool {
+    let words = |s: &str| -> Vec<String> {
+        s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect()
+    };
+    let cjk = |c: char| matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3);
+    let arabic = |c: char| matches!(c as u32, 0x0600..=0x06FF);
+    let chunk_words: Vec<String> = words(chunk).into_iter().filter(|w| !w.chars().any(|c| c.is_ascii_digit())).collect();
+    phrases.iter().flat_map(|p| words(p)).any(|v| {
+        let n = v.chars().count();
+        match v.chars().next() {
+            Some(c) if cjk(c) || (arabic(c) && n >= 3) => chunk_words.iter().any(|w| w.contains(v.as_str())),
+            Some(c) if !arabic(c) && n >= 3 => {
+                let need = 3.max(n - 2);
+                chunk_words.iter().any(|w| w.chars().zip(v.chars()).take_while(|(a, b)| a == b).count() >= need)
+            }
+            _ => false,
+        }
+    })
+}
+
 /// 🌟 [DETERMINISTIC TIME] bias.json 의 exact_match 배열로 완전일치 판정합니다.
 ///    '오늘' / 'today' / '今日' 처럼 50개 언어의 시간·계절 표현이 리터럴로 등재되어 있어
 ///    코드에 다국어 어휘를 하나도 넣지 않고 확정할 수 있습니다.

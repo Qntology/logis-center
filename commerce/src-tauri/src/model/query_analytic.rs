@@ -91,9 +91,11 @@ impl crate::model::LogisModel {
         // =====================================================================
         // STEP 1 : bias.json 완전일치 + 접두일치 (벡터·LLM 없이 확정)
         // =====================================================================
-        let (det_time_key, det_season_key) = crate::analytic::deterministic_time_keys(&query);
+        // 따옴표로 묶은 이름('Summer getaway picks' · 「夏休み準備セール」)은 값이므로 기간 · 이벤트 판정에 쓰지 않습니다.
+        let literal_free = crate::stanza::strip_quoted(&query);
+        let (det_time_key, det_season_key) = crate::analytic::deterministic_time_keys(&literal_free);
         let mut det_event_keys: Vec<String> = Vec::new();
-        for w in query.split_whitespace() {
+        for w in literal_free.split_whitespace() {
             // ① 완전일치
             if let Some(k) = crate::analytic::event_type_exact_match(w) {
                 if !det_event_keys.iter().any(|e| e == &k) {
@@ -158,6 +160,7 @@ impl crate::model::LogisModel {
         //    드롭은 keywords / target 산출 시에만 적용합니다.
         const DROP_TAGS: &[&str] = crate::utils::ai_utils::STANZA_DROP_TAGS;
         let all_words: Vec<String> = tokens.iter().map(|(w, _, _)| w.clone()).collect();
+        let quoted = crate::stanza::quoted_token_flags(&query, &all_words);
         let content_flags: Vec<bool> = tokens
             .iter()
             .map(|(_, t, _)| !DROP_TAGS.iter().any(|d| d == t))
@@ -202,8 +205,15 @@ impl crate::model::LogisModel {
         let mut seen_chunk: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for s in 0..all_words.len() {
+            // 따옴표 안 낱말이 든 창은 청크로 올리지 않습니다 (이름 속 Summer 가 여름 기간이 되던 것). 낱말은 키워드로 남습니다.
+            if quoted[s] {
+                continue;
+            }
             let max_e = all_words.len().min(s + 6);
             for e in (s + 1)..=max_e {
+                if quoted[e - 1] {
+                    break;
+                }
                 // ① 표면형 조합
                 let surface = all_words[s..e].join(" ");
                 if !surface.trim().is_empty() {
@@ -417,6 +427,7 @@ impl crate::model::LogisModel {
         //    '전역 분포의 상위 1σ 꼬리' 에 든 최상위 후보를 따로 모아 둡니다.
         //    (통계적 사실 기반이며 새 매직 상수가 아닙니다)
         let mut rescue_pool: Vec<AnalyticSpan> = Vec::new();
+        let mut period_unsupported = 0usize;
 
         for (ci, (s, e)) in chunk_spans.iter().enumerate() {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -464,6 +475,14 @@ impl crate::model::LogisModel {
                     .unwrap_or(0.0);
                 if prej >= own {
                     continue;
+                }
+                // 🌟 [PERIOD LEXICAL GATE] 기간(시간 · 계절)은 청크 낱말이 그 키의 구 낱말을 품을 때만 후보가 됩니다.
+                if ck.0 == "time_filters" || ck.0 == "season_filters" {
+                    let phrases: Vec<&str> = idxs.iter().filter_map(|&i| bank_defs.get(i).map(|d| d.2.as_str())).collect();
+                    if !crate::analytic::period_lexical_support(&chunk_texts[ci], &phrases) {
+                        period_unsupported += 1;
+                        continue;
+                    }
                 }
                 scored.push((ck.0.clone(), ck.1.clone(), sur, own));
             }
@@ -517,6 +536,13 @@ impl crate::model::LogisModel {
                 ));
                 rescue_pool.push(span);
             }
+        }
+
+        if period_unsupported > 0 {
+            emit_term(&format!(
+                "   🧷 [PERIOD LEXICAL GATE] 청크 낱말에 기간 구 낱말이 없어 (청크, 시간 · 계절 키) {}쌍을 후보에서 뺐습니다. 벡터만 가까운 기간(가을 ← Copperleaf)은 정답을 통째로 거릅니다.",
+                period_unsupported
+            ));
         }
 
         // 🌟 [COVERAGE RESCUE] 게이트를 넘은 후보가 하나도 없으면
