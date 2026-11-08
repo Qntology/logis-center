@@ -776,6 +776,18 @@ function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
     }
     return best;
 }
+// 🌟 [ALTERNATES] 조건의 필드가 비었거나 맞지 않으면 plan.alternates 의 대체 필드로도 봅니다.
+//    lib.rs 의 dexie_condition_passes 와 같은 규칙입니다. 예전에는 alternates 를 읽지 않아, 무역 허브 번호 조건
+//    (data.hub_reference, 대체 필드 doc_number · reference_*)이 그 필드를 가진 문서가 없어 모든 행을 걸러 냈습니다.
+function conditionAlternates(plan: DexiePlan, cond: DexieCondition): string[] {
+    const field = cond.path.startsWith('data.') ? cond.path.slice(5) : cond.path;
+    const alts = plan.alternates && plan.alternates[field];
+    return Array.isArray(alts) ? alts : [];
+}
+function matchConditionWithAlternates(row: any, cond: DexieCondition, plan: DexiePlan): boolean {
+    if (matchCondition(row, cond)) return true;
+    return conditionAlternates(plan, cond).some(a => matchCondition(row, { ...cond, path: `data.${a}` }));
+}
 async function executeDexiePlan(
     plan: DexiePlan,
     opts: { candidateIds?: string[]; limit?: number; offset?: number } = {}
@@ -791,7 +803,8 @@ async function executeDexiePlan(
         rows = await appDb.table('items').where('id').anyOf(opts.candidateIds).toArray();
         console.log(`[DEXIE-PLAN] 후보 ${opts.candidateIds.length}건 → Dexie 적재 ${rows.length}건`);
     } else {
-        const driver = pickDriverCondition(conds);
+        // 대체 필드가 있는 조건은 인덱스 드라이버로 쓰지 않습니다(그 필드에만 값이 있는 행을 놓칩니다).
+        const driver = pickDriverCondition(conds.filter(c => conditionAlternates(plan, c).length === 0));
         if (driver) {
             try {
                 const coll = appDb.table('items').where(driver.path);
@@ -849,7 +862,7 @@ async function executeDexiePlan(
 
     if (plainConds.length > 0) {
         const before = rows.length;
-        rows = rows.filter(r => plainConds.every(c => matchCondition(r, c)));
+        rows = rows.filter(r => plainConds.every(c => matchConditionWithAlternates(r, c, plan)));
         console.log(`[DEXIE-PLAN] 정밀 조건 ${plainConds.length}개 적용: ${before} → ${rows.length}건`);
         for (const c of plainConds) {
             const viaIndex = DEXIE_INDEXED_PATHS.has(c.path) ? 'index' : 'scan';
@@ -3771,7 +3784,9 @@ listen("extraction-progress", async (event: any) => {
                                 if (!absorb(match, "backward")) continue;
 
                                 // 3) 2-Depth 체이닝 : 부모의 index 로 다시 자식 찾기
-                                const bIndex = match.data?.index ? String(match.data.index) : "";
+                                //    연결 칸(data.goods · order · tracking · index)은 숫자로 저장되어 있어, 예전처럼
+                                //    String(index) 로 찾으면 Dexie 키 비교(숫자 ≠ 문자열)에서 한 건도 맞지 않았습니다.
+                                const bIndex = match.data?.index ? Number(match.data.index) : 0;
                                 if (!bIndex) continue;
                                 for (const d2 of await findLinked(bIndex)) {
                                     if (d2.id === match.id || d2.id === doc.id) continue;
