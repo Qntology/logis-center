@@ -1,0 +1,101 @@
+url: https://kranichhof-markt.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+title: Sendungen
+items:
+- id,link: '306689037496'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: Proteinriegel mit wenig Zucker
+  shipping_date: '2026-09-25'
+  recipient_name: Lukas Wolf
+- id,link: '183704573456'
+  carrier: Nordkurier Logistik
+  status: Zugestellt
+  title: Aufladbarer Handwärmer
+  shipping_date: '2026-09-22'
+  recipient_name: Felix Wagner
+- id,link: '199257775839'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: UV-Schutz-Sonnenschirm
+  shipping_date: '2026-09-10'
+  recipient_name: Lukas Wolf
+- id,link: '950621210532'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Plüsch-Hausschuhe
+  shipping_date: '2026-09-02'
+  recipient_name: Felix Wagner
+- id,link: '626675058939'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Plüsch-Hausschuhe
+  shipping_date: '2026-09-02'
+  recipient_name: Lukas Wolf
+- id,link: '635677280212'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Geröstete Naturreis-Chips
+  shipping_date: '2026-08-26'
+  recipient_name: Leon Schulz
+- id,link: '364784124712'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Parfümfreie Bodylotion
+  shipping_date: '2026-08-18'
+  recipient_name: Lukas Becker
+- id,link: '746032456059'
+  carrier: Nordkurier Logistik
+  status: Zurückgesendet
+  title: Kabelbox
+  shipping_date: '2026-08-13'
+  recipient_name: Kranichhof Handels GmbH
+- id,link: '105026355876'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: Kabelbox
+  shipping_date: '2026-08-09'
+  recipient_name: Lukas Wolf
+- id,link: '622541545374'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: Holzbausteine
+  shipping_date: '2026-07-30'
+  recipient_name: Lukas Wolf
+- id,link: '203558536218'
+  carrier: Nordkurier Logistik
+  status: Zugestellt
+  title: Geröstete Naturreis-Chips
+  shipping_date: '2026-07-25'
+  recipient_name: Sophie Braun
+- id,link: '989554366896'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Proteinriegel mit wenig Zucker
+  shipping_date: '2026-07-22'
+  recipient_name: Lukas Wolf
+- id,link: '613745374932'
+  carrier: Nordkurier Logistik
+  status: Zugestellt
+  title: USB-C-Multiport-Hub
+  shipping_date: '2026-07-17'
+  recipient_name: Lukas Wolf
+- id,link: '238325447762'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Parfümfreie Bodylotion
+  shipping_date: '2026-07-09'
+  recipient_name: Leon Schulz
+- id,link: '822493770810'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Laptopständer
+  shipping_date: '2026-07-07'
+  recipient_name: Leon Schulz
+- id,link: '790538082982'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: UV-Schutz-Sonnenschirm
+  shipping_date: '2026-07-06'
+  recipient_name: Clara Keller

@@ -1,0 +1,20 @@
+url: https://copperleaf-goods.test/admin/event/list?page=1
+page_type: event
+layout: list
+title: Campaigns
+items:
+- id,link: EV709
+  title: Spring stroll showcase
+  started_at: '2026-04-06'
+  expired_at: '2026-04-26'
+  status: Ended
+- id,link: EV718
+  title: Summer getaway picks
+  started_at: '2026-06-15'
+  expired_at: '2026-07-12'
+  status: Ended
+- id,link: EV727
+  title: Harvest gift guide
+  started_at: '2026-09-01'
+  expired_at: '2026-09-20'
+  status: Ended

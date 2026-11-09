@@ -1,0 +1,37 @@
+url: https://kranichhof-markt.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+title: Gutscheincodes
+items:
+- id,link: CP5013
+  code: KRWELCOME
+  title: Willkommen zur ersten Bestellung
+  discount: 2,05 €
+  started_at: '2026-04-01'
+  expired_at: '2026-09-30'
+  status: Beendet
+  min_order_amount: 13.8
+- id,link: CP5026
+  code: KRSUMMER
+  title: Nur in der App
+  discount: 15%
+  started_at: '2026-06-15'
+  expired_at: '2026-07-12'
+  status: Beendet
+  min_order_amount: 20.7
+- id,link: CP5039
+  code: KRAGAIN
+  title: Bonus für Stammkunden
+  discount: 10%
+  started_at: '2026-04-01'
+  expired_at: '2026-09-30'
+  status: Beendet
+  min_order_amount: 6.9
+- id,link: CP5052
+  code: KRHARVEST
+  title: Herbstliches Dankeschön
+  discount: 3,45 €
+  started_at: '2026-09-01'
+  expired_at: '2026-09-20'
+  status: Beendet
+  min_order_amount: 27.6

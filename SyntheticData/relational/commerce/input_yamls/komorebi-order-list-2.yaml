@@ -1,0 +1,163 @@
+url: https://komorebi-shop.test/admin/order/list?page=2
+page_type: order
+layout: list
+title: 注文一覧
+items:
+- id,link: 20260707-301491
+  registration_date: '2026-07-07'
+  status: 配達完了
+  goods: シリコン調理器具セット
+  tracking_number: '848739929093'
+  sender_name: 渡辺 大翔
+  recipient_name: 渡辺 大翔
+  quantity: 2
+  amount: 5150
+  payment_method: クレジットカード
+- id,link: 20260705-301704
+  registration_date: '2026-07-05'
+  status: 配達完了
+  goods: 温度調節電気ケトル
+  tracking_number: '389984867208'
+  sender_name: 渡辺 湊
+  recipient_name: 渡辺 湊
+  quantity: 1
+  amount: 4910
+  payment_method: 電子マネー
+- id,link: 20260702-300994
+  registration_date: '2026-07-02'
+  status: 配達完了
+  goods: シリコン調理器具セット
+  tracking_number: '503400467005'
+  sender_name: 鈴木 悠真
+  recipient_name: 鈴木 悠真
+  quantity: 1
+  amount: 3360
+  payment_method: クレジットカード
+- id,link: 20260625-300142
+  registration_date: '2026-06-25'
+  status: 配達完了
+  goods: アウトドアクッカーセット
+  tracking_number: '222046054191'
+  sender_name: 鈴木 悠真
+  recipient_name: 鈴木 悠真
+  quantity: 6
+  amount: 23060
+  payment_method: クレジットカード
+- id,link: 20260621-300852
+  registration_date: '2026-06-21'
+  status: 配達完了
+  goods: 防水Bluetoothスピーカー
+  tracking_number: '961736408912'
+  sender_name: 渡辺 大翔
+  recipient_name: 渡辺 大翔
+  quantity: 3
+  amount: 15610
+  payment_method: クレジットカード
+- id,link: 20260606-300710
+  registration_date: '2026-06-06'
+  status: 返品
+  goods: ビタミンC美容液
+  tracking_number: '397090333729'
+  sender_name: 加藤 芽依
+  recipient_name: 加藤 芽依
+  quantity: 2
+  amount: 9080
+  payment_method: クレジットカード
+- id,link: 20260518-300923
+  registration_date: '2026-05-18'
+  status: 配達完了
+  goods: アウトドアクッカーセット
+  tracking_number: '442841635125'
+  sender_name: 鈴木 悠真
+  recipient_name: 加藤 芽依
+  quantity: 2
+  amount: 8540
+  payment_method: クレジットカード
+- id,link: 20260515-302201
+  registration_date: '2026-05-15'
+  status: 配達完了
+  goods: USB-Cマルチポートハブ
+  tracking_number: '865922336675'
+  sender_name: 山本 蓮
+  recipient_name: 山本 蓮
+  quantity: 6
+  amount: 20860
+  payment_method: 電子マネー
+- id,link: 20260512-301917
+  registration_date: '2026-05-12'
+  status: 配達完了
+  goods: 子ども用食器セット
+  tracking_number: '807240663942'
+  sender_name: 高橋 健太
+  recipient_name: 渡辺 大翔
+  quantity: 3
+  amount: 9660
+  payment_method: 電子マネー
+- id,link: 20260511-301420
+  registration_date: '2026-05-11'
+  status: キャンセル
+  goods: セラミック包丁
+  sender_name: 加藤 芽依
+  recipient_name: 加藤 芽依
+  quantity: 4
+  amount: 22750
+  payment_method: クレジットカード
+- id,link: 20260506-300639
+  registration_date: '2026-05-06'
+  status: 配達完了
+  goods: もこもこルームシューズ
+  tracking_number: '552636909670'
+  sender_name: 鈴木 悠真
+  recipient_name: 鈴木 悠真
+  quantity: 1
+  amount: 2320
+  payment_method: 電子マネー
+- id,link: 20260425-300071
+  registration_date: '2026-04-25'
+  status: 配達完了
+  goods: スマートフィットネスバンド
+  tracking_number: '646781334594'
+  sender_name: 加藤 芽依
+  recipient_name: 小林 大翔
+  quantity: 1
+  amount: 5460
+  payment_method: クレジットカード
+- id,link: 20260416-300781
+  registration_date: '2026-04-16'
+  status: 配達完了
+  goods: ビタミンC美容液
+  tracking_number: '697719988118'
+  sender_name: 加藤 芽依
+  recipient_name: 加藤 芽依
+  quantity: 5
+  amount: 17800
+  payment_method: クレジットカード
+- id,link: 20260415-301065
+  registration_date: '2026-04-15'
+  status: キャンセル
+  goods: 温度調節電気ケトル
+  sender_name: 加藤 芽依
+  recipient_name: 加藤 芽依
+  quantity: 1
+  amount: 5720
+  payment_method: クレジットカード
+- id,link: 20260411-301349
+  registration_date: '2026-04-11'
+  status: 返品
+  goods: スマートフィットネスバンド
+  tracking_number: '599550539605'
+  sender_name: 鈴木 悠真
+  recipient_name: 鈴木 悠真
+  quantity: 5
+  amount: 20680
+  payment_method: 銀行振込
+- id,link: 20260407-301775
+  registration_date: '2026-04-07'
+  status: 配達完了
+  goods: 温度調節電気ケトル
+  tracking_number: '900897482474'
+  sender_name: 渡辺 湊
+  recipient_name: 渡辺 湊
+  quantity: 1
+  amount: 5720
+  payment_method: 電子マネー

@@ -1,0 +1,149 @@
+url: https://sorae-market.test/admin/goods/list?page=1
+page_type: goods
+layout: list
+title: 상품 관리
+items:
+- id,link: SR20041
+  title: 기모 후드집업
+  status: 판매중
+  category: 의류
+  sale_price: 46600
+  quantity: 4
+  registration_date: '2026-02-12'
+  brand_name: 솔빛
+- id,link: SR20082
+  title: 대용량 보조배터리
+  status: 판매중
+  category: 디지털
+  sale_price: 42400
+  quantity: 60
+  registration_date: '2026-03-04'
+  brand_name: 하람
+- id,link: SR20123
+  title: 휴대용 코펠 세트
+  status: 판매중
+  category: 레저
+  sale_price: 43500
+  quantity: 140
+  registration_date: '2026-02-26'
+  brand_name: Tidewell
+- id,link: SR20164
+  title: 리넨 반팔 셔츠
+  status: 판매중
+  category: 의류
+  sale_price: 48500
+  quantity: 140
+  registration_date: '2026-01-23'
+  brand_name: Tidewell
+- id,link: SR20205
+  title: 유기농 그래놀라
+  status: 판매중
+  category: 식품
+  sale_price: 14600
+  quantity: 60
+  registration_date: '2026-02-18'
+  brand_name: 누리온
+- id,link: SR20246
+  title: 밀폐 유리 용기 세트
+  status: 판매중
+  category: 주방
+  sale_price: 30800
+  quantity: 140
+  registration_date: '2026-01-21'
+  brand_name: Tidewell
+- id,link: SR20287
+  title: 반려동물 이동장
+  status: 판매중
+  category: 반려
+  sale_price: 44500
+  quantity: 9
+  registration_date: '2026-03-03'
+  brand_name: Marlow & Finch
+- id,link: SR20328
+  title: 자외선 차단 양산
+  status: 판매중
+  category: 생활
+  sale_price: 29800
+  quantity: 140
+  registration_date: '2026-02-23'
+  brand_name: Oakfern
+- id,link: SR20369
+  title: 어린이 킥보드
+  status: 판매중
+  category: 완구
+  sale_price: 63800
+  quantity: 140
+  registration_date: '2026-03-14'
+  brand_name: 버들
+- id,link: SR20410
+  title: 수분 장벽 크림
+  status: 판매중
+  category: 뷰티
+  sale_price: 34500
+  quantity: 4
+  registration_date: '2026-01-19'
+  brand_name: 솔빛
+- id,link: SR20451
+  title: 방수 블루투스 스피커
+  status: 판매중
+  category: 디지털
+  sale_price: 54700
+  quantity: 9
+  registration_date: '2026-01-18'
+  brand_name: Marlow & Finch
+- id,link: SR20492
+  title: 제주 감귤 주스
+  status: 품절
+  category: 식품
+  sale_price: 17000
+  quantity: 0
+  registration_date: '2026-02-19'
+  brand_name: 하람
+- id,link: SR20533
+  title: 진공 보온 텀블러
+  status: 판매중
+  category: 주방
+  sale_price: 24200
+  quantity: 9
+  registration_date: '2026-01-27'
+  brand_name: Oakfern
+- id,link: SR20574
+  title: 콜드브루 원액
+  status: 판매중
+  category: 식품
+  sale_price: 15800
+  quantity: 9
+  registration_date: '2026-03-12'
+  brand_name: 하람
+- id,link: SR20615
+  title: 코딩 로봇 키트
+  status: 판매중
+  category: 완구
+  sale_price: 80500
+  quantity: 9
+  registration_date: '2026-02-03'
+  brand_name: Marlow & Finch
+- id,link: SR20656
+  title: 접이식 등산 스틱
+  status: 판매중
+  category: 레저
+  sale_price: 54700
+  quantity: 140
+  registration_date: '2026-02-24'
+  brand_name: 다온랩
+- id,link: SR20697
+  title: 자동 급식기
+  status: 판매중
+  category: 반려
+  sale_price: 72200
+  quantity: 4
+  registration_date: '2026-02-01'
+  brand_name: 누리온
+- id,link: SR20738
+  title: USB-C 멀티 허브
+  status: 판매중
+  category: 디지털
+  sale_price: 40400
+  quantity: 140
+  registration_date: '2026-02-12'
+  brand_name: 마루공방

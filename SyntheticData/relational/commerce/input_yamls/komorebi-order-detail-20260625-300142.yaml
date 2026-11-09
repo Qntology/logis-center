@@ -1,0 +1,18 @@
+url: https://komorebi-shop.test/admin/order/view?od_id=20260625-300142
+page_type: order
+layout: detail
+title: 注文詳細
+fields:
+  id,link: 20260625-300142
+  registration_date: '2026-06-25'
+  status: 配達完了
+  goods: アウトドアクッカーセット
+  tracking_number: '222046054191'
+  sender_name: 鈴木 悠真
+  recipient_name: 鈴木 悠真
+  quantity: 6
+  amount: 23060
+  payment_method: クレジットカード
+  sender_phone: 090-3762-8743
+  recipient_address: 〒060-0001 北海道札幌市中央区本町5-12-18
+  recipient_phone: 090-3762-8743

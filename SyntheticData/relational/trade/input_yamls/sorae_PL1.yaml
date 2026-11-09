@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: de
+document_title: Packliste
+metadata:
+  packing_list_number: PL-DE-2606-243
+  issue_date: '2026-06-10'
+  related_invoice_number: CI-DE-2606-904
+  related_po_number: PO-DE-27434
+  related_bl_number: BL-DE33269536
+parties:
+  shipper_exporter:
+    name: Wolkenfeld Haushaltswaren GmbH
+    address: Gutenbergstraße 8, 90461 Nürnberg, Deutschland
+  consignee:
+    name: Sorae Sanghoe Co., Ltd.
+    address: 12 Soraeyeok-ro, Namdong-gu, Incheon, Südkorea
+shipping_details:
+  vessel_flight: ELBSTERN V.207E
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Incheon, Südkorea
+packing_details:
+- item_code: SR20738
+  description: USB-C-Multiport-Hub
+  quantity: 480
+  unit: Stk.
+  packages: 20
+  package_type: Kartons
+  net_weight_kg: 546.9
+  gross_weight_kg: 612.5
+  measurement_cbm: 5.28
+- item_code: SR20123
+  description: Tragbares Kochgeschirr-Set
+  quantity: 120
+  unit: Stk.
+  packages: 5
+  package_type: Kartons
+  net_weight_kg: 127.7
+  gross_weight_kg: 143.0
+  measurement_cbm: 1.32
+summary:
+  total_packages: 25
+  total_net_weight_kg: 674.6
+  total_gross_weight_kg: 755.5
+  total_measurement_cbm: 6.6

@@ -1,0 +1,10 @@
+url: https://copperleaf-goods.test/admin/event/view?ev_id=EV718
+page_type: event
+layout: detail
+title: Campaign
+fields:
+  id,link: EV718
+  title: Summer getaway picks
+  started_at: '2026-06-15'
+  expired_at: '2026-07-12'
+  status: Ended

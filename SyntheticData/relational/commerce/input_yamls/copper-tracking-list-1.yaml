@@ -1,0 +1,125 @@
+url: https://copperleaf-goods.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+title: Shipments
+items:
+- id,link: '288827969776'
+  carrier: Swiftline Parcel
+  status: Delivered
+  title: Rechargeable LED lantern
+  shipping_date: '2026-09-30'
+  recipient_name: Finley Whitfield
+- id,link: '180347964021'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Temperature control kettle
+  shipping_date: '2026-09-19'
+  recipient_name: Taylor Marsh
+- id,link: '406275153226'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Waterproof Bluetooth speaker
+  shipping_date: '2026-09-10'
+  recipient_name: Finley Whitfield
+- id,link: '558752065596'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Microfiber throw blanket
+  shipping_date: '2026-09-03'
+  recipient_name: Taylor Marsh
+- id,link: '728542500826'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Cooling neck band
+  shipping_date: '2026-08-24'
+  recipient_name: Finley Whitfield
+- id,link: '141450883602'
+  carrier: Harbor Courier
+  status: Delivered
+  title: 65W fast charger
+  shipping_date: '2026-08-22'
+  recipient_name: Finley Whitfield
+- id,link: '834193774951'
+  carrier: Swiftline Parcel
+  status: Returned
+  title: Toddler tableware set
+  shipping_date: '2026-08-21'
+  recipient_name: Copperleaf Goods Inc.
+- id,link: '401273632939'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Document file organizer
+  shipping_date: '2026-08-20'
+  recipient_name: Finley Whitfield
+- id,link: '780435405056'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Smart fitness band
+  shipping_date: '2026-08-19'
+  recipient_name: Finley Whitfield
+- id,link: '107511662394'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Toddler tableware set
+  shipping_date: '2026-08-17'
+  recipient_name: Emerson Whitfield
+- id,link: '858283630144'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Noise-cancelling wireless earbuds
+  shipping_date: '2026-08-16'
+  recipient_name: Riley Holloway
+- id,link: '539027061263'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Cooling neck band
+  shipping_date: '2026-08-14'
+  recipient_name: Riley Holloway
+- id,link: '544952251001'
+  carrier: BlueRoute Freight
+  status: Shipped
+  title: Ventilated sandals
+  shipping_date: '2026-08-06'
+  recipient_name: Casey Dorsey
+- id,link: '325494280337'
+  carrier: Swiftline Parcel
+  status: Delivered
+  title: Temperature control kettle
+  shipping_date: '2026-08-05'
+  recipient_name: Harper Marsh
+- id,link: '109152022586'
+  carrier: Harbor Courier
+  status: Shipped
+  title: Noise-cancelling wireless earbuds
+  shipping_date: '2026-08-04'
+  recipient_name: Casey Dorsey
+- id,link: '514498820946'
+  carrier: Swiftline Parcel
+  status: Delivered
+  title: Mineral sunscreen
+  shipping_date: '2026-07-20'
+  recipient_name: Taylor Marsh
+- id,link: '469490076221'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Smart fitness band
+  shipping_date: '2026-07-17'
+  recipient_name: Riley Mercer
+- id,link: '402651896898'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Cooling neck band
+  shipping_date: '2026-07-16'
+  recipient_name: Riley Mercer
+- id,link: '108009013231'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Scorched brown rice crisps
+  shipping_date: '2026-06-30'
+  recipient_name: Finley Marsh
+- id,link: '236960924483'
+  carrier: Pinewood Express
+  status: Shipped
+  title: Cooling neck band
+  shipping_date: '2026-06-27'
+  recipient_name: Taylor Marsh

@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: ja
+document_title: 原産地証明書
+metadata:
+  certificate_number: CO-2026-JP-3862
+  issue_date: '2026-06-09'
+  related_invoice_number: CI-JP-2606-324
+  related_bl_number: BL-JP81652912
+  related_lc_number: LC-JP8788712
+parties:
+  exporter:
+    name: 株式会社ひなた工房
+    address: 大阪府東大阪市高井田元町1-3-9
+  importer_consignee:
+    name: Copperleaf Goods Inc.
+    address: 1220 Larkspur Ave, Boise, ID 83702, アメリカ合衆国
+  issuing_authority:
+    name: 河内国際商工会
+    address: 大阪府東大阪市長堂1-8-37
+transport_details:
+  vessel_flight: MINATO MARU V.118E
+  port_of_loading: 大阪港（日本）
+  port_of_discharge: シアトル港（アメリカ合衆国）
+cargo_details:
+- marks_and_numbers: COPPERLEAF / BOISE / MADE IN JAPAN
+  description_of_goods: ペットキャリーバッグ (CL20738)
+  hs_code: '4201.00'
+  quantity: 240 個
+  gross_weight_kg: 337.5
+  origin_criterion: 日本国内で完全に生産
+- marks_and_numbers: COPPERLEAF / BOISE / MADE IN JAPAN
+  description_of_goods: マイクロファイバーブランケット (CL20246)
+  hs_code: '6110.30'
+  quantity: 480 個
+  gross_weight_kg: 247.7
+  origin_criterion: 日本国内で完全に生産
+declaration:
+  statement: 上記の貨物が日本を原産地とすることを証明する。

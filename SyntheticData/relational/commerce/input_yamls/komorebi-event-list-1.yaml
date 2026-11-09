@@ -1,0 +1,20 @@
+url: https://komorebi-shop.test/admin/event/list?page=1
+page_type: event
+layout: list
+title: キャンペーン一覧
+items:
+- id,link: EV709
+  title: 春のおでかけ特集
+  started_at: '2026-04-06'
+  expired_at: '2026-04-26'
+  status: 終了
+- id,link: EV718
+  title: 夏休み準備セール
+  started_at: '2026-06-15'
+  expired_at: '2026-07-12'
+  status: 終了
+- id,link: EV727
+  title: 実りの秋ギフト特集
+  started_at: '2026-09-01'
+  expired_at: '2026-09-20'
+  status: 終了

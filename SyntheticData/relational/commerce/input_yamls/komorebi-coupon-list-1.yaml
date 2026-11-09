@@ -1,0 +1,37 @@
+url: https://komorebi-shop.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+title: クーポン一覧
+items:
+- id,link: CP5013
+  code: KMWELCOME
+  title: 初回購入ウェルカムクーポン
+  discount: ¥330
+  started_at: '2026-04-01'
+  expired_at: '2026-09-30'
+  status: 終了
+  min_order_amount: 2170
+- id,link: CP5026
+  code: KMSUMMER
+  title: アプリ限定クーポン
+  discount: 15%
+  started_at: '2026-06-15'
+  expired_at: '2026-07-12'
+  status: 終了
+  min_order_amount: 3260
+- id,link: CP5039
+  code: KMAGAIN
+  title: リピーター優待クーポン
+  discount: 10%
+  started_at: '2026-04-01'
+  expired_at: '2026-09-30'
+  status: 終了
+  min_order_amount: 1090
+- id,link: CP5052
+  code: KMHARVEST
+  title: 秋の感謝クーポン
+  discount: ¥540
+  started_at: '2026-09-01'
+  expired_at: '2026-09-20'
+  status: 終了
+  min_order_amount: 4350

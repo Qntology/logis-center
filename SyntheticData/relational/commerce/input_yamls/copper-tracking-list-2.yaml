@@ -1,0 +1,125 @@
+url: https://copperleaf-goods.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+title: Shipments
+items:
+- id,link: '686636227667'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Toddler tableware set
+  shipping_date: '2026-06-27'
+  recipient_name: Taylor Marsh
+- id,link: '395340899714'
+  carrier: Swiftline Parcel
+  status: Delivered
+  title: Low-sugar protein bar
+  shipping_date: '2026-06-24'
+  recipient_name: Taylor Marsh
+- id,link: '758506797873'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: USB-C multiport hub
+  shipping_date: '2026-06-23'
+  recipient_name: Taylor Marsh
+- id,link: '891893069713'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Cooling neck band
+  shipping_date: '2026-06-20'
+  recipient_name: Taylor Marsh
+- id,link: '483050492816'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Microfiber throw blanket
+  shipping_date: '2026-06-20'
+  recipient_name: Riley Mercer
+- id,link: '154285041432'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Scorched brown rice crisps
+  shipping_date: '2026-06-19'
+  recipient_name: Finley Marsh
+- id,link: '589434022142'
+  carrier: Swiftline Parcel
+  status: Delivered
+  title: Scorched brown rice crisps
+  shipping_date: '2026-06-18'
+  recipient_name: Riley Mercer
+- id,link: '283790803806'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Organic granola
+  shipping_date: '2026-06-12'
+  recipient_name: Morgan Whitfield
+- id,link: '305196311798'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Scorched brown rice crisps
+  shipping_date: '2026-06-04'
+  recipient_name: Finley Marsh
+- id,link: '366765045131'
+  carrier: Swiftline Parcel
+  status: Delivered
+  title: Microfiber throw blanket
+  shipping_date: '2026-06-03'
+  recipient_name: Riley Holloway
+- id,link: '787840932298'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Lightweight camp chair
+  shipping_date: '2026-05-30'
+  recipient_name: Taylor Marsh
+- id,link: '575670635323'
+  carrier: Harbor Courier
+  status: Delivered
+  title: Waterproof Bluetooth speaker
+  shipping_date: '2026-05-18'
+  recipient_name: Riley Holloway
+- id,link: '442518133417'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Document file organizer
+  shipping_date: '2026-05-05'
+  recipient_name: Harper Marsh
+- id,link: '348534771627'
+  carrier: Harbor Courier
+  status: Delivered
+  title: USB-C multiport hub
+  shipping_date: '2026-05-05'
+  recipient_name: Finley Whitfield
+- id,link: '928959638358'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Cooling neck band
+  shipping_date: '2026-05-02'
+  recipient_name: Harper Marsh
+- id,link: '286830169143'
+  carrier: Harbor Courier
+  status: Returned
+  title: USB-C multiport hub
+  shipping_date: '2026-04-23'
+  recipient_name: Copperleaf Goods Inc.
+- id,link: '436626658419'
+  carrier: BlueRoute Freight
+  status: Delivered
+  title: Document file organizer
+  shipping_date: '2026-04-16'
+  recipient_name: Finley Marsh
+- id,link: '993186552339'
+  carrier: Harbor Courier
+  status: Delivered
+  title: USB-C multiport hub
+  shipping_date: '2026-04-15'
+  recipient_name: Riley Mercer
+- id,link: '338271627007'
+  carrier: Pinewood Express
+  status: Delivered
+  title: Low-sugar protein bar
+  shipping_date: '2026-04-14'
+  recipient_name: Finley Marsh
+- id,link: '557212768904'
+  carrier: Harbor Courier
+  status: Shipped
+  title: Low-sugar protein bar
+  shipping_date: '2026-04-04'
+  recipient_name: Harper Mercer

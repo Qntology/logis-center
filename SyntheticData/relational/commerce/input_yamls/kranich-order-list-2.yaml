@@ -1,0 +1,164 @@
+url: https://kranichhof-markt.test/admin/order/list?page=2
+page_type: order
+layout: list
+title: Bestellungen
+items:
+- id,link: 20260708-301420
+  registration_date: '2026-07-08'
+  status: Zugestellt
+  goods: Parfümfreie Bodylotion
+  tracking_number: '238325447762'
+  sender_name: Leon Schulz
+  recipient_name: Leon Schulz
+  quantity: 1
+  amount: 14.35
+  payment_method: Überweisung
+- id,link: 20260705-300355
+  registration_date: '2026-07-05'
+  status: Zugestellt
+  goods: UV-Schutz-Sonnenschirm
+  tracking_number: '790538082982'
+  sender_name: Clara Keller
+  recipient_name: Clara Keller
+  quantity: 1
+  amount: 19.95
+  payment_method: Kreditkarte
+- id,link: 20260705-301491
+  registration_date: '2026-07-05'
+  status: Zugestellt
+  goods: Laptopständer
+  tracking_number: '822493770810'
+  sender_name: Leon Schulz
+  recipient_name: Leon Schulz
+  quantity: 3
+  amount: 59.04
+  payment_method: Kreditkarte
+- id,link: 20260705-302130
+  registration_date: '2026-07-05'
+  status: Zugestellt
+  goods: Luftige Sandalen
+  tracking_number: '154665774109'
+  sender_name: Felix Wagner
+  recipient_name: Felix Wagner
+  quantity: 3
+  amount: 54.57
+  payment_method: Digitale Geldbörse
+- id,link: 20260703-300710
+  registration_date: '2026-07-03'
+  status: Zugestellt
+  goods: Jeju-Mandarinensaft
+  tracking_number: '562244173367'
+  sender_name: Jonas Schneider
+  recipient_name: Felix Wagner
+  quantity: 4
+  amount: 66.2
+  payment_method: Kreditkarte
+- id,link: 20260701-301917
+  registration_date: '2026-07-01'
+  status: Zugestellt
+  goods: Luftige Sandalen
+  tracking_number: '517564587471'
+  sender_name: Leon Schulz
+  recipient_name: Leon Schulz
+  quantity: 2
+  amount: 36.38
+  payment_method: Kreditkarte
+- id,link: 20260620-302059
+  registration_date: '2026-06-20'
+  status: Zugestellt
+  goods: Luftige Sandalen
+  tracking_number: '892595461976'
+  sender_name: Felix Wagner
+  recipient_name: Jonas Wagner
+  quantity: 1
+  amount: 23.45
+  payment_method: Digitale Geldbörse
+- id,link: 20260614-300923
+  registration_date: '2026-06-14'
+  status: Zugestellt
+  goods: Jeju-Mandarinensaft
+  tracking_number: '725379839017'
+  sender_name: Leon Keller
+  recipient_name: Leon Keller
+  quantity: 5
+  amount: 76.65
+  payment_method: Kreditkarte
+- id,link: 20260606-301278
+  registration_date: '2026-06-06'
+  status: Zugestellt
+  goods: Geröstete Naturreis-Chips
+  tracking_number: '772563756671'
+  sender_name: Leon Schulz
+  recipient_name: Sophie Braun
+  quantity: 1
+  amount: 9.5
+  payment_method: Überweisung
+- id,link: 20260606-301704
+  registration_date: '2026-06-06'
+  status: Zugestellt
+  goods: Silikon-Küchenhelfer-Set
+  tracking_number: '563338095060'
+  sender_name: Felix Neumann
+  recipient_name: Clara Keller
+  quantity: 3
+  amount: 55.25
+  payment_method: Digitale Geldbörse
+- id,link: 20260605-301207
+  registration_date: '2026-06-05'
+  status: Zugestellt
+  goods: Parfümfreie Bodylotion
+  tracking_number: '390213389205'
+  sender_name: Jonas Wagner
+  recipient_name: Clara Keller
+  quantity: 4
+  amount: 47.5
+  payment_method: Kreditkarte
+- id,link: 20260529-301633
+  registration_date: '2026-05-29'
+  status: Zurückgesendet
+  goods: Geröstete Naturreis-Chips
+  tracking_number: '813911883497'
+  sender_name: Sophie Braun
+  recipient_name: Sophie Braun
+  quantity: 3
+  amount: 24.4
+  payment_method: Kreditkarte
+- id,link: 20260520-302272
+  registration_date: '2026-05-20'
+  status: Zugestellt
+  goods: Parfümfreie Bodylotion
+  tracking_number: '902772346501'
+  sender_name: Clara Schulz
+  recipient_name: Lukas Becker
+  quantity: 3
+  amount: 62.95
+  payment_method: Kreditkarte
+- id,link: 20260505-300497
+  registration_date: '2026-05-05'
+  status: Zugestellt
+  goods: Proteinriegel mit wenig Zucker
+  tracking_number: '553009309008'
+  sender_name: Lukas Becker
+  recipient_name: Lukas Becker
+  quantity: 3
+  amount: 70.8
+  payment_method: Kreditkarte
+- id,link: 20260504-300142
+  registration_date: '2026-05-04'
+  status: Storniert
+  goods: Jeju-Mandarinensaft
+  sender_name: Lukas Becker
+  recipient_name: Lukas Becker
+  quantity: 4
+  amount: 52.05
+  payment_method: Kreditkarte
+- id,link: 20260501-300852
+  registration_date: '2026-05-01'
+  status: Zugestellt
+  goods: Kabelbox
+  tracking_number: '927326044614'
+  sender_name: Felix Wagner
+  recipient_name: Felix Wagner
+  quantity: 2
+  amount: 24.55
+  payment_method: Überweisung

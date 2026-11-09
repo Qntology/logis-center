@@ -1,0 +1,18 @@
+url: https://sorae-market.test/admin/order/view?od_id=20260712-300497
+page_type: order
+layout: detail
+title: 주문 상세내역
+fields:
+  id,link: 20260712-300497
+  registration_date: '2026-07-12'
+  status: 배송완료
+  goods: 제주 감귤 주스
+  tracking_number: '371942377068'
+  sender_name: 이예준
+  recipient_name: 이예준
+  quantity: 2
+  amount: 52280
+  payment_method: Digital wallet
+  sender_phone: 010-4344-6030
+  recipient_address: 경기도 고양시 일산동구 중앙로 416 14층
+  recipient_phone: 010-4344-6030

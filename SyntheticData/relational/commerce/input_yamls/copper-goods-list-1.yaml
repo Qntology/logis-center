@@ -1,0 +1,149 @@
+url: https://copperleaf-goods.test/admin/goods/list?page=1
+page_type: goods
+layout: list
+title: Products
+items:
+- id,link: CL20041
+  title: Lightweight camp chair
+  status: Active
+  category: Outdoor
+  sale_price: 26.45
+  quantity: 25
+  registration_date: '2026-01-17'
+  brand_name: 다온랩
+- id,link: CL20082
+  title: Cooling neck band
+  status: Active
+  category: Home
+  sale_price: 9.6
+  quantity: 140
+  registration_date: '2026-03-19'
+  brand_name: 버들
+- id,link: CL20123
+  title: 65W fast charger
+  status: Active
+  category: Electronics
+  sale_price: 26.6
+  quantity: 4
+  registration_date: '2026-01-22'
+  brand_name: 누리온
+- id,link: CL20164
+  title: Noise-cancelling wireless earbuds
+  status: Active
+  category: Electronics
+  sale_price: 92.4
+  quantity: 25
+  registration_date: '2026-03-19'
+  brand_name: Tidewell
+- id,link: CL20205
+  title: USB-C multiport hub
+  status: Sold out
+  category: Electronics
+  sale_price: 27.25
+  quantity: 0
+  registration_date: '2026-02-24'
+  brand_name: Kestrel Lane
+- id,link: CL20246
+  title: Microfiber throw blanket
+  status: Active
+  category: Home
+  sale_price: 18.1
+  quantity: 60
+  registration_date: '2026-02-11'
+  brand_name: 마루공방
+- id,link: CL20287
+  title: Ventilated sandals
+  status: Sold out
+  category: Apparel
+  sale_price: 27.25
+  quantity: 0
+  registration_date: '2026-02-03'
+  brand_name: Marlow & Finch
+- id,link: CL20328
+  title: Temperature control kettle
+  status: Active
+  category: Appliances
+  sale_price: 40.6
+  quantity: 60
+  registration_date: '2026-02-28'
+  brand_name: Tidewell
+- id,link: CL20369
+  title: Document file organizer
+  status: Sold out
+  category: Office
+  sale_price: 10.55
+  quantity: 0
+  registration_date: '2026-01-30'
+  brand_name: 다온랩
+- id,link: CL20410
+  title: Low-sugar protein bar
+  status: Active
+  category: Grocery
+  sale_price: 17.15
+  quantity: 140
+  registration_date: '2026-03-08'
+  brand_name: 하람
+- id,link: CL20451
+  title: Toddler tableware set
+  status: Active
+  category: Baby
+  sale_price: 21.9
+  quantity: 140
+  registration_date: '2026-01-20'
+  brand_name: 하람
+- id,link: CL20492
+  title: Organic granola
+  status: Active
+  category: Grocery
+  sale_price: 11.4
+  quantity: 60
+  registration_date: '2026-02-12'
+  brand_name: Kestrel Lane
+- id,link: CL20533
+  title: Scorched brown rice crisps
+  status: Active
+  category: Grocery
+  sale_price: 9.25
+  quantity: 4
+  registration_date: '2026-01-20'
+  brand_name: 하람
+- id,link: CL20574
+  title: Rechargeable LED lantern
+  status: Active
+  category: Outdoor
+  sale_price: 22.55
+  quantity: 9
+  registration_date: '2026-03-10'
+  brand_name: 버들
+- id,link: CL20615
+  title: Smart fitness band
+  status: Sold out
+  category: Electronics
+  sale_price: 37.3
+  quantity: 0
+  registration_date: '2026-02-28'
+  brand_name: Oakfern
+- id,link: CL20656
+  title: Waterproof Bluetooth speaker
+  status: Active
+  category: Electronics
+  sale_price: 44.85
+  quantity: 4
+  registration_date: '2026-03-09'
+  brand_name: 하람
+- id,link: CL20697
+  title: Mineral sunscreen
+  status: Active
+  category: Beauty
+  sale_price: 18.6
+  quantity: 4
+  registration_date: '2026-01-25'
+  brand_name: Oakfern
+- id,link: CL20738
+  title: Pet travel carrier
+  status: Active
+  category: Pets
+  sale_price: 37.9
+  quantity: 60
+  registration_date: '2026-03-07'
+  brand_name: 버들

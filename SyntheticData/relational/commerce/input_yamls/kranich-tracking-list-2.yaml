@@ -1,0 +1,95 @@
+url: https://kranichhof-markt.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+title: Sendungen
+items:
+- id,link: '154665774109'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: Luftige Sandalen
+  shipping_date: '2026-07-06'
+  recipient_name: Felix Wagner
+- id,link: '562244173367'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: Jeju-Mandarinensaft
+  shipping_date: '2026-07-04'
+  recipient_name: Felix Wagner
+- id,link: '517564587471'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: Luftige Sandalen
+  shipping_date: '2026-07-02'
+  recipient_name: Leon Schulz
+- id,link: '892595461976'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Luftige Sandalen
+  shipping_date: '2026-06-21'
+  recipient_name: Jonas Wagner
+- id,link: '725379839017'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Jeju-Mandarinensaft
+  shipping_date: '2026-06-15'
+  recipient_name: Leon Keller
+- id,link: '437328128257'
+  carrier: Nordkurier Logistik
+  status: Zugestellt
+  title: Kabelbox
+  shipping_date: '2026-06-08'
+  recipient_name: Clara Keller
+- id,link: '772563756671'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Geröstete Naturreis-Chips
+  shipping_date: '2026-06-08'
+  recipient_name: Sophie Braun
+- id,link: '563338095060'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Silikon-Küchenhelfer-Set
+  shipping_date: '2026-06-07'
+  recipient_name: Clara Keller
+- id,link: '390213389205'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Parfümfreie Bodylotion
+  shipping_date: '2026-06-06'
+  recipient_name: Clara Keller
+- id,link: '633210389628'
+  carrier: Kiefernexpress
+  status: Zurückgesendet
+  title: Geröstete Naturreis-Chips
+  shipping_date: '2026-06-04'
+  recipient_name: Kranichhof Handels GmbH
+- id,link: '813911883497'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Geröstete Naturreis-Chips
+  shipping_date: '2026-05-30'
+  recipient_name: Sophie Braun
+- id,link: '902772346501'
+  carrier: Kiefernexpress
+  status: Zugestellt
+  title: Parfümfreie Bodylotion
+  shipping_date: '2026-05-21'
+  recipient_name: Lukas Becker
+- id,link: '238470016017'
+  carrier: Blitzpaket
+  status: Zugestellt
+  title: USB-C-Multiport-Hub
+  shipping_date: '2026-05-09'
+  recipient_name: Lukas Becker
+- id,link: '553009309008'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Proteinriegel mit wenig Zucker
+  shipping_date: '2026-05-06'
+  recipient_name: Lukas Becker
+- id,link: '927326044614'
+  carrier: Rheinfracht
+  status: Zugestellt
+  title: Kabelbox
+  shipping_date: '2026-05-02'
+  recipient_name: Felix Wagner

@@ -1,0 +1,149 @@
+url: https://kranichhof-markt.test/admin/goods/list?page=1
+page_type: goods
+layout: list
+title: Produkte
+items:
+- id,link: KR20041
+  title: Holzbausteine
+  status: Aktiv
+  category: Spielwaren
+  sale_price: 24.95
+  quantity: 25
+  registration_date: '2026-01-23'
+  brand_name: 마루공방
+- id,link: KR20082
+  title: Kühlendes Nackenband
+  status: Aktiv
+  category: Wohnen
+  sale_price: 7.95
+  quantity: 4
+  registration_date: '2026-01-10'
+  brand_name: 하람
+- id,link: KR20123
+  title: Aufladbarer Handwärmer
+  status: Ausverkauft
+  category: Wohnen
+  sale_price: 14.35
+  quantity: 0
+  registration_date: '2026-01-26'
+  brand_name: 버들
+- id,link: KR20164
+  title: Proteinriegel mit wenig Zucker
+  status: Aktiv
+  category: Lebensmittel
+  sale_price: 16.6
+  quantity: 25
+  registration_date: '2026-02-22'
+  brand_name: 다온랩
+- id,link: KR20205
+  title: Mineralische Sonnencreme
+  status: Ausverkauft
+  category: Kosmetik
+  sale_price: 16.95
+  quantity: 0
+  registration_date: '2026-01-19'
+  brand_name: Oakfern
+- id,link: KR20246
+  title: Silikon-Küchenhelfer-Set
+  status: Aktiv
+  category: Küche
+  sale_price: 19.1
+  quantity: 4
+  registration_date: '2026-03-05'
+  brand_name: 마루공방
+- id,link: KR20287
+  title: Mini-Handventilator
+  status: Aktiv
+  category: Haushaltsgeräte
+  sale_price: 14.4
+  quantity: 25
+  registration_date: '2026-03-17'
+  brand_name: 마루공방
+- id,link: KR20328
+  title: Luftige Sandalen
+  status: Aktiv
+  category: Bekleidung
+  sale_price: 21.4
+  quantity: 25
+  registration_date: '2026-02-11'
+  brand_name: 마루공방
+- id,link: KR20369
+  title: Parfümfreie Bodylotion
+  status: Aktiv
+  category: Kosmetik
+  sale_price: 12.3
+  quantity: 4
+  registration_date: '2026-03-20'
+  brand_name: Marlow & Finch
+- id,link: KR20410
+  title: Transporttasche für Haustiere
+  status: Aktiv
+  category: Haustiere
+  sale_price: 31.65
+  quantity: 60
+  registration_date: '2026-03-20'
+  brand_name: 다온랩
+- id,link: KR20451
+  title: USB-C-Multiport-Hub
+  status: Aktiv
+  category: Elektronik
+  sale_price: 27.1
+  quantity: 25
+  registration_date: '2026-03-07'
+  brand_name: 버들
+- id,link: KR20492
+  title: Plüsch-Hausschuhe
+  status: Ausverkauft
+  category: Wohnen
+  sale_price: 12.4
+  quantity: 0
+  registration_date: '2026-02-21'
+  brand_name: Marlow & Finch
+- id,link: KR20533
+  title: Laptopständer
+  status: Aktiv
+  category: Büro
+  sale_price: 23.15
+  quantity: 60
+  registration_date: '2026-02-18'
+  brand_name: Tidewell
+- id,link: KR20574
+  title: Reparierende Haaressenz
+  status: Aktiv
+  category: Kosmetik
+  sale_price: 12.9
+  quantity: 25
+  registration_date: '2026-01-25'
+  brand_name: Tidewell
+- id,link: KR20615
+  title: Kabelbox
+  status: Aktiv
+  category: Büro
+  sale_price: 10.6
+  quantity: 140
+  registration_date: '2026-02-23'
+  brand_name: 누리온
+- id,link: KR20656
+  title: Jeju-Mandarinensaft
+  status: Aktiv
+  category: Lebensmittel
+  sale_price: 11.7
+  quantity: 25
+  registration_date: '2026-02-11'
+  brand_name: 하람
+- id,link: KR20697
+  title: UV-Schutz-Sonnenschirm
+  status: Ausverkauft
+  category: Wohnen
+  sale_price: 21.05
+  quantity: 0
+  registration_date: '2026-02-13'
+  brand_name: Kestrel Lane
+- id,link: KR20738
+  title: Geröstete Naturreis-Chips
+  status: Ausverkauft
+  category: Lebensmittel
+  sale_price: 7.45
+  quantity: 0
+  registration_date: '2026-01-17'
+  brand_name: 마루공방

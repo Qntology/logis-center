@@ -1,0 +1,18 @@
+url: https://sorae-market.test/admin/order/view?od_id=20260527-301136
+page_type: order
+layout: detail
+title: 주문 상세내역
+fields:
+  id,link: 20260527-301136
+  registration_date: '2026-05-27'
+  status: 배송완료
+  goods: 대용량 보조배터리
+  tracking_number: '215260019995'
+  sender_name: 이예준
+  recipient_name: 이예준
+  quantity: 2
+  amount: 79800
+  payment_method: Credit card
+  sender_phone: 010-4344-6030
+  recipient_address: 경기도 고양시 일산동구 중앙로 416 14층
+  recipient_phone: 010-4344-6030

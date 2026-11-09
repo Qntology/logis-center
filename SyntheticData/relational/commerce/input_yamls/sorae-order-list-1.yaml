@@ -1,0 +1,165 @@
+url: https://sorae-market.test/admin/order/list?page=1
+page_type: order
+layout: list
+title: 주문내역 관리
+items:
+- id,link: 20260925-302130
+  registration_date: '2026-09-25'
+  status: 배송완료
+  goods: 접이식 등산 스틱
+  tracking_number: '331773862277'
+  sender_name: 오예준
+  recipient_name: 오예준
+  quantity: 3
+  amount: 147690
+  payment_method: Credit card
+- id,link: 20260924-301065
+  registration_date: '2026-09-24'
+  status: 반품
+  goods: 코딩 로봇 키트
+  tracking_number: '811767621722'
+  sender_name: 이예준
+  recipient_name: 오예준
+  quantity: 2
+  amount: 144300
+  payment_method: Wire transfer
+- id,link: 20260913-300284
+  registration_date: '2026-09-13'
+  status: 배송완료
+  goods: 기모 후드집업
+  tracking_number: '894203509348'
+  sender_name: 장소율
+  recipient_name: 장소율
+  quantity: 1
+  amount: 44600
+  payment_method: Credit card
+- id,link: 20260909-302272
+  registration_date: '2026-09-09'
+  status: 반품
+  goods: 유기농 그래놀라
+  tracking_number: '833617099233'
+  sender_name: 오예준
+  recipient_name: 오예준
+  quantity: 7
+  amount: 212400
+  payment_method: Credit card
+- id,link: 20260830-300639
+  registration_date: '2026-08-30'
+  status: 배송완료
+  goods: 휴대용 코펠 세트
+  tracking_number: '410955983584'
+  sender_name: 이민준
+  recipient_name: 이민준
+  quantity: 3
+  amount: 102800
+  payment_method: Wire transfer
+- id,link: 20260814-300213
+  registration_date: '2026-08-14'
+  status: 배송완료
+  goods: 콜드브루 원액
+  tracking_number: '485162401511'
+  sender_name: 윤도윤
+  recipient_name: 윤도윤
+  quantity: 1
+  amount: 18800
+  payment_method: Digital wallet
+- id,link: 20260730-300994
+  registration_date: '2026-07-30'
+  status: 반품
+  goods: USB-C 멀티 허브
+  tracking_number: '442847822607'
+  sender_name: 장소율
+  recipient_name: 장소율
+  quantity: 3
+  amount: 127300
+  payment_method: Digital wallet
+- id,link: 20260728-301988
+  registration_date: '2026-07-28'
+  status: 배송완료
+  goods: 진공 보온 텀블러
+  tracking_number: '288733669283'
+  sender_name: 이예준
+  recipient_name: 이예준
+  quantity: 3
+  amount: 151800
+  payment_method: Credit card
+- id,link: 20260723-301207
+  registration_date: '2026-07-23'
+  status: 배송완료
+  goods: 리넨 반팔 셔츠
+  tracking_number: '367886162031'
+  sender_name: 장소율
+  recipient_name: 장소율
+  quantity: 1
+  amount: 48500
+  payment_method: Digital wallet
+- id,link: 20260716-300781
+  registration_date: '2026-07-16'
+  status: 배송중
+  goods: 어린이 킥보드
+  tracking_number: '251492071895'
+  sender_name: 강수아
+  recipient_name: 강수아
+  quantity: 2
+  amount: 124600
+  payment_method: Credit card
+- id,link: 20260715-302201
+  registration_date: '2026-07-15'
+  status: 배송완료
+  goods: 밀폐 유리 용기 세트
+  tracking_number: '730047318147'
+  sender_name: 오예준
+  recipient_name: 최다은
+  quantity: 4
+  amount: 158600
+  payment_method: Digital wallet
+- id,link: 20260714-301349
+  registration_date: '2026-07-14'
+  status: 배송완료
+  goods: 방수 블루투스 스피커
+  tracking_number: '462611318214'
+  sender_name: 윤도윤
+  recipient_name: 윤도윤
+  quantity: 2
+  amount: 103200
+  payment_method: Credit card
+- id,link: 20260712-300568
+  registration_date: '2026-07-12'
+  status: 배송완료
+  goods: 접이식 등산 스틱
+  tracking_number: '514821246185'
+  sender_name: 이예준
+  recipient_name: 이예준
+  quantity: 6
+  amount: 232050
+  payment_method: Credit card
+- id,link: 20260712-300497
+  registration_date: '2026-07-12'
+  status: 배송완료
+  goods: 제주 감귤 주스
+  tracking_number: '371942377068'
+  sender_name: 이예준
+  recipient_name: 이예준
+  quantity: 2
+  amount: 52280
+  payment_method: Digital wallet
+- id,link: 20260709-302059
+  registration_date: '2026-07-09'
+  status: 배송완료
+  goods: 코딩 로봇 키트
+  tracking_number: '871115069410'
+  sender_name: 강수아
+  recipient_name: 이예준
+  quantity: 5
+  amount: 229500
+  payment_method: Digital wallet
+- id,link: 20260702-301846
+  registration_date: '2026-07-02'
+  status: 배송완료
+  goods: 접이식 등산 스틱
+  tracking_number: '186621467425'
+  sender_name: 박현우
+  recipient_name: 박현우
+  quantity: 3
+  amount: 149800
+  payment_method: Wire transfer

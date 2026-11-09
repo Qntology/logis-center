@@ -1,0 +1,75 @@
+url: https://sorae-market.test/admin/review/list?page=1
+page_type: review
+layout: list
+title: 상품후기 관리
+items:
+- id,link: RV8100
+  status: 승인
+  title: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+  name: 윤도윤
+  registration_date: '2026-05-02'
+- id,link: RV8117
+  status: 승인
+  title: 포장이 꼼꼼했고 가벼워서 괜찮습니다.
+  name: 박현우
+  registration_date: '2026-05-24'
+- id,link: RV8134
+  status: 승인
+  title: 두 번째 구매인데 역시 마감이 좋아서 좋네요.
+  name: 장소율
+  registration_date: '2026-06-17'
+- id,link: RV8151
+  status: 승인
+  title: 두 번째 구매인데 역시 가벼워서 좋네요.
+  name: 이예준
+  registration_date: '2026-06-23'
+- id,link: RV8168
+  status: 승인
+  title: 포장이 꼼꼼했고 마감이 좋아서 괜찮습니다.
+  name: 박현우
+  registration_date: '2026-07-09'
+- id,link: RV8185
+  status: 승인
+  title: 금방 고장 났어요.
+  name: 이예준
+  registration_date: '2026-07-20'
+- id,link: RV8202
+  status: 대기중
+  title: 배송 중에 파손되어 실망했습니다.
+  name: 이예준
+  registration_date: '2026-07-23'
+- id,link: RV8219
+  status: 승인
+  title: 금방 고장 났어요.
+  name: 이예준
+  registration_date: '2026-08-04'
+- id,link: RV8236
+  status: 승인
+  title: 설명과 달라서 반품했습니다.
+  name: 장소율
+  registration_date: '2026-08-05'
+- id,link: RV8253
+  status: 승인
+  title: 생각보다 가벼워서 만족합니다.
+  name: 이민준
+  registration_date: '2026-09-04'
+- id,link: RV8270
+  status: 승인
+  title: 금방 고장 났어요.
+  name: 오예준
+  registration_date: '2026-09-21'
+- id,link: RV8287
+  status: 승인
+  title: 포장이 꼼꼼했고 색이 예뻐서 괜찮습니다.
+  name: 장소율
+  registration_date: '2026-09-23'
+- id,link: RV8304
+  status: 승인
+  title: 설명과 달라서 반품했습니다.
+  name: 이예준
+  registration_date: '2026-10-02'
+- id,link: RV8321
+  status: 승인
+  title: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+  name: 오예준
+  registration_date: '2026-10-05'

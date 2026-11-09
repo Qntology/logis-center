@@ -1,0 +1,107 @@
+url: https://komorebi-shop.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+title: 出荷一覧
+items:
+- id,link: '136921732942'
+  carrier: さくら便
+  status: 返品
+  title: USB-Cマルチポートハブ
+  shipping_date: '2026-09-30'
+  recipient_name: 株式会社こもれび
+- id,link: '473951648970'
+  carrier: さくら便
+  status: 配達完了
+  title: もこもこルームシューズ
+  shipping_date: '2026-09-30'
+  recipient_name: 中村 湊
+- id,link: '560784441306'
+  carrier: はやぶさ運輸
+  status: 配達完了
+  title: 木製積み木
+  shipping_date: '2026-09-23'
+  recipient_name: 加藤 芽依
+- id,link: '564760769854'
+  carrier: つばめ配送
+  status: 配達完了
+  title: 木製積み木
+  shipping_date: '2026-09-23'
+  recipient_name: 小林 芽依
+- id,link: '472339038575'
+  carrier: さくら便
+  status: 配達完了
+  title: もこもこルームシューズ
+  shipping_date: '2026-09-23'
+  recipient_name: 小林 大翔
+- id,link: '499768577109'
+  carrier: みなと急便
+  status: 配達完了
+  title: シリコン調理器具セット
+  shipping_date: '2026-09-22'
+  recipient_name: 山本 蓮
+- id,link: '609768533584'
+  carrier: みなと急便
+  status: 配達完了
+  title: 防水Bluetoothスピーカー
+  shipping_date: '2026-09-21'
+  recipient_name: 渡辺 大翔
+- id,link: '509952105774'
+  carrier: みなと急便
+  status: 配達完了
+  title: USB-Cマルチポートハブ
+  shipping_date: '2026-09-21'
+  recipient_name: 加藤 芽依
+- id,link: '753168486774'
+  carrier: みなと急便
+  status: 配達完了
+  title: 子ども用食器セット
+  shipping_date: '2026-09-19'
+  recipient_name: 渡辺 湊
+- id,link: '178350404767'
+  carrier: みなと急便
+  status: 配達完了
+  title: スマートフィットネスバンド
+  shipping_date: '2026-09-12'
+  recipient_name: 加藤 芽依
+- id,link: '462221939905'
+  carrier: はやぶさ運輸
+  status: 配達完了
+  title: スマートフィットネスバンド
+  shipping_date: '2026-08-14'
+  recipient_name: 渡辺 湊
+- id,link: '340530575553'
+  carrier: みなと急便
+  status: 発送済み
+  title: アウトドアクッカーセット
+  shipping_date: '2026-08-13'
+  recipient_name: 加藤 芽依
+- id,link: '124349929967'
+  carrier: つばめ配送
+  status: 配達完了
+  title: セラミック包丁
+  shipping_date: '2026-08-07'
+  recipient_name: 鈴木 悠真
+- id,link: '517705177615'
+  carrier: みなと急便
+  status: 配達完了
+  title: ケーブル収納ボックス
+  shipping_date: '2026-08-05'
+  recipient_name: 鈴木 悠真
+- id,link: '521193411386'
+  carrier: つばめ配送
+  status: 配達完了
+  title: 温度調節電気ケトル
+  shipping_date: '2026-07-26'
+  recipient_name: 山本 蓮
+- id,link: '848739929093'
+  carrier: つばめ配送
+  status: 配達完了
+  title: シリコン調理器具セット
+  shipping_date: '2026-07-08'
+  recipient_name: 渡辺 大翔
+- id,link: '389984867208'
+  carrier: はやぶさ運輸
+  status: 配達完了
+  title: 温度調節電気ケトル
+  shipping_date: '2026-07-06'
+  recipient_name: 渡辺 湊

@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: ja
+document_title: 船荷証券
+metadata:
+  bl_number: BL-JP81652912
+  issue_date: '2026-06-10'
+  related_invoice_number: CI-JP-2606-324
+  related_po_number: PO-JP-62173
+  related_lc_number: LC-JP8788712
+  freight_term: 運賃前払い
+parties:
+  shipper:
+    name: 株式会社ひなた工房
+    address: 大阪府東大阪市高井田元町1-3-9
+  consignee:
+    name: Copperleaf Goods Inc.
+    address: 1220 Larkspur Ave, Boise, ID 83702, アメリカ合衆国
+  notify_party:
+    name: Copperleaf Goods Inc.
+    address: 1220 Larkspur Ave, Boise, ID 83702, アメリカ合衆国
+  carrier:
+    name: みなと汽船株式会社
+shipping_details:
+  vessel_flight: MINATO MARU V.118E
+  port_of_loading: 大阪港（日本）
+  port_of_discharge: シアトル港（アメリカ合衆国）
+  place_of_receipt: 東大阪（日本）
+  place_of_delivery: ボイシ（アメリカ合衆国）
+cargo_details:
+  container_number: MNTU1195598
+  seal_number: SL532740
+  marks_and_numbers: COPPERLEAF / BOISE / MADE IN JAPAN
+  number_of_packages: 30カートン
+  description_of_goods: ペットキャリーバッグ / マイクロファイバーブランケット
+  gross_weight_kg: 585.2
+  measurement_cbm: 7.92

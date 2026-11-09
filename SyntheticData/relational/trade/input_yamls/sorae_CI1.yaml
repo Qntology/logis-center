@@ -1,0 +1,48 @@
+document_type: Commercial Invoice
+document_code: CI
+language: de
+document_title: Handelsrechnung
+metadata:
+  invoice_number: CI-DE-2606-904
+  issue_date: '2026-06-10'
+  reference_po_number: PO-DE-27434
+  related_bl_number: BL-DE33269536
+  related_lc_number: LC-DE7472990
+  currency: EUR
+parties:
+  shipper_exporter:
+    name: Wolkenfeld Haushaltswaren GmbH
+    address: Gutenbergstraße 8, 90461 Nürnberg, Deutschland
+    contact_number: +49 911 555 0126
+    tax_id: DE 314 552 087
+  consignee:
+    name: Sorae Sanghoe Co., Ltd.
+    address: 12 Soraeyeok-ro, Namdong-gu, Incheon, Südkorea
+    contact_number: +82 32 555 0412
+    tax_id: 131-86-40912
+shipping_details:
+  vessel_flight: ELBSTERN V.207E
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Incheon, Südkorea
+  incoterms: FOB Hamburg
+line_items:
+- item_code: SR20738
+  description: USB-C-Multiport-Hub
+  quantity: 480
+  unit: Stk.
+  unit_price: 10.72
+  total_amount: 5145.6
+  hs_code: '8518.30'
+- item_code: SR20123
+  description: Tragbares Kochgeschirr-Set
+  quantity: 120
+  unit: Stk.
+  unit_price: 11.88
+  total_amount: 1425.6
+  hs_code: '6306.22'
+summary:
+  total_quantity: 600
+  total_items_amount: 6571.2
+  freight_charge: 0.0
+  insurance: 0.0
+  grand_total_amount: 6571.2

@@ -1,0 +1,45 @@
+document_type: Packing List
+document_code: PL
+language: en
+document_title: Packing List
+metadata:
+  packing_list_number: PL-GB-2606-408
+  issue_date: '2026-06-08'
+  related_invoice_number: CI-GB-2606-899
+  related_po_number: PO-GB-92895
+  related_bl_number: BL-GB13666752
+parties:
+  shipper_exporter:
+    name: Bramblewood Outfitters Ltd.
+    address: 14 Wharf Road, Felixstowe IP11 3AB, United Kingdom
+  consignee:
+    name: Kranichhof Handels GmbH
+    address: Lindenallee 21, 04109 Leipzig, Germany
+shipping_details:
+  vessel_flight: NORTHBRIDGE TRADER V.55E
+  port_of_loading: Felixstowe, United Kingdom
+  port_of_discharge: Hamburg, Germany
+packing_details:
+- item_code: KR20287
+  description: Handheld mini fan
+  quantity: 480
+  unit: pcs
+  packages: 20
+  package_type: cartons
+  net_weight_kg: 760.6
+  gross_weight_kg: 851.9
+  measurement_cbm: 5.28
+- item_code: KR20492
+  description: Plush house slippers
+  quantity: 240
+  unit: pcs
+  packages: 10
+  package_type: cartons
+  net_weight_kg: 214.2
+  gross_weight_kg: 239.9
+  measurement_cbm: 2.64
+summary:
+  total_packages: 30
+  total_net_weight_kg: 974.8
+  total_gross_weight_kg: 1091.8
+  total_measurement_cbm: 7.92

@@ -1,0 +1,18 @@
+url: https://copperleaf-goods.test/admin/order/view?od_id=20260617-300284
+page_type: order
+layout: detail
+title: Order details
+fields:
+  id,link: 20260617-300284
+  registration_date: '2026-06-17'
+  status: Delivered
+  goods: Scorched brown rice crisps
+  tracking_number: '589434022142'
+  sender_name: Riley Mercer
+  recipient_name: Riley Mercer
+  quantity: 3
+  amount: 33.41
+  payment_method: Credit card
+  sender_phone: +1-309-555-0112
+  recipient_address: 6984 Cedar Ln, Portland, OR 97205
+  recipient_phone: +1-309-555-0112

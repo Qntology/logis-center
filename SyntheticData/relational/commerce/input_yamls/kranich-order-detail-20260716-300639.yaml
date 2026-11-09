@@ -1,0 +1,18 @@
+url: https://kranichhof-markt.test/admin/order/view?od_id=20260716-300639
+page_type: order
+layout: detail
+title: Bestelldetails
+fields:
+  id,link: 20260716-300639
+  registration_date: '2026-07-16'
+  status: Zugestellt
+  goods: USB-C-Multiport-Hub
+  tracking_number: '613745374932'
+  sender_name: Lukas Wolf
+  recipient_name: Lukas Wolf
+  quantity: 2
+  amount: 35.65
+  payment_method: Überweisung
+  sender_phone: +49 174 09542206
+  recipient_address: Rosenstraße 167, 79098 Freiburg
+  recipient_phone: +49 174 09542206

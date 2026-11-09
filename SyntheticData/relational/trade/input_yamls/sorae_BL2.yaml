@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: de
+document_title: Konnossement
+metadata:
+  bl_number: BL-DE69045827
+  issue_date: '2026-08-18'
+  related_invoice_number: CI-DE-2608-685
+  related_po_number: PO-DE-27434
+  related_lc_number: LC-DE7472990
+  freight_term: Fracht zahlbar am Bestimmungsort
+parties:
+  shipper:
+    name: Wolkenfeld Haushaltswaren GmbH
+    address: Gutenbergstraße 8, 90461 Nürnberg, Deutschland
+  consignee:
+    name: Sorae Sanghoe Co., Ltd.
+    address: 12 Soraeyeok-ro, Namdong-gu, Incheon, Südkorea
+  notify_party:
+    name: Sorae Sanghoe Co., Ltd.
+    address: 12 Soraeyeok-ro, Namdong-gu, Incheon, Südkorea
+  carrier:
+    name: Elbstrom Reederei GmbH
+shipping_details:
+  vessel_flight: ELBSTERN V.211E
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Incheon, Südkorea
+  place_of_receipt: Nürnberg, Deutschland
+  place_of_delivery: Incheon, Südkorea
+cargo_details:
+  container_number: EBRU6772030
+  seal_number: SL472391
+  marks_and_numbers: SORAE / INCHEON / MADE IN GERMANY
+  number_of_packages: 5 Kartons
+  description_of_goods: Kapuzenjacke mit Fleecefutter
+  gross_weight_kg: 165.2
+  measurement_cbm: 1.32

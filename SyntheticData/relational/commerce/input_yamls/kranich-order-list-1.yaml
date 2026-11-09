@@ -1,0 +1,161 @@
+url: https://kranichhof-markt.test/admin/order/list?page=1
+page_type: order
+layout: list
+title: Bestellungen
+items:
+- id,link: 20260924-302201
+  registration_date: '2026-09-24'
+  status: Zugestellt
+  goods: Proteinriegel mit wenig Zucker
+  tracking_number: '306689037496'
+  sender_name: Lukas Wolf
+  recipient_name: Lukas Wolf
+  quantity: 3
+  amount: 45.14
+  payment_method: Digitale Geldbörse
+- id,link: 20260920-300426
+  registration_date: '2026-09-20'
+  status: Zugestellt
+  goods: Aufladbarer Handwärmer
+  tracking_number: '183704573456'
+  sender_name: Felix Wagner
+  recipient_name: Felix Wagner
+  quantity: 1
+  amount: 14.35
+  payment_method: Überweisung
+- id,link: 20260919-301775
+  registration_date: '2026-09-19'
+  status: Storniert
+  goods: Silikon-Küchenhelfer-Set
+  sender_name: Jonas Wagner
+  recipient_name: Lukas Wolf
+  quantity: 3
+  amount: 53.85
+  payment_method: Überweisung
+- id,link: 20260908-301349
+  registration_date: '2026-09-08'
+  status: Zugestellt
+  goods: UV-Schutz-Sonnenschirm
+  tracking_number: '199257775839'
+  sender_name: Lukas Wolf
+  recipient_name: Lukas Wolf
+  quantity: 4
+  amount: 82.85
+  payment_method: Kreditkarte
+- id,link: 20260831-300284
+  registration_date: '2026-08-31'
+  status: Zugestellt
+  goods: Plüsch-Hausschuhe
+  tracking_number: '626675058939'
+  sender_name: Lukas Wolf
+  recipient_name: Lukas Wolf
+  quantity: 6
+  amount: 77.55
+  payment_method: Kreditkarte
+- id,link: 20260831-300071
+  registration_date: '2026-08-31'
+  status: Zugestellt
+  goods: Plüsch-Hausschuhe
+  tracking_number: '950621210532'
+  sender_name: Felix Wagner
+  recipient_name: Felix Wagner
+  quantity: 1
+  amount: 14.45
+  payment_method: Kreditkarte
+- id,link: 20260824-300213
+  registration_date: '2026-08-24'
+  status: Zugestellt
+  goods: Geröstete Naturreis-Chips
+  tracking_number: '635677280212'
+  sender_name: Leon Schulz
+  recipient_name: Leon Schulz
+  quantity: 1
+  amount: 9.5
+  payment_method: Digitale Geldbörse
+- id,link: 20260823-301846
+  registration_date: '2026-08-23'
+  status: Storniert
+  goods: Plüsch-Hausschuhe
+  sender_name: Clara Schulz
+  recipient_name: Sophie Braun
+  quantity: 3
+  amount: 62.3
+  payment_method: Kreditkarte
+- id,link: 20260817-301065
+  registration_date: '2026-08-17'
+  status: Zugestellt
+  goods: Parfümfreie Bodylotion
+  tracking_number: '364784124712'
+  sender_name: Lukas Becker
+  recipient_name: Lukas Becker
+  quantity: 4
+  amount: 47.5
+  payment_method: Kreditkarte
+- id,link: 20260807-301988
+  registration_date: '2026-08-07'
+  status: Zurückgesendet
+  goods: Kabelbox
+  tracking_number: '105026355876'
+  sender_name: Lukas Wolf
+  recipient_name: Lukas Wolf
+  quantity: 3
+  amount: 33.85
+  payment_method: Kreditkarte
+- id,link: 20260731-300781
+  registration_date: '2026-07-31'
+  status: Storniert
+  goods: Holzbausteine
+  sender_name: Felix Wagner
+  recipient_name: Felix Wagner
+  quantity: 4
+  amount: 69.3
+  payment_method: Kreditkarte
+- id,link: 20260729-301136
+  registration_date: '2026-07-29'
+  status: Zugestellt
+  goods: Holzbausteine
+  tracking_number: '622541545374'
+  sender_name: Leon Keller
+  recipient_name: Lukas Wolf
+  quantity: 1
+  amount: 27.0
+  payment_method: Kreditkarte
+- id,link: 20260723-301562
+  registration_date: '2026-07-23'
+  status: Zugestellt
+  goods: Geröstete Naturreis-Chips
+  tracking_number: '203558536218'
+  sender_name: Lukas Wolf
+  recipient_name: Sophie Braun
+  quantity: 2
+  amount: 16.95
+  payment_method: Digitale Geldbörse
+- id,link: 20260721-300568
+  registration_date: '2026-07-21'
+  status: Storniert
+  goods: UV-Schutz-Sonnenschirm
+  sender_name: Felix Wagner
+  recipient_name: Felix Wagner
+  quantity: 4
+  amount: 73.75
+  payment_method: Überweisung
+- id,link: 20260720-300994
+  registration_date: '2026-07-20'
+  status: Zugestellt
+  goods: Proteinriegel mit wenig Zucker
+  tracking_number: '989554366896'
+  sender_name: Lukas Wolf
+  recipient_name: Lukas Wolf
+  quantity: 1
+  amount: 18.65
+  payment_method: Kreditkarte
+- id,link: 20260716-300639
+  registration_date: '2026-07-16'
+  status: Zugestellt
+  goods: USB-C-Multiport-Hub
+  tracking_number: '613745374932'
+  sender_name: Lukas Wolf
+  recipient_name: Lukas Wolf
+  quantity: 2
+  amount: 35.65
+  payment_method: Überweisung
