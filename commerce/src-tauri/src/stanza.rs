@@ -84,6 +84,61 @@ const LATIN_LANGS: [(whatlang::Lang, &str); 8] = [
 static LATIN_DETECTOR: Lazy<whatlang::Detector> =
     Lazy::new(|| whatlang::Detector::with_allowlist(LATIN_LANGS.iter().map(|(l, _)| *l).collect()));
 
+/// 도메인 사전 언어 구역(필드 라벨 · 뜻 · 편견 문구)의 낱말 → 그 낱말이 든 라틴 언어 구역들.
+/// 8개 라틴 언어 구역이 모두 있는 사전(배포 사전 · full-bias)에서만 만듭니다. 개발 사전(ko · en 구역만)에서는 None 이라 투표하지 않습니다.
+static LATIN_VOCAB: Lazy<Option<HashMap<String, Vec<&'static str>>>> = Lazy::new(|| {
+    let dict: &Value = &crate::parsing::BIAS_DICT;
+    let mut map: HashMap<String, Vec<&'static str>> = HashMap::new();
+    for (_, code) in LATIN_LANGS.iter() {
+        let mut words: HashSet<String> = HashSet::new();
+        collect_vocab(dict.get(*code)?, &mut words);
+        for w in words {
+            map.entry(w).or_default().push(*code);
+        }
+    }
+    Some(map)
+});
+
+/// 사전 투표 낱말: 세 글자 이상, 숫자 · 밑줄 없는 낱말 (소문자)
+fn vocab_words(s: &str) -> impl Iterator<Item = String> + '_ {
+    s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|w| w.chars().count() >= 3 && !w.chars().any(|c| c.is_numeric() || c == '_'))
+        .map(|w| w.to_lowercase())
+}
+
+fn collect_vocab(v: &Value, out: &mut HashSet<String>) {
+    match v {
+        Value::String(s) => out.extend(vocab_words(s)),
+        Value::Array(a) => a.iter().for_each(|x| collect_vocab(x, out)),
+        Value::Object(o) => o.values().for_each(|x| collect_vocab(x, out)),
+        _ => {}
+    }
+}
+
+/// 라틴 문자 질의의 사전 투표: 질의 낱말이 든 언어 구역마다 1 / (그 낱말이 든 구역 수)를 더해, 1위 언어의 낱말이 둘 이상이고
+/// 2위보다 1 이상 앞설 때만 그 언어입니다. whatlang 은 짧은 질의에서 cs → pt · nl → fr · de → en · fr → es 로 자주 틀렸습니다
+/// (v2 질의 라틴 8개 언어 184개 중 16개). 투표가 그중 9개를 바로잡고 새로 틀린 것은 없었습니다 (쇼핑몰 이름 Copperleaf Goods 의
+/// goods 처럼 낱말 하나뿐인 근거는 쓰지 않습니다).
+fn latin_vocab_vote(text: &str) -> Option<&'static str> {
+    let vocab = LATIN_VOCAB.as_ref()?;
+    let mut score: Vec<(&'static str, f32, usize)> = LATIN_LANGS.iter().map(|(_, c)| (*c, 0.0, 0)).collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    for w in vocab_words(text) {
+        if !seen.insert(w.clone()) {
+            continue;
+        }
+        if let Some(owners) = vocab.get(&w) {
+            for s in score.iter_mut().filter(|s| owners.contains(&s.0)) {
+                s.1 += 1.0 / owners.len() as f32;
+                s.2 += 1;
+            }
+        }
+    }
+    score.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let (top, first, hits) = score[0];
+    (hits >= 2 && first - score[1].1 >= 0.999).then_some(top)
+}
+
 fn is_latin_letter(c: char) -> bool {
     c.is_alphabetic() && matches!(c as u32, 0x0041..=0x024F | 0x1E00..=0x1EFF)
 }
@@ -235,9 +290,10 @@ fn drop_cjk_names(text: &str) -> String {
 ///  · 문자 체계: 한글 → ko, 가나 → ja, 가나 없는 한자 → zh-hans (앱 언어가 일본어면 ja), 아랍 문자 → ar
 ///    한글은 글자 수가 한자 · 가나보다 적어도 어절 끝(조사 · 어미 자리)이 더 많이 한글이면 ko (株式会社ひなた工房에서 보낸 선하증권),
 ///    가나가 있어도 간체에만 쓰는 한자가 둘 이상이면 zh-hans (在こもれび商店商品详情页更改选项的记录)
-///  · 라틴 문자: 그 언어에만 쓰는 글자(ě š č ř ž ů ť ď ň → cs, ã õ → pt, ñ ¿ ¡ → es, ß → de)를 먼저 보고,
-///    아니면 whatlang 을 8개 라틴 언어 안에서 돌립니다. 후보를 넓게 두면 짧은 질의가 라틴어 · 슬로바키아어 · 아프리칸스어로
-///    판정되어 영어로 떨어졌습니다 (12개 언어 질의 144개 중 26개). 판정을 믿을 수 없고 앱 언어가 라틴 문자 언어면 앱 언어.
+///  · 라틴 문자: 그 언어에만 쓰는 글자(ě š č ř ž ů ť ď ň → cs, ã õ → pt, ñ ¿ ¡ → es, ß → de)를 먼저 보고, 다음으로 도메인 사전
+///    언어 구역 낱말 투표(배포 사전에서만, [`latin_vocab_vote`]), 아니면 whatlang 을 8개 라틴 언어 안에서 돌립니다. 후보를 넓게 두면
+///    짧은 질의가 라틴어 · 슬로바키아어 · 아프리칸스어로 판정되어 영어로 떨어졌습니다 (12개 언어 질의 144개 중 26개).
+///    판정을 믿을 수 없고 앱 언어가 라틴 문자 언어면 앱 언어.
 pub fn detect_query_lang(query: &str, ui_language: &str) -> Option<&'static str> {
     let text = drop_cjk_names(&strip_quoted(query));
     let query = text.as_str();
@@ -284,6 +340,9 @@ pub fn detect_query_lang(query: &str, ui_language: &str) -> Option<&'static str>
         if lower.chars().any(|c| letters.contains(c)) {
             return Some(code);
         }
+    }
+    if let Some(code) = latin_vocab_vote(query) {
+        return Some(code);
     }
     let ui = lang_code(ui_language).filter(|c| LATIN_LANGS.iter().any(|(_, l)| l == c));
     match LATIN_DETECTOR.detect(query) {

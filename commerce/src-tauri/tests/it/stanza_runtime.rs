@@ -123,6 +123,26 @@ fn query_language_ignores_quoted_and_embedded_names() {
     assert_eq!(detect_query_lang("在소래마켓进入结算页面却没有付款的记录", "korean"), Some("zh-hans"));
 }
 
+/// 배포 사전(full-bias)의 언어 구역 낱말 투표: whatlang 이 짧은 질의에서 틀리던 라틴 언어 질의 (v2 질의; fr → es, en → de,
+/// de → en, es → pt, nl → fr · de, cs → pt 로 판정되던 것). 개발 사전(ko · en 구역만)에서는 투표하지 않습니다.
+#[cfg(feature = "full-bias")]
+#[test]
+fn latin_queries_vote_with_dictionary_sections() {
+    for (q, want) in [
+        ("numéros de suivi de la commande 20260413-302272", "fr"),
+        ("orders in April that included Fleece-lined zip hoodie", "en"),
+        ("Artikel der Aktion „夏休み準備セール“", "de"),
+        ("productos de pedidos devueltos", "es"),
+        ("documenten bij cognossement BL-JP81652912", "nl"),
+        ("obchodní faktura ke konosamentu BL-GB85095836", "cs"),
+        ("met welk cognossement is Keramisch koksmes verscheept?", "nl"),
+        // 근거 낱말이 쇼핑몰 이름 하나(goods)뿐이면 투표하지 않습니다
+        ("aggiunte al carrello su Copperleaf Goods", "it"),
+    ] {
+        assert_eq!(detect_query_lang(q, "korean"), Some(want), "{q}");
+    }
+}
+
 #[test]
 fn korean_stems_and_mwt_casing() {
     assert_eq!(korean_stem("가디건+을", "ncn+jco"), "가디건");
