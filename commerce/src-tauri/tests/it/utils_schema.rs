@@ -1061,9 +1061,16 @@ fn filter_dictionaries_and_phrase_statistics() {
         vec![vec![true, false], vec![true, true]]
     );
 
-    assert_eq!(ai::bank_lang_order("ja"), strings(&["en", "ko"]));
-    assert_eq!(ai::bank_lang_order("ko"), strings(&["ko", "en"]));
-    assert_eq!(ai::bank_lang_coverage().0, vec!["en", "ko"]);
+    // 은행 언어는 내장 사전의 언어 구역을 따릅니다: 개발 사전(bias.json)은 ko · en, 배포 사전(full-bias)은 12개 언어.
+    if cfg!(feature = "full-bias") {
+        assert_eq!(ai::bank_lang_order("ja").first().map(String::as_str), Some("ja"));
+        assert_eq!(ai::bank_lang_order("ko").first().map(String::as_str), Some("ko"));
+        assert_eq!(ai::bank_lang_coverage().0.len(), 12);
+    } else {
+        assert_eq!(ai::bank_lang_order("ja"), strings(&["en", "ko"]));
+        assert_eq!(ai::bank_lang_order("ko"), strings(&["ko", "en"]));
+        assert_eq!(ai::bank_lang_coverage().0, vec!["en", "ko"]);
+    }
 }
 
 #[test]
