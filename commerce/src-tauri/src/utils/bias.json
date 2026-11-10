@@ -16,7 +16,9 @@
         "لمس", "ملموس", "تمرير",
         "dotyk", "dotknutí", "přejetí",
         "tocco", "toccato", "scorrere",
-        "aanraken", "aangeraakt", "vegen"
+        "aanraken", "aangeraakt", "vegen",
+        "tap", "taps", "tapped", "tapping", "タップ", "点按", "轻触", "tippen", "getippt",
+        "toque", "toques", "appui", "appuis", "tocchi", "tikken", "tik", "getikt", "dotyky", "لمسات"
       ]
     },
     "click": {
@@ -94,6 +96,28 @@
         "rapporto", "riepilogo", 
         "overzicht", "samenvatting"
       ]
+    }
+  },
+  "analytic_action_filters": {
+    "add_to_cart": {
+      "semantic": "the user put a product into the shopping cart with the add-to-cart button",
+      "types": ["click", "touch"],
+      "stems": ["cart", "basket", "장바구니", "カート", "购物车", "加购", "warenkorb", "panier", "carrito", "cesta", "carrello", "carrinho", "winkelwagen", "košík", "سلة"]
+    },
+    "buy_now": {
+      "semantic": "the user pressed the buy-now button to purchase a product immediately",
+      "types": ["click", "touch"],
+      "stems": ["buy now", "바로 구매", "바로구매", "今すぐ購入", "立即购买", "jetzt kaufen", "sofort kaufen", "acheter maintenant", "comprar ahora", "acquista ora", "compra ora", "comprar agora", "nu kopen", "koupit nyní", "اشتر الآن"]
+    },
+    "wishlist": {
+      "semantic": "the user saved a product to the wishlist or favourites",
+      "types": ["click", "touch"],
+      "stems": ["wishlist", "wish list", "favorite", "favourite", "찜", "관심상품", "お気に入り", "收藏", "merkzettel", "wunschliste", "favoris", "liste de souhaits", "favoritos", "lista de deseos", "preferiti", "lista dei desideri", "lista de desejos", "verlanglijst", "favorieten", "oblíbené", "المفضلة"]
+    },
+    "coupon": {
+      "semantic": "the user downloaded or claimed a coupon",
+      "types": ["click", "touch"],
+      "stems": ["coupon", "voucher", "쿠폰", "クーポン", "优惠券", "gutschein", "cupón", "cupon", "cupom", "cupão", "kortingsbon", "kupón", "kupon", "قسيمة", "قسائم", "كوبون"]
     }
   },
   "analytic_page_filters": {

@@ -86,6 +86,33 @@ pub fn event_type_prefix_key(word: &str) -> Option<String> {
     }
 }
 
+/// 🌟 [EVENT GLUED MATCH] 일본어 · 중국어는 띄어 쓰지 않아 '…のモバイルタッチ記録' 처럼 질의 전체가 낱말 하나입니다.
+///  완전일치 · 접두일치는 낱말 첫머리만 보므로 확정어가 낱말 중간에 있으면 놓쳤고, 유형이 벡터 추정으로 남았습니다
+///  (v2 질의 A6 'タッチ' · A2 '変更' · '更改'). 가나 · 한자로만 쓴 두 글자 이상 확정어가 낱말 안에 있으면 그 유형으로 확정합니다.
+pub fn event_type_glued_keys(word: &str) -> Vec<String> {
+    let glued = |c: char| matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF);
+    let mut out: Vec<String> = Vec::new();
+    if !word.chars().any(glued) {
+        return out;
+    }
+    let node = match crate::parsing::BIAS_DICT.get("analytic_event_filters").and_then(|v| v.as_object()) {
+        Some(n) => n,
+        None => return out,
+    };
+    for (key, val) in node {
+        if !ANALYTIC_SEARCH_TYPES.iter().any(|t| t == key) || out.contains(key) {
+            continue;
+        }
+        let hit = val.get("exact_match").and_then(|v| v.as_array()).map_or(false, |a| {
+            a.iter().filter_map(|x| x.as_str()).map(str::trim).any(|s| s.chars().count() >= 2 && s.chars().all(glued) && word.contains(s))
+        });
+        if hit {
+            out.push(key.clone());
+        }
+    }
+    out
+}
+
 // =====================================================================
 // 🌟 [ANALYTIC PAGE / SITE] 도메인 · 웹 경로 정의
 // ---------------------------------------------------------------------
@@ -164,6 +191,79 @@ pub fn page_kinds_in_query(query: &str) -> Vec<(String, String)> {
             .max_by_key(|p| p.chars().count());
         if let Some(p) = phrase {
             out.push((kind.clone(), p));
+        }
+    }
+    out
+}
+
+/// 행동 종류 사전 (bias.json analytic_action_filters): (종류, 어간들, 그 행동이 기록되는 이벤트 유형들)
+/// 장바구니 담기 · 바로 구매 · 찜 · 쿠폰 받기처럼 버튼 하나를 누르는 쇼핑 행동입니다. 데스크톱은 click, 모바일은 touch 로 기록됩니다.
+pub fn action_filter_table() -> Vec<(String, Vec<String>, Vec<String>)> {
+    let Some(filters) = crate::parsing::BIAS_DICT.get("analytic_action_filters").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let list = |v: Option<&Value>| -> Vec<String> {
+        v.and_then(|x| x.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    filters.iter().map(|(k, node)| (k.clone(), list(node.get("stems")), list(node.get("types")))).collect()
+}
+
+/// 글 안에 어간이 낱말 앞머리로 나오는가 (한중일 · 아랍 문자는 글자 일치: 'add-to-cart' ⊃ cart · 'košíku' ⊃ košík · 'السلة' ⊃ سلة)
+fn stem_in(text: &str, stem: &str) -> bool {
+    let glued = stem.chars().any(|c| matches!(c as u32, 0x0600..=0x06FF | 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3));
+    let mut start = 0;
+    while let Some(off) = text[start..].find(stem) {
+        let a = start + off;
+        if glued || text[..a].chars().last().map_or(true, |c| !c.is_alphanumeric()) {
+            return true;
+        }
+        start = a + stem.len();
+    }
+    false
+}
+
+/// 질의에 나온 행동 종류. 페이지 문구('장바구니 페이지' · 'cart page')에 든 어간은 행동이 아니라 페이지 조건이라 빼고 봅니다.
+pub fn action_kinds_in_query(query: &str) -> Vec<String> {
+    let mut q = crate::stanza::strip_quoted(query).to_lowercase();
+    for (_, phrase) in page_kinds_in_query(query) {
+        q = q.replace(phrase.as_str(), " ");
+    }
+    action_filter_table()
+        .into_iter()
+        .filter(|(_, stems, _)| stems.iter().any(|s| stem_in(&q, s)))
+        .map(|(k, _, _)| k)
+        .collect()
+}
+
+/// 행동 기록의 행동 종류: 구조화가 남긴 data.action(누른 버튼 · 고른 값의 화면 글자)에 그 종류의 어간이 들어 있으면.
+pub fn doc_action_kinds(data: &Value) -> Vec<String> {
+    let label = data.get("action").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    if label.trim().is_empty() {
+        return Vec::new();
+    }
+    action_filter_table()
+        .into_iter()
+        .filter(|(_, stems, _)| stems.iter().any(|s| stem_in(&label, s)))
+        .map(|(k, _, _)| k)
+        .collect()
+}
+
+/// 행동 종류들이 기록되는 이벤트 유형 (중복 없이)
+pub fn action_event_types(kinds: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (k, _, types) in action_filter_table() {
+        if kinds.contains(&k) {
+            for t in types {
+                if !out.contains(&t) {
+                    out.push(t);
+                }
+            }
         }
     }
     out

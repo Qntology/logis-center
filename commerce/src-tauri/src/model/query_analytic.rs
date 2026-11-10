@@ -113,6 +113,17 @@ impl crate::model::LogisModel {
                     ));
                     det_event_keys.push(k);
                 }
+                continue;
+            }
+            // 🌟 ③ 붙여 쓰는 일본어 · 중국어: 확정어가 낱말 중간에 있어도 확정 ('…のモバイルタッチ記録' → touch)
+            for k in crate::analytic::event_type_glued_keys(w) {
+                if !det_event_keys.iter().any(|e| e == &k) {
+                    emit_term(&format!(
+                        "   ⚡ [EVENT GLUED MATCH] '{}' → analytic_event_filters.{} (띄어 쓰지 않는 문자의 낱말 안 확정어)",
+                        w, k
+                    ));
+                    det_event_keys.push(k);
+                }
             }
         }
         if !det_time_key.is_empty() || !det_season_key.is_empty() || !det_event_keys.is_empty() {
@@ -1021,7 +1032,9 @@ impl crate::model::LogisModel {
         // 🌟 [REPORT ALWAYS-IN] report 는 여러 이벤트를 합성한 문서라
         //    '가장 많이', '패턴', '흐름' 류 질의의 정답을 담고 있습니다.
         //    특정 이벤트가 확정되어도 report 는 후보에 남겨야 정답이 잘리지 않습니다.
-        if !event_types.iter().any(|t| t == "report") {
+        //    질의가 묻지 않았는데 안전망으로 넣은 것이면(report_fallback) 검색은 묻는 유형의 기록을 report 보다 앞에 둡니다.
+        let report_fallback = !event_types.iter().any(|t| t == "report");
+        if report_fallback {
             event_types.push("report".to_string());
             emit_term("   📊 [REPORT ALWAYS-IN] 합성 리포트를 스코프에 함께 포함합니다.");
         }
@@ -1244,6 +1257,10 @@ impl crate::model::LogisModel {
             "started_at": started_at,
             "expired_at": expired_at,
             "event_types": event_types,
+            // 이벤트 유형이 확정어(클릭 · 터치 · 입력 …)로 정해졌는가. 아니면 벡터 추정이라, 페이지 종류가 있을 때 검색은 유형으로 좁히지 않습니다.
+            "event_exact": !det_event_keys.is_empty(),
+            // report 가 질의의 유형이 아니라 안전망으로 덧붙은 것인가 (그러면 검색은 묻는 유형의 기록을 앞에 둡니다)
+            "report_fallback": report_fallback,
             "page_kinds": page_kinds,
             "keywords": keywords,
             "target": target,

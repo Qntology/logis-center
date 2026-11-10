@@ -2892,6 +2892,67 @@ async fn ai_search_complex(
         } else {
             Vec::new()
         };
+        // 🌟 [ANALYTIC ACTION] 장바구니 담기 · 바로 구매 · 찜 · 쿠폰 받기 같은 버튼 행동(bias.json analytic_action_filters)을 물으면
+        //    유형을 그 행동이 기록되는 유형(데스크톱 click · 모바일 touch)으로 바꾸고, 회수한 기록을 누른 버튼 글자로 거릅니다.
+        //    v2 질의: '장바구니에 담은 기록' 이 change · hover 로 판정되어 정답 click · touch 기록이 유형 조건에서 빠졌습니다.
+        let analytic_actions: Vec<String> = if search_mode == "analytic" {
+            crate::analytic::action_kinds_in_query(&query)
+        } else {
+            Vec::new()
+        };
+        // 🌟 [ANALYTIC PAGE / TYPE] 페이지 종류(결제 페이지 · 상품 상세 …)가 있고 이벤트 유형이 확정어가 아니라 벡터 추정이면 유형으로 좁히지 않고
+        //    전체 유형을 회수하되, 추정 유형의 기록을 앞에 둡니다 (아래 5-D1). 페이지 조건이 정확한 거름이고, 추정 유형으로 좁히면 추정이
+        //    틀릴 때 정답이 빠졌습니다 (v2 질의 A4 한국어: '결제 페이지까지 갔다가' → hover · touch, 정답은 결제 페이지의 change · click).
+        //    추정이 맞을 때(A2 '옵션을 바꾼' → change)는 순서가 그대로 남습니다 — 전체로만 넓히면 다른 유형이 앞에 섞여 A2 가 1.0 → 0.2 였습니다.
+        //    report 가 질의의 유형이 아니라 안전망으로 덧붙은 것이면(report_fallback, 질의가 요약 · 통계를 묻지 않음) 묻는 유형의 기록을
+        //    report 보다 앞에 둡니다 (v2 질의 A2 일본어 · 중국어: '変更' · '更改' 로 change 가 확정되었는데 같은 상품 페이지의 report 가 1위).
+        let event_exact = structured_query.get("event_exact").and_then(|v| v.as_bool()).unwrap_or(true);
+        let report_fallback = structured_query.get("report_fallback").and_then(|v| v.as_bool()).unwrap_or(false);
+        let widen_types = search_mode == "analytic" && !analytic_pages.is_empty() && analytic_actions.is_empty() && !event_exact;
+        let mut analytic_lift: Vec<String> = Vec::new();
+        if search_mode == "analytic" && analytic_actions.is_empty() && (widen_types || report_fallback) {
+            let all: Vec<String> = crate::analytic::ANALYTIC_SEARCH_TYPES.iter().map(|t| t.to_string()).collect();
+            if let Some(ctxs) = structured_query.get_mut("context").and_then(|c| c.as_array_mut()) {
+                for ctx in ctxs.iter_mut() {
+                    if let Some(o) = ctx.as_object_mut() {
+                        let first = o.get("type").and_then(|v| v.as_str()).map(String::from);
+                        for t in first.into_iter().chain(
+                            o.get("types").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|x| x.as_str().map(String::from)),
+                        ) {
+                            if all.contains(&t) && !(report_fallback && t == "report") && !analytic_lift.contains(&t) {
+                                analytic_lift.push(t);
+                            }
+                        }
+                        if widen_types {
+                            o.insert("types".to_string(), json!(all));
+                        }
+                    }
+                }
+            }
+            if widen_types {
+                emit_term(&format!(
+                    "[AI-SEARCH] 🧭 [ANALYTIC PAGE / TYPE] 페이지 종류 {:?} 가 있고 이벤트 유형은 벡터 추정이라 {:?} 전체를 회수하고, 추정 유형 {:?} 의 기록을 앞에 둡니다.",
+                    analytic_pages, all, analytic_lift
+                ));
+            }
+        }
+        if !analytic_actions.is_empty() {
+            let action_types = crate::analytic::action_event_types(&analytic_actions);
+            if let Some(ctxs) = structured_query.get_mut("context").and_then(|c| c.as_array_mut()) {
+                for ctx in ctxs.iter_mut() {
+                    if let Some(o) = ctx.as_object_mut() {
+                        o.insert("types".to_string(), json!(action_types));
+                        if let Some(first) = action_types.first() {
+                            o.insert("type".to_string(), json!(first));
+                        }
+                    }
+                }
+            }
+            emit_term(&format!(
+                "[AI-SEARCH] 🧭 [ANALYTIC ACTION] 질의의 버튼 행동 {:?} → 유형 {:?}, 회수한 기록을 누른 버튼 글자로 거릅니다.",
+                analytic_actions, action_types
+            ));
+        }
         let cc = if search_mode == "analytic" && cc.trim().is_empty() {
             match store_opt.as_ref() {
                 Some(store) => match crate::analytic::site_mention(store, &query).await {
@@ -3109,7 +3170,7 @@ async fn ai_search_complex(
                 //    기존 limit 5 는 '조건이 SQL 에 이미 적용되었다' 는 전제였는데,
                 //    v4 에서는 조건이 SQL 에 없으므로 5건만 가져오면 정답이 잘려 나갑니다.
                 //    행동 로그를 페이지 종류로 거를 때는 거른 뒤에도 정답이 남도록 넓게 회수합니다.
-                let recall_limit: usize = if analytic_pages.is_empty() { 50 } else { 200 };
+                let recall_limit: usize = if analytic_pages.is_empty() && analytic_actions.is_empty() { 50 } else { 200 };
 
                 // 🌟 [비전 트랙] 루프 밖에서 1회 생성한 질의 벡터를 전 컨텍스트가 공유합니다.
                 //    (구버전은 여기서 매번 siglip2_model 을 들여다봤지만 로드 코드가 없어
@@ -3144,6 +3205,21 @@ async fn ai_search_complex(
                 };
 
                 let mut page_dropped = 0usize;
+                // 🌟 [ANALYTIC ACTION] 질의가 장바구니 담기 · 바로 구매 · 찜 · 쿠폰 받기 같은 버튼 행동을 물으면, 회수한 기록 중
+                //    누른 버튼 글자(data.action)가 그 행동인 것만 남깁니다 (바로 앞 페이지 거르기와 같은 자리). 하나도 안 남으면 거르지 않습니다.
+                let action_hits: usize = if analytic_actions.is_empty() {
+                    0
+                } else {
+                    final_results
+                        .iter()
+                        .filter(|(_, content, _)| {
+                            serde_json::from_str::<Value>(content)
+                                .ok()
+                                .map_or(false, |d| crate::analytic::doc_action_kinds(&d).iter().any(|k| analytic_actions.contains(k)))
+                        })
+                        .count()
+                };
+                let mut action_dropped = 0usize;
                 for (id, content, score) in final_results {
                     if !analytic_pages.is_empty() {
                         let kind = serde_json::from_str::<Value>(&content)
@@ -3151,6 +3227,16 @@ async fn ai_search_complex(
                             .and_then(|d| crate::analytic::doc_page_kind(&d));
                         if !kind.as_ref().map_or(false, |k| analytic_pages.contains(k)) {
                             page_dropped += 1;
+                            continue;
+                        }
+                    }
+                    if action_hits > 0 {
+                        let acts = serde_json::from_str::<Value>(&content)
+                            .ok()
+                            .map(|d| crate::analytic::doc_action_kinds(&d))
+                            .unwrap_or_default();
+                        if !acts.iter().any(|k| analytic_actions.contains(k)) {
+                            action_dropped += 1;
                             continue;
                         }
                     }
@@ -3162,6 +3248,12 @@ async fn ai_search_complex(
 
                     // 백엔드(LanceDB)에서의 N:N 양방향 교차 검색(FTS) 로직을 제거하고,
                     // 프론트엔드(Dexie DB)로 역할을 위임합니다.
+                }
+                if page_dropped + action_dropped > 0 {
+                    emit_term(&format!(
+                        "[AI-SEARCH] 🧭 [ANALYTIC FILTER] 페이지 종류 {:?} 로 {}건, 행동 종류 {:?} 로 {}건을 걸렀습니다 (행동이 맞는 기록 {}건).",
+                        analytic_pages, page_dropped, analytic_actions, action_dropped, action_hits
+                    ));
                 }
 
                 // =====================================================================
@@ -3718,6 +3810,38 @@ async fn ai_search_complex(
                 let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
+
+            // ── 5-D1: 행동 로그는 질의가 묻는 유형(넓혀 회수했으면 추정 유형, 안전망 report 제외)의 기록을 앞으로
+            //          (점수는 정규화되어 1 이하이므로 +1 이 묶음 경계) ──
+            if !analytic_lift.is_empty() {
+                let mut lifted = 0usize;
+                for r in ranked_results.iter_mut() {
+                    let ty = r
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .and_then(|t| serde_json::from_str::<Value>(t).ok())
+                        .and_then(|d| d.get("type").and_then(|v| v.as_str()).map(|s| s.to_lowercase()))
+                        .unwrap_or_default();
+                    if analytic_lift.iter().any(|g| *g == ty) {
+                        if let Some(o) = r.as_object_mut() {
+                            let s = o.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            o.insert("score".to_string(), json!(s + 1.0));
+                        }
+                        lifted += 1;
+                    }
+                }
+                ranked_results.sort_by(|a, b| {
+                    let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                emit_term(&format!(
+                    "[AI-SEARCH] 🧭 [ANALYTIC TYPE ORDER] 질의가 묻는 유형 {:?} 의 기록 {}건을 앞에, 나머지(다른 유형 · 안전망 report) {}건을 뒤에 둡니다.",
+                    analytic_lift,
+                    lifted,
+                    ranked_results.len() - lifted
+                ));
+            }
 
             // ── 5-D2: 질의 전체 트랙과 합칩니다 (search_fusion 모듈 설명 참조) ──
             if search_mode == "commerce" {
