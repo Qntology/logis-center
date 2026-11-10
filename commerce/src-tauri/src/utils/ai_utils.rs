@@ -850,6 +850,12 @@ pub fn query_chunk_matches_property_ext(
 
     let fmt = detect_field_format(field_name);
 
+    // 🌟 [RECORD ID EXCLUSIVE] 주문번호 20260413-302272 · 운송장 472339038575 처럼 생긴 값은 수량 · 금액 · 날짜가 아닙니다.
+    //    식별자 · 운송장 · 전화 칸만 받습니다 (비교 표현이 붙어 보여도: '20260413-302272의').
+    if record_id_token(v).is_some() {
+        return matches!(fmt, FieldFormat::Identifier | FieldFormat::TrackingCode | FieldFormat::Phone);
+    }
+
     // 🌟 [NUMERIC COMPARISON EXCLUSIVE] '5000원 이하로' 처럼 숫자와 비교 표현이 결합된 청크는
     //    물리적으로 수치 비교 조건입니다.
     //    currency.bias 의 '원' 이 '5000원' 과 공명해 String 필드가 이 청크를 선점하면
@@ -4523,7 +4529,39 @@ fn exact_compose(
     }
 }
 
+/// 날짜 사이에 끼는 채움말 (스페인어 · 포르투갈어 '12 de septiembre de 2026', 영어 '12th of September').
+/// 채움말이 달 이름과 숫자 사이를 갈라 달 이름이 숫자 옆 조각으로 인정되지 않았습니다(v2 질의 A6 es · pt 기간 없음).
+const DATE_FILLERS: [&str; 3] = ["de", "of", "the"];
+
+/// 두 날짜 조각을 잇지 않는 목록 접속어 (and · und · et · y · e · en · i · و · 和 · と · 및 · or …)
+const LIST_CONJUNCTIONS: [&str; 22] = [
+    "and", "und", "et", "y", "e", "ed", "en", "i", "och", "og", "و", "和", "及", "与", "と", "および", "및", "or", "oder", "ou", "o", "nebo",
+];
+
+/// 기간 사이 낱말 (between · zwischen · entre · tra · fra · tussen · mezi · بين): 이 낱말이 있으면 'and' 도 구간을 잇습니다.
+const BETWEEN_WORDS: [&str; 8] = ["between", "zwischen", "entre", "tra", "fra", "tussen", "mezi", "بين"];
+
+/// 숫자 없이 달 이름만 오는 자리의 앞말 ('in September' · 'im Juni' · 'en junio' · 'a giugno' · 'em junho' · 'v červnu' · 'في يونيو').
+/// 이 앞말 뒤의 달 이름은 숫자가 붙지 않아도 그 달입니다 (올해). 앞말 없이 홀로 선 달 이름(영어 may · march)은 보지 않습니다.
+const MONTH_PREPOSITIONS: [&str; 22] = [
+    "in", "im", "en", "a", "em", "v", "ve", "في", "during", "durante", "nel", "nello", "since", "until", "seit", "bis", "desde", "hasta",
+    "dal", "fino", "sinds", "od",
+];
+
+/// 질의 낱말에서 절대 기간을 읽습니다. 날짜 채움말(de · of · the)은 건너뛰고 읽고, 결과의 낱말 위치는 원래 위치로 돌려줍니다.
 pub fn exact_absolute_period(words: &[String], today: chrono::NaiveDate) -> Option<ExactPeriod> {
+    let filler = |w: &str| DATE_FILLERS.contains(&w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase().as_str());
+    let kept: Vec<usize> = (0..words.len()).filter(|&i| !filler(&words[i])).collect();
+    if kept.len() == words.len() {
+        return exact_absolute_period_core(words, today);
+    }
+    let sub: Vec<String> = kept.iter().map(|&i| words[i].clone()).collect();
+    let mut p = exact_absolute_period_core(&sub, today)?;
+    p.tokens = p.tokens.iter().filter_map(|&t| kept.get(t).copied()).collect();
+    Some(p)
+}
+
+fn exact_absolute_period_core(words: &[String], today: chrono::NaiveDate) -> Option<ExactPeriod> {
     #[derive(Clone)]
     enum Piece {
         Num(i64, usize),
@@ -4643,7 +4681,10 @@ pub fn exact_absolute_period(words: &[String], today: chrono::NaiveDate) -> Opti
                     let pure_num = |j: usize| {
                         is_num(j) && pieces.get(j).map_or(false, |(tj, _)| token_pure.get(*tj).copied().unwrap_or(false))
                     };
-                    let adj_num = (k > 0 && pure_num(k - 1)) || pure_num(k + 1);
+                    let after_preposition = k > 0
+                        && matches!(&pieces[k - 1], (_, Piece::Word(p)) if MONTH_PREPOSITIONS.contains(&p.to_lowercase().as_str()))
+                        && month_from_name(&w).is_some();
+                    let adj_num = (k > 0 && pure_num(k - 1)) || pure_num(k + 1) || after_preposition;
                     if !adj_num { continue; }
                     if let Some(m) = month_from_name(&w) {
                         parts.push((ti, ExactTimePart::Month(m)));
@@ -4708,12 +4749,27 @@ pub fn exact_absolute_period(words: &[String], today: chrono::NaiveDate) -> Opti
     if parts.is_empty() { return None; }
     parts.sort_by_key(|(t, _)| *t);
 
+    // 🌟 [RANGE CONNECTOR] 두 날짜 조각 사이에 숫자 없는 낱말이 1 ~ 2개 끼면 한 구간으로 잇습니다
+    //    ('from September 12, 2026 to October 2, 2026' · 'vom 12. September 2026 bis 2. Oktober 2026' · 'od 12. září 2026 do 2. října 2026'
+    //    · 'من 12 سبتمبر 2026 إلى 2 أكتوبر 2026'). 꼬리 연산자(부터 · から)가 붙지 않는 언어는 이어지지 않아 첫 날 하루만 기간이 되었습니다
+    //    (v2 질의 A6 en · fr · it · cs · ar). 목록 접속어(and · und · y · و …)는 'between' 류 낱말이 앞에 있을 때만 잇습니다.
+    let between = words.iter().any(|w| BETWEEN_WORDS.contains(&core_of(w).to_lowercase().as_str()));
+    let range_gap = |a: usize, b: usize| -> bool {
+        b > a + 1
+            && b - a - 1 <= 2
+            && (a + 1..b).all(|k| {
+                let c = core_of(&words[k]).to_lowercase();
+                !c.chars().any(|ch| ch.is_ascii_digit())
+                    && c.chars().count() <= 8
+                    && (between || !LIST_CONJUNCTIONS.contains(&c.as_str()))
+            })
+    };
     let mut groups: Vec<Vec<(usize, ExactTimePart)>> = Vec::new();
     for p in parts.into_iter() {
         let joins = match groups.last() {
             Some(g) => {
                 let last = g.last().map(|x| x.0).unwrap_or(0);
-                p.0 == last || p.0 == last + 1
+                p.0 == last || p.0 == last + 1 || range_gap(last, p.0)
             }
             None => false,
         };
@@ -4947,6 +5003,29 @@ pub fn has_date_shape(s: &str) -> bool {
         return false;
     }
     years == 1 && months <= 1 && (days + months) >= 1
+}
+
+/// 🌟 [RECORD ID] 질의 청크에 든 숫자 식별자 토큰 (주문번호 20260413-302272 · 운송장 472339038575).
+///  · 하이픈 등으로 나뉜 숫자 묶음이 둘 이상이고 숫자가 8개 이상 (날짜 2026-04-13 · 2026.4.13 은 아님)
+///  · 숫자만 10개 이상 (8자리 날짜 20260413 · 금액 29900 · 소수 46.05 · 수량 5 는 아님)
+/// 글자가 섞인 코드(CP5052 · BL-JP81652912)는 상품 모델명(iPhone15 · RTX4090)과 구별되지 않아 여기서 다루지 않습니다
+/// — 저장된 식별자와 같을 때만 식별자로 봅니다(search_relation).
+/// v2 질의 C1 은 주문번호 20260413-302272 가 12개 언어 모두 '수량 · 금액 ≤ 20260413302272' 로 풀렸습니다.
+pub fn record_id_token(chunk: &str) -> Option<String> {
+    for raw in chunk.split(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '_' | '/' | '.'))) {
+        let t = raw.trim_matches(|c: char| matches!(c, '-' | '_' | '/' | '.'));
+        let groups: Vec<&str> = t.split(|c: char| !c.is_ascii_digit()).filter(|g| !g.is_empty()).collect();
+        let digits: usize = groups.iter().map(|g| g.len()).sum();
+        if digits == 0 {
+            continue;
+        }
+        let date_like = (groups.len() == 3 && groups[0].len() == 4 && groups[1].len() <= 2 && groups[2].len() <= 2)
+            || (groups.len() == 1 && digits == 8 && (t.starts_with("19") || t.starts_with("20")));
+        if !date_like && (digits >= 10 || (groups.len() >= 2 && digits >= 8 && !t.contains('.'))) {
+            return Some(t.to_string());
+        }
+    }
+    None
 }
 
 // 🌟 값 안에서 "숫자를 포함한 영숫자 토큰"의 최대 길이를 구합니다. (운송장/코드 판정용)

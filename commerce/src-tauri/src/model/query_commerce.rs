@@ -2561,10 +2561,18 @@ impl crate::model::LogisModel {
                 //    있을 때만 LLM 에게 묻습니다 (analytic::period_lexical_support, 행동 로그 질의와 같은 규칙).
                 //    v2 질의: 영어 · 중국어 · 스페인어 · 이탈리아어 · 포르투갈어 · 체코어의 C7 이 이름 속 Sommer 로 여름 기간이 걸려
                 //    행사 기간 → 주문 → 상품 연결 대신 행사 4건만 보였습니다 (R@all 0).
-                let unquoted_query = crate::stanza::strip_quoted(&query).to_lowercase();
+                //    동사 · 조동사로 쓰인 낱말(프랑스어 'a été expédiée' 의 été = être 의 과거분사, 영어 'prices fall' 의 fall)도
+                //    계절 · 시간 낱말이 아닙니다 (Stanza 품사 AUX · VERB). v2 질의 C2 fr 은 été 로 여름이 확정되었습니다.
+                let verbal = |w: &str| matches!(word_pos_map.get(w).map(|s| s.as_str()), Some("AUX") | Some("VERB"));
+                let unquoted_query: String = crate::stanza::strip_quoted(&query)
+                    .split_whitespace()
+                    .filter(|w| !verbal(w.trim_matches(|c: char| !c.is_alphanumeric())))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase();
                 let in_unquoted = |w: &str| -> bool {
                     let t = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
-                    !t.is_empty() && unquoted_query.contains(&t)
+                    !t.is_empty() && !verbal(w.trim_matches(|c: char| !c.is_alphanumeric())) && unquoted_query.contains(&t)
                 };
                 let period_phrases = crate::utils::ai_utils::filter_category_phrases(&["time_filters", "season_filters"]);
                 let period_supported = |cat: &str, key: &str| -> bool {

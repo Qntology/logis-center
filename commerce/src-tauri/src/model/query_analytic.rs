@@ -161,6 +161,31 @@ impl crate::model::LogisModel {
         const DROP_TAGS: &[&str] = crate::utils::ai_utils::STANZA_DROP_TAGS;
         let all_words: Vec<String> = tokens.iter().map(|(w, _, _)| w.clone()).collect();
         let quoted = crate::stanza::quoted_token_flags(&query, &all_words);
+        // 동사 · 조동사로 쓰인 낱말(프랑스어 'a été payée' 의 été = être 의 과거분사, 영어 'prices fall' 의 fall)은
+        // 계절 · 시간 낱말이 아닙니다 (Stanza 품사 AUX · VERB). 확정 일치와 기간 글자 근거에서 뺍니다.
+        let verbal_words: std::collections::HashSet<String> = tokens
+            .iter()
+            .filter(|(_, t, _)| t == "AUX" || t == "VERB")
+            .map(|(w, _, _)| w.to_lowercase())
+            .collect();
+        let not_verbal = |text: &str| -> String {
+            text.split_whitespace()
+                .filter(|w| !verbal_words.contains(&w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let (det_time_key, det_season_key) = if verbal_words.is_empty() || (det_time_key.is_empty() && det_season_key.is_empty()) {
+            (det_time_key, det_season_key)
+        } else {
+            let keys = crate::analytic::deterministic_time_keys(&not_verbal(&literal_free));
+            if keys != (det_time_key.clone(), det_season_key.clone()) {
+                emit_term(&format!(
+                    "   🧷 [VERBAL PERIOD WORD] 동사 · 조동사로 쓰인 낱말 {:?} 를 빼고 기간 확정어를 다시 봅니다: time '{}' → '{}' · season '{}' → '{}'",
+                    verbal_words, det_time_key, keys.0, det_season_key, keys.1
+                ));
+            }
+            keys
+        };
         let content_flags: Vec<bool> = tokens
             .iter()
             .map(|(_, t, _)| !DROP_TAGS.iter().any(|d| d == t))
@@ -479,7 +504,7 @@ impl crate::model::LogisModel {
                 // 🌟 [PERIOD LEXICAL GATE] 기간(시간 · 계절)은 청크 낱말이 그 키의 구 낱말을 품을 때만 후보가 됩니다.
                 if ck.0 == "time_filters" || ck.0 == "season_filters" {
                     let phrases: Vec<&str> = idxs.iter().filter_map(|&i| bank_defs.get(i).map(|d| d.2.as_str())).collect();
-                    if !crate::analytic::period_lexical_support(&chunk_texts[ci], &phrases) {
+                    if !crate::analytic::period_lexical_support(&not_verbal(&chunk_texts[ci]), &phrases) {
                         period_unsupported += 1;
                         continue;
                     }
