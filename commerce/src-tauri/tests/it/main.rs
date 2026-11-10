@@ -73,3 +73,11 @@ mod synthetic_eval;
 mod stanza_runtime;
 // 내장 도메인 사전: 개발 bias.json(ko · en) ↔ 배포 full_bias.json(모든 언어) 일관성
 mod bias_source;
+// SDS 원장: 부팅(로컬 기본 팀) → 로그인(실제 팀) 사이에 원장이 살아남는지 실제 파일로 (LOGIS_APP_DIR, --ignored)
+mod sds_ledger;
+// 행동 로그 도메인 · 웹 경로 정의: link 경로 → 페이지 종류, 12개 언어 질의 문구 → 페이지 종류 (bias.json analytic_page_filters)
+mod analytic_page;
+// 목록 행의 자기 식별자: 코사인 게이트가 실패하면 이 페이지 유형의 별칭 매개변수 링크(od_id · it_id · invoice)를 먼저
+mod relay_links;
+// 고정점 → 목표 유형 관계 단계 · 서식 질의 근거 · 숫자 식별자 · 날짜 구간 · 행동 종류
+mod search_relation;

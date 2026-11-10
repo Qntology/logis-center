@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: de
+document_title: Ursprungszeugnis
+metadata:
+  certificate_number: CO-2026-DE-7122
+  issue_date: '2026-06-12'
+  related_invoice_number: CI-DE-2606-904
+  related_bl_number: BL-DE33269536
+  related_lc_number: LC-DE7472990
+parties:
+  exporter:
+    name: Wolkenfeld Haushaltswaren GmbH
+    address: Gutenbergstraße 8, 90461 Nürnberg, Deutschland
+  importer_consignee:
+    name: Sorae Sanghoe Co., Ltd.
+    address: 12 Soraeyeok-ro, Namdong-gu, Incheon, Südkorea
+  issuing_authority:
+    name: Handelskammer Pegnitzgrund
+    address: Hauptmarkt 25, 90403 Nürnberg, Deutschland
+transport_details:
+  vessel_flight: ELBSTERN V.207E
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Incheon, Südkorea
+cargo_details:
+- marks_and_numbers: SORAE / INCHEON / MADE IN GERMANY
+  description_of_goods: USB-C-Multiport-Hub (SR20738)
+  hs_code: '8518.30'
+  quantity: 480 Stk.
+  gross_weight_kg: 612.5
+  origin_criterion: Vollständig in Deutschland hergestellt
+- marks_and_numbers: SORAE / INCHEON / MADE IN GERMANY
+  description_of_goods: Tragbares Kochgeschirr-Set (SR20123)
+  hs_code: '6306.22'
+  quantity: 120 Stk.
+  gross_weight_kg: 143.0
+  origin_criterion: Vollständig in Deutschland hergestellt
+declaration:
+  statement: Es wird bescheinigt, dass die oben bezeichneten Waren ihren Ursprung in Deutschland haben.

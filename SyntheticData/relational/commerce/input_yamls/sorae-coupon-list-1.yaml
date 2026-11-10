@@ -1,0 +1,37 @@
+url: https://sorae-market.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+title: 쿠폰 관리
+items:
+- id,link: CP5013
+  code: SRWELCOME
+  title: 첫 구매 환영 혜택
+  discount: 3,000원
+  started_at: '2026-04-01'
+  expired_at: '2026-09-30'
+  status: 종료
+  min_order_amount: 20000
+- id,link: CP5026
+  code: SRSUMMER
+  title: 여름 휴가 응원 쿠폰
+  discount: 15%
+  started_at: '2026-06-15'
+  expired_at: '2026-07-12'
+  status: 종료
+  min_order_amount: 30000
+- id,link: CP5039
+  code: SRAGAIN
+  title: 재구매 고객 감사
+  discount: 10%
+  started_at: '2026-04-01'
+  expired_at: '2026-09-30'
+  status: 종료
+  min_order_amount: 10000
+- id,link: CP5052
+  code: SRHARVEST
+  title: 가을 맞이 감사제
+  discount: 5,000원
+  started_at: '2026-09-01'
+  expired_at: '2026-09-20'
+  status: 종료
+  min_order_amount: 40000

@@ -1,0 +1,53 @@
+sites:
+- host: sorae-market.test
+  name: 소래마켓
+  lang: ko
+  shop: sorae
+- host: copperleaf-goods.test
+  name: Copperleaf Goods
+  lang: en
+  shop: copper
+- host: komorebi-shop.test
+  name: こもれび商店
+  lang: ja
+  shop: komorebi
+- host: kranichhof-markt.test
+  name: Kranichhof Markt
+  lang: de
+  shop: kranich
+routes:
+- kind: home
+  path: /
+- kind: goods_list
+  path: /goods/list
+  params:
+  - cate
+- kind: goods_view
+  path: /goods/view
+  params:
+  - goodsNo
+- kind: search
+  path: /search
+  params:
+  - q
+- kind: cart
+  path: /order/cart
+- kind: checkout
+  path: /order/checkout
+- kind: order_complete
+  path: /order/complete
+  params:
+  - orderNo
+- kind: event_view
+  path: /event/view
+  params:
+  - eventNo
+- kind: mypage_orders
+  path: /mypage/orders
+  params:
+  - orderNo
+- kind: review_write
+  path: /mypage/review/write
+  params:
+  - goodsNo
+  - orderNo

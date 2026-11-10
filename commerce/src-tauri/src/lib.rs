@@ -16,6 +16,7 @@ pub mod scheduler;
 pub mod analytic;
 pub mod stanza;
 pub mod search_fusion;
+pub mod search_relation;
 pub mod js_templates;
 pub mod prompts; // 🌟 새로 추가된 프롬프트 모듈 선언
 pub mod parsers; // 🌟 문서 파서 모듈 선언
@@ -1213,6 +1214,23 @@ fn build_scope_filter(ctx: &Value, search_mode: &str) -> Option<String> {
                 Some(s) => s.trim().to_lowercase(),
                 None => continue,
             };
+            let epoch = |v: Option<&Value>| -> Option<String> {
+                match v {
+                    Some(Value::Number(n)) => Some(n.to_string()),
+                    Some(Value::String(s)) => Some(s.chars().filter(|c| c.is_ascii_digit()).collect::<String>()).filter(|s| !s.is_empty()),
+                    _ => None,
+                }
+            };
+            // 🌟 [PERIOD RANGE] 범위는 한 컨텍스트 안에서 두 경계를 함께 겁니다 (행동 로그 기간 질의).
+            if op_str.starts_with("between") {
+                if let Some(lo) = epoch(val_obj.get("value")) {
+                    filters.push(format!("{} >= {}", envelope_col, lo));
+                }
+                if let Some(hi) = epoch(val_obj.get("value_to")) {
+                    filters.push(format!("{} <= {}", envelope_col, hi));
+                }
+                continue;
+            }
             // 비교 연산자만 SQL 로 내립니다. top/bottom/contains 는 Dexie 담당입니다.
             let sql_op = if op_str.starts_with("gte") { ">=" }
                 else if op_str.starts_with("gt") { ">" }
@@ -2319,6 +2337,136 @@ async fn ground_conditions<E: Fn(&str)>(store: &VectorStore, structured: &mut Va
     }
 }
 
+/// 🌟 [TRADE GROUNDING] 서식 질의의 하드 조건은 질의에 근거가 있을 때만 남깁니다.
+///  · 식별자(번호 · 참조 · 컨테이너 · HS 코드): 정규화한 값이 질의(정규화)에 들어 있어야 합니다.
+///  · 수: 질의에 그 수가 따로 선 숫자로 나와야 합니다 ('6月' 의 6 · 'LC-DE7472990' 속 2990 은 아님).
+///  · 날짜: 값의 연도가 질의에 나오거나 올해여야 합니다 (지어낸 'etd > 2019-06-30' 은 버림).
+///  · 통화: 코드 · 기호 · 이름이 질의에 나와야 합니다 (일본어 질의의 'currency = JPY' 는 버림).
+///  · 글자 값(선박 · 항구 · 당사자 · 설명): 질의에 그대로 나오면 힌트로, 아니면 버립니다. 'none' · 'null' 같은 빈 값은 버립니다.
+/// v2 질의 R7('6월에 펠릭스토우에서 선적된 서류')은 en `vessel = none` · `etd > 2019-06-30`, it `recipient_name = giugno`,
+/// ja · zh `currency = JPY` · `freight_amount ≤ 6`, cs `pod = Felixstowe` 같은 조건이 걸려 정답이 통째로 걸러졌습니다.
+pub fn ground_trade_conditions<E: Fn(&str)>(structured: &mut Value, query: &str, emit: &E) {
+    use crate::utils::ai_utils::{detect_field_format, FieldFormat};
+    let q_lower = query.to_lowercase();
+    let q_key = crate::scheduler::normalize_entity_key(query);
+    // 식별자 토큰 밖에서, 날짜 단위(年 · 月 · 日 · 년 · 월 · 일)가 붙지 않은 숫자
+    let mut free = q_lower.clone();
+    for (raw, _) in crate::search_relation::query_id_tokens(query) {
+        // 글자가 섞인 번호(LC-DE7472990)와 긴 숫자 식별자만 지웁니다. '5000' 같은 수는 남깁니다.
+        if raw.chars().any(|c| c.is_ascii_alphabetic()) || crate::utils::ai_utils::record_id_token(&raw).is_some() {
+            free = free.replace(&raw.to_lowercase(), " ");
+        }
+    }
+    let chars: Vec<char> = free.chars().collect();
+    let mut numbers: Vec<f64> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let s = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.' || chars[i] == ',') {
+                i += 1;
+            }
+            let unit = chars.get(i).copied().unwrap_or(' ');
+            let dated = matches!(unit, '年' | '月' | '日' | '년' | '월' | '일' | '号' | '號');
+            let run: String = chars[s..i].iter().filter(|c| **c != ',').collect();
+            if !dated {
+                if let Ok(v) = run.trim_end_matches('.').parse::<f64>() {
+                    numbers.push(v);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let this_year = chrono::Datelike::year(&chrono::Local::now()).to_string();
+    let null_like = |v: &str| matches!(v.trim().to_lowercase().as_str(), "" | "none" | "null" | "n/a" | "na" | "nil" | "unknown" | "-" | "없음" | "なし" | "无");
+    let Some(ctxs) = structured.get_mut("context").and_then(|c| c.as_array_mut()) else { return };
+    for ctx in ctxs.iter_mut() {
+        let Some(o) = ctx.as_object_mut() else { continue };
+        let conds: Vec<(String, Value)> = match o.get("condition").and_then(|v| v.as_object()) {
+            Some(c) => c.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            None => continue,
+        };
+        let mut dropped: Vec<String> = Vec::new();
+        let mut hinted: Vec<(String, Value)> = Vec::new();
+        for (field, spec) in conds.iter() {
+            let raw = match spec.get("value") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => continue,
+            };
+            if null_like(&raw) {
+                dropped.push(format!("{} = {}", field, raw));
+                continue;
+            }
+            let ident = matches!(field.as_str(), "doc_number" | "no" | "hub_reference") || field.starts_with("reference_");
+            let fmt = detect_field_format(field);
+            let keep = if ident || matches!(fmt, FieldFormat::Identifier | FieldFormat::TrackingCode) {
+                let k = crate::scheduler::normalize_entity_key(&raw);
+                k.chars().count() >= 3 && q_key.contains(&k)
+            } else if field == "status" || field.ends_with("_status") {
+                true
+            } else if field == "currency" || field.ends_with("_currency") {
+                let code = raw.trim().to_uppercase();
+                q_lower.contains(&code.to_lowercase())
+                    || q_lower.split_whitespace().any(|w| {
+                        crate::utils::ai_utils::currency_code_of(w) == Some(code.as_str())
+                            || crate::utils::ai_utils::currency_symbol_in(w) == Some(code.as_str())
+                            || crate::utils::ai_utils::currency_name_exact(w) == Some(code.as_str())
+                    })
+            } else {
+                match fmt {
+                    FieldFormat::Date => {
+                        let year: String = raw.chars().take(4).collect();
+                        !(year.len() == 4 && year.chars().all(|c| c.is_ascii_digit())) || year == this_year || q_lower.contains(&year)
+                    }
+                    FieldFormat::Numeric => raw.trim().parse::<f64>().map_or(false, |v| numbers.iter().any(|n| (n - v).abs() < 1e-9)),
+                    FieldFormat::Text | FieldFormat::Address => {
+                        if q_lower.contains(&raw.trim().to_lowercase()) {
+                            hinted.push((field.clone(), spec.clone()));
+                        } else {
+                            dropped.push(format!("{} = {}", field, raw));
+                        }
+                        continue;
+                    }
+                    _ => true,
+                }
+            };
+            if !keep {
+                dropped.push(format!("{} {} {}", field, spec.get("operator").and_then(|v| v.as_str()).unwrap_or(""), raw));
+            }
+        }
+        if dropped.is_empty() && hinted.is_empty() {
+            continue;
+        }
+        if let Some(c) = o.get_mut("condition").and_then(|v| v.as_object_mut()) {
+            for d in dropped.iter() {
+                let key = d.split_whitespace().next().unwrap_or("").to_string();
+                c.remove(&key);
+            }
+            for (k, _) in hinted.iter() {
+                c.remove(k);
+            }
+        }
+        if !hinted.is_empty() {
+            let hint = o.entry("hint".to_string()).or_insert_with(|| json!({}));
+            if !hint.is_object() {
+                *hint = json!({});
+            }
+            if let Some(h) = hint.as_object_mut() {
+                for (k, spec) in hinted.iter() {
+                    h.entry(k.clone()).or_insert_with(|| spec.clone());
+                }
+            }
+        }
+        emit(&format!(
+            "[AI-SEARCH] ⚓ [TRADE GROUNDING] 질의에 근거가 없는 서식 조건을 버리고 {:?}, 글자 값 조건은 힌트로 내립니다 {:?}",
+            dropped,
+            hinted.iter().map(|(k, s)| format!("{} = {}", k, s.get("value").unwrap_or(&Value::Null))).collect::<Vec<_>>()
+        ));
+    }
+}
+
 /// 유형별 지시어: 언어별 유형 이름에 bias.json 의 search_bridge.domain_words 를 더합니다. 상품은 기본값이라 넣지 않습니다.
 fn domain_vocabulary(language: &str) -> Vec<(String, Vec<String>)> {
     ["order", "tracking", "review", "coupon", "event"]
@@ -2863,6 +3011,99 @@ async fn ai_search_complex(
                 ground_conditions(store, &mut structured_query, &cc, &domains, &emit_term).await;
             }
         }
+        if search_mode == "shipping" {
+            ground_trade_conditions(&mut structured_query, &query, &emit_term);
+        }
+
+        // 🌟 [ANALYTIC PAGE / SITE] 행동 로그 질의에 사이트 이름이 하나 나오면(앱이 사이트를 고르지 않았을 때) 그 사이트로 좁히고,
+        //    페이지 종류가 나오면 회수한 문서를 link 경로의 페이지 종류로 거릅니다 (analytic.rs 의 도메인 · 경로 정의).
+        let analytic_pages: Vec<String> = if search_mode == "analytic" {
+            structured_query
+                .get("page_kinds")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // 🌟 [ANALYTIC ACTION] 장바구니 담기 · 바로 구매 · 찜 · 쿠폰 받기 같은 버튼 행동(bias.json analytic_action_filters)을 물으면
+        //    유형을 그 행동이 기록되는 유형(데스크톱 click · 모바일 touch)으로 바꾸고, 회수한 기록을 누른 버튼 글자로 거릅니다.
+        //    v2 질의: '장바구니에 담은 기록' 이 change · hover 로 판정되어 정답 click · touch 기록이 유형 조건에서 빠졌습니다.
+        let analytic_actions: Vec<String> = if search_mode == "analytic" {
+            crate::analytic::action_kinds_in_query(&query)
+        } else {
+            Vec::new()
+        };
+        // 🌟 [ANALYTIC PAGE / TYPE] 페이지 종류(결제 페이지 · 상품 상세 …)가 있고 이벤트 유형이 확정어가 아니라 벡터 추정이면 유형으로 좁히지 않고
+        //    전체 유형을 회수하되, 추정 유형의 기록을 앞에 둡니다 (아래 5-D1). 페이지 조건이 정확한 거름이고, 추정 유형으로 좁히면 추정이
+        //    틀릴 때 정답이 빠졌습니다 (v2 질의 A4 한국어: '결제 페이지까지 갔다가' → hover · touch, 정답은 결제 페이지의 change · click).
+        //    추정이 맞을 때(A2 '옵션을 바꾼' → change)는 순서가 그대로 남습니다 — 전체로만 넓히면 다른 유형이 앞에 섞여 A2 가 1.0 → 0.2 였습니다.
+        //    report 가 질의의 유형이 아니라 안전망으로 덧붙은 것이면(report_fallback, 질의가 요약 · 통계를 묻지 않음) 묻는 유형의 기록을
+        //    report 보다 앞에 둡니다 (v2 질의 A2 일본어 · 중국어: '変更' · '更改' 로 change 가 확정되었는데 같은 상품 페이지의 report 가 1위).
+        let event_exact = structured_query.get("event_exact").and_then(|v| v.as_bool()).unwrap_or(true);
+        let report_fallback = structured_query.get("report_fallback").and_then(|v| v.as_bool()).unwrap_or(false);
+        let widen_types = search_mode == "analytic" && !analytic_pages.is_empty() && analytic_actions.is_empty() && !event_exact;
+        let mut analytic_lift: Vec<String> = Vec::new();
+        if search_mode == "analytic" && analytic_actions.is_empty() && (widen_types || report_fallback) {
+            let all: Vec<String> = crate::analytic::ANALYTIC_SEARCH_TYPES.iter().map(|t| t.to_string()).collect();
+            if let Some(ctxs) = structured_query.get_mut("context").and_then(|c| c.as_array_mut()) {
+                for ctx in ctxs.iter_mut() {
+                    if let Some(o) = ctx.as_object_mut() {
+                        let first = o.get("type").and_then(|v| v.as_str()).map(String::from);
+                        for t in first.into_iter().chain(
+                            o.get("types").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|x| x.as_str().map(String::from)),
+                        ) {
+                            if all.contains(&t) && !(report_fallback && t == "report") && !analytic_lift.contains(&t) {
+                                analytic_lift.push(t);
+                            }
+                        }
+                        if widen_types {
+                            o.insert("types".to_string(), json!(all));
+                        }
+                    }
+                }
+            }
+            if widen_types {
+                emit_term(&format!(
+                    "[AI-SEARCH] 🧭 [ANALYTIC PAGE / TYPE] 페이지 종류 {:?} 가 있고 이벤트 유형은 벡터 추정이라 {:?} 전체를 회수하고, 추정 유형 {:?} 의 기록을 앞에 둡니다.",
+                    analytic_pages, all, analytic_lift
+                ));
+            }
+        }
+        if !analytic_actions.is_empty() {
+            let action_types = crate::analytic::action_event_types(&analytic_actions);
+            if let Some(ctxs) = structured_query.get_mut("context").and_then(|c| c.as_array_mut()) {
+                for ctx in ctxs.iter_mut() {
+                    if let Some(o) = ctx.as_object_mut() {
+                        o.insert("types".to_string(), json!(action_types));
+                        if let Some(first) = action_types.first() {
+                            o.insert("type".to_string(), json!(first));
+                        }
+                    }
+                }
+            }
+            emit_term(&format!(
+                "[AI-SEARCH] 🧭 [ANALYTIC ACTION] 질의의 버튼 행동 {:?} → 유형 {:?}, 회수한 기록을 누른 버튼 글자로 거릅니다.",
+                analytic_actions, action_types
+            ));
+        }
+        let cc = if search_mode == "analytic" && cc.trim().is_empty() {
+            match store_opt.as_ref() {
+                Some(store) => match crate::analytic::site_mention(store, &query).await {
+                    Some((site_cc, name)) => {
+                        emit_term(&format!(
+                            "[AI-SEARCH] 🌐 [SITE SCOPE] 질의에 사이트 '{}' 가 나와 그 사이트의 행동 로그로 좁힙니다 (cc={}).",
+                            name, site_cc
+                        ));
+                        site_cc
+                    }
+                    None => cc,
+                },
+                None => cc,
+            }
+        } else {
+            cc
+        };
 
         // =====================================================================
         // 🌟 [VISION QUERY TRACK] shipping 모드에서 SigLIP2 텍스트 인코더로
@@ -3062,13 +3303,14 @@ async fn ai_search_complex(
                 // 🌟 [RECALL LIMIT] Dexie 가 뒤에서 조건으로 잘라내므로 여기서는 넓게 긁습니다.
                 //    기존 limit 5 는 '조건이 SQL 에 이미 적용되었다' 는 전제였는데,
                 //    v4 에서는 조건이 SQL 에 없으므로 5건만 가져오면 정답이 잘려 나갑니다.
-                const RECALL_LIMIT: usize = 50;
+                //    행동 로그를 페이지 종류로 거를 때는 거른 뒤에도 정답이 남도록 넓게 회수합니다.
+                let recall_limit: usize = if analytic_pages.is_empty() && analytic_actions.is_empty() { 50 } else { 200 };
 
                 // 🌟 [비전 트랙] 루프 밖에서 1회 생성한 질의 벡터를 전 컨텍스트가 공유합니다.
                 //    (구버전은 여기서 매번 siglip2_model 을 들여다봤지만 로드 코드가 없어
                 //     항상 None 이었습니다. 자세한 경위는 위 [VISION QUERY TRACK] 주석 참조)
                 let final_results = store
-                    .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), RECALL_LIMIT, 0, scope_filter.clone(), true)
+                    .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), recall_limit, 0, scope_filter.clone(), true)
                     .await
                     .unwrap_or_else(|e| {
                         println!("[AI-SEARCH] ⚠️ scope query failed ({}). Falling back to mode-only scope.", e);
@@ -3089,14 +3331,49 @@ async fn ai_search_complex(
                     };
                     println!("[AI-SEARCH] 🛟 [SCOPE FALLBACK] 0 hit with full scope. Retrying with '{}'.", mode_only);
                     store
-                        .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), RECALL_LIMIT, 0, Some(mode_only), true)
+                        .search_items(target_table, &search_text, emb.clone(), vision_qvec.clone(), recall_limit, 0, Some(mode_only), true)
                         .await
                         .unwrap_or_default()
                 } else {
                     final_results
                 };
 
+                let mut page_dropped = 0usize;
+                // 🌟 [ANALYTIC ACTION] 질의가 장바구니 담기 · 바로 구매 · 찜 · 쿠폰 받기 같은 버튼 행동을 물으면, 회수한 기록 중
+                //    누른 버튼 글자(data.action)가 그 행동인 것만 남깁니다 (바로 앞 페이지 거르기와 같은 자리). 하나도 안 남으면 거르지 않습니다.
+                let action_hits: usize = if analytic_actions.is_empty() {
+                    0
+                } else {
+                    final_results
+                        .iter()
+                        .filter(|(_, content, _)| {
+                            serde_json::from_str::<Value>(content)
+                                .ok()
+                                .map_or(false, |d| crate::analytic::doc_action_kinds(&d).iter().any(|k| analytic_actions.contains(k)))
+                        })
+                        .count()
+                };
+                let mut action_dropped = 0usize;
                 for (id, content, score) in final_results {
+                    if !analytic_pages.is_empty() {
+                        let kind = serde_json::from_str::<Value>(&content)
+                            .ok()
+                            .and_then(|d| crate::analytic::doc_page_kind(&d));
+                        if !kind.as_ref().map_or(false, |k| analytic_pages.contains(k)) {
+                            page_dropped += 1;
+                            continue;
+                        }
+                    }
+                    if action_hits > 0 {
+                        let acts = serde_json::from_str::<Value>(&content)
+                            .ok()
+                            .map(|d| crate::analytic::doc_action_kinds(&d))
+                            .unwrap_or_default();
+                        if !acts.iter().any(|k| analytic_actions.contains(k)) {
+                            action_dropped += 1;
+                            continue;
+                        }
+                    }
                     // 결과 배열 내 중복 방어
                     let is_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&id));
                     if !is_dup {
@@ -3105,6 +3382,12 @@ async fn ai_search_complex(
 
                     // 백엔드(LanceDB)에서의 N:N 양방향 교차 검색(FTS) 로직을 제거하고,
                     // 프론트엔드(Dexie DB)로 역할을 위임합니다.
+                }
+                if page_dropped + action_dropped > 0 {
+                    emit_term(&format!(
+                        "[AI-SEARCH] 🧭 [ANALYTIC FILTER] 페이지 종류 {:?} 로 {}건, 행동 종류 {:?} 로 {}건을 걸렀습니다 (행동이 맞는 기록 {}건).",
+                        analytic_pages, page_dropped, analytic_actions, action_dropped, action_hits
+                    ));
                 }
 
                 // =====================================================================
@@ -3662,6 +3945,38 @@ async fn ai_search_complex(
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
 
+            // ── 5-D1: 행동 로그는 질의가 묻는 유형(넓혀 회수했으면 추정 유형, 안전망 report 제외)의 기록을 앞으로
+            //          (점수는 정규화되어 1 이하이므로 +1 이 묶음 경계) ──
+            if !analytic_lift.is_empty() {
+                let mut lifted = 0usize;
+                for r in ranked_results.iter_mut() {
+                    let ty = r
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .and_then(|t| serde_json::from_str::<Value>(t).ok())
+                        .and_then(|d| d.get("type").and_then(|v| v.as_str()).map(|s| s.to_lowercase()))
+                        .unwrap_or_default();
+                    if analytic_lift.iter().any(|g| *g == ty) {
+                        if let Some(o) = r.as_object_mut() {
+                            let s = o.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            o.insert("score".to_string(), json!(s + 1.0));
+                        }
+                        lifted += 1;
+                    }
+                }
+                ranked_results.sort_by(|a, b| {
+                    let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                emit_term(&format!(
+                    "[AI-SEARCH] 🧭 [ANALYTIC TYPE ORDER] 질의가 묻는 유형 {:?} 의 기록 {}건을 앞에, 나머지(다른 유형 · 안전망 report) {}건을 뒤에 둡니다.",
+                    analytic_lift,
+                    lifted,
+                    ranked_results.len() - lifted
+                ));
+            }
+
             // ── 5-D2: 질의 전체 트랙과 합칩니다 (search_fusion 모듈 설명 참조) ──
             if search_mode == "commerce" {
                 if let Some(store) = store_opt.as_ref() {
@@ -3709,6 +4024,15 @@ async fn ai_search_complex(
                         let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
                     });
+                }
+                // 🌟 [RELATION] 고정점(식별자 · 사람 이름 · 제목 · 상태 · 서식 번호)에서 질의가 묻는 유형으로 건너간 문서를 맨 앞으로
+                //    (search_relation 설명 참조). 기간 조인이 적용된 질의는 건드리지 않습니다.
+                if search_mode == "commerce" {
+                    crate::search_relation::relation_join(store, &mut ranked_results, &mut dexie_plans, &query, &language, &cc, &emit_term).await;
+                } else if search_mode == "shipping" {
+                    crate::search_relation::trade_relation_join(store, &mut ranked_results, &mut dexie_plans, &query, &language, &emit_term).await;
+                } else if search_mode == "analytic" {
+                    crate::search_relation::analytic_anchor_boost(store, &mut ranked_results, &query, &cc, &emit_term).await;
                 }
             }
 
@@ -5627,6 +5951,34 @@ pub async fn eval_ai_search(
     .await
 }
 
+/// 🌟 [SYNTH EVAL / ANALYTIC] 행동 로그 원시 행을 프론트엔드 동기화(modes/analytic.ts)와 같은 명령 순서로 넣습니다.
+///   upsert_items(원시 행 저장, updated_at 0) → structure_pending_analytics(대상이 없을 때까지)
+///   → reindex_pending_embeddings(mode analytic, 대상이 없을 때까지).
+/// Cloudflare D1(console.logis.center) 대신 합성 행을 받는 연결점이라, 원시 행의 모양은 Worker 응답을
+/// fetchAnalyticsOrigin 이 바꾼 모양과 같아야 합니다 (data 는 풀린 JSON).
+pub async fn eval_analytic_ingest(app: &tauri::AppHandle, items: Vec<Value>, batch: usize) -> Result<Value, String> {
+    let saved = upsert_items(app.state::<AppState>(), items).await?;
+    let processed = |r: &Value| r.get("processed").and_then(|v| v.as_u64()).unwrap_or(0);
+    let (mut structured, mut rounds) = (0u64, 0u32);
+    loop {
+        let r = structure_pending_analytics(app.state::<AppState>(), app.clone(), Some(batch.max(1)), None).await?;
+        rounds += 1;
+        structured += processed(&r);
+        if processed(&r) == 0 || rounds >= 500 {
+            break;
+        }
+    }
+    let mut embedded = 0u64;
+    for _ in 0..500 {
+        let r = reindex_pending_embeddings(app.state::<AppState>(), app.clone(), Some(64), None, Some("analytic".to_string())).await?;
+        embedded += processed(&r);
+        if processed(&r) == 0 {
+            break;
+        }
+    }
+    Ok(json!({ "saved": saved, "structured": structured, "rounds": rounds, "embedded": embedded }))
+}
+
 pub fn run() {
     crate::model::lang_llm::register_loader(crate::models::qwen4_exp::registry::load_lang_runtime);
     let model = Arc::new(TokioMutex::new(None));
@@ -5902,4 +6254,4 @@ pub fn run() {
                 crate::utils::device_utils::rocm_exit_now_if_used(0);
             }
         });
-}
+}

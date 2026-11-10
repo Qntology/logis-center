@@ -1,0 +1,10 @@
+url: https://sorae-market.test/admin/event/view?ev_id=EV718
+page_type: event
+layout: detail
+title: 기획전 정보
+fields:
+  id,link: EV718
+  title: 여름 휴가 준비전
+  started_at: '2026-06-15'
+  expired_at: '2026-07-12'
+  status: 종료

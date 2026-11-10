@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: ko
+document_title: 선하증권
+metadata:
+  bl_number: BL-KR26601893
+  issue_date: '2026-06-11'
+  related_invoice_number: CI-KR-2606-415
+  related_po_number: PO-KR-86767
+  related_lc_number: LC-KR2902275
+  freight_term: 운임 선불
+parties:
+  shipper:
+    name: (주)새벽공방
+    address: 경기도 안산시 단원구 해봉로 77
+  consignee:
+    name: Komorebi Co., Ltd.
+    address: 일본 도쿄도 스기나미구 아사가야키타 2-14-7
+  notify_party:
+    name: Komorebi Co., Ltd.
+    address: 일본 도쿄도 스기나미구 아사가야키타 2-14-7
+  carrier:
+    name: 한바다해운(주)
+shipping_details:
+  vessel_flight: HANBADA STAR V.031E
+  port_of_loading: 부산, 대한민국
+  port_of_discharge: 도쿄, 일본
+  place_of_receipt: 안산, 대한민국
+  place_of_delivery: 도쿄, 일본
+cargo_details:
+  container_number: HBDU5692557
+  seal_number: SL898473
+  marks_and_numbers: KOMOREBI / TOKYO / MADE IN KOREA
+  number_of_packages: 19상자
+  description_of_goods: USB-C 멀티 허브 / 털 슬리퍼
+  gross_weight_kg: 567.2
+  measurement_cbm: 5.28

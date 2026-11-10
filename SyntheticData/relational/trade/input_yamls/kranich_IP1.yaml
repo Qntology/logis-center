@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: en
+document_title: Cargo Insurance Policy
+metadata:
+  policy_number: IP-GB-309063
+  issue_date: '2026-06-10'
+  effective_date: '2026-06-11'
+  related_invoice_number: CI-GB-2606-899
+  related_bl_number: BL-GB13666752
+  related_lc_number: LC-GB6873816
+  related_po_number: PO-GB-92895
+parties:
+  insurer:
+    name: Harrowgate Marine Assurance plc
+    address: 22 Mincing Row, London EC3R 7AA, United Kingdom
+  insured:
+    name: Bramblewood Outfitters Ltd.
+    address: 14 Wharf Road, Felixstowe IP11 3AB, United Kingdom
+coverage_details:
+  sum_insured: 3808.12
+  currency: GBP
+  valuation_basis: Invoice value plus 10%
+  coverage_conditions: Institute Cargo Clauses (A) - All Risks
+  premium_amount: 9.52
+  claims_payable_at: Hamburg, Germany
+transport_details:
+  vessel_flight: NORTHBRIDGE TRADER V.55E
+  port_of_loading: Felixstowe, United Kingdom
+  port_of_discharge: Hamburg, Germany
+cargo_details:
+- mark_and_numbers: KRANICHHOF / LEIPZIG / MADE IN UK
+  description_of_goods: Handheld mini fan / Plush house slippers
+  number_of_packages: 30 cartons
+  gross_weight_kg: 1091.8

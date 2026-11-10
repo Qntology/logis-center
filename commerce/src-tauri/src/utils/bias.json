@@ -16,7 +16,9 @@
         "لمس", "ملموس", "تمرير",
         "dotyk", "dotknutí", "přejetí",
         "tocco", "toccato", "scorrere",
-        "aanraken", "aangeraakt", "vegen"
+        "aanraken", "aangeraakt", "vegen",
+        "tap", "taps", "tapped", "tapping", "タップ", "点按", "轻触", "tippen", "getippt",
+        "toque", "toques", "appui", "appuis", "tocchi", "tikken", "tik", "getikt", "dotyky", "لمسات"
       ]
     },
     "click": {
@@ -93,6 +95,408 @@
         "zpráva", "přehled", "statistika", 
         "rapporto", "riepilogo", 
         "overzicht", "samenvatting"
+      ]
+    }
+  },
+  "analytic_action_filters": {
+    "add_to_cart": {
+      "semantic": "the user put a product into the shopping cart with the add-to-cart button",
+      "types": ["click", "touch"],
+      "stems": ["cart", "basket", "장바구니", "カート", "购物车", "加购", "warenkorb", "panier", "carrito", "cesta", "carrello", "carrinho", "winkelwagen", "košík", "سلة"]
+    },
+    "buy_now": {
+      "semantic": "the user pressed the buy-now button to purchase a product immediately",
+      "types": ["click", "touch"],
+      "stems": ["buy now", "바로 구매", "바로구매", "今すぐ購入", "立即购买", "jetzt kaufen", "sofort kaufen", "acheter maintenant", "comprar ahora", "acquista ora", "compra ora", "comprar agora", "nu kopen", "koupit nyní", "اشتر الآن"]
+    },
+    "wishlist": {
+      "semantic": "the user saved a product to the wishlist or favourites",
+      "types": ["click", "touch"],
+      "stems": ["wishlist", "wish list", "favorite", "favourite", "찜", "관심상품", "お気に入り", "收藏", "merkzettel", "wunschliste", "favoris", "liste de souhaits", "favoritos", "lista de deseos", "preferiti", "lista dei desideri", "lista de desejos", "verlanglijst", "favorieten", "oblíbené", "المفضلة"]
+    },
+    "coupon": {
+      "semantic": "the user downloaded or claimed a coupon",
+      "types": ["click", "touch"],
+      "stems": ["coupon", "voucher", "쿠폰", "クーポン", "优惠券", "gutschein", "cupón", "cupon", "cupom", "cupão", "kortingsbon", "kupón", "kupon", "قسيمة", "قسائم", "كوبون"]
+    }
+  },
+  "analytic_page_filters": {
+    "goods_view": {
+      "semantic": "the product detail page that shows one product with its price, options and the add-to-cart button",
+      "paths": [
+        "/goods/view",
+        "/goods/detail",
+        "/goods/",
+        "/product/",
+        "/products/",
+        "/item/",
+        "/shop/detail"
+      ],
+      "exact_match": [
+        "상품 상세",
+        "상품상세",
+        "상세 페이지",
+        "상세페이지",
+        "상품 페이지",
+        "상품페이지",
+        "product page",
+        "product pages",
+        "product detail",
+        "product details",
+        "item page",
+        "商品詳細",
+        "商品ページ",
+        "詳細ページ",
+        "商品详情",
+        "详情页",
+        "商品页",
+        "produktseite",
+        "produktseiten",
+        "artikelseite",
+        "artikelseiten",
+        "produktdetail",
+        "fiche produit",
+        "fiches produit",
+        "page produit",
+        "pages produit",
+        "ficha de producto",
+        "fichas de producto",
+        "página de producto",
+        "páginas de producto",
+        "pagina prodotto",
+        "pagine prodotto",
+        "scheda prodotto",
+        "schede prodotto",
+        "página de produto",
+        "páginas de produto",
+        "página do produto",
+        "productpagina",
+        "productpagina's",
+        "stránka produktu",
+        "stránce produktu",
+        "stránkách produktů",
+        "stránky produktů",
+        "detail produktu",
+        "صفحة المنتج",
+        "صفحات المنتجات",
+        "صفحة منتج"
+      ]
+    },
+    "goods_list": {
+      "semantic": "a category or product listing page that shows many products",
+      "paths": [
+        "/goods/list",
+        "/category",
+        "/products",
+        "/shop"
+      ],
+      "exact_match": [
+        "상품 목록",
+        "상품목록",
+        "카테고리 페이지",
+        "category page",
+        "product list",
+        "product listing",
+        "商品一覧",
+        "カテゴリページ",
+        "商品列表",
+        "分类页",
+        "produktliste",
+        "kategorieseite",
+        "liste des produits",
+        "page catégorie",
+        "lista de productos",
+        "página de categoría",
+        "elenco prodotti",
+        "pagina categoria",
+        "lista de produtos",
+        "página de categoria",
+        "productoverzicht",
+        "categoriepagina",
+        "seznam produktů",
+        "stránka kategorie",
+        "قائمة المنتجات",
+        "صفحة الفئة"
+      ]
+    },
+    "search": {
+      "semantic": "the search results page shown after typing a keyword",
+      "paths": [
+        "/search",
+        "/goods/search"
+      ],
+      "exact_match": [
+        "검색 결과 페이지",
+        "검색 페이지",
+        "검색결과",
+        "search results",
+        "search page",
+        "検索結果",
+        "搜索结果",
+        "suchergebnis",
+        "suchseite",
+        "résultats de recherche",
+        "page de recherche",
+        "resultados de búsqueda",
+        "risultati di ricerca",
+        "risultati della ricerca",
+        "resultados da pesquisa",
+        "resultados de busca",
+        "zoekresultaten",
+        "výsledky vyhledávání",
+        "نتائج البحث"
+      ]
+    },
+    "cart": {
+      "semantic": "the shopping cart page that lists the items put in the cart",
+      "paths": [
+        "/order/cart",
+        "/cart",
+        "/basket"
+      ],
+      "exact_match": [
+        "장바구니 페이지",
+        "장바구니 화면",
+        "cart page",
+        "basket page",
+        "shopping cart page",
+        "カートページ",
+        "カート画面",
+        "购物车页面",
+        "购物车页",
+        "warenkorbseite",
+        "warenkorb-seite",
+        "page panier",
+        "page du panier",
+        "página del carrito",
+        "página de la cesta",
+        "pagina del carrello",
+        "pagina carrello",
+        "página do carrinho",
+        "winkelwagenpagina",
+        "stránka košíku",
+        "stránce košíku",
+        "صفحة السلة",
+        "صفحة عربة التسوق"
+      ]
+    },
+    "checkout": {
+      "semantic": "the checkout page where the buyer chooses a payment method and pays",
+      "paths": [
+        "/order/checkout",
+        "/checkout",
+        "/order/form",
+        "/payment"
+      ],
+      "exact_match": [
+        "결제 페이지",
+        "결제페이지",
+        "결제 화면",
+        "결제 단계",
+        "주문서",
+        "checkout",
+        "決済ページ",
+        "レジ",
+        "注文手続き",
+        "お支払い画面",
+        "结算页",
+        "结算页面",
+        "付款页面",
+        "支付页面",
+        "kasse",
+        "bezahlseite",
+        "page de paiement",
+        "au paiement",
+        "página de pago",
+        "al pago",
+        "pagina di pagamento",
+        "al pagamento",
+        "página de pagamento",
+        "ao pagamento",
+        "kassa",
+        "afrekenpagina",
+        "afrekenen",
+        "pokladna",
+        "pokladně",
+        "pokladny",
+        "صفحة الدفع"
+      ]
+    },
+    "order_complete": {
+      "semantic": "the order confirmation page shown after the payment succeeded",
+      "paths": [
+        "/order/complete",
+        "/order/done",
+        "/order/finish",
+        "/checkout/complete"
+      ],
+      "exact_match": [
+        "주문 완료",
+        "주문완료",
+        "결제 완료 페이지",
+        "order confirmation",
+        "order complete",
+        "order confirmed",
+        "thank you page",
+        "注文完了",
+        "ご注文完了",
+        "订单完成",
+        "下单成功",
+        "bestellbestätigung",
+        "bestellung bestätigt",
+        "confirmation de commande",
+        "confirmación del pedido",
+        "confirmación de pedido",
+        "conferma dell'ordine",
+        "conferma ordine",
+        "confirmação do pedido",
+        "orderbevestiging",
+        "bestelbevestiging",
+        "potvrzení objednávky",
+        "تأكيد الطلب",
+        "اكتمال الطلب"
+      ]
+    },
+    "event_view": {
+      "semantic": "a promotion or event landing page",
+      "paths": [
+        "/event/view",
+        "/event/",
+        "/events/",
+        "/promotion/",
+        "/exhibition/"
+      ],
+      "exact_match": [
+        "이벤트 페이지",
+        "이벤트페이지",
+        "기획전 페이지",
+        "event page",
+        "promotion page",
+        "campaign page",
+        "イベントページ",
+        "特集ページ",
+        "活动页面",
+        "活动页",
+        "aktionsseite",
+        "aktionsseiten",
+        "eventseite",
+        "page de l'opération",
+        "page de l'événement",
+        "page événement",
+        "página de la promoción",
+        "página del evento",
+        "pagina della promozione",
+        "pagina dell'evento",
+        "página da promoção",
+        "página do evento",
+        "actiepagina",
+        "evenementpagina",
+        "stránce akce",
+        "stránka akce",
+        "stránku akce",
+        "صفحة عرض",
+        "صفحة العرض",
+        "صفحة الفعالية"
+      ]
+    },
+    "review_write": {
+      "semantic": "the page where a buyer writes a product review",
+      "paths": [
+        "/mypage/review/write",
+        "/review/write",
+        "/reviews/new"
+      ],
+      "exact_match": [
+        "리뷰 작성",
+        "리뷰 쓰기",
+        "후기 작성",
+        "review form",
+        "write a review page",
+        "レビュー投稿",
+        "レビューを書く",
+        "写评价",
+        "评价页面",
+        "bewertungsformular",
+        "bewertung schreiben",
+        "formulaire d'avis",
+        "rédiger un avis",
+        "escribir una reseña",
+        "formulario de reseña",
+        "scrivere una recensione",
+        "modulo recensione",
+        "escrever uma avaliação",
+        "formulário de avaliação",
+        "review schrijven",
+        "reviewformulier",
+        "psaní recenze",
+        "formulář recenze",
+        "كتابة مراجعة",
+        "نموذج المراجعة"
+      ]
+    },
+    "mypage_orders": {
+      "semantic": "the account page that lists the buyer's past orders",
+      "paths": [
+        "/mypage/orders",
+        "/mypage",
+        "/my/orders",
+        "/account/orders"
+      ],
+      "exact_match": [
+        "마이페이지",
+        "주문 내역",
+        "주문내역",
+        "my account",
+        "order history",
+        "マイページ",
+        "注文履歴",
+        "我的订单",
+        "个人中心",
+        "mein konto",
+        "bestellübersicht",
+        "mon compte",
+        "historique des commandes",
+        "mi cuenta",
+        "historial de pedidos",
+        "il mio account",
+        "storico ordini",
+        "minha conta",
+        "histórico de pedidos",
+        "mijn account",
+        "bestelgeschiedenis",
+        "můj účet",
+        "historie objednávek",
+        "حسابي",
+        "سجل الطلبات"
+      ]
+    },
+    "home": {
+      "semantic": "the site's main landing page",
+      "paths": [
+        "/",
+        "/index",
+        "/main",
+        "/home"
+      ],
+      "exact_match": [
+        "메인 페이지",
+        "메인페이지",
+        "홈 화면",
+        "첫 화면",
+        "home page",
+        "homepage",
+        "landing page",
+        "トップページ",
+        "首页",
+        "startseite",
+        "page d'accueil",
+        "página de inicio",
+        "pagina iniziale",
+        "página inicial",
+        "startpagina",
+        "domovská stránka",
+        "úvodní stránka",
+        "الصفحة الرئيسية"
       ]
     }
   },
@@ -917,12 +1321,16 @@
   },
   "search_bridge": {
     "domain_words": {
-      "order": ["purchase", "주문", "구매", "bestellung", "pedido", "commande", "ordin", "l'ordin", "encomenda", "bestelling", "objednávk", "طلب", "注文", "订单"],
-      "tracking": ["shipment", "shipping", "delivery", "parcel", "배송", "택배", "송장", "운송", "sendung", "lieferung", "paket", "envío", "envio", "paquete", "colis", "expédition", "livraison", "spedizion", "pacco", "pacchi", "remessa", "seguimento", "zending", "pakket", "zásilk", "balík", "شحن", "تتبع", "荷物", "配送", "追跡", "発送", "包裹", "快递", "运单", "物流"],
+      "order": ["purchase", "주문", "구매", "bestellung", "pedido", "commande", "ordin", "l'ordin", "encomenda", "bestelling", "objednáv", "طلب", "注文", "订单"],
+      "tracking": ["shipment", "shipping", "delivery", "parcel", "배송", "택배", "송장", "운송", "sendung", "lieferung", "paket", "envío", "envio", "paquete", "colis", "expédition", "livraison", "spedizion", "pacco", "pacchi", "remessa", "seguimento", "zending", "pakket", "zásil", "balík", "شحن", "تتبع", "荷物", "配送", "追跡", "発送", "包裹", "快递", "运单", "物流", "suivi", "seguimiento", "tracciament", "rastre", "verzend", "sledován"],
       "review": ["리뷰", "후기", "bewertung", "rezension", "reseña", "opinión", "avis", "recension", "avaliaç", "beoordeling", "recensie", "recenz", "مراجع", "レビュー", "口コミ", "评价", "评论"],
       "coupon": ["voucher", "쿠폰", "gutschein", "rabattcode", "cupón", "cupon", "cupão", "cupom", "kortingscode", "waardebon", "kupón", "slevov", "قسيمة", "كوبون", "クーポン", "优惠券"],
-      "event": ["campaign", "promotion", "이벤트", "기획전", "프로모션", "캠페인", "kampagne", "aktion", "campaña", "promoci", "campagne", "campagn", "promozion", "campanha", "promoç", "kampaň", "akce", "حملة", "حملات", "キャンペーン", "イベント", "活动"]
+      "event": ["campaign", "promotion", "이벤트", "기획전", "프로모션", "캠페인", "kampagne", "aktion", "campaña", "promoci", "campagne", "campagn", "promozion", "campanha", "promoç", "kampaň", "akce", "حملة", "حملات", "キャンペーン", "イベント", "活动"],
+      "goods": ["product", "item", "goods", "merchandise", "상품", "제품", "품목", "물건", "商品", "製品", "品物", "产品", "货品", "artikel", "produkt", "producto", "artículo", "articulo", "produit", "prodott", "articol", "produto", "artigo", "zboží", "výrob", "منتج", "سلع", "بضائع"]
     },
+    "document_words": ["document", "documents", "docs", "paperwork", "서류", "문서", "書類", "文書", "单据", "文件", "unterlagen", "dokumente", "papiere", "documentos", "documenti", "documentazione", "documentação", "documenten", "dokumenty", "dokumentace", "مستندات", "وثائق"],
+    "period_words": ["during", "throughout", "기간", "동안", "期間", "期间", "während", "im zeitraum", "pendant", "durant", "au cours de", "durante", "en el transcurso de", "nel corso di", "no decorrer de", "tijdens", "gedurende", "během", "v průběhu", "po dobu", "خلال", "أثناء", "طوال"],
+    "trade_title_plurals": {"BL": ["بوالص الشحن"], "AWB": ["بوالص الشحن الجوي"], "IP": ["بوالص التأمين", "وثائق التأمين"], "CI": ["فواتير تجارية"], "PI": ["فواتير مبدئية"], "PL": ["قوائم التعبئة"], "PO": ["أوامر الشراء"], "SC": ["عقود البيع"], "LC": ["خطابات اعتماد"], "CO": ["شهادات المنشأ"], "ED": ["إقرارات التصدير"], "SA": ["إشعارات الشحن"], "SR": ["طلبات الشحن"]},
     "path_alias": {
       "amount": ["amount_total", "total_amount", "grand_total_amount", "price", "total_price_sum"],
       "amount_subtotal": ["subtotal", "sub_total", "net_amount", "total_supply_amount"],
@@ -1337,13 +1745,13 @@
   "status_filters": {
     "draft": { "bias": "draft, preparation, pending pickup, cart", "prejudice": "complete, delivered, closed, running, active", "exact_match": ["draft", "drafts", "임시저장", "작성중", "초안", "下書き", "草稿", "Entwurf", "borrador", "brouillon", "bozza", "rascunho", "koncept", "مسودة", "awaiting payment", "zahlung ausstehend", "pendiente de pago", "en attente de paiement", "in attesa di pagamento", "a aguardar pagamento", "wacht op betaling", "čeká na platbu", "بانتظار الدفع", "入金待ち", "待付款", "entwurf", "concept", "pending", "ausstehend", "pendiente", "en attente", "in attesa", "pendente", "in afwachting", "čeká na schválení", "قيد المراجعة", "承認待ち", "待审核", "scheduled", "geplant", "programado", "programmé", "programmato", "agendado", "gepland", "naplánováno", "مجدولة", "開催予定", "未开始"] },
     "progress": { "bias": "progress, processing, active, running, transit, in transit", "prejudice": "draft, complete, error, stop, pause", "exact_match": ["in progress", "processing", "in transit", "진행중", "진행 중", "처리중", "처리 중", "배송중", "배송 중", "배송준비중", "배송 준비중", "상품준비중", "발송중", "결제완료", "進行中", "処理中", "配送中", "発送準備中", "进行中", "处理中", "运输中", "in Bearbeitung", "unterwegs", "en proceso", "en tránsito", "en cours", "en transit", "in corso", "in lavorazione", "in transito", "em andamento", "em processamento", "em trânsito", "in behandeling", "onderweg", "na cestě", "قيد المعالجة", "قيد التوصيل", "paid", "bezahlt", "pagado", "payée", "pagato", "pago", "betaald", "zaplaceno", "مدفوع", "入金済み", "已付款", "in bearbeitung", "en préparation", "zpracovává se", "shipped", "enviado", "expédiée", "spedito", "verzonden", "odesláno", "تم الشحن", "発送済み", "已发货", "live", "läuft", "en curso", "attivo", "ativo", "lopend", "probíhá", "جارية", "開催中"] },
-    "return": { "bias": "return, returning, returned", "prejudice": "progress, complete, draft", "exact_match": ["returned", "반품", "반품완료", "반품됨", "반품된", "返品", "返品済み", "已退货", "退货", "zurückgesendet", "retourniert", "devuelto", "retourné", "restituito", "devolvido", "geretourneerd", "vráceno", "مرتجع", "retournée", "retournées", "retournés", "devuelta", "devueltas", "devueltos", "restituita", "restituiti"] },
+    "return": { "bias": "return, returning, returned", "prejudice": "progress, complete, draft", "exact_match": ["returned", "반품", "반품완료", "반품됨", "반품된", "返品", "返品済み", "已退货", "退货", "zurückgesendet", "retourniert", "devuelto", "retourné", "restituito", "devolvido", "geretourneerd", "vráceno", "vrácen", "مرتجع", "retournée", "retournées", "retournés", "devuelta", "devueltas", "devueltos", "restituita", "restituiti"] },
     "complete": { "bias": "complete, delivered, closed, finished, published", "prejudice": "draft, progress, error, stop, return", "exact_match": ["completed", "delivered", "finished", "배송완료", "배달완료", "구매확정", "거래완료", "처리완료", "수령완료", "完了", "配達完了", "配送完了", "已完成", "已送达", "已签收", "abgeschlossen", "zugestellt", "completado", "entregado", "terminé", "livré", "completato", "consegnato", "concluído", "entregue", "voltooid", "afgeleverd", "bezorgd", "dokončeno", "doručeno", "مكتمل", "تم التسليم", "완료", "zugestellte", "abgeschlossene", "livrée", "livrées", "livrés", "terminée", "terminées", "entregada", "entregadas", "entregados", "completada", "completadas", "completados", "consegnata", "consegnati", "consegnate", "completata", "تم التوصيل", "approved", "freigegeben", "aprobada", "approuvé", "approvata", "aprovada", "goedgekeurd", "schváleno", "معتمد", "承認済み", "已通过"] },
     "error": { "bias": "error, exception, failed, spam, blocked, rejected", "prejudice": "complete, progress, active, draft", "exact_match": ["failed", "오류", "에러", "실패", "エラー", "失敗", "错误", "失败", "fehlgeschlagen", "fallido", "échoué", "fallito", "falhou", "mislukt", "selhalo", "فشل"] },
     "show": { "bias": "show, visible, active, displayed", "prejudice": "hide, hidden, stop", "exact_match": ["displayed", "on display", "visible", "진열", "진열중", "노출", "노출중", "전시중", "판매중", "表示中", "陳列中", "显示中", "展示中", "上架", "sichtbar", "angezeigt", "mostrado", "affiché", "visibile", "esposto", "visível", "exibido", "zichtbaar", "viditelné", "معروض", "active", "aktiv", "activo", "en vente", "in vendita", "à venda", "actief", "v prodeji", "معروض للبيع", "販売中", "在售"] },
     "hide": { "bias": "hide, hidden", "prejudice": "show, visible, active, displayed", "exact_match": ["hidden", "숨김", "비노출", "미노출", "미진열", "진열안함", "노출안함", "비공개", "非表示", "非公開", "隐藏", "下架", "ausgeblendet", "versteckt", "oculto", "masqué", "caché", "nascosto", "verborgen", "skryté", "مخفي", "nascosta", "oculta", "skryto", "已隐藏"] },
     "stop": { "bias": "stop, hold, pause, suspended, blocked", "prejudice": "progress, active, running, complete", "exact_match": ["stopped", "suspended", "paused", "on hold", "중지", "판매중지", "일시중지", "정지", "보류", "停止", "販売停止", "一時停止", "暂停", "停售", "gestoppt", "pausiert", "angehalten", "detenido", "pausado", "suspendido", "suspendu", "en pause", "sospeso", "in pausa", "suspenso", "gestopt", "gepauzeerd", "pozastaveno", "متوقف", "معلق", "판매중단", "sold out", "ausverkauft", "agotado", "épuisé", "esaurito", "esgotado", "uitverkocht", "vyprodáno", "نفد المخزون", "売り切れ", "已售罄"] },
-    "cancel": { "bias": "cancel, cancelled, deleted, withdrawn, discontinued", "prejudice": "progress, complete, draft, active", "exact_match": ["cancelled", "canceled", "취소", "주문취소", "취소완료", "취소됨", "취소된", "단종", "キャンセル", "キャンセル済み", "取消", "已取消", "storniert", "cancelado", "annulé", "annullato", "geannuleerd", "zrušeno", "ملغى", "ملغي", "stornierte", "storniertes", "stornierten", "annulée", "annulées", "annulés", "cancelada", "canceladas", "cancelados", "annullata", "annullate", "annullati"] },
+    "cancel": { "bias": "cancel, cancelled, deleted, withdrawn, discontinued", "prejudice": "progress, complete, draft, active", "exact_match": ["cancelled", "canceled", "취소", "주문취소", "취소완료", "취소됨", "취소된", "단종", "キャンセル", "キャンセル済み", "取消", "已取消", "storniert", "cancelado", "annulé", "annullato", "geannuleerd", "zrušeno", "zrušen", "ملغى", "ملغي", "ملغاة", "stornierte", "storniertes", "stornierten", "annulée", "annulées", "annulés", "cancelada", "canceladas", "cancelados", "annullata", "annullate", "annullati"] },
     "refund": { "bias": "refund, refunded", "prejudice": "progress, active, complete", "exact_match": ["refunded", "환불", "환불완료", "환불됨", "환불된", "返金", "返金済み", "已退款", "退款", "erstattet", "rückerstattet", "reembolsado", "remboursé", "rimborsato", "terugbetaald", "مسترد", "erstattete", "remboursée", "remboursées", "remboursés", "reembolsada", "reembolsadas", "reembolsados", "rimborsata", "rimborsati"] },
     "exchange": { "bias": "exchange, exchanged", "prejudice": "refund, return, complete", "exact_match": ["exchanged", "교환", "교환완료", "교환됨", "교환된", "交換", "交換済み", "已换货", "换货", "umgetauscht", "intercambiado", "échangé", "sostituito", "trocado", "omgeruild", "vyměněno", "مستبدل"] },
     "expire": { "bias": "expire, expired", "prejudice": "progress, active, complete", "exact_match": ["expired", "만료", "기간만료", "만료됨", "만료된", "期限切れ", "已过期", "过期", "abgelaufen", "caducado", "vencido", "expirado", "expiré", "scaduto", "verlopen", "prošlé", "منتهي الصلاحية", "ended", "beendet", "finalizado", "concluso", "terminado", "afgelopen", "ukončeno", "منتهية", "終了", "已结束"] },
@@ -1425,7 +1833,7 @@
       },
       "recipient_name": {
         "semantic": "받는사람, 수령인, 구매자 이름",
-        "bias": "받는사람, 수령인, 구매자 이름, 김철수, 이영희, 박지성",
+        "bias": "받는사람, 수령인, 구매자 이름, 김철수, 이영희, 박지성, 받는분, 받는 분",
         "prejudice": "식별자, 링크, 운송장번호, 송장, 번호, 코드, 배송상태, 진행상황, 등록일, 접수일, 발송일, 출발일, 보낸사람, 발송인, 판매자, 주소, 위치, 연락처, 전화번호, 핸드폰, 받는사람, 수령지, 배송지, 가로, 너비, 폭, 세로, 높이, 길이, 깊이, 무게, 중량, 택배사, 배송업체, 운송사, 배송비, 운송료, 요금, 배송방법, 배송수단, 배송기간, 소요일, 묶음배송, 합배송"
       },
       "recipient_address": {
@@ -2552,7 +2960,7 @@
       },
       "title": {
         "semantic": "Product name, apparel name, item name, item, name, title",
-        "bias": "shipping product name, shipping item title, shipping item name, Nike Air Force, Samsung Galaxy Book, iPhone Case, Dress Set",
+        "bias": "shipping product name, shipping item title, shipping item name, Nike Air Force, Samsung Galaxy Book, iPhone Case, Dress Set, Items, Contents",
         "prejudice": "identifier, link, tracking number, waybill, number, code, delivery status, progress, registration date, received date, dispatch date, departure date, address, location, contact, phone number, mobile, width, breadth, height, length, depth, weight, mass, carrier, courier, shipping company, shipping fee, shipping cost, rate, shipping method, delivery method, transit time, delivery duration, combined shipping, bundled shipping"
       },
       "registration_date": {
@@ -2562,7 +2970,7 @@
       },
       "shipping_date": {
         "semantic": "Dispatch date, shipping date, departure date",
-        "bias": "dispatch date, shipping date, transit time, 2026-03-16, 05/21/2026",
+        "bias": "dispatch date, shipping date, transit time, 2026-03-16, 05/21/2026, Shipped on, Ship date, Dispatched on",
         "prejudice": "identifier, link, tracking number, waybill, number, code, delivery status, progress, product name, item, name, title, sender, dispatcher, seller, address, location, contact, phone number, mobile, recipient, receiver, buyer, width, breadth, height, length, depth, weight, mass, carrier, courier, shipping company, shipping fee, shipping cost, rate, shipping method, delivery method, combined shipping, bundled shipping"
       },
       "sender_name": {
@@ -2674,7 +3082,7 @@
       },
       "registration_date": {
         "semantic": "Registration date, creation date",
-        "bias": "product date, item date, product registration date, 2026-03-15T12:00:00, 2026-05-20",
+        "bias": "product date, item date, product registration date, 2026-03-15T12:00:00, 2026-05-20, Created, Created on, Date added, Added on",
         "prejudice": "identifier, link, address, code, sales status, display status, product name, item name, name, payment method, bank, account, deposit, wire transfer, card, credit card, model name, brand name, manufacturer, product condition, used, detailed description, body text, short description, tags, keywords, country of origin, sale price, discount price, price, supply price, cost price, purchase price, currency, unit, regular price, MSRP, original price, quantity, stock, inventory level, low stock warning, unit name, taxable, tax, VAT, tax code, main image, thumbnail, additional image, video, clip, carrier, courier, shipping fee, shipping cost, shipping method, delivery method, transit time, combined shipping, bundled shipping, width, breadth, height, length, weight, mass, options, choices, add-on item, related product"
       },
       "payment_method": {
@@ -2891,7 +3299,7 @@
       },
       "tracking_number": {
         "semantic": "Tracking number, waybill",
-        "bias": "tracking number, waybill number, courier tracking, 1Z9999999999999999, 9400100000000000000000, 381234567891",
+        "bias": "tracking number, waybill number, courier tracking, 1Z9999999999999999, 9400100000000000000000, 381234567891, Tracking #, Tracking no., Tracking ID",
         "prejudice": "number, sequence, serial number, row number, list number, index, No, link, order number, order status, delivery status, status, order date, payment date, date, quantity, count, item amount, total order amount, shipping fee, order item, product name, item name, item, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "status": {
@@ -2901,17 +3309,17 @@
       },
       "registration_date": {
         "semantic": "Order date, payment date, date",
-        "bias": "order date and time, order date, order time, order registration date, 2026-03-15T14:16:35, 05/20/2026, 03-15-26 14:16",
+        "bias": "order date and time, order date, order time, order registration date, 2026-03-15T14:16:35, 05/20/2026, 03-15-26 14:16, Ordered, Ordered on, Order placed, Placed on, Date placed, Purchase date",
         "prejudice": "number, sequence, serial number, row number, index, quantity, count, item amount, total order amount, payment amount, shipping fee, identifier, link, order number, tracking number, waybill, order status, delivery status, status, order item, product name, item name, item, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, deposit, account, wire transfer, card, credit card, payment card, payment method, payment option, payment gateway, PG, payment route"
       },
       "goods": {
         "semantic": "Order item, product name, item name, item",
-        "bias": "iPhone, 15, wireless, keyboard, Nike, sneakers, dress, knit, T-shirt, order name, order title, main item name, item name and 2 more",
+        "bias": "iPhone, 15, wireless, keyboard, Nike, sneakers, dress, knit, T-shirt, order name, order title, main item name, item name and 2 more, Items, Line items, Products",
         "prejudice": "identifier, link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, orderer, buyer, sender, name, address, location, contact, phone number, mobile, recipient, receiver, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "sender_name": {
         "semantic": "Orderer, buyer, sender, name",
-        "bias": "John Doe, Jane Smith, Inc., member, guest",
+        "bias": "John Doe, Jane Smith, Inc., member, guest, Customer, Customer name, Billed to, Bill to",
         "prejudice": "link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, contact, phone number, mobile, address, location, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "sender_address": {
@@ -2926,7 +3334,7 @@
       },
       "recipient_name": {
         "semantic": "Recipient, receiver, name",
-        "bias": "Jane Doe, Michael Smith, Emily Brown",
+        "bias": "Jane Doe, Michael Smith, Emily Brown, Ship to, Shipping name, Deliver to",
         "prejudice": "link, order number, tracking number, waybill, order status, delivery status, status, order date, payment date, date, order item, product name, item name, item, address, location, contact, phone number, mobile, bank, deposit, account, wire transfer, card, credit card, payment card, date of order, deposit date, payment method, payment option, payment gateway, PG, payment route"
       },
       "recipient_address": {

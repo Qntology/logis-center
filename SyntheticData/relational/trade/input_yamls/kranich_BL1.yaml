@@ -1,0 +1,37 @@
+document_type: Bill of Lading
+document_code: BL
+language: en
+document_title: Bill of Lading
+metadata:
+  bl_number: BL-GB13666752
+  issue_date: '2026-06-11'
+  related_invoice_number: CI-GB-2606-899
+  related_po_number: PO-GB-92895
+  related_lc_number: LC-GB6873816
+  freight_term: Freight prepaid
+parties:
+  shipper:
+    name: Bramblewood Outfitters Ltd.
+    address: 14 Wharf Road, Felixstowe IP11 3AB, United Kingdom
+  consignee:
+    name: Kranichhof Handels GmbH
+    address: Lindenallee 21, 04109 Leipzig, Germany
+  notify_party:
+    name: Kranichhof Handels GmbH
+    address: Lindenallee 21, 04109 Leipzig, Germany
+  carrier:
+    name: Northbridge Line Ltd.
+shipping_details:
+  vessel_flight: NORTHBRIDGE TRADER V.55E
+  port_of_loading: Felixstowe, United Kingdom
+  port_of_discharge: Hamburg, Germany
+  place_of_receipt: Felixstowe, United Kingdom
+  place_of_delivery: Leipzig, Germany
+cargo_details:
+  container_number: NBTU9866633
+  seal_number: SL155990
+  marks_and_numbers: KRANICHHOF / LEIPZIG / MADE IN UK
+  number_of_packages: 30 cartons
+  description_of_goods: Handheld mini fan / Plush house slippers
+  gross_weight_kg: 1091.8
+  measurement_cbm: 7.92

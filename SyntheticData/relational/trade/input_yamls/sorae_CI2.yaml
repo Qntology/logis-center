@@ -1,0 +1,41 @@
+document_type: Commercial Invoice
+document_code: CI
+language: de
+document_title: Handelsrechnung
+metadata:
+  invoice_number: CI-DE-2608-685
+  issue_date: '2026-08-15'
+  reference_po_number: PO-DE-27434
+  related_bl_number: BL-DE69045827
+  related_lc_number: LC-DE7472990
+  currency: EUR
+parties:
+  shipper_exporter:
+    name: Wolkenfeld Haushaltswaren GmbH
+    address: Gutenbergstraße 8, 90461 Nürnberg, Deutschland
+    contact_number: +49 911 555 0126
+    tax_id: DE 314 552 087
+  consignee:
+    name: Sorae Sanghoe Co., Ltd.
+    address: 12 Soraeyeok-ro, Namdong-gu, Incheon, Südkorea
+    contact_number: +82 32 555 0412
+    tax_id: 131-86-40912
+shipping_details:
+  vessel_flight: ELBSTERN V.211E
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Incheon, Südkorea
+  incoterms: FOB Hamburg
+line_items:
+- item_code: SR20041
+  description: Kapuzenjacke mit Fleecefutter
+  quantity: 120
+  unit: Stk.
+  unit_price: 14.19
+  total_amount: 1702.8
+  hs_code: '6110.30'
+summary:
+  total_quantity: 120
+  total_items_amount: 1702.8
+  freight_charge: 0.0
+  insurance: 0.0
+  grand_total_amount: 1702.8

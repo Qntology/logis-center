@@ -1,0 +1,18 @@
+url: https://copperleaf-goods.test/admin/order/view?od_id=20260623-300213
+page_type: order
+layout: detail
+title: Order details
+fields:
+  id,link: 20260623-300213
+  registration_date: '2026-06-23'
+  status: Delivered
+  goods: Low-sugar protein bar
+  tracking_number: '395340899714'
+  sender_name: Taylor Marsh
+  recipient_name: Taylor Marsh
+  quantity: 4
+  amount: 62.35
+  payment_method: Credit card
+  sender_phone: +1-790-555-0181
+  recipient_address: 4443 Birch Ave, Portland, OR 97205
+  recipient_phone: +1-790-555-0181

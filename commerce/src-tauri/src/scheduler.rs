@@ -5087,9 +5087,23 @@ pub async fn process_task(
                         let c = &idlink_cands[bi];
                         det_id_link = Some((c.token.clone(), c.href.clone()));
                         emit_term(&format!("    🔑 [ID/LINK COSINE] 식별자 '{}' 확정 (역할 '{}', Score {:+.4}) → link '{}'", c.token, c.role_phrase, best_score, c.href));
+                        // 코사인 차이는 작습니다(영어 주문 목록에서 od id +0.0253 · it id +0.0245). 고른 링크가 다른 유형이고
+                        // 이 페이지 유형의 별칭 매개변수를 가진 링크가 따로 있으면 그쪽이 행 자신의 식별자입니다.
+                        if let Some((fid, flink)) = self_alias_id_link(&idlink_cands, &page_type) {
+                            if !same_id_token(&fid, &c.token) {
+                                emit_term(&format!("    🔁 [ID/LINK SELF ALIAS] 코사인이 고른 '{}' 는 다른 유형의 링크라 이 페이지 유형('{}')의 별칭 링크 '{}' 로 바꿉니다.", c.token, page_type, fid));
+                                det_id_link = Some((fid, flink));
+                            }
+                        }
                     }
                 }
 
+                if det_id_link.is_none() {
+                    if let Some((fid, flink)) = self_alias_id_link(&idlink_cands, &page_type) {
+                        emit_term(&format!("    🔑 [ID/LINK SELF ALIAS] 코사인 게이트를 통과한 후보가 없어 이 페이지 유형('{}')의 별칭 매개변수를 가진 링크로 확정: '{}' → '{}'", page_type, fid, flink));
+                        det_id_link = Some((fid, flink));
+                    }
+                }
                 if det_id_link.is_none() {
                     det_id_link = resolve_id_link_from_lines(&item_lines_ref);
                     if let Some((fid, flink)) = &det_id_link {
@@ -7279,6 +7293,13 @@ pub async fn process_task(
             }
 
             
+            if det_id_link.is_none() {
+                let cands = collect_id_link_candidates(&pug_lines_ref);
+                if let Some((fid, flink)) = self_alias_id_link(&cands, &page_type) {
+                    emit_term(&format!("  🔑 [ID/LINK SELF ALIAS] 코사인 게이트 통과 후보가 없어 이 페이지 유형('{}')의 별칭 매개변수를 가진 링크로 확정: '{}' → '{}'", page_type, fid, flink));
+                    det_id_link = Some((fid, flink));
+                }
+            }
             if det_id_link.is_none() {
                 det_id_link = resolve_id_link_from_lines(&pug_lines_ref);
                 if let Some((fid, flink)) = &det_id_link {
@@ -9637,6 +9658,7 @@ pub async fn process_task(
         obj.insert("id".to_string(), json!(generated_id.clone()));
         obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
     }
+    crate::search_relation::expose_own_number(&mut extracted_data, &page_type, &id_val_raw);
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Saving", "summary": "Syncing to database..." }));
 
@@ -10162,6 +10184,7 @@ pub async fn process_task(
                     obj.insert("index".to_string(), json!(index_val));
                     obj.insert("updated_at".to_string(), json!(0));
                 }
+                crate::search_relation::expose_own_number(&mut single_item, &page_type, &identity_seed);
                 relay_ledger::bind_tracking_ref(&mut single_item, &page_type, &team_id, &task.cc);
 
                 let existing_item = store.get_item_by_id(&target_table, &hashed_item_id).await.ok().flatten();

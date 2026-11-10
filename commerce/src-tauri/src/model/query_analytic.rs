@@ -91,9 +91,11 @@ impl crate::model::LogisModel {
         // =====================================================================
         // STEP 1 : bias.json 완전일치 + 접두일치 (벡터·LLM 없이 확정)
         // =====================================================================
-        let (det_time_key, det_season_key) = crate::analytic::deterministic_time_keys(&query);
+        // 따옴표로 묶은 이름('Summer getaway picks' · 「夏休み準備セール」)은 값이므로 기간 · 이벤트 판정에 쓰지 않습니다.
+        let literal_free = crate::stanza::strip_quoted(&query);
+        let (det_time_key, det_season_key) = crate::analytic::deterministic_time_keys(&literal_free);
         let mut det_event_keys: Vec<String> = Vec::new();
-        for w in query.split_whitespace() {
+        for w in literal_free.split_whitespace() {
             // ① 완전일치
             if let Some(k) = crate::analytic::event_type_exact_match(w) {
                 if !det_event_keys.iter().any(|e| e == &k) {
@@ -107,6 +109,17 @@ impl crate::model::LogisModel {
                 if !det_event_keys.iter().any(|e| e == &k) {
                     emit_term(&format!(
                         "   ⚡ [EVENT PREFIX MATCH] '{}' → analytic_event_filters.{} (교착어 접두 확정)",
+                        w, k
+                    ));
+                    det_event_keys.push(k);
+                }
+                continue;
+            }
+            // 🌟 ③ 붙여 쓰는 일본어 · 중국어: 확정어가 낱말 중간에 있어도 확정 ('…のモバイルタッチ記録' → touch)
+            for k in crate::analytic::event_type_glued_keys(w) {
+                if !det_event_keys.iter().any(|e| e == &k) {
+                    emit_term(&format!(
+                        "   ⚡ [EVENT GLUED MATCH] '{}' → analytic_event_filters.{} (띄어 쓰지 않는 문자의 낱말 안 확정어)",
                         w, k
                     ));
                     det_event_keys.push(k);
@@ -158,6 +171,32 @@ impl crate::model::LogisModel {
         //    드롭은 keywords / target 산출 시에만 적용합니다.
         const DROP_TAGS: &[&str] = crate::utils::ai_utils::STANZA_DROP_TAGS;
         let all_words: Vec<String> = tokens.iter().map(|(w, _, _)| w.clone()).collect();
+        let quoted = crate::stanza::quoted_token_flags(&query, &all_words);
+        // 동사 · 조동사로 쓰인 낱말(프랑스어 'a été payée' 의 été = être 의 과거분사, 영어 'prices fall' 의 fall)은
+        // 계절 · 시간 낱말이 아닙니다 (Stanza 품사 AUX · VERB). 확정 일치와 기간 글자 근거에서 뺍니다.
+        let verbal_words: std::collections::HashSet<String> = tokens
+            .iter()
+            .filter(|(_, t, _)| t == "AUX" || t == "VERB")
+            .map(|(w, _, _)| w.to_lowercase())
+            .collect();
+        let not_verbal = |text: &str| -> String {
+            text.split_whitespace()
+                .filter(|w| !verbal_words.contains(&w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let (det_time_key, det_season_key) = if verbal_words.is_empty() || (det_time_key.is_empty() && det_season_key.is_empty()) {
+            (det_time_key, det_season_key)
+        } else {
+            let keys = crate::analytic::deterministic_time_keys(&not_verbal(&literal_free));
+            if keys != (det_time_key.clone(), det_season_key.clone()) {
+                emit_term(&format!(
+                    "   🧷 [VERBAL PERIOD WORD] 동사 · 조동사로 쓰인 낱말 {:?} 를 빼고 기간 확정어를 다시 봅니다: time '{}' → '{}' · season '{}' → '{}'",
+                    verbal_words, det_time_key, keys.0, det_season_key, keys.1
+                ));
+            }
+            keys
+        };
         let content_flags: Vec<bool> = tokens
             .iter()
             .map(|(_, t, _)| !DROP_TAGS.iter().any(|d| d == t))
@@ -202,8 +241,15 @@ impl crate::model::LogisModel {
         let mut seen_chunk: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for s in 0..all_words.len() {
+            // 따옴표 안 낱말이 든 창은 청크로 올리지 않습니다 (이름 속 Summer 가 여름 기간이 되던 것). 낱말은 키워드로 남습니다.
+            if quoted[s] {
+                continue;
+            }
             let max_e = all_words.len().min(s + 6);
             for e in (s + 1)..=max_e {
+                if quoted[e - 1] {
+                    break;
+                }
                 // ① 표면형 조합
                 let surface = all_words[s..e].join(" ");
                 if !surface.trim().is_empty() {
@@ -417,6 +463,7 @@ impl crate::model::LogisModel {
         //    '전역 분포의 상위 1σ 꼬리' 에 든 최상위 후보를 따로 모아 둡니다.
         //    (통계적 사실 기반이며 새 매직 상수가 아닙니다)
         let mut rescue_pool: Vec<AnalyticSpan> = Vec::new();
+        let mut period_unsupported = 0usize;
 
         for (ci, (s, e)) in chunk_spans.iter().enumerate() {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -464,6 +511,14 @@ impl crate::model::LogisModel {
                     .unwrap_or(0.0);
                 if prej >= own {
                     continue;
+                }
+                // 🌟 [PERIOD LEXICAL GATE] 기간(시간 · 계절)은 청크 낱말이 그 키의 구 낱말을 품을 때만 후보가 됩니다.
+                if ck.0 == "time_filters" || ck.0 == "season_filters" {
+                    let phrases: Vec<&str> = idxs.iter().filter_map(|&i| bank_defs.get(i).map(|d| d.2.as_str())).collect();
+                    if !crate::analytic::period_lexical_support(&not_verbal(&chunk_texts[ci]), &phrases) {
+                        period_unsupported += 1;
+                        continue;
+                    }
                 }
                 scored.push((ck.0.clone(), ck.1.clone(), sur, own));
             }
@@ -517,6 +572,13 @@ impl crate::model::LogisModel {
                 ));
                 rescue_pool.push(span);
             }
+        }
+
+        if period_unsupported > 0 {
+            emit_term(&format!(
+                "   🧷 [PERIOD LEXICAL GATE] 청크 낱말에 기간 구 낱말이 없어 (청크, 시간 · 계절 키) {}쌍을 후보에서 뺐습니다. 벡터만 가까운 기간(가을 ← Copperleaf)은 정답을 통째로 거릅니다.",
+                period_unsupported
+            ));
         }
 
         // 🌟 [COVERAGE RESCUE] 게이트를 넘은 후보가 하나도 없으면
@@ -970,7 +1032,9 @@ impl crate::model::LogisModel {
         // 🌟 [REPORT ALWAYS-IN] report 는 여러 이벤트를 합성한 문서라
         //    '가장 많이', '패턴', '흐름' 류 질의의 정답을 담고 있습니다.
         //    특정 이벤트가 확정되어도 report 는 후보에 남겨야 정답이 잘리지 않습니다.
-        if !event_types.iter().any(|t| t == "report") {
+        //    질의가 묻지 않았는데 안전망으로 넣은 것이면(report_fallback) 검색은 묻는 유형의 기록을 report 보다 앞에 둡니다.
+        let report_fallback = !event_types.iter().any(|t| t == "report");
+        if report_fallback {
             event_types.push("report".to_string());
             emit_term("   📊 [REPORT ALWAYS-IN] 합성 리포트를 스코프에 함께 포함합니다.");
         }
@@ -1145,8 +1209,16 @@ impl crate::model::LogisModel {
         // =====================================================================
         // STEP 12 : 컨텍스트 조립 (lib.rs STAGE-3 계약과 동일)
         // =====================================================================
+        // 🌟 [PERIOD RANGE] 시작과 끝이 둘 다 있으면 한 컨텍스트에 범위(between)로 겁니다.
+        //    예전에는 '시작 이상' 컨텍스트와 '끝 이하' 컨텍스트를 따로 검색해 합쳤는데, 두 집합의 합은
+        //    기간과 상관없이 전 구간이라 기간 조건이 사실상 사라졌습니다.
         let mut condition = serde_json::Map::new();
-        if started_at > 0 {
+        if started_at > 0 && expired_at > 0 {
+            condition.insert(
+                "created_at".to_string(),
+                json!({ "operator": "between", "value": started_at, "value_to": expired_at }),
+            );
+        } else if started_at > 0 {
             condition.insert(
                 "created_at".to_string(),
                 json!({ "operator": "gte", "value": started_at }),
@@ -1158,31 +1230,25 @@ impl crate::model::LogisModel {
             );
         }
 
-        let mut contexts: Vec<serde_json::Value> = Vec::new();
-        contexts.push(json!({
+        // 🌟 [ANALYTIC PAGE] 질의가 가리키는 페이지 종류 (bias.json analytic_page_filters 문구 일치).
+        let page_hits = crate::analytic::page_kinds_in_query(&query);
+        let page_kinds: Vec<String> = page_hits.iter().map(|(k, _)| k.clone()).collect();
+        if !page_hits.is_empty() {
+            emit_term(&format!(
+                "   🧭 [PAGE KIND] 질의의 페이지 문구 {:?} → 페이지 종류 {:?} 로 좁힙니다. (link 경로를 analytic_page_filters.paths 로 판정)",
+                page_hits.iter().map(|(_, p)| p.as_str()).collect::<Vec<_>>(),
+                page_kinds
+            ));
+        }
+
+        let contexts: Vec<serde_json::Value> = vec![json!({
             "text": target,
             "language": language,
             "type": event_types[0],
             "types": event_types,
             "condition": serde_json::Value::Object(condition.clone()),
             "unassigned": keywords
-        }));
-
-        if started_at > 0 && expired_at > 0 {
-            let mut upper = serde_json::Map::new();
-            upper.insert(
-                "created_at".to_string(),
-                json!({ "operator": "lte", "value": expired_at }),
-            );
-            contexts.push(json!({
-                "text": target,
-                "language": language,
-                "type": event_types[0],
-                "types": event_types,
-                "condition": serde_json::Value::Object(upper),
-                "unassigned": keywords
-            }));
-        }
+        })];
 
         let out = json!({
             "original_text": query,
@@ -1191,6 +1257,11 @@ impl crate::model::LogisModel {
             "started_at": started_at,
             "expired_at": expired_at,
             "event_types": event_types,
+            // 이벤트 유형이 확정어(클릭 · 터치 · 입력 …)로 정해졌는가. 아니면 벡터 추정이라, 페이지 종류가 있을 때 검색은 유형으로 좁히지 않습니다.
+            "event_exact": !det_event_keys.is_empty(),
+            // report 가 질의의 유형이 아니라 안전망으로 덧붙은 것인가 (그러면 검색은 묻는 유형의 기록을 앞에 둡니다)
+            "report_fallback": report_fallback,
+            "page_kinds": page_kinds,
             "keywords": keywords,
             "target": target,
             "context": contexts

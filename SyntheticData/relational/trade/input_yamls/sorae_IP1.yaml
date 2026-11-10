@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: de
+document_title: Transportversicherungspolice
+metadata:
+  policy_number: IP-DE-580416
+  issue_date: '2026-06-12'
+  effective_date: '2026-06-13'
+  related_invoice_number: CI-DE-2606-904
+  related_bl_number: BL-DE33269536
+  related_lc_number: LC-DE7472990
+  related_po_number: PO-DE-27434
+parties:
+  insurer:
+    name: Frankenland Transportversicherung AG
+    address: Am Plärrer 3, 90443 Nürnberg, Deutschland
+  insured:
+    name: Sorae Sanghoe Co., Ltd.
+    address: 12 Soraeyeok-ro, Namdong-gu, Incheon, Südkorea
+coverage_details:
+  sum_insured: 7228.32
+  currency: EUR
+  valuation_basis: Rechnungswert zuzüglich 10 %
+  coverage_conditions: Institute Cargo Clauses (A) – Deckung gegen alle Gefahren
+  premium_amount: 18.07
+  claims_payable_at: Incheon, Südkorea
+transport_details:
+  vessel_flight: ELBSTERN V.207E
+  port_of_loading: Hamburg, Deutschland
+  port_of_discharge: Incheon, Südkorea
+cargo_details:
+- mark_and_numbers: SORAE / INCHEON / MADE IN GERMANY
+  description_of_goods: USB-C-Multiport-Hub / Tragbares Kochgeschirr-Set
+  number_of_packages: 25 Kartons
+  gross_weight_kg: 755.5

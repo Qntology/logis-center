@@ -1,0 +1,37 @@
+url: https://copperleaf-goods.test/admin/coupon/list?page=1
+page_type: coupon
+layout: list
+title: Discount codes
+items:
+- id,link: CP5013
+  code: CLWELCOME
+  title: First order welcome
+  discount: $2.30
+  started_at: '2026-04-01'
+  expired_at: '2026-09-30'
+  status: Ended
+  min_order_amount: 15.4
+- id,link: CP5026
+  code: CLSUMMER
+  title: Summer getaway coupon
+  discount: 15%
+  started_at: '2026-06-15'
+  expired_at: '2026-07-12'
+  status: Ended
+  min_order_amount: 23.1
+- id,link: CP5039
+  code: CLAGAIN
+  title: Returning customer perk
+  discount: 10%
+  started_at: '2026-04-01'
+  expired_at: '2026-09-30'
+  status: Ended
+  min_order_amount: 7.7
+- id,link: CP5052
+  code: CLHARVEST
+  title: Autumn thank-you sale
+  discount: $3.85
+  started_at: '2026-09-01'
+  expired_at: '2026-09-20'
+  status: Ended
+  min_order_amount: 30.75

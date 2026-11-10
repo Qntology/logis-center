@@ -1,0 +1,75 @@
+url: https://kranichhof-markt.test/admin/review/list?page=1
+page_type: review
+layout: list
+title: Produktbewertungen
+items:
+- id,link: RV8100
+  status: Freigegeben
+  title: Sorgfältig verpackt und insgesamt farblich wunderschön.
+  name: Lukas Becker
+  registration_date: '2026-05-17'
+- id,link: RV8117
+  status: Ausstehend
+  title: Besser als erwartet, wirklich robust.
+  name: Jonas Wagner
+  registration_date: '2026-06-15'
+- id,link: RV8134
+  status: Freigegeben
+  title: Sorgfältig verpackt und insgesamt leicht.
+  name: Felix Neumann
+  registration_date: '2026-06-15'
+- id,link: RV8151
+  status: Freigegeben
+  title: Beim Versand beschädigt, sehr enttäuschend.
+  name: Leon Schulz
+  registration_date: '2026-06-13'
+- id,link: RV8168
+  status: Freigegeben
+  title: Besser als erwartet, wirklich sauber verarbeitet.
+  name: Felix Wagner
+  registration_date: '2026-06-28'
+- id,link: RV8185
+  status: Ausstehend
+  title: Sorgfältig verpackt und insgesamt farblich wunderschön.
+  name: Leon Schulz
+  registration_date: '2026-07-14'
+- id,link: RV8202
+  status: Freigegeben
+  title: Besser als erwartet, wirklich farblich wunderschön.
+  name: Jonas Schneider
+  registration_date: '2026-07-14'
+- id,link: RV8219
+  status: Freigegeben
+  title: Zweiter Kauf und immer noch leicht.
+  name: Clara Keller
+  registration_date: '2026-07-16'
+- id,link: RV8236
+  status: Freigegeben
+  title: Besser als erwartet, wirklich robust.
+  name: Leon Keller
+  registration_date: '2026-08-06'
+- id,link: RV8253
+  status: Freigegeben
+  title: Sorgfältig verpackt und insgesamt leicht.
+  name: Lukas Becker
+  registration_date: '2026-08-29'
+- id,link: RV8270
+  status: Freigegeben
+  title: Zweiter Kauf und immer noch farblich wunderschön.
+  name: Lukas Wolf
+  registration_date: '2026-09-13'
+- id,link: RV8287
+  status: Freigegeben
+  title: Zweiter Kauf und immer noch farblich wunderschön.
+  name: Lukas Wolf
+  registration_date: '2026-09-21'
+- id,link: RV8304
+  status: Freigegeben
+  title: Zweiter Kauf und immer noch leicht.
+  name: Felix Wagner
+  registration_date: '2026-10-01'
+- id,link: RV8321
+  status: Freigegeben
+  title: Zweiter Kauf und immer noch leicht.
+  name: Lukas Wolf
+  registration_date: '2026-09-30'

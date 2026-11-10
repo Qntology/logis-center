@@ -27,6 +27,11 @@
 //!    검색을 추출 오류와 떼어 재기 위한 것이고, 언어 모델 없이 임베딩만 씁니다.
 //!  · `lang_engine` : `{id, kind, lang}` 앱의 `await_engine` 으로 언어 전용 모델을 받아 실행 준비까지 마칩니다.
 //!  · `dump`     : `{id, kind}` 저장소의 아이템 전체를 결과 줄의 `items` 로 남깁니다(score_commerce.py --pool).
+//!  · `seed2`    : `{id, kind, mode, host, type, self, links, arrays, hub, data ...}` 정답 레코드를 추출 경로와 같은 모양
+//!    (id = entity_id, data.index, 연결 칸 = 대상 index)으로 넣습니다. 관계 질의를 추출 오류와 떼어 잽니다.
+//!  · `keys`     : `{id, kind, hosts, items:[[mode, host, 유형, 번호] ...]}` 정답 엔터티의 연결 번호 · 사이트 cc 를 남깁니다.
+//!  · `analytic` : `{id, kind, events, batch}` 행동 로그 합성 행(JSONL, Cloudflare D1 행 모양)을 앱의 동기화와 같은
+//!    순서(upsert_items → structure_pending_analytics → reindex_pending_embeddings)로 넣습니다. `eval_analytic_ingest`.
 #![cfg(any(windows, target_os = "linux"))]
 
 use serde_json::{json, Value};
@@ -159,6 +164,115 @@ async fn seed_record(
     .await
 }
 
+/// 연결 번호: 커머스는 entity_key_index(유형, 팀, cc, 번호) (사이트마다 다름), 무역은 entity_index(서식, 팀, 번호) (사이트 없음).
+fn link_index(mode: &str, ty: &str, team: &str, cc: &str, raw: &str) -> u32 {
+    if mode == "shipping" {
+        tauri_app_lib::scheduler::entity_index(ty, team, raw)
+    } else {
+        tauri_app_lib::scheduler::entity_key_index(ty, team, cc, raw)
+    }
+}
+
+/// 🌟 [SEED2] 정답 레코드를 추출 경로가 남기는 모양으로 저장합니다: id = entity_id(팀, index), data.index,
+/// 연결 칸(goods · order · tracking · event · rel_<서식>) = 대상의 index. 추출 오류 없이 검색 로직만 재려고 씁니다.
+///  `{id, kind:"seed2", mode, host, type, self:[유형, 번호], lang, detail, url, hub, data,
+///    links:{칸:[유형, 번호]}, arrays:{칸:[[유형, 번호, 제목] ...]}}`
+async fn seed_linked(
+    db: &VectorStore,
+    model: &LogisModel,
+    entry: &Value,
+    team: &str,
+    cancel: &Arc<AtomicBool>,
+    handle: &tauri::AppHandle,
+) -> anyhow::Result<(String, u32, usize)> {
+    let mode = match str_of(entry, "mode") { "" => "commerce", m => m };
+    let kind = str_of(entry, "type");
+    let cc = hash_id(str_of(entry, "host"));
+    let self_ty = entry["self"][0].as_str().unwrap_or(kind);
+    let self_raw = entry["self"][1].as_str().unwrap_or("");
+    let index = link_index(mode, self_ty, team, &cc, self_raw);
+    let id = tauri_app_lib::scheduler::entity_id(team, index);
+    let bcc = tauri_app_lib::scheduler::entity_bcc(kind, &cc);
+    let r#ref = match str_of(entry, "hub") {
+        "" => hash_id(&format!("{}{}{}", team, cc, str_of(entry, "url").to_lowercase())),
+        hub => hash_id(&format!("{}{}#{}", team, cc, hub)),
+    };
+    let mut data = entry["data"].clone();
+    let o = data.as_object_mut().ok_or_else(|| anyhow::anyhow!("data 가 객체가 아님"))?;
+    if let Some(links) = entry.get("links").and_then(|v| v.as_object()) {
+        for (field, target) in links {
+            let (ty, raw) = (target[0].as_str().unwrap_or(""), target[1].as_str().unwrap_or(""));
+            if !ty.is_empty() && !raw.is_empty() {
+                o.insert(field.clone(), json!(link_index(mode, ty, team, &cc, raw)));
+            }
+        }
+    }
+    if let Some(arrays) = entry.get("arrays").and_then(|v| v.as_object()) {
+        for (field, targets) in arrays {
+            let list: Vec<Value> = targets
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| json!({"index": link_index(mode, t[0].as_str().unwrap_or(""), team, &cc, t[1].as_str().unwrap_or("")),
+                                "title": t[2].as_str().unwrap_or("")}))
+                .collect();
+            o.insert(field.clone(), json!(list));
+        }
+    }
+    let text = tauri_app_lib::nl_convert::json_to_natural_language(&data);
+    let digest = hash::digest(&text);
+    let vector = model.get_embedding(text.clone()).await?;
+    if let Some(o) = data.as_object_mut() {
+        o.insert("index".into(), json!(index));
+        o.insert("ledger".into(), json!("count"));
+        o.insert("text".into(), json!(text));
+        o.insert("masked_text".into(), json!(text));
+        o.insert("embed".into(), json!(1));
+        o.insert("mode".into(), json!(mode));
+        o.insert("type".into(), json!(kind));
+    }
+    save_item(db, "items", &id, kind, data.clone(), Some(vector), ZERO_ADDR, team, &cc, &bcc, &r#ref, Some(&digest)).await;
+    let chunks = index_item_chunks(
+        db, model, &id, kind, str_of(entry, "lang"), &data, entry["detail"].as_bool().unwrap_or(true), &cc, &bcc, &r#ref,
+        mode, str_of(entry, "url"), cancel, handle, str_of(entry, "id"), true,
+    )
+    .await?;
+    Ok((id, index, chunks))
+}
+
+/// 행동 로그 합성 행(JSONL) → upsert_items 가 받는 아이템. modes/analytic.ts 의 fetchAnalyticsOrigin 이 Worker 응답을
+/// 바꾸는 규칙을 그대로 따릅니다: cc = hash(host), bcc = hash(type + cc), ref = hash(팀 + cc + 경로) (html 작업과 같은 식),
+/// 원시 이벤트(action · relate 가 배열)는 updated_at 0, text 는 비워 둡니다(구조화가 채움).
+fn analytic_rows(path: &str, team: &str) -> Vec<Value> {
+    let text = std::fs::read_to_string(path).expect("행동 로그 파일");
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let row: Value = serde_json::from_str(l).expect("행동 로그 줄");
+            let (host, path) = (str_of(&row, "host"), str_of(&row, "path"));
+            let r#type = str_of(&row, "type").to_string();
+            let cc = hash_id(host);
+            let bcc = hash_id(&format!("{}{}", r#type, cc));
+            let r#ref = hash_id(&format!("{}{}{}", team, cc, path.to_lowercase()));
+            let mut data = row["data"].clone();
+            let id = str_of(&row, "id").to_string();
+            if let Some(o) = data.as_object_mut() {
+                o.insert("id".into(), json!(id));
+                o.insert("type".into(), json!(r#type));
+                o.insert("mode".into(), json!("analytic"));
+                o.insert("updated_at".into(), json!(0));
+                o.insert("text".into(), json!(""));
+                o.insert("masked_text".into(), json!(""));
+            }
+            json!({
+                "id": id, "type": r#type, "flag": "", "from": str_of(&row, "from"), "to": team, "cc": cc, "bcc": bcc,
+                "ref": r#ref, "status": 9, "mode": "analytic", "created_at": row["created_at"].as_i64().unwrap_or(0),
+                "updated_at": 0, "text": "", "masked_text": "", "data": data,
+            })
+        })
+        .collect()
+}
+
 /// `since` 뒤로 만들어졌거나 바뀐 아이템. 목록 행과 상세 페이지가 같은 레코드로 합쳐지는 경우까지 잡습니다.
 async fn changed_items(store: &VectorStore, since: i64) -> Vec<Value> {
     let docs = store.get_all_items("items", 20_000, 0, None).await.unwrap_or_default();
@@ -281,6 +395,75 @@ fn run_plan() {
                     Err(e) => line["error"] = json!(format!("{:#}", e)),
                 }
                 sds::flush();
+            } else if str_of(entry, "kind") == "seed2" {
+                let db = store.lock().await.clone().expect("저장소");
+                let logis = {
+                    let mut g = model.lock().await;
+                    if g.is_none() {
+                        *g = Some(LogisModel::new(handle.clone(), None).await.expect("모델"));
+                    }
+                    g.as_ref().unwrap().clone()
+                };
+                logis.ensure_embedding().await.expect("임베딩 모델");
+                match seed_linked(&db, &logis, entry, &team, &cancel, &handle).await {
+                    Ok((item_id, index, chunks)) => {
+                        line["ok"] = json!(true);
+                        line["item_id"] = json!(item_id);
+                        line["index"] = json!(index);
+                        line["chunks"] = json!(chunks);
+                    }
+                    Err(e) => {
+                        line["ok"] = json!(false);
+                        line["error"] = json!(format!("{:#}", e));
+                    }
+                }
+                sds::flush();
+            } else if str_of(entry, "kind") == "keys" {
+                // 정답 엔터티의 연결 번호 (전처리 채점이 연결 칸을 대조할 때 씁니다).
+                let keys: Vec<Value> = entry["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|k| {
+                        let (mode, host, ty, raw) = (k[0].as_str().unwrap_or(""), k[1].as_str().unwrap_or(""), k[2].as_str().unwrap_or(""), k[3].as_str().unwrap_or(""));
+                        json!([mode, host, ty, raw, link_index(mode, ty, &team, &hash_id(host), raw)])
+                    })
+                    .collect();
+                line["keys"] = json!(keys);
+                line["cc"] = json!(entry["hosts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|h| h.as_str())
+                    .map(|h| json!([h, hash_id(h)]))
+                    .collect::<Vec<_>>());
+                line["ok"] = json!(true);
+            } else if str_of(entry, "kind") == "analytic" {
+                let rows = analytic_rows(str_of(entry, "events"), &team);
+                line["rows"] = json!(rows.len());
+                let batch = entry["batch"].as_u64().unwrap_or(20) as usize;
+                match tauri_app_lib::eval_analytic_ingest(&handle, rows, batch).await {
+                    Ok(v) => {
+                        line["ok"] = json!(true);
+                        line["ingest"] = v;
+                    }
+                    Err(e) => {
+                        line["ok"] = json!(false);
+                        line["error"] = json!(e);
+                    }
+                }
+                {
+                    let mut g = model.lock().await;
+                    if let Some(m) = g.as_ref() {
+                        m.end_task_cleanup("synthetic eval").await;
+                    }
+                    *g = None;
+                }
+                println!("{}", sds::report());
+                sds::flush();
+                if let Some(db) = store.lock().await.as_ref() {
+                    line["items"] = json!(changed_items(db, t0).await);
+                }
             } else if str_of(entry, "kind") == "search" {
                 let r = tauri_app_lib::eval_ai_search(
                     &handle,

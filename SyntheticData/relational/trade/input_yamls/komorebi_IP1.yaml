@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: ko
+document_title: 적하보험증권
+metadata:
+  policy_number: IP-KR-584907
+  issue_date: '2026-06-10'
+  effective_date: '2026-06-11'
+  related_invoice_number: CI-KR-2606-415
+  related_bl_number: BL-KR26601893
+  related_lc_number: LC-KR2902275
+  related_po_number: PO-KR-86767
+parties:
+  insurer:
+    name: 새솔해상보험(주)
+    address: 서울특별시 중구 을지로 55
+  insured:
+    name: Komorebi Co., Ltd.
+    address: 일본 도쿄도 스기나미구 아사가야키타 2-14-7
+coverage_details:
+  sum_insured: 5299.69
+  currency: USD
+  valuation_basis: 송장 금액의 110%
+  coverage_conditions: 협회적하약관(A) 전위험담보
+  premium_amount: 13.25
+  claims_payable_at: 도쿄, 일본
+transport_details:
+  vessel_flight: HANBADA STAR V.031E
+  port_of_loading: 부산, 대한민국
+  port_of_discharge: 도쿄, 일본
+cargo_details:
+- mark_and_numbers: KOMOREBI / TOKYO / MADE IN KOREA
+  description_of_goods: USB-C 멀티 허브 / 털 슬리퍼
+  number_of_packages: 19상자
+  gross_weight_kg: 567.2

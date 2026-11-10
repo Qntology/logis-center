@@ -601,7 +601,7 @@ pub struct RelayJoinReport {
 
 impl RelayJoinReport {
     pub fn changed_set(&self) -> bool {
-        self.rescued > 0 || self.dropped > 0
+        self.rescued > 0 || self.dropped > 0 || self.period_targets > 0
     }
 }
 
@@ -754,6 +754,9 @@ pub async fn relay_join(
     if results.is_empty() {
         return rep;
     }
+    // 기간 조인은 계획마다 검색 스코프를 잠시 바꿉니다. 끝나면 leave_scope 가 아니라 호출자의 스코프로 되돌립니다
+    // (leave_scope 는 호출자 스코프까지 지워 그 뒤 호출자의 관측이 'unscoped' 로 떨어집니다).
+    let caller_scope = crate::utils::score_dynamics::scope_snapshot();
 
     let mut docs: Vec<Option<Value>> = Vec::with_capacity(results.len());
     for r in results.iter() {
@@ -1039,7 +1042,7 @@ pub async fn relay_join(
             if let Some(o) = plan.as_object_mut() {
                 o.insert("relay".to_string(), json!({ "period": period, "key": key, "partner_types": partner_types, "void_only": void_only, "applied": false, "void_only_applied": void_dropped > 0 }));
             }
-            crate::utils::score_dynamics::leave_scope();
+            crate::utils::score_dynamics::restore_scope(caller_scope.clone());
             continue;
         }
 
@@ -1104,6 +1107,17 @@ pub async fn relay_join(
         }
         let dropped = pre_drop - results.len();
         rep.dropped += dropped;
+        // 기간 조인의 목표(질의가 묻는 유형 — 그 기간에 팔린 상품)를 결과 맨 앞으로 올립니다. 화면은 결과 순서를 그대로 보여 주므로
+        // 목표가 연결 문서 · 다른 유형 문서 사이에 섞이면 첫 정답이 아래로 밀렸습니다 (v2 질의 C7 MRR 0.11). 많이 팔린 것이 먼저입니다.
+        let top = results.iter().filter_map(|r| r.get("score").and_then(|v| v.as_f64())).fold(0.0f64, f64::max).max(1.0);
+        for r in results.iter_mut() {
+            let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if let Some(n) = hits.get(&id) {
+                if let Some(o) = r.as_object_mut() {
+                    o.insert("score".to_string(), json!(top + 1.0 + (*n as f64) * 1e-3));
+                }
+            }
+        }
         for r in results.iter_mut() {
             let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if let Some(n) = hits.get(&id) {
@@ -1165,7 +1179,7 @@ pub async fn relay_join(
             unit_json(units_net_total), unit_json(void_units_total), unit_json(units_total),
             if units_exact { " — 연결 문서의 quantity 를 그대로 더했습니다." } else { " — quantity 가 없거나 한 문서가 여러 상대를 가리키는 경우는 1개로 셌습니다(relay_period_units_exact=false)." }
         ));
-        crate::utils::score_dynamics::leave_scope();
+        crate::utils::score_dynamics::restore_scope(caller_scope.clone());
     }
 
     if rep.edges > 0 {

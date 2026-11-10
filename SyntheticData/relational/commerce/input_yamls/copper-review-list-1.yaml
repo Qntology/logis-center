@@ -1,0 +1,75 @@
+url: https://copperleaf-goods.test/admin/review/list?page=1
+page_type: review
+layout: list
+title: Product reviews
+items:
+- id,link: RV8100
+  status: Approved
+  title: Packed with care and sturdy overall.
+  name: Taylor Marsh
+  registration_date: '2026-04-20'
+- id,link: RV8117
+  status: Approved
+  title: Arrived damaged, very disappointed.
+  name: Riley Mercer
+  registration_date: '2026-04-25'
+- id,link: RV8134
+  status: Approved
+  title: Second purchase and still well finished.
+  name: Taylor Marsh
+  registration_date: '2026-05-13'
+- id,link: RV8151
+  status: Approved
+  title: Second purchase and still lightweight.
+  name: Riley Holloway
+  registration_date: '2026-06-15'
+- id,link: RV8168
+  status: Approved
+  title: Better than expected, really well finished.
+  name: Riley Mercer
+  registration_date: '2026-06-27'
+- id,link: RV8185
+  status: Approved
+  title: Second purchase and still sturdy.
+  name: Taylor Marsh
+  registration_date: '2026-07-01'
+- id,link: RV8202
+  status: Approved
+  title: Better than expected, really sturdy.
+  name: Finley Marsh
+  registration_date: '2026-07-07'
+- id,link: RV8219
+  status: Approved
+  title: Not as described, sent it back.
+  name: Taylor Marsh
+  registration_date: '2026-07-20'
+- id,link: RV8236
+  status: Pending
+  title: Better than expected, really lightweight.
+  name: Taylor Marsh
+  registration_date: '2026-07-29'
+- id,link: RV8253
+  status: Approved
+  title: Better than expected, really sturdy.
+  name: Harper Marsh
+  registration_date: '2026-08-16'
+- id,link: RV8270
+  status: Approved
+  title: Packed with care and sturdy overall.
+  name: Riley Holloway
+  registration_date: '2026-08-26'
+- id,link: RV8287
+  status: Approved
+  title: Arrived damaged, very disappointed.
+  name: Finley Whitfield
+  registration_date: '2026-08-30'
+- id,link: RV8304
+  status: Approved
+  title: Packed with care and lightweight overall.
+  name: Taylor Marsh
+  registration_date: '2026-09-04'
+- id,link: RV8321
+  status: Approved
+  title: Packed with care and lightweight overall.
+  name: Taylor Marsh
+  registration_date: '2026-09-08'

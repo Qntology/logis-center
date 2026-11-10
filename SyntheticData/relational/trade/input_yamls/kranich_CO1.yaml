@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: en
+document_title: Certificate of Origin
+metadata:
+  certificate_number: CO-2026-GB-7174
+  issue_date: '2026-06-10'
+  related_invoice_number: CI-GB-2606-899
+  related_bl_number: BL-GB13666752
+  related_lc_number: LC-GB6873816
+parties:
+  exporter:
+    name: Bramblewood Outfitters Ltd.
+    address: 14 Wharf Road, Felixstowe IP11 3AB, United Kingdom
+  importer_consignee:
+    name: Kranichhof Handels GmbH
+    address: Lindenallee 21, 04109 Leipzig, Germany
+  issuing_authority:
+    name: East Coast Chamber of Trade
+    address: 3 Dock Street, Ipswich IP4 1AA, United Kingdom
+transport_details:
+  vessel_flight: NORTHBRIDGE TRADER V.55E
+  port_of_loading: Felixstowe, United Kingdom
+  port_of_discharge: Hamburg, Germany
+cargo_details:
+- marks_and_numbers: KRANICHHOF / LEIPZIG / MADE IN UK
+  description_of_goods: Handheld mini fan (KR20287)
+  hs_code: '6205.20'
+  quantity: 480 pcs
+  gross_weight_kg: 851.9
+  origin_criterion: Wholly obtained in the United Kingdom
+- marks_and_numbers: KRANICHHOF / LEIPZIG / MADE IN UK
+  description_of_goods: Plush house slippers (KR20492)
+  hs_code: '6110.30'
+  quantity: 240 pcs
+  gross_weight_kg: 239.9
+  origin_criterion: Wholly obtained in the United Kingdom
+declaration:
+  statement: It is hereby certified that the goods described above originate in the United Kingdom.

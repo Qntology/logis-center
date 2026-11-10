@@ -1,0 +1,41 @@
+document_type: Commercial Invoice
+document_code: CI
+language: ko
+document_title: 상업송장
+metadata:
+  invoice_number: CI-KR-2608-102
+  issue_date: '2026-08-20'
+  reference_po_number: PO-KR-86767
+  related_bl_number: BL-KR30181389
+  related_lc_number: LC-KR2902275
+  currency: USD
+parties:
+  shipper_exporter:
+    name: (주)새벽공방
+    address: 경기도 안산시 단원구 해봉로 77
+    contact_number: +82 31-555-0148
+    tax_id: 134-86-55210
+  consignee:
+    name: Komorebi Co., Ltd.
+    address: 일본 도쿄도 스기나미구 아사가야키타 2-14-7
+    contact_number: +81 3-5555-0148
+    tax_id: T8011101076543
+shipping_details:
+  vessel_flight: HANBADA STAR V.035E
+  port_of_loading: 부산, 대한민국
+  port_of_discharge: 도쿄, 일본
+  incoterms: CFR Tokyo
+line_items:
+- item_code: KM20738
+  description: 세라믹 식칼
+  quantity: 180
+  unit: 개
+  unit_price: 11.63
+  total_amount: 2093.4
+  hs_code: '7323.93'
+summary:
+  total_quantity: 180
+  total_items_amount: 2093.4
+  freight_charge: 83.74
+  insurance: 0.0
+  grand_total_amount: 2177.14

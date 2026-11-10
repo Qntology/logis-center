@@ -2556,9 +2556,36 @@ impl crate::model::LogisModel {
                     plinko_alternates = alt_map;
                 }
 
+                // 🌟 [QUOTED NAME / PERIOD LEXICAL GATE] 따옴표로 묶은 이름('Bereit für den Sommerurlaub' · 「夏休み準備セール」)의
+                //    계절어는 기간이 아닙니다. 확정어는 따옴표 밖 낱말에서만 찾고, 벡터 후보는 따옴표 밖 질의에 그 키의 구 낱말이
+                //    있을 때만 LLM 에게 묻습니다 (analytic::period_lexical_support, 행동 로그 질의와 같은 규칙).
+                //    v2 질의: 영어 · 중국어 · 스페인어 · 이탈리아어 · 포르투갈어 · 체코어의 C7 이 이름 속 Sommer 로 여름 기간이 걸려
+                //    행사 기간 → 주문 → 상품 연결 대신 행사 4건만 보였습니다 (R@all 0).
+                //    동사 · 조동사로 쓰인 낱말(프랑스어 'a été expédiée' 의 été = être 의 과거분사, 영어 'prices fall' 의 fall)도
+                //    계절 · 시간 낱말이 아닙니다 (Stanza 품사 AUX · VERB). v2 질의 C2 fr 은 été 로 여름이 확정되었습니다.
+                let verbal = |w: &str| matches!(word_pos_map.get(w).map(|s| s.as_str()), Some("AUX") | Some("VERB"));
+                let unquoted_query: String = crate::stanza::strip_quoted(&query)
+                    .split_whitespace()
+                    .filter(|w| !verbal(w.trim_matches(|c: char| !c.is_alphanumeric())))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase();
+                let in_unquoted = |w: &str| -> bool {
+                    let t = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                    !t.is_empty() && !verbal(w.trim_matches(|c: char| !c.is_alphanumeric())) && unquoted_query.contains(&t)
+                };
+                let period_phrases = crate::utils::ai_utils::filter_category_phrases(&["time_filters", "season_filters"]);
+                let period_supported = |cat: &str, key: &str| -> bool {
+                    let phrases: Vec<&str> =
+                        period_phrases.iter().filter(|(c, k, _)| c == cat && k == key).map(|(_, _, p)| p.as_str()).collect();
+                    crate::analytic::period_lexical_support(&unquoted_query, &phrases)
+                };
                 let mut exact_season_key = String::new();
                 let mut exact_time_key = String::new();
                 for w in current_text.split_whitespace() {
+                    if !in_unquoted(w) {
+                        continue;
+                    }
                     if exact_season_key.is_empty() {
                         if let Some(k) = crate::utils::ai_utils::exact_match_filter_key_tailed("season_filters", w) {
                             emit_term(&format!("  🌤️ [SEASON EXACT MATCH] '{}' ∈ season_filters.{}.exact_match (닫힌 조사·어미 포함) → 코사인 경쟁 없이 확정합니다.", w, k));
@@ -3146,7 +3173,11 @@ impl crate::model::LogisModel {
                         verified_time = exact_time_key.clone();
                         emit_term(&format!("  🕒 [TIME EXACT MATCH] Time Intent 를 bias.json exact_match 로 '{}' 확정합니다 (LLM 에게 되묻지 않습니다). 계절과 같은 규칙입니다. 지금까지는 이 확정이 결정론 시간 가이드에 전달되지 않아 '오늘'·'지난달' 이 속성 배정에서만 빠지고 기간 조건은 만들어지지 않았습니다.", verified_time));
                     } else {
-                        let time_cands = temporal_cands("time_filters");
+                        let (time_cands, unsupported): (Vec<(String, f32)>, Vec<(String, f32)>) =
+                            temporal_cands("time_filters").into_iter().partition(|(k, _)| period_supported("time_filters", k));
+                        if !unsupported.is_empty() {
+                            emit_term(&format!("  🧷 [PERIOD LEXICAL GATE] 따옴표 밖 질의에 시간 구 낱말이 없어 묻지 않는 후보: {:?}", unsupported.iter().map(|(k, _)| k).collect::<Vec<_>>()));
+                        }
                         if !time_cands.is_empty() {
                             let first_choice = &time_cands[0].0;
                             let first_score = time_cands[0].1;
@@ -3178,7 +3209,11 @@ impl crate::model::LogisModel {
                         verified_season = exact_season_key.clone();
                         emit_term(&format!("  🌤️ [SEASON EXACT MATCH] Season Intent 를 bias.json exact_match 로 '{}' 확정 (LLM 호출 생략).", verified_season));
                     } else {
-                        let season_cands = temporal_cands("season_filters");
+                        let (season_cands, unsupported): (Vec<(String, f32)>, Vec<(String, f32)>) =
+                            temporal_cands("season_filters").into_iter().partition(|(k, _)| period_supported("season_filters", k));
+                        if !unsupported.is_empty() {
+                            emit_term(&format!("  🧷 [PERIOD LEXICAL GATE] 따옴표 밖 질의에 계절 구 낱말이 없어 묻지 않는 후보: {:?}", unsupported.iter().map(|(k, _)| k).collect::<Vec<_>>()));
+                        }
                         if !season_cands.is_empty() {
                             let first_choice = &season_cands[0].0;
                             let first_score = season_cands[0].1;

@@ -1,0 +1,35 @@
+document_type: Cargo Insurance Policy
+document_code: IP
+language: ja
+document_title: 貨物海上保険証券
+metadata:
+  policy_number: IP-JP-834793
+  issue_date: '2026-06-09'
+  effective_date: '2026-06-10'
+  related_invoice_number: CI-JP-2606-324
+  related_bl_number: BL-JP81652912
+  related_lc_number: LC-JP8788712
+  related_po_number: PO-JP-62173
+parties:
+  insurer:
+    name: あかね海上保険株式会社
+    address: 大阪府大阪市中央区北久宝寺町2-4-6
+  insured:
+    name: 株式会社ひなた工房
+    address: 大阪府東大阪市高井田元町1-3-9
+coverage_details:
+  sum_insured: 1206592.0
+  currency: JPY
+  valuation_basis: 送り状価額の110%
+  coverage_conditions: 協会貨物約款（A）全危険担保
+  premium_amount: 3016.0
+  claims_payable_at: シアトル（アメリカ合衆国）
+transport_details:
+  vessel_flight: MINATO MARU V.118E
+  port_of_loading: 大阪港（日本）
+  port_of_discharge: シアトル港（アメリカ合衆国）
+cargo_details:
+- mark_and_numbers: COPPERLEAF / BOISE / MADE IN JAPAN
+  description_of_goods: ペットキャリーバッグ / マイクロファイバーブランケット
+  number_of_packages: 30カートン
+  gross_weight_kg: 585.2

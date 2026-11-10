@@ -1,0 +1,75 @@
+url: https://komorebi-shop.test/admin/review/list?page=1
+page_type: review
+layout: list
+title: 商品レビュー
+items:
+- id,link: RV8100
+  status: 承認済み
+  title: すぐに壊れました。
+  name: 鈴木 悠真
+  registration_date: '2026-04-17'
+- id,link: RV8117
+  status: 承認済み
+  title: 梱包も丁寧で、全体的に軽くて使いやすいです。
+  name: 加藤 芽依
+  registration_date: '2026-04-25'
+- id,link: RV8134
+  status: 承認済み
+  title: 思っていたより丈夫です。
+  name: 鈴木 悠真
+  registration_date: '2026-05-14'
+- id,link: RV8151
+  status: 承認済み
+  title: 思っていたより色がきれいです。
+  name: 山本 蓮
+  registration_date: '2026-05-21'
+- id,link: RV8168
+  status: 承認済み
+  title: 思っていたより仕上がりがきれいです。
+  name: 鈴木 悠真
+  registration_date: '2026-05-25'
+- id,link: RV8185
+  status: 承認済み
+  title: すぐに壊れました。
+  name: 加藤 芽依
+  registration_date: '2026-06-11'
+- id,link: RV8202
+  status: 承認済み
+  title: 梱包も丁寧で、全体的に丈夫です。
+  name: 渡辺 大翔
+  registration_date: '2026-06-26'
+- id,link: RV8219
+  status: 承認済み
+  title: リピート購入ですが、やはり丈夫です。
+  name: 鈴木 悠真
+  registration_date: '2026-07-10'
+- id,link: RV8236
+  status: 承認済み
+  title: すぐに壊れました。
+  name: 渡辺 湊
+  registration_date: '2026-07-11'
+- id,link: RV8253
+  status: 承認済み
+  title: 思っていたより丈夫です。
+  name: 渡辺 葵
+  registration_date: '2026-08-02'
+- id,link: RV8270
+  status: 承認済み
+  title: 思っていたより軽くて使いやすいです。
+  name: 渡辺 湊
+  registration_date: '2026-08-19'
+- id,link: RV8287
+  status: 承認済み
+  title: 思っていたより色がきれいです。
+  name: 加藤 芽依
+  registration_date: '2026-09-17'
+- id,link: RV8304
+  status: 承認済み
+  title: 梱包も丁寧で、全体的に仕上がりがきれいです。
+  name: 渡辺 湊
+  registration_date: '2026-09-28'
+- id,link: RV8321
+  status: 承認済み
+  title: 説明と違ったので返品しました。
+  name: 加藤 芽依
+  registration_date: '2026-09-25'

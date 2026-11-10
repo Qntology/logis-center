@@ -1,0 +1,143 @@
+url: https://sorae-market.test/admin/shipping/list?page=1
+page_type: tracking
+layout: list
+title: 배송 조회
+items:
+- id,link: '426236559889'
+  carrier: 한빛로지스
+  status: 반품
+  title: 코딩 로봇 키트
+  shipping_date: '2026-10-02'
+  recipient_name: (주)소래상회
+- id,link: '331773862277'
+  carrier: 새길운송
+  status: 배송완료
+  title: 접이식 등산 스틱
+  shipping_date: '2026-09-26'
+  recipient_name: 오예준
+- id,link: '811767621722'
+  carrier: 새길운송
+  status: 배송완료
+  title: 코딩 로봇 키트
+  shipping_date: '2026-09-25'
+  recipient_name: 오예준
+- id,link: '263426448087'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: 유기농 그래놀라
+  shipping_date: '2026-09-15'
+  recipient_name: (주)소래상회
+- id,link: '894203509348'
+  carrier: 새길운송
+  status: 배송완료
+  title: 기모 후드집업
+  shipping_date: '2026-09-14'
+  recipient_name: 장소율
+- id,link: '833617099233'
+  carrier: 바른택배
+  status: 배송완료
+  title: 유기농 그래놀라
+  shipping_date: '2026-09-11'
+  recipient_name: 오예준
+- id,link: '410955983584'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 휴대용 코펠 세트
+  shipping_date: '2026-09-01'
+  recipient_name: 이민준
+- id,link: '485162401511'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 콜드브루 원액
+  shipping_date: '2026-08-15'
+  recipient_name: 윤도윤
+- id,link: '729926425311'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: USB-C 멀티 허브
+  shipping_date: '2026-08-07'
+  recipient_name: (주)소래상회
+- id,link: '377677509783'
+  carrier: 새길운송
+  status: 배송완료
+  title: 대용량 보조배터리
+  shipping_date: '2026-08-01'
+  recipient_name: 장소율
+- id,link: '442847822607'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: USB-C 멀티 허브
+  shipping_date: '2026-07-31'
+  recipient_name: 장소율
+- id,link: '288733669283'
+  carrier: 새길운송
+  status: 배송완료
+  title: 진공 보온 텀블러
+  shipping_date: '2026-07-29'
+  recipient_name: 이예준
+- id,link: '367886162031'
+  carrier: 새길운송
+  status: 배송완료
+  title: 리넨 반팔 셔츠
+  shipping_date: '2026-07-25'
+  recipient_name: 장소율
+- id,link: '831304558033'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 리넨 반팔 셔츠
+  shipping_date: '2026-07-18'
+  recipient_name: 윤도윤
+- id,link: '251492071895'
+  carrier: 한빛로지스
+  status: 배송중
+  title: 어린이 킥보드
+  shipping_date: '2026-07-17'
+  recipient_name: 강수아
+- id,link: '730047318147'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 밀폐 유리 용기 세트
+  shipping_date: '2026-07-16'
+  recipient_name: 최다은
+- id,link: '462611318214'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 방수 블루투스 스피커
+  shipping_date: '2026-07-15'
+  recipient_name: 윤도윤
+- id,link: '486564932357'
+  carrier: 바른택배
+  status: 배송완료
+  title: 반려동물 이동장
+  shipping_date: '2026-07-14'
+  recipient_name: 이예준
+- id,link: '514821246185'
+  carrier: 새길운송
+  status: 배송완료
+  title: 접이식 등산 스틱
+  shipping_date: '2026-07-13'
+  recipient_name: 이예준
+- id,link: '371942377068'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 제주 감귤 주스
+  shipping_date: '2026-07-13'
+  recipient_name: 이예준
+- id,link: '871115069410'
+  carrier: 새길운송
+  status: 배송완료
+  title: 코딩 로봇 키트
+  shipping_date: '2026-07-11'
+  recipient_name: 이예준
+- id,link: '722164798942'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: USB-C 멀티 허브
+  shipping_date: '2026-07-06'
+  recipient_name: 박현우
+- id,link: '721545389659'
+  carrier: 온누리익스프레스
+  status: 반품
+  title: USB-C 멀티 허브
+  shipping_date: '2026-07-04'
+  recipient_name: (주)소래상회

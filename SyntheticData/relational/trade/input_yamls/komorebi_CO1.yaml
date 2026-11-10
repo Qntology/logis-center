@@ -1,0 +1,39 @@
+document_type: Certificate of Origin
+document_code: CO
+language: ko
+document_title: 원산지증명서
+metadata:
+  certificate_number: CO-2026-KR-3676
+  issue_date: '2026-06-10'
+  related_invoice_number: CI-KR-2606-415
+  related_bl_number: BL-KR26601893
+  related_lc_number: LC-KR2902275
+parties:
+  exporter:
+    name: (주)새벽공방
+    address: 경기도 안산시 단원구 해봉로 77
+  importer_consignee:
+    name: Komorebi Co., Ltd.
+    address: 일본 도쿄도 스기나미구 아사가야키타 2-14-7
+  issuing_authority:
+    name: 서해안국제상공회
+    address: 경기도 안산시 단원구 광덕대로 182
+transport_details:
+  vessel_flight: HANBADA STAR V.031E
+  port_of_loading: 부산, 대한민국
+  port_of_discharge: 도쿄, 일본
+cargo_details:
+- marks_and_numbers: KOMOREBI / TOKYO / MADE IN KOREA
+  description_of_goods: USB-C 멀티 허브 (KM20369)
+  hs_code: '8518.30'
+  quantity: 300 개
+  gross_weight_kg: 331.0
+  origin_criterion: 대한민국에서 완전 생산
+- marks_and_numbers: KOMOREBI / TOKYO / MADE IN KOREA
+  description_of_goods: 털 슬리퍼 (KM20205)
+  hs_code: '6110.30'
+  quantity: 180 개
+  gross_weight_kg: 236.2
+  origin_criterion: 대한민국에서 완전 생산
+declaration:
+  statement: 위 물품이 대한민국을 원산지로 함을 증명합니다.

@@ -1,0 +1,101 @@
+url: https://komorebi-shop.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+title: 出荷一覧
+items:
+- id,link: '503400467005'
+  carrier: はやぶさ運輸
+  status: 配達完了
+  title: シリコン調理器具セット
+  shipping_date: '2026-07-03'
+  recipient_name: 鈴木 悠真
+- id,link: '405629602313'
+  carrier: はやぶさ運輸
+  status: 配達完了
+  title: ビタミンC美容液
+  shipping_date: '2026-06-28'
+  recipient_name: 鈴木 悠真
+- id,link: '222046054191'
+  carrier: はやぶさ運輸
+  status: 配達完了
+  title: アウトドアクッカーセット
+  shipping_date: '2026-06-26'
+  recipient_name: 鈴木 悠真
+- id,link: '961736408912'
+  carrier: さくら便
+  status: 配達完了
+  title: 防水Bluetoothスピーカー
+  shipping_date: '2026-06-22'
+  recipient_name: 渡辺 大翔
+- id,link: '836754722307'
+  carrier: はやぶさ運輸
+  status: 返品
+  title: ビタミンC美容液
+  shipping_date: '2026-06-15'
+  recipient_name: 株式会社こもれび
+- id,link: '397090333729'
+  carrier: はやぶさ運輸
+  status: 配達完了
+  title: ビタミンC美容液
+  shipping_date: '2026-06-07'
+  recipient_name: 加藤 芽依
+- id,link: '442841635125'
+  carrier: さくら便
+  status: 配達完了
+  title: アウトドアクッカーセット
+  shipping_date: '2026-05-19'
+  recipient_name: 加藤 芽依
+- id,link: '215110458777'
+  carrier: つばめ配送
+  status: 配達完了
+  title: 木製積み木
+  shipping_date: '2026-05-17'
+  recipient_name: 渡辺 大翔
+- id,link: '865922336675'
+  carrier: みなと急便
+  status: 配達完了
+  title: USB-Cマルチポートハブ
+  shipping_date: '2026-05-16'
+  recipient_name: 山本 蓮
+- id,link: '807240663942'
+  carrier: はやぶさ運輸
+  status: 配達完了
+  title: 子ども用食器セット
+  shipping_date: '2026-05-14'
+  recipient_name: 渡辺 大翔
+- id,link: '552636909670'
+  carrier: つばめ配送
+  status: 配達完了
+  title: もこもこルームシューズ
+  shipping_date: '2026-05-08'
+  recipient_name: 鈴木 悠真
+- id,link: '646781334594'
+  carrier: さくら便
+  status: 配達完了
+  title: スマートフィットネスバンド
+  shipping_date: '2026-04-26'
+  recipient_name: 小林 大翔
+- id,link: '299605337428'
+  carrier: はやぶさ運輸
+  status: 返品
+  title: スマートフィットネスバンド
+  shipping_date: '2026-04-21'
+  recipient_name: 株式会社こもれび
+- id,link: '697719988118'
+  carrier: さくら便
+  status: 配達完了
+  title: ビタミンC美容液
+  shipping_date: '2026-04-17'
+  recipient_name: 加藤 芽依
+- id,link: '599550539605'
+  carrier: つばめ配送
+  status: 配達完了
+  title: スマートフィットネスバンド
+  shipping_date: '2026-04-12'
+  recipient_name: 鈴木 悠真
+- id,link: '900897482474'
+  carrier: みなと急便
+  status: 配達完了
+  title: 温度調節電気ケトル
+  shipping_date: '2026-04-08'
+  recipient_name: 渡辺 湊

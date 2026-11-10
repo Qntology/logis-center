@@ -1,0 +1,18 @@
+url: https://kranichhof-markt.test/admin/order/view?od_id=20260505-300497
+page_type: order
+layout: detail
+title: Bestelldetails
+fields:
+  id,link: 20260505-300497
+  registration_date: '2026-05-05'
+  status: Zugestellt
+  goods: Proteinriegel mit wenig Zucker
+  tracking_number: '553009309008'
+  sender_name: Lukas Becker
+  recipient_name: Lukas Becker
+  quantity: 3
+  amount: 70.8
+  payment_method: Kreditkarte
+  sender_phone: +49 163 21484804
+  recipient_address: Rosenstraße 66, 10115 Berlin
+  recipient_phone: +49 163 21484804

@@ -1,0 +1,6093 @@
+- shop: sorae
+  lang: ko
+  name: 소래마켓
+  domain: sorae-market.test
+  company: (주)소래상회
+  goods:
+  - key: sorae:goods:SR20041
+    id: SR20041
+    title: 기모 후드집업
+    title_en: Fleece-lined zip hoodie
+    title_ko: 기모 후드집업
+    concept: cold_weather
+    status: Active
+    price: 46600
+    stock: 4
+    registered: '2026-02-12'
+    imported: true
+  - key: sorae:goods:SR20082
+    id: SR20082
+    title: 대용량 보조배터리
+    title_en: High-capacity power bank
+    title_ko: 대용량 보조배터리
+    concept: audio_power
+    status: Active
+    price: 42400
+    stock: 60
+    registered: '2026-03-04'
+    imported: false
+  - key: sorae:goods:SR20123
+    id: SR20123
+    title: 휴대용 코펠 세트
+    title_en: Portable cookware set
+    title_ko: 휴대용 코펠 세트
+    concept: outdoor
+    status: Active
+    price: 43500
+    stock: 140
+    registered: '2026-02-26'
+    imported: true
+  - key: sorae:goods:SR20164
+    id: SR20164
+    title: 리넨 반팔 셔츠
+    title_en: Linen short-sleeve shirt
+    title_ko: 리넨 반팔 셔츠
+    concept: hot_weather
+    status: Active
+    price: 48500
+    stock: 140
+    registered: '2026-01-23'
+    imported: false
+  - key: sorae:goods:SR20205
+    id: SR20205
+    title: 유기농 그래놀라
+    title_en: Organic granola
+    title_ko: 유기농 그래놀라
+    concept: snack_food
+    status: Active
+    price: 14600
+    stock: 60
+    registered: '2026-02-18'
+    imported: false
+  - key: sorae:goods:SR20246
+    id: SR20246
+    title: 밀폐 유리 용기 세트
+    title_en: Airtight glass container set
+    title_ko: 밀폐 유리 용기 세트
+    concept: cooking
+    status: Active
+    price: 30800
+    stock: 140
+    registered: '2026-01-21'
+    imported: false
+  - key: sorae:goods:SR20287
+    id: SR20287
+    title: 반려동물 이동장
+    title_en: Pet travel carrier
+    title_ko: 반려동물 이동장
+    concept: pet
+    status: Active
+    price: 44500
+    stock: 9
+    registered: '2026-03-03'
+    imported: false
+  - key: sorae:goods:SR20328
+    id: SR20328
+    title: 자외선 차단 양산
+    title_en: UV-blocking parasol
+    title_ko: 자외선 차단 양산
+    concept: hot_weather
+    status: Active
+    price: 29800
+    stock: 140
+    registered: '2026-02-23'
+    imported: false
+  - key: sorae:goods:SR20369
+    id: SR20369
+    title: 어린이 킥보드
+    title_en: Kids kick scooter
+    title_ko: 어린이 킥보드
+    concept: kids
+    status: Active
+    price: 63800
+    stock: 140
+    registered: '2026-03-14'
+    imported: false
+  - key: sorae:goods:SR20410
+    id: SR20410
+    title: 수분 장벽 크림
+    title_en: Barrier moisture cream
+    title_ko: 수분 장벽 크림
+    concept: skincare
+    status: Active
+    price: 34500
+    stock: 4
+    registered: '2026-01-19'
+    imported: false
+  - key: sorae:goods:SR20451
+    id: SR20451
+    title: 방수 블루투스 스피커
+    title_en: Waterproof Bluetooth speaker
+    title_ko: 방수 블루투스 스피커
+    concept: audio_power
+    status: Active
+    price: 54700
+    stock: 9
+    registered: '2026-01-18'
+    imported: false
+  - key: sorae:goods:SR20492
+    id: SR20492
+    title: 제주 감귤 주스
+    title_en: Jeju tangerine juice
+    title_ko: 제주 감귤 주스
+    concept: snack_food
+    status: Sold out
+    price: 17000
+    stock: 0
+    registered: '2026-02-19'
+    imported: false
+  - key: sorae:goods:SR20533
+    id: SR20533
+    title: 진공 보온 텀블러
+    title_en: Vacuum insulated tumbler
+    title_ko: 진공 보온 텀블러
+    concept: outdoor
+    status: Active
+    price: 24200
+    stock: 9
+    registered: '2026-01-27'
+    imported: false
+  - key: sorae:goods:SR20574
+    id: SR20574
+    title: 콜드브루 원액
+    title_en: Cold brew concentrate
+    title_ko: 콜드브루 원액
+    concept: snack_food
+    status: Active
+    price: 15800
+    stock: 9
+    registered: '2026-03-12'
+    imported: false
+  - key: sorae:goods:SR20615
+    id: SR20615
+    title: 코딩 로봇 키트
+    title_en: Coding robot kit
+    title_ko: 코딩 로봇 키트
+    concept: kids
+    status: Active
+    price: 80500
+    stock: 9
+    registered: '2026-02-03'
+    imported: false
+  - key: sorae:goods:SR20656
+    id: SR20656
+    title: 접이식 등산 스틱
+    title_en: Folding trekking poles
+    title_ko: 접이식 등산 스틱
+    concept: outdoor
+    status: Active
+    price: 54700
+    stock: 140
+    registered: '2026-02-24'
+    imported: false
+  - key: sorae:goods:SR20697
+    id: SR20697
+    title: 자동 급식기
+    title_en: Automatic pet feeder
+    title_ko: 자동 급식기
+    concept: pet
+    status: Active
+    price: 72200
+    stock: 4
+    registered: '2026-02-01'
+    imported: false
+  - key: sorae:goods:SR20738
+    id: SR20738
+    title: USB-C 멀티 허브
+    title_en: USB-C multiport hub
+    title_ko: USB-C 멀티 허브
+    concept: audio_power
+    status: Active
+    price: 40400
+    stock: 140
+    registered: '2026-02-12'
+    imported: true
+  orders:
+  - key: sorae:order:20260925-302130
+    id: 20260925-302130
+    when: 2026-09-25T00:37
+    member: MSR3035
+    buyer: 오예준
+    receiver: 오예준
+    status: Delivered
+    amount: 147690
+    goods:
+    - SR20656
+    qty:
+      SR20656: 3
+    coupon: CP5039
+    event: null
+    tracking:
+    - '331773862277'
+  - key: sorae:order:20260924-301065
+    id: 20260924-301065
+    when: 2026-09-24T18:46
+    member: MSR3014
+    buyer: 이예준
+    receiver: 오예준
+    status: Returned
+    amount: 144300
+    goods:
+    - SR20615
+    - SR20369
+    qty:
+      SR20615: 1
+      SR20369: 1
+    coupon: null
+    event: null
+    tracking:
+    - '811767621722'
+    - '426236559889'
+  - key: sorae:order:20260913-300284
+    id: 20260913-300284
+    when: 2026-09-13T11:53
+    member: MSR3028
+    buyer: 장소율
+    receiver: 장소율
+    status: Delivered
+    amount: 44600
+    goods:
+    - SR20041
+    qty:
+      SR20041: 1
+    coupon: CP5052
+    event: EV727
+    tracking:
+    - '894203509348'
+  - key: sorae:order:20260909-302272
+    id: 20260909-302272
+    when: 2026-09-09T23:38
+    member: MSR3035
+    buyer: 오예준
+    receiver: 오예준
+    status: Returned
+    amount: 212400
+    goods:
+    - SR20205
+    - SR20041
+    - SR20533
+    qty:
+      SR20205: 2
+      SR20041: 3
+      SR20533: 2
+    coupon: CP5052
+    event: EV727
+    tracking:
+    - '833617099233'
+    - '263426448087'
+  - key: sorae:order:20260830-300639
+    id: 20260830-300639
+    when: 2026-08-30T15:04
+    member: MSR3056
+    buyer: 이민준
+    receiver: 이민준
+    status: Delivered
+    amount: 102800
+    goods:
+    - SR20123
+    - SR20574
+    qty:
+      SR20123: 2
+      SR20574: 1
+    coupon: null
+    event: null
+    tracking:
+    - '410955983584'
+  - key: sorae:order:20260814-300213
+    id: 20260814-300213
+    when: 2026-08-14T12:33
+    member: MSR3007
+    buyer: 윤도윤
+    receiver: 윤도윤
+    status: Delivered
+    amount: 18800
+    goods:
+    - SR20574
+    qty:
+      SR20574: 1
+    coupon: null
+    event: null
+    tracking:
+    - '485162401511'
+  - key: sorae:order:20260730-300994
+    id: 20260730-300994
+    when: 2026-07-30T11:02
+    member: MSR3028
+    buyer: 장소율
+    receiver: 장소율
+    status: Returned
+    amount: 127300
+    goods:
+    - SR20738
+    - SR20082
+    - SR20287
+    qty:
+      SR20738: 1
+      SR20082: 1
+      SR20287: 1
+    coupon: null
+    event: null
+    tracking:
+    - '442847822607'
+    - '377677509783'
+    - '729926425311'
+  - key: sorae:order:20260728-301988
+    id: 20260728-301988
+    when: 2026-07-28T04:07
+    member: MSR3014
+    buyer: 이예준
+    receiver: 이예준
+    status: Delivered
+    amount: 151800
+    goods:
+    - SR20533
+    - SR20369
+    qty:
+      SR20533: 1
+      SR20369: 2
+    coupon: null
+    event: null
+    tracking:
+    - '288733669283'
+  - key: sorae:order:20260723-301207
+    id: 20260723-301207
+    when: 2026-07-23T21:24
+    member: MSR3028
+    buyer: 장소율
+    receiver: 장소율
+    status: Delivered
+    amount: 48500
+    goods:
+    - SR20164
+    qty:
+      SR20164: 1
+    coupon: CP5013
+    event: null
+    tracking:
+    - '367886162031'
+  - key: sorae:order:20260716-300781
+    id: 20260716-300781
+    when: 2026-07-16T11:14
+    member: MSR3021
+    buyer: 강수아
+    receiver: 강수아
+    status: Shipped
+    amount: 124600
+    goods:
+    - SR20369
+    qty:
+      SR20369: 2
+    coupon: CP5013
+    event: null
+    tracking:
+    - '251492071895'
+  - key: sorae:order:20260715-302201
+    id: 20260715-302201
+    when: 2026-07-15T02:16
+    member: MSR3035
+    buyer: 오예준
+    receiver: 최다은
+    status: Delivered
+    amount: 158600
+    goods:
+    - SR20246
+    - SR20164
+    qty:
+      SR20246: 2
+      SR20164: 2
+    coupon: null
+    event: null
+    tracking:
+    - '730047318147'
+  - key: sorae:order:20260714-301349
+    id: 20260714-301349
+    when: 2026-07-14T06:44
+    member: MSR3007
+    buyer: 윤도윤
+    receiver: 윤도윤
+    status: Delivered
+    amount: 103200
+    goods:
+    - SR20451
+    - SR20164
+    qty:
+      SR20451: 1
+      SR20164: 1
+    coupon: null
+    event: null
+    tracking:
+    - '462611318214'
+    - '831304558033'
+  - key: sorae:order:20260712-300568
+    id: 20260712-300568
+    when: 2026-07-12T14:52
+    member: MSR3014
+    buyer: 이예준
+    receiver: 이예준
+    status: Delivered
+    amount: 232050
+    goods:
+    - SR20656
+    - SR20738
+    - SR20082
+    qty:
+      SR20656: 2
+      SR20738: 3
+      SR20082: 1
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '514821246185'
+  - key: sorae:order:20260712-300497
+    id: 20260712-300497
+    when: 2026-07-12T01:26
+    member: MSR3014
+    buyer: 이예준
+    receiver: 이예준
+    status: Delivered
+    amount: 52280
+    goods:
+    - SR20492
+    - SR20287
+    qty:
+      SR20492: 1
+      SR20287: 1
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '371942377068'
+    - '486564932357'
+  - key: sorae:order:20260709-302059
+    id: 20260709-302059
+    when: 2026-07-09T22:36
+    member: MSR3021
+    buyer: 강수아
+    receiver: 이예준
+    status: Delivered
+    amount: 229500
+    goods:
+    - SR20615
+    - SR20041
+    - SR20574
+    qty:
+      SR20615: 2
+      SR20041: 2
+      SR20574: 1
+    coupon: CP5026
+    event: null
+    tracking:
+    - '871115069410'
+  - key: sorae:order:20260702-301846
+    id: 20260702-301846
+    when: 2026-07-02T09:46
+    member: MSR3000
+    buyer: 박현우
+    receiver: 박현우
+    status: Delivered
+    amount: 149800
+    goods:
+    - SR20656
+    - SR20738
+    qty:
+      SR20656: 2
+      SR20738: 1
+    coupon: null
+    event: EV718
+    tracking:
+    - '186621467425'
+    - '722164798942'
+  - key: sorae:order:20260627-301278
+    id: 20260627-301278
+    when: 2026-06-27T01:53
+    member: MSR3063
+    buyer: 임현우
+    receiver: 임현우
+    status: Returned
+    amount: 152920
+    goods:
+    - SR20738
+    - SR20082
+    - SR20451
+    qty:
+      SR20738: 1
+      SR20082: 2
+      SR20451: 1
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '391349957884'
+    - '443668403958'
+    - '721545389659'
+  - key: sorae:order:20260621-300710
+    id: 20260621-300710
+    when: 2026-06-21T23:10
+    member: MSR3000
+    buyer: 박현우
+    receiver: 장소율
+    status: Delivered
+    amount: 240040
+    goods:
+    - SR20738
+    - SR20697
+    - SR20287
+    qty:
+      SR20738: 3
+      SR20697: 1
+      SR20287: 2
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '804056249620'
+  - key: sorae:order:20260612-300142
+    id: 20260612-300142
+    when: 2026-06-12T15:08
+    member: MSR3014
+    buyer: 이예준
+    receiver: 이예준
+    status: Delivered
+    amount: 45400
+    goods:
+    - SR20082
+    qty:
+      SR20082: 1
+    coupon: null
+    event: null
+    tracking:
+    - '175813423825'
+  - key: sorae:order:20260609-300923
+    id: 20260609-300923
+    when: 2026-06-09T15:48
+    member: MSR3028
+    buyer: 장소율
+    receiver: 장소율
+    status: Delivered
+    amount: 96800
+    goods:
+    - SR20410
+    - SR20246
+    qty:
+      SR20410: 2
+      SR20246: 1
+    coupon: CP5013
+    event: null
+    tracking:
+    - '297562608457'
+  - key: sorae:order:20260608-300071
+    id: 20260608-300071
+    when: 2026-06-08T15:18
+    member: MSR3000
+    buyer: 박현우
+    receiver: 박현우
+    status: Delivered
+    amount: 241800
+    goods:
+    - SR20164
+    - SR20205
+    - SR20451
+    qty:
+      SR20164: 1
+      SR20205: 2
+      SR20451: 3
+    coupon: null
+    event: null
+    tracking:
+    - '867271781212'
+  - key: sorae:order:20260528-301633
+    id: 20260528-301633
+    when: 2026-05-28T22:58
+    member: MSR3063
+    buyer: 임현우
+    receiver: 강수아
+    status: Delivered
+    amount: 181600
+    goods:
+    - SR20451
+    - SR20697
+    qty:
+      SR20451: 2
+      SR20697: 1
+    coupon: null
+    event: null
+    tracking:
+    - '238752959418'
+    - '882889373264'
+  - key: sorae:order:20260527-301136
+    id: 20260527-301136
+    when: 2026-05-27T22:20
+    member: MSR3014
+    buyer: 이예준
+    receiver: 이예준
+    status: Delivered
+    amount: 79800
+    goods:
+    - SR20082
+    - SR20738
+    qty:
+      SR20082: 1
+      SR20738: 1
+    coupon: CP5013
+    event: null
+    tracking:
+    - '215260019995'
+    - '288430519733'
+  - key: sorae:order:20260520-300355
+    id: 20260520-300355
+    when: 2026-05-20T13:34
+    member: MSR3007
+    buyer: 윤도윤
+    receiver: 윤도윤
+    status: Delivered
+    amount: 46500
+    goods:
+    - SR20123
+    qty:
+      SR20123: 1
+    coupon: null
+    event: null
+    tracking:
+    - '560932351608'
+  - key: sorae:order:20260519-301562
+    id: 20260519-301562
+    when: 2026-05-19T19:33
+    member: MSR3007
+    buyer: 윤도윤
+    receiver: 윤도윤
+    status: Delivered
+    amount: 34050
+    goods:
+    - SR20410
+    qty:
+      SR20410: 1
+    coupon: CP5039
+    event: null
+    tracking:
+    - '543603017020'
+  - key: sorae:order:20260517-301704
+    id: 20260517-301704
+    when: 2026-05-17T10:53
+    member: MSR3000
+    buyer: 박현우
+    receiver: 김유진
+    status: Delivered
+    amount: 51000
+    goods:
+    - SR20492
+    qty:
+      SR20492: 3
+    coupon: null
+    event: null
+    tracking:
+    - '138702387225'
+  - key: sorae:order:20260428-300852
+    id: 20260428-300852
+    when: 2026-04-28T01:09
+    member: MSR3007
+    buyer: 윤도윤
+    receiver: 윤도윤
+    status: Delivered
+    amount: 183300
+    goods:
+    - SR20041
+    - SR20123
+    qty:
+      SR20041: 3
+      SR20123: 1
+    coupon: null
+    event: null
+    tracking:
+    - '232264572564'
+  - key: sorae:order:20260425-301420
+    id: 20260425-301420
+    when: 2026-04-25T18:31
+    member: MSR3028
+    buyer: 장소율
+    receiver: 장소율
+    status: Shipped
+    amount: 108200
+    goods:
+    - SR20246
+    - SR20041
+    qty:
+      SR20246: 2
+      SR20041: 1
+    coupon: null
+    event: EV709
+    tracking:
+    - '719066369755'
+  - key: sorae:order:20260423-301917
+    id: 20260423-301917
+    when: 2026-04-23T12:45
+    member: MSR3077
+    buyer: 강은호
+    receiver: 강은호
+    status: Delivered
+    amount: 326900
+    goods:
+    - SR20328
+    - SR20697
+    - SR20615
+    qty:
+      SR20328: 1
+      SR20697: 3
+      SR20615: 1
+    coupon: null
+    event: EV709
+    tracking:
+    - '645360343245'
+    - '546079789298'
+  - key: sorae:order:20260419-301775
+    id: 20260419-301775
+    when: 2026-04-19T08:25
+    member: MSR3007
+    buyer: 윤도윤
+    receiver: 윤도윤
+    status: Delivered
+    amount: 18800
+    goods:
+    - SR20574
+    qty:
+      SR20574: 1
+    coupon: null
+    event: EV709
+    tracking:
+    - '741918356651'
+  - key: sorae:order:20260417-300426
+    id: 20260417-300426
+    when: 2026-04-17T04:47
+    member: MSR3021
+    buyer: 강수아
+    receiver: 강수아
+    status: Delivered
+    amount: 17220
+    goods:
+    - SR20574
+    qty:
+      SR20574: 1
+    coupon: CP5039
+    event: EV709
+    tracking:
+    - '796071672264'
+  - key: sorae:order:20260403-301491
+    id: 20260403-301491
+    when: 2026-04-03T17:34
+    member: MSR3035
+    buyer: 오예준
+    receiver: 오예준
+    status: Delivered
+    amount: 206400
+    goods:
+    - SR20041
+    - SR20533
+    - SR20082
+    qty:
+      SR20041: 3
+      SR20533: 1
+      SR20082: 1
+    coupon: null
+    event: null
+    tracking:
+    - '815065701362'
+    - '220021582323'
+  shipments:
+  - key: sorae:tracking:867271781212
+    id: '867271781212'
+    order: 20260608-300071
+    kind: outbound
+    carrier: 바른택배
+    goods:
+    - SR20164
+    - SR20205
+    - SR20451
+    shipped: 2026-06-09T23:18
+    delivered: 2026-06-10T23:18
+    status: Delivered
+    receiver: 박현우
+  - key: sorae:tracking:175813423825
+    id: '175813423825'
+    order: 20260612-300142
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20082
+    shipped: 2026-06-13T17:08
+    delivered: 2026-06-15T17:08
+    status: Delivered
+    receiver: 이예준
+  - key: sorae:tracking:485162401511
+    id: '485162401511'
+    order: 20260814-300213
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20574
+    shipped: 2026-08-15T18:33
+    delivered: 2026-08-18T18:33
+    status: Delivered
+    receiver: 윤도윤
+  - key: sorae:tracking:894203509348
+    id: '894203509348'
+    order: 20260913-300284
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20041
+    shipped: 2026-09-14T16:53
+    delivered: 2026-09-16T16:53
+    status: Delivered
+    receiver: 장소율
+  - key: sorae:tracking:560932351608
+    id: '560932351608'
+    order: 20260520-300355
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20123
+    shipped: 2026-05-21T17:34
+    delivered: 2026-05-22T17:34
+    status: Delivered
+    receiver: 윤도윤
+  - key: sorae:tracking:796071672264
+    id: '796071672264'
+    order: 20260417-300426
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20574
+    shipped: 2026-04-18T07:47
+    delivered: 2026-04-19T07:47
+    status: Delivered
+    receiver: 강수아
+  - key: sorae:tracking:371942377068
+    id: '371942377068'
+    order: 20260712-300497
+    kind: outbound
+    carrier: 온누리익스프레스
+    goods:
+    - SR20492
+    shipped: 2026-07-13T07:26
+    delivered: 2026-07-15T07:26
+    status: Delivered
+    receiver: 이예준
+  - key: sorae:tracking:486564932357
+    id: '486564932357'
+    order: 20260712-300497
+    kind: outbound
+    carrier: 바른택배
+    goods:
+    - SR20287
+    shipped: 2026-07-14T04:26
+    delivered: 2026-07-17T04:26
+    status: Delivered
+    receiver: 이예준
+  - key: sorae:tracking:514821246185
+    id: '514821246185'
+    order: 20260712-300568
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20656
+    - SR20738
+    - SR20082
+    shipped: 2026-07-13T18:52
+    delivered: 2026-07-16T18:52
+    status: Delivered
+    receiver: 이예준
+  - key: sorae:tracking:410955983584
+    id: '410955983584'
+    order: 20260830-300639
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20123
+    - SR20574
+    shipped: 2026-09-01T00:04
+    delivered: 2026-09-03T00:04
+    status: Delivered
+    receiver: 이민준
+  - key: sorae:tracking:804056249620
+    id: '804056249620'
+    order: 20260621-300710
+    kind: outbound
+    carrier: 온누리익스프레스
+    goods:
+    - SR20738
+    - SR20697
+    - SR20287
+    shipped: 2026-06-23T01:10
+    delivered: 2026-06-25T01:10
+    status: Delivered
+    receiver: 장소율
+  - key: sorae:tracking:251492071895
+    id: '251492071895'
+    order: 20260716-300781
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20369
+    shipped: 2026-07-17T20:14
+    delivered: null
+    status: Shipped
+    receiver: 강수아
+  - key: sorae:tracking:232264572564
+    id: '232264572564'
+    order: 20260428-300852
+    kind: outbound
+    carrier: 온누리익스프레스
+    goods:
+    - SR20041
+    - SR20123
+    shipped: 2026-04-29T09:09
+    delivered: 2026-05-01T09:09
+    status: Delivered
+    receiver: 윤도윤
+  - key: sorae:tracking:297562608457
+    id: '297562608457'
+    order: 20260609-300923
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20410
+    - SR20246
+    shipped: 2026-06-10T19:48
+    delivered: 2026-06-13T19:48
+    status: Delivered
+    receiver: 장소율
+  - key: sorae:tracking:442847822607
+    id: '442847822607'
+    order: 20260730-300994
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20738
+    shipped: 2026-07-31T18:02
+    delivered: 2026-08-02T18:02
+    status: Delivered
+    receiver: 장소율
+  - key: sorae:tracking:377677509783
+    id: '377677509783'
+    order: 20260730-300994
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20082
+    - SR20287
+    shipped: 2026-08-01T18:02
+    delivered: 2026-08-04T18:02
+    status: Delivered
+    receiver: 장소율
+  - key: sorae:tracking:729926425311
+    id: '729926425311'
+    order: 20260730-300994
+    kind: return
+    carrier: 온누리익스프레스
+    goods:
+    - SR20738
+    shipped: 2026-08-07T18:02
+    delivered: 2026-08-09T18:02
+    status: Returned
+    receiver: (주)소래상회
+  - key: sorae:tracking:811767621722
+    id: '811767621722'
+    order: 20260924-301065
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20615
+    - SR20369
+    shipped: 2026-09-25T22:46
+    delivered: 2026-09-27T22:46
+    status: Delivered
+    receiver: 오예준
+  - key: sorae:tracking:426236559889
+    id: '426236559889'
+    order: 20260924-301065
+    kind: return
+    carrier: 한빛로지스
+    goods:
+    - SR20615
+    shipped: 2026-10-02T22:46
+    delivered: 2026-10-04T22:46
+    status: Returned
+    receiver: (주)소래상회
+  - key: sorae:tracking:215260019995
+    id: '215260019995'
+    order: 20260527-301136
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20082
+    shipped: 2026-05-29T04:20
+    delivered: 2026-06-01T04:20
+    status: Delivered
+    receiver: 이예준
+  - key: sorae:tracking:288430519733
+    id: '288430519733'
+    order: 20260527-301136
+    kind: outbound
+    carrier: 온누리익스프레스
+    goods:
+    - SR20738
+    shipped: 2026-05-31T01:20
+    delivered: 2026-06-03T01:20
+    status: Delivered
+    receiver: 이예준
+  - key: sorae:tracking:367886162031
+    id: '367886162031'
+    order: 20260723-301207
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20164
+    shipped: 2026-07-25T01:24
+    delivered: 2026-07-27T01:24
+    status: Delivered
+    receiver: 장소율
+  - key: sorae:tracking:391349957884
+    id: '391349957884'
+    order: 20260627-301278
+    kind: outbound
+    carrier: 온누리익스프레스
+    goods:
+    - SR20738
+    shipped: 2026-06-28T05:53
+    delivered: 2026-06-29T05:53
+    status: Delivered
+    receiver: 임현우
+  - key: sorae:tracking:443668403958
+    id: '443668403958'
+    order: 20260627-301278
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20082
+    - SR20451
+    shipped: 2026-06-30T06:53
+    delivered: 2026-07-02T06:53
+    status: Delivered
+    receiver: 임현우
+  - key: sorae:tracking:721545389659
+    id: '721545389659'
+    order: 20260627-301278
+    kind: return
+    carrier: 온누리익스프레스
+    goods:
+    - SR20738
+    shipped: 2026-07-04T06:53
+    delivered: 2026-07-06T06:53
+    status: Returned
+    receiver: (주)소래상회
+  - key: sorae:tracking:462611318214
+    id: '462611318214'
+    order: 20260714-301349
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20451
+    shipped: 2026-07-15T09:44
+    delivered: 2026-07-17T09:44
+    status: Delivered
+    receiver: 윤도윤
+  - key: sorae:tracking:831304558033
+    id: '831304558033'
+    order: 20260714-301349
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20164
+    shipped: 2026-07-18T13:44
+    delivered: 2026-07-19T13:44
+    status: Delivered
+    receiver: 윤도윤
+  - key: sorae:tracking:719066369755
+    id: '719066369755'
+    order: 20260425-301420
+    kind: outbound
+    carrier: 온누리익스프레스
+    goods:
+    - SR20246
+    - SR20041
+    shipped: 2026-04-26T20:31
+    delivered: null
+    status: Shipped
+    receiver: 장소율
+  - key: sorae:tracking:815065701362
+    id: '815065701362'
+    order: 20260403-301491
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20041
+    - SR20533
+    shipped: 2026-04-04T22:34
+    delivered: 2026-04-05T22:34
+    status: Delivered
+    receiver: 오예준
+  - key: sorae:tracking:220021582323
+    id: '220021582323'
+    order: 20260403-301491
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20082
+    shipped: 2026-04-07T19:34
+    delivered: 2026-04-09T19:34
+    status: Delivered
+    receiver: 오예준
+  - key: sorae:tracking:543603017020
+    id: '543603017020'
+    order: 20260519-301562
+    kind: outbound
+    carrier: 바른택배
+    goods:
+    - SR20410
+    shipped: 2026-05-21T02:33
+    delivered: 2026-05-22T02:33
+    status: Delivered
+    receiver: 윤도윤
+  - key: sorae:tracking:238752959418
+    id: '238752959418'
+    order: 20260528-301633
+    kind: outbound
+    carrier: 바른택배
+    goods:
+    - SR20451
+    shipped: 2026-05-30T00:58
+    delivered: 2026-05-31T00:58
+    status: Delivered
+    receiver: 강수아
+  - key: sorae:tracking:882889373264
+    id: '882889373264'
+    order: 20260528-301633
+    kind: outbound
+    carrier: 바른택배
+    goods:
+    - SR20697
+    shipped: 2026-06-02T00:58
+    delivered: 2026-06-05T00:58
+    status: Delivered
+    receiver: 강수아
+  - key: sorae:tracking:138702387225
+    id: '138702387225'
+    order: 20260517-301704
+    kind: outbound
+    carrier: 온누리익스프레스
+    goods:
+    - SR20492
+    shipped: 2026-05-18T14:53
+    delivered: 2026-05-21T14:53
+    status: Delivered
+    receiver: 김유진
+  - key: sorae:tracking:741918356651
+    id: '741918356651'
+    order: 20260419-301775
+    kind: outbound
+    carrier: 온누리익스프레스
+    goods:
+    - SR20574
+    shipped: 2026-04-20T14:25
+    delivered: 2026-04-22T14:25
+    status: Delivered
+    receiver: 윤도윤
+  - key: sorae:tracking:186621467425
+    id: '186621467425'
+    order: 20260702-301846
+    kind: outbound
+    carrier: 온누리익스프레스
+    goods:
+    - SR20656
+    shipped: 2026-07-03T18:46
+    delivered: 2026-07-04T18:46
+    status: Delivered
+    receiver: 박현우
+  - key: sorae:tracking:722164798942
+    id: '722164798942'
+    order: 20260702-301846
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20738
+    shipped: 2026-07-06T11:46
+    delivered: 2026-07-09T11:46
+    status: Delivered
+    receiver: 박현우
+  - key: sorae:tracking:645360343245
+    id: '645360343245'
+    order: 20260423-301917
+    kind: outbound
+    carrier: 바른택배
+    goods:
+    - SR20328
+    shipped: 2026-04-24T18:45
+    delivered: 2026-04-27T18:45
+    status: Delivered
+    receiver: 강은호
+  - key: sorae:tracking:546079789298
+    id: '546079789298'
+    order: 20260423-301917
+    kind: outbound
+    carrier: 한빛로지스
+    goods:
+    - SR20697
+    - SR20615
+    shipped: 2026-04-26T14:45
+    delivered: 2026-04-27T14:45
+    status: Delivered
+    receiver: 강은호
+  - key: sorae:tracking:288733669283
+    id: '288733669283'
+    order: 20260728-301988
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20533
+    - SR20369
+    shipped: 2026-07-29T10:07
+    delivered: 2026-07-31T10:07
+    status: Delivered
+    receiver: 이예준
+  - key: sorae:tracking:871115069410
+    id: '871115069410'
+    order: 20260709-302059
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20615
+    - SR20041
+    - SR20574
+    shipped: 2026-07-11T05:36
+    delivered: 2026-07-13T05:36
+    status: Delivered
+    receiver: 이예준
+  - key: sorae:tracking:331773862277
+    id: '331773862277'
+    order: 20260925-302130
+    kind: outbound
+    carrier: 새길운송
+    goods:
+    - SR20656
+    shipped: 2026-09-26T04:37
+    delivered: 2026-09-29T04:37
+    status: Delivered
+    receiver: 오예준
+  - key: sorae:tracking:730047318147
+    id: '730047318147'
+    order: 20260715-302201
+    kind: outbound
+    carrier: 온누리익스프레스
+    goods:
+    - SR20246
+    - SR20164
+    shipped: 2026-07-16T05:16
+    delivered: 2026-07-18T05:16
+    status: Delivered
+    receiver: 최다은
+  - key: sorae:tracking:833617099233
+    id: '833617099233'
+    order: 20260909-302272
+    kind: outbound
+    carrier: 바른택배
+    goods:
+    - SR20205
+    - SR20041
+    - SR20533
+    shipped: 2026-09-11T07:38
+    delivered: 2026-09-13T07:38
+    status: Delivered
+    receiver: 오예준
+  - key: sorae:tracking:263426448087
+    id: '263426448087'
+    order: 20260909-302272
+    kind: return
+    carrier: 온누리익스프레스
+    goods:
+    - SR20205
+    shipped: 2026-09-15T07:38
+    delivered: 2026-09-17T07:38
+    status: Returned
+    receiver: (주)소래상회
+  reviews:
+  - key: sorae:review:RV8100
+    id: RV8100
+    order: 20260419-301775
+    goods: SR20574
+    author: 윤도윤
+    rating: 4
+    text: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+    posted: '2026-05-02'
+    status: Approved
+  - key: sorae:review:RV8117
+    id: RV8117
+    order: 20260517-301704
+    goods: SR20492
+    author: 박현우
+    rating: 5
+    text: 포장이 꼼꼼했고 가벼워서 괜찮습니다.
+    posted: '2026-05-24'
+    status: Approved
+  - key: sorae:review:RV8134
+    id: RV8134
+    order: 20260609-300923
+    goods: SR20410
+    author: 장소율
+    rating: 5
+    text: 두 번째 구매인데 역시 마감이 좋아서 좋네요.
+    posted: '2026-06-17'
+    status: Approved
+  - key: sorae:review:RV8151
+    id: RV8151
+    order: 20260612-300142
+    goods: SR20082
+    author: 이예준
+    rating: 5
+    text: 두 번째 구매인데 역시 가벼워서 좋네요.
+    posted: '2026-06-23'
+    status: Approved
+  - key: sorae:review:RV8168
+    id: RV8168
+    order: 20260702-301846
+    goods: SR20656
+    author: 박현우
+    rating: 5
+    text: 포장이 꼼꼼했고 마감이 좋아서 괜찮습니다.
+    posted: '2026-07-09'
+    status: Approved
+  - key: sorae:review:RV8185
+    id: RV8185
+    order: 20260712-300497
+    goods: SR20492
+    author: 이예준
+    rating: 2
+    text: 금방 고장 났어요.
+    posted: '2026-07-20'
+    status: Approved
+  - key: sorae:review:RV8202
+    id: RV8202
+    order: 20260712-300568
+    goods: SR20738
+    author: 이예준
+    rating: 1
+    text: 배송 중에 파손되어 실망했습니다.
+    posted: '2026-07-23'
+    status: Pending
+  - key: sorae:review:RV8219
+    id: RV8219
+    order: 20260728-301988
+    goods: SR20533
+    author: 이예준
+    rating: 1
+    text: 금방 고장 났어요.
+    posted: '2026-08-04'
+    status: Approved
+  - key: sorae:review:RV8236
+    id: RV8236
+    order: 20260730-300994
+    goods: SR20738
+    author: 장소율
+    rating: 2
+    text: 설명과 달라서 반품했습니다.
+    posted: '2026-08-05'
+    status: Approved
+  - key: sorae:review:RV8253
+    id: RV8253
+    order: 20260830-300639
+    goods: SR20574
+    author: 이민준
+    rating: 5
+    text: 생각보다 가벼워서 만족합니다.
+    posted: '2026-09-04'
+    status: Approved
+  - key: sorae:review:RV8270
+    id: RV8270
+    order: 20260909-302272
+    goods: SR20205
+    author: 오예준
+    rating: 1
+    text: 금방 고장 났어요.
+    posted: '2026-09-21'
+    status: Approved
+  - key: sorae:review:RV8287
+    id: RV8287
+    order: 20260913-300284
+    goods: SR20041
+    author: 장소율
+    rating: 5
+    text: 포장이 꼼꼼했고 색이 예뻐서 괜찮습니다.
+    posted: '2026-09-23'
+    status: Approved
+  - key: sorae:review:RV8304
+    id: RV8304
+    order: 20260924-301065
+    goods: SR20615
+    author: 이예준
+    rating: 1
+    text: 설명과 달라서 반품했습니다.
+    posted: '2026-10-02'
+    status: Approved
+  - key: sorae:review:RV8321
+    id: RV8321
+    order: 20260925-302130
+    goods: SR20656
+    author: 오예준
+    rating: 5
+    text: 포장이 꼼꼼했고 튼튼해서 괜찮습니다.
+    posted: '2026-10-05'
+    status: Approved
+  coupons:
+  - key: sorae:coupon:CP5013
+    id: CP5013
+    code: SRWELCOME
+    title: 첫 구매 환영 혜택
+    start: '2026-04-01'
+    end: '2026-09-30'
+    event: null
+  - key: sorae:coupon:CP5026
+    id: CP5026
+    code: SRSUMMER
+    title: 여름 휴가 응원 쿠폰
+    start: '2026-06-15'
+    end: '2026-07-12'
+    event: EV718
+  - key: sorae:coupon:CP5039
+    id: CP5039
+    code: SRAGAIN
+    title: 재구매 고객 감사
+    start: '2026-04-01'
+    end: '2026-09-30'
+    event: null
+  - key: sorae:coupon:CP5052
+    id: CP5052
+    code: SRHARVEST
+    title: 가을 맞이 감사제
+    start: '2026-09-01'
+    end: '2026-09-20'
+    event: EV727
+  events:
+  - key: sorae:event:EV709
+    id: EV709
+    title: 봄 산책 기획전
+    start: '2026-04-06'
+    end: '2026-04-26'
+    goods:
+    - SR20328
+    - SR20574
+    - SR20451
+    - SR20533
+    - SR20246
+    coupon: null
+  - key: sorae:event:EV718
+    id: EV718
+    title: 여름 휴가 준비전
+    start: '2026-06-15'
+    end: '2026-07-12'
+    goods:
+    - SR20656
+    - SR20287
+    - SR20738
+    - SR20082
+    - SR20205
+    coupon: CP5026
+  - key: sorae:event:EV727
+    id: EV727
+    title: 추석 선물 모음
+    start: '2026-09-01'
+    end: '2026-09-20'
+    goods:
+    - SR20410
+    - SR20123
+    - SR20615
+    - SR20164
+    - SR20041
+    coupon: CP5052
+  members:
+  - id: MSR3000
+    name: 박현우
+    phone: 010-5690-8485
+  - id: MSR3007
+    name: 윤도윤
+    phone: 010-4615-2722
+  - id: MSR3014
+    name: 이예준
+    phone: 010-4344-6030
+  - id: MSR3021
+    name: 강수아
+    phone: 010-3298-4753
+  - id: MSR3028
+    name: 장소율
+    phone: 010-3841-7541
+  - id: MSR3035
+    name: 오예준
+    phone: 010-3540-6660
+  - id: MSR3042
+    name: 김유진
+    phone: 010-2122-3587
+  - id: MSR3049
+    name: 조서연
+    phone: 010-4039-6390
+  - id: MSR3056
+    name: 이민준
+    phone: 010-5669-6780
+  - id: MSR3063
+    name: 임현우
+    phone: 010-5564-5305
+  - id: MSR3070
+    name: 최다은
+    phone: 010-7266-5746
+  - id: MSR3077
+    name: 강은호
+    phone: 010-8089-4258
+  trade:
+    lang: de
+    exporter: Wolkenfeld Haushaltswaren GmbH
+    importer: Sorae Sanghoe Co., Ltd.
+    currency: EUR
+    pol: Hamburg, Deutschland
+    pod: Incheon, Südkorea
+    numbers:
+      po: PO-DE-27434
+      lc: LC-DE7472990
+      co: CO-2026-DE-7122
+      ip: IP-DE-580416
+    ships:
+    - n: 1
+      ci: CI-DE-2606-904
+      pl: PL-DE-2606-243
+      bl: BL-DE33269536
+      vessel: ELBSTERN V.207E
+      etd: '2026-06-13'
+      eta: '2026-07-02'
+      container: EBRU7862443
+      goods:
+      - SR20738
+      - SR20123
+      descriptions:
+      - USB-C-Multiport-Hub
+      - Tragbares Kochgeschirr-Set
+    - n: 2
+      ci: CI-DE-2608-685
+      pl: null
+      bl: BL-DE69045827
+      vessel: ELBSTERN V.211E
+      etd: '2026-08-18'
+      eta: '2026-09-07'
+      container: EBRU6772030
+      goods:
+      - SR20041
+      descriptions:
+      - Kapuzenjacke mit Fleecefutter
+    docs:
+    - stem: sorae_CI1
+      code: CI
+      ship: 1
+      number: CI-DE-2606-904
+      refs:
+      - PO-DE-27434
+      - BL-DE33269536
+      - LC-DE7472990
+    - stem: sorae_PL1
+      code: PL
+      ship: 1
+      number: PL-DE-2606-243
+      refs:
+      - PO-DE-27434
+      - CI-DE-2606-904
+      - BL-DE33269536
+    - stem: sorae_BL1
+      code: BL
+      ship: 1
+      number: BL-DE33269536
+      refs:
+      - PO-DE-27434
+      - CI-DE-2606-904
+      - LC-DE7472990
+    - stem: sorae_CO1
+      code: CO
+      ship: 1
+      number: CO-2026-DE-7122
+      refs:
+      - CI-DE-2606-904
+      - BL-DE33269536
+      - LC-DE7472990
+    - stem: sorae_IP1
+      code: IP
+      ship: 1
+      number: IP-DE-580416
+      refs:
+      - PO-DE-27434
+      - CI-DE-2606-904
+      - BL-DE33269536
+      - LC-DE7472990
+    - stem: sorae_CI2
+      code: CI
+      ship: 2
+      number: CI-DE-2608-685
+      refs:
+      - PO-DE-27434
+      - BL-DE69045827
+      - LC-DE7472990
+    - stem: sorae_BL2
+      code: BL
+      ship: 2
+      number: BL-DE69045827
+      refs:
+      - PO-DE-27434
+      - CI-DE-2608-685
+      - LC-DE7472990
+- shop: copper
+  lang: en
+  name: Copperleaf Goods
+  domain: copperleaf-goods.test
+  company: Copperleaf Goods Inc.
+  goods:
+  - key: copper:goods:CL20041
+    id: CL20041
+    title: Lightweight camp chair
+    title_en: Lightweight camp chair
+    title_ko: 경량 캠핑 의자
+    concept: outdoor
+    status: Active
+    price: 26.45
+    stock: 25
+    registered: '2026-01-17'
+    imported: false
+  - key: copper:goods:CL20082
+    id: CL20082
+    title: Cooling neck band
+    title_en: Cooling neck band
+    title_ko: 냉감 넥밴드
+    concept: hot_weather
+    status: Active
+    price: 9.6
+    stock: 140
+    registered: '2026-03-19'
+    imported: false
+  - key: copper:goods:CL20123
+    id: CL20123
+    title: 65W fast charger
+    title_en: 65W fast charger
+    title_ko: 65W 고속 충전기
+    concept: audio_power
+    status: Active
+    price: 26.6
+    stock: 4
+    registered: '2026-01-22'
+    imported: false
+  - key: copper:goods:CL20164
+    id: CL20164
+    title: Noise-cancelling wireless earbuds
+    title_en: Noise-cancelling wireless earbuds
+    title_ko: 노이즈캔슬링 무선 이어폰
+    concept: audio_power
+    status: Active
+    price: 92.4
+    stock: 25
+    registered: '2026-03-19'
+    imported: false
+  - key: copper:goods:CL20205
+    id: CL20205
+    title: USB-C multiport hub
+    title_en: USB-C multiport hub
+    title_ko: USB-C 멀티 허브
+    concept: audio_power
+    status: Sold out
+    price: 27.25
+    stock: 0
+    registered: '2026-02-24'
+    imported: false
+  - key: copper:goods:CL20246
+    id: CL20246
+    title: Microfiber throw blanket
+    title_en: Microfiber throw blanket
+    title_ko: 극세사 담요
+    concept: cold_weather
+    status: Active
+    price: 18.1
+    stock: 60
+    registered: '2026-02-11'
+    imported: true
+  - key: copper:goods:CL20287
+    id: CL20287
+    title: Ventilated sandals
+    title_en: Ventilated sandals
+    title_ko: 통풍 샌들
+    concept: hot_weather
+    status: Sold out
+    price: 27.25
+    stock: 0
+    registered: '2026-02-03'
+    imported: false
+  - key: copper:goods:CL20328
+    id: CL20328
+    title: Temperature control kettle
+    title_en: Temperature control kettle
+    title_ko: 온도조절 전기포트
+    concept: cooking
+    status: Active
+    price: 40.6
+    stock: 60
+    registered: '2026-02-28'
+    imported: false
+  - key: copper:goods:CL20369
+    id: CL20369
+    title: Document file organizer
+    title_en: Document file organizer
+    title_ko: 서류 정리함
+    concept: desk_work
+    status: Sold out
+    price: 10.55
+    stock: 0
+    registered: '2026-01-30'
+    imported: false
+  - key: copper:goods:CL20410
+    id: CL20410
+    title: Low-sugar protein bar
+    title_en: Low-sugar protein bar
+    title_ko: 저당 단백질바
+    concept: snack_food
+    status: Active
+    price: 17.15
+    stock: 140
+    registered: '2026-03-08'
+    imported: false
+  - key: copper:goods:CL20451
+    id: CL20451
+    title: Toddler tableware set
+    title_en: Toddler tableware set
+    title_ko: 유아 식기 세트
+    concept: kids
+    status: Active
+    price: 21.9
+    stock: 140
+    registered: '2026-01-20'
+    imported: false
+  - key: copper:goods:CL20492
+    id: CL20492
+    title: Organic granola
+    title_en: Organic granola
+    title_ko: 유기농 그래놀라
+    concept: snack_food
+    status: Active
+    price: 11.4
+    stock: 60
+    registered: '2026-02-12'
+    imported: false
+  - key: copper:goods:CL20533
+    id: CL20533
+    title: Scorched brown rice crisps
+    title_en: Scorched brown rice crisps
+    title_ko: 현미 누룽지
+    concept: snack_food
+    status: Active
+    price: 9.25
+    stock: 4
+    registered: '2026-01-20'
+    imported: false
+  - key: copper:goods:CL20574
+    id: CL20574
+    title: Rechargeable LED lantern
+    title_en: Rechargeable LED lantern
+    title_ko: LED 충전 랜턴
+    concept: outdoor
+    status: Active
+    price: 22.55
+    stock: 9
+    registered: '2026-03-10'
+    imported: true
+  - key: copper:goods:CL20615
+    id: CL20615
+    title: Smart fitness band
+    title_en: Smart fitness band
+    title_ko: 스마트 밴드
+    concept: audio_power
+    status: Sold out
+    price: 37.3
+    stock: 0
+    registered: '2026-02-28'
+    imported: false
+  - key: copper:goods:CL20656
+    id: CL20656
+    title: Waterproof Bluetooth speaker
+    title_en: Waterproof Bluetooth speaker
+    title_ko: 방수 블루투스 스피커
+    concept: audio_power
+    status: Active
+    price: 44.85
+    stock: 4
+    registered: '2026-03-09'
+    imported: false
+  - key: copper:goods:CL20697
+    id: CL20697
+    title: Mineral sunscreen
+    title_en: Mineral sunscreen
+    title_ko: 무기자차 선크림
+    concept: skincare
+    status: Active
+    price: 18.6
+    stock: 4
+    registered: '2026-01-25'
+    imported: false
+  - key: copper:goods:CL20738
+    id: CL20738
+    title: Pet travel carrier
+    title_en: Pet travel carrier
+    title_ko: 반려동물 이동장
+    concept: pet
+    status: Active
+    price: 37.9
+    stock: 60
+    registered: '2026-03-07'
+    imported: true
+  orders:
+  - key: copper:order:20260929-301562
+    id: 20260929-301562
+    when: 2026-09-29T17:41
+    member: MCL3007
+    buyer: Emerson Whitfield
+    receiver: Finley Whitfield
+    status: Delivered
+    amount: 69.1
+    goods:
+    - CL20574
+    - CL20533
+    - CL20615
+    qty:
+      CL20574: 1
+      CL20533: 1
+      CL20615: 1
+    coupon: null
+    event: null
+    tracking:
+    - '288827969776'
+  - key: copper:order:20260918-300994
+    id: 20260918-300994
+    when: 2026-09-18T14:36
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Taylor Marsh
+    status: Delivered
+    amount: 54.85
+    goods:
+    - CL20328
+    - CL20246
+    qty:
+      CL20328: 1
+      CL20246: 1
+    coupon: CP5052
+    event: EV727
+    tracking:
+    - '180347964021'
+  - key: copper:order:20260909-300923
+    id: 20260909-300923
+    when: 2026-09-09T02:48
+    member: MCL3014
+    buyer: Casey Dorsey
+    receiver: Finley Whitfield
+    status: Delivered
+    amount: 41.0
+    goods:
+    - CL20656
+    qty:
+      CL20656: 1
+    coupon: CP5052
+    event: EV727
+    tracking:
+    - '406275153226'
+  - key: copper:order:20260902-301278
+    id: 20260902-301278
+    when: 2026-09-02T14:18
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Taylor Marsh
+    status: Delivered
+    amount: 95.55
+    goods:
+    - CL20246
+    - CL20533
+    - CL20410
+    qty:
+      CL20246: 3
+      CL20533: 1
+      CL20410: 2
+    coupon: CP5013
+    event: EV727
+    tracking:
+    - '558752065596'
+  - key: copper:order:20260821-301207
+    id: 20260821-301207
+    when: 2026-08-21T07:26
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Finley Whitfield
+    status: Delivered
+    amount: 45.8
+    goods:
+    - CL20123
+    - CL20082
+    qty:
+      CL20123: 1
+      CL20082: 2
+    coupon: null
+    event: null
+    tracking:
+    - '141450883602'
+    - '728542500826'
+  - key: copper:order:20260820-300639
+    id: 20260820-300639
+    when: 2026-08-20T20:40
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Casey Dorsey
+    status: Cancelled
+    amount: 79.8
+    goods:
+    - CL20123
+    qty:
+      CL20123: 3
+    coupon: null
+    event: null
+    tracking: []
+  - key: copper:order:20260817-301491
+    id: 20260817-301491
+    when: 2026-08-17T22:28
+    member: MCL3028
+    buyer: Finley Whitfield
+    receiver: Finley Whitfield
+    status: Delivered
+    amount: 68.95
+    goods:
+    - CL20615
+    - CL20369
+    qty:
+      CL20615: 1
+      CL20369: 3
+    coupon: null
+    event: null
+    tracking:
+    - '780435405056'
+    - '401273632939'
+  - key: copper:order:20260816-300710
+    id: 20260816-300710
+    when: 2026-08-16T14:06
+    member: MCL3007
+    buyer: Emerson Whitfield
+    receiver: Emerson Whitfield
+    status: Returned
+    amount: 22.01
+    goods:
+    - CL20451
+    qty:
+      CL20451: 1
+    coupon: CP5039
+    event: null
+    tracking:
+    - '107511662394'
+    - '834193774951'
+  - key: copper:order:20260813-301420
+    id: 20260813-301420
+    when: 2026-08-13T03:08
+    member: MCL3049
+    buyer: Riley Holloway
+    receiver: Riley Holloway
+    status: Delivered
+    amount: 296.4
+    goods:
+    - CL20082
+    - CL20164
+    qty:
+      CL20082: 2
+      CL20164: 3
+    coupon: null
+    event: null
+    tracking:
+    - '539027061263'
+    - '858283630144'
+  - key: copper:order:20260804-301917
+    id: 20260804-301917
+    when: 2026-08-04T03:12
+    member: MCL3042
+    buyer: Harper Marsh
+    receiver: Harper Marsh
+    status: Delivered
+    amount: 40.6
+    goods:
+    - CL20328
+    qty:
+      CL20328: 1
+    coupon: null
+    event: null
+    tracking:
+    - '325494280337'
+  - key: copper:order:20260803-302059
+    id: 20260803-302059
+    when: 2026-08-03T04:47
+    member: MCL3014
+    buyer: Casey Dorsey
+    receiver: Casey Dorsey
+    status: Shipped
+    amount: 144.6
+    goods:
+    - CL20164
+    - CL20287
+    qty:
+      CL20164: 1
+      CL20287: 2
+    coupon: CP5013
+    event: null
+    tracking:
+    - '109152022586'
+    - '544952251001'
+  - key: copper:order:20260718-301704
+    id: 20260718-301704
+    when: 2026-07-18T17:50
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Taylor Marsh
+    status: Delivered
+    amount: 53.5
+    goods:
+    - CL20697
+    qty:
+      CL20697: 3
+    coupon: CP5013
+    event: null
+    tracking:
+    - '514498820946'
+  - key: copper:order:20260715-300071
+    id: 20260715-300071
+    when: 2026-07-15T08:12
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Riley Mercer
+    status: Delivered
+    amount: 46.9
+    goods:
+    - CL20082
+    - CL20615
+    qty:
+      CL20082: 1
+      CL20615: 1
+    coupon: null
+    event: null
+    tracking:
+    - '402651896898'
+    - '469490076221'
+  - key: copper:order:20260628-300355
+    id: 20260628-300355
+    when: 2026-06-28T23:10
+    member: MCL3035
+    buyer: Finley Marsh
+    receiver: Finley Marsh
+    status: Delivered
+    amount: 11.55
+    goods:
+    - CL20533
+    qty:
+      CL20533: 1
+    coupon: null
+    event: EV718
+    tracking:
+    - '108009013231'
+  - key: copper:order:20260626-301065
+    id: 20260626-301065
+    when: 2026-06-26T11:04
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Taylor Marsh
+    status: Shipped
+    amount: 119.85
+    goods:
+    - CL20082
+    - CL20328
+    qty:
+      CL20082: 2
+      CL20328: 3
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '236960924483'
+  - key: copper:order:20260623-300213
+    id: 20260623-300213
+    when: 2026-06-23T04:33
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Taylor Marsh
+    status: Delivered
+    amount: 62.35
+    goods:
+    - CL20410
+    - CL20451
+    qty:
+      CL20410: 3
+      CL20451: 1
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '395340899714'
+    - '686636227667'
+  - key: copper:order:20260619-301775
+    id: 20260619-301775
+    when: 2026-06-19T07:15
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Taylor Marsh
+    status: Delivered
+    amount: 54.49
+    goods:
+    - CL20082
+    - CL20205
+    qty:
+      CL20082: 1
+      CL20205: 2
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '891893069713'
+    - '758506797873'
+  - key: copper:order:20260618-301988
+    id: 20260618-301988
+    when: 2026-06-18T09:30
+    member: MCL3035
+    buyer: Finley Marsh
+    receiver: Finley Marsh
+    status: Delivered
+    amount: 34.77
+    goods:
+    - CL20533
+    - CL20369
+    qty:
+      CL20533: 1
+      CL20369: 3
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '154285041432'
+  - key: copper:order:20260617-300284
+    id: 20260617-300284
+    when: 2026-06-17T16:15
+    member: MCL3021
+    buyer: Riley Mercer
+    receiver: Riley Mercer
+    status: Delivered
+    amount: 33.41
+    goods:
+    - CL20533
+    - CL20246
+    qty:
+      CL20533: 2
+      CL20246: 1
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '589434022142'
+    - '483050492816'
+  - key: copper:order:20260611-301136
+    id: 20260611-301136
+    when: 2026-06-11T02:45
+    member: MCL3056
+    buyer: Morgan Whitfield
+    receiver: Morgan Whitfield
+    status: Delivered
+    amount: 50.85
+    goods:
+    - CL20492
+    - CL20574
+    qty:
+      CL20492: 1
+      CL20574: 2
+    coupon: CP5039
+    event: null
+    tracking:
+    - '283790803806'
+  - key: copper:order:20260603-301349
+    id: 20260603-301349
+    when: 2026-06-03T10:08
+    member: MCL3035
+    buyer: Finley Marsh
+    receiver: Finley Marsh
+    status: Delivered
+    amount: 45.1
+    goods:
+    - CL20533
+    - CL20123
+    qty:
+      CL20533: 2
+      CL20123: 1
+    coupon: null
+    event: null
+    tracking:
+    - '305196311798'
+  - key: copper:order:20260601-300142
+    id: 20260601-300142
+    when: 2026-06-01T21:01
+    member: MCL3049
+    buyer: Riley Holloway
+    receiver: Riley Holloway
+    status: Delivered
+    amount: 38.5
+    goods:
+    - CL20246
+    qty:
+      CL20246: 2
+    coupon: null
+    event: null
+    tracking:
+    - '366765045131'
+  - key: copper:order:20260529-301633
+    id: 20260529-301633
+    when: 2026-05-29T04:06
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Taylor Marsh
+    status: Delivered
+    amount: 28.75
+    goods:
+    - CL20041
+    qty:
+      CL20041: 1
+    coupon: null
+    event: null
+    tracking:
+    - '787840932298'
+  - key: copper:order:20260525-300852
+    id: 20260525-300852
+    when: 2026-05-25T03:53
+    member: MCL3007
+    buyer: Emerson Whitfield
+    receiver: Emerson Whitfield
+    status: Cancelled
+    amount: 119.65
+    goods:
+    - CL20738
+    - CL20287
+    qty:
+      CL20738: 1
+      CL20287: 3
+    coupon: null
+    event: null
+    tracking: []
+  - key: copper:order:20260520-300781
+    id: 20260520-300781
+    when: 2026-05-20T03:09
+    member: MCL3028
+    buyer: Finley Whitfield
+    receiver: Riley Holloway
+    status: Cancelled
+    amount: 220.19
+    goods:
+    - CL20246
+    - CL20697
+    - CL20656
+    qty:
+      CL20246: 3
+      CL20697: 3
+      CL20656: 3
+    coupon: CP5039
+    event: null
+    tracking: []
+  - key: copper:order:20260517-301846
+    id: 20260517-301846
+    when: 2026-05-17T04:24
+    member: MCL3049
+    buyer: Riley Holloway
+    receiver: Riley Holloway
+    status: Delivered
+    amount: 132.25
+    goods:
+    - CL20656
+    qty:
+      CL20656: 3
+    coupon: CP5013
+    event: null
+    tracking:
+    - '575670635323'
+  - key: copper:order:20260513-302130
+    id: 20260513-302130
+    when: 2026-05-13T05:12
+    member: MCL3007
+    buyer: Emerson Whitfield
+    receiver: Emerson Whitfield
+    status: Cancelled
+    amount: 56.5
+    goods:
+    - CL20738
+    - CL20697
+    qty:
+      CL20738: 1
+      CL20697: 1
+    coupon: null
+    event: null
+    tracking: []
+  - key: copper:order:20260504-300568
+    id: 20260504-300568
+    when: 2026-05-04T02:36
+    member: MCL3028
+    buyer: Finley Whitfield
+    receiver: Finley Whitfield
+    status: Delivered
+    amount: 40.82
+    goods:
+    - CL20205
+    - CL20246
+    qty:
+      CL20205: 1
+      CL20246: 1
+    coupon: CP5039
+    event: null
+    tracking:
+    - '348534771627'
+  - key: copper:order:20260501-300497
+    id: 20260501-300497
+    when: 2026-05-01T13:05
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Harper Marsh
+    status: Delivered
+    amount: 39.35
+    goods:
+    - CL20082
+    - CL20369
+    qty:
+      CL20082: 3
+      CL20369: 1
+    coupon: null
+    event: null
+    tracking:
+    - '928959638358'
+    - '442518133417'
+  - key: copper:order:20260414-302201
+    id: 20260414-302201
+    when: 2026-04-14T10:44
+    member: MCL3021
+    buyer: Riley Mercer
+    receiver: Riley Mercer
+    status: Returned
+    amount: 46.05
+    goods:
+    - CL20205
+    - CL20369
+    qty:
+      CL20205: 1
+      CL20369: 2
+    coupon: CP5013
+    event: EV709
+    tracking:
+    - '993186552339'
+    - '286830169143'
+  - key: copper:order:20260413-302272
+    id: 20260413-302272
+    when: 2026-04-13T02:50
+    member: MCL3000
+    buyer: Taylor Marsh
+    receiver: Finley Marsh
+    status: Delivered
+    amount: 92.34
+    goods:
+    - CL20410
+    - CL20369
+    - CL20328
+    qty:
+      CL20410: 3
+      CL20369: 1
+      CL20328: 1
+    coupon: CP5039
+    event: EV709
+    tracking:
+    - '338271627007'
+    - '436626658419'
+  - key: copper:order:20260402-300426
+    id: 20260402-300426
+    when: 2026-04-02T21:57
+    member: MCL3077
+    buyer: Harper Mercer
+    receiver: Harper Mercer
+    status: Shipped
+    amount: 53.2
+    goods:
+    - CL20410
+    - CL20082
+    - CL20041
+    qty:
+      CL20410: 1
+      CL20082: 1
+      CL20041: 1
+    coupon: null
+    event: null
+    tracking:
+    - '557212768904'
+  shipments:
+  - key: copper:tracking:402651896898
+    id: '402651896898'
+    order: 20260715-300071
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20082
+    shipped: 2026-07-16T17:12
+    delivered: 2026-07-19T17:12
+    status: Delivered
+    receiver: Riley Mercer
+  - key: copper:tracking:469490076221
+    id: '469490076221'
+    order: 20260715-300071
+    kind: outbound
+    carrier: BlueRoute Freight
+    goods:
+    - CL20615
+    shipped: 2026-07-17T14:12
+    delivered: 2026-07-18T14:12
+    status: Delivered
+    receiver: Riley Mercer
+  - key: copper:tracking:366765045131
+    id: '366765045131'
+    order: 20260601-300142
+    kind: outbound
+    carrier: Swiftline Parcel
+    goods:
+    - CL20246
+    shipped: 2026-06-03T00:01
+    delivered: 2026-06-06T00:01
+    status: Delivered
+    receiver: Riley Holloway
+  - key: copper:tracking:395340899714
+    id: '395340899714'
+    order: 20260623-300213
+    kind: outbound
+    carrier: Swiftline Parcel
+    goods:
+    - CL20410
+    shipped: 2026-06-24T09:33
+    delivered: 2026-06-27T09:33
+    status: Delivered
+    receiver: Taylor Marsh
+  - key: copper:tracking:686636227667
+    id: '686636227667'
+    order: 20260623-300213
+    kind: outbound
+    carrier: BlueRoute Freight
+    goods:
+    - CL20451
+    shipped: 2026-06-27T12:33
+    delivered: 2026-06-29T12:33
+    status: Delivered
+    receiver: Taylor Marsh
+  - key: copper:tracking:589434022142
+    id: '589434022142'
+    order: 20260617-300284
+    kind: outbound
+    carrier: Swiftline Parcel
+    goods:
+    - CL20533
+    shipped: 2026-06-18T20:15
+    delivered: 2026-06-21T20:15
+    status: Delivered
+    receiver: Riley Mercer
+  - key: copper:tracking:483050492816
+    id: '483050492816'
+    order: 20260617-300284
+    kind: outbound
+    carrier: Pinewood Express
+    goods:
+    - CL20246
+    shipped: 2026-06-20T00:15
+    delivered: 2026-06-21T00:15
+    status: Delivered
+    receiver: Riley Mercer
+  - key: copper:tracking:108009013231
+    id: '108009013231'
+    order: 20260628-300355
+    kind: outbound
+    carrier: BlueRoute Freight
+    goods:
+    - CL20533
+    shipped: 2026-06-30T05:10
+    delivered: 2026-07-02T05:10
+    status: Delivered
+    receiver: Finley Marsh
+  - key: copper:tracking:557212768904
+    id: '557212768904'
+    order: 20260402-300426
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20410
+    - CL20082
+    - CL20041
+    shipped: 2026-04-04T06:57
+    delivered: null
+    status: Shipped
+    receiver: Harper Mercer
+  - key: copper:tracking:928959638358
+    id: '928959638358'
+    order: 20260501-300497
+    kind: outbound
+    carrier: BlueRoute Freight
+    goods:
+    - CL20082
+    shipped: 2026-05-02T19:05
+    delivered: 2026-05-03T19:05
+    status: Delivered
+    receiver: Harper Marsh
+  - key: copper:tracking:442518133417
+    id: '442518133417'
+    order: 20260501-300497
+    kind: outbound
+    carrier: Pinewood Express
+    goods:
+    - CL20369
+    shipped: 2026-05-05T15:05
+    delivered: 2026-05-07T15:05
+    status: Delivered
+    receiver: Harper Marsh
+  - key: copper:tracking:348534771627
+    id: '348534771627'
+    order: 20260504-300568
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20205
+    - CL20246
+    shipped: 2026-05-05T10:36
+    delivered: 2026-05-06T10:36
+    status: Delivered
+    receiver: Finley Whitfield
+  - key: copper:tracking:107511662394
+    id: '107511662394'
+    order: 20260816-300710
+    kind: outbound
+    carrier: BlueRoute Freight
+    goods:
+    - CL20451
+    shipped: 2026-08-17T16:06
+    delivered: 2026-08-19T16:06
+    status: Delivered
+    receiver: Emerson Whitfield
+  - key: copper:tracking:834193774951
+    id: '834193774951'
+    order: 20260816-300710
+    kind: return
+    carrier: Swiftline Parcel
+    goods:
+    - CL20451
+    shipped: 2026-08-21T16:06
+    delivered: 2026-08-23T16:06
+    status: Returned
+    receiver: Copperleaf Goods Inc.
+  - key: copper:tracking:406275153226
+    id: '406275153226'
+    order: 20260909-300923
+    kind: outbound
+    carrier: Pinewood Express
+    goods:
+    - CL20656
+    shipped: 2026-09-10T06:48
+    delivered: 2026-09-13T06:48
+    status: Delivered
+    receiver: Finley Whitfield
+  - key: copper:tracking:180347964021
+    id: '180347964021'
+    order: 20260918-300994
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20328
+    - CL20246
+    shipped: 2026-09-19T23:36
+    delivered: 2026-09-22T23:36
+    status: Delivered
+    receiver: Taylor Marsh
+  - key: copper:tracking:236960924483
+    id: '236960924483'
+    order: 20260626-301065
+    kind: outbound
+    carrier: Pinewood Express
+    goods:
+    - CL20082
+    - CL20328
+    shipped: 2026-06-27T13:04
+    delivered: null
+    status: Shipped
+    receiver: Taylor Marsh
+  - key: copper:tracking:283790803806
+    id: '283790803806'
+    order: 20260611-301136
+    kind: outbound
+    carrier: Pinewood Express
+    goods:
+    - CL20492
+    - CL20574
+    shipped: 2026-06-12T09:45
+    delivered: 2026-06-13T09:45
+    status: Delivered
+    receiver: Morgan Whitfield
+  - key: copper:tracking:141450883602
+    id: '141450883602'
+    order: 20260821-301207
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20123
+    shipped: 2026-08-22T16:26
+    delivered: 2026-08-25T16:26
+    status: Delivered
+    receiver: Finley Whitfield
+  - key: copper:tracking:728542500826
+    id: '728542500826'
+    order: 20260821-301207
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20082
+    shipped: 2026-08-24T10:26
+    delivered: 2026-08-25T10:26
+    status: Delivered
+    receiver: Finley Whitfield
+  - key: copper:tracking:558752065596
+    id: '558752065596'
+    order: 20260902-301278
+    kind: outbound
+    carrier: BlueRoute Freight
+    goods:
+    - CL20246
+    - CL20533
+    - CL20410
+    shipped: 2026-09-03T20:18
+    delivered: 2026-09-04T20:18
+    status: Delivered
+    receiver: Taylor Marsh
+  - key: copper:tracking:305196311798
+    id: '305196311798'
+    order: 20260603-301349
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20533
+    - CL20123
+    shipped: 2026-06-04T14:08
+    delivered: 2026-06-06T14:08
+    status: Delivered
+    receiver: Finley Marsh
+  - key: copper:tracking:539027061263
+    id: '539027061263'
+    order: 20260813-301420
+    kind: outbound
+    carrier: Pinewood Express
+    goods:
+    - CL20082
+    shipped: 2026-08-14T09:08
+    delivered: 2026-08-15T09:08
+    status: Delivered
+    receiver: Riley Holloway
+  - key: copper:tracking:858283630144
+    id: '858283630144'
+    order: 20260813-301420
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20164
+    shipped: 2026-08-16T06:08
+    delivered: 2026-08-19T06:08
+    status: Delivered
+    receiver: Riley Holloway
+  - key: copper:tracking:780435405056
+    id: '780435405056'
+    order: 20260817-301491
+    kind: outbound
+    carrier: BlueRoute Freight
+    goods:
+    - CL20615
+    shipped: 2026-08-19T07:28
+    delivered: 2026-08-22T07:28
+    status: Delivered
+    receiver: Finley Whitfield
+  - key: copper:tracking:401273632939
+    id: '401273632939'
+    order: 20260817-301491
+    kind: outbound
+    carrier: Pinewood Express
+    goods:
+    - CL20369
+    shipped: 2026-08-20T05:28
+    delivered: 2026-08-23T05:28
+    status: Delivered
+    receiver: Finley Whitfield
+  - key: copper:tracking:288827969776
+    id: '288827969776'
+    order: 20260929-301562
+    kind: outbound
+    carrier: Swiftline Parcel
+    goods:
+    - CL20574
+    - CL20533
+    - CL20615
+    shipped: 2026-09-30T22:41
+    delivered: 2026-10-01T22:41
+    status: Delivered
+    receiver: Finley Whitfield
+  - key: copper:tracking:787840932298
+    id: '787840932298'
+    order: 20260529-301633
+    kind: outbound
+    carrier: Pinewood Express
+    goods:
+    - CL20041
+    shipped: 2026-05-30T09:06
+    delivered: 2026-06-02T09:06
+    status: Delivered
+    receiver: Taylor Marsh
+  - key: copper:tracking:514498820946
+    id: '514498820946'
+    order: 20260718-301704
+    kind: outbound
+    carrier: Swiftline Parcel
+    goods:
+    - CL20697
+    shipped: 2026-07-20T00:50
+    delivered: 2026-07-23T00:50
+    status: Delivered
+    receiver: Taylor Marsh
+  - key: copper:tracking:891893069713
+    id: '891893069713'
+    order: 20260619-301775
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20082
+    shipped: 2026-06-20T11:15
+    delivered: 2026-06-23T11:15
+    status: Delivered
+    receiver: Taylor Marsh
+  - key: copper:tracking:758506797873
+    id: '758506797873'
+    order: 20260619-301775
+    kind: outbound
+    carrier: BlueRoute Freight
+    goods:
+    - CL20205
+    shipped: 2026-06-23T13:15
+    delivered: 2026-06-25T13:15
+    status: Delivered
+    receiver: Taylor Marsh
+  - key: copper:tracking:575670635323
+    id: '575670635323'
+    order: 20260517-301846
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20656
+    shipped: 2026-05-18T06:24
+    delivered: 2026-05-20T06:24
+    status: Delivered
+    receiver: Riley Holloway
+  - key: copper:tracking:325494280337
+    id: '325494280337'
+    order: 20260804-301917
+    kind: outbound
+    carrier: Swiftline Parcel
+    goods:
+    - CL20328
+    shipped: 2026-08-05T05:12
+    delivered: 2026-08-07T05:12
+    status: Delivered
+    receiver: Harper Marsh
+  - key: copper:tracking:154285041432
+    id: '154285041432'
+    order: 20260618-301988
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20533
+    - CL20369
+    shipped: 2026-06-19T15:30
+    delivered: 2026-06-22T15:30
+    status: Delivered
+    receiver: Finley Marsh
+  - key: copper:tracking:109152022586
+    id: '109152022586'
+    order: 20260803-302059
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20164
+    shipped: 2026-08-04T08:47
+    delivered: null
+    status: Shipped
+    receiver: Casey Dorsey
+  - key: copper:tracking:544952251001
+    id: '544952251001'
+    order: 20260803-302059
+    kind: outbound
+    carrier: BlueRoute Freight
+    goods:
+    - CL20287
+    shipped: 2026-08-06T13:47
+    delivered: null
+    status: Shipped
+    receiver: Casey Dorsey
+  - key: copper:tracking:993186552339
+    id: '993186552339'
+    order: 20260414-302201
+    kind: outbound
+    carrier: Harbor Courier
+    goods:
+    - CL20205
+    - CL20369
+    shipped: 2026-04-15T13:44
+    delivered: 2026-04-17T13:44
+    status: Delivered
+    receiver: Riley Mercer
+  - key: copper:tracking:286830169143
+    id: '286830169143'
+    order: 20260414-302201
+    kind: return
+    carrier: Harbor Courier
+    goods:
+    - CL20205
+    shipped: 2026-04-23T13:44
+    delivered: 2026-04-25T13:44
+    status: Returned
+    receiver: Copperleaf Goods Inc.
+  - key: copper:tracking:338271627007
+    id: '338271627007'
+    order: 20260413-302272
+    kind: outbound
+    carrier: Pinewood Express
+    goods:
+    - CL20410
+    shipped: 2026-04-14T07:50
+    delivered: 2026-04-16T07:50
+    status: Delivered
+    receiver: Finley Marsh
+  - key: copper:tracking:436626658419
+    id: '436626658419'
+    order: 20260413-302272
+    kind: outbound
+    carrier: BlueRoute Freight
+    goods:
+    - CL20369
+    - CL20328
+    shipped: 2026-04-16T11:50
+    delivered: 2026-04-19T11:50
+    status: Delivered
+    receiver: Finley Marsh
+  reviews:
+  - key: copper:review:RV8100
+    id: RV8100
+    order: 20260413-302272
+    goods: CL20328
+    author: Taylor Marsh
+    rating: 5
+    text: Packed with care and sturdy overall.
+    posted: '2026-04-20'
+    status: Approved
+  - key: copper:review:RV8117
+    id: RV8117
+    order: 20260414-302201
+    goods: CL20205
+    author: Riley Mercer
+    rating: 1
+    text: Arrived damaged, very disappointed.
+    posted: '2026-04-25'
+    status: Approved
+  - key: copper:review:RV8134
+    id: RV8134
+    order: 20260501-300497
+    goods: CL20369
+    author: Taylor Marsh
+    rating: 5
+    text: Second purchase and still well finished.
+    posted: '2026-05-13'
+    status: Approved
+  - key: copper:review:RV8151
+    id: RV8151
+    order: 20260601-300142
+    goods: CL20246
+    author: Riley Holloway
+    rating: 5
+    text: Second purchase and still lightweight.
+    posted: '2026-06-15'
+    status: Approved
+  - key: copper:review:RV8168
+    id: RV8168
+    order: 20260617-300284
+    goods: CL20533
+    author: Riley Mercer
+    rating: 4
+    text: Better than expected, really well finished.
+    posted: '2026-06-27'
+    status: Approved
+  - key: copper:review:RV8185
+    id: RV8185
+    order: 20260623-300213
+    goods: CL20410
+    author: Taylor Marsh
+    rating: 5
+    text: Second purchase and still sturdy.
+    posted: '2026-07-01'
+    status: Approved
+  - key: copper:review:RV8202
+    id: RV8202
+    order: 20260628-300355
+    goods: CL20533
+    author: Finley Marsh
+    rating: 5
+    text: Better than expected, really sturdy.
+    posted: '2026-07-07'
+    status: Approved
+  - key: copper:review:RV8219
+    id: RV8219
+    order: 20260715-300071
+    goods: CL20615
+    author: Taylor Marsh
+    rating: 1
+    text: Not as described, sent it back.
+    posted: '2026-07-20'
+    status: Approved
+  - key: copper:review:RV8236
+    id: RV8236
+    order: 20260718-301704
+    goods: CL20697
+    author: Taylor Marsh
+    rating: 5
+    text: Better than expected, really lightweight.
+    posted: '2026-07-29'
+    status: Pending
+  - key: copper:review:RV8253
+    id: RV8253
+    order: 20260804-301917
+    goods: CL20328
+    author: Harper Marsh
+    rating: 5
+    text: Better than expected, really sturdy.
+    posted: '2026-08-16'
+    status: Approved
+  - key: copper:review:RV8270
+    id: RV8270
+    order: 20260813-301420
+    goods: CL20082
+    author: Riley Holloway
+    rating: 4
+    text: Packed with care and sturdy overall.
+    posted: '2026-08-26'
+    status: Approved
+  - key: copper:review:RV8287
+    id: RV8287
+    order: 20260817-301491
+    goods: CL20369
+    author: Finley Whitfield
+    rating: 2
+    text: Arrived damaged, very disappointed.
+    posted: '2026-08-30'
+    status: Approved
+  - key: copper:review:RV8304
+    id: RV8304
+    order: 20260821-301207
+    goods: CL20123
+    author: Taylor Marsh
+    rating: 5
+    text: Packed with care and lightweight overall.
+    posted: '2026-09-04'
+    status: Approved
+  - key: copper:review:RV8321
+    id: RV8321
+    order: 20260902-301278
+    goods: CL20246
+    author: Taylor Marsh
+    rating: 5
+    text: Packed with care and lightweight overall.
+    posted: '2026-09-08'
+    status: Approved
+  coupons:
+  - key: copper:coupon:CP5013
+    id: CP5013
+    code: CLWELCOME
+    title: First order welcome
+    start: '2026-04-01'
+    end: '2026-09-30'
+    event: null
+  - key: copper:coupon:CP5026
+    id: CP5026
+    code: CLSUMMER
+    title: Summer getaway coupon
+    start: '2026-06-15'
+    end: '2026-07-12'
+    event: EV718
+  - key: copper:coupon:CP5039
+    id: CP5039
+    code: CLAGAIN
+    title: Returning customer perk
+    start: '2026-04-01'
+    end: '2026-09-30'
+    event: null
+  - key: copper:coupon:CP5052
+    id: CP5052
+    code: CLHARVEST
+    title: Autumn thank-you sale
+    start: '2026-09-01'
+    end: '2026-09-20'
+    event: EV727
+  events:
+  - key: copper:event:EV709
+    id: EV709
+    title: Spring stroll showcase
+    start: '2026-04-06'
+    end: '2026-04-26'
+    goods:
+    - CL20574
+    - CL20205
+    - CL20615
+    - CL20287
+    - CL20369
+    coupon: null
+  - key: copper:event:EV718
+    id: EV718
+    title: Summer getaway picks
+    start: '2026-06-15'
+    end: '2026-07-12'
+    goods:
+    - CL20451
+    - CL20082
+    - CL20533
+    - CL20738
+    - CL20410
+    coupon: CP5026
+  - key: copper:event:EV727
+    id: EV727
+    title: Harvest gift guide
+    start: '2026-09-01'
+    end: '2026-09-20'
+    goods:
+    - CL20123
+    - CL20246
+    - CL20656
+    - CL20328
+    - CL20492
+    coupon: CP5052
+  members:
+  - id: MCL3000
+    name: Taylor Marsh
+    phone: +1-790-555-0181
+  - id: MCL3007
+    name: Emerson Whitfield
+    phone: +1-954-555-0199
+  - id: MCL3014
+    name: Casey Dorsey
+    phone: +1-650-555-0122
+  - id: MCL3021
+    name: Riley Mercer
+    phone: +1-309-555-0112
+  - id: MCL3028
+    name: Finley Whitfield
+    phone: +1-727-555-0184
+  - id: MCL3035
+    name: Finley Marsh
+    phone: +1-522-555-0191
+  - id: MCL3042
+    name: Harper Marsh
+    phone: +1-789-555-0116
+  - id: MCL3049
+    name: Riley Holloway
+    phone: +1-512-555-0123
+  - id: MCL3056
+    name: Morgan Whitfield
+    phone: +1-739-555-0189
+  - id: MCL3063
+    name: Finley Holloway
+    phone: +1-361-555-0106
+  - id: MCL3070
+    name: Taylor Sinclair
+    phone: +1-650-555-0195
+  - id: MCL3077
+    name: Harper Mercer
+    phone: +1-337-555-0174
+  trade:
+    lang: ja
+    exporter: 株式会社ひなた工房
+    importer: Copperleaf Goods Inc.
+    currency: JPY
+    pol: 大阪港（日本）
+    pod: シアトル港（アメリカ合衆国）
+    numbers:
+      po: PO-JP-62173
+      lc: LC-JP8788712
+      co: CO-2026-JP-3862
+      ip: IP-JP-834793
+    ships:
+    - n: 1
+      ci: CI-JP-2606-324
+      pl: PL-JP-2606-454
+      bl: BL-JP81652912
+      vessel: MINATO MARU V.118E
+      etd: '2026-06-10'
+      eta: '2026-07-05'
+      container: MNTU1195598
+      goods:
+      - CL20738
+      - CL20246
+      descriptions:
+      - ペットキャリーバッグ
+      - マイクロファイバーブランケット
+    - n: 2
+      ci: CI-JP-2608-408
+      pl: null
+      bl: BL-JP70174471
+      vessel: MINATO MARU V.122E
+      etd: '2026-08-18'
+      eta: '2026-09-05'
+      container: MNTU6729903
+      goods:
+      - CL20574
+      descriptions:
+      - 充電式LEDランタン
+    docs:
+    - stem: copper_CI1
+      code: CI
+      ship: 1
+      number: CI-JP-2606-324
+      refs:
+      - PO-JP-62173
+      - BL-JP81652912
+      - LC-JP8788712
+    - stem: copper_PL1
+      code: PL
+      ship: 1
+      number: PL-JP-2606-454
+      refs:
+      - PO-JP-62173
+      - CI-JP-2606-324
+      - BL-JP81652912
+    - stem: copper_BL1
+      code: BL
+      ship: 1
+      number: BL-JP81652912
+      refs:
+      - PO-JP-62173
+      - CI-JP-2606-324
+      - LC-JP8788712
+    - stem: copper_CO1
+      code: CO
+      ship: 1
+      number: CO-2026-JP-3862
+      refs:
+      - CI-JP-2606-324
+      - BL-JP81652912
+      - LC-JP8788712
+    - stem: copper_IP1
+      code: IP
+      ship: 1
+      number: IP-JP-834793
+      refs:
+      - PO-JP-62173
+      - CI-JP-2606-324
+      - BL-JP81652912
+      - LC-JP8788712
+    - stem: copper_CI2
+      code: CI
+      ship: 2
+      number: CI-JP-2608-408
+      refs:
+      - PO-JP-62173
+      - BL-JP70174471
+      - LC-JP8788712
+    - stem: copper_BL2
+      code: BL
+      ship: 2
+      number: BL-JP70174471
+      refs:
+      - PO-JP-62173
+      - CI-JP-2608-408
+      - LC-JP8788712
+- shop: komorebi
+  lang: ja
+  name: こもれび商店
+  domain: komorebi-shop.test
+  company: 株式会社こもれび
+  goods:
+  - key: komorebi:goods:KM20041
+    id: KM20041
+    title: プログラミングロボットキット
+    title_en: Coding robot kit
+    title_ko: 코딩 로봇 키트
+    concept: kids
+    status: Active
+    price: 9090
+    stock: 9
+    registered: '2026-02-24'
+    imported: false
+  - key: komorebi:goods:KM20082
+    id: KM20082
+    title: ひんやりジェルマット
+    title_en: Ice gel cooling mat
+    title_ko: 아이스 쿨매트
+    concept: hot_weather
+    status: Active
+    price: 4620
+    stock: 25
+    registered: '2026-01-22'
+    imported: false
+  - key: komorebi:goods:KM20123
+    id: KM20123
+    title: 折りたたみトレッキングポール
+    title_en: Folding trekking poles
+    title_ko: 접이식 등산 스틱
+    concept: outdoor
+    status: Active
+    price: 5300
+    stock: 140
+    registered: '2026-02-19'
+    imported: false
+  - key: komorebi:goods:KM20164
+    id: KM20164
+    title: 充電式LEDランタン
+    title_en: Rechargeable LED lantern
+    title_ko: LED 충전 랜턴
+    concept: outdoor
+    status: Active
+    price: 3130
+    stock: 140
+    registered: '2026-03-09'
+    imported: false
+  - key: komorebi:goods:KM20205
+    id: KM20205
+    title: もこもこルームシューズ
+    title_en: Plush house slippers
+    title_ko: 털 슬리퍼
+    concept: cold_weather
+    status: Active
+    price: 1990
+    stock: 9
+    registered: '2026-01-18'
+    imported: true
+  - key: komorebi:goods:KM20246
+    id: KM20246
+    title: ケーブル収納ボックス
+    title_en: Cable management box
+    title_ko: 케이블 정리함
+    concept: desk_work
+    status: Active
+    price: 1710
+    stock: 140
+    registered: '2026-01-23'
+    imported: false
+  - key: komorebi:goods:KM20287
+    id: KM20287
+    title: スマートフィットネスバンド
+    title_en: Smart fitness band
+    title_ko: 스마트 밴드
+    concept: audio_power
+    status: Active
+    price: 5460
+    stock: 25
+    registered: '2026-01-13'
+    imported: false
+  - key: komorebi:goods:KM20328
+    id: KM20328
+    title: 木製積み木
+    title_en: Wooden building blocks
+    title_ko: 원목 블록 세트
+    concept: kids
+    status: Active
+    price: 4020
+    stock: 4
+    registered: '2026-02-04'
+    imported: false
+  - key: komorebi:goods:KM20369
+    id: KM20369
+    title: USB-Cマルチポートハブ
+    title_en: USB-C multiport hub
+    title_ko: USB-C 멀티 허브
+    concept: audio_power
+    status: Active
+    price: 3800
+    stock: 25
+    registered: '2026-03-08'
+    imported: true
+  - key: komorebi:goods:KM20410
+    id: KM20410
+    title: ビタミンC美容液
+    title_en: Vitamin C serum
+    title_ko: 비타민 C 세럼
+    concept: skincare
+    status: Active
+    price: 4540
+    stock: 140
+    registered: '2026-01-14'
+    imported: false
+  - key: komorebi:goods:KM20451
+    id: KM20451
+    title: 防水Bluetoothスピーカー
+    title_en: Waterproof Bluetooth speaker
+    title_ko: 방수 블루투스 스피커
+    concept: audio_power
+    status: Active
+    price: 6120
+    stock: 140
+    registered: '2026-02-18'
+    imported: false
+  - key: komorebi:goods:KM20492
+    id: KM20492
+    title: マイクロファイバーブランケット
+    title_en: Microfiber throw blanket
+    title_ko: 극세사 담요
+    concept: cold_weather
+    status: Active
+    price: 2990
+    stock: 25
+    registered: '2026-01-16'
+    imported: false
+  - key: komorebi:goods:KM20533
+    id: KM20533
+    title: 温度調節電気ケトル
+    title_en: Temperature control kettle
+    title_ko: 온도조절 전기포트
+    concept: cooking
+    status: Active
+    price: 5390
+    stock: 25
+    registered: '2026-01-25'
+    imported: false
+  - key: komorebi:goods:KM20574
+    id: KM20574
+    title: シリコン調理器具セット
+    title_en: Silicone utensil set
+    title_ko: 실리콘 조리도구 세트
+    concept: cooking
+    status: Sold out
+    price: 3030
+    stock: 0
+    registered: '2026-01-30'
+    imported: false
+  - key: komorebi:goods:KM20615
+    id: KM20615
+    title: 子ども用食器セット
+    title_en: Toddler tableware set
+    title_ko: 유아 식기 세트
+    concept: kids
+    status: Sold out
+    price: 2820
+    stock: 0
+    registered: '2026-01-12'
+    imported: false
+  - key: komorebi:goods:KM20656
+    id: KM20656
+    title: 無香料ボディローション
+    title_en: Fragrance-free body lotion
+    title_ko: 무향 바디 로션
+    concept: skincare
+    status: Active
+    price: 1990
+    stock: 9
+    registered: '2026-02-16'
+    imported: false
+  - key: komorebi:goods:KM20697
+    id: KM20697
+    title: アウトドアクッカーセット
+    title_en: Portable cookware set
+    title_ko: 휴대용 코펠 세트
+    concept: outdoor
+    status: Active
+    price: 4270
+    stock: 25
+    registered: '2026-02-05'
+    imported: false
+  - key: komorebi:goods:KM20738
+    id: KM20738
+    title: セラミック包丁
+    title_en: Ceramic chef knife
+    title_ko: 세라믹 식칼
+    concept: cooking
+    status: Active
+    price: 4100
+    stock: 25
+    registered: '2026-02-11'
+    imported: true
+  orders:
+  - key: komorebi:order:20260928-300568
+    id: 20260928-300568
+    when: 2026-09-28T22:51
+    member: MKM3056
+    buyer: 小林 大翔
+    receiver: 中村 湊
+    status: Delivered
+    amount: 5970
+    goods:
+    - KM20205
+    qty:
+      KM20205: 3
+    coupon: null
+    event: null
+    tracking:
+    - '473951648970'
+  - key: komorebi:order:20260922-301207
+    id: 20260922-301207
+    when: 2026-09-22T06:17
+    member: MKM3021
+    buyer: 渡辺 湊
+    receiver: 小林 芽依
+    status: Delivered
+    amount: 4350
+    goods:
+    - KM20328
+    qty:
+      KM20328: 1
+    coupon: null
+    event: null
+    tracking:
+    - '564760769854'
+  - key: komorebi:order:20260921-300426
+    id: 20260921-300426
+    when: 2026-09-21T23:36
+    member: MKM3028
+    buyer: 山本 蓮
+    receiver: 小林 大翔
+    status: Delivered
+    amount: 7120
+    goods:
+    - KM20205
+    - KM20287
+    qty:
+      KM20205: 1
+      KM20287: 1
+    coupon: CP5013
+    event: null
+    tracking:
+    - '472339038575'
+  - key: komorebi:order:20260921-301988
+    id: 20260921-301988
+    when: 2026-09-21T15:21
+    member: MKM3028
+    buyer: 山本 蓮
+    receiver: 山本 蓮
+    status: Delivered
+    amount: 3360
+    goods:
+    - KM20574
+    qty:
+      KM20574: 1
+    coupon: null
+    event: null
+    tracking:
+    - '499768577109'
+  - key: komorebi:order:20260920-300497
+    id: 20260920-300497
+    when: 2026-09-20T22:58
+    member: MKM3007
+    buyer: 鈴木 悠真
+    receiver: 鈴木 悠真
+    status: Cancelled
+    amount: 5430
+    goods:
+    - KM20205
+    qty:
+      KM20205: 3
+    coupon: CP5052
+    event: EV727
+    tracking: []
+  - key: komorebi:order:20260920-300355
+    id: 20260920-300355
+    when: 2026-09-20T08:46
+    member: MKM3000
+    buyer: 加藤 芽依
+    receiver: 加藤 芽依
+    status: Returned
+    amount: 7280
+    goods:
+    - KM20369
+    - KM20328
+    qty:
+      KM20369: 1
+      KM20328: 1
+    coupon: CP5052
+    event: EV727
+    tracking:
+    - '509952105774'
+    - '560784441306'
+    - '136921732942'
+  - key: komorebi:order:20260920-300284
+    id: 20260920-300284
+    when: 2026-09-20T06:33
+    member: MKM3049
+    buyer: 渡辺 大翔
+    receiver: 渡辺 大翔
+    status: Delivered
+    amount: 11700
+    goods:
+    - KM20451
+    qty:
+      KM20451: 2
+    coupon: CP5052
+    event: EV727
+    tracking:
+    - '609768533584'
+  - key: komorebi:order:20260917-301278
+    id: 20260917-301278
+    when: 2026-09-17T20:52
+    member: MKM3021
+    buyer: 渡辺 湊
+    receiver: 渡辺 湊
+    status: Delivered
+    amount: 5100
+    goods:
+    - KM20615
+    qty:
+      KM20615: 2
+    coupon: CP5052
+    event: EV727
+    tracking:
+    - '753168486774'
+  - key: komorebi:order:20260911-300213
+    id: 20260911-300213
+    when: 2026-09-11T06:06
+    member: MKM3000
+    buyer: 加藤 芽依
+    receiver: 加藤 芽依
+    status: Delivered
+    amount: 15840
+    goods:
+    - KM20287
+    qty:
+      KM20287: 3
+    coupon: CP5052
+    event: null
+    tracking:
+    - '178350404767'
+  - key: komorebi:order:20260812-301633
+    id: 20260812-301633
+    when: 2026-08-12T22:26
+    member: MKM3021
+    buyer: 渡辺 湊
+    receiver: 渡辺 湊
+    status: Delivered
+    amount: 19630
+    goods:
+    - KM20287
+    - KM20738
+    - KM20205
+    qty:
+      KM20287: 1
+      KM20738: 2
+      KM20205: 3
+    coupon: null
+    event: null
+    tracking:
+    - '462221939905'
+  - key: komorebi:order:20260812-301562
+    id: 20260812-301562
+    when: 2026-08-12T05:09
+    member: MKM3000
+    buyer: 加藤 芽依
+    receiver: 加藤 芽依
+    status: Shipped
+    amount: 11570
+    goods:
+    - KM20697
+    - KM20574
+    qty:
+      KM20697: 2
+      KM20574: 1
+    coupon: null
+    event: null
+    tracking:
+    - '340530575553'
+  - key: komorebi:order:20260809-302130
+    id: 20260809-302130
+    when: 2026-08-09T22:43
+    member: MKM3077
+    buyer: 中村 湊
+    receiver: 中村 湊
+    status: Cancelled
+    amount: 3750
+    goods:
+    - KM20246
+    qty:
+      KM20246: 2
+    coupon: null
+    event: null
+    tracking: []
+  - key: komorebi:order:20260804-302059
+    id: 20260804-302059
+    when: 2026-08-04T01:46
+    member: MKM3007
+    buyer: 鈴木 悠真
+    receiver: 鈴木 悠真
+    status: Delivered
+    amount: 7520
+    goods:
+    - KM20246
+    - KM20738
+    qty:
+      KM20246: 2
+      KM20738: 1
+    coupon: null
+    event: null
+    tracking:
+    - '517705177615'
+    - '124349929967'
+  - key: komorebi:order:20260725-301846
+    id: 20260725-301846
+    when: 2026-07-25T07:40
+    member: MKM3070
+    buyer: 中村 美咲
+    receiver: 中村 美咲
+    status: Cancelled
+    amount: 5790
+    goods:
+    - KM20369
+    - KM20205
+    qty:
+      KM20369: 1
+      KM20205: 1
+    coupon: null
+    event: null
+    tracking: []
+  - key: komorebi:order:20260724-302272
+    id: 20260724-302272
+    when: 2026-07-24T22:44
+    member: MKM3042
+    buyer: 渡辺 葵
+    receiver: 山本 蓮
+    status: Delivered
+    amount: 10730
+    goods:
+    - KM20533
+    - KM20410
+    - KM20205
+    qty:
+      KM20533: 1
+      KM20410: 1
+      KM20205: 1
+    coupon: CP5039
+    event: null
+    tracking:
+    - '521193411386'
+  - key: komorebi:order:20260722-301136
+    id: 20260722-301136
+    when: 2026-07-22T16:54
+    member: MKM3007
+    buyer: 鈴木 悠真
+    receiver: 鈴木 悠真
+    status: Cancelled
+    amount: 7960
+    goods:
+    - KM20205
+    - KM20656
+    qty:
+      KM20205: 3
+      KM20656: 1
+    coupon: null
+    event: null
+    tracking: []
+  - key: komorebi:order:20260707-301491
+    id: 20260707-301491
+    when: 2026-07-07T15:16
+    member: MKM3049
+    buyer: 渡辺 大翔
+    receiver: 渡辺 大翔
+    status: Delivered
+    amount: 5150
+    goods:
+    - KM20574
+    qty:
+      KM20574: 2
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '848739929093'
+  - key: komorebi:order:20260705-301704
+    id: 20260705-301704
+    when: 2026-07-05T02:08
+    member: MKM3021
+    buyer: 渡辺 湊
+    receiver: 渡辺 湊
+    status: Delivered
+    amount: 4910
+    goods:
+    - KM20533
+    qty:
+      KM20533: 1
+    coupon: CP5026
+    event: null
+    tracking:
+    - '389984867208'
+  - key: komorebi:order:20260702-300994
+    id: 20260702-300994
+    when: 2026-07-02T17:11
+    member: MKM3007
+    buyer: 鈴木 悠真
+    receiver: 鈴木 悠真
+    status: Delivered
+    amount: 3360
+    goods:
+    - KM20574
+    qty:
+      KM20574: 1
+    coupon: null
+    event: EV718
+    tracking:
+    - '503400467005'
+  - key: komorebi:order:20260625-300142
+    id: 20260625-300142
+    when: 2026-06-25T09:03
+    member: MKM3007
+    buyer: 鈴木 悠真
+    receiver: 鈴木 悠真
+    status: Delivered
+    amount: 23060
+    goods:
+    - KM20697
+    - KM20410
+    - KM20082
+    qty:
+      KM20697: 1
+      KM20410: 3
+      KM20082: 2
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '222046054191'
+    - '405629602313'
+  - key: komorebi:order:20260621-300852
+    id: 20260621-300852
+    when: 2026-06-21T12:41
+    member: MKM3049
+    buyer: 渡辺 大翔
+    receiver: 渡辺 大翔
+    status: Delivered
+    amount: 15610
+    goods:
+    - KM20451
+    qty:
+      KM20451: 3
+    coupon: CP5026
+    event: null
+    tracking:
+    - '961736408912'
+  - key: komorebi:order:20260606-300710
+    id: 20260606-300710
+    when: 2026-06-06T16:25
+    member: MKM3000
+    buyer: 加藤 芽依
+    receiver: 加藤 芽依
+    status: Returned
+    amount: 9080
+    goods:
+    - KM20410
+    qty:
+      KM20410: 2
+    coupon: null
+    event: null
+    tracking:
+    - '397090333729'
+    - '836754722307'
+  - key: komorebi:order:20260518-300923
+    id: 20260518-300923
+    when: 2026-05-18T17:16
+    member: MKM3007
+    buyer: 鈴木 悠真
+    receiver: 加藤 芽依
+    status: Delivered
+    amount: 8540
+    goods:
+    - KM20697
+    qty:
+      KM20697: 2
+    coupon: null
+    event: null
+    tracking:
+    - '442841635125'
+  - key: komorebi:order:20260515-302201
+    id: 20260515-302201
+    when: 2026-05-15T06:47
+    member: MKM3028
+    buyer: 山本 蓮
+    receiver: 山本 蓮
+    status: Delivered
+    amount: 20860
+    goods:
+    - KM20369
+    - KM20615
+    - KM20287
+    qty:
+      KM20369: 1
+      KM20615: 3
+      KM20287: 2
+    coupon: CP5039
+    event: null
+    tracking:
+    - '865922336675'
+  - key: komorebi:order:20260512-301917
+    id: 20260512-301917
+    when: 2026-05-12T21:15
+    member: MKM3014
+    buyer: 高橋 健太
+    receiver: 渡辺 大翔
+    status: Delivered
+    amount: 9660
+    goods:
+    - KM20615
+    - KM20328
+    qty:
+      KM20615: 2
+      KM20328: 1
+    coupon: null
+    event: null
+    tracking:
+    - '807240663942'
+    - '215110458777'
+  - key: komorebi:order:20260511-301420
+    id: 20260511-301420
+    when: 2026-05-11T14:40
+    member: MKM3000
+    buyer: 加藤 芽依
+    receiver: 加藤 芽依
+    status: Cancelled
+    amount: 22750
+    goods:
+    - KM20738
+    - KM20041
+    - KM20287
+    qty:
+      KM20738: 2
+      KM20041: 1
+      KM20287: 1
+    coupon: null
+    event: null
+    tracking: []
+  - key: komorebi:order:20260506-300639
+    id: 20260506-300639
+    when: 2026-05-06T23:54
+    member: MKM3007
+    buyer: 鈴木 悠真
+    receiver: 鈴木 悠真
+    status: Delivered
+    amount: 2320
+    goods:
+    - KM20205
+    qty:
+      KM20205: 1
+    coupon: null
+    event: null
+    tracking:
+    - '552636909670'
+  - key: komorebi:order:20260425-300071
+    id: 20260425-300071
+    when: 2026-04-25T08:51
+    member: MKM3000
+    buyer: 加藤 芽依
+    receiver: 小林 大翔
+    status: Delivered
+    amount: 5460
+    goods:
+    - KM20287
+    qty:
+      KM20287: 1
+    coupon: null
+    event: EV709
+    tracking:
+    - '646781334594'
+  - key: komorebi:order:20260416-300781
+    id: 20260416-300781
+    when: 2026-04-16T09:52
+    member: MKM3000
+    buyer: 加藤 芽依
+    receiver: 加藤 芽依
+    status: Delivered
+    amount: 17800
+    goods:
+    - KM20410
+    - KM20123
+    - KM20246
+    qty:
+      KM20410: 2
+      KM20123: 1
+      KM20246: 2
+    coupon: null
+    event: EV709
+    tracking:
+    - '697719988118'
+  - key: komorebi:order:20260415-301065
+    id: 20260415-301065
+    when: 2026-04-15T07:33
+    member: MKM3000
+    buyer: 加藤 芽依
+    receiver: 加藤 芽依
+    status: Cancelled
+    amount: 5720
+    goods:
+    - KM20533
+    qty:
+      KM20533: 1
+    coupon: null
+    event: EV709
+    tracking: []
+  - key: komorebi:order:20260411-301349
+    id: 20260411-301349
+    when: 2026-04-11T01:38
+    member: MKM3007
+    buyer: 鈴木 悠真
+    receiver: 鈴木 悠真
+    status: Returned
+    amount: 20680
+    goods:
+    - KM20287
+    - KM20328
+    qty:
+      KM20287: 2
+      KM20328: 3
+    coupon: CP5039
+    event: EV709
+    tracking:
+    - '599550539605'
+    - '299605337428'
+  - key: komorebi:order:20260407-301775
+    id: 20260407-301775
+    when: 2026-04-07T01:38
+    member: MKM3021
+    buyer: 渡辺 湊
+    receiver: 渡辺 湊
+    status: Delivered
+    amount: 5720
+    goods:
+    - KM20533
+    qty:
+      KM20533: 1
+    coupon: null
+    event: EV709
+    tracking:
+    - '900897482474'
+  shipments:
+  - key: komorebi:tracking:646781334594
+    id: '646781334594'
+    order: 20260425-300071
+    kind: outbound
+    carrier: さくら便
+    goods:
+    - KM20287
+    shipped: 2026-04-26T10:51
+    delivered: 2026-04-28T10:51
+    status: Delivered
+    receiver: 小林 大翔
+  - key: komorebi:tracking:222046054191
+    id: '222046054191'
+    order: 20260625-300142
+    kind: outbound
+    carrier: はやぶさ運輸
+    goods:
+    - KM20697
+    shipped: 2026-06-26T13:03
+    delivered: 2026-06-28T13:03
+    status: Delivered
+    receiver: 鈴木 悠真
+  - key: komorebi:tracking:405629602313
+    id: '405629602313'
+    order: 20260625-300142
+    kind: outbound
+    carrier: はやぶさ運輸
+    goods:
+    - KM20410
+    - KM20082
+    shipped: 2026-06-28T14:03
+    delivered: 2026-07-01T14:03
+    status: Delivered
+    receiver: 鈴木 悠真
+  - key: komorebi:tracking:178350404767
+    id: '178350404767'
+    order: 20260911-300213
+    kind: outbound
+    carrier: みなと急便
+    goods:
+    - KM20287
+    shipped: 2026-09-12T12:06
+    delivered: 2026-09-13T12:06
+    status: Delivered
+    receiver: 加藤 芽依
+  - key: komorebi:tracking:609768533584
+    id: '609768533584'
+    order: 20260920-300284
+    kind: outbound
+    carrier: みなと急便
+    goods:
+    - KM20451
+    shipped: 2026-09-21T11:33
+    delivered: 2026-09-23T11:33
+    status: Delivered
+    receiver: 渡辺 大翔
+  - key: komorebi:tracking:509952105774
+    id: '509952105774'
+    order: 20260920-300355
+    kind: outbound
+    carrier: みなと急便
+    goods:
+    - KM20369
+    shipped: 2026-09-21T10:46
+    delivered: 2026-09-23T10:46
+    status: Delivered
+    receiver: 加藤 芽依
+  - key: komorebi:tracking:560784441306
+    id: '560784441306'
+    order: 20260920-300355
+    kind: outbound
+    carrier: はやぶさ運輸
+    goods:
+    - KM20328
+    shipped: 2026-09-23T14:46
+    delivered: 2026-09-25T14:46
+    status: Delivered
+    receiver: 加藤 芽依
+  - key: komorebi:tracking:136921732942
+    id: '136921732942'
+    order: 20260920-300355
+    kind: return
+    carrier: さくら便
+    goods:
+    - KM20369
+    shipped: 2026-09-30T14:46
+    delivered: 2026-10-02T14:46
+    status: Returned
+    receiver: 株式会社こもれび
+  - key: komorebi:tracking:472339038575
+    id: '472339038575'
+    order: 20260921-300426
+    kind: outbound
+    carrier: さくら便
+    goods:
+    - KM20205
+    - KM20287
+    shipped: 2026-09-23T06:36
+    delivered: 2026-09-24T06:36
+    status: Delivered
+    receiver: 小林 大翔
+  - key: komorebi:tracking:473951648970
+    id: '473951648970'
+    order: 20260928-300568
+    kind: outbound
+    carrier: さくら便
+    goods:
+    - KM20205
+    shipped: 2026-09-30T04:51
+    delivered: 2026-10-02T04:51
+    status: Delivered
+    receiver: 中村 湊
+  - key: komorebi:tracking:552636909670
+    id: '552636909670'
+    order: 20260506-300639
+    kind: outbound
+    carrier: つばめ配送
+    goods:
+    - KM20205
+    shipped: 2026-05-08T01:54
+    delivered: 2026-05-11T01:54
+    status: Delivered
+    receiver: 鈴木 悠真
+  - key: komorebi:tracking:397090333729
+    id: '397090333729'
+    order: 20260606-300710
+    kind: outbound
+    carrier: はやぶさ運輸
+    goods:
+    - KM20410
+    shipped: 2026-06-07T20:25
+    delivered: 2026-06-10T20:25
+    status: Delivered
+    receiver: 加藤 芽依
+  - key: komorebi:tracking:836754722307
+    id: '836754722307'
+    order: 20260606-300710
+    kind: return
+    carrier: はやぶさ運輸
+    goods:
+    - KM20410
+    shipped: 2026-06-15T20:25
+    delivered: 2026-06-17T20:25
+    status: Returned
+    receiver: 株式会社こもれび
+  - key: komorebi:tracking:697719988118
+    id: '697719988118'
+    order: 20260416-300781
+    kind: outbound
+    carrier: さくら便
+    goods:
+    - KM20410
+    - KM20123
+    - KM20246
+    shipped: 2026-04-17T18:52
+    delivered: 2026-04-19T18:52
+    status: Delivered
+    receiver: 加藤 芽依
+  - key: komorebi:tracking:961736408912
+    id: '961736408912'
+    order: 20260621-300852
+    kind: outbound
+    carrier: さくら便
+    goods:
+    - KM20451
+    shipped: 2026-06-22T15:41
+    delivered: 2026-06-23T15:41
+    status: Delivered
+    receiver: 渡辺 大翔
+  - key: komorebi:tracking:442841635125
+    id: '442841635125'
+    order: 20260518-300923
+    kind: outbound
+    carrier: さくら便
+    goods:
+    - KM20697
+    shipped: 2026-05-19T22:16
+    delivered: 2026-05-20T22:16
+    status: Delivered
+    receiver: 加藤 芽依
+  - key: komorebi:tracking:503400467005
+    id: '503400467005'
+    order: 20260702-300994
+    kind: outbound
+    carrier: はやぶさ運輸
+    goods:
+    - KM20574
+    shipped: 2026-07-03T21:11
+    delivered: 2026-07-06T21:11
+    status: Delivered
+    receiver: 鈴木 悠真
+  - key: komorebi:tracking:564760769854
+    id: '564760769854'
+    order: 20260922-301207
+    kind: outbound
+    carrier: つばめ配送
+    goods:
+    - KM20328
+    shipped: 2026-09-23T09:17
+    delivered: 2026-09-24T09:17
+    status: Delivered
+    receiver: 小林 芽依
+  - key: komorebi:tracking:753168486774
+    id: '753168486774'
+    order: 20260917-301278
+    kind: outbound
+    carrier: みなと急便
+    goods:
+    - KM20615
+    shipped: 2026-09-19T01:52
+    delivered: 2026-09-21T01:52
+    status: Delivered
+    receiver: 渡辺 湊
+  - key: komorebi:tracking:599550539605
+    id: '599550539605'
+    order: 20260411-301349
+    kind: outbound
+    carrier: つばめ配送
+    goods:
+    - KM20287
+    - KM20328
+    shipped: 2026-04-12T04:38
+    delivered: 2026-04-15T04:38
+    status: Delivered
+    receiver: 鈴木 悠真
+  - key: komorebi:tracking:299605337428
+    id: '299605337428'
+    order: 20260411-301349
+    kind: return
+    carrier: はやぶさ運輸
+    goods:
+    - KM20287
+    shipped: 2026-04-21T04:38
+    delivered: 2026-04-23T04:38
+    status: Returned
+    receiver: 株式会社こもれび
+  - key: komorebi:tracking:848739929093
+    id: '848739929093'
+    order: 20260707-301491
+    kind: outbound
+    carrier: つばめ配送
+    goods:
+    - KM20574
+    shipped: 2026-07-08T19:16
+    delivered: 2026-07-10T19:16
+    status: Delivered
+    receiver: 渡辺 大翔
+  - key: komorebi:tracking:340530575553
+    id: '340530575553'
+    order: 20260812-301562
+    kind: outbound
+    carrier: みなと急便
+    goods:
+    - KM20697
+    - KM20574
+    shipped: 2026-08-13T07:09
+    delivered: null
+    status: Shipped
+    receiver: 加藤 芽依
+  - key: komorebi:tracking:462221939905
+    id: '462221939905'
+    order: 20260812-301633
+    kind: outbound
+    carrier: はやぶさ運輸
+    goods:
+    - KM20287
+    - KM20738
+    - KM20205
+    shipped: 2026-08-14T06:26
+    delivered: 2026-08-15T06:26
+    status: Delivered
+    receiver: 渡辺 湊
+  - key: komorebi:tracking:389984867208
+    id: '389984867208'
+    order: 20260705-301704
+    kind: outbound
+    carrier: はやぶさ運輸
+    goods:
+    - KM20533
+    shipped: 2026-07-06T06:08
+    delivered: 2026-07-09T06:08
+    status: Delivered
+    receiver: 渡辺 湊
+  - key: komorebi:tracking:900897482474
+    id: '900897482474'
+    order: 20260407-301775
+    kind: outbound
+    carrier: みなと急便
+    goods:
+    - KM20533
+    shipped: 2026-04-08T05:38
+    delivered: 2026-04-10T05:38
+    status: Delivered
+    receiver: 渡辺 湊
+  - key: komorebi:tracking:807240663942
+    id: '807240663942'
+    order: 20260512-301917
+    kind: outbound
+    carrier: はやぶさ運輸
+    goods:
+    - KM20615
+    shipped: 2026-05-14T04:15
+    delivered: 2026-05-16T04:15
+    status: Delivered
+    receiver: 渡辺 大翔
+  - key: komorebi:tracking:215110458777
+    id: '215110458777'
+    order: 20260512-301917
+    kind: outbound
+    carrier: つばめ配送
+    goods:
+    - KM20328
+    shipped: 2026-05-17T00:15
+    delivered: 2026-05-18T00:15
+    status: Delivered
+    receiver: 渡辺 大翔
+  - key: komorebi:tracking:499768577109
+    id: '499768577109'
+    order: 20260921-301988
+    kind: outbound
+    carrier: みなと急便
+    goods:
+    - KM20574
+    shipped: 2026-09-22T21:21
+    delivered: 2026-09-23T21:21
+    status: Delivered
+    receiver: 山本 蓮
+  - key: komorebi:tracking:517705177615
+    id: '517705177615'
+    order: 20260804-302059
+    kind: outbound
+    carrier: みなと急便
+    goods:
+    - KM20246
+    shipped: 2026-08-05T04:46
+    delivered: 2026-08-08T04:46
+    status: Delivered
+    receiver: 鈴木 悠真
+  - key: komorebi:tracking:124349929967
+    id: '124349929967'
+    order: 20260804-302059
+    kind: outbound
+    carrier: つばめ配送
+    goods:
+    - KM20738
+    shipped: 2026-08-07T07:46
+    delivered: 2026-08-09T07:46
+    status: Delivered
+    receiver: 鈴木 悠真
+  - key: komorebi:tracking:865922336675
+    id: '865922336675'
+    order: 20260515-302201
+    kind: outbound
+    carrier: みなと急便
+    goods:
+    - KM20369
+    - KM20615
+    - KM20287
+    shipped: 2026-05-16T09:47
+    delivered: 2026-05-17T09:47
+    status: Delivered
+    receiver: 山本 蓮
+  - key: komorebi:tracking:521193411386
+    id: '521193411386'
+    order: 20260724-302272
+    kind: outbound
+    carrier: つばめ配送
+    goods:
+    - KM20533
+    - KM20410
+    - KM20205
+    shipped: 2026-07-26T07:44
+    delivered: 2026-07-29T07:44
+    status: Delivered
+    receiver: 山本 蓮
+  reviews:
+  - key: komorebi:review:RV8100
+    id: RV8100
+    order: 20260411-301349
+    goods: KM20287
+    author: 鈴木 悠真
+    rating: 2
+    text: すぐに壊れました。
+    posted: '2026-04-17'
+    status: Approved
+  - key: komorebi:review:RV8117
+    id: RV8117
+    order: 20260416-300781
+    goods: KM20123
+    author: 加藤 芽依
+    rating: 4
+    text: 梱包も丁寧で、全体的に軽くて使いやすいです。
+    posted: '2026-04-25'
+    status: Approved
+  - key: komorebi:review:RV8134
+    id: RV8134
+    order: 20260506-300639
+    goods: KM20205
+    author: 鈴木 悠真
+    rating: 5
+    text: 思っていたより丈夫です。
+    posted: '2026-05-14'
+    status: Approved
+  - key: komorebi:review:RV8151
+    id: RV8151
+    order: 20260515-302201
+    goods: KM20615
+    author: 山本 蓮
+    rating: 4
+    text: 思っていたより色がきれいです。
+    posted: '2026-05-21'
+    status: Approved
+  - key: komorebi:review:RV8168
+    id: RV8168
+    order: 20260518-300923
+    goods: KM20697
+    author: 鈴木 悠真
+    rating: 4
+    text: 思っていたより仕上がりがきれいです。
+    posted: '2026-05-25'
+    status: Approved
+  - key: komorebi:review:RV8185
+    id: RV8185
+    order: 20260606-300710
+    goods: KM20410
+    author: 加藤 芽依
+    rating: 1
+    text: すぐに壊れました。
+    posted: '2026-06-11'
+    status: Approved
+  - key: komorebi:review:RV8202
+    id: RV8202
+    order: 20260621-300852
+    goods: KM20451
+    author: 渡辺 大翔
+    rating: 5
+    text: 梱包も丁寧で、全体的に丈夫です。
+    posted: '2026-06-26'
+    status: Approved
+  - key: komorebi:review:RV8219
+    id: RV8219
+    order: 20260702-300994
+    goods: KM20574
+    author: 鈴木 悠真
+    rating: 5
+    text: リピート購入ですが、やはり丈夫です。
+    posted: '2026-07-10'
+    status: Approved
+  - key: komorebi:review:RV8236
+    id: RV8236
+    order: 20260705-301704
+    goods: KM20533
+    author: 渡辺 湊
+    rating: 2
+    text: すぐに壊れました。
+    posted: '2026-07-11'
+    status: Approved
+  - key: komorebi:review:RV8253
+    id: RV8253
+    order: 20260724-302272
+    goods: KM20205
+    author: 渡辺 葵
+    rating: 4
+    text: 思っていたより丈夫です。
+    posted: '2026-08-02'
+    status: Approved
+  - key: komorebi:review:RV8270
+    id: RV8270
+    order: 20260812-301633
+    goods: KM20205
+    author: 渡辺 湊
+    rating: 5
+    text: 思っていたより軽くて使いやすいです。
+    posted: '2026-08-19'
+    status: Approved
+  - key: komorebi:review:RV8287
+    id: RV8287
+    order: 20260911-300213
+    goods: KM20287
+    author: 加藤 芽依
+    rating: 4
+    text: 思っていたより色がきれいです。
+    posted: '2026-09-17'
+    status: Approved
+  - key: komorebi:review:RV8304
+    id: RV8304
+    order: 20260917-301278
+    goods: KM20615
+    author: 渡辺 湊
+    rating: 5
+    text: 梱包も丁寧で、全体的に仕上がりがきれいです。
+    posted: '2026-09-28'
+    status: Approved
+  - key: komorebi:review:RV8321
+    id: RV8321
+    order: 20260920-300355
+    goods: KM20369
+    author: 加藤 芽依
+    rating: 2
+    text: 説明と違ったので返品しました。
+    posted: '2026-09-25'
+    status: Approved
+  coupons:
+  - key: komorebi:coupon:CP5013
+    id: CP5013
+    code: KMWELCOME
+    title: 初回購入ウェルカムクーポン
+    start: '2026-04-01'
+    end: '2026-09-30'
+    event: null
+  - key: komorebi:coupon:CP5026
+    id: CP5026
+    code: KMSUMMER
+    title: アプリ限定クーポン
+    start: '2026-06-15'
+    end: '2026-07-12'
+    event: EV718
+  - key: komorebi:coupon:CP5039
+    id: CP5039
+    code: KMAGAIN
+    title: リピーター優待クーポン
+    start: '2026-04-01'
+    end: '2026-09-30'
+    event: null
+  - key: komorebi:coupon:CP5052
+    id: CP5052
+    code: KMHARVEST
+    title: 秋の感謝クーポン
+    start: '2026-09-01'
+    end: '2026-09-20'
+    event: EV727
+  events:
+  - key: komorebi:event:EV709
+    id: EV709
+    title: 春のおでかけ特集
+    start: '2026-04-06'
+    end: '2026-04-26'
+    goods:
+    - KM20328
+    - KM20533
+    - KM20041
+    - KM20246
+    - KM20287
+    coupon: null
+  - key: komorebi:event:EV718
+    id: EV718
+    title: 夏休み準備セール
+    start: '2026-06-15'
+    end: '2026-07-12'
+    goods:
+    - KM20410
+    - KM20697
+    - KM20574
+    - KM20738
+    - KM20164
+    coupon: CP5026
+  - key: komorebi:event:EV727
+    id: EV727
+    title: 実りの秋ギフト特集
+    start: '2026-09-01'
+    end: '2026-09-20'
+    goods:
+    - KM20451
+    - KM20615
+    - KM20205
+    - KM20369
+    - KM20082
+    coupon: CP5052
+  members:
+  - id: MKM3000
+    name: 加藤 芽依
+    phone: 090-3147-9798
+  - id: MKM3007
+    name: 鈴木 悠真
+    phone: 090-3762-8743
+  - id: MKM3014
+    name: 高橋 健太
+    phone: 090-8933-3036
+  - id: MKM3021
+    name: 渡辺 湊
+    phone: 090-9958-2662
+  - id: MKM3028
+    name: 山本 蓮
+    phone: 090-2023-8543
+  - id: MKM3035
+    name: 小林 芽依
+    phone: 090-1144-4742
+  - id: MKM3042
+    name: 渡辺 葵
+    phone: 090-3653-0749
+  - id: MKM3049
+    name: 渡辺 大翔
+    phone: 090-1276-4755
+  - id: MKM3056
+    name: 小林 大翔
+    phone: 090-8785-8499
+  - id: MKM3063
+    name: 佐藤 美咲
+    phone: 090-9824-5834
+  - id: MKM3070
+    name: 中村 美咲
+    phone: 090-5102-4376
+  - id: MKM3077
+    name: 中村 湊
+    phone: 090-9754-4154
+  trade:
+    lang: ko
+    exporter: (주)새벽공방
+    importer: Komorebi Co., Ltd.
+    currency: USD
+    pol: 부산, 대한민국
+    pod: 도쿄, 일본
+    numbers:
+      po: PO-KR-86767
+      lc: LC-KR2902275
+      co: CO-2026-KR-3676
+      ip: IP-KR-584907
+    ships:
+    - n: 1
+      ci: CI-KR-2606-415
+      pl: PL-KR-2606-777
+      bl: BL-KR26601893
+      vessel: HANBADA STAR V.031E
+      etd: '2026-06-11'
+      eta: '2026-07-01'
+      container: HBDU5692557
+      goods:
+      - KM20369
+      - KM20205
+      descriptions:
+      - USB-C 멀티 허브
+      - 털 슬리퍼
+    - n: 2
+      ci: CI-KR-2608-102
+      pl: null
+      bl: BL-KR30181389
+      vessel: HANBADA STAR V.035E
+      etd: '2026-08-23'
+      eta: '2026-09-18'
+      container: HBDU7834462
+      goods:
+      - KM20738
+      descriptions:
+      - 세라믹 식칼
+    docs:
+    - stem: komorebi_CI1
+      code: CI
+      ship: 1
+      number: CI-KR-2606-415
+      refs:
+      - PO-KR-86767
+      - BL-KR26601893
+      - LC-KR2902275
+    - stem: komorebi_PL1
+      code: PL
+      ship: 1
+      number: PL-KR-2606-777
+      refs:
+      - PO-KR-86767
+      - CI-KR-2606-415
+      - BL-KR26601893
+    - stem: komorebi_BL1
+      code: BL
+      ship: 1
+      number: BL-KR26601893
+      refs:
+      - PO-KR-86767
+      - CI-KR-2606-415
+      - LC-KR2902275
+    - stem: komorebi_CO1
+      code: CO
+      ship: 1
+      number: CO-2026-KR-3676
+      refs:
+      - CI-KR-2606-415
+      - BL-KR26601893
+      - LC-KR2902275
+    - stem: komorebi_IP1
+      code: IP
+      ship: 1
+      number: IP-KR-584907
+      refs:
+      - PO-KR-86767
+      - CI-KR-2606-415
+      - BL-KR26601893
+      - LC-KR2902275
+    - stem: komorebi_CI2
+      code: CI
+      ship: 2
+      number: CI-KR-2608-102
+      refs:
+      - PO-KR-86767
+      - BL-KR30181389
+      - LC-KR2902275
+    - stem: komorebi_BL2
+      code: BL
+      ship: 2
+      number: BL-KR30181389
+      refs:
+      - PO-KR-86767
+      - CI-KR-2608-102
+      - LC-KR2902275
+- shop: kranich
+  lang: de
+  name: Kranichhof Markt
+  domain: kranichhof-markt.test
+  company: Kranichhof Handels GmbH
+  goods:
+  - key: kranich:goods:KR20041
+    id: KR20041
+    title: Holzbausteine
+    title_en: Wooden building blocks
+    title_ko: 원목 블록 세트
+    concept: kids
+    status: Active
+    price: 24.95
+    stock: 25
+    registered: '2026-01-23'
+    imported: false
+  - key: kranich:goods:KR20082
+    id: KR20082
+    title: Kühlendes Nackenband
+    title_en: Cooling neck band
+    title_ko: 냉감 넥밴드
+    concept: hot_weather
+    status: Active
+    price: 7.95
+    stock: 4
+    registered: '2026-01-10'
+    imported: false
+  - key: kranich:goods:KR20123
+    id: KR20123
+    title: Aufladbarer Handwärmer
+    title_en: Rechargeable hand warmer
+    title_ko: 충전식 손난로
+    concept: cold_weather
+    status: Sold out
+    price: 14.35
+    stock: 0
+    registered: '2026-01-26'
+    imported: false
+  - key: kranich:goods:KR20164
+    id: KR20164
+    title: Proteinriegel mit wenig Zucker
+    title_en: Low-sugar protein bar
+    title_ko: 저당 단백질바
+    concept: snack_food
+    status: Active
+    price: 16.6
+    stock: 25
+    registered: '2026-02-22'
+    imported: false
+  - key: kranich:goods:KR20205
+    id: KR20205
+    title: Mineralische Sonnencreme
+    title_en: Mineral sunscreen
+    title_ko: 무기자차 선크림
+    concept: skincare
+    status: Sold out
+    price: 16.95
+    stock: 0
+    registered: '2026-01-19'
+    imported: false
+  - key: kranich:goods:KR20246
+    id: KR20246
+    title: Silikon-Küchenhelfer-Set
+    title_en: Silicone utensil set
+    title_ko: 실리콘 조리도구 세트
+    concept: cooking
+    status: Active
+    price: 19.1
+    stock: 4
+    registered: '2026-03-05'
+    imported: false
+  - key: kranich:goods:KR20287
+    id: KR20287
+    title: Mini-Handventilator
+    title_en: Handheld mini fan
+    title_ko: 휴대용 미니 선풍기
+    concept: hot_weather
+    status: Active
+    price: 14.4
+    stock: 25
+    registered: '2026-03-17'
+    imported: true
+  - key: kranich:goods:KR20328
+    id: KR20328
+    title: Luftige Sandalen
+    title_en: Ventilated sandals
+    title_ko: 통풍 샌들
+    concept: hot_weather
+    status: Active
+    price: 21.4
+    stock: 25
+    registered: '2026-02-11'
+    imported: false
+  - key: kranich:goods:KR20369
+    id: KR20369
+    title: Parfümfreie Bodylotion
+    title_en: Fragrance-free body lotion
+    title_ko: 무향 바디 로션
+    concept: skincare
+    status: Active
+    price: 12.3
+    stock: 4
+    registered: '2026-03-20'
+    imported: true
+  - key: kranich:goods:KR20410
+    id: KR20410
+    title: Transporttasche für Haustiere
+    title_en: Pet travel carrier
+    title_ko: 반려동물 이동장
+    concept: pet
+    status: Active
+    price: 31.65
+    stock: 60
+    registered: '2026-03-20'
+    imported: false
+  - key: kranich:goods:KR20451
+    id: KR20451
+    title: USB-C-Multiport-Hub
+    title_en: USB-C multiport hub
+    title_ko: USB-C 멀티 허브
+    concept: audio_power
+    status: Active
+    price: 27.1
+    stock: 25
+    registered: '2026-03-07'
+    imported: false
+  - key: kranich:goods:KR20492
+    id: KR20492
+    title: Plüsch-Hausschuhe
+    title_en: Plush house slippers
+    title_ko: 털 슬리퍼
+    concept: cold_weather
+    status: Sold out
+    price: 12.4
+    stock: 0
+    registered: '2026-02-21'
+    imported: true
+  - key: kranich:goods:KR20533
+    id: KR20533
+    title: Laptopständer
+    title_en: Laptop stand
+    title_ko: 노트북 거치대
+    concept: desk_work
+    status: Active
+    price: 23.15
+    stock: 60
+    registered: '2026-02-18'
+    imported: false
+  - key: kranich:goods:KR20574
+    id: KR20574
+    title: Reparierende Haaressenz
+    title_en: Repair hair essence
+    title_ko: 손상모 헤어 에센스
+    concept: skincare
+    status: Active
+    price: 12.9
+    stock: 25
+    registered: '2026-01-25'
+    imported: false
+  - key: kranich:goods:KR20615
+    id: KR20615
+    title: Kabelbox
+    title_en: Cable management box
+    title_ko: 케이블 정리함
+    concept: desk_work
+    status: Active
+    price: 10.6
+    stock: 140
+    registered: '2026-02-23'
+    imported: false
+  - key: kranich:goods:KR20656
+    id: KR20656
+    title: Jeju-Mandarinensaft
+    title_en: Jeju tangerine juice
+    title_ko: 제주 감귤 주스
+    concept: snack_food
+    status: Active
+    price: 11.7
+    stock: 25
+    registered: '2026-02-11'
+    imported: false
+  - key: kranich:goods:KR20697
+    id: KR20697
+    title: UV-Schutz-Sonnenschirm
+    title_en: UV-blocking parasol
+    title_ko: 자외선 차단 양산
+    concept: hot_weather
+    status: Sold out
+    price: 21.05
+    stock: 0
+    registered: '2026-02-13'
+    imported: false
+  - key: kranich:goods:KR20738
+    id: KR20738
+    title: Geröstete Naturreis-Chips
+    title_en: Scorched brown rice crisps
+    title_ko: 현미 누룽지
+    concept: snack_food
+    status: Sold out
+    price: 7.45
+    stock: 0
+    registered: '2026-01-17'
+    imported: false
+  orders:
+  - key: kranich:order:20260924-302201
+    id: 20260924-302201
+    when: 2026-09-24T07:03
+    member: MKR3007
+    buyer: Lukas Wolf
+    receiver: Lukas Wolf
+    status: Delivered
+    amount: 45.14
+    goods:
+    - KR20164
+    - KR20205
+    qty:
+      KR20164: 2
+      KR20205: 1
+    coupon: CP5039
+    event: null
+    tracking:
+    - '306689037496'
+  - key: kranich:order:20260920-300426
+    id: 20260920-300426
+    when: 2026-09-20T20:19
+    member: MKR3000
+    buyer: Felix Wagner
+    receiver: Felix Wagner
+    status: Delivered
+    amount: 14.35
+    goods:
+    - KR20123
+    qty:
+      KR20123: 1
+    coupon: CP5013
+    event: EV727
+    tracking:
+    - '183704573456'
+  - key: kranich:order:20260919-301775
+    id: 20260919-301775
+    when: 2026-09-19T18:17
+    member: MKR3021
+    buyer: Jonas Wagner
+    receiver: Lukas Wolf
+    status: Cancelled
+    amount: 53.85
+    goods:
+    - KR20246
+    qty:
+      KR20246: 3
+    coupon: CP5052
+    event: EV727
+    tracking: []
+  - key: kranich:order:20260908-301349
+    id: 20260908-301349
+    when: 2026-09-08T21:47
+    member: MKR3007
+    buyer: Lukas Wolf
+    receiver: Lukas Wolf
+    status: Delivered
+    amount: 82.85
+    goods:
+    - KR20697
+    - KR20533
+    qty:
+      KR20697: 3
+      KR20533: 1
+    coupon: CP5052
+    event: null
+    tracking:
+    - '199257775839'
+  - key: kranich:order:20260831-300284
+    id: 20260831-300284
+    when: 2026-08-31T22:38
+    member: MKR3007
+    buyer: Lukas Wolf
+    receiver: Lukas Wolf
+    status: Delivered
+    amount: 77.55
+    goods:
+    - KR20492
+    - KR20205
+    - KR20656
+    qty:
+      KR20492: 3
+      KR20205: 1
+      KR20656: 2
+    coupon: null
+    event: null
+    tracking:
+    - '626675058939'
+  - key: kranich:order:20260831-300071
+    id: 20260831-300071
+    when: 2026-08-31T22:33
+    member: MKR3000
+    buyer: Felix Wagner
+    receiver: Felix Wagner
+    status: Delivered
+    amount: 14.45
+    goods:
+    - KR20492
+    qty:
+      KR20492: 1
+    coupon: null
+    event: null
+    tracking:
+    - '950621210532'
+  - key: kranich:order:20260824-300213
+    id: 20260824-300213
+    when: 2026-08-24T22:28
+    member: MKR3014
+    buyer: Leon Schulz
+    receiver: Leon Schulz
+    status: Delivered
+    amount: 9.5
+    goods:
+    - KR20738
+    qty:
+      KR20738: 1
+    coupon: null
+    event: null
+    tracking:
+    - '635677280212'
+  - key: kranich:order:20260823-301846
+    id: 20260823-301846
+    when: 2026-08-23T03:47
+    member: MKR3035
+    buyer: Clara Schulz
+    receiver: Sophie Braun
+    status: Cancelled
+    amount: 62.3
+    goods:
+    - KR20492
+    - KR20041
+    qty:
+      KR20492: 1
+      KR20041: 2
+    coupon: null
+    event: null
+    tracking: []
+  - key: kranich:order:20260817-301065
+    id: 20260817-301065
+    when: 2026-08-17T11:11
+    member: MKR3049
+    buyer: Lukas Becker
+    receiver: Lukas Becker
+    status: Delivered
+    amount: 47.5
+    goods:
+    - KR20369
+    - KR20615
+    qty:
+      KR20369: 3
+      KR20615: 1
+    coupon: null
+    event: null
+    tracking:
+    - '364784124712'
+  - key: kranich:order:20260807-301988
+    id: 20260807-301988
+    when: 2026-08-07T21:20
+    member: MKR3007
+    buyer: Lukas Wolf
+    receiver: Lukas Wolf
+    status: Returned
+    amount: 33.85
+    goods:
+    - KR20615
+    qty:
+      KR20615: 3
+    coupon: null
+    event: null
+    tracking:
+    - '105026355876'
+    - '746032456059'
+  - key: kranich:order:20260731-300781
+    id: 20260731-300781
+    when: 2026-07-31T14:14
+    member: MKR3000
+    buyer: Felix Wagner
+    receiver: Felix Wagner
+    status: Cancelled
+    amount: 69.3
+    goods:
+    - KR20041
+    - KR20533
+    - KR20615
+    qty:
+      KR20041: 1
+      KR20533: 1
+      KR20615: 2
+    coupon: null
+    event: null
+    tracking: []
+  - key: kranich:order:20260729-301136
+    id: 20260729-301136
+    when: 2026-07-29T12:01
+    member: MKR3028
+    buyer: Leon Keller
+    receiver: Lukas Wolf
+    status: Delivered
+    amount: 27.0
+    goods:
+    - KR20041
+    qty:
+      KR20041: 1
+    coupon: null
+    event: null
+    tracking:
+    - '622541545374'
+  - key: kranich:order:20260723-301562
+    id: 20260723-301562
+    when: 2026-07-23T21:12
+    member: MKR3007
+    buyer: Lukas Wolf
+    receiver: Sophie Braun
+    status: Delivered
+    amount: 16.95
+    goods:
+    - KR20738
+    qty:
+      KR20738: 2
+    coupon: null
+    event: null
+    tracking:
+    - '203558536218'
+  - key: kranich:order:20260721-300568
+    id: 20260721-300568
+    when: 2026-07-21T19:11
+    member: MKR3000
+    buyer: Felix Wagner
+    receiver: Felix Wagner
+    status: Cancelled
+    amount: 73.75
+    goods:
+    - KR20697
+    - KR20615
+    qty:
+      KR20697: 3
+      KR20615: 1
+    coupon: null
+    event: null
+    tracking: []
+  - key: kranich:order:20260720-300994
+    id: 20260720-300994
+    when: 2026-07-20T23:58
+    member: MKR3007
+    buyer: Lukas Wolf
+    receiver: Lukas Wolf
+    status: Delivered
+    amount: 18.65
+    goods:
+    - KR20164
+    qty:
+      KR20164: 1
+    coupon: null
+    event: null
+    tracking:
+    - '989554366896'
+  - key: kranich:order:20260716-300639
+    id: 20260716-300639
+    when: 2026-07-16T09:14
+    member: MKR3007
+    buyer: Lukas Wolf
+    receiver: Lukas Wolf
+    status: Delivered
+    amount: 35.65
+    goods:
+    - KR20451
+    - KR20615
+    qty:
+      KR20451: 1
+      KR20615: 1
+    coupon: CP5013
+    event: null
+    tracking:
+    - '613745374932'
+  - key: kranich:order:20260708-301420
+    id: 20260708-301420
+    when: 2026-07-08T08:42
+    member: MKR3014
+    buyer: Leon Schulz
+    receiver: Leon Schulz
+    status: Delivered
+    amount: 14.35
+    goods:
+    - KR20369
+    qty:
+      KR20369: 1
+    coupon: null
+    event: null
+    tracking:
+    - '238325447762'
+  - key: kranich:order:20260705-300355
+    id: 20260705-300355
+    when: 2026-07-05T21:29
+    member: MKR3077
+    buyer: Clara Keller
+    receiver: Clara Keller
+    status: Delivered
+    amount: 19.95
+    goods:
+    - KR20697
+    qty:
+      KR20697: 1
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '790538082982'
+  - key: kranich:order:20260705-301491
+    id: 20260705-301491
+    when: 2026-07-05T18:15
+    member: MKR3014
+    buyer: Leon Schulz
+    receiver: Leon Schulz
+    status: Delivered
+    amount: 59.04
+    goods:
+    - KR20533
+    qty:
+      KR20533: 3
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '822493770810'
+  - key: kranich:order:20260705-302130
+    id: 20260705-302130
+    when: 2026-07-05T03:42
+    member: MKR3000
+    buyer: Felix Wagner
+    receiver: Felix Wagner
+    status: Delivered
+    amount: 54.57
+    goods:
+    - KR20328
+    qty:
+      KR20328: 3
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '154665774109'
+  - key: kranich:order:20260703-300710
+    id: 20260703-300710
+    when: 2026-07-03T14:20
+    member: MKR3056
+    buyer: Jonas Schneider
+    receiver: Felix Wagner
+    status: Delivered
+    amount: 66.2
+    goods:
+    - KR20656
+    - KR20328
+    qty:
+      KR20656: 2
+      KR20328: 2
+    coupon: null
+    event: EV718
+    tracking:
+    - '562244173367'
+  - key: kranich:order:20260701-301917
+    id: 20260701-301917
+    when: 2026-07-01T05:26
+    member: MKR3014
+    buyer: Leon Schulz
+    receiver: Leon Schulz
+    status: Delivered
+    amount: 36.38
+    goods:
+    - KR20328
+    qty:
+      KR20328: 2
+    coupon: CP5026
+    event: EV718
+    tracking:
+    - '517564587471'
+  - key: kranich:order:20260620-302059
+    id: 20260620-302059
+    when: 2026-06-20T20:39
+    member: MKR3000
+    buyer: Felix Wagner
+    receiver: Jonas Wagner
+    status: Delivered
+    amount: 23.45
+    goods:
+    - KR20328
+    qty:
+      KR20328: 1
+    coupon: null
+    event: EV718
+    tracking:
+    - '892595461976'
+  - key: kranich:order:20260614-300923
+    id: 20260614-300923
+    when: 2026-06-14T07:53
+    member: MKR3028
+    buyer: Leon Keller
+    receiver: Leon Keller
+    status: Delivered
+    amount: 76.65
+    goods:
+    - KR20656
+    - KR20041
+    - KR20164
+    qty:
+      KR20656: 3
+      KR20041: 1
+      KR20164: 1
+    coupon: null
+    event: null
+    tracking:
+    - '725379839017'
+  - key: kranich:order:20260606-301278
+    id: 20260606-301278
+    when: 2026-06-06T20:46
+    member: MKR3014
+    buyer: Leon Schulz
+    receiver: Sophie Braun
+    status: Delivered
+    amount: 9.5
+    goods:
+    - KR20738
+    qty:
+      KR20738: 1
+    coupon: null
+    event: null
+    tracking:
+    - '772563756671'
+  - key: kranich:order:20260606-301704
+    id: 20260606-301704
+    when: 2026-06-06T16:51
+    member: MKR3042
+    buyer: Felix Neumann
+    receiver: Clara Keller
+    status: Delivered
+    amount: 55.25
+    goods:
+    - KR20246
+    qty:
+      KR20246: 3
+    coupon: CP5013
+    event: null
+    tracking:
+    - '563338095060'
+  - key: kranich:order:20260605-301207
+    id: 20260605-301207
+    when: 2026-06-05T04:36
+    member: MKR3021
+    buyer: Jonas Wagner
+    receiver: Clara Keller
+    status: Delivered
+    amount: 47.5
+    goods:
+    - KR20369
+    - KR20615
+    qty:
+      KR20369: 3
+      KR20615: 1
+    coupon: null
+    event: null
+    tracking:
+    - '390213389205'
+    - '437328128257'
+  - key: kranich:order:20260529-301633
+    id: 20260529-301633
+    when: 2026-05-29T06:19
+    member: MKR3070
+    buyer: Sophie Braun
+    receiver: Sophie Braun
+    status: Returned
+    amount: 24.4
+    goods:
+    - KR20738
+    qty:
+      KR20738: 3
+    coupon: null
+    event: null
+    tracking:
+    - '813911883497'
+    - '633210389628'
+  - key: kranich:order:20260520-302272
+    id: 20260520-302272
+    when: 2026-05-20T16:07
+    member: MKR3035
+    buyer: Clara Schulz
+    receiver: Lukas Becker
+    status: Delivered
+    amount: 62.95
+    goods:
+    - KR20369
+    - KR20697
+    - KR20410
+    qty:
+      KR20369: 1
+      KR20697: 1
+      KR20410: 1
+    coupon: CP5013
+    event: null
+    tracking:
+    - '902772346501'
+  - key: kranich:order:20260505-300497
+    id: 20260505-300497
+    when: 2026-05-05T12:10
+    member: MKR3049
+    buyer: Lukas Becker
+    receiver: Lukas Becker
+    status: Delivered
+    amount: 70.8
+    goods:
+    - KR20164
+    - KR20451
+    qty:
+      KR20164: 1
+      KR20451: 2
+    coupon: null
+    event: null
+    tracking:
+    - '553009309008'
+    - '238470016017'
+  - key: kranich:order:20260504-300142
+    id: 20260504-300142
+    when: 2026-05-04T06:00
+    member: MKR3049
+    buyer: Lukas Becker
+    receiver: Lukas Becker
+    status: Cancelled
+    amount: 52.05
+    goods:
+    - KR20656
+    - KR20205
+    qty:
+      KR20656: 3
+      KR20205: 1
+    coupon: null
+    event: null
+    tracking: []
+  - key: kranich:order:20260501-300852
+    id: 20260501-300852
+    when: 2026-05-01T07:00
+    member: MKR3000
+    buyer: Felix Wagner
+    receiver: Felix Wagner
+    status: Delivered
+    amount: 24.55
+    goods:
+    - KR20615
+    - KR20287
+    qty:
+      KR20615: 1
+      KR20287: 1
+    coupon: CP5039
+    event: null
+    tracking:
+    - '927326044614'
+  shipments:
+  - key: kranich:tracking:950621210532
+    id: '950621210532'
+    order: 20260831-300071
+    kind: outbound
+    carrier: Kiefernexpress
+    goods:
+    - KR20492
+    shipped: 2026-09-02T03:33
+    delivered: 2026-09-03T03:33
+    status: Delivered
+    receiver: Felix Wagner
+  - key: kranich:tracking:635677280212
+    id: '635677280212'
+    order: 20260824-300213
+    kind: outbound
+    carrier: Kiefernexpress
+    goods:
+    - KR20738
+    shipped: 2026-08-26T01:28
+    delivered: 2026-08-27T01:28
+    status: Delivered
+    receiver: Leon Schulz
+  - key: kranich:tracking:626675058939
+    id: '626675058939'
+    order: 20260831-300284
+    kind: outbound
+    carrier: Rheinfracht
+    goods:
+    - KR20492
+    - KR20205
+    - KR20656
+    shipped: 2026-09-02T01:38
+    delivered: 2026-09-04T01:38
+    status: Delivered
+    receiver: Lukas Wolf
+  - key: kranich:tracking:790538082982
+    id: '790538082982'
+    order: 20260705-300355
+    kind: outbound
+    carrier: Blitzpaket
+    goods:
+    - KR20697
+    shipped: 2026-07-06T23:29
+    delivered: 2026-07-09T23:29
+    status: Delivered
+    receiver: Clara Keller
+  - key: kranich:tracking:183704573456
+    id: '183704573456'
+    order: 20260920-300426
+    kind: outbound
+    carrier: Nordkurier Logistik
+    goods:
+    - KR20123
+    shipped: 2026-09-22T02:19
+    delivered: 2026-09-24T02:19
+    status: Delivered
+    receiver: Felix Wagner
+  - key: kranich:tracking:553009309008
+    id: '553009309008'
+    order: 20260505-300497
+    kind: outbound
+    carrier: Rheinfracht
+    goods:
+    - KR20164
+    shipped: 2026-05-06T18:10
+    delivered: 2026-05-08T18:10
+    status: Delivered
+    receiver: Lukas Becker
+  - key: kranich:tracking:238470016017
+    id: '238470016017'
+    order: 20260505-300497
+    kind: outbound
+    carrier: Blitzpaket
+    goods:
+    - KR20451
+    shipped: 2026-05-09T15:10
+    delivered: 2026-05-11T15:10
+    status: Delivered
+    receiver: Lukas Becker
+  - key: kranich:tracking:613745374932
+    id: '613745374932'
+    order: 20260716-300639
+    kind: outbound
+    carrier: Nordkurier Logistik
+    goods:
+    - KR20451
+    - KR20615
+    shipped: 2026-07-17T13:14
+    delivered: 2026-07-18T13:14
+    status: Delivered
+    receiver: Lukas Wolf
+  - key: kranich:tracking:562244173367
+    id: '562244173367'
+    order: 20260703-300710
+    kind: outbound
+    carrier: Blitzpaket
+    goods:
+    - KR20656
+    - KR20328
+    shipped: 2026-07-04T16:20
+    delivered: 2026-07-07T16:20
+    status: Delivered
+    receiver: Felix Wagner
+  - key: kranich:tracking:927326044614
+    id: '927326044614'
+    order: 20260501-300852
+    kind: outbound
+    carrier: Rheinfracht
+    goods:
+    - KR20615
+    - KR20287
+    shipped: 2026-05-02T14:00
+    delivered: 2026-05-05T14:00
+    status: Delivered
+    receiver: Felix Wagner
+  - key: kranich:tracking:725379839017
+    id: '725379839017'
+    order: 20260614-300923
+    kind: outbound
+    carrier: Rheinfracht
+    goods:
+    - KR20656
+    - KR20041
+    - KR20164
+    shipped: 2026-06-15T12:53
+    delivered: 2026-06-16T12:53
+    status: Delivered
+    receiver: Leon Keller
+  - key: kranich:tracking:989554366896
+    id: '989554366896'
+    order: 20260720-300994
+    kind: outbound
+    carrier: Kiefernexpress
+    goods:
+    - KR20164
+    shipped: 2026-07-22T01:58
+    delivered: 2026-07-23T01:58
+    status: Delivered
+    receiver: Lukas Wolf
+  - key: kranich:tracking:364784124712
+    id: '364784124712'
+    order: 20260817-301065
+    kind: outbound
+    carrier: Rheinfracht
+    goods:
+    - KR20369
+    - KR20615
+    shipped: 2026-08-18T20:11
+    delivered: 2026-08-21T20:11
+    status: Delivered
+    receiver: Lukas Becker
+  - key: kranich:tracking:622541545374
+    id: '622541545374'
+    order: 20260729-301136
+    kind: outbound
+    carrier: Blitzpaket
+    goods:
+    - KR20041
+    shipped: 2026-07-30T14:01
+    delivered: 2026-08-02T14:01
+    status: Delivered
+    receiver: Lukas Wolf
+  - key: kranich:tracking:390213389205
+    id: '390213389205'
+    order: 20260605-301207
+    kind: outbound
+    carrier: Kiefernexpress
+    goods:
+    - KR20369
+    shipped: 2026-06-06T13:36
+    delivered: 2026-06-08T13:36
+    status: Delivered
+    receiver: Clara Keller
+  - key: kranich:tracking:437328128257
+    id: '437328128257'
+    order: 20260605-301207
+    kind: outbound
+    carrier: Nordkurier Logistik
+    goods:
+    - KR20615
+    shipped: 2026-06-08T13:36
+    delivered: 2026-06-09T13:36
+    status: Delivered
+    receiver: Clara Keller
+  - key: kranich:tracking:772563756671
+    id: '772563756671'
+    order: 20260606-301278
+    kind: outbound
+    carrier: Rheinfracht
+    goods:
+    - KR20738
+    shipped: 2026-06-08T00:46
+    delivered: 2026-06-11T00:46
+    status: Delivered
+    receiver: Sophie Braun
+  - key: kranich:tracking:199257775839
+    id: '199257775839'
+    order: 20260908-301349
+    kind: outbound
+    carrier: Blitzpaket
+    goods:
+    - KR20697
+    - KR20533
+    shipped: 2026-09-10T05:47
+    delivered: 2026-09-13T05:47
+    status: Delivered
+    receiver: Lukas Wolf
+  - key: kranich:tracking:238325447762
+    id: '238325447762'
+    order: 20260708-301420
+    kind: outbound
+    carrier: Rheinfracht
+    goods:
+    - KR20369
+    shipped: 2026-07-09T11:42
+    delivered: 2026-07-12T11:42
+    status: Delivered
+    receiver: Leon Schulz
+  - key: kranich:tracking:822493770810
+    id: '822493770810'
+    order: 20260705-301491
+    kind: outbound
+    carrier: Rheinfracht
+    goods:
+    - KR20533
+    shipped: 2026-07-07T00:15
+    delivered: 2026-07-10T00:15
+    status: Delivered
+    receiver: Leon Schulz
+  - key: kranich:tracking:203558536218
+    id: '203558536218'
+    order: 20260723-301562
+    kind: outbound
+    carrier: Nordkurier Logistik
+    goods:
+    - KR20738
+    shipped: 2026-07-25T00:12
+    delivered: 2026-07-26T00:12
+    status: Delivered
+    receiver: Sophie Braun
+  - key: kranich:tracking:813911883497
+    id: '813911883497'
+    order: 20260529-301633
+    kind: outbound
+    carrier: Kiefernexpress
+    goods:
+    - KR20738
+    shipped: 2026-05-30T08:19
+    delivered: 2026-06-01T08:19
+    status: Delivered
+    receiver: Sophie Braun
+  - key: kranich:tracking:633210389628
+    id: '633210389628'
+    order: 20260529-301633
+    kind: return
+    carrier: Kiefernexpress
+    goods:
+    - KR20738
+    shipped: 2026-06-04T08:19
+    delivered: 2026-06-06T08:19
+    status: Returned
+    receiver: Kranichhof Handels GmbH
+  - key: kranich:tracking:563338095060
+    id: '563338095060'
+    order: 20260606-301704
+    kind: outbound
+    carrier: Rheinfracht
+    goods:
+    - KR20246
+    shipped: 2026-06-07T21:51
+    delivered: 2026-06-09T21:51
+    status: Delivered
+    receiver: Clara Keller
+  - key: kranich:tracking:517564587471
+    id: '517564587471'
+    order: 20260701-301917
+    kind: outbound
+    carrier: Blitzpaket
+    goods:
+    - KR20328
+    shipped: 2026-07-02T07:26
+    delivered: 2026-07-03T07:26
+    status: Delivered
+    receiver: Leon Schulz
+  - key: kranich:tracking:105026355876
+    id: '105026355876'
+    order: 20260807-301988
+    kind: outbound
+    carrier: Blitzpaket
+    goods:
+    - KR20615
+    shipped: 2026-08-09T06:20
+    delivered: 2026-08-10T06:20
+    status: Delivered
+    receiver: Lukas Wolf
+  - key: kranich:tracking:746032456059
+    id: '746032456059'
+    order: 20260807-301988
+    kind: return
+    carrier: Nordkurier Logistik
+    goods:
+    - KR20615
+    shipped: 2026-08-13T06:20
+    delivered: 2026-08-15T06:20
+    status: Returned
+    receiver: Kranichhof Handels GmbH
+  - key: kranich:tracking:892595461976
+    id: '892595461976'
+    order: 20260620-302059
+    kind: outbound
+    carrier: Kiefernexpress
+    goods:
+    - KR20328
+    shipped: 2026-06-21T23:39
+    delivered: 2026-06-24T23:39
+    status: Delivered
+    receiver: Jonas Wagner
+  - key: kranich:tracking:154665774109
+    id: '154665774109'
+    order: 20260705-302130
+    kind: outbound
+    carrier: Blitzpaket
+    goods:
+    - KR20328
+    shipped: 2026-07-06T11:42
+    delivered: 2026-07-07T11:42
+    status: Delivered
+    receiver: Felix Wagner
+  - key: kranich:tracking:306689037496
+    id: '306689037496'
+    order: 20260924-302201
+    kind: outbound
+    carrier: Blitzpaket
+    goods:
+    - KR20164
+    - KR20205
+    shipped: 2026-09-25T15:03
+    delivered: 2026-09-28T15:03
+    status: Delivered
+    receiver: Lukas Wolf
+  - key: kranich:tracking:902772346501
+    id: '902772346501'
+    order: 20260520-302272
+    kind: outbound
+    carrier: Kiefernexpress
+    goods:
+    - KR20369
+    - KR20697
+    - KR20410
+    shipped: 2026-05-21T18:07
+    delivered: 2026-05-23T18:07
+    status: Delivered
+    receiver: Lukas Becker
+  reviews:
+  - key: kranich:review:RV8100
+    id: RV8100
+    order: 20260505-300497
+    goods: KR20164
+    author: Lukas Becker
+    rating: 5
+    text: Sorgfältig verpackt und insgesamt farblich wunderschön.
+    posted: '2026-05-17'
+    status: Approved
+  - key: kranich:review:RV8117
+    id: RV8117
+    order: 20260605-301207
+    goods: KR20369
+    author: Jonas Wagner
+    rating: 4
+    text: Besser als erwartet, wirklich robust.
+    posted: '2026-06-15'
+    status: Pending
+  - key: kranich:review:RV8134
+    id: RV8134
+    order: 20260606-301704
+    goods: KR20246
+    author: Felix Neumann
+    rating: 5
+    text: Sorgfältig verpackt und insgesamt leicht.
+    posted: '2026-06-15'
+    status: Approved
+  - key: kranich:review:RV8151
+    id: RV8151
+    order: 20260606-301278
+    goods: KR20738
+    author: Leon Schulz
+    rating: 2
+    text: Beim Versand beschädigt, sehr enttäuschend.
+    posted: '2026-06-13'
+    status: Approved
+  - key: kranich:review:RV8168
+    id: RV8168
+    order: 20260620-302059
+    goods: KR20328
+    author: Felix Wagner
+    rating: 5
+    text: Besser als erwartet, wirklich sauber verarbeitet.
+    posted: '2026-06-28'
+    status: Approved
+  - key: kranich:review:RV8185
+    id: RV8185
+    order: 20260701-301917
+    goods: KR20328
+    author: Leon Schulz
+    rating: 5
+    text: Sorgfältig verpackt und insgesamt farblich wunderschön.
+    posted: '2026-07-14'
+    status: Pending
+  - key: kranich:review:RV8202
+    id: RV8202
+    order: 20260703-300710
+    goods: KR20328
+    author: Jonas Schneider
+    rating: 5
+    text: Besser als erwartet, wirklich farblich wunderschön.
+    posted: '2026-07-14'
+    status: Approved
+  - key: kranich:review:RV8219
+    id: RV8219
+    order: 20260705-300355
+    goods: KR20697
+    author: Clara Keller
+    rating: 5
+    text: Zweiter Kauf und immer noch leicht.
+    posted: '2026-07-16'
+    status: Approved
+  - key: kranich:review:RV8236
+    id: RV8236
+    order: 20260729-301136
+    goods: KR20041
+    author: Leon Keller
+    rating: 5
+    text: Besser als erwartet, wirklich robust.
+    posted: '2026-08-06'
+    status: Approved
+  - key: kranich:review:RV8253
+    id: RV8253
+    order: 20260817-301065
+    goods: KR20369
+    author: Lukas Becker
+    rating: 5
+    text: Sorgfältig verpackt und insgesamt leicht.
+    posted: '2026-08-29'
+    status: Approved
+  - key: kranich:review:RV8270
+    id: RV8270
+    order: 20260831-300284
+    goods: KR20492
+    author: Lukas Wolf
+    rating: 5
+    text: Zweiter Kauf und immer noch farblich wunderschön.
+    posted: '2026-09-13'
+    status: Approved
+  - key: kranich:review:RV8287
+    id: RV8287
+    order: 20260908-301349
+    goods: KR20533
+    author: Lukas Wolf
+    rating: 5
+    text: Zweiter Kauf und immer noch farblich wunderschön.
+    posted: '2026-09-21'
+    status: Approved
+  - key: kranich:review:RV8304
+    id: RV8304
+    order: 20260920-300426
+    goods: KR20123
+    author: Felix Wagner
+    rating: 5
+    text: Zweiter Kauf und immer noch leicht.
+    posted: '2026-10-01'
+    status: Approved
+  - key: kranich:review:RV8321
+    id: RV8321
+    order: 20260924-302201
+    goods: KR20205
+    author: Lukas Wolf
+    rating: 5
+    text: Zweiter Kauf und immer noch leicht.
+    posted: '2026-09-30'
+    status: Approved
+  coupons:
+  - key: kranich:coupon:CP5013
+    id: CP5013
+    code: KRWELCOME
+    title: Willkommen zur ersten Bestellung
+    start: '2026-04-01'
+    end: '2026-09-30'
+    event: null
+  - key: kranich:coupon:CP5026
+    id: CP5026
+    code: KRSUMMER
+    title: Nur in der App
+    start: '2026-06-15'
+    end: '2026-07-12'
+    event: EV718
+  - key: kranich:coupon:CP5039
+    id: CP5039
+    code: KRAGAIN
+    title: Bonus für Stammkunden
+    start: '2026-04-01'
+    end: '2026-09-30'
+    event: null
+  - key: kranich:coupon:CP5052
+    id: CP5052
+    code: KRHARVEST
+    title: Herbstliches Dankeschön
+    start: '2026-09-01'
+    end: '2026-09-20'
+    event: EV727
+  events:
+  - key: kranich:event:EV709
+    id: EV709
+    title: Frühlingsspaziergang
+    start: '2026-04-06'
+    end: '2026-04-26'
+    goods:
+    - KR20369
+    - KR20738
+    - KR20451
+    - KR20492
+    - KR20164
+    coupon: null
+  - key: kranich:event:EV718
+    id: EV718
+    title: Bereit für den Sommerurlaub
+    start: '2026-06-15'
+    end: '2026-07-12'
+    goods:
+    - KR20328
+    - KR20205
+    - KR20533
+    - KR20656
+    - KR20697
+    coupon: CP5026
+  - key: kranich:event:EV727
+    id: EV727
+    title: Geschenkideen zur Erntezeit
+    start: '2026-09-01'
+    end: '2026-09-20'
+    goods:
+    - KR20246
+    - KR20123
+    - KR20410
+    - KR20287
+    - KR20574
+    coupon: CP5052
+  members:
+  - id: MKR3000
+    name: Felix Wagner
+    phone: +49 133 90849522
+  - id: MKR3007
+    name: Lukas Wolf
+    phone: +49 174 09542206
+  - id: MKR3014
+    name: Leon Schulz
+    phone: +49 156 37707309
+  - id: MKR3021
+    name: Jonas Wagner
+    phone: +49 112 80482351
+  - id: MKR3028
+    name: Leon Keller
+    phone: +49 172 88265372
+  - id: MKR3035
+    name: Clara Schulz
+    phone: +49 190 25828359
+  - id: MKR3042
+    name: Felix Neumann
+    phone: +49 163 33605708
+  - id: MKR3049
+    name: Lukas Becker
+    phone: +49 163 21484804
+  - id: MKR3056
+    name: Jonas Schneider
+    phone: +49 168 73614408
+  - id: MKR3063
+    name: Felix Braun
+    phone: +49 146 98637476
+  - id: MKR3070
+    name: Sophie Braun
+    phone: +49 108 13579983
+  - id: MKR3077
+    name: Clara Keller
+    phone: +49 167 21724930
+  trade:
+    lang: en
+    exporter: Bramblewood Outfitters Ltd.
+    importer: Kranichhof Handels GmbH
+    currency: GBP
+    pol: Felixstowe, United Kingdom
+    pod: Hamburg, Germany
+    numbers:
+      po: PO-GB-92895
+      lc: LC-GB6873816
+      co: CO-2026-GB-7174
+      ip: IP-GB-309063
+    ships:
+    - n: 1
+      ci: CI-GB-2606-899
+      pl: PL-GB-2606-408
+      bl: BL-GB13666752
+      vessel: NORTHBRIDGE TRADER V.55E
+      etd: '2026-06-11'
+      eta: '2026-07-04'
+      container: NBTU9866633
+      goods:
+      - KR20287
+      - KR20492
+      descriptions:
+      - Handheld mini fan
+      - Plush house slippers
+    - n: 2
+      ci: CI-GB-2608-727
+      pl: null
+      bl: BL-GB85095836
+      vessel: NORTHBRIDGE TRADER V.58E
+      etd: '2026-08-18'
+      eta: '2026-09-09'
+      container: NBTU2693561
+      goods:
+      - KR20369
+      descriptions:
+      - Fragrance-free body lotion
+    docs:
+    - stem: kranich_CI1
+      code: CI
+      ship: 1
+      number: CI-GB-2606-899
+      refs:
+      - PO-GB-92895
+      - BL-GB13666752
+      - LC-GB6873816
+    - stem: kranich_PL1
+      code: PL
+      ship: 1
+      number: PL-GB-2606-408
+      refs:
+      - PO-GB-92895
+      - CI-GB-2606-899
+      - BL-GB13666752
+    - stem: kranich_BL1
+      code: BL
+      ship: 1
+      number: BL-GB13666752
+      refs:
+      - PO-GB-92895
+      - CI-GB-2606-899
+      - LC-GB6873816
+    - stem: kranich_CO1
+      code: CO
+      ship: 1
+      number: CO-2026-GB-7174
+      refs:
+      - CI-GB-2606-899
+      - BL-GB13666752
+      - LC-GB6873816
+    - stem: kranich_IP1
+      code: IP
+      ship: 1
+      number: IP-GB-309063
+      refs:
+      - PO-GB-92895
+      - CI-GB-2606-899
+      - BL-GB13666752
+      - LC-GB6873816
+    - stem: kranich_CI2
+      code: CI
+      ship: 2
+      number: CI-GB-2608-727
+      refs:
+      - PO-GB-92895
+      - BL-GB85095836
+      - LC-GB6873816
+    - stem: kranich_BL2
+      code: BL
+      ship: 2
+      number: BL-GB85095836
+      refs:
+      - PO-GB-92895
+      - CI-GB-2608-727
+      - LC-GB6873816

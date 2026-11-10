@@ -1,0 +1,164 @@
+url: https://copperleaf-goods.test/admin/order/list?page=1
+page_type: order
+layout: list
+title: Orders
+items:
+- id,link: 20260929-301562
+  registration_date: '2026-09-29'
+  status: Delivered
+  goods: Rechargeable LED lantern
+  tracking_number: '288827969776'
+  sender_name: Emerson Whitfield
+  recipient_name: Finley Whitfield
+  quantity: 3
+  amount: 69.1
+  payment_method: Wire transfer
+- id,link: 20260918-300994
+  registration_date: '2026-09-18'
+  status: Delivered
+  goods: Temperature control kettle
+  tracking_number: '180347964021'
+  sender_name: Taylor Marsh
+  recipient_name: Taylor Marsh
+  quantity: 2
+  amount: 54.85
+  payment_method: Credit card
+- id,link: 20260909-300923
+  registration_date: '2026-09-09'
+  status: Delivered
+  goods: Waterproof Bluetooth speaker
+  tracking_number: '406275153226'
+  sender_name: Casey Dorsey
+  recipient_name: Finley Whitfield
+  quantity: 1
+  amount: 41.0
+  payment_method: Credit card
+- id,link: 20260902-301278
+  registration_date: '2026-09-02'
+  status: Delivered
+  goods: Microfiber throw blanket
+  tracking_number: '558752065596'
+  sender_name: Taylor Marsh
+  recipient_name: Taylor Marsh
+  quantity: 6
+  amount: 95.55
+  payment_method: Digital wallet
+- id,link: 20260821-301207
+  registration_date: '2026-08-21'
+  status: Delivered
+  goods: 65W fast charger
+  tracking_number: '141450883602'
+  sender_name: Taylor Marsh
+  recipient_name: Finley Whitfield
+  quantity: 3
+  amount: 45.8
+  payment_method: Credit card
+- id,link: 20260820-300639
+  registration_date: '2026-08-20'
+  status: Cancelled
+  goods: 65W fast charger
+  sender_name: Taylor Marsh
+  recipient_name: Casey Dorsey
+  quantity: 3
+  amount: 79.8
+  payment_method: Wire transfer
+- id,link: 20260817-301491
+  registration_date: '2026-08-17'
+  status: Delivered
+  goods: Smart fitness band
+  tracking_number: '780435405056'
+  sender_name: Finley Whitfield
+  recipient_name: Finley Whitfield
+  quantity: 4
+  amount: 68.95
+  payment_method: Wire transfer
+- id,link: 20260816-300710
+  registration_date: '2026-08-16'
+  status: Returned
+  goods: Toddler tableware set
+  tracking_number: '107511662394'
+  sender_name: Emerson Whitfield
+  recipient_name: Emerson Whitfield
+  quantity: 1
+  amount: 22.01
+  payment_method: Credit card
+- id,link: 20260813-301420
+  registration_date: '2026-08-13'
+  status: Delivered
+  goods: Cooling neck band
+  tracking_number: '539027061263'
+  sender_name: Riley Holloway
+  recipient_name: Riley Holloway
+  quantity: 5
+  amount: 296.4
+  payment_method: Wire transfer
+- id,link: 20260804-301917
+  registration_date: '2026-08-04'
+  status: Delivered
+  goods: Temperature control kettle
+  tracking_number: '325494280337'
+  sender_name: Harper Marsh
+  recipient_name: Harper Marsh
+  quantity: 1
+  amount: 40.6
+  payment_method: Digital wallet
+- id,link: 20260803-302059
+  registration_date: '2026-08-03'
+  status: Shipped
+  goods: Noise-cancelling wireless earbuds
+  tracking_number: '109152022586'
+  sender_name: Casey Dorsey
+  recipient_name: Casey Dorsey
+  quantity: 3
+  amount: 144.6
+  payment_method: Wire transfer
+- id,link: 20260718-301704
+  registration_date: '2026-07-18'
+  status: Delivered
+  goods: Mineral sunscreen
+  tracking_number: '514498820946'
+  sender_name: Taylor Marsh
+  recipient_name: Taylor Marsh
+  quantity: 3
+  amount: 53.5
+  payment_method: Wire transfer
+- id,link: 20260715-300071
+  registration_date: '2026-07-15'
+  status: Delivered
+  goods: Cooling neck band
+  tracking_number: '402651896898'
+  sender_name: Taylor Marsh
+  recipient_name: Riley Mercer
+  quantity: 2
+  amount: 46.9
+  payment_method: Wire transfer
+- id,link: 20260628-300355
+  registration_date: '2026-06-28'
+  status: Delivered
+  goods: Scorched brown rice crisps
+  tracking_number: '108009013231'
+  sender_name: Finley Marsh
+  recipient_name: Finley Marsh
+  quantity: 1
+  amount: 11.55
+  payment_method: Credit card
+- id,link: 20260626-301065
+  registration_date: '2026-06-26'
+  status: Shipped
+  goods: Cooling neck band
+  tracking_number: '236960924483'
+  sender_name: Taylor Marsh
+  recipient_name: Taylor Marsh
+  quantity: 5
+  amount: 119.85
+  payment_method: Credit card
+- id,link: 20260623-300213
+  registration_date: '2026-06-23'
+  status: Delivered
+  goods: Low-sugar protein bar
+  tracking_number: '395340899714'
+  sender_name: Taylor Marsh
+  recipient_name: Taylor Marsh
+  quantity: 4
+  amount: 62.35
+  payment_method: Credit card

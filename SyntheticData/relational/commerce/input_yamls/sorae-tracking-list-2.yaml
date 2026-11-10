@@ -1,0 +1,137 @@
+url: https://sorae-market.test/admin/shipping/list?page=2
+page_type: tracking
+layout: list
+title: 배송 조회
+items:
+- id,link: '186621467425'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 접이식 등산 스틱
+  shipping_date: '2026-07-03'
+  recipient_name: 박현우
+- id,link: '443668403958'
+  carrier: 새길운송
+  status: 배송완료
+  title: 대용량 보조배터리
+  shipping_date: '2026-06-30'
+  recipient_name: 임현우
+- id,link: '391349957884'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: USB-C 멀티 허브
+  shipping_date: '2026-06-28'
+  recipient_name: 임현우
+- id,link: '804056249620'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: USB-C 멀티 허브
+  shipping_date: '2026-06-23'
+  recipient_name: 장소율
+- id,link: '175813423825'
+  carrier: 새길운송
+  status: 배송완료
+  title: 대용량 보조배터리
+  shipping_date: '2026-06-13'
+  recipient_name: 이예준
+- id,link: '297562608457'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 수분 장벽 크림
+  shipping_date: '2026-06-10'
+  recipient_name: 장소율
+- id,link: '867271781212'
+  carrier: 바른택배
+  status: 배송완료
+  title: 리넨 반팔 셔츠
+  shipping_date: '2026-06-09'
+  recipient_name: 박현우
+- id,link: '882889373264'
+  carrier: 바른택배
+  status: 배송완료
+  title: 자동 급식기
+  shipping_date: '2026-06-02'
+  recipient_name: 강수아
+- id,link: '288430519733'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: USB-C 멀티 허브
+  shipping_date: '2026-05-31'
+  recipient_name: 이예준
+- id,link: '238752959418'
+  carrier: 바른택배
+  status: 배송완료
+  title: 방수 블루투스 스피커
+  shipping_date: '2026-05-30'
+  recipient_name: 강수아
+- id,link: '215260019995'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 대용량 보조배터리
+  shipping_date: '2026-05-29'
+  recipient_name: 이예준
+- id,link: '560932351608'
+  carrier: 새길운송
+  status: 배송완료
+  title: 휴대용 코펠 세트
+  shipping_date: '2026-05-21'
+  recipient_name: 윤도윤
+- id,link: '543603017020'
+  carrier: 바른택배
+  status: 배송완료
+  title: 수분 장벽 크림
+  shipping_date: '2026-05-21'
+  recipient_name: 윤도윤
+- id,link: '138702387225'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 제주 감귤 주스
+  shipping_date: '2026-05-18'
+  recipient_name: 김유진
+- id,link: '232264572564'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 기모 후드집업
+  shipping_date: '2026-04-29'
+  recipient_name: 윤도윤
+- id,link: '719066369755'
+  carrier: 온누리익스프레스
+  status: 배송중
+  title: 밀폐 유리 용기 세트
+  shipping_date: '2026-04-26'
+  recipient_name: 장소율
+- id,link: '546079789298'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 자동 급식기
+  shipping_date: '2026-04-26'
+  recipient_name: 강은호
+- id,link: '645360343245'
+  carrier: 바른택배
+  status: 배송완료
+  title: 자외선 차단 양산
+  shipping_date: '2026-04-24'
+  recipient_name: 강은호
+- id,link: '741918356651'
+  carrier: 온누리익스프레스
+  status: 배송완료
+  title: 콜드브루 원액
+  shipping_date: '2026-04-20'
+  recipient_name: 윤도윤
+- id,link: '796071672264'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 콜드브루 원액
+  shipping_date: '2026-04-18'
+  recipient_name: 강수아
+- id,link: '220021582323'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 대용량 보조배터리
+  shipping_date: '2026-04-07'
+  recipient_name: 오예준
+- id,link: '815065701362'
+  carrier: 한빛로지스
+  status: 배송완료
+  title: 기모 후드집업
+  shipping_date: '2026-04-04'
+  recipient_name: 오예준

@@ -1,0 +1,18 @@
+url: https://komorebi-shop.test/admin/order/view?od_id=20260920-300355
+page_type: order
+layout: detail
+title: 注文詳細
+fields:
+  id,link: 20260920-300355
+  registration_date: '2026-09-20'
+  status: 返品
+  goods: USB-Cマルチポートハブ
+  tracking_number: '509952105774'
+  sender_name: 加藤 芽依
+  recipient_name: 加藤 芽依
+  quantity: 2
+  amount: 7280
+  payment_method: 銀行振込
+  sender_phone: 090-3147-9798
+  recipient_address: 〒530-0001 大阪府大阪市北区緑町8-7-20
+  recipient_phone: 090-3147-9798

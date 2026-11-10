@@ -1,0 +1,41 @@
+document_type: Commercial Invoice
+document_code: CI
+language: en
+document_title: Commercial Invoice
+metadata:
+  invoice_number: CI-GB-2608-727
+  issue_date: '2026-08-15'
+  reference_po_number: PO-GB-92895
+  related_bl_number: BL-GB85095836
+  related_lc_number: LC-GB6873816
+  currency: GBP
+parties:
+  shipper_exporter:
+    name: Bramblewood Outfitters Ltd.
+    address: 14 Wharf Road, Felixstowe IP11 3AB, United Kingdom
+    contact_number: +44 1394 555 0172
+    tax_id: GB 482 7731 05
+  consignee:
+    name: Kranichhof Handels GmbH
+    address: Lindenallee 21, 04109 Leipzig, Germany
+    contact_number: +49 341 5550187
+    tax_id: DE 297 664 310
+shipping_details:
+  vessel_flight: NORTHBRIDGE TRADER V.58E
+  port_of_loading: Felixstowe, United Kingdom
+  port_of_discharge: Hamburg, Germany
+  incoterms: CIP Leipzig
+line_items:
+- item_code: KR20369
+  description: Fragrance-free body lotion
+  quantity: 300
+  unit: pcs
+  unit_price: 4.2
+  total_amount: 1260.0
+  hs_code: '3304.99'
+summary:
+  total_quantity: 300
+  total_items_amount: 1260.0
+  freight_charge: 50.4
+  insurance: 3.78
+  grand_total_amount: 1314.18

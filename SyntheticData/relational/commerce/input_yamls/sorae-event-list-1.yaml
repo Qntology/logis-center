@@ -1,0 +1,20 @@
+url: https://sorae-market.test/admin/event/list?page=1
+page_type: event
+layout: list
+title: 기획전 관리
+items:
+- id,link: EV709
+  title: 봄 산책 기획전
+  started_at: '2026-04-06'
+  expired_at: '2026-04-26'
+  status: 종료
+- id,link: EV718
+  title: 여름 휴가 준비전
+  started_at: '2026-06-15'
+  expired_at: '2026-07-12'
+  status: 종료
+- id,link: EV727
+  title: 추석 선물 모음
+  started_at: '2026-09-01'
+  expired_at: '2026-09-20'
+  status: 종료

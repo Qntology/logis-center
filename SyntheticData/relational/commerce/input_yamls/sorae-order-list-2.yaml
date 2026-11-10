@@ -1,0 +1,165 @@
+url: https://sorae-market.test/admin/order/list?page=2
+page_type: order
+layout: list
+title: 주문내역 관리
+items:
+- id,link: 20260627-301278
+  registration_date: '2026-06-27'
+  status: 반품
+  goods: USB-C 멀티 허브
+  tracking_number: '391349957884'
+  sender_name: 임현우
+  recipient_name: 임현우
+  quantity: 4
+  amount: 152920
+  payment_method: Wire transfer
+- id,link: 20260621-300710
+  registration_date: '2026-06-21'
+  status: 배송완료
+  goods: USB-C 멀티 허브
+  tracking_number: '804056249620'
+  sender_name: 박현우
+  recipient_name: 장소율
+  quantity: 6
+  amount: 240040
+  payment_method: Credit card
+- id,link: 20260612-300142
+  registration_date: '2026-06-12'
+  status: 배송완료
+  goods: 대용량 보조배터리
+  tracking_number: '175813423825'
+  sender_name: 이예준
+  recipient_name: 이예준
+  quantity: 1
+  amount: 45400
+  payment_method: Credit card
+- id,link: 20260609-300923
+  registration_date: '2026-06-09'
+  status: 배송완료
+  goods: 수분 장벽 크림
+  tracking_number: '297562608457'
+  sender_name: 장소율
+  recipient_name: 장소율
+  quantity: 3
+  amount: 96800
+  payment_method: Credit card
+- id,link: 20260608-300071
+  registration_date: '2026-06-08'
+  status: 배송완료
+  goods: 리넨 반팔 셔츠
+  tracking_number: '867271781212'
+  sender_name: 박현우
+  recipient_name: 박현우
+  quantity: 6
+  amount: 241800
+  payment_method: Digital wallet
+- id,link: 20260528-301633
+  registration_date: '2026-05-28'
+  status: 배송완료
+  goods: 방수 블루투스 스피커
+  tracking_number: '238752959418'
+  sender_name: 임현우
+  recipient_name: 강수아
+  quantity: 3
+  amount: 181600
+  payment_method: Credit card
+- id,link: 20260527-301136
+  registration_date: '2026-05-27'
+  status: 배송완료
+  goods: 대용량 보조배터리
+  tracking_number: '215260019995'
+  sender_name: 이예준
+  recipient_name: 이예준
+  quantity: 2
+  amount: 79800
+  payment_method: Credit card
+- id,link: 20260520-300355
+  registration_date: '2026-05-20'
+  status: 배송완료
+  goods: 휴대용 코펠 세트
+  tracking_number: '560932351608'
+  sender_name: 윤도윤
+  recipient_name: 윤도윤
+  quantity: 1
+  amount: 46500
+  payment_method: Credit card
+- id,link: 20260519-301562
+  registration_date: '2026-05-19'
+  status: 배송완료
+  goods: 수분 장벽 크림
+  tracking_number: '543603017020'
+  sender_name: 윤도윤
+  recipient_name: 윤도윤
+  quantity: 1
+  amount: 34050
+  payment_method: Wire transfer
+- id,link: 20260517-301704
+  registration_date: '2026-05-17'
+  status: 배송완료
+  goods: 제주 감귤 주스
+  tracking_number: '138702387225'
+  sender_name: 박현우
+  recipient_name: 김유진
+  quantity: 3
+  amount: 51000
+  payment_method: Credit card
+- id,link: 20260428-300852
+  registration_date: '2026-04-28'
+  status: 배송완료
+  goods: 기모 후드집업
+  tracking_number: '232264572564'
+  sender_name: 윤도윤
+  recipient_name: 윤도윤
+  quantity: 4
+  amount: 183300
+  payment_method: Wire transfer
+- id,link: 20260425-301420
+  registration_date: '2026-04-25'
+  status: 배송중
+  goods: 밀폐 유리 용기 세트
+  tracking_number: '719066369755'
+  sender_name: 장소율
+  recipient_name: 장소율
+  quantity: 3
+  amount: 108200
+  payment_method: Wire transfer
+- id,link: 20260423-301917
+  registration_date: '2026-04-23'
+  status: 배송완료
+  goods: 자외선 차단 양산
+  tracking_number: '645360343245'
+  sender_name: 강은호
+  recipient_name: 강은호
+  quantity: 5
+  amount: 326900
+  payment_method: Digital wallet
+- id,link: 20260419-301775
+  registration_date: '2026-04-19'
+  status: 배송완료
+  goods: 콜드브루 원액
+  tracking_number: '741918356651'
+  sender_name: 윤도윤
+  recipient_name: 윤도윤
+  quantity: 1
+  amount: 18800
+  payment_method: Wire transfer
+- id,link: 20260417-300426
+  registration_date: '2026-04-17'
+  status: 배송완료
+  goods: 콜드브루 원액
+  tracking_number: '796071672264'
+  sender_name: 강수아
+  recipient_name: 강수아
+  quantity: 1
+  amount: 17220
+  payment_method: Credit card
+- id,link: 20260403-301491
+  registration_date: '2026-04-03'
+  status: 배송완료
+  goods: 기모 후드집업
+  tracking_number: '815065701362'
+  sender_name: 오예준
+  recipient_name: 오예준
+  quantity: 5
+  amount: 206400
+  payment_method: Digital wallet
