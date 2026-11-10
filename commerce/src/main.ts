@@ -3804,7 +3804,7 @@ listen("extraction-progress", async (event: any) => {
                 totalResultCount = docs.length;
 
                 if (docs.length > 0) {
-                    upsertListItems(docs, 'append');
+                    upsertListItems(docs, 'append', true);
                     hasMore = false; // 🌟 [CRITICAL FIX] AI 검색 결과는 단발성 고정 셋이므로 스크롤을 통한 전체 리스트 더 불러오기를 원천 차단합니다!
                 } else {
                     if (docListContainer) docListContainer.innerHTML = `<div class="empty">No detailed documents found.</div>`;
@@ -5499,14 +5499,16 @@ function updateResultCount() {
     }
 }
 
-function upsertListItems(docs: any[], mode: 'prepend' | 'append') {
+// keepOrder: 검색 결과는 백엔드 관련도 순서(목표 → 조건 통과 → 구출 → 연결 문서)를 그대로 보여 줍니다.
+// 문서 목록(둘러보기)은 지금처럼 최신순입니다. 예전에는 검색 결과도 created_at 으로 다시 정렬되어 관련도 순위가 화면에서 사라졌습니다.
+function upsertListItems(docs: any[], mode: 'prepend' | 'append', keepOrder: boolean = false) {
     if (!docListContainer) return;
 
     const scrollEl = document.getElementById("list-scroll");
     const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
     const wasAtTop = listCurrentY <= 10; 
 
-    const sortedBatch = [...docs].sort((a, b) => b.created_at - a.created_at);
+    const sortedBatch = keepOrder ? [...docs] : [...docs].sort((a, b) => b.created_at - a.created_at);
     const processBatch = mode === 'prepend' ? [...sortedBatch].reverse() : sortedBatch;
 
     processBatch.forEach(doc => {
