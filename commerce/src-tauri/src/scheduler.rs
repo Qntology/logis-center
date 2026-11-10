@@ -9658,6 +9658,7 @@ pub async fn process_task(
         obj.insert("id".to_string(), json!(generated_id.clone()));
         obj.insert("updated_at".to_string(), json!(chrono::Utc::now().timestamp_millis()));
     }
+    crate::search_relation::expose_own_number(&mut extracted_data, &page_type, &id_val_raw);
 
     log_task_progress(app_handle, &task.id, &json!({ "category": "Saving", "summary": "Syncing to database..." }));
 
@@ -10183,6 +10184,7 @@ pub async fn process_task(
                     obj.insert("index".to_string(), json!(index_val));
                     obj.insert("updated_at".to_string(), json!(0));
                 }
+                crate::search_relation::expose_own_number(&mut single_item, &page_type, &identity_seed);
                 relay_ledger::bind_tracking_ref(&mut single_item, &page_type, &team_id, &task.cc);
 
                 let existing_item = store.get_item_by_id(&target_table, &hashed_item_id).await.ok().flatten();

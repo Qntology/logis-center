@@ -79,3 +79,5 @@ mod sds_ledger;
 mod analytic_page;
 // 목록 행의 자기 식별자: 코사인 게이트가 실패하면 이 페이지 유형의 별칭 매개변수 링크(od_id · it_id · invoice)를 먼저
 mod relay_links;
+// 고정점 → 목표 유형 관계 단계 · 서식 질의 근거 · 숫자 식별자 · 날짜 구간 · 행동 종류
+mod search_relation;

@@ -37,6 +37,9 @@ def commerce_seeds(rec: dict) -> list:
     out = []
 
     def seed(ty, raw, url, data, links=None, arrays=None, detail=False):
+        # 앱의 추출 저장(search_relation::expose_own_number)과 같이 링크의 자기 번호를 data.no 에 원문 그대로 둡니다.
+        if "no" not in data and "?" in data.get("link", ""):
+            data = {**data, "no": data["link"].split("?", 1)[1].split("&")[0].split("=", 1)[1]}
         out.append({"id": f"seed-{k}-{ty}-{raw}", "kind": "seed2", "mode": "commerce", "host": host, "type": ty,
                     "self": [ty, raw], "lang": lang, "detail": detail, "url": url, "data": data,
                     "links": links or {}, "arrays": arrays or {}})

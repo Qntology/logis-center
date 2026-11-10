@@ -601,7 +601,7 @@ pub struct RelayJoinReport {
 
 impl RelayJoinReport {
     pub fn changed_set(&self) -> bool {
-        self.rescued > 0 || self.dropped > 0
+        self.rescued > 0 || self.dropped > 0 || self.period_targets > 0
     }
 }
 
@@ -1107,6 +1107,17 @@ pub async fn relay_join(
         }
         let dropped = pre_drop - results.len();
         rep.dropped += dropped;
+        // 기간 조인의 목표(질의가 묻는 유형 — 그 기간에 팔린 상품)를 결과 맨 앞으로 올립니다. 화면은 결과 순서를 그대로 보여 주므로
+        // 목표가 연결 문서 · 다른 유형 문서 사이에 섞이면 첫 정답이 아래로 밀렸습니다 (v2 질의 C7 MRR 0.11). 많이 팔린 것이 먼저입니다.
+        let top = results.iter().filter_map(|r| r.get("score").and_then(|v| v.as_f64())).fold(0.0f64, f64::max).max(1.0);
+        for r in results.iter_mut() {
+            let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if let Some(n) = hits.get(&id) {
+                if let Some(o) = r.as_object_mut() {
+                    o.insert("score".to_string(), json!(top + 1.0 + (*n as f64) * 1e-3));
+                }
+            }
+        }
         for r in results.iter_mut() {
             let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             if let Some(n) = hits.get(&id) {
