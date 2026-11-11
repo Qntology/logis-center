@@ -113,6 +113,59 @@ pub fn event_type_glued_keys(word: &str) -> Vec<String> {
     out
 }
 
+/// 낱말을 붙여 합성어를 만드는 언어 (Stanza 코드). 합성어의 뜻을 정하는 머리가 꼬리에 옵니다.
+///  어휘가 아니라 언어의 구조 속성이라 코드에 둡니다 (search_relation::target_type 의 머리-끝 언어와 같은 자리).
+const SOLID_COMPOUND_LANGS: [&str; 2] = ["de", "nl"];
+
+/// 🌟 [EVENT LEMMA MATCH] 낱말은 사전에 없어도 원형(lemma)이 확정어이면 그 유형으로 확정합니다. (유형, 맞은 확정어, 근거)
+///  완전일치 · 접두일치는 낱말의 겉모습만 보아, 굴절해서 첫머리가 달라진 낱말과 합성어를 놓쳤습니다
+///  (실측 A2 '옵션을 바꾼 기록': it 'modifiche' · cs 'změny' · pt 'alterações' · de 'Optionsänderungen' · nl 'optiewijzigingen'
+///   — 유형이 확정되지 않아 다섯 유형을 모두 회수했고, 잘못 추정한 유형의 기록이 정답 19건을 밀어냈습니다. R@10 0.3 ~ 0.8).
+///  ① 원형 완전일치 (it 'modifiche' → 'modifica', cs 'změny' → 'změna')
+///  ② 원형에 합성 표시(_ · -)가 있으면 꼬리 낱말 (nl 'optie_wijziging' → 'wijziging')
+///  ③ 붙여 쓰는 합성어 언어의 명사는 확정어로 끝나는가 (de 'optionsänderung' → 'änderung').
+///     머리 3자 이상 · 확정어 6자 이상 · 명사만: 'zwischen'(머리 1자) · 'inzwischen'(부사) 이 'wischen'(touch) 으로 읽히지 않습니다.
+pub fn event_type_lemma_key(lemma: &str, tag: &str, lang: &str) -> Option<(String, String, &'static str)> {
+    let l = lemma.trim().to_lowercase();
+    if l.is_empty() {
+        return None;
+    }
+    if let Some(k) = event_type_exact_match(&l) {
+        return Some((k, l, "원형"));
+    }
+    if let Some(p) = l.rfind(|c: char| c == '_' || c == '-') {
+        let tail = &l[p + 1..];
+        if tail.chars().count() >= 3 {
+            if let Some(k) = event_type_exact_match(tail) {
+                return Some((k, tail.to_string(), "합성어 꼬리"));
+            }
+        }
+    }
+    if !SOLID_COMPOUND_LANGS.contains(&lang) || !(tag == "NOUN" || tag == "PROPN") {
+        return None;
+    }
+    let latin = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_alphabetic() && (c as u32) < 0x0250);
+    if !latin(&l) {
+        return None;
+    }
+    let node = crate::parsing::BIAS_DICT.get("analytic_event_filters").and_then(|v| v.as_object())?;
+    let total = l.chars().count();
+    let mut best: Option<(String, String)> = None;
+    for (key, val) in node {
+        if !ANALYTIC_SEARCH_TYPES.iter().any(|t| t == key) {
+            continue;
+        }
+        for s in val.get("exact_match").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|x| x.as_str()) {
+            let s = s.trim().to_lowercase();
+            let n = s.chars().count();
+            if n >= 6 && total >= n + 3 && latin(&s) && l.ends_with(s.as_str()) && best.as_ref().map_or(true, |(_, b)| n > b.chars().count()) {
+                best = Some((key.clone(), s));
+            }
+        }
+    }
+    best.map(|(k, s)| (k, s, "합성어 꼬리"))
+}
+
 // =====================================================================
 // 🌟 [ANALYTIC PAGE / SITE] 도메인 · 웹 경로 정의
 // ---------------------------------------------------------------------
@@ -254,6 +307,18 @@ pub fn doc_action_kinds(data: &Value) -> Vec<String> {
         .collect()
 }
 
+/// 행동 기록(data)이 질의의 페이지 종류 · 행동 종류 조건을 지나는가. 문서 트랙이 거른 기록이 청크 트랙으로 되돌아오지 않게
+/// 청크로만 올라온 기록에도 같은 판정을 씁니다. action_on 은 '행동이 맞는 기록이 하나라도 회수되었는가'(없으면 행동으로 거르지 않음).
+pub fn record_passes_filters(data: &Value, pages: &[String], actions: &[String], action_on: bool) -> bool {
+    if !pages.is_empty() && !doc_page_kind(data).map_or(false, |k| pages.contains(&k)) {
+        return false;
+    }
+    if action_on && !doc_action_kinds(data).iter().any(|k| actions.contains(k)) {
+        return false;
+    }
+    true
+}
+
 /// 행동 종류들이 기록되는 이벤트 유형 (중복 없이)
 pub fn action_event_types(kinds: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -267,6 +332,468 @@ pub fn action_event_types(kinds: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+// =====================================================================
+// 🌟 [ANALYTIC NEGATION] 부정 조건 → 방문 단위 여집합
+// ---------------------------------------------------------------------
+//  '결제 페이지까지 갔다가 결제하지 않은 기록' · 'reached checkout but never paid' 의 '결제 · paid' 는 찾을 대상이 아니라 없어야 하는
+//  일입니다. 긍정 조건으로 두면 결제를 마친 방문의 결제 페이지 기록이 앞에 옵니다 (v2 질의 A4: MRR 0.28, 한국어는 정답이 8 · 19 · 20위).
+//   1. 부정어(bias.json analytic_negation.markers, 12개 언어)가 가까운 완료 의도 낱말(결제 · 구매 · 주문) · 행동 어간 · 페이지 문구에
+//      걸리면 [`negated_conditions`] 가 그 조건을 부정된 의도 · 제외 행동 · 제외 페이지로 가릅니다.
+//   2. 검색은 긍정 조건으로 회수한 뒤, 기록이 속한 방문에 완료 증거(의도의 evidence_pages 기록 · 제외 행동 · 제외 페이지)가 있으면
+//      그 기록을 뺍니다 ([`evidence_visits`] · lib.rs 의 [ANALYTIC NEGATION]).
+//  방문 = 같은 방문자의 기록이 [`VISIT_IDLE_MS`] 안쪽 간격으로 이어진 묶음. 방문자 단위로 빼면 안 됩니다: 같은 방문자가 한 번은
+//  그만두고 나중에 구매합니다 — 그 이탈 방문이 정답입니다. 결제 버튼을 누른 기록은 증거가 아닙니다(결제가 실패해도 누른 기록은
+//  남음). 주문 완료 페이지 기록만 증거로 씁니다.
+//
+//  부정어가 걸리는 낱말 찾기 (판정은 tests/fixtures/analytic/negation_cases.json 273문장으로 고정):
+//   · 부정어에서 한쪽으로 최대 NEGATION_SCAN_CAP 낱말. 기능어 · 다른 부정어 · 보조 용언은 세지 않고 지나가고,
+//     내용어(동사 · 형용사 · 부사)는 NEGATION_SCAN_SKIP 개까지 건너뜁니다. 그 밖의 품사(명사 …) · 접속사 · 쉼표 · 숫자에서 멈춥니다.
+//   · 내용어를 건넌 뒤에는 다른 절의 서술어를 잡지 않습니다: 뒤로 볼 때 서술어 대상, 앞으로 볼 때 관계대명사를 지난 서술어 대상,
+//     종속 접속사 · 절을 닫는 낱말에서 멈춥니다 ('결제하고 돌아오지 않은' · 'visitors who paid who did not review' 는 부정이 아님).
+//   · 페이지 문구를 먼저 만나면 들고 있다가, 같은 절에서 의도 낱말이 이어지면 그쪽이 대상입니다 ('nicht an der Kasse bezahlt').
+//  놓치는 쪽으로 보수적입니다 ('orders that were not completed' 처럼 의도 낱말이 부정어에서 멀면 판정하지 않음).
+// =====================================================================
+
+/// 질의의 부정 조건: 부정된 완료 의도 · 제외할 행동 종류 · 제외할 페이지 종류와 근거 (부정어, 걸린 낱말, "종류:이름").
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct NegatedConditions {
+    pub intents: Vec<String>,
+    pub actions: Vec<String>,
+    pub pages: Vec<String>,
+    pub evidence: Vec<(String, String, String)>,
+}
+
+impl NegatedConditions {
+    pub fn is_empty(&self) -> bool {
+        self.intents.is_empty() && self.actions.is_empty() && self.pages.is_empty()
+    }
+
+    /// 방문에 이 페이지 기록이 있으면 부정된 일이 일어난 방문입니다: 부정된 의도의 완료 페이지(evidence_pages) + 제외 페이지.
+    pub fn evidence_pages(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for name in self.intents.iter() {
+            let pages = crate::parsing::BIAS_DICT
+                .get("analytic_negation")
+                .and_then(|n| n.get("intents"))
+                .and_then(|i| i.get(name.as_str()))
+                .and_then(|i| i.get("evidence_pages"));
+            for p in neg_list(pages) {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        for p in self.pages.iter() {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        out
+    }
+
+    /// 검색 계약(structured_query)에 싣는 꼴
+    pub fn to_json(&self) -> Value {
+        json!({
+            "negated_intents": self.intents,
+            "exclude_actions": self.actions,
+            "exclude_pages": self.pages,
+            "negation_evidence": self.evidence.iter().map(|(m, w, t)| json!([m, w, t])).collect::<Vec<_>>(),
+        })
+    }
+
+    /// structured_query 에서 다시 읽습니다 (근거는 싣지 않습니다).
+    pub fn from_query_json(v: &Value) -> Self {
+        let list = |k: &str| -> Vec<String> {
+            v.get(k).and_then(|x| x.as_array()).into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect()
+        };
+        Self { intents: list("negated_intents"), actions: list("exclude_actions"), pages: list("exclude_pages"), evidence: Vec::new() }
+    }
+}
+
+/// 같은 방문으로 보는 기록 사이 최대 간격 (웹 분석의 관례적 세션 만료 30분)
+pub const VISIT_IDLE_MS: i64 = 30 * 60 * 1000;
+/// 부정어와 걸리는 낱말 사이에 건너뛸 수 있는 내용어 수
+const NEGATION_SCAN_SKIP: usize = 1;
+/// 부정어에서 걸리는 낱말까지의 최대 거리 (낱말 수)
+const NEGATION_SCAN_CAP: usize = 6;
+/// 세지 않고 지나가는 기능어 품사
+const NEGATION_FUNCTION_TAGS: [&str; 6] = ["AUX", "PART", "SCONJ", "ADP", "DET", "PRON"];
+/// 부정 접두가 붙을 수 있는 품사 (체코어 ne-)
+const NEGATION_HEAD_TAGS: [&str; 3] = ["VERB", "AUX", "ADJ"];
+/// 건너뛸 수 있는 내용어 품사
+const NEGATION_SKIPPABLE_TAGS: [&str; 3] = ["VERB", "ADJ", "ADV"];
+/// 서술어 품사
+const NEGATION_VERBAL_TAGS: [&str; 2] = ["VERB", "AUX"];
+/// 절을 가르는 문장 부호
+const NEGATION_CLAUSE_MARKS: &str = ",;:.!?。、，；：！？";
+
+/// 부정어가 대상을 찾는 방향
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NegReach {
+    /// 부정되는 낱말이 뒤에 옴 (not paid · ohne zu bezahlen · 没有付款)
+    Forward,
+    /// 앞에 옴 (결제하지 않은 · 支払わなかった)
+    Backward,
+    /// 가까운 쪽 (bezahlt nicht · nicht bezahlt)
+    Either,
+    /// 부정 접두가 붙은 낱말 자신 (nezaplatily · 未付款)
+    Own,
+}
+
+/// 붙여 쓰는 문자(한중일 · 아랍 문자)인가. 이런 글은 낱말 경계를 글자 종류로 알 수 없어 글자 일치로 봅니다.
+fn negation_glued(c: char) -> bool {
+    matches!(c as u32, 0x0600..=0x06FF | 0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3)
+}
+
+/// 글 안에서 구가 나오는 바이트 구간들. word_start 이면 낱말 앞머리에서 시작하는 것만 셉니다 (붙여 쓰는 문자의 구는 글자 일치).
+fn phrase_spans(text: &str, phrase: &str, word_start: bool) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    if phrase.is_empty() {
+        return out;
+    }
+    let glued = phrase.chars().any(negation_glued);
+    let mut start = 0;
+    while let Some(off) = text[start..].find(phrase) {
+        let a = start + off;
+        if !word_start || glued || text[..a].chars().last().map_or(true, |c| !c.is_alphanumeric()) {
+            out.push((a, a + phrase.len()));
+        }
+        start = a + phrase.len();
+    }
+    out
+}
+
+/// 사전 배열 → 앞뒤 공백을 뗀 소문자 목록
+fn neg_list(v: Option<&Value>) -> Vec<String> {
+    v.and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 🌟 [ANALYTIC NEGATION] 질의 토큰(표면, 품사, 원형)에서 부정 조건을 찾습니다. quoted 는 따옴표 안 낱말 표시(값이라 보지 않음).
+pub fn negated_conditions(query: &str, lang: &str, tokens: &[(String, String, String)], quoted: &[bool]) -> NegatedConditions {
+    let mut out = NegatedConditions::default();
+    let Some(dict) = crate::parsing::BIAS_DICT.get("analytic_negation") else {
+        return out;
+    };
+    let markers = dict.get("markers").and_then(|m| m.get(lang));
+    let lst = |key: &str| -> Vec<String> { neg_list(markers.and_then(|m| m.get(key))) };
+    let (before, before_stems, after, after_stems, both) =
+        (lst("before"), lst("before_stems"), lst("after"), lst("after_stems"), lst("both"));
+    let (ends, starts, prefix, prefix_except) = (lst("ends"), lst("starts"), lst("prefix"), lst("prefix_except"));
+    let (light_stems, verbal_tails, clause_closers, relative_stems) =
+        (lst("light_stems"), lst("verbal_tails"), lst("clause_closers"), lst("relative_stems"));
+    let intents: Vec<(String, std::collections::HashSet<String>, Vec<String>)> = dict
+        .get("intents")
+        .and_then(|i| i.as_object())
+        .map(|o| {
+            o.iter()
+                .map(|(name, node)| (name.clone(), neg_list(node.get("words")).into_iter().collect(), neg_list(node.get("negated"))))
+                .collect()
+        })
+        .unwrap_or_default();
+    let n = tokens.len();
+    let is_quoted = |i: usize| quoted.get(i).copied().unwrap_or(false);
+    let ql = query.to_lowercase();
+
+    // 낱말 구간 (질의 소문자 글의 바이트 위치)
+    let mut spans: Vec<Option<(usize, usize)>> = Vec::with_capacity(n);
+    let mut cur = 0usize;
+    for (w, _, _) in tokens.iter() {
+        let s = w.to_lowercase();
+        let found = if s.is_empty() { None } else { ql.get(cur..).and_then(|rest| rest.find(&s)).map(|off| cur + off) };
+        match found {
+            Some(a) => {
+                spans.push(Some((a, a + s.len())));
+                cur = a + s.len();
+            }
+            None => spans.push(None),
+        }
+    }
+    // 페이지 문구 구간 → 그 자리를 가린 질의에서 행동 어간 구간 (긴 구가 먼저; 사전 순회 순서에 기대지 않음)
+    let mut page_spans: Vec<(usize, usize, usize, String)> = Vec::new();
+    let mut masked: Vec<u8> = ql.as_bytes().to_vec();
+    if let Some(filters) = crate::parsing::BIAS_DICT.get("analytic_page_filters").and_then(|v| v.as_object()) {
+        for (kind, node) in filters.iter() {
+            for phrase in neg_list(node.get("exact_match")) {
+                for (s, e) in phrase_spans(&ql, &phrase, false) {
+                    page_spans.push((s, e, phrase.chars().count(), kind.clone()));
+                    masked[s..e].iter_mut().for_each(|b| *b = b' ');
+                }
+            }
+        }
+    }
+    let by_length = |a: &(usize, usize, usize, String), b: &(usize, usize, usize, String)| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.3.cmp(&b.3));
+    page_spans.sort_by(by_length);
+    let masked = String::from_utf8(masked).unwrap_or_default();
+    let mut action_spans: Vec<(usize, usize, usize, String)> = Vec::new();
+    for (kind, stems, _) in action_filter_table() {
+        for stem in stems.iter() {
+            for (s, e) in phrase_spans(&masked, stem, true) {
+                action_spans.push((s, e, stem.chars().count(), kind.clone()));
+            }
+        }
+    }
+    action_spans.sort_by(by_length);
+
+    let lw: Vec<String> = tokens.iter().map(|(w, _, _)| w.to_lowercase().trim_matches(|c: char| !c.is_alphanumeric()).to_string()).collect();
+    let ll: Vec<String> = tokens.iter().map(|(_, _, l)| l.to_lowercase()).collect();
+    let tags: Vec<&str> = tokens.iter().map(|(_, t, _)| t.as_str()).collect();
+
+    // 낱말 i 가 가리키는 조건: ("page" | "action" | "intent", 이름)
+    let target_of = |i: usize| -> Option<(&'static str, String)> {
+        if is_quoted(i) {
+            return None;
+        }
+        if let Some((a, b)) = spans[i] {
+            if let Some((_, _, _, kind)) = page_spans.iter().find(|(s, e, _, _)| a < *e && *s < b) {
+                return Some(("page", kind.clone()));
+            }
+            if let Some((_, _, _, kind)) = action_spans.iter().find(|(s, e, _, _)| a < *e && *s < b) {
+                return Some(("action", kind.clone()));
+            }
+        }
+        intents
+            .iter()
+            .find(|(_, ws, _)| ws.contains(&lw[i]) || (!ll[i].is_empty() && ws.contains(&ll[i])))
+            .map(|(name, _, _)| ("intent", name.clone()))
+    };
+    // 낱말 i 가 부정어인가: (방향, 부정 접두가 붙은 낱말이면 그 자신이 가리키는 조건)
+    let marker_of = |i: usize| -> (Option<NegReach>, Option<(&'static str, String)>) {
+        if is_quoted(i) {
+            return (None, None);
+        }
+        let (w, l, tag) = (lw[i].as_str(), ll[i].as_str(), tags[i]);
+        if w.is_empty() {
+            return (None, None);
+        }
+        let has = |list: &[String], x: &str| list.iter().any(|e| e == x);
+        if has(&before, w) || (!l.is_empty() && has(&before_stems, l)) {
+            return (Some(NegReach::Forward), None);
+        }
+        if has(&after, w) || (!l.is_empty() && has(&after_stems, l)) {
+            return (Some(NegReach::Backward), None);
+        }
+        if has(&both, w) {
+            return (Some(NegReach::Either), None);
+        }
+        if ends.iter().any(|x| w.ends_with(x.as_str()) && w.len() > x.len()) {
+            return (Some(NegReach::Either), None);
+        }
+        if starts.iter().any(|x| w.starts_with(x.as_str()) && w.len() > x.len()) {
+            return (Some(NegReach::Forward), None);
+        }
+        if prefix_except.iter().any(|x| w.starts_with(x.as_str())) {
+            return (None, None);
+        }
+        for p in prefix.iter() {
+            if !(w.starts_with(p.as_str()) && w.len() > p.len()) {
+                continue;
+            }
+            let rest = &w[p.len()..];
+            let glued = p.chars().any(negation_glued);
+            // 붙여 쓰는 문자: 접두를 뗀 나머지가 의도 낱말일 때만. 그 밖: 원형이 접두를 잃었을 때만 부정형
+            if !glued && (l.is_empty() || l.starts_with(p.as_str())) {
+                continue;
+            }
+            if let Some((name, _, _)) = intents.iter().find(|(_, ws, _)| ws.contains(rest) || (!l.is_empty() && ws.contains(l))) {
+                return (Some(NegReach::Own), Some(("intent", name.clone())));
+            }
+            if !glued && NEGATION_HEAD_TAGS.contains(&tag) {
+                return (Some(NegReach::Forward), None);
+            }
+        }
+        (None, None)
+    };
+    let marks: Vec<(Option<NegReach>, Option<(&'static str, String)>)> = (0..n).map(marker_of).collect();
+
+    let clause_mark = |c: Option<char>| c.map_or(false, |c| NEGATION_CLAUSE_MARKS.contains(c));
+    let boundary = |lo: usize| -> bool { clause_mark(tokens[lo].0.chars().last()) || clause_mark(tokens[lo + 1].0.chars().next()) };
+    let barrier = |i: usize| -> bool {
+        tags[i] == "CCONJ"
+            || tokens[i].0.chars().any(|c| c.is_numeric())
+            || (tags[i] == "PUNCT" && !tokens[i].0.chars().any(|c| c.is_alphanumeric()))
+    };
+    let pronoun = |i: usize| -> bool { tags[i] == "PRON" || (!ll[i].is_empty() && relative_stems.contains(&ll[i])) };
+    let verbal = |i: usize| -> bool {
+        if NEGATION_VERBAL_TAGS.contains(&tags[i]) {
+            return true;
+        }
+        if !ll[i].is_empty() && lw[i].starts_with(ll[i].as_str()) && lw[i].len() > ll[i].len() {
+            let tail = &lw[i][ll[i].len()..];
+            return verbal_tails.iter().any(|x| tail.starts_with(x.as_str()));
+        }
+        false
+    };
+    // 부정어 i 에서 step(±1) 쪽으로 걸리는 낱말: (거리, 조건, 위치)
+    let scan = |i: usize, step: isize| -> Option<(usize, (&'static str, String), usize)> {
+        let (mut count, mut dist) = (0usize, 1usize);
+        let mut j = i as isize + step;
+        let mut crossed = false;
+        let mut held: Option<(usize, (&'static str, String), usize)> = None;
+        while j >= 0 && (j as usize) < n && dist <= NEGATION_SCAN_CAP {
+            let ju = j as usize;
+            if boundary(if step > 0 { ju - 1 } else { ju }) {
+                break;
+            }
+            let t = if marks[ju].0.is_none() { target_of(ju) } else { None };
+            if let Some(t) = t {
+                let v = verbal(ju);
+                if (step < 0 && v && count >= 1) || (step > 0 && v && count >= 1 && crossed) {
+                    break;
+                }
+                if t.0 == "page" {
+                    if held.is_none() {
+                        held = Some((dist, t, ju));
+                    }
+                    j += step;
+                    dist += 1;
+                    continue;
+                }
+                if held.is_some() && t.0 != "intent" {
+                    break;
+                }
+                return Some((dist, t, ju));
+            }
+            if barrier(ju) {
+                break;
+            }
+            if pronoun(ju) {
+                if step < 0 {
+                    break;
+                }
+                crossed = true;
+            }
+            if count >= 1 && (tags[ju] == "SCONJ" || clause_closers.contains(&lw[ju])) {
+                break;
+            }
+            let passes = NEGATION_FUNCTION_TAGS.contains(&tags[ju]) || marks[ju].0.is_some() || (!ll[ju].is_empty() && light_stems.contains(&ll[ju]));
+            if !passes {
+                if !NEGATION_SKIPPABLE_TAGS.contains(&tags[ju]) {
+                    break;
+                }
+                count += 1;
+                if count > NEGATION_SCAN_SKIP {
+                    break;
+                }
+            }
+            j += step;
+            dist += 1;
+        }
+        held
+    };
+
+    let mut found: Vec<(String, String, (&'static str, String))> = Vec::new();
+    for (i, (reach, own)) in marks.iter().enumerate() {
+        let Some(reach) = reach else { continue };
+        if *reach == NegReach::Own {
+            if let Some(t) = own {
+                found.push((tokens[i].0.clone(), tokens[i].0.clone(), t.clone()));
+            }
+            continue;
+        }
+        let f = if matches!(reach, NegReach::Forward | NegReach::Either) { scan(i, 1) } else { None };
+        let b = if matches!(reach, NegReach::Backward | NegReach::Either) { scan(i, -1) } else { None };
+        let pick = match (f, b) {
+            (Some(f), Some(b)) => Some(if f.0 <= b.0 { f } else { b }),
+            (f, b) => f.or(b),
+        };
+        if let Some((_, t, j)) = pick {
+            found.push((tokens[i].0.clone(), tokens[j].0.clone(), t));
+        }
+    }
+    // 어휘화된 부정 (미결제 · unpaid …)
+    for (name, _, negated) in intents.iter() {
+        for neg in negated.iter() {
+            if !phrase_spans(&ql, neg, true).is_empty() {
+                found.push((neg.clone(), neg.clone(), ("intent", name.clone())));
+            }
+        }
+    }
+    for (marker, word, (kind, name)) in found.into_iter() {
+        let dst = match kind {
+            "intent" => &mut out.intents,
+            "action" => &mut out.actions,
+            _ => &mut out.pages,
+        };
+        if !dst.contains(&name) {
+            dst.push(name.clone());
+        }
+        out.evidence.push((marker, word, format!("{}:{}", kind, name)));
+    }
+    out
+}
+
+/// 행동 기록 · 리포트에서 시각(ms) 읽기: 숫자 또는 숫자 문자열
+fn data_ms(data: &Value, key: &str) -> Option<i64> {
+    match data.get(key)? {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+    .filter(|v| *v > 0)
+}
+
+/// 행동 기록 한 건이 놓인 시간 구간: 리포트는 묶은 방문의 처음 · 끝(episode_started_at · episode_ended_at), 그 밖은 기록 시각.
+pub fn record_window(data: &Value) -> Option<(i64, i64)> {
+    if data.get("type").and_then(|v| v.as_str()) == Some("report") {
+        let s = data_ms(data, "episode_started_at");
+        let e = data_ms(data, "episode_ended_at");
+        return match (s, e) {
+            (Some(s), Some(e)) => Some((s.min(e), s.max(e))),
+            (Some(x), None) | (None, Some(x)) => Some((x, x)),
+            (None, None) => None,
+        };
+    }
+    data_ms(data, "created_at").map(|t| (t, t))
+}
+
+/// 🌟 [ANALYTIC NEGATION] 방문자들의 행동 기록(방문자, 데이터)을 방문으로 묶고, 부정된 일이 일어난 방문의 (방문자, 처음, 끝)을 돌려줍니다.
+/// 리포트는 기록이 아니라 방문의 요약이라 방문을 이루는 데 쓰지 않습니다.
+pub fn evidence_visits(records: &[(String, Value)], neg: &NegatedConditions) -> Vec<(String, i64, i64)> {
+    let pages = neg.evidence_pages();
+    let mut by_visitor: std::collections::HashMap<&str, Vec<(i64, bool)>> = std::collections::HashMap::new();
+    for (from, data) in records.iter() {
+        if from.is_empty() || data.get("type").and_then(|v| v.as_str()) == Some("report") {
+            continue;
+        }
+        let Some((t, _)) = record_window(data) else { continue };
+        let evidence = doc_page_kind(data).map_or(false, |k| pages.contains(&k))
+            || (!neg.actions.is_empty() && doc_action_kinds(data).iter().any(|k| neg.actions.contains(k)));
+        by_visitor.entry(from.as_str()).or_default().push((t, evidence));
+    }
+    let mut out: Vec<(String, i64, i64)> = Vec::new();
+    for (from, mut recs) in by_visitor.into_iter() {
+        recs.sort_by_key(|(t, _)| *t);
+        let (mut start, mut end, mut hit) = (recs[0].0, recs[0].0, false);
+        for (k, (t, ev)) in recs.iter().enumerate() {
+            if k > 0 && *t - end > VISIT_IDLE_MS {
+                if hit {
+                    out.push((from.to_string(), start, end));
+                }
+                start = *t;
+                hit = false;
+            }
+            end = *t;
+            hit |= *ev;
+        }
+        if hit {
+            out.push((from.to_string(), start, end));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 기록(방문자, 시간 구간)이 부정된 일이 일어난 방문에 속하는가
+pub fn in_evidence_visit(from: &str, window: (i64, i64), visits: &[(String, i64, i64)]) -> bool {
+    visits.iter().any(|(f, s, e)| f == from && window.0 <= *e && *s <= window.1)
 }
 
 /// 질의에 나온 사이트: 저장된 행동 로그의 사이트 이름(site) · host 가 질의에 들어 있고 그런 사이트가 하나뿐이면 (cc, 이름).
@@ -1869,9 +2396,15 @@ pub async fn tokenize_query_with_morphology(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    // Stanza 가 없으면(모델 미설치 · 언어 미지원) 품사 없이 공백으로 나누되, 한글 · 가나 · 한자 어절은 닫힌 조사 · 어미 표로 벗긴 어간을
+    // 원형 자리에 둡니다. 원형이 비면 '결제를 안 한' · '않은' 의 부정 판정과 원형 기반 유형 확정이 끊겼습니다.
     let fallback: Vec<(String, String, String)> = words
         .iter()
-        .map(|w| (w.clone(), String::new(), String::new()))
+        .map(|w| {
+            let glued = w.chars().any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x9FFF | 0xAC00..=0xD7A3));
+            let lemma = if glued { crate::utils::ai_utils::closed_tail_lemma(w).unwrap_or_default() } else { String::new() };
+            (w.clone(), String::new(), lemma)
+        })
         .collect();
     if words.is_empty() {
         return fallback;

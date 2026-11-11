@@ -1227,6 +1227,96 @@ pub async fn analytic_anchor_boost(
     boosted
 }
 
+/// 🌟 [ANALYTIC NEGATION] 부정 조건의 방문 단위 여집합 (analytic.rs [ANALYTIC NEGATION] 설명).
+/// 결과 기록 · 리포트의 방문자들의 행동 기록을 다시 읽어 방문으로 묶고, 부정된 일(주문 완료 · 제외 행동 · 제외 페이지)이 일어난
+/// 방문의 기록 · 리포트를 결과에서 뺍니다. 페이지 · 행동으로 거른 결과에는 증거 기록(주문 완료 페이지)이 없으므로 다시 읽어야 합니다.
+/// 다 빠지면 부정 판정이 틀렸을 수 있어 그대로 둡니다. 뺀 건수를 돌려줍니다.
+pub async fn analytic_visit_complement(
+    store: &VectorStore,
+    results: &mut Vec<Value>,
+    neg: &crate::analytic::NegatedConditions,
+    cc: &str,
+    emit: &(dyn Fn(&str) + Send + Sync),
+) -> usize {
+    if results.is_empty() || neg.is_empty() {
+        return 0;
+    }
+    let from_of = |d: &Value| text_of(d.get("from")).trim().to_string();
+    let docs: Vec<Option<Value>> = result_docs(store, results).await;
+    let mut visitors: Vec<String> = docs.iter().flatten().map(|d| from_of(d)).filter(|s| !s.is_empty()).collect();
+    visitors.sort();
+    visitors.dedup();
+    if visitors.is_empty() {
+        return 0;
+    }
+    let mut filter = format!(
+        "mode = 'analytic' AND `from` IN ({})",
+        visitors.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ")
+    );
+    if !cc.trim().is_empty() {
+        filter.push_str(&format!(" AND `cc` = '{}'", cc.replace('\'', "''")));
+    }
+    let rows = match store.get_all_items("items", 20_000, 0, Some(filter)).await {
+        Ok(r) => r,
+        Err(e) => {
+            emit(&format!("[AI-SEARCH] ⚠️ [ANALYTIC NEGATION] 방문자 기록을 읽지 못해 부정 조건을 적용하지 않습니다 ({}).", e));
+            return 0;
+        }
+    };
+    let records: Vec<(String, Value)> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let d = serde_json::from_str::<Value>(&r.json_data).ok()?;
+            let from = from_of(&d);
+            Some((if from.is_empty() { r.from.trim().to_string() } else { from }, d))
+        })
+        .collect();
+    let visits = crate::analytic::evidence_visits(&records, neg);
+    let drop: Vec<bool> = docs
+        .iter()
+        .map(|d| {
+            d.as_ref().map_or(false, |d| {
+                crate::analytic::record_window(d).map_or(false, |w| crate::analytic::in_evidence_visit(&from_of(d), w, &visits))
+            })
+        })
+        .collect();
+    let dropped = drop.iter().filter(|x| **x).count();
+    if dropped == 0 || dropped == results.len() {
+        emit(&format!(
+            "[AI-SEARCH] 🚫 [ANALYTIC NEGATION] 부정 조건 의도 {:?} · 행동 {:?} · 페이지 {:?}: 방문자 {}명의 기록 {}건에서 그 일이 일어난 방문 {}개 — 결과 {}건 중 {}건이 그 방문의 것이라 {}.",
+            neg.intents,
+            neg.actions,
+            neg.pages,
+            visitors.len(),
+            records.len(),
+            visits.len(),
+            results.len(),
+            dropped,
+            if dropped == 0 { "뺄 것이 없습니다" } else { "다 빠지면 판정이 틀렸을 수 있어 그대로 둡니다" }
+        ));
+        return 0;
+    }
+    let mut k = 0usize;
+    results.retain(|_| {
+        let keep = !drop[k];
+        k += 1;
+        keep
+    });
+    emit(&format!(
+        "[AI-SEARCH] 🚫 [ANALYTIC NEGATION] 부정 조건 의도 {:?} · 행동 {:?} · 페이지 {:?}: 방문자 {}명의 기록 {}건을 {}분 간격으로 방문으로 묶어, 그 일이 일어난 방문 {}개의 기록 · 리포트 {}건을 결과에서 뺐습니다 (남은 {}건).",
+        neg.intents,
+        neg.actions,
+        neg.pages,
+        visitors.len(),
+        records.len(),
+        crate::analytic::VISIT_IDLE_MS / 60_000,
+        visits.len(),
+        dropped,
+        results.len()
+    ));
+    dropped
+}
+
 /// 질의의 절대 기간 (오늘 기준; 'in September' · '9월' · 'from X to Y')
 fn query_period(query: &str) -> Option<(chrono::NaiveDate, chrono::NaiveDate)> {
     let words: Vec<String> = crate::stanza::strip_quoted(query).split_whitespace().map(String::from).collect();
