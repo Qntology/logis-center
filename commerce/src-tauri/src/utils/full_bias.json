@@ -65,13 +65,13 @@
       "prejudice": "click, pressed, hover, mouse over, lingered, summary, report",
       "exact_match": [
         "change", "changed", "input", 
-        "입력", "입력한", "변경", "수정", 
+        "입력", "입력한", "변경", "수정", "바꾸", "바꾼", "바뀌", "바뀐", 
         "入力", "変更", 
         "输入", "修改", "更改", 
         "änderung", "geändert", "eingabe", 
         "cambio", "cambiado", "ingreso", 
         "changement", "changé", "saisie", 
-        "mudança", "alterado", "inserido", 
+        "mudança", "alterado", "inserido", "alteração", "alterações", "alterar", 
         "تغيير", "تعديل", "إدخال", 
         "změna", "změněno", "zadání", 
         "modifica", "cambiato", "inserimento", 
@@ -498,6 +498,78 @@
         "úvodní stránka",
         "الصفحة الرئيسية"
       ]
+    }
+  },
+  "analytic_negation": {
+    "semantic": "Negation in action-log queries. markers lists each language's negators by where the negated word sits: before = the negated word follows, after = it precedes, both = whichever side is nearer (these three match the written word), before_stems / after_stems = the same by lemma for negators that inflect, starts / ends = contractions attached to a word, prefix = a negative prefix fused to the negated word, prefix_except = prefixes that only look like one, light_stems = support verbs that are not counted as a skipped word, verbal_tails = endings that turn a noun lemma into a predicate, clause_closers = words that end a modifying clause, relative_stems = relative words that are not tagged as pronouns. intents lists the completion intents that can be negated and the pages that prove completion (evidence_pages). When a negator lands on an intent, action or page word, that condition leaves the positive filters and becomes a complement: records of visits that contain the completion evidence are removed.",
+    "markers": {
+      "en": {
+        "before": ["no", "without"],
+        "both": ["not", "never"],
+        "ends": ["n't", "n’t"]
+      },
+      "de": {
+        "before": ["ohne", "kein", "keine", "keinen", "keiner", "keinem", "keines", "nichts"],
+        "before_stems": ["kein"],
+        "both": ["nicht", "nie", "niemals"]
+      },
+      "nl": {
+        "before": ["zonder", "geen", "niets"],
+        "before_stems": ["geen"],
+        "both": ["niet", "nooit"]
+      },
+      "fr": {
+        "before": ["ne", "sans", "aucun", "aucune"],
+        "before_stems": ["aucun"],
+        "both": ["pas", "jamais"],
+        "starts": ["n'", "n’"]
+      },
+      "es": {
+        "before": ["no", "sin", "nunca", "jamás", "ningún", "ninguna", "ninguno"],
+        "before_stems": ["ninguno", "ningún"]
+      },
+      "it": {
+        "before": ["non", "senza", "mai", "nessun", "nessuna", "nessuno"],
+        "before_stems": ["nessuno"]
+      },
+      "pt": {
+        "before": ["não", "sem", "nunca", "jamais", "nenhum", "nenhuma"],
+        "before_stems": ["nenhum"]
+      },
+      "cs": {
+        "before": ["bez", "nikdy", "aniž", "žádný", "žádná", "žádné", "žádnou"],
+        "before_stems": ["žádný"],
+        "prefix": ["ne"],
+        "prefix_except": ["nej"],
+        "relative_stems": ["který", "jenž"]
+      },
+      "ar": {
+        "before": ["لم", "لا", "لن", "دون", "بدون", "بلا", "غير", "عدم", "ليس", "ليست", "ولم", "ولا", "ولن", "فلم", "وبدون", "ودون"]
+      },
+      "ko": {
+        "after_stems": ["않", "못하", "없"],
+        "both": ["안", "못"],
+        "verbal_tails": ["하", "한", "할", "함", "합", "해", "했", "되", "된", "될", "됨", "됩", "돼", "됐"]
+      },
+      "ja": {
+        "before": ["未"],
+        "after": ["なし", "無し"],
+        "after_stems": ["ない", "無い", "無し", "ぬ", "ず"],
+        "light_stems": ["居る", "いる"]
+      },
+      "zh-hans": {
+        "before": ["没有", "没", "未", "不", "无", "未曾", "没能", "并未", "尚未", "从未", "不曾", "并没有", "还没", "还没有"],
+        "prefix": ["没有", "没", "未", "不"],
+        "clause_closers": ["的"]
+      }
+    },
+    "intents": {
+      "purchase": {
+        "semantic": "Completing a payment, purchase or order. When negated ('never paid', 'sans commander', '결제하지 않은'), visits that contain an order-complete page record are removed. Pressing the pay button alone is not evidence: a failed payment is still unpaid.",
+        "evidence_pages": ["order_complete"],
+        "words": ["결제", "구매", "주문", "구입", "지불", "pay", "paid", "pays", "paying", "payment", "payments", "purchase", "purchased", "purchases", "purchasing", "buy", "buys", "bought", "buying", "order", "ordered", "orders", "ordering", "支払う", "支払い", "支払", "お支払い", "購入", "注文", "決済", "買う", "払う", "付款", "支付", "购买", "下单", "结账", "买单", "付钱", "付费", "订购", "买", "bezahlen", "bezahlt", "zahlen", "gezahlt", "kaufen", "gekauft", "bestellen", "bestellt", "bezahlung", "zahlung", "kauf", "einkauf", "bestellung", "payer", "payé", "acheter", "acheté", "commander", "commandé", "paiement", "achat", "commande", "pagar", "comprar", "pedir", "pago", "compra", "pedido", "pagare", "pagato", "acquistare", "acquistato", "comprare", "ordinare", "ordinato", "pagamento", "acquisto", "ordine", "encomendar", "encomenda", "betalen", "betaald", "kopen", "gekocht", "besteld", "betaling", "aankoop", "bestelling", "zaplatit", "platit", "koupit", "nakoupit", "objednat", "platba", "nákup", "objednávka", "zaplacení", "zaplacený", "دفع", "شراء", "اشترى", "طلب"],
+        "negated": ["미결제", "미구매", "미주문", "미구입", "unpaid", "unpurchased", "non-paying", "nonpaying", "未払い", "未払", "未購入", "未注文", "未決済", "未付款", "未支付", "未购买", "未下单", "未结账", "unbezahlt", "onbetaald", "impayé", "impago"]
+      }
     }
   },
   "trade_schema": {

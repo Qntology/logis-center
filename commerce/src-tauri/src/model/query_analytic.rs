@@ -172,6 +172,24 @@ impl crate::model::LogisModel {
         const DROP_TAGS: &[&str] = crate::utils::ai_utils::STANZA_DROP_TAGS;
         let all_words: Vec<String> = tokens.iter().map(|(w, _, _)| w.clone()).collect();
         let quoted = crate::stanza::quoted_token_flags(&query, &all_words);
+
+        // 🌟 [EVENT LEMMA MATCH] STEP 1 은 낱말의 겉모습(완전일치 · 접두 · 붙여 쓴 문자)만 보았습니다.
+        //    Stanza 가 준 원형이 확정어이면 여기서 유형을 확정합니다 (굴절해 첫머리가 달라진 낱말 · 합성어의 꼬리).
+        //    따옴표 안 낱말(고유값)과 기능어는 보지 않습니다.
+        for (i, (w, t, l)) in tokens.iter().enumerate() {
+            if quoted.get(i).copied().unwrap_or(false) || DROP_TAGS.iter().any(|d| d == t) {
+                continue;
+            }
+            if let Some((k, hit, why)) = crate::analytic::event_type_lemma_key(l, t, stanza_code) {
+                if !det_event_keys.iter().any(|e| e == &k) {
+                    emit_term(&format!(
+                        "   ⚡ [EVENT LEMMA MATCH] '{}' (원형 '{}') → analytic_event_filters.{} ({} 확정어 '{}')",
+                        w, l, k, why, hit
+                    ));
+                    det_event_keys.push(k);
+                }
+            }
+        }
         // 동사 · 조동사로 쓰인 낱말(프랑스어 'a été payée' 의 été = être 의 과거분사, 영어 'prices fall' 의 fall)은
         // 계절 · 시간 낱말이 아닙니다 (Stanza 품사 AUX · VERB). 확정 일치와 기간 글자 근거에서 뺍니다.
         let verbal_words: std::collections::HashSet<String> = tokens
@@ -1092,6 +1110,27 @@ impl crate::model::LogisModel {
                 }
             }
         }
+        // 🌟 [ANALYTIC NEGATION] 부정어가 걸린 완료 의도 · 행동 · 페이지는 찾을 조건이 아니라 없어야 하는 일입니다 (analytic.rs 설명).
+        //    검색은 긍정 조건으로 회수한 뒤 그 일이 일어난 방문의 기록을 뺍니다. 부정어와 걸린 낱말은 검색어에서 뺍니다
+        //    ('결제하지 않은' 을 검색어로 두면 결제 버튼 기록 쪽으로 끌립니다).
+        let negated = crate::analytic::negated_conditions(&query, stanza_code, &tokens, &quoted);
+        if !negated.is_empty() {
+            let negated_words: std::collections::HashSet<&str> =
+                negated.evidence.iter().flat_map(|(m, w, _)| [m.as_str(), w.as_str()]).collect();
+            let kept: Vec<String> = keywords.iter().filter(|k| !negated_words.contains(k.as_str())).cloned().collect();
+            emit_term(&format!(
+                "   🚫 [ANALYTIC NEGATION] 부정 조건 의도 {:?} · 행동 {:?} · 페이지 {:?} (근거 {:?}) → 긍정 조건에서 빼고, 그 일이 일어난 방문의 기록을 결과에서 뺍니다. 검색어 {:?} → {:?}",
+                negated.intents,
+                negated.actions,
+                negated.pages,
+                negated.evidence,
+                keywords,
+                if kept.is_empty() { &keywords } else { &kept }
+            ));
+            if !kept.is_empty() {
+                keywords = kept;
+            }
+        }
         let mut stem_added: Vec<String> = Vec::new();
         for k in keywords.clone().iter() {
             for (stem, _) in crate::utils::ai_utils::closed_tail_stems(k) {
@@ -1231,7 +1270,9 @@ impl crate::model::LogisModel {
         }
 
         // 🌟 [ANALYTIC PAGE] 질의가 가리키는 페이지 종류 (bias.json analytic_page_filters 문구 일치).
-        let page_hits = crate::analytic::page_kinds_in_query(&query);
+        //    부정어가 걸린 페이지('결제 페이지에 가지 않은')는 거를 조건이 아니라 없어야 하는 페이지입니다.
+        let page_hits: Vec<(String, String)> =
+            crate::analytic::page_kinds_in_query(&query).into_iter().filter(|(k, _)| !negated.pages.contains(k)).collect();
         let page_kinds: Vec<String> = page_hits.iter().map(|(k, _)| k.clone()).collect();
         if !page_hits.is_empty() {
             emit_term(&format!(
@@ -1250,7 +1291,7 @@ impl crate::model::LogisModel {
             "unassigned": keywords
         })];
 
-        let out = json!({
+        let mut out = json!({
             "original_text": query,
             "time_intent": time_intent,
             "season_intent": season_intent,
@@ -1266,6 +1307,12 @@ impl crate::model::LogisModel {
             "target": target,
             "context": contexts
         });
+        // 부정 조건(부정된 의도 · 제외 행동 · 제외 페이지)은 검색이 방문 단위 여집합으로 씁니다 (lib.rs [ANALYTIC NEGATION]).
+        if !negated.is_empty() {
+            if let (Some(o), Value::Object(n)) = (out.as_object_mut(), negated.to_json()) {
+                o.extend(n);
+            }
+        }
 
         emit_term(&format!(
             "[ANALYTIC-QUERY] ✅ 파싱 결과: {}",

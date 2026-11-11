@@ -1759,6 +1759,34 @@ pub fn confusion_winner(a: &str, b: &str) -> Option<(String, f32)> {
     )
 }
 
+/// 🌟 [SDS TIE] 배정 동률(TieKind::PairConfusion)을 혼동 사전의 역사 승자로 깰 때의 승률 하한.
+///  세 배정 호출부(trading.rs 두 곳 · scheduler.rs)는 각자 같은 클로저로 '승률 > 0.5' 이면 받았습니다. 과반이면 받으므로
+///  두 필드가 번갈아 이기는 쌍(진짜 혼동)도 한쪽으로 굳었습니다. ai_utils [T-2] 의 부분 게이팅 원칙대로 강화만 합니다.
+pub const TIE_WIN_RATE: f32 = 0.65;
+/// 역사 승자의 학습형 특이도(값이 서식 · 편견 · 열거 · 자기 식별자로 거절된 비율)가 경쟁자보다 이만큼 넘게 높으면 받지 않습니다.
+pub const TIE_SPECIFICITY_SLACK: f32 = 0.15;
+
+/// 순수 판정: 역사(이 필드가 승자인가, 승률)와 두 필드의 학습형 특이도로 동률을 이 필드 쪽으로 깰지.
+/// 승자가 이 필드이고 승률이 [`TIE_WIN_RATE`] 이상이며, 두 특이도를 다 알면 이 필드가 [`TIE_SPECIFICITY_SLACK`] 넘게 더 자주
+/// 거절되는 필드가 아닐 때만 참입니다. 특이도를 모르면(관측 부족) 승률만 봅니다.
+pub fn tie_verdict(history: Option<(bool, f32)>, spec_self: Option<f32>, spec_rival: Option<f32>) -> bool {
+    let Some((self_wins, rate)) = history else { return false };
+    if !self_wins || !(rate >= TIE_WIN_RATE) {
+        return false;
+    }
+    match (spec_self, spec_rival) {
+        (Some(a), Some(b)) => a <= b + TIE_SPECIFICITY_SLACK,
+        _ => true,
+    }
+}
+
+/// 배정 동률에서 `field` 가 `rival` 을 이기게 둘지: 혼동 사전의 역사 승자(confusion_winner) + 학습형 특이도 대조 ([`tie_verdict`]).
+/// 세 배정 호출부의 allow_tie 가 같이 씁니다 (Flat 동률은 호출부가 먼저 거릅니다).
+pub fn tie_break_allows(field: &str, rival: &str) -> bool {
+    let history = confusion_winner(field, rival).map(|(winner, rate)| (winner == field, rate));
+    tie_verdict(history, learned_specificity(field), learned_specificity(rival))
+}
+
 pub fn effective_draws(category: &str) -> Option<f32> {
     resolve_entry(
         |st| st.category.get(category),

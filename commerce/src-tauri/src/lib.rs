@@ -3029,8 +3029,14 @@ async fn ai_search_complex(
         // 🌟 [ANALYTIC ACTION] 장바구니 담기 · 바로 구매 · 찜 · 쿠폰 받기 같은 버튼 행동(bias.json analytic_action_filters)을 물으면
         //    유형을 그 행동이 기록되는 유형(데스크톱 click · 모바일 touch)으로 바꾸고, 회수한 기록을 누른 버튼 글자로 거릅니다.
         //    v2 질의: '장바구니에 담은 기록' 이 change · hover 로 판정되어 정답 click · touch 기록이 유형 조건에서 빠졌습니다.
+        // 🌟 [ANALYTIC NEGATION] 부정어가 걸린 행동('쿠폰을 받지 않은')은 거를 조건이 아니라 없어야 하는 행동입니다 (페이지는 해석기가 이미 뺌).
+        let analytic_negation = if search_mode == "analytic" {
+            crate::analytic::NegatedConditions::from_query_json(&structured_query)
+        } else {
+            crate::analytic::NegatedConditions::default()
+        };
         let analytic_actions: Vec<String> = if search_mode == "analytic" {
-            crate::analytic::action_kinds_in_query(&query)
+            crate::analytic::action_kinds_in_query(&query).into_iter().filter(|k| !analytic_negation.actions.contains(k)).collect()
         } else {
             Vec::new()
         };
@@ -3545,6 +3551,14 @@ async fn ai_search_complex(
                         println!("[AI-SEARCH] 🧩 [STAGE-4] item_chunks 코사인 매칭: {}개 item 후보 발견 (ctx_type='{}')", chunk_results.len(), ctx_type);
                     }
 
+                    // 🌟 [ANALYTIC FILTER · CHUNK] 청크로만 올라온 기록도 문서 트랙(STAGE-3)과 같은 페이지 · 행동 조건을 지나야 합니다.
+                    //    문서 트랙이 '누른 버튼이 그 행동이 아니다' 로 거른 기록이 청크 매칭으로 되돌아와 정답 자리를 차지했습니다
+                    //    (실측 A1 '장바구니에 담은 기록': 행동이 맞는 기록은 다 회수했는데 10위 안의 절반이 걸러졌던 기록의 청크 — R@10 0.5).
+                    //    청크 행에는 문서 본문이 없어(text = 청크 글) 문서를 id 로 읽어 같은 판정을 합니다. 문서를 못 읽으면 거르지 않습니다.
+                    let chunk_gate_on = search_mode == "analytic" && (!analytic_pages.is_empty() || action_hits > 0);
+                    let mut chunk_gate_seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+                    let mut chunk_gate_dropped = 0usize;
+
                     for (chunk_id, item_id, chunk_text, property, group_score, best_cos) in chunk_results {
                         // 🌟 [SCALE FIX] 트랙 가중치는 반드시 '코사인(0~1)' 에만 곱합니다.
                         //    기존에는 search_chunks 가 돌려준 '그룹 합산 점수' 를 코사인이라 가정하고 곱해
@@ -3686,6 +3700,28 @@ async fn ai_search_complex(
                                 existing_item.as_object_mut().unwrap().insert("alias_match".to_string(), json!(is_alias));
                             }
                         } else {
+                            if chunk_gate_on {
+                                let pass = match chunk_gate_seen.get(&item_id) {
+                                    Some(p) => *p,
+                                    None => {
+                                        let data = store
+                                            .get_item_by_id(target_table, &item_id)
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|d| serde_json::from_str::<Value>(&d.json_data).ok());
+                                        let p = data.as_ref().map_or(true, |d| {
+                                            crate::analytic::record_passes_filters(d, &analytic_pages, &analytic_actions, action_hits > 0)
+                                        });
+                                        chunk_gate_seen.insert(item_id.clone(), p);
+                                        p
+                                    }
+                                };
+                                if !pass {
+                                    chunk_gate_dropped += 1;
+                                    continue;
+                                }
+                            }
                             // 신규 결과 삽입
                             // chunk_id 가 아닌 item_id 를 기준으로 삽입하여
                             // 동일 item 의 여러 청크가 중복 결과로 나타나지 않도록 합니다.
@@ -3706,6 +3742,12 @@ async fn ai_search_complex(
                                 }));
                             }
                         }
+                    }
+                    if chunk_gate_dropped > 0 {
+                        emit_term(&format!(
+                            "[AI-SEARCH] 🧭 [ANALYTIC FILTER · CHUNK] 청크로만 올라온 기록 {}건이 페이지 종류 {:?} · 행동 종류 {:?} 조건에 맞지 않아 뺐습니다.",
+                            chunk_gate_dropped, analytic_pages, analytic_actions
+                        ));
                     }
                 }
                 // =====================================================================
@@ -4028,11 +4070,15 @@ async fn ai_search_complex(
                 // 🌟 [RELATION] 고정점(식별자 · 사람 이름 · 제목 · 상태 · 서식 번호)에서 질의가 묻는 유형으로 건너간 문서를 맨 앞으로
                 //    (search_relation 설명 참조). 기간 조인이 적용된 질의는 건드리지 않습니다.
                 if search_mode == "commerce" {
-                    crate::search_relation::relation_join(store, &mut ranked_results, &mut dexie_plans, &query, &language, &cc, &emit_term).await;
+                    crate::search_relation::relation_join(store, &model, &mut ranked_results, &mut dexie_plans, &query, &language, &cc, &emit_term).await;
                 } else if search_mode == "shipping" {
                     crate::search_relation::trade_relation_join(store, &mut ranked_results, &mut dexie_plans, &query, &language, &emit_term).await;
                 } else if search_mode == "analytic" {
-                    crate::search_relation::analytic_anchor_boost(store, &mut ranked_results, &query, &cc, &emit_term).await;
+                    crate::search_relation::analytic_anchor_boost(store, &model, &mut ranked_results, &query, &cc, &emit_term).await;
+                    // 🌟 [ANALYTIC NEGATION] '결제하지 않은' 처럼 부정된 일이 일어난 방문의 기록을 뺍니다 (방문 단위 여집합).
+                    if !analytic_negation.is_empty() {
+                        crate::search_relation::analytic_visit_complement(store, &mut ranked_results, &analytic_negation, &cc, &emit_term).await;
+                    }
                 }
             }
 

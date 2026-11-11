@@ -531,6 +531,92 @@ fn all_trade_types() -> Vec<String> {
 /// v2 질의 R2('PO X 의 B/L') · R4('L/C X 로 결제한 상업송장')는 번호 앞 글자(PO · LC)가 유형을 그 서식으로 좁혀, 저장소에 없는
 /// 발주서 · 신용장만 찾다가 0건이었고(8 · 5개 언어), R3 일본어는 B/L 로 좁혀 상업송장을 놓쳤습니다.
 /// 머리가 일반 이름(서류 · documents)이면 해석기가 좁힌 유형을 서식 전체로 되돌립니다 (R7 한국어: '선적된' → SR · ED · SA).
+/// 음역 고정점의 자음 골격 일치도 하한. 질의 396건 탐침에서 참 음역(Felixstowe 넷)은 1.00, 무역 질의의 다른 조각 최고는 0.80 입니다.
+pub const PHONETIC_ANCHOR_PASS: f32 = 0.90;
+/// 음역 고정점에 쓰는 자음 골격 최소 길이 (조각 · 값 둘 다). 골격 2 ~ 3개는 우연히 같기 쉽습니다 ('운송' · '배송' ↔ Incheon · 부산 = 1.00).
+pub const PHONETIC_ANCHOR_MIN_SKELETON: usize = 4;
+
+/// 음역을 찾을 문자 종류 (라틴 · 숫자 · 기호는 None)
+fn phonetic_script(c: char) -> Option<u8> {
+    let u = c as u32;
+    match u {
+        0xAC00..=0xD7A3 => Some(1),
+        0x30A0..=0x30FF => Some(2),
+        0x3040..=0x309F => Some(3),
+        0x3400..=0x9FFF | 0xF900..=0xFAFF => Some(4),
+        0x0600..=0x06FF => Some(5),
+        0x0400..=0x04FF => Some(6),
+        _ if c.is_alphabetic() && u >= 0x0250 => Some(7),
+        _ => None,
+    }
+}
+
+/// 음역 고정점에 쓸 질의 조각: 라틴 문자가 아닌 글자 덩어리(문자 종류가 바뀌는 곳에서 끊음)의 2 ~ 10 글자 부분.
+/// 붙여 쓴 질의('6月にフェリクストウから')와 조사가 붙은 어절('펠릭스토우에서')에서도 이름 조각이 나옵니다.
+pub fn phonetic_spans(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for tok in query.split_whitespace() {
+        let chars: Vec<char> = tok.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            let Some(k) = phonetic_script(chars[i]) else {
+                i += 1;
+                continue;
+            };
+            let mut j = i;
+            while j < chars.len() && phonetic_script(chars[j]) == Some(k) {
+                j += 1;
+            }
+            let run = &chars[i..j];
+            for a in 0..run.len() {
+                for b in (a + 2)..=(run.len().min(a + 10)) {
+                    let s: String = run[a..b].iter().collect();
+                    if seen.insert(s.clone()) {
+                        out.push(s);
+                    }
+                }
+            }
+            i = j;
+        }
+    }
+    out
+}
+
+/// 라틴 문자가 글자의 과반인가
+fn latin_dominant(v: &str) -> bool {
+    let (mut latin, mut other) = (0usize, 0usize);
+    for c in v.chars().filter(|c| c.is_alphabetic()) {
+        if (c as u32) < 0x0250 {
+            latin += 1;
+        } else {
+            other += 1;
+        }
+    }
+    latin > other
+}
+
+/// 🌟 [PHONETIC ANCHOR] 라틴 문자 값(항구 · 당사자 · 선박 이름 첫 마디)이 질의 조각에 음역되어 나오는가: (조각, 자음 골격 일치도).
+/// 값 · 조각 모두 골격이 [`PHONETIC_ANCHOR_MIN_SKELETON`] 개 이상이고 일치도(nl_convert::phonetic_similarity)가 [`PHONETIC_ANCHOR_PASS`] 이상인
+/// 조각 중 가장 높은 것.
+pub fn phonetic_value_hit(spans: &[String], value: &str) -> Option<(String, f32)> {
+    if !latin_dominant(value) || crate::nl_convert::phonetic_skeleton_len(value) < PHONETIC_ANCHOR_MIN_SKELETON {
+        return None;
+    }
+    let mut best: Option<(String, f32)> = None;
+    for s in spans.iter() {
+        if crate::nl_convert::phonetic_skeleton_len(s) < PHONETIC_ANCHOR_MIN_SKELETON {
+            continue;
+        }
+        if let Some(sim) = crate::nl_convert::phonetic_similarity(s, value) {
+            if sim >= PHONETIC_ANCHOR_PASS && best.as_ref().map_or(true, |(_, b)| sim > *b) {
+                best = Some((s.clone(), sim));
+            }
+        }
+    }
+    best
+}
+
 pub async fn trade_relation_join(
     store: &VectorStore,
     results: &mut Vec<Value>,
@@ -623,12 +709,22 @@ pub async fn trade_relation_join(
     }
     // 값 고정점: 항구 · 당사자 · 선박 이름이 질의에 그대로 나오는 서식 (쉼표 앞 첫 마디: 'Felixstowe, United Kingdom' → felixstowe)
     // v2 질의 R7('6월에 펠릭스토우에서 선적된 서류') · R5('株式会社ひなた工房 에서 보낸 B/L')는 번호가 없어 고정점이 없었습니다.
+    // 🌟 [PHONETIC ANCHOR] 라틴 문자 값이 질의 언어로 음역되어 나오면(フェリクストウ · 费利克斯托 · فيليكستو ↔ Felixstowe) 자음 골격으로 잇습니다
+    //    ([`phonetic_value_hit`]). v2 질의 R7 일본어 · 중국어 · 아랍어는 이 고정점이 없어 MRR 0.33 · 0.20 · 0.13 이었습니다.
     let query_norm = norm_text(query);
+    let pspans = phonetic_spans(query);
+    let mut phonetic: HashMap<String, Option<(String, f32)>> = HashMap::new();
     for (i, (_, d)) in docs.iter().enumerate() {
         let hit = ["pol", "pod", "sender_name", "recipient_name", "vessel"].iter().any(|k| {
             let v = text_of(d.get(*k));
             let head = norm_text(v.split(',').next().unwrap_or(""));
-            name_like(&head) && contains_value(&query_norm, &head)
+            if name_like(&head) && contains_value(&query_norm, &head) {
+                return true;
+            }
+            if pspans.is_empty() || head.is_empty() {
+                return false;
+            }
+            phonetic.entry(head.clone()).or_insert_with(|| phonetic_value_hit(&pspans, &head)).is_some()
         });
         if hit {
             anchors += 1;
@@ -636,6 +732,16 @@ pub async fn trade_relation_join(
                 tiered.push((2, i));
             }
         }
+    }
+    let heard: Vec<String> = phonetic
+        .iter()
+        .filter_map(|(head, h)| h.as_ref().map(|(span, s)| format!("'{}' ← '{}' ({:.2})", head, span, s)))
+        .collect();
+    if !heard.is_empty() {
+        emit(&format!(
+            "[AI-SEARCH] 🧭 [PHONETIC ANCHOR] 질의에 음역되어 나온 서류 값 {:?} (자음 골격 일치 ≥ {:.2}, 골격 {}개 이상)을 고정점으로 씁니다.",
+            heard, PHONETIC_ANCHOR_PASS, PHONETIC_ANCHOR_MIN_SKELETON
+        ));
     }
     let targets: Vec<usize> = order_targets(tiered, &docs, results, query_period(query));
     rep.anchors = anchors;
@@ -725,52 +831,293 @@ pub async fn trade_relation_join(
     rep
 }
 
-/// 🌟 [ANALYTIC ANCHOR] 행동 로그 질의에 커머스 문서의 제목(행사 · 쿠폰 · 상품 이름)이 그대로 나오면, 그 문서의 자기 번호
-/// (ev_id · cp_id · it_id …)를 링크 매개변수로 가진 행동 기록(eventNo=EV718 · goodsNo=…)을 결과 맨 앞으로 올립니다.
-/// v2 질의 A5('Summer getaway picks' 이벤트 페이지에서 쿠폰 받은 기록)는 같은 사이트의 다른 행사 쿠폰 기록이 앞에 섞였습니다.
-/// 행동 기록과 커머스 문서는 같은 사이트 범위(cc)를 씁니다. 범위가 없으면 커머스 문서 전체에서 찾습니다.
-pub async fn analytic_anchor_boost(
-    store: &VectorStore,
-    results: &mut Vec<Value>,
-    query: &str,
-    cc: &str,
-    emit: &(dyn Fn(&str) + Send + Sync),
-) -> usize {
-    if results.is_empty() {
-        return 0;
-    }
-    let mut filter = "mode = 'commerce'".to_string();
-    if !cc.trim().is_empty() {
-        filter.push_str(&format!(" AND `cc` = '{}'", cc.replace('\'', "''")));
-    }
-    let rows = match store.get_all_items("items", 4000, 0, Some(filter)).await {
-        Ok(r) => r,
-        Err(_) => return 0,
+// =====================================================================
+// 🌟 [CROSS-LINGUAL ANCHOR] 질의 언어로 번역된 제목 고정점
+// ---------------------------------------------------------------------
+//  값 고정점은 저장 값이 질의에 글자 그대로 나와야 했습니다. 상품 이름이 질의 언어로 번역되면('자외선 차단 양산' ·
+//  'UVカット日傘' ↔ 'UV-Schutz-Sonnenschirm') 닿지 않았습니다 (v2 질의 A3 MRR 0.20 · C4 0.41).
+//  글자 고정점이 아무것도 잇지 못했을 때만, 질의 조각(낱말 n-그램 · 붙여 쓰는 문자의 글자 n-그램)과 제목을 다국어 임베딩으로
+//  비교합니다 (보정 코사인, models::embedding::calibrate_cos).
+//   · 조각이 구조 낱말(유형 · 상태 · 행동 · 페이지 · 기간 · 동사 — bias 사전, [`structure_bank`])보다 제목에 더 가까울 때만 씁니다.
+//     '장바구니 담기 기록' 같은 조각이 행동 버튼 글자가 비슷한 상품 제목으로 가지 않게.
+//   · 범위(사이트)마다 1위 제목이 2위를 [`CROSS_ANCHOR_MARGIN`] 앞서고, 그 조각이 구조 낱말보다 [`CROSS_ANCHOR_BANK_GAP`] 앞서야 합니다.
+//   · 범위가 여럿이면(사이트를 말하지 않은 행동 로그 질의) 전체 1위에서 [`CROSS_ANCHOR_BAND`] 안의 범위 1위만 받습니다. 사이트마다
+//     따로 받으면 그 상품이 없는 쇼핑몰의 비슷한 상품('Mineral sunscreen')을 12개 언어 중 6개에서 받았습니다.
+//  탐침(같은 임베딩 · 같은 규칙, 이번 브랜치 SyntheticData 세계): 평가 A3 12/12 맞음 · 0 틀림, 합성 A3 288건 맞음 155 · 틀림 13,
+//  다른 행동 로그 질의 60건 틀림 0, 한 사이트 범위 C4 평가 22건 중 4건 맞음 · 0 틀림. 무역 품목(R6)은 규칙을 넘는 사례가 없어 쓰지 않습니다.
+// =====================================================================
+
+/// 범위 안 1위 제목이 2위를 앞서야 하는 보정 코사인 차
+pub const CROSS_ANCHOR_MARGIN: f32 = 0.05;
+/// 1위 제목을 고른 조각이 구조 낱말 은행보다 앞서야 하는 보정 코사인 차
+pub const CROSS_ANCHOR_BANK_GAP: f32 = 0.05;
+/// 범위가 여럿일 때 받는 범위 1위들의 폭 (전체 1위에서)
+pub const CROSS_ANCHOR_BAND: f32 = 0.03;
+/// 낱말 조각 최대 길이 (낱말 수)
+const CROSS_SPAN_MAX_WORDS: usize = 5;
+/// 붙여 쓰는 문자 조각 최대 길이 (글자 수)
+const CROSS_SPAN_MAX_CHARS: usize = 10;
+
+/// 낱말 경계를 공백으로 알 수 없는 문자 (가나 · 한자 · 타이 문자). 한글은 띄어 쓰므로 낱말 조각으로 봅니다.
+fn cross_glued(c: char) -> bool {
+    matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x9FFF | 0xF900..=0xFAFF | 0x0E00..=0x0E7F)
+}
+
+/// 값을 찾을 질의 조각: 앞뒤 기호를 뗀 낱말의 1 ~ 5-그램, 붙여 쓰는 문자 낱말(3글자 이상)은 2글자 ~ (길이 − 1, 최대 10) 글자 조각.
+pub fn query_value_spans(query: &str) -> Vec<String> {
+    let toks: Vec<String> = query
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut add = |s: String| {
+        if !s.is_empty() && seen.insert(s.clone()) {
+            out.push(s);
+        }
     };
-    let query_norm = norm_text(query);
-    // 번호는 사이트 안에서만 유일합니다 (네 쇼핑몰이 모두 EV718 을 씀): (사이트 cc, 번호) 쌍으로 맞춥니다.
-    // v2 질의 A5 일본어는 copper 의 'Summer getaway picks'(EV718) 로 kranich · sorae 의 EV718 기록까지 올라와 1위를 내줬습니다.
-    let mut ids: HashSet<(String, String)> = HashSet::new();
-    let mut titles: Vec<String> = Vec::new();
-    for r in rows.into_iter() {
-        let Ok(d) = serde_json::from_str::<Value>(&r.json_data) else { continue };
-        if !matches!(relay_type_family(&text_of(d.get("type"))).as_str(), "event" | "goods") || is_relay_placeholder(&d) {
+    for n in 1..=CROSS_SPAN_MAX_WORDS.min(toks.len()) {
+        for i in 0..=toks.len() - n {
+            add(toks[i..i + n].join(" "));
+        }
+    }
+    for t in toks.iter() {
+        let chars: Vec<char> = t.chars().collect();
+        if chars.len() >= 3 && chars.iter().any(|c| cross_glued(*c)) {
+            for n in 2..=(chars.len() - 1).min(CROSS_SPAN_MAX_CHARS) {
+                for i in 0..=chars.len() - n {
+                    add(chars[i..i + n].iter().collect());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 구조 낱말 은행: 값이 아닌 낱말들 — 유형 · 서식 · 기간 낱말(search_bridge), 행동 · 페이지 · 상태 · 기간 · 계절 · 실질 · 찾기 확정어,
+/// 행동 어간, 동사 · 표현 구 (bias 사전, 12개 언어). 조각이 이것보다 제목에 가까워야 제목 조각으로 봅니다.
+pub fn structure_bank() -> &'static [String] {
+    static BANK: once_cell::sync::Lazy<Vec<String>> = once_cell::sync::Lazy::new(|| {
+        let b = &*crate::parsing::BIAS_DICT;
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut add = |p: &str| {
+            let p = p.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !p.is_empty() && seen.insert(p.clone()) {
+                out.push(p);
+            }
+        };
+        let strs = |v: Option<&Value>| -> Vec<String> {
+            v.and_then(|x| x.as_array()).into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect()
+        };
+        let sb = b.get("search_bridge");
+        if let Some(o) = sb.and_then(|s| s.get("domain_words")).and_then(|v| v.as_object()) {
+            for (ty, ws) in o {
+                add(ty);
+                strs(Some(ws)).iter().for_each(|w| add(w));
+            }
+        }
+        for key in ["document_words", "period_words"] {
+            strs(sb.and_then(|s| s.get(key))).iter().for_each(|w| add(w));
+        }
+        if let Some(o) = sb.and_then(|s| s.get("trade_title_plurals")).and_then(|v| v.as_object()) {
+            for ws in o.values() {
+                match ws {
+                    Value::Array(_) => strs(Some(ws)).iter().for_each(|w| add(w)),
+                    Value::Object(m) => {
+                        for v in m.values() {
+                            match v {
+                                Value::Array(_) => strs(Some(v)).iter().for_each(|w| add(w)),
+                                Value::String(s) => add(s),
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        strs(sb.and_then(|s| s.get("sales_to_order")).and_then(|s| s.get("trigger_words"))).iter().for_each(|w| add(w));
+        for cat in [
+            "analytic_event_filters",
+            "analytic_page_filters",
+            "status_filters",
+            "time_filters",
+            "season_filters",
+            "substantial_filters",
+            "find_filters",
+        ] {
+            for ent in b.get(cat).and_then(|v| v.as_object()).into_iter().flat_map(|o| o.values()) {
+                strs(ent.get("exact_match")).iter().for_each(|w| add(w));
+            }
+        }
+        for ent in b.get("analytic_action_filters").and_then(|v| v.as_object()).into_iter().flat_map(|o| o.values()) {
+            strs(ent.get("stems")).iter().for_each(|w| add(w));
+        }
+        for cat in ["verb", "expression"] {
+            for ent in b.get(cat).and_then(|v| v.as_object()).into_iter().flat_map(|o| o.values()) {
+                for s in ent.as_object().into_iter().flat_map(|o| o.values()).filter_map(|v| v.as_str()) {
+                    s.split(',').for_each(|p| add(p));
+                }
+            }
+        }
+        out
+    });
+    &BANK
+}
+
+/// 받아들인 번역 제목 고정점: (범위, 후보 위치, 보정 코사인, 은행 여유, 범위 안 2위와의 차, 조각 위치)
+#[derive(Debug, Clone, PartialEq)]
+pub struct CrossAnchor {
+    pub group: String,
+    pub title: usize,
+    pub cos: f32,
+    pub bank_gap: f32,
+    pub margin: f32,
+    pub span: usize,
+}
+
+/// 조각 × 제목 보정 코사인(`sim[조각][제목]`)과 조각의 구조 낱말 최고 보정 코사인(`span_bank`)에서 받아들일 제목 고정점을 고릅니다.
+/// `groups[제목]` 은 제목의 범위(사이트). 위 [CROSS-LINGUAL ANCHOR] 규칙 그대로입니다.
+pub fn cross_anchor_pick(sim: &[Vec<f32>], span_bank: &[f32], groups: &[String]) -> Vec<CrossAnchor> {
+    let mut names: Vec<&str> = groups.iter().map(|g| g.as_str()).collect();
+    names.sort();
+    names.dedup();
+    let mut per: Vec<CrossAnchor> = Vec::new();
+    for g in names {
+        let cols: Vec<usize> = (0..groups.len()).filter(|&t| groups[t] == g).collect();
+        if cols.len() < 2 {
             continue;
         }
-        let title = norm_text(&text_of(d.get("title")));
-        if name_like(&title) && contains_value(&query_norm, &title) {
-            let site = text_of(d.get("cc"));
-            ids.extend(own_ids(&d).into_iter().map(|k| (site.clone(), k)));
-            titles.push(title);
+        let elig: Vec<bool> = sim
+            .iter()
+            .zip(span_bank)
+            .map(|(row, bank)| cols.iter().map(|&t| row[t]).fold(f32::MIN, f32::max) > *bank)
+            .collect();
+        if !elig.iter().any(|e| *e) {
+            continue;
+        }
+        let best: Vec<(f32, usize)> = cols
+            .iter()
+            .map(|&t| (0..sim.len()).filter(|&s| elig[s]).fold((-1.0f32, 0usize), |a, s| if sim[s][t] > a.0 { (sim[s][t], s) } else { a }))
+            .collect();
+        let mut order: Vec<usize> = (0..cols.len()).collect();
+        order.sort_by(|&a, &b| best[b].0.partial_cmp(&best[a].0).unwrap_or(std::cmp::Ordering::Equal));
+        let (cos, span) = best[order[0]];
+        per.push(CrossAnchor {
+            group: g.to_string(),
+            title: cols[order[0]],
+            cos,
+            bank_gap: cos - span_bank[span],
+            margin: cos - best[order[1]].0.max(0.0),
+            span,
+        });
+    }
+    let b1 = per.iter().map(|a| a.cos).fold(f32::MIN, f32::max);
+    per.into_iter()
+        .filter(|a| a.cos >= b1 - CROSS_ANCHOR_BAND && a.bank_gap > CROSS_ANCHOR_BANK_GAP && a.margin > CROSS_ANCHOR_MARGIN)
+        .collect()
+}
+
+/// 단위 벡터로 (0 벡터는 그대로)
+fn unit(v: &[f32]) -> Vec<f32> {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 0.0 { v.iter().map(|x| x / n).collect() } else { v.to_vec() }
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut s = 0.0f32;
+    for i in 0..a.len().min(b.len()) {
+        s += a[i] * b[i];
+    }
+    s
+}
+
+/// 🌟 [CROSS-LINGUAL ANCHOR] 후보 (범위, 제목) 중 질의가 번역해 부른 것들: (같은 범위 · 같은 제목인 후보 위치들, 판정, 근거 조각).
+/// 같은 제목이 여러 문서(목록 행 · 상세 페이지)에 있어도 한 후보로 겨룹니다 (안 그러면 1위와 2위가 같은 제목이라 차가 0).
+/// 임베딩을 못 하면 빈 목록.
+pub async fn cross_lingual_title_anchors(
+    model: &crate::model::LogisModel,
+    query: &str,
+    candidates: &[(String, String)],
+) -> Vec<(Vec<usize>, CrossAnchor, String)> {
+    let spans = query_value_spans(query);
+    let mut unique: Vec<(String, String)> = Vec::new();
+    for (g, t) in candidates.iter() {
+        if !unique.iter().any(|(ug, ut)| ug == g && ut == t) {
+            unique.push((g.clone(), t.clone()));
         }
     }
-    if ids.is_empty() {
-        return 0;
+    if unique.len() < 2 || spans.is_empty() {
+        return Vec::new();
     }
+    let Ok(bank) = model.get_embedding_batch_pinned(structure_bank().to_vec()).await else { return Vec::new() };
+    let Ok(span_vecs) = model.get_embedding_batch(spans.clone()).await else { return Vec::new() };
+    let Ok(title_vecs) = model.get_embedding_batch(unique.iter().map(|(_, t)| t.clone()).collect()).await else { return Vec::new() };
+    let bank: Vec<Vec<f32>> = bank.iter().map(|v| unit(v)).collect();
+    let titles: Vec<Vec<f32>> = title_vecs.iter().map(|v| unit(v)).collect();
+    let cal = crate::models::embedding::calibrate_cos;
+    let mut sim: Vec<Vec<f32>> = Vec::with_capacity(spans.len());
+    let mut span_bank: Vec<f32> = Vec::with_capacity(spans.len());
+    for v in span_vecs.iter() {
+        let s = unit(v);
+        sim.push(titles.iter().map(|t| cal(dot(&s, t))).collect());
+        span_bank.push(cal(bank.iter().map(|b| dot(&s, b)).fold(f32::MIN, f32::max)));
+    }
+    let groups: Vec<String> = unique.iter().map(|(g, _)| g.clone()).collect();
+    cross_anchor_pick(&sim, &span_bank, &groups)
+        .into_iter()
+        .map(|a| {
+            let (g, t) = &unique[a.title];
+            let members: Vec<usize> = (0..candidates.len()).filter(|&i| candidates[i].0 == *g && candidates[i].1 == *t).collect();
+            let s = spans[a.span].clone();
+            (members, a, s)
+        })
+        .collect()
+}
+
+/// 결과마다 기록 본문(data). 청크로만 올라온 결과는 text 가 청크 글이라('This touch is titled …') 저장소에서 id 로 읽습니다.
+/// v2 질의 A4 한국어는 결과 55건 중 33건이 청크 결과였습니다 — 본문 없이는 방문자 · 링크를 볼 수 없습니다.
+async fn result_docs(store: &VectorStore, results: &[Value]) -> Vec<Option<Value>> {
+    let mut out: Vec<Option<Value>> = Vec::with_capacity(results.len());
+    for r in results.iter() {
+        let parsed = r
+            .get("text")
+            .and_then(|t| t.as_str())
+            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+            .filter(|d| d.is_object());
+        let doc = match parsed {
+            Some(d) => Some(d),
+            None => match r.get("id").and_then(|v| v.as_str()) {
+                Some(id) => match store.get_item_by_id("items", id).await {
+                    Ok(Some(d)) => serde_json::from_str::<Value>(&d.json_data).ok().map(|mut v| {
+                        // 본문에 없는 봉투 칸(방문자 · 사이트)은 열에서 채웁니다.
+                        if let Some(o) = v.as_object_mut() {
+                            for (k, col) in [("from", &d.from), ("cc", &d.cc)] {
+                                if o.get(k).map_or(true, |x| text_of(Some(x)).is_empty()) && !col.trim().is_empty() {
+                                    o.insert(k.to_string(), json!(col));
+                                }
+                            }
+                        }
+                        v
+                    }),
+                    _ => None,
+                },
+                None => None,
+            },
+        };
+        out.push(doc);
+    }
+    out
+}
+
+/// 링크 매개변수 값이 (사이트, 번호) 고정점인 행동 기록을 결과 맨 앞으로 올립니다. docs 는 results 와 같은 순서의 기록 본문. 올린 건수.
+fn boost_linked_records(results: &mut Vec<Value>, docs: &[Option<Value>], ids: &HashSet<(String, String)>) -> usize {
     let top = results.iter().filter_map(|r| r.get("score").and_then(|v| v.as_f64())).fold(0.0f64, f64::max).max(1.0);
     let mut boosted = 0usize;
-    for r in results.iter_mut() {
-        let doc = r.get("text").and_then(|t| t.as_str()).and_then(|t| serde_json::from_str::<Value>(t).ok()).unwrap_or(Value::Null);
+    for (r, doc) in results.iter_mut().zip(docs.iter()) {
+        let Some(doc) = doc else { continue };
         let link = text_of(doc.get("link"));
         let site = text_of(doc.get("cc"));
         let hit = link.split_once('?').map_or(false, |(_, q)| {
@@ -794,14 +1141,180 @@ pub async fn analytic_anchor_boost(
             let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
+    }
+    boosted
+}
+
+/// 🌟 [ANALYTIC ANCHOR] 행동 로그 질의에 커머스 문서의 제목(행사 · 쿠폰 · 상품 이름)이 그대로 나오면, 그 문서의 자기 번호
+/// (ev_id · cp_id · it_id …)를 링크 매개변수로 가진 행동 기록(eventNo=EV718 · goodsNo=…)을 결과 맨 앞으로 올립니다.
+/// v2 질의 A5('Summer getaway picks' 이벤트 페이지에서 쿠폰 받은 기록)는 같은 사이트의 다른 행사 쿠폰 기록이 앞에 섞였습니다.
+/// 행동 기록과 커머스 문서는 같은 사이트 범위(cc)를 씁니다. 범위가 없으면 커머스 문서 전체에서 찾습니다.
+/// 글자 그대로 나온 제목이 기록을 하나도 올리지 못하면 질의 언어로 번역된 제목을 찾습니다 ([CROSS-LINGUAL ANCHOR]).
+pub async fn analytic_anchor_boost(
+    store: &VectorStore,
+    model: &crate::model::LogisModel,
+    results: &mut Vec<Value>,
+    query: &str,
+    cc: &str,
+    emit: &(dyn Fn(&str) + Send + Sync),
+) -> usize {
+    if results.is_empty() {
+        return 0;
+    }
+    let mut filter = "mode = 'commerce'".to_string();
+    if !cc.trim().is_empty() {
+        filter.push_str(&format!(" AND `cc` = '{}'", cc.replace('\'', "''")));
+    }
+    let rows = match store.get_all_items("items", 4000, 0, Some(filter)).await {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+    let query_norm = norm_text(query);
+    // 번호는 사이트 안에서만 유일합니다 (네 쇼핑몰이 모두 EV718 을 씀): (사이트 cc, 번호) 쌍으로 맞춥니다.
+    // v2 질의 A5 일본어는 copper 의 'Summer getaway picks'(EV718) 로 kranich · sorae 의 EV718 기록까지 올라와 1위를 내줬습니다.
+    let mut ids: HashSet<(String, String)> = HashSet::new();
+    let mut titles: Vec<String> = Vec::new();
+    // 글자 그대로 나오지 않은 제목: (사이트, 원래 제목, 자기 번호들)
+    let mut others: Vec<(String, String, Vec<String>)> = Vec::new();
+    for r in rows.into_iter() {
+        let Ok(d) = serde_json::from_str::<Value>(&r.json_data) else { continue };
+        if !matches!(relay_type_family(&text_of(d.get("type"))).as_str(), "event" | "goods") || is_relay_placeholder(&d) {
+            continue;
+        }
+        let raw = text_of(d.get("title"));
+        let title = norm_text(&raw);
+        let site = text_of(d.get("cc"));
+        if name_like(&title) && contains_value(&query_norm, &title) {
+            ids.extend(own_ids(&d).into_iter().map(|k| (site.clone(), k)));
+            titles.push(title);
+        } else if !raw.is_empty() {
+            others.push((site, raw, own_ids(&d)));
+        }
+    }
+    let docs = if ids.is_empty() && others.is_empty() { Vec::new() } else { result_docs(store, results).await };
+    let boosted = if ids.is_empty() { 0 } else { boost_linked_records(results, &docs, &ids) };
+    if boosted > 0 {
         emit(&format!(
             "[AI-SEARCH] 🧭 [ANALYTIC ANCHOR] 질의에 나온 커머스 제목 {:?} 의 번호 {:?} 를 같은 사이트 링크에 가진 행동 기록 {}건을 맨 앞으로 올렸습니다.",
             titles,
             ids.iter().take(6).map(|(_, k)| k.as_str()).collect::<Vec<_>>(),
             boosted
         ));
+        return boosted;
     }
+    // 🌟 [CROSS-LINGUAL ANCHOR] 글자 그대로 나온 제목이 없거나 그 상품의 기록이 없으면, 질의 언어로 번역해 부른 제목을 찾습니다.
+    let cands: Vec<(String, String)> = others.iter().map(|(s, t, _)| (s.clone(), t.clone())).collect();
+    let picked = cross_lingual_title_anchors(model, query, &cands).await;
+    if picked.is_empty() {
+        return 0;
+    }
+    let mut ids: HashSet<(String, String)> = HashSet::new();
+    for (members, _, _) in picked.iter() {
+        for &m in members.iter() {
+            let (site, _, own) = &others[m];
+            ids.extend(own.iter().map(|k| (site.clone(), k.clone())));
+        }
+    }
+    let boosted = boost_linked_records(results, &docs, &ids);
+    emit(&format!(
+        "[AI-SEARCH] 🧭 [CROSS-LINGUAL ANCHOR] 질의 조각이 번역해 부른 커머스 제목 {:?} → 그 번호를 같은 사이트 링크에 가진 행동 기록 {}건을 맨 앞으로 올렸습니다.",
+        picked
+            .iter()
+            .map(|(m, a, span)| format!("'{}' ← '{}' (보정 코사인 {:.3} · 2위와 {:+.3} · 구조 낱말과 {:+.3})", others[m[0]].1, span, a.cos, a.margin, a.bank_gap))
+            .collect::<Vec<_>>(),
+        boosted
+    ));
     boosted
+}
+
+/// 🌟 [ANALYTIC NEGATION] 부정 조건의 방문 단위 여집합 (analytic.rs [ANALYTIC NEGATION] 설명).
+/// 결과 기록 · 리포트의 방문자들의 행동 기록을 다시 읽어 방문으로 묶고, 부정된 일(주문 완료 · 제외 행동 · 제외 페이지)이 일어난
+/// 방문의 기록 · 리포트를 결과에서 뺍니다. 페이지 · 행동으로 거른 결과에는 증거 기록(주문 완료 페이지)이 없으므로 다시 읽어야 합니다.
+/// 다 빠지면 부정 판정이 틀렸을 수 있어 그대로 둡니다. 뺀 건수를 돌려줍니다.
+pub async fn analytic_visit_complement(
+    store: &VectorStore,
+    results: &mut Vec<Value>,
+    neg: &crate::analytic::NegatedConditions,
+    cc: &str,
+    emit: &(dyn Fn(&str) + Send + Sync),
+) -> usize {
+    if results.is_empty() || neg.is_empty() {
+        return 0;
+    }
+    let from_of = |d: &Value| text_of(d.get("from")).trim().to_string();
+    let docs: Vec<Option<Value>> = result_docs(store, results).await;
+    let mut visitors: Vec<String> = docs.iter().flatten().map(|d| from_of(d)).filter(|s| !s.is_empty()).collect();
+    visitors.sort();
+    visitors.dedup();
+    if visitors.is_empty() {
+        return 0;
+    }
+    let mut filter = format!(
+        "mode = 'analytic' AND `from` IN ({})",
+        visitors.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ")
+    );
+    if !cc.trim().is_empty() {
+        filter.push_str(&format!(" AND `cc` = '{}'", cc.replace('\'', "''")));
+    }
+    let rows = match store.get_all_items("items", 20_000, 0, Some(filter)).await {
+        Ok(r) => r,
+        Err(e) => {
+            emit(&format!("[AI-SEARCH] ⚠️ [ANALYTIC NEGATION] 방문자 기록을 읽지 못해 부정 조건을 적용하지 않습니다 ({}).", e));
+            return 0;
+        }
+    };
+    let records: Vec<(String, Value)> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let d = serde_json::from_str::<Value>(&r.json_data).ok()?;
+            let from = from_of(&d);
+            Some((if from.is_empty() { r.from.trim().to_string() } else { from }, d))
+        })
+        .collect();
+    let visits = crate::analytic::evidence_visits(&records, neg);
+    let drop: Vec<bool> = docs
+        .iter()
+        .map(|d| {
+            d.as_ref().map_or(false, |d| {
+                crate::analytic::record_window(d).map_or(false, |w| crate::analytic::in_evidence_visit(&from_of(d), w, &visits))
+            })
+        })
+        .collect();
+    let dropped = drop.iter().filter(|x| **x).count();
+    if dropped == 0 || dropped == results.len() {
+        emit(&format!(
+            "[AI-SEARCH] 🚫 [ANALYTIC NEGATION] 부정 조건 의도 {:?} · 행동 {:?} · 페이지 {:?}: 방문자 {}명의 기록 {}건에서 그 일이 일어난 방문 {}개 — 결과 {}건 중 {}건이 그 방문의 것이라 {}.",
+            neg.intents,
+            neg.actions,
+            neg.pages,
+            visitors.len(),
+            records.len(),
+            visits.len(),
+            results.len(),
+            dropped,
+            if dropped == 0 { "뺄 것이 없습니다" } else { "다 빠지면 판정이 틀렸을 수 있어 그대로 둡니다" }
+        ));
+        return 0;
+    }
+    let mut k = 0usize;
+    results.retain(|_| {
+        let keep = !drop[k];
+        k += 1;
+        keep
+    });
+    emit(&format!(
+        "[AI-SEARCH] 🚫 [ANALYTIC NEGATION] 부정 조건 의도 {:?} · 행동 {:?} · 페이지 {:?}: 방문자 {}명의 기록 {}건을 {}분 간격으로 방문으로 묶어, 그 일이 일어난 방문 {}개의 기록 · 리포트 {}건을 결과에서 뺐습니다 (남은 {}건).",
+        neg.intents,
+        neg.actions,
+        neg.pages,
+        visitors.len(),
+        records.len(),
+        crate::analytic::VISIT_IDLE_MS / 60_000,
+        visits.len(),
+        dropped,
+        results.len()
+    ));
+    dropped
 }
 
 /// 질의의 절대 기간 (오늘 기준; 'in September' · '9월' · 'from X to Y')
@@ -860,6 +1373,7 @@ struct Anchor {
 
 pub async fn relation_join(
     store: &VectorStore,
+    model: &crate::model::LogisModel,
     results: &mut Vec<Value>,
     plans: &mut Vec<Value>,
     query: &str,
@@ -959,6 +1473,33 @@ pub async fn relation_join(
             if status_fams.contains(&fam_of[i]) && status_codes.contains(&status_code(d)) && !anchors.iter().any(|a| a.doc == i) {
                 anchors.push(Anchor { doc: i, kind: "status", matched: status_code(d).to_string(), primary: true });
             }
+        }
+    }
+    // 🌟 [CROSS-LINGUAL ANCHOR] 번호 · 사람 · 제목 · 상태 고정점이 하나도 없으면, 질의 언어로 번역해 부른 상품 · 행사 · 쿠폰 제목을 찾습니다.
+    //    v2 질의 C4('orders in April that included Fleece-lined zip hoodie' ↔ 저장 제목 '기모 후드집업').
+    //    그 조각은 고정점이 풀어낸 값입니다: 제목 · 이름 칸 조건의 값이 조각과 겹치면 아래에서 뺍니다.
+    let mut cross_spans: Vec<String> = Vec::new();
+    if anchors.is_empty() {
+        let cand_docs: Vec<usize> = (0..docs.len())
+            .filter(|&i| matches!(fam_of[i].as_str(), "goods" | "event" | "coupon") && !text_of(docs[i].1.get("title")).is_empty())
+            .collect();
+        let cands: Vec<(String, String)> =
+            cand_docs.iter().map(|&i| (text_of(docs[i].1.get("cc")), text_of(docs[i].1.get("title")))).collect();
+        let picked = cross_lingual_title_anchors(model, query, &cands).await;
+        if !picked.is_empty() {
+            emit(&format!(
+                "[AI-SEARCH] 🧭 [CROSS-LINGUAL ANCHOR] 질의 조각이 번역해 부른 제목 {:?} 을 고정점으로 씁니다.",
+                picked
+                    .iter()
+                    .map(|(m, a, span)| format!("'{}' ← '{}' (보정 코사인 {:.3} · 2위와 {:+.3} · 구조 낱말과 {:+.3})", cands[m[0]].1, span, a.cos, a.margin, a.bank_gap))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        for (members, _, span) in picked.into_iter() {
+            for m in members {
+                anchors.push(Anchor { doc: cand_docs[m], kind: "title", matched: norm_text(&cands[m].1), primary: false });
+            }
+            cross_spans.push(norm_text(&span));
         }
     }
     if anchors.is_empty() {
@@ -1162,7 +1703,10 @@ pub async fn relation_join(
     let name_fragment = |path: &str, s: &str| {
         let v = norm_text(s);
         let long_enough = if v.chars().any(glued_script) { v.chars().count() >= 2 } else { v.chars().count() >= 3 };
-        (path.ends_with("title") || path.ends_with("name")) && long_enough && anchor_texts.iter().any(|a| contains_value(a, &v))
+        (path.ends_with("title") || path.ends_with("name"))
+            && long_enough
+            && (anchor_texts.iter().any(|a| contains_value(a, &v))
+                || cross_spans.iter().any(|s| contains_value(s, &v) || contains_value(&v, s)))
     };
     let anchor_status: HashSet<i64> = anchors.iter().filter(|a| a.kind == "status").filter_map(|a| a.matched.parse::<i64>().ok()).collect();
     let mut consumed: Vec<String> = Vec::new();

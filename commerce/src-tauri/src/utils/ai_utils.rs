@@ -4240,6 +4240,13 @@ fn closed_tail_peel(core: &str) -> Vec<(&str, &'static str)> {
     out
 }
 
+/// 닫힌 조사 · 어미 표로 가장 많이 벗겨 낸 어간 하나 ('않은' → '않' · '장바구니에' → '장바구니' · '상품들을' → '상품').
+/// Stanza 가 없을 때 원형 자리를 채웁니다 (한 글자 어간도 둡니다 — 부정 보조 용언 '않' · '없' 이 그 꼴).
+pub fn closed_tail_lemma(word: &str) -> Option<String> {
+    let core = word.trim_matches(|c: char| !c.is_alphanumeric());
+    closed_tail_peel(core).into_iter().next().map(|(stem, _)| stem.to_string()).filter(|s| !s.is_empty())
+}
+
 pub fn closed_tail_stems(word: &str) -> Vec<(String, &'static str)> {
     let core = word.trim_matches(|c: char| !c.is_alphanumeric());
     closed_tail_peel(core)
