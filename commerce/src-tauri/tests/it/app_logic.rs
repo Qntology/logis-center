@@ -385,3 +385,18 @@ fn relay_accepts_shipping_as_primary_tracking() -> anyhow::Result<()> {
     assert!(relay("goods", &json!({"type": "receiving", "goods": 1, "index": 2})).is_some());
     Ok(())
 }
+
+/// 🌟 [SDS TIE] 배정 동률은 혼동 사전의 역사 승자가 이 필드이고 승률이 0.65 이상일 때만, 그리고 두 필드의 학습형 특이도(거절률)를
+/// 알면 이 필드가 경쟁자보다 0.15 넘게 더 자주 거절되는 필드가 아닐 때만 이 필드 쪽으로 깹니다 (예전: 승률 > 0.5).
+#[test]
+fn tie_break_needs_a_clear_history_and_no_worse_rejections() {
+    use tauri_app_lib::score_dynamics::{tie_verdict, TIE_WIN_RATE};
+    assert!(!tie_verdict(None, None, None), "역사가 없으면 보류");
+    assert!(!tie_verdict(Some((false, 0.9)), None, None), "역사 승자가 경쟁자");
+    assert!(!tie_verdict(Some((true, 0.55)), None, None), "번갈아 이기는 쌍(과반이지만 0.65 미만)은 보류");
+    assert!(tie_verdict(Some((true, TIE_WIN_RATE)), None, None));
+    assert!(tie_verdict(Some((true, 0.8)), Some(0.30), Some(0.20)), "특이도 차 0.10 은 허용");
+    assert!(!tie_verdict(Some((true, 0.8)), Some(0.50), Some(0.20)), "승자가 훨씬 자주 거절되는 필드면 보류");
+    assert!(tie_verdict(Some((true, 0.8)), Some(0.50), None), "한쪽 특이도를 모르면 승률만");
+    assert!(!tie_verdict(Some((true, f32::NAN)), None, None));
+}

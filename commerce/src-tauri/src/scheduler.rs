@@ -7617,10 +7617,7 @@ pub async fn process_task(
                                 (Some(x), Some(y)) => (x.as_str(), y.as_str()),
                                 _ => return false,
                             };
-                            match crate::utils::score_dynamics::confusion_winner(a, b) {
-                                Some((winner, rate)) => winner == a && rate > 0.5,
-                                None => false,
-                            }
+                            crate::utils::score_dynamics::tie_break_allows(a, b)
                         },
                     )
                 };
