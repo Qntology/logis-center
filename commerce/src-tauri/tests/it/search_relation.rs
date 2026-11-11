@@ -292,3 +292,63 @@ fn tap_words_are_touch() {
     }
 }
 
+/// 번역 제목 고정점의 질의 조각: 낱말 1 ~ 5-그램과, 붙여 쓰는 문자 낱말의 글자 조각 (한글은 띄어 쓰므로 낱말 조각만)
+#[test]
+fn cross_lingual_query_spans() {
+    use tauri_app_lib::search_relation::query_value_spans;
+    let s = query_value_spans("자외선 차단 양산 장바구니 담기 기록");
+    assert!(s.contains(&"자외선 차단 양산".to_string()) && s.contains(&"양산".to_string()));
+    assert!(!s.contains(&"자외".to_string()), "한글은 글자 조각을 만들지 않습니다");
+    let whole = "把防晒遮阳伞加入购物车的记录";
+    let s = query_value_spans(whole);
+    assert!(s.contains(&"防晒遮阳伞".to_string()) && s.contains(&whole.to_string()));
+    assert!(s.iter().filter(|x| x.as_str() != whole).all(|x| x.chars().count() <= 10), "글자 조각은 10글자까지");
+    let s = query_value_spans("who added UV-blocking parasol to the cart?");
+    assert!(s.contains(&"UV-blocking parasol".to_string()) && s.contains(&"cart".to_string()), "앞뒤 기호를 뗍니다: {s:?}");
+}
+
+/// 번역 제목 고정점 규칙: 범위마다 1위가 2위를 앞서고 조각이 구조 낱말보다 제목에 가까워야 하며,
+/// 범위가 여럿이면 전체 1위에서 폭 안의 범위 1위만 받습니다.
+#[test]
+fn cross_lingual_anchor_rule() {
+    use tauri_app_lib::search_relation::{cross_anchor_pick, CROSS_ANCHOR_BAND};
+    // 제목 0 · 1 은 사이트 k, 2 · 3 은 사이트 c. 조각 0 은 제목 0 을, 조각 1 은 제목 2 를 부릅니다.
+    let groups: Vec<String> = ["k", "k", "c", "c"].iter().map(|s| s.to_string()).collect();
+    let sim = vec![vec![0.76, 0.62, 0.70, 0.50], vec![0.40, 0.35, 0.69, 0.55]];
+    let bank = vec![0.60, 0.60];
+    let got = cross_anchor_pick(&sim, &bank, &groups);
+    assert_eq!(got.len(), 1, "c 의 1위(0.70)는 전체 1위(0.76)에서 {} 밖이라 받지 않습니다: {got:?}", CROSS_ANCHOR_BAND);
+    assert_eq!((got[0].group.as_str(), got[0].title, got[0].span), ("k", 0, 0));
+    // 같은 상품이 두 사이트에 있으면(1위끼리 폭 안) 둘 다 받습니다
+    let sim2 = vec![vec![0.76, 0.62, 0.75, 0.50]];
+    assert_eq!(cross_anchor_pick(&sim2, &[0.60], &groups).len(), 2);
+    // 2위와 차가 작으면 받지 않습니다
+    let sim3 = vec![vec![0.76, 0.73, 0.40, 0.30]];
+    assert!(cross_anchor_pick(&sim3, &[0.60], &groups).is_empty());
+    // 조각이 구조 낱말('장바구니 담기')에 더 가까우면 제목 조각이 아닙니다
+    let sim4 = vec![vec![0.76, 0.60, 0.40, 0.30]];
+    assert!(cross_anchor_pick(&sim4, &[0.80], &groups).is_empty());
+    assert!(cross_anchor_pick(&sim4, &[0.73], &groups).is_empty(), "은행 여유 0.03 < 0.05");
+}
+
+/// 음역 고정점: 질의 언어로 음역된 항구 이름 ↔ 서류의 라틴 문자 값 (자음 골격), 짧은 골격의 우연한 일치는 받지 않습니다.
+#[test]
+fn phonetic_anchor_for_transliterated_values() {
+    use tauri_app_lib::search_relation::{phonetic_spans, phonetic_value_hit};
+    for q in [
+        "6月にフェリクストウから出港した貨物の書類",
+        "6月从费利克斯托装船的单据",
+        "مستندات الشحنة التي غادرت فيليكستو في يونيو",
+        "6월에 펠릭스토우에서 선적된 서류",
+    ] {
+        let hit = phonetic_value_hit(&phonetic_spans(q), "felixstowe");
+        assert!(hit.as_ref().map_or(false, |(_, s)| *s >= 0.9), "{q}: {hit:?}");
+    }
+    // '운송' · '배송' 은 Incheon · 부산과 골격(3개)이 같지만 짧아서 보지 않습니다
+    assert_eq!(phonetic_value_hit(&phonetic_spans("12월에 운송된 주문의 배송 상태"), "incheon"), None);
+    // 라틴 문자 질의는 글자 고정점의 몫입니다
+    assert!(phonetic_spans("documents that left Felixstowe in June").is_empty());
+    // 다른 항구
+    assert_eq!(phonetic_value_hit(&phonetic_spans("6月にフェリクストウから出港した貨物の書類"), "hamburg"), None);
+}
+

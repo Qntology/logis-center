@@ -1822,6 +1822,11 @@ pub fn phonetic_similarity(a: &str, b: &str) -> Option<f32> {
     Some(2.0 * dp[n][m] / (n + m) as f32)
 }
 
+/// 자음 골격 길이 (phonetic_similarity 가 비교하는 단위 수). 짧은 골격끼리는 우연히 같기 쉬워 고정점 판정이 하한으로 씁니다.
+pub fn phonetic_skeleton_len(text: &str) -> usize {
+    phone_skeleton(&romanize_for_phonetics(text)).len()
+}
+
 pub fn phonetic_gate(latin_src: &str, native: &str) -> (bool, Option<f32>) {
     if native.trim().is_empty() || latin_src.trim().is_empty() {
         return (true, None);

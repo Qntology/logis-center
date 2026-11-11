@@ -4028,11 +4028,11 @@ async fn ai_search_complex(
                 // 🌟 [RELATION] 고정점(식별자 · 사람 이름 · 제목 · 상태 · 서식 번호)에서 질의가 묻는 유형으로 건너간 문서를 맨 앞으로
                 //    (search_relation 설명 참조). 기간 조인이 적용된 질의는 건드리지 않습니다.
                 if search_mode == "commerce" {
-                    crate::search_relation::relation_join(store, &mut ranked_results, &mut dexie_plans, &query, &language, &cc, &emit_term).await;
+                    crate::search_relation::relation_join(store, &model, &mut ranked_results, &mut dexie_plans, &query, &language, &cc, &emit_term).await;
                 } else if search_mode == "shipping" {
                     crate::search_relation::trade_relation_join(store, &mut ranked_results, &mut dexie_plans, &query, &language, &emit_term).await;
                 } else if search_mode == "analytic" {
-                    crate::search_relation::analytic_anchor_boost(store, &mut ranked_results, &query, &cc, &emit_term).await;
+                    crate::search_relation::analytic_anchor_boost(store, &model, &mut ranked_results, &query, &cc, &emit_term).await;
                 }
             }
 
