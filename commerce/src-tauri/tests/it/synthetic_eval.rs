@@ -555,8 +555,10 @@ fn vision_probe() {
         std::fs::create_dir_all(d).expect("덤프 폴더");
     }
     let dir = crate::common::models_dir().join("siglip2-so400m-patch16-naflex");
-    let device = tauri_app_lib::utils::new_gpu_device(0).expect("GPU");
-    let dtype = if device.is_vulkan() { candle_core::DType::F32 } else { candle_core::DType::BF16 };
+    // `LOGIS_SYNTH_CPU=1`: CPU(F32)로 돕니다 — GPU 검색 평가와 함께 돌릴 때. 판정 코드는 같고 수치만 장치 · 정밀도 차이만큼 다릅니다.
+    let cpu = std::env::var("LOGIS_SYNTH_CPU").map(|v| v == "1").unwrap_or(false);
+    let device = if cpu { candle_core::Device::Cpu } else { tauri_app_lib::utils::new_gpu_device(0).expect("GPU") };
+    let dtype = if cpu || device.is_vulkan() { candle_core::DType::F32 } else { candle_core::DType::BF16 };
     let config = Siglip2Config::from_json(&dir.join("config.json")).expect("config.json");
     let encode_only = std::env::var("LOGIS_SYNTH_ENCODE_ONLY").map(|v| v == "1").unwrap_or(false);
     let mut model = Siglip2Model::load_vision_only(&dir.join("model.safetensors"), &config, &device, dtype).expect("비전 타워");
@@ -578,12 +580,21 @@ fn vision_probe() {
         .filter(|p| only.is_empty() || p.to_string_lossy().contains(&only))
         .collect();
     files.sort();
+    // `LOGIS_SYNTH_LIST`: 페이지 이름(확장자 없이) 한 줄에 하나. 그 순서로 그 페이지만 돕니다 — SDS 가 한 실행 안에서 쌓이므로
+    //  기준선을 쌓을 페이지(dev)를 평가할 페이지(test) 앞에 두려면 순서를 정해야 합니다.
+    if let Ok(list) = std::env::var("LOGIS_SYNTH_LIST") {
+        let order: Vec<String> = std::fs::read_to_string(&list).expect("페이지 목록").lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+        let stem = |p: &PathBuf| p.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        files = order.iter().filter_map(|s| files.iter().find(|p| stem(p) == *s).cloned()).collect();
+    }
     let mut out = std::fs::File::create(&out_path).expect("결과 파일");
 
     for png in files.iter() {
         let stem = png.file_stem().unwrap_or_default().to_string_lossy().to_string();
         println!("\n@@EVAL BEGIN {}", stem);
         let img = image::DynamicImage::ImageRgb8(image::open(png).expect("PNG").to_rgb8());
+        // 앱의 이미지 경로처럼 'unknown' 스코프로 들어가 판정 뒤 서식 코드로 좁힙니다(SDS 관측 · 동적 하한이 같은 스코프를 봄).
+        sds::enter_scope("", sds::Track::Vision, "unknown", "");
         let t0 = std::time::Instant::now();
         let grid = encode_image(&model, &img).expect("encode_image");
         let encode_secs = t0.elapsed().as_secs_f64();
@@ -604,6 +615,7 @@ fn vision_probe() {
         }
         let legibility = build_legibility_map(&img, grid.grid_rows, grid.grid_cols, &emit);
         let verdict = classify_doc_type(&model, &grid, &emit).expect("classify_doc_type");
+        sds::refine_primary(&verdict.code);
         let title_prej: Vec<String> =
             if verdict.title_text.is_empty() { Vec::new() } else { vec![verdict.title_text.clone()] };
         let mut heatmaps = build_column_heatmaps(&model, &grid, &verdict.code, &lang, Some(&legibility), &title_prej, &emit)
@@ -660,6 +672,246 @@ fn vision_probe() {
         println!("@@EVAL END {} {}", stem, verdict.code);
     }
     tauri_app_lib::utils::device_utils::rocm_exit_now_if_used(0);
+}
+
+/// 🌟 [SYNTH EVAL / VISION GATES] 이미지 경로의 출처 판독성 게이트(verify_claims_v2)를 합성 열화 페이지로 잽니다.
+///
+/// `LOGIS_SYNTH_CASES` 는 SyntheticData/eval/make_vision_cases.py 의 출력 폴더(cases.jsonl · img/)입니다. 격자는 앱과 같은
+/// NaFlex 전처리(preprocess_image), 판독성 지도는 build_legibility_map 으로 만들고 모델 가중치는 읽지 않습니다(config.json 만).
+/// 주장의 출처 상자는 `LOGIS_SYNTH_BBOX`(block · line, 기본 block) 한 종류만 씁니다. 두 종류를 한 실행에 섞으면 같은 값이
+/// SDS 기준선에 두 번 들어갑니다. SDS 는 원장을 읽지 않고 이 실행 안에서만 쌓입니다(calib 쪽이 앞에 옵니다).
+///
+/// ```text
+/// LOGIS_APP_DIR=<평가 폴더> LOGIS_SYNTH_CASES=<cases 폴더> LOGIS_SYNTH_OUT=<result.jsonl> [LOGIS_SYNTH_BBOX=line] \
+/// cargo test --test it --no-default-features --features rocm -- synthetic_eval::vision_gates --ignored --nocapture --test-threads 1
+/// ```
+#[test]
+#[ignore = "합성 페이지: LOGIS_SYNTH_CASES · LOGIS_SYNTH_OUT · LOGIS_APP_DIR"]
+fn vision_gates() {
+    use tauri_app_lib::models::siglip2::legibility::build_legibility_map;
+    use tauri_app_lib::models::siglip2::preprocessor::preprocess_image;
+    use tauri_app_lib::models::siglip2::value_grounding::{verify_claims_v2, GroundingClaim};
+    use tauri_app_lib::models::siglip2::Siglip2Config;
+
+    let (Ok(dir), Ok(out_path), Some(_)) = (
+        std::env::var("LOGIS_SYNTH_CASES"),
+        std::env::var("LOGIS_SYNTH_OUT"),
+        std::env::var_os("LOGIS_APP_DIR").filter(|v| !v.is_empty()),
+    ) else {
+        println!("LOGIS_SYNTH_CASES · LOGIS_SYNTH_OUT · LOGIS_APP_DIR 가 없어 건너뜁니다.");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let bbox_kind = std::env::var("LOGIS_SYNTH_BBOX").unwrap_or_else(|_| "block".to_string());
+    let config = Siglip2Config::from_json(&crate::common::models_dir().join("siglip2-so400m-patch16-naflex").join("config.json"))
+        .expect("config.json");
+    let quiet = |_: &str| {};
+    let text = std::fs::read_to_string(dir.join("cases.jsonl")).expect("cases.jsonl");
+    let mut out = std::fs::File::create(&out_path).expect("결과 파일");
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let case: Value = serde_json::from_str(line).expect("사례 JSON");
+        let image = PathBuf::from(str_of(&case, "image"));
+        let image = if image.is_absolute() { image } else { dir.join(image) };
+        let img = image::DynamicImage::ImageRgb8(image::open(&image).expect("PNG").to_rgb8());
+        let pre = preprocess_image(&img, &config, &candle_core::Device::Cpu).expect("NaFlex 전처리");
+        let legibility = build_legibility_map(&img, pre.grid_rows, pre.grid_cols, &quiet);
+        // calib 는 서식 코드 스코프에 쌓고, 평가 사례는 사례마다 따로 된 하위 스코프에 씁니다. 하위 스코프는 표본이 없으니 읽기는
+        // 서식 코드 스코프(= calib 만)로 내려갑니다 — 같은 쪽의 다른 열화본이 서로의 기준선이 되지 않습니다.
+        let secondary = if str_of(&case, "kind") == "calib" { "" } else { str_of(&case, "case") };
+        sds::enter_scope("", sds::Track::Vision, str_of(&case, "code"), secondary);
+        let picked: Vec<&Value> = case["claims"]
+            .as_array()
+            .map(|a| a.iter().filter(|c| str_of(c, "bbox_kind") == bbox_kind).collect())
+            .unwrap_or_default();
+        let claims: Vec<GroundingClaim> = picked
+            .iter()
+            .map(|c| {
+                let b: Vec<u32> = c["bbox"].as_array().map(|a| a.iter().map(|x| x.as_u64().unwrap_or(0) as u32).collect()).unwrap_or_default();
+                GroundingClaim {
+                    category: str_of(c, "category").to_string(),
+                    field: str_of(c, "field").to_string(),
+                    value: str_of(c, "value").to_string(),
+                    bbox: (b[0], b[1], b[2], b[3]),
+                }
+            })
+            .collect();
+        let before = sds::adaptive_baseline_n("vision.source_illegible_ratio");
+        let verdicts = verify_claims_v2(&claims, pre.grid_rows, pre.grid_cols, img.width(), img.height(), &legibility, str_of(&case, "lang"), &quiet);
+        let rows: Vec<Value> = claims
+            .iter()
+            .zip(picked.iter())
+            .zip(verdicts.iter())
+            .map(|((c, src), v)| {
+                let (lg, il, bl) = legibility.count_in_bbox(c.bbox, img.width(), img.height());
+                json!({"field": c.field, "value": c.value, "expect": str_of(src, "expect"), "kept": v.accepted, "verdict_value": v.value,
+                       "gate": format!("{:?}", v.gate), "reason": v.reason, "lg": lg, "il": il, "bl": bl})
+            })
+            .collect();
+        writeln!(
+            out,
+            "{}",
+            json!({"case": str_of(&case, "case"), "kind": str_of(&case, "kind"), "code": str_of(&case, "code"), "lang": str_of(&case, "lang"),
+                   "bbox_kind": bbox_kind, "grid": [pre.grid_rows, pre.grid_cols], "split_applied": legibility.split_applied,
+                   "sds_before": before.map(|(m, s, n)| json!([m, s, n])), "claims": rows})
+        )
+        .expect("결과 쓰기");
+    }
+    sds::leave_scope();
+    println!("@@EVAL VISION GATES {} → {}", bbox_kind, out_path);
+}
+
+/// 🌟 [SYNTH EVAL / NAME RESIDUE] 인명 잔해 깎기(strip_name_residue)를 names.jsonl(make_vision_cases.py)로 잽니다. 모델 없음.
+/// 결과 `{id, value}` 는 score_vision_gates.py names 가 읽습니다.
+#[test]
+#[ignore = "합성 인명: LOGIS_SYNTH_CASES · LOGIS_SYNTH_OUT"]
+fn name_residue_cases() {
+    use tauri_app_lib::models::siglip2::value_grounding::{strip_name_residue, GroundingClaim};
+    let (Ok(dir), Ok(out_path)) = (std::env::var("LOGIS_SYNTH_CASES"), std::env::var("LOGIS_SYNTH_OUT")) else {
+        println!("LOGIS_SYNTH_CASES · LOGIS_SYNTH_OUT 이 없어 건너뜁니다.");
+        return;
+    };
+    let text = std::fs::read_to_string(PathBuf::from(dir).join("names.jsonl")).expect("names.jsonl");
+    let mut out = std::fs::File::create(&out_path).expect("결과 파일");
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let case: Value = serde_json::from_str(line).expect("인명 JSON");
+        let field = str_of(&case, "field").to_string();
+        let mut claims = vec![GroundingClaim {
+            category: "parties".to_string(),
+            field: field.clone(),
+            value: str_of(&case, "value").to_string(),
+            bbox: (0, 0, 1, 1),
+        }];
+        let mut slot = serde_json::Map::new();
+        slot.insert(field.clone(), json!(str_of(&case, "value")));
+        let mut data = serde_json::Map::new();
+        data.insert(field.clone(), json!(str_of(&case, "value")));
+        data.insert("parties".to_string(), Value::Object(slot));
+        strip_name_residue(&mut claims, &mut data, &|_: &str| {});
+        let stored = [data.get(&field).and_then(|v| v.as_str()), data["parties"].get(&field).and_then(|v| v.as_str())];
+        assert!(stored.iter().all(|s| *s == Some(claims[0].value.as_str())), "저장본과 주장이 같이 고쳐져야 합니다");
+        writeln!(out, "{}", json!({"id": str_of(&case, "id"), "value": claims[0].value})).expect("결과 쓰기");
+    }
+    println!("@@EVAL NAME RESIDUE → {}", out_path);
+}
+
+/// 🌟 [SYNTH EVAL / LABEL GATES] 인쇄 라벨 → 스키마 축 라우팅(route_pairs_to_fields_exact)을 언어 팩 라벨로 잽니다.
+///
+/// `LOGIS_SYNTH_CASES` 폴더의 labels.jsonl(make_vision_cases.py)을 읽습니다. 서식(언어 × 코드) 하나를 문서 하나로 보고,
+/// 앱과 같은 라벨 뱅크(스키마 필드 · 자기 참조 축 제외 · owner_label_bank_for_doc)를 granite 로 임베딩해 라벨마다 따로
+/// 라우팅합니다(한 창에 넣으면 같은 축을 두 라벨이 다투는 규칙이 끼어 라벨 하나의 판정이 가려집니다). 혼동 사전은 이 실행
+/// 안에서만 쌓입니다. `LOGIS_SYNTH_CPU=1` 이면 granite 를 CPU 로 돌립니다(다른 GPU 평가와 함께 돌릴 때).
+#[test]
+#[ignore = "실모델(granite): LOGIS_SYNTH_CASES · LOGIS_SYNTH_OUT · LOGIS_APP_DIR"]
+fn label_gates() {
+    use std::collections::HashMap;
+    use tauri_app_lib::model::merge::{
+        build_label_exact_index, label_axis_scores, label_exact_field, owner_label_bank_for_doc, route_pairs_to_fields_exact,
+    };
+    use tauri_app_lib::models::embedding::EmbeddingModel;
+
+    let (Ok(dir), Ok(out_path), Some(_)) = (
+        std::env::var("LOGIS_SYNTH_CASES"),
+        std::env::var("LOGIS_SYNTH_OUT"),
+        std::env::var_os("LOGIS_APP_DIR").filter(|v| !v.is_empty()),
+    ) else {
+        println!("LOGIS_SYNTH_CASES · LOGIS_SYNTH_OUT · LOGIS_APP_DIR 가 없어 건너뜁니다.");
+        return;
+    };
+    let text = std::fs::read_to_string(PathBuf::from(dir).join("labels.jsonl")).expect("labels.jsonl");
+    let rows: Vec<Value> = text.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).expect("라벨 JSON")).collect();
+    let cpu = std::env::var("LOGIS_SYNTH_CPU").map(|v| v == "1").unwrap_or(false);
+    // `LOGIS_SYNTH_SEED_CONFUSION=1`: 라벨마다 1 · 2위 축 쌍을 혼동 사전에 미리 적어 두는 상한 측정(아래).
+    let seed_confusion = std::env::var("LOGIS_SYNTH_SEED_CONFUSION").map(|v| v == "1").unwrap_or(false);
+    let device = if cpu { candle_core::Device::Cpu } else { tauri_app_lib::utils::new_gpu_device(0).expect("GPU") };
+    let gdir = crate::common::model_subdir("granite-embedding-97m-multilingual-r2", "model.safetensors").expect("granite");
+    let model = EmbeddingModel::new_with_device(&gdir, &device).expect("granite 로드");
+    let mut cache: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut embed = |texts: &[String]| -> Vec<Vec<f32>> {
+        let mut miss: Vec<String> = texts.iter().filter(|t| !cache.contains_key(*t)).cloned().collect();
+        miss.sort();
+        miss.dedup();
+        for part in miss.chunks(256) {
+            for (t, v) in part.iter().zip(model.embed_batch(part).expect("임베딩")) {
+                cache.insert(t.clone(), v);
+            }
+        }
+        texts.iter().map(|t| cache[t].clone()).collect()
+    };
+
+    let mut docs: Vec<(String, Vec<&Value>)> = Vec::new();
+    for r in rows.iter() {
+        match docs.iter_mut().find(|(d, _)| d == str_of(r, "doc")) {
+            Some((_, v)) => v.push(r),
+            None => docs.push((str_of(r, "doc").to_string(), vec![r])),
+        }
+    }
+    let mut out = std::fs::File::create(&out_path).expect("결과 파일");
+    for (doc, items) in docs.iter() {
+        let (code, lang) = (str_of(items[0], "code"), str_of(items[0], "lang"));
+        sds::enter_scope("", sds::Track::Vision, code, "");
+        let self_ref = tauri_app_lib::logic::trade_reference_field_of(code).unwrap_or("");
+        let fields: Vec<String> = tauri_app_lib::parsing::get_detail_schema_fields(code, "", lang)
+            .into_iter()
+            .map(|(f, _, _, _)| f)
+            .filter(|f| !tauri_app_lib::bias_schema::is_system_axis(f))
+            .filter(|f| self_ref.is_empty() || f != self_ref)
+            .collect();
+        let per_field: Vec<(String, Vec<String>, Vec<f32>)> = fields
+            .iter()
+            .map(|f| {
+                let (p, w) = owner_label_bank_for_doc(lang, "shipping_doc", f, self_ref);
+                (f.clone(), p, w)
+            })
+            .collect();
+        let phrases: Vec<String> = per_field.iter().flat_map(|(_, p, _)| p.iter().cloned()).collect();
+        let table: HashMap<String, Vec<f32>> = phrases.iter().cloned().zip(embed(&phrases)).collect();
+        let banks: Vec<(String, Vec<Vec<f32>>, Vec<f32>)> = per_field
+            .iter()
+            .map(|(f, p, w)| {
+                let (mut b, mut ww) = (Vec::new(), Vec::new());
+                for (ph, x) in p.iter().zip(w.iter()) {
+                    if let Some(e) = table.get(ph).filter(|e| !e.is_empty()) {
+                        b.push(e.clone());
+                        ww.push(*x);
+                    }
+                }
+                (f.clone(), b, ww)
+            })
+            .collect();
+        let exact = build_label_exact_index(&per_field.iter().map(|(f, p, _)| (f.clone(), p.clone())).collect::<Vec<_>>());
+        let labels: Vec<String> = items.iter().map(|r| str_of(r, "label").to_string()).collect();
+        let label_embs = embed(&labels);
+        for (r, e) in items.iter().zip(label_embs.iter()) {
+            if seed_confusion {
+                // 상한 측정: 이 라벨의 1 · 2위 축을 혼동 사전에 비전 트랙 표본 하한(8)만큼 미리 적어 둡니다 — 혼동 기록이 있으면
+                // 재측정하는 규칙이 이 쌍에서 반드시 발화합니다(기록이 없는 실행과 비교).
+                let top2: Vec<String> = label_axis_scores(e, &banks).into_iter().take(2).map(|(f, _)| f).collect();
+                if top2.len() == 2 {
+                    for _ in 0..8 {
+                        sds::record_confusion(&top2[0], &top2[1], 0.0);
+                    }
+                }
+            }
+            let pair = vec![(str_of(r, "label").to_string(), str_of(r, "value").to_string())];
+            let (routes, logs, row_axis) = route_pairs_to_fields_exact(&pair, std::slice::from_ref(e), &fields, &banks, &exact);
+            let top: Vec<Value> = label_axis_scores(e, &banks).into_iter().take(3).map(|(f, z)| json!([f, z])).collect();
+            writeln!(
+                out,
+                "{}",
+                json!({"id": str_of(r, "id"), "doc": doc, "lang": lang, "code": code, "label": str_of(r, "label"),
+                       "expect": str_of(r, "expect"), "routed": routes.first().map(|x| x.field.clone()),
+                       "own": routes.first().map(|x| x.own), "row_axis": row_axis.first().map(|x| x.1.clone()),
+                       "exact": label_exact_field(str_of(r, "label"), &exact, &banks), "top": top, "logs": logs,
+                       "seeded": seed_confusion})
+            )
+            .expect("결과 쓰기");
+        }
+    }
+    sds::leave_scope();
+    println!("@@EVAL LABEL GATES {}건 → {}", rows.len(), out_path);
+    if !cpu {
+        tauri_app_lib::utils::device_utils::rocm_exit_now_if_used(0);
+    }
 }
 
 /// 🌟 [SYNTH EVAL / EMBED] 문장 목록을 앱과 같은 모델 코드로 임베딩해 f32 행렬 파일로 씁니다. 오프라인 실험용입니다.

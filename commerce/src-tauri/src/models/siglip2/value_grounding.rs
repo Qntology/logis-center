@@ -1,6 +1,9 @@
 use crate::models::siglip2::legibility::LegibilityMap;
 use crate::utils::ai_utils::gumbel_expected_z;
 
+/// [SOURCE BLANK SURGE] 출처 여백 비율 띠의 위쪽 경계: 평균 + 이 값 × σ (verify_claims_v2 설명의 실측으로 정함).
+pub const BLANK_SURGE_SIGMA: f32 = 3.0;
+
 #[derive(Debug, Clone)]
 pub struct GroundingClaim {
     pub category: String,
@@ -275,6 +278,85 @@ where
     out
 }
 
+/// 🌟 [NAME RESIDUE] 서명 획이 글자로 읽혀 인명 값 양끝에 붙는 잔해 문자입니다('-Jane Smith' · 'Jane Smith /').
+///  하이픈 · 대시 · 빼기 · 밑줄 · 빗금 · 세로줄 · 물결만 둡니다. 마침표 · 괄호 · 따옴표 · 쉼표는 넣지 않습니다 —
+///  'Daehan Fluid Power Co., Ltd.' · '(주)한빛타이어' · '"Delta" Trading' 처럼 이름 양끝에 정당하게 붙습니다.
+///  (합성 평가 SyntheticData/eval/make_vision_cases.py 의 names: 양끝이 영숫자가 아니면 잔해로 보던 관측 규칙은 정당한 이름
+///  42개 중 27개를 잔해로 표시했습니다.)
+pub const NAME_RESIDUE_CHARS: [char; 9] = ['-', '\u{2013}', '\u{2014}', '\u{2212}', '_', '/', '\\', '|', '~'];
+
+/// 인명 축(`*_name`) 값의 양끝 잔해([`NAME_RESIDUE_CHARS`])를 깎은 값. 깎을 것이 없거나 깎고 나면 영숫자가 남지 않으면 None.
+/// 안쪽 하이픈 · 빗금('Jean-Luc Moreau' · 'A/S Nordfragt')은 그대로입니다.
+pub fn trim_name_residue(field: &str, value: &str) -> Option<String> {
+    if !field.ends_with("_name") {
+        return None;
+    }
+    let t = value.trim();
+    let cut = t.trim_matches(|c: char| c.is_whitespace() || NAME_RESIDUE_CHARS.contains(&c));
+    if cut == t || !cut.chars().any(|c| c.is_alphanumeric()) {
+        return None;
+    }
+    Some(cut.to_string())
+}
+
+/// 🌟 [NAME RESIDUE TRIM] 접지 검증 직전에 인명 축 주장의 양끝 잔해를 깎고, 저장본(`data` 의 루트 · 카테고리 슬롯 · 표 행)의 같은 값도
+/// 함께 고칩니다. 깎은 주장 수를 돌려줍니다.
+///
+///  ── 왜 verify_claims_v2 의 판정이 아닌가 ──
+///   판정(GroundingVerdict)은 값을 받거나 버릴 뿐 고친 값을 실을 자리가 없습니다. 잔해 때문에 값을 버리면 'Jane Smith' 까지 잃고,
+///   그대로 두면 '-Jane Smith' 가 저장되어 같은 사람이 다른 이름으로 색인됩니다. 이 함수가 깎은 뒤의 값을 검증이 봅니다.
+///  ── SDS ──
+///   `vision.name_residue` 는 인명 주장 가운데 잔해를 깎은 비율입니다(예전에는 양끝 비영숫자 관측 — 정당한 구두점까지 셌습니다).
+pub fn strip_name_residue(
+    claims: &mut [GroundingClaim],
+    data: &mut serde_json::Map<String, serde_json::Value>,
+    emit: &dyn Fn(&str),
+) -> usize {
+    use serde_json::Value;
+    fn fix(node: &mut Value, field: &str, old: &str, new: &str) -> usize {
+        match node {
+            Value::Object(o) => match o.get_mut(field) {
+                Some(Value::String(s)) if s.trim() == old => {
+                    *s = new.to_string();
+                    1
+                }
+                _ => 0,
+            },
+            Value::Array(rows) => rows.iter_mut().map(|r| fix(r, field, old, new)).sum(),
+            _ => 0,
+        }
+    }
+    let mut trimmed = 0usize;
+    for c in claims.iter_mut() {
+        if !c.field.ends_with("_name") {
+            continue;
+        }
+        let Some(cut) = trim_name_residue(&c.field, &c.value) else {
+            crate::utils::score_dynamics::record_baseline("vision.name_residue", 0.0);
+            continue;
+        };
+        let old = c.value.trim().to_string();
+        let mut hits = 0usize;
+        if let Some(Value::String(s)) = data.get_mut(&c.field) {
+            if s.trim() == old {
+                *s = cut.clone();
+                hits += 1;
+            }
+        }
+        for node in data.values_mut() {
+            hits += fix(node, &c.field, &old, &cut);
+        }
+        crate::utils::score_dynamics::record_baseline("vision.name_residue", 1.0);
+        emit(&format!(
+            "    ✂️ [NAME RESIDUE TRIM] [{}] '{}' = \"{}\" → \"{}\" | 인명은 하이픈 · 빗금 · 밑줄로 시작하거나 끝나지 않습니다. 서명 획을 글자로 읽은 잔해로 보고 깎습니다(저장본 {}곳 · 주장 함께).",
+            c.category, c.field, old, cut, hits
+        ));
+        c.value = cut;
+        trimmed += 1;
+    }
+    trimmed
+}
+
 pub fn verify_claims_v2(
     claims: &[GroundingClaim],
     grid_rows: usize,
@@ -290,12 +372,22 @@ pub fn verify_claims_v2(
     let role_field = |f: &str| -> bool { matches!(f.trim(), "party_role" | "doc_type") };
     let mut out = Vec::with_capacity(claims.len());
     let mut rejected = 0usize;
+    // 출처 여백 비율의 평소 띠 위쪽(SDS: 이 서식 스코프에 지난 문서들이 남긴 vision.source_blank_ratio). 한 문서의 주장끼리 서로의
+    // 기준선이 되지 않게 판정 전에 한 번만 읽습니다. 표본이 비전 트랙 하한에 못 미치면 None 이고 [SOURCE BLANK SURGE] 는 쉽니다.
+    let blank_bound = crate::utils::score_dynamics::adaptive_upper_bound("vision.source_blank_ratio", BLANK_SURGE_SIGMA);
     for c in claims {
         // 🌟 [LABEL ECHO GATE] 값 자리에 서식의 '박스 라벨' 이 그대로 들어온 경우를 폐기합니다.
         //    "SIGNATORY COMPANY" 는 이미지에 실제로 인쇄되어 있어 판독성 검사는 반드시 통과합니다.
         //    라벨인지 값인지는 픽셀이 아니라 어휘로만 판정할 수 있습니다.
         //    사전은 parsing.rs 의 TRADE_PRINTED_LABELS + TRADE_COLUMN_ALIASES 를 그대로 씁니다.
+        // 🌟 [UNIT WORD] 단위 축 값 'PCS' · 'pieces' 는 수량 열 머리말 별칭과 글자가 같습니다. 단위 열 자기 별칭('Unit' · 'UOM')이 아니면
+        //    메아리가 아니라 단위 낱말입니다. (합성 비전 평가: 포장 명세서 · 판매 계약서의 unit = PCS 가 쪽마다 버려졌습니다 — 읽히는
+        //    값을 버린 24건이 모두 이것)
+        let unit_word = c.field == "unit"
+            && crate::parsing::is_column_alias_of("quantity", &c.value, doc_lang)
+            && !crate::parsing::is_column_alias_of("unit", &c.value, doc_lang);
         if !role_field(&c.field)
+            && !unit_word
             && (crate::parsing::is_printed_label_echo(&c.value, doc_lang)
                 || crate::parsing::is_printed_label_fragment(&c.value, doc_lang))
         {
@@ -339,7 +431,16 @@ pub fn verify_claims_v2(
             });
             continue;
         }
-        let accepted = lg > 0;
+        // 🌟 [SOURCE BLANK SURGE] 출처 상자의 여백 비율이 이 서식(SDS 스코프)의 평소 띠 위쪽(평균 + 3σ)을 넘고 판독가능 패치가 소수이면
+        //    값을 받지 않습니다. 판독성 지도는 크게 흐려진 글자를 '판독불가' 가 아니라 '여백' 으로 셉니다(먹 대비가 여백 문턱 아래로
+        //    내려감). 그래서 라벨은 선명하고 값만 뭉개진 블록은 판독불가가 아니라 여백이 늘어난 모양입니다.
+        //  ── 실측 (SyntheticData/eval/make_vision_cases.py, 서식 코드마다 깨끗한 쪽으로 기준선을 쌓은 뒤 평가 쪽 판정) ──
+        //   기획안의 '판독불가 > 판독가능 && 판독불가 비율 > 평균 + 2σ' 는 뭉갠 값 114건 중 5 · 11건(크롭 · 좁은 출처)만 잡고 읽히는 값
+        //   1258건 중 33 · 74건을 더 버렸습니다(도장 · 서명 획이 판독불가를 늘림). 여백 비율 + 3σ 는 26 · 52건을 잡고 더 버린 것은
+        //   0 · 5건, 기준선이 없는 영어 서식에서는 전과 같습니다. 2σ · 2.5σ 는 더 버린 것이 많아(24 · 57건, 0 · 14건) 쓰지 않습니다.
+        let total = (lg + il + bl).max(1) as f32;
+        let blank_surge = blank_bound.map_or(false, |b| bl as f32 / total > b && lg < il + bl);
+        let accepted = lg > 0 && !blank_surge;
         // 🌟 [SDS / V-4 입력] 출처 영역의 판독성 구성입니다.
         //
         //  ── 왜 남기는가 ──
@@ -371,45 +472,30 @@ pub fn verify_claims_v2(
                 &format!("vision.source_illegible_ratio.{:?}", claim_fmt),
                 il as f32 / total,
             );
-            // 🌟 [NAME RESIDUE OBSERVE] 인명 축의 선행/후행 구두점을 관측만 합니다.
-            //
-            //  ── 왜 판정하지 않는가 ──
-            //   signatory_name = "-Jane" 의 선행 하이픈은 서명 획을 글자로 읽은
-            //   잔해일 가능성이 높습니다. 그러나 인명에는 하이픈이 정당하게
-            //   들어가는 경우가 있고(Jean-Luc, Smith-Jones), 구두점 하나를
-            //   폐기 근거로 쓰면 오탐 위험이 큽니다.
-            //   임계는 상수가 아니라 이 축의 자기 분포에서 유도해야 하므로
-            //   이번 회차는 분포만 모읍니다.
-            if c.field.ends_with("_name") {
-                let t = c.value.trim();
-                let edge = !t.is_empty()
-                    && (t.starts_with(|ch: char| !ch.is_alphanumeric())
-                        || t.ends_with(|ch: char| !ch.is_alphanumeric()));
-                crate::utils::score_dynamics::record_baseline(
-                    "vision.name_residue",
-                    if edge { 1.0 } else { 0.0 },
-                );
-                if edge {
-                    emit(&format!(
-                        "    👁️ [NAME RESIDUE OBSERVE] [{}] '{}' = \"{}\" | 인명 축의 값 양끝에 영숫자가 아닌 문자가 붙어 있습니다. 서명 획을 글자로 읽은 잔해일 수 있으나, 인명에 하이픈이 정당하게 들어가는 경우가 있어 이번 회차는 폐기하지 않고 관측만 합니다.",
-                        c.category, c.field, c.value
-                    ));
-                }
-            }
+            // 인명 축 양끝의 서명 잔해('-Jane')는 이 함수 앞에서 strip_name_residue 가 깎습니다(폐기하지 않고 고침).
             if il > 0 {
                 emit(&format!(
-                    "    👁️ [SOURCE BLUR OBSERVE] [{}] '{}' ({:?}) = \"{}\" | 출처 판독가능 {} / 판독불가 {} / 여백 {} (판독불가 비중 {:.0}%). 이번 회차는 폐기하지 않고 관측만 합니다. 판독가능 패치가 하나라도 있으면 통과시키는 현재 기준으로는 라벨만 선명하고 본문이 흐린 블록을 가려낼 수 없는데, 그 임계는 상수가 아니라 이 문서 자기 분포에서 유도해야 합니다.",
+                    "    👁️ [SOURCE BLUR OBSERVE] [{}] '{}' ({:?}) = \"{}\" | 출처 판독가능 {} / 판독불가 {} / 여백 {} (판독불가 비중 {:.0}%). 판독불가 비중은 폐기 근거로 쓰지 않고 관측만 합니다 — 도장 · 서명 획이 겹친 읽히는 값도 판독불가를 늘리고, 크게 흐려진 글자는 판독불가가 아니라 여백으로 잡힙니다([SOURCE BLANK SURGE]).",
                     c.category, c.field, claim_fmt, c.value, lg, il, bl,
                     il as f32 / total * 100.0
                 ));
             }
         }
-        if !accepted {
+        if blank_surge {
+            rejected += 1;
+            crate::utils::score_dynamics::record_baseline("vision.source_blank_surge", 1.0);
+            emit(&format!(
+                "    🌫️ [SOURCE BLANK SURGE] [{}] '{}' = \"{}\" | 출처 판독가능 {} / 판독불가 {} / 여백 {} — 여백 비율 {:.2} 가 이 서식의 평소 띠 위쪽 {:.2}(평균 + 3σ)를 넘고 판독가능 패치가 소수입니다. 크게 흐려지거나 지워진 글자는 여백으로 잡히므로, 라벨만 선명한 자리에서 읽힌 값으로 보고 폐기합니다.",
+                c.category, c.field, c.value, lg, il, bl, bl as f32 / total, blank_bound.unwrap_or(0.0)
+            ));
+        } else if !accepted {
             rejected += 1;
             emit(&format!(
                 "    🚫 [EMPTY SOURCE] [{}] '{}' = \"{}\" | 출처 영역 판독가능 {} / 불가 {} / 여백 {} → 폐기",
                 c.category, c.field, c.value, lg, il, bl
             ));
+        } else if lg > 0 {
+            crate::utils::score_dynamics::record_baseline("vision.source_blank_surge", 0.0);
         }
         out.push(GroundingVerdict {
             category: c.category.clone(),
@@ -421,7 +507,13 @@ pub fn verify_claims_v2(
             top_legible: accepted,
             accepted,
             gate: VerdictGate::Format,
-            reason: if accepted { String::new() } else { "출처 영역에 읽을 내용이 없음".to_string() },
+            reason: if blank_surge {
+                "출처 영역이 이 서식의 평소보다 비어 있음(흐림 · 지워짐)".to_string()
+            } else if accepted {
+                String::new()
+            } else {
+                "출처 영역에 읽을 내용이 없음".to_string()
+            },
         });
     }
     {

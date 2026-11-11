@@ -1649,6 +1649,11 @@ pub fn recovery_label_gate_guarded(
         let nested = field_name_contains(&a, &b);
         let ab = banks.iter().position(|(f, _, _)| *f == a).map(|fi| view.purged_bank(banks, fi));
         let bb = banks.iter().position(|(f, _, _)| *f == b).map(|fi| view.purged_bank(banks, fi));
+        //  ── 혼동 사전에 쌓인 비포함 쌍도 재측정하지 않는 이유 (실측) ──
+        //   SyntheticData/eval/make_vision_cases.py 의 11개 언어 인쇄 라벨 1001개(synthetic_eval::label_gates)에서, 1 · 2위 쌍이 모두
+        //   혼동 사전에 있다고 두고(confusion_winner 가 표본 하한을 넘게) 비포함 쌍까지 재측정하면 라벨 23개의 축이 바뀌어 2개가 맞고
+        //   15개가 틀려졌습니다(정답 776 → 763 — reference_lc · doc_number 가 reference_master_bl 등으로). 기록이 쌓이는 그대로 돌리면
+        //   한 번도 발화하지 않았습니다. 이름이 서로를 품는 쌍만 재측정합니다.
         if !nested {
             crate::utils::score_dynamics::record_baseline("vision.discriminative_skip", 1.0);
             println!(

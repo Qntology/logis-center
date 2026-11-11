@@ -3690,6 +3690,9 @@ impl crate::model::LogisModel {
                     ));
                 }
             }
+            if let Some(m) = extracted_data.as_object_mut() {
+                crate::models::siglip2::value_grounding::strip_name_residue(&mut grounding_claims, m, &emit_term);
+            }
             if !grounding_claims.is_empty() {
                 emit_term(&format!(
                     "[STAGE-6] 🔬 추출값 {}건 접지 검증 (SigLIP2 텍스트 ↔ 이미지 패치)",
