@@ -331,6 +331,21 @@ fn cross_lingual_anchor_rule() {
     assert!(cross_anchor_pick(&sim4, &[0.73], &groups).is_empty(), "은행 여유 0.03 < 0.05");
 }
 
+/// 품목 고정점의 품목 이름: description · description_of_goods 를 ' / ' 로 나누고 품목 행 설명을 더하며, 끝의 품목 번호 괄호는 뗍니다.
+#[test]
+fn trade_item_names_for_the_item_anchor() {
+    use tauri_app_lib::search_relation::trade_item_names;
+    let d = json!({
+        "description": "USB-C-Multiport-Hub / Tragbares Kochgeschirr-Set",
+        "items": [{ "description_of_goods": "Handheld mini fan (KR20287)" }, { "description": "USB-C-Multiport-Hub" }]
+    });
+    assert_eq!(trade_item_names(&d), vec!["usb-c-multiport-hub", "tragbares kochgeschirr-set", "handheld mini fan"]);
+    let bl = json!({ "description": "세라믹 식칼" });
+    let q = "세라믹 식칼 품목이 실린 선하증권";
+    assert!(trade_item_names(&bl).iter().any(|n| contains_value(q, n)));
+    assert!(!trade_item_names(&bl).iter().any(|n| contains_value("6월에 펠릭스토우에서 선적된 서류", n)));
+}
+
 /// 음역 고정점: 질의 언어로 음역된 항구 이름 ↔ 서류의 라틴 문자 값 (자음 골격), 짧은 골격의 우연한 일치는 받지 않습니다.
 #[test]
 fn phonetic_anchor_for_transliterated_values() {

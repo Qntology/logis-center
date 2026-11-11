@@ -518,4 +518,52 @@ fn siglip2_phrase_rows_are_batch_invariant_gpu() -> anyhow::Result<()> {
     phrase_batch_invariance(&dev)
 }
 
+/// 라벨 메아리 게이트: 단위 축의 'PCS'(수량 열 별칭과 같은 글자)는 단위 낱말로 받고, 단위 열 자기 별칭 'UOM' 과
+/// 다른 축의 'PCS' 는 그대로 메아리로 버립니다.
+#[test]
+fn label_echo_keeps_unit_words() {
+    use tauri_app_lib::models::siglip2::value_grounding::verify_claims_v2;
+    let leg = legible_map(12, 10);
+    let claim = |field: &str, value: &str| GroundingClaim {
+        category: "items".into(),
+        field: field.into(),
+        value: value.into(),
+        bbox: (0, 0, 400, 300),
+    };
+    let claims = vec![claim("unit", "PCS"), claim("unit", "pieces"), claim("unit", "UOM"), claim("description", "PCS")];
+    let got = verify_claims_v2(&claims, 12, 10, 1000, 1200, &leg, "en", &|_: &str| {});
+    let kept: Vec<bool> = got.iter().map(|v| v.accepted).collect();
+    assert_eq!(kept, vec![true, true, false, false]);
+}
+
+/// 분할 크롭 하한: SDS 손실 띠가 없으면 예전 상수 0.70, 있으면 1 − (μ + 2σ) 를 [0.5, 0.9] 로 묶은 값.
+#[test]
+fn split_floor_follows_coverage_band() {
+    use tauri_app_lib::models::siglip2::vision_crop::split_coverage_floor;
+    assert_eq!(split_coverage_floor(None), 0.70);
+    assert!((split_coverage_floor(Some((0.10, 0.05, 12))) - 0.80).abs() < 1e-6);
+    assert_eq!(split_coverage_floor(Some((0.0, 0.0, 12))), 0.90); // 늘 다 덮던 카테고리
+    assert_eq!(split_coverage_floor(Some((0.45, 0.15, 12))), 0.50); // 늘 넓게 퍼지던 카테고리
+}
+
+/// 인명 잔해: 양끝의 하이픈 · 대시 · 빗금 · 밑줄 · 세로줄만 깎고, 안쪽 하이픈과 정당한 양끝 구두점(마침표 · 괄호 · 따옴표)은 그대로.
+#[test]
+fn name_residue_trims_only_signature_strokes() {
+    use tauri_app_lib::models::siglip2::value_grounding::trim_name_residue;
+    for (raw, want) in [
+        ("-Jane Smith", "Jane Smith"),
+        ("Jane Smith /", "Jane Smith"),
+        ("— Hans Müller", "Hans Müller"),
+        ("_Daehan Fluid Power Co., Ltd.", "Daehan Fluid Power Co., Ltd."),
+        ("|北斗精機株式会社", "北斗精機株式会社"),
+    ] {
+        assert_eq!(trim_name_residue("signatory_name", raw).as_deref(), Some(want), "{raw}");
+    }
+    for keep in ["Jean-Luc Moreau", "A/S Nordfragt", "Daehan Fluid Power Co., Ltd.", "(주)한빛타이어", "\"Delta\" Trading", "J. R. Smith Jr.", "-", "--"] {
+        assert_eq!(trim_name_residue("sender_name", keep), None, "{keep}");
+    }
+    // 인명 축이 아니면 손대지 않습니다(번호의 하이픈은 값의 일부일 수 있음).
+    assert_eq!(trim_name_residue("doc_number", "-INV-001"), None);
+}
+
 

@@ -378,14 +378,16 @@ def fill(tmpl: str, lang: str, slots: dict) -> str:
 
 
 def build(records: list, events: list) -> list:
-    """사례 × 12개 언어 질의. 커머스는 틀마다 쇼핑몰 2곳, 무역 · 행동은 틀마다 1곳(돌아가며)."""
+    """사례 × 12개 언어 질의. 커머스 · 행동 로그는 틀마다 쇼핑몰 2곳, 무역은 틀마다 1곳(돌아가며).
+    두 번째 쇼핑몰 사례는 진단(평가 축약)에 쓰지 않는 보류 집합입니다 — 행동 로그 쪽은 3차(2026-11-11)에 더했습니다:
+    행동 로그 수정을 진단 72건의 로그에서 찾아 그 1.000 이 사례에 맞춘 것인지 가릴 질의가 없었습니다."""
     shops = [r["shop"] for r in records]
     by = {r["shop"]: r for r in records}
     out = []
     for i, tmpl in enumerate(sorted(T, key=lambda t: (t[0] != "C", t[0] != "R", int(t[1:])))):
         dom = DOMAIN[tmpl]
         n = int(tmpl[1:])
-        if dom == "commerce":
+        if dom in ("commerce", "analytic"):
             picks = [shops[n % 4], shops[(n + 2) % 4]]
         else:
             picks = [shops[n % 4]]

@@ -3467,6 +3467,140 @@
   host: ''
   query: عمليات الإضافة إلى السلة على Copperleaf Goods
   relevant: *id028
+- id: A1-kranich-ko
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: ko
+  host: ''
+  query: Kranichhof Markt에서 장바구니에 담은 기록
+  relevant: &id029
+  - ev-kranich-p1-04
+  - ev-kranich-p2-04
+  - ev-kranich-p3-03
+  - ev-kranich-p3-05
+  - ev-kranich-p4-03
+  - ev-kranich-p4-05
+  - ev-kranich-p5-03
+  - ev-kranich-p5-05
+  - ev-kranich-p6-03
+  - ev-kranich-p6-05
+  - ev-kranich-p7-04
+  - ev-kranich-a1-02
+  - ev-kranich-a2-02
+  - ev-kranich-a3-02
+- id: A1-kranich-en
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: en
+  host: ''
+  query: add-to-cart actions on Kranichhof Markt
+  relevant: *id029
+- id: A1-kranich-ja
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: ja
+  host: ''
+  query: Kranichhof Marktでカートに入れた記録
+  relevant: *id029
+- id: A1-kranich-zh-hans
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: zh-hans
+  host: ''
+  query: Kranichhof Markt上加入购物车的记录
+  relevant: *id029
+- id: A1-kranich-de
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: de
+  host: ''
+  query: Wann wurde bei Kranichhof Markt etwas in den Warenkorb gelegt?
+  relevant: *id029
+- id: A1-kranich-fr
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: fr
+  host: ''
+  query: ajouts au panier sur Kranichhof Markt
+  relevant: *id029
+- id: A1-kranich-es
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: es
+  host: ''
+  query: productos añadidos a la cesta en Kranichhof Markt
+  relevant: *id029
+- id: A1-kranich-it
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: it
+  host: ''
+  query: aggiunte al carrello su Kranichhof Markt
+  relevant: *id029
+- id: A1-kranich-pt
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: pt
+  host: ''
+  query: itens adicionados ao carrinho na Kranichhof Markt
+  relevant: *id029
+- id: A1-kranich-nl
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: nl
+  host: ''
+  query: toevoegingen aan de winkelwagen bij Kranichhof Markt
+  relevant: *id029
+- id: A1-kranich-cs
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: cs
+  host: ''
+  query: vložení do košíku na Kranichhof Markt
+  relevant: *id029
+- id: A1-kranich-ar
+  template: A1
+  kind: site+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: ar
+  host: ''
+  query: عمليات الإضافة إلى السلة على Kranichhof Markt
+  relevant: *id029
 - id: A2-komorebi-ko
   template: A2
   kind: site+page+action
@@ -3476,7 +3610,7 @@
   lang: ko
   host: ''
   query: こもれび商店 상품 상세 페이지에서 옵션을 바꾼 기록
-  relevant: &id029
+  relevant: &id030
   - ev-komorebi-p1-02
   - ev-komorebi-p1-05
   - ev-komorebi-p1-07
@@ -3505,7 +3639,7 @@
   lang: en
   host: ''
   query: option changes on product pages of こもれび商店
-  relevant: *id029
+  relevant: *id030
 - id: A2-komorebi-ja
   template: A2
   kind: site+page+action
@@ -3515,7 +3649,7 @@
   lang: ja
   host: ''
   query: こもれび商店の商品詳細ページでオプションを変更した記録
-  relevant: *id029
+  relevant: *id030
 - id: A2-komorebi-zh-hans
   template: A2
   kind: site+page+action
@@ -3525,7 +3659,7 @@
   lang: zh-hans
   host: ''
   query: 在こもれび商店商品详情页更改选项的记录
-  relevant: *id029
+  relevant: *id030
 - id: A2-komorebi-de
   template: A2
   kind: site+page+action
@@ -3535,7 +3669,7 @@
   lang: de
   host: ''
   query: Optionsänderungen auf Produktseiten von こもれび商店
-  relevant: *id029
+  relevant: *id030
 - id: A2-komorebi-fr
   template: A2
   kind: site+page+action
@@ -3545,7 +3679,7 @@
   lang: fr
   host: ''
   query: changements d'option sur les fiches produit de こもれび商店
-  relevant: *id029
+  relevant: *id030
 - id: A2-komorebi-es
   template: A2
   kind: site+page+action
@@ -3555,7 +3689,7 @@
   lang: es
   host: ''
   query: cambios de opción en las fichas de producto de こもれび商店
-  relevant: *id029
+  relevant: *id030
 - id: A2-komorebi-it
   template: A2
   kind: site+page+action
@@ -3565,7 +3699,7 @@
   lang: it
   host: ''
   query: modifiche delle opzioni nelle pagine prodotto di こもれび商店
-  relevant: *id029
+  relevant: *id030
 - id: A2-komorebi-pt
   template: A2
   kind: site+page+action
@@ -3575,7 +3709,7 @@
   lang: pt
   host: ''
   query: alterações de opção nas páginas de produto da こもれび商店
-  relevant: *id029
+  relevant: *id030
 - id: A2-komorebi-nl
   template: A2
   kind: site+page+action
@@ -3585,7 +3719,7 @@
   lang: nl
   host: ''
   query: optiewijzigingen op productpagina's van こもれび商店
-  relevant: *id029
+  relevant: *id030
 - id: A2-komorebi-cs
   template: A2
   kind: site+page+action
@@ -3595,7 +3729,7 @@
   lang: cs
   host: ''
   query: změny možností na stránkách produktů こもれび商店
-  relevant: *id029
+  relevant: *id030
 - id: A2-komorebi-ar
   template: A2
   kind: site+page+action
@@ -3605,7 +3739,148 @@
   lang: ar
   host: ''
   query: تغييرات الخيارات في صفحات المنتجات على こもれび商店
-  relevant: *id029
+  relevant: *id030
+- id: A2-sorae-ko
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: ko
+  host: ''
+  query: 소래마켓 상품 상세 페이지에서 옵션을 바꾼 기록
+  relevant: &id031
+  - ev-sorae-p1-02
+  - ev-sorae-p1-05
+  - ev-sorae-p2-02
+  - ev-sorae-p2-05
+  - ev-sorae-p2-07
+  - ev-sorae-p3-02
+  - ev-sorae-p3-05
+  - ev-sorae-p3-07
+  - ev-sorae-p4-02
+  - ev-sorae-p4-05
+  - ev-sorae-p4-07
+  - ev-sorae-p5-02
+  - ev-sorae-p5-05
+  - ev-sorae-p5-07
+  - ev-sorae-p6-02
+  - ev-sorae-p7-02
+  - ev-sorae-a1-01
+  - ev-sorae-a2-01
+  - ev-sorae-a3-01
+  - ev-sorae-s1-03
+  - ev-sorae-s2-03
+- id: A2-sorae-en
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: en
+  host: ''
+  query: option changes on product pages of 소래마켓
+  relevant: *id031
+- id: A2-sorae-ja
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: ja
+  host: ''
+  query: 소래마켓の商品詳細ページでオプションを変更した記録
+  relevant: *id031
+- id: A2-sorae-zh-hans
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: zh-hans
+  host: ''
+  query: 在소래마켓商品详情页更改选项的记录
+  relevant: *id031
+- id: A2-sorae-de
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: de
+  host: ''
+  query: Optionsänderungen auf Produktseiten von 소래마켓
+  relevant: *id031
+- id: A2-sorae-fr
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: fr
+  host: ''
+  query: changements d'option sur les fiches produit de 소래마켓
+  relevant: *id031
+- id: A2-sorae-es
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: es
+  host: ''
+  query: cambios de opción en las fichas de producto de 소래마켓
+  relevant: *id031
+- id: A2-sorae-it
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: it
+  host: ''
+  query: modifiche delle opzioni nelle pagine prodotto di 소래마켓
+  relevant: *id031
+- id: A2-sorae-pt
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: pt
+  host: ''
+  query: alterações de opção nas páginas de produto da 소래마켓
+  relevant: *id031
+- id: A2-sorae-nl
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: nl
+  host: ''
+  query: optiewijzigingen op productpagina's van 소래마켓
+  relevant: *id031
+- id: A2-sorae-cs
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: cs
+  host: ''
+  query: změny možností na stránkách produktů 소래마켓
+  relevant: *id031
+- id: A2-sorae-ar
+  template: A2
+  kind: site+page+action
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: ar
+  host: ''
+  query: تغييرات الخيارات في صفحات المنتجات على 소래마켓
+  relevant: *id031
 - id: A3-kranich-ko
   template: A3
   kind: goods+action
@@ -3615,7 +3890,7 @@
   lang: ko
   host: ''
   query: 자외선 차단 양산 장바구니 담기 기록
-  relevant: &id030
+  relevant: &id032
   - ev-kranich-p1-04
   - ev-kranich-p6-03
   - ev-kranich-a1-02
@@ -3628,7 +3903,7 @@
   lang: en
   host: ''
   query: who added UV-blocking parasol to the cart
-  relevant: *id030
+  relevant: *id032
 - id: A3-kranich-ja
   template: A3
   kind: goods+action
@@ -3638,7 +3913,7 @@
   lang: ja
   host: ''
   query: UVカット日傘をカートに入れた記録
-  relevant: *id030
+  relevant: *id032
 - id: A3-kranich-zh-hans
   template: A3
   kind: goods+action
@@ -3648,7 +3923,7 @@
   lang: zh-hans
   host: ''
   query: 把防晒遮阳伞加入购物车的记录
-  relevant: *id030
+  relevant: *id032
 - id: A3-kranich-de
   template: A3
   kind: goods+action
@@ -3658,7 +3933,7 @@
   lang: de
   host: ''
   query: wer UV-Schutz-Sonnenschirm in den Warenkorb gelegt hat
-  relevant: *id030
+  relevant: *id032
 - id: A3-kranich-fr
   template: A3
   kind: goods+action
@@ -3668,7 +3943,7 @@
   lang: fr
   host: ''
   query: qui a ajouté Ombrelle anti-UV au panier
-  relevant: *id030
+  relevant: *id032
 - id: A3-kranich-es
   template: A3
   kind: goods+action
@@ -3678,7 +3953,7 @@
   lang: es
   host: ''
   query: quién añadió Sombrilla con protección UV a la cesta
-  relevant: *id030
+  relevant: *id032
 - id: A3-kranich-it
   template: A3
   kind: goods+action
@@ -3688,7 +3963,7 @@
   lang: it
   host: ''
   query: chi ha aggiunto Ombrellino anti-UV al carrello
-  relevant: *id030
+  relevant: *id032
 - id: A3-kranich-pt
   template: A3
   kind: goods+action
@@ -3698,7 +3973,7 @@
   lang: pt
   host: ''
   query: quem adicionou Sombrinha com proteção UV ao carrinho
-  relevant: *id030
+  relevant: *id032
 - id: A3-kranich-nl
   template: A3
   kind: goods+action
@@ -3708,7 +3983,7 @@
   lang: nl
   host: ''
   query: wie Zonneparaplu met UV-bescherming in de winkelwagen heeft gelegd
-  relevant: *id030
+  relevant: *id032
 - id: A3-kranich-cs
   template: A3
   kind: goods+action
@@ -3718,7 +3993,7 @@
   lang: cs
   host: ''
   query: kdo vložil Slunečník s UV ochranou do košíku
-  relevant: *id030
+  relevant: *id032
 - id: A3-kranich-ar
   template: A3
   kind: goods+action
@@ -3728,7 +4003,131 @@
   lang: ar
   host: ''
   query: من أضاف مظلة شمسية بحماية من الأشعة فوق البنفسجية إلى السلة
-  relevant: *id030
+  relevant: *id032
+- id: A3-copper-ko
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: ko
+  host: ''
+  query: 극세사 담요 장바구니 담기 기록
+  relevant: &id033
+  - ev-copper-p2-06
+  - ev-copper-p3-06
+  - ev-copper-p5-04
+  - ev-copper-a3-02
+- id: A3-copper-en
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: en
+  host: ''
+  query: who added Microfiber throw blanket to the cart
+  relevant: *id033
+- id: A3-copper-ja
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: ja
+  host: ''
+  query: マイクロファイバーブランケットをカートに入れた記録
+  relevant: *id033
+- id: A3-copper-zh-hans
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: zh-hans
+  host: ''
+  query: 把超细纤维毯加入购物车的记录
+  relevant: *id033
+- id: A3-copper-de
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: de
+  host: ''
+  query: wer Mikrofaser-Kuscheldecke in den Warenkorb gelegt hat
+  relevant: *id033
+- id: A3-copper-fr
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: fr
+  host: ''
+  query: qui a ajouté Plaid en microfibre au panier
+  relevant: *id033
+- id: A3-copper-es
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: es
+  host: ''
+  query: quién añadió Manta de microfibra a la cesta
+  relevant: *id033
+- id: A3-copper-it
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: it
+  host: ''
+  query: chi ha aggiunto Plaid in microfibra al carrello
+  relevant: *id033
+- id: A3-copper-pt
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: pt
+  host: ''
+  query: quem adicionou Manta de microfibra ao carrinho
+  relevant: *id033
+- id: A3-copper-nl
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: nl
+  host: ''
+  query: wie Plaid van microvezel in de winkelwagen heeft gelegd
+  relevant: *id033
+- id: A3-copper-cs
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: cs
+  host: ''
+  query: kdo vložil Deka z mikrovlákna do košíku
+  relevant: *id033
+- id: A3-copper-ar
+  template: A3
+  kind: goods+action
+  domain: analytic
+  shop: copper
+  data_lang: en
+  lang: ar
+  host: ''
+  query: من أضاف بطانية مايكروفايبر إلى السلة
+  relevant: *id033
 - id: A4-sorae-ko
   template: A4
   kind: site+funnel
@@ -3738,7 +4137,7 @@
   lang: ko
   host: ''
   query: 소래마켓에서 결제 페이지까지 갔다가 결제하지 않은 기록
-  relevant: &id031
+  relevant: &id034
   - ev-sorae-a1-04
   - ev-sorae-a2-04
   - ev-sorae-a3-04
@@ -3751,7 +4150,7 @@
   lang: en
   host: ''
   query: visits on 소래마켓 that reached checkout but never paid
-  relevant: *id031
+  relevant: *id034
 - id: A4-sorae-ja
   template: A4
   kind: site+funnel
@@ -3761,7 +4160,7 @@
   lang: ja
   host: ''
   query: 소래마켓で決済ページまで進んだのに支払わなかった記録
-  relevant: *id031
+  relevant: *id034
 - id: A4-sorae-zh-hans
   template: A4
   kind: site+funnel
@@ -3771,7 +4170,7 @@
   lang: zh-hans
   host: ''
   query: 在소래마켓进入结算页面却没有付款的记录
-  relevant: *id031
+  relevant: *id034
 - id: A4-sorae-de
   template: A4
   kind: site+funnel
@@ -3781,7 +4180,7 @@
   lang: de
   host: ''
   query: Besuche bei 소래마켓, die bis zur Kasse kamen, aber nicht bezahlt haben
-  relevant: *id031
+  relevant: *id034
 - id: A4-sorae-fr
   template: A4
   kind: site+funnel
@@ -3791,7 +4190,7 @@
   lang: fr
   host: ''
   query: visites sur 소래마켓 arrivées au paiement sans commander
-  relevant: *id031
+  relevant: *id034
 - id: A4-sorae-es
   template: A4
   kind: site+funnel
@@ -3801,7 +4200,7 @@
   lang: es
   host: ''
   query: visitas en 소래마켓 que llegaron al pago pero no pagaron
-  relevant: *id031
+  relevant: *id034
 - id: A4-sorae-it
   template: A4
   kind: site+funnel
@@ -3811,7 +4210,7 @@
   lang: it
   host: ''
   query: visite su 소래마켓 arrivate al pagamento senza pagare
-  relevant: *id031
+  relevant: *id034
 - id: A4-sorae-pt
   template: A4
   kind: site+funnel
@@ -3821,7 +4220,7 @@
   lang: pt
   host: ''
   query: visitas na 소래마켓 que chegaram ao pagamento mas não pagaram
-  relevant: *id031
+  relevant: *id034
 - id: A4-sorae-nl
   template: A4
   kind: site+funnel
@@ -3831,7 +4230,7 @@
   lang: nl
   host: ''
   query: bezoeken bij 소래마켓 die tot de kassa kwamen maar niet betaalden
-  relevant: *id031
+  relevant: *id034
 - id: A4-sorae-cs
   template: A4
   kind: site+funnel
@@ -3841,7 +4240,7 @@
   lang: cs
   host: ''
   query: návštěvy na 소래마켓, které došly k pokladně, ale nezaplatily
-  relevant: *id031
+  relevant: *id034
 - id: A4-sorae-ar
   template: A4
   kind: site+funnel
@@ -3851,7 +4250,130 @@
   lang: ar
   host: ''
   query: زيارات على 소래마켓 وصلت إلى صفحة الدفع دون أن تدفع
-  relevant: *id031
+  relevant: *id034
+- id: A4-komorebi-ko
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: ko
+  host: ''
+  query: こもれび商店에서 결제 페이지까지 갔다가 결제하지 않은 기록
+  relevant: &id035
+  - ev-komorebi-a1-04
+  - ev-komorebi-a2-04
+  - ev-komorebi-a3-04
+- id: A4-komorebi-en
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: en
+  host: ''
+  query: visits on こもれび商店 that reached checkout but never paid
+  relevant: *id035
+- id: A4-komorebi-ja
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: ja
+  host: ''
+  query: こもれび商店で決済ページまで進んだのに支払わなかった記録
+  relevant: *id035
+- id: A4-komorebi-zh-hans
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: zh-hans
+  host: ''
+  query: 在こもれび商店进入结算页面却没有付款的记录
+  relevant: *id035
+- id: A4-komorebi-de
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: de
+  host: ''
+  query: Besuche bei こもれび商店, die bis zur Kasse kamen, aber nicht bezahlt haben
+  relevant: *id035
+- id: A4-komorebi-fr
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: fr
+  host: ''
+  query: visites sur こもれび商店 arrivées au paiement sans commander
+  relevant: *id035
+- id: A4-komorebi-es
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: es
+  host: ''
+  query: visitas en こもれび商店 que llegaron al pago pero no pagaron
+  relevant: *id035
+- id: A4-komorebi-it
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: it
+  host: ''
+  query: visite su こもれび商店 arrivate al pagamento senza pagare
+  relevant: *id035
+- id: A4-komorebi-pt
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: pt
+  host: ''
+  query: visitas na こもれび商店 que chegaram ao pagamento mas não pagaram
+  relevant: *id035
+- id: A4-komorebi-nl
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: nl
+  host: ''
+  query: bezoeken bij こもれび商店 die tot de kassa kwamen maar niet betaalden
+  relevant: *id035
+- id: A4-komorebi-cs
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: cs
+  host: ''
+  query: návštěvy na こもれび商店, které došly k pokladně, ale nezaplatily
+  relevant: *id035
+- id: A4-komorebi-ar
+  template: A4
+  kind: site+funnel
+  domain: analytic
+  shop: komorebi
+  data_lang: ja
+  lang: ar
+  host: ''
+  query: زيارات على こもれび商店 وصلت إلى صفحة الدفع دون أن تدفع
+  relevant: *id035
 - id: A5-copper-ko
   template: A5
   kind: event page+action
@@ -3861,7 +4383,7 @@
   lang: ko
   host: ''
   query: '''Summer getaway picks'' 이벤트 페이지에서 쿠폰 받은 기록'
-  relevant: &id032
+  relevant: &id036
   - ev-copper-c1-01
 - id: A5-copper-en
   template: A5
@@ -3872,7 +4394,7 @@
   lang: en
   host: ''
   query: coupon downloads on the 'Summer getaway picks' event page
-  relevant: *id032
+  relevant: *id036
 - id: A5-copper-ja
   template: A5
   kind: event page+action
@@ -3882,7 +4404,7 @@
   lang: ja
   host: ''
   query: 「Summer getaway picks」のイベントページでクーポンを受け取った記録
-  relevant: *id032
+  relevant: *id036
 - id: A5-copper-zh-hans
   template: A5
   kind: event page+action
@@ -3892,7 +4414,7 @@
   lang: zh-hans
   host: ''
   query: 在“Summer getaway picks”活动页面领取优惠券的记录
-  relevant: *id032
+  relevant: *id036
 - id: A5-copper-de
   template: A5
   kind: event page+action
@@ -3902,7 +4424,7 @@
   lang: de
   host: ''
   query: Gutschein-Downloads auf der Aktionsseite „Summer getaway picks“
-  relevant: *id032
+  relevant: *id036
 - id: A5-copper-fr
   template: A5
   kind: event page+action
@@ -3912,7 +4434,7 @@
   lang: fr
   host: ''
   query: coupons récupérés sur la page de l'opération « Summer getaway picks »
-  relevant: *id032
+  relevant: *id036
 - id: A5-copper-es
   template: A5
   kind: event page+action
@@ -3922,7 +4444,7 @@
   lang: es
   host: ''
   query: cupones obtenidos en la página de la promoción «Summer getaway picks»
-  relevant: *id032
+  relevant: *id036
 - id: A5-copper-it
   template: A5
   kind: event page+action
@@ -3932,7 +4454,7 @@
   lang: it
   host: ''
   query: coupon ritirati nella pagina della promozione «Summer getaway picks»
-  relevant: *id032
+  relevant: *id036
 - id: A5-copper-pt
   template: A5
   kind: event page+action
@@ -3942,7 +4464,7 @@
   lang: pt
   host: ''
   query: cupons resgatados na página da promoção “Summer getaway picks”
-  relevant: *id032
+  relevant: *id036
 - id: A5-copper-nl
   template: A5
   kind: event page+action
@@ -3952,7 +4474,7 @@
   lang: nl
   host: ''
   query: kortingsbonnen opgehaald op de actiepagina 'Summer getaway picks'
-  relevant: *id032
+  relevant: *id036
 - id: A5-copper-cs
   template: A5
   kind: event page+action
@@ -3962,7 +4484,7 @@
   lang: cs
   host: ''
   query: stažené kupóny na stránce akce „Summer getaway picks“
-  relevant: *id032
+  relevant: *id036
 - id: A5-copper-ar
   template: A5
   kind: event page+action
@@ -3972,7 +4494,128 @@
   lang: ar
   host: ''
   query: القسائم التي تم الحصول عليها في صفحة عرض «Summer getaway picks»
-  relevant: *id032
+  relevant: *id036
+- id: A5-kranich-ko
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: ko
+  host: ''
+  query: '''Bereit für den Sommerurlaub'' 이벤트 페이지에서 쿠폰 받은 기록'
+  relevant: &id037
+  - ev-kranich-c1-01
+- id: A5-kranich-en
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: en
+  host: ''
+  query: coupon downloads on the 'Bereit für den Sommerurlaub' event page
+  relevant: *id037
+- id: A5-kranich-ja
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: ja
+  host: ''
+  query: 「Bereit für den Sommerurlaub」のイベントページでクーポンを受け取った記録
+  relevant: *id037
+- id: A5-kranich-zh-hans
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: zh-hans
+  host: ''
+  query: 在“Bereit für den Sommerurlaub”活动页面领取优惠券的记录
+  relevant: *id037
+- id: A5-kranich-de
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: de
+  host: ''
+  query: Gutschein-Downloads auf der Aktionsseite „Bereit für den Sommerurlaub“
+  relevant: *id037
+- id: A5-kranich-fr
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: fr
+  host: ''
+  query: coupons récupérés sur la page de l'opération « Bereit für den Sommerurlaub »
+  relevant: *id037
+- id: A5-kranich-es
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: es
+  host: ''
+  query: cupones obtenidos en la página de la promoción «Bereit für den Sommerurlaub»
+  relevant: *id037
+- id: A5-kranich-it
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: it
+  host: ''
+  query: coupon ritirati nella pagina della promozione «Bereit für den Sommerurlaub»
+  relevant: *id037
+- id: A5-kranich-pt
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: pt
+  host: ''
+  query: cupons resgatados na página da promoção “Bereit für den Sommerurlaub”
+  relevant: *id037
+- id: A5-kranich-nl
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: nl
+  host: ''
+  query: kortingsbonnen opgehaald op de actiepagina 'Bereit für den Sommerurlaub'
+  relevant: *id037
+- id: A5-kranich-cs
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: cs
+  host: ''
+  query: stažené kupóny na stránce akce „Bereit für den Sommerurlaub“
+  relevant: *id037
+- id: A5-kranich-ar
+  template: A5
+  kind: event page+action
+  domain: analytic
+  shop: kranich
+  data_lang: de
+  lang: ar
+  host: ''
+  query: القسائم التي تم الحصول عليها في صفحة عرض «Bereit für den Sommerurlaub»
+  relevant: *id037
 - id: A6-komorebi-ko
   template: A6
   kind: site+period+device
@@ -3982,7 +4625,7 @@
   lang: ko
   host: ''
   query: 2026년 9월 12일부터 2026년 10월 2일까지 こもれび商店 모바일 터치 기록
-  relevant: &id033
+  relevant: &id038
   - ev-komorebi-a2-02
   - ev-komorebi-a2-03
   - ev-komorebi-p2-01
@@ -4007,7 +4650,7 @@
   lang: en
   host: ''
   query: mobile taps on こもれび商店 from September 12, 2026 to October 2, 2026
-  relevant: *id033
+  relevant: *id038
 - id: A6-komorebi-ja
   template: A6
   kind: site+period+device
@@ -4017,7 +4660,7 @@
   lang: ja
   host: ''
   query: 2026年9月12日から2026年10月2日までのこもれび商店のモバイルタッチ記録
-  relevant: *id033
+  relevant: *id038
 - id: A6-komorebi-zh-hans
   template: A6
   kind: site+period+device
@@ -4027,7 +4670,7 @@
   lang: zh-hans
   host: ''
   query: 2026年9月12日到2026年10月2日期间こもれび商店的手机触摸记录
-  relevant: *id033
+  relevant: *id038
 - id: A6-komorebi-de
   template: A6
   kind: site+period+device
@@ -4037,7 +4680,7 @@
   lang: de
   host: ''
   query: mobile Touch-Eingaben bei こもれび商店 vom 12. September 2026 bis 2. Oktober 2026
-  relevant: *id033
+  relevant: *id038
 - id: A6-komorebi-fr
   template: A6
   kind: site+period+device
@@ -4047,7 +4690,7 @@
   lang: fr
   host: ''
   query: appuis mobiles sur こもれび商店 du 12 septembre 2026 au 2 octobre 2026
-  relevant: *id033
+  relevant: *id038
 - id: A6-komorebi-es
   template: A6
   kind: site+period+device
@@ -4057,7 +4700,7 @@
   lang: es
   host: ''
   query: toques en el móvil en こもれび商店 del 12 de septiembre de 2026 al 2 de octubre de 2026
-  relevant: *id033
+  relevant: *id038
 - id: A6-komorebi-it
   template: A6
   kind: site+period+device
@@ -4067,7 +4710,7 @@
   lang: it
   host: ''
   query: tocchi da mobile su こもれび商店 dal 12 settembre 2026 al 2 ottobre 2026
-  relevant: *id033
+  relevant: *id038
 - id: A6-komorebi-pt
   template: A6
   kind: site+period+device
@@ -4077,7 +4720,7 @@
   lang: pt
   host: ''
   query: toques no celular na こもれび商店 de 12 de setembro de 2026 a 2 de outubro de 2026
-  relevant: *id033
+  relevant: *id038
 - id: A6-komorebi-nl
   template: A6
   kind: site+period+device
@@ -4087,7 +4730,7 @@
   lang: nl
   host: ''
   query: mobiele tikken bij こもれび商店 van 12 september 2026 tot 2 oktober 2026
-  relevant: *id033
+  relevant: *id038
 - id: A6-komorebi-cs
   template: A6
   kind: site+period+device
@@ -4097,7 +4740,7 @@
   lang: cs
   host: ''
   query: dotyky na mobilu na こもれび商店 od 12. září 2026 do 2. října 2026
-  relevant: *id033
+  relevant: *id038
 - id: A6-komorebi-ar
   template: A6
   kind: site+period+device
@@ -4107,4 +4750,132 @@
   lang: ar
   host: ''
   query: لمسات الجوال على こもれび商店 من 12 سبتمبر 2026 إلى 2 أكتوبر 2026
-  relevant: *id033
+  relevant: *id038
+- id: A6-sorae-ko
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: ko
+  host: ''
+  query: 2026년 7월 12일부터 2026년 8월 1일까지 소래마켓 모바일 터치 기록
+  relevant: &id039
+  - ev-sorae-p2-01
+  - ev-sorae-p2-03
+  - ev-sorae-p2-04
+  - ev-sorae-p2-06
+  - ev-sorae-p2-08
+  - ev-sorae-p2-09
+  - ev-sorae-p2-11
+  - ev-sorae-p2-12
+- id: A6-sorae-en
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: en
+  host: ''
+  query: mobile taps on 소래마켓 from July 12, 2026 to August 1, 2026
+  relevant: *id039
+- id: A6-sorae-ja
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: ja
+  host: ''
+  query: 2026年7月12日から2026年8月1日までの소래마켓のモバイルタッチ記録
+  relevant: *id039
+- id: A6-sorae-zh-hans
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: zh-hans
+  host: ''
+  query: 2026年7月12日到2026年8月1日期间소래마켓的手机触摸记录
+  relevant: *id039
+- id: A6-sorae-de
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: de
+  host: ''
+  query: mobile Touch-Eingaben bei 소래마켓 vom 12. Juli 2026 bis 1. August 2026
+  relevant: *id039
+- id: A6-sorae-fr
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: fr
+  host: ''
+  query: appuis mobiles sur 소래마켓 du 12 juillet 2026 au 1er août 2026
+  relevant: *id039
+- id: A6-sorae-es
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: es
+  host: ''
+  query: toques en el móvil en 소래마켓 del 12 de julio de 2026 al 1 de agosto de 2026
+  relevant: *id039
+- id: A6-sorae-it
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: it
+  host: ''
+  query: tocchi da mobile su 소래마켓 dal 12 luglio 2026 al 1 agosto 2026
+  relevant: *id039
+- id: A6-sorae-pt
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: pt
+  host: ''
+  query: toques no celular na 소래마켓 de 12 de julho de 2026 a 1 de agosto de 2026
+  relevant: *id039
+- id: A6-sorae-nl
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: nl
+  host: ''
+  query: mobiele tikken bij 소래마켓 van 12 juli 2026 tot 1 augustus 2026
+  relevant: *id039
+- id: A6-sorae-cs
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: cs
+  host: ''
+  query: dotyky na mobilu na 소래마켓 od 12. července 2026 do 1. srpna 2026
+  relevant: *id039
+- id: A6-sorae-ar
+  template: A6
+  kind: site+period+device
+  domain: analytic
+  shop: sorae
+  data_lang: ko
+  lang: ar
+  host: ''
+  query: لمسات الجوال على 소래마켓 من 12 يوليو 2026 إلى 1 أغسطس 2026
+  relevant: *id039

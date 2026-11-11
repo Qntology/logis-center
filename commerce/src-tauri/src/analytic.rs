@@ -2289,6 +2289,30 @@ pub fn season_range(season: &str, year: i32) -> Option<(i64, i64)> {
 ///    숫자가 든 청크 낱말은 근거로 쓰지 않습니다 (2026 → this_year 는 절대 기간 해석기 몫).
 /// 벡터만으로는 근거 없는 기간이 붙었습니다 (v2 행동 로그 질의 중 시간 낱말이 없는 60개 중 55개: "actions on Copperleaf" →
 /// 가을 cos 0.67, "UV-blocking parasol" → 여름, "bij" → 올해). 행동 로그는 기간이 틀리면 정답이 통째로 걸러집니다.
+/// 기간의 글자 근거가 될 수 없는 기능어 품사 (관계사 · 한정사 · 접속사 · 전치사 · 불변화사 · 대명사 · 문장 부호)
+pub const PERIOD_FUNCTION_TAGS: [&str; 7] = ["ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON", "DET"];
+
+/// 🌟 [PERIOD LEXICAL GATE / FUNCTION WORD] 기간 어휘 근거를 볼 글에서 뺄 라틴 문자 기능어 (소문자, 앞뒤 기호 뗌).
+/// 라틴 문자 낱말은 앞 글자 일치로 근거를 보는데(굴절 létě ↔ léto · jaře ↔ jaro), 영어 'that'(PRON)이 봄 구 낱말 'thaw' 와 앞 세 글자로
+/// 맞아 'visits on 소래마켓 that reached checkout but never paid' 에 가짜 봄 기간이 붙었습니다(v2 질의 A4 영어). 기능어는 기간을 말하지
+/// 않으므로 품사로 뺍니다 — 짧은 낱말을 완전 일치로만 받으면 체코어 굴절이 깨집니다. 한중일 · 아랍 문자는 글자 포함으로 보므로 그대로 둡니다.
+pub fn period_function_words<'a>(tagged: impl IntoIterator<Item = (&'a str, &'a str)>) -> std::collections::HashSet<String> {
+    tagged
+        .into_iter()
+        .filter(|(_, tag)| PERIOD_FUNCTION_TAGS.contains(tag))
+        .map(|(w, _)| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty() && w.chars().all(|c| c.is_alphabetic() && (c as u32) < 0x0250))
+        .collect()
+}
+
+/// 글에서 [`period_function_words`] 낱말을 뺍니다.
+pub fn strip_period_function_words(text: &str, function_words: &std::collections::HashSet<String>) -> String {
+    text.split_whitespace()
+        .filter(|w| !function_words.contains(&w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn period_lexical_support(chunk: &str, phrases: &[&str]) -> bool {
     let words = |s: &str| -> Vec<String> {
         s.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect()

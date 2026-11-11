@@ -2575,10 +2575,14 @@ impl crate::model::LogisModel {
                     !t.is_empty() && !verbal(w.trim_matches(|c: char| !c.is_alphanumeric())) && unquoted_query.contains(&t)
                 };
                 let period_phrases = crate::utils::ai_utils::filter_category_phrases(&["time_filters", "season_filters"]);
+                // 기능어('that' ≈ 'thaw')는 기간의 글자 근거가 아닙니다 (analytic::period_function_words 설명).
+                let period_function_words =
+                    crate::analytic::period_function_words(word_pos_map.iter().map(|(w, t)| (w.as_str(), t.as_str())));
+                let period_text = crate::analytic::strip_period_function_words(&unquoted_query, &period_function_words);
                 let period_supported = |cat: &str, key: &str| -> bool {
                     let phrases: Vec<&str> =
                         period_phrases.iter().filter(|(c, k, _)| c == cat && k == key).map(|(_, _, p)| p.as_str()).collect();
-                    crate::analytic::period_lexical_support(&unquoted_query, &phrases)
+                    crate::analytic::period_lexical_support(&period_text, &phrases)
                 };
                 let mut exact_season_key = String::new();
                 let mut exact_time_key = String::new();

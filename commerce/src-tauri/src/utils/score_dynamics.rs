@@ -1686,6 +1686,11 @@ pub fn adaptive_baseline_n(axis: &str) -> Option<(f32, f32, u64)> {
     )
 }
 
+/// 🌟 [SDS BAND / UPPER] 축 분포의 위쪽 경계: 평균 + k·σ. 표본이 트랙 하한에 못 미치면 None (상수 대신 이 스코프의 평소 띠).
+pub fn adaptive_upper_bound(axis: &str, k: f32) -> Option<f32> {
+    adaptive_baseline(axis).map(|(m, sd)| m + k * sd)
+}
+
 pub fn adaptive_recent(axis: &str) -> Option<(f32, f32, u64)> {
     resolve_entry(
         |st| st.baseline.get(axis),
@@ -1796,6 +1801,19 @@ pub fn effective_draws(category: &str) -> Option<f32> {
             let n_eff = (m * m / 2.0).exp().max(1.0);
             let cap = c.n_fields.max(1) as f64;
             Some((n_eff.min(cap) as f32, c.realized_max.n))
+        },
+    )
+}
+
+/// 🌟 [SDS BAND / COVERAGE] 카테고리 크롭의 커버리지 손실률 띠 (평균, σ, n). record_coverage_loss 가 1차 크롭마다 쌓은 분포입니다.
+/// 이 스코프(서식 코드)의 표본이 트랙 하한에 못 미치면 None.
+pub fn spatial_coverage_band(category: &str) -> Option<(f32, f32, u64)> {
+    resolve_entry(
+        |st| st.spatial.get(category),
+        SpatialStat::merge_from,
+        |s| {
+            let w = &s.coverage_loss;
+            Some(((w.mean as f32, w.sd() as f32, w.n), w.n))
         },
     )
 }

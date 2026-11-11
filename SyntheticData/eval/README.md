@@ -8,7 +8,9 @@
 |---|---|
 | `make_plan.py` | 평가 계획(JSONL). 커머스 페이지 · 무역 문서 · 페이지 이미지 · 검색 질의 · 정답 레코드 색인 |
 | `run_eval.bat` | ROCm 테스트 바이너리 실행. 실험마다 `%LOCALAPPDATA%\logis-center-eval\<이름>` 을 씁니다 |
-| `rasterize_trading.py` | 무역 PDF → 페이지 PNG + 단어 위치. 앱은 PDF 를 이미지로 바꾸지 않으므로 SigLIP2 경로를 재려면 필요합니다 |
+| `rasterize_trading.py` | 무역 PDF → 페이지 PNG + 단어 위치. 앱은 PDF 를 이미지로 바꾸지 않으므로 SigLIP2 경로를 재려면 필요합니다. 렌더러는 pypdfium2(BSD-3-Clause / Apache-2.0) — 예전 PyMuPDF(AGPL-3.0)는 쓰지 않습니다 |
+| `make_vision_cases.py` | 비전 게이트 합성 평가 세트: 페이지에 열화(흐림 · 도장 · 잉크 얼룩 · 서명 획)를 입힌 출처 판독성 사례, 인명 잔해('-Jane'), 11개 언어 팩(`trading/ml/packs`)의 인쇄 라벨 → 축 |
+| `score_vision_gates.py` | 위 세트의 채점: 판독성 게이트 재현율 · 오폐기율, 라벨 라우팅 정답률, 인명 잔해 |
 | `score_pages.py` | 페이지 유형 · 목록/상세 판정 (실행 로그에서 읽음) |
 | `score_commerce.py` · `score_trading.py` | 저장된 아이템과 정답 비교. `score_commerce.py --pool` 은 `{"id":"dump","kind":"dump"}` 계획으로 남긴 저장소 끝 상태로 찾습니다. 상세가 앞서 저장된 목록 문서에 합쳐지면 그 페이지의 결과에는 아이템이 남지 않기 때문입니다 |
 | `score_vision.py` | SigLIP2 서식 판정 · 크롭 커버리지 |
@@ -63,6 +65,29 @@ python score_search.py mlship12_out.jsonl 무역추출결과.jsonl --domain ship
 평가 폴더에는 `models` 만 앱 데이터의 모델 폴더로 연결하고 DB · SDS 원장은 새로 쌓습니다. 앱 데이터(`%LOCALAPPDATA%\logis-center`)의 DB 와 원장은 바뀌지 않습니다. 모델은 앱의 다운로드 로직으로 받습니다. 언어 전용 4B 모델은 계획에 `{"id":"fetch","kind":"lang_engine","lang":"korean"}` 한 줄을 두면 앱의 `await_engine` 이 받습니다.
 
 `run_eval.bat` 은 실행 중에 고치지 않습니다. cmd 는 배치 파일을 바이트 위치로 읽어서, 고치면 다음 줄을 잘못 읽습니다.
+
+### 비전 게이트 (SigLIP2 경로, 합성 열화)
+
+전체 이미지 추출(크롭마다 언어 모델)은 쪽당 5~25분이라, 읽은 값을 받을지 정하는 게이트만 실제 함수로 잽니다.
+
+```bat
+python rasterize_trading.py pages                                   & rem 영어 45건
+python rasterize_trading.py pages_ml ..\trading\ml\output_pdfs      & rem 11개 언어 55건
+python make_vision_cases.py pages pages_ml cases
+run_eval.bat 실험이름 gates cases gates_block.jsonl gates.log block   & rem 출처 상자 = 카테고리 크롭 (line = 값 줄 ±1줄)
+run_eval.bat 실험이름 names cases names_out.jsonl names.log
+run_eval.bat 실험이름 labels cases labels_out.jsonl labels.log cpu
+python score_vision_gates.py legibility gates_block.jsonl
+python score_vision_gates.py names cases\names.jsonl names_out.jsonl
+python score_vision_gates.py labels labels_out.jsonl
+```
+
+- `gates` 는 모델 가중치 없이 판독성 지도(build_legibility_map)와 verify_claims_v2 만 돕니다. SDS 기준선은 서식 코드마다 calib 쪽(열화 없음)으로
+  쌓고, 평가 사례는 사례마다 따로 된 하위 스코프에서 판정해 calib 기준선만 봅니다.
+- `labels` 는 granite 로 앱과 같은 라벨 뱅크를 세웁니다. `LOGIS_SYNTH_SEED_CONFUSION=1` 이면 라벨마다 1 · 2위 축 쌍을 혼동 사전에 미리 적는
+  상한 측정입니다.
+- 크롭 하한(분할 크롭)은 `vision` 모드(vision_probe)로 크롭 계획을 남기고 `score_vision.py` 로 정답 값이 크롭 안에 드는지 봅니다.
+  `LOGIS_SYNTH_LIST` 로 쪽 순서(기준선을 쌓을 쪽 먼저)를 정합니다. `LOGIS_SYNTH_CPU=1` 은 CPU 로 돌지만 첫 쪽 구 인코딩만 수십 분이라 GPU 를 씁니다.
 
 ## 분할
 

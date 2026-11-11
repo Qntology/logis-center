@@ -617,6 +617,34 @@ pub fn phonetic_value_hit(spans: &[String], value: &str) -> Option<(String, f32)
     best
 }
 
+/// 무역 서식의 품목 이름들 (정규화): description · description_of_goods 를 ' / ' 로 나눈 것과 품목 행(items · line_items)의 설명.
+/// 끝의 품목 번호 괄호('Handheld mini fan (KR20287)')는 뗍니다.
+pub fn trade_item_names(doc: &Value) -> Vec<String> {
+    let mut raw: Vec<String> = Vec::new();
+    for k in ["description", "description_of_goods"] {
+        raw.extend(text_of(doc.get(k)).split(" / ").map(String::from));
+    }
+    for arr in ["items", "line_items"] {
+        for it in doc.get(arr).and_then(|v| v.as_array()).into_iter().flatten() {
+            for k in ["description", "description_of_goods", "item_name"] {
+                raw.push(text_of(it.get(k)));
+            }
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for r in raw {
+        let base = match (r.rfind('('), r.ends_with(')')) {
+            (Some(p), true) => r[..p].trim().to_string(),
+            _ => r.trim().to_string(),
+        };
+        let n = norm_text(&base);
+        if !n.is_empty() && !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
 pub async fn trade_relation_join(
     store: &VectorStore,
     results: &mut Vec<Value>,
@@ -714,6 +742,7 @@ pub async fn trade_relation_join(
     let query_norm = norm_text(query);
     let pspans = phonetic_spans(query);
     let mut phonetic: HashMap<String, Option<(String, f32)>> = HashMap::new();
+    let mut item_anchors = 0usize;
     for (i, (_, d)) in docs.iter().enumerate() {
         let hit = ["pol", "pod", "sender_name", "recipient_name", "vessel"].iter().any(|k| {
             let v = text_of(d.get(*k));
@@ -726,12 +755,22 @@ pub async fn trade_relation_join(
             }
             phonetic.entry(head.clone()).or_insert_with(|| phonetic_value_hit(&pspans, &head)).is_some()
         });
-        if hit {
+        // 🌟 [ITEM ANCHOR] 품목 이름이 질의에 그대로 나오는 서식 ('세라믹 식칼 품목이 실린 선하증권'). 값 고정점이 항구 · 당사자 · 선박만 보아
+        //    v2 질의 R6 한국어는 저장 품목 이름이 질의에 그대로 있는데도 고정점이 없었습니다 (MRR 0.17). 글자 일치만 씁니다 — 번역된
+        //    품목 이름은 임베딩으로 판별되지 않았습니다 (탐침: 열 센터링을 해도 맞는 품목이 1위가 아님).
+        let item_hit = !hit && trade_item_names(d).iter().any(|n| name_like(n) && contains_value(&query_norm, n));
+        if hit || item_hit {
             anchors += 1;
+            if item_hit {
+                item_anchors += 1;
+            }
             if wants(d) {
                 tiered.push((2, i));
             }
         }
+    }
+    if item_anchors > 0 {
+        emit(&format!("[AI-SEARCH] 🧭 [ITEM ANCHOR] 질의에 그대로 나온 품목 이름을 가진 서식 {}건을 고정점으로 씁니다.", item_anchors));
     }
     let heard: Vec<String> = phonetic
         .iter()

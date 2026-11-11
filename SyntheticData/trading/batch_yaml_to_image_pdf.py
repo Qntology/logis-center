@@ -10,8 +10,8 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 
-import fitz          # PyMuPDF  (pip install PyMuPDF)
-from PIL import Image # Pillow   (pip install Pillow)
+import pypdfium2 as pdfium  # PDFium  (pip install pypdfium2 — BSD-3-Clause / Apache-2.0; 예전 PyMuPDF 는 AGPL-3.0)
+from PIL import Image       # Pillow  (pip install Pillow)
 
 
 # ──────────────────────────────────────────────
@@ -86,19 +86,18 @@ def build_text_pdf_bytes(data, font_name: str) -> bytes:
 # 4. 텍스트 PDF → 고해상도 이미지 리스트
 # ──────────────────────────────────────────────
 def pdf_bytes_to_images(pdf_bytes: bytes, dpi: int = 200) -> list[Image.Image]:
-    """PyMuPDF로 각 페이지를 렌더링하여 PIL Image 리스트 반환"""
+    """PDFium(pypdfium2)으로 각 페이지를 렌더링하여 PIL Image 리스트 반환"""
     images: list[Image.Image] = []
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pdf = pdfium.PdfDocument(pdf_bytes)
 
     zoom = dpi / 72  # 72 dpi가 PDF 기본 단위
-    mat = fitz.Matrix(zoom, zoom)
 
-    for page in doc:
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        images.append(img)
+    for i in range(len(pdf)):
+        page = pdf[i]
+        images.append(page.render(scale=zoom).to_pil().convert("RGB"))
+        page.close()
 
-    doc.close()
+    pdf.close()
     return images
 
 

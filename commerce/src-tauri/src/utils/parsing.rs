@@ -1626,6 +1626,15 @@ pub fn is_printed_label_echo(value: &str, doc_lang: &str) -> bool {
     })
 }
 
+/// 값이 이 열(`column`, TRADE_COLUMN_ALIASES 의 열 이름)의 머리말 별칭과 글자가 같은가 (is_printed_label_echo 와 같은 접기 · 언어 규칙).
+pub fn is_column_alias_of(column: &str, value: &str, doc_lang: &str) -> bool {
+    let norm = fold_column_label(value);
+    !norm.is_empty()
+        && TRADE_COLUMN_ALIASES.iter().filter(|(c, _)| *c == column).any(|(_, aliases)| {
+            aliases.iter().any(|a| alias_lang_matches(a, doc_lang) && fold_column_label(a) == norm)
+        })
+}
+
 pub fn is_printed_label_fragment(value: &str, doc_lang: &str) -> bool {
     fn weight(s: &str) -> usize {
         s.chars()

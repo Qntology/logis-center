@@ -50,6 +50,9 @@ const RESCUE_SPLIT_PASSES: usize = 4;
 const RESCUE_OWNER_MIN_SHARE: f32 = 0.20;
 
 const SPLIT_COVERAGE_FLOOR: f32 = 0.70;
+/// 동적 분할 하한의 묶음 범위 (SDS 띠가 극단일 때 0.70 기준에서 너무 멀어지지 않게)
+const SPLIT_FLOOR_MIN: f32 = 0.50;
+const SPLIT_FLOOR_MAX: f32 = 0.90;
 const SPLIT_CROP_LIMIT: usize = 2;
 const SPLIT_MIN_HOT: usize = 8;
 const SPLIT_MIN_GAIN: usize = 4;
@@ -1172,6 +1175,17 @@ pub fn clamp_text_height(
     median
 }
 
+/// 🌟 [SPLIT FLOOR / SDS] 분할 크롭 하한: 이 카테고리의 1차 크롭 커버리지 손실이 평소 띠 위쪽(평균 + 2σ)보다 클 때만 분할합니다
+/// → 하한 = 1 − (μ + 2σ), [`SPLIT_FLOOR_MIN`, `SPLIT_FLOOR_MAX`] 로 묶음. 띠가 없으면(이 서식 코드의 표본이 비전 트랙 하한 미만)
+/// 예전 상수 [`SPLIT_COVERAGE_FLOOR`].
+///  히트맵이 늘 넓게 퍼지는 카테고리(손실이 평소에 큼)는 덜 쪼개고, 늘 좁게 모이는 카테고리는 평소보다 조금만 잘려도 쪼갭니다.
+pub fn split_coverage_floor(band: Option<(f32, f32, u64)>) -> f32 {
+    match band {
+        Some((m, sd, _)) if m.is_finite() && sd.is_finite() => (1.0 - (m + 2.0 * sd)).clamp(SPLIT_FLOOR_MIN, SPLIT_FLOOR_MAX),
+        _ => SPLIT_COVERAGE_FLOOR,
+    }
+}
+
 pub fn plan_crops(
     heatmaps: &[CategoryHeatmap],
     grid: &PatchGrid,
@@ -1184,6 +1198,11 @@ pub fn plan_crops(
     if heatmaps.is_empty() || grid.len() == 0 {
         return Vec::new();
     }
+    // 분할 하한은 이 쪽의 1차 크롭이 커버리지 손실을 기록하기 전에 읽습니다(자기 관측이 자기 기준선에 섞이지 않게).
+    let split_floors: Vec<(String, f32)> = heatmaps
+        .iter()
+        .map(|h| (h.category.clone(), split_coverage_floor(crate::utils::score_dynamics::spatial_coverage_band(&h.category))))
+        .collect();
 
     let rows = grid.grid_rows;
     let cols = grid.grid_cols;
@@ -1693,7 +1712,11 @@ pub fn plan_crops(
                 continue;
             }
             let ratio = covered as f32 / hot as f32;
-            if ratio >= SPLIT_COVERAGE_FLOOR {
+            let floor = split_floors.iter().find(|(c, _)| c == cat).map(|(_, f)| *f).unwrap_or(SPLIT_COVERAGE_FLOOR);
+            if floor != SPLIT_COVERAGE_FLOOR {
+                crate::utils::score_dynamics::record_baseline("vision.split_floor", floor);
+            }
+            if ratio >= floor {
                 continue;
             }
 
@@ -1744,10 +1767,11 @@ pub fn plan_crops(
                 }
                 acc += gain;
                 emit(&format!(
-                    "    ➕ [SPLIT CROP] '{}' 커버리지 {:.0}% < {:.0}% — 배정받지 못한 자기 영역 grid(r{}~{}, c{}~{}) 를 크롭으로 하나 더 만듭니다. → px({},{})-({},{}) | 신규 커버 {}칸 | 판독 가능 {} | 누적 {:.0}%",
+                    "    ➕ [SPLIT CROP] '{}' 커버리지 {:.0}% < {:.0}%{} — 배정받지 못한 자기 영역 grid(r{}~{}, c{}~{}) 를 크롭으로 하나 더 만듭니다. → px({},{})-({},{}) | 신규 커버 {}칸 | 판독 가능 {} | 누적 {:.0}%",
                     cat,
                     ratio * 100.0,
-                    SPLIT_COVERAGE_FLOOR * 100.0,
+                    floor * 100.0,
+                    if floor != SPLIT_COVERAGE_FLOOR { "(SDS 손실 띠)" } else { "" },
                     gboxes[gi].0, gboxes[gi].1, gboxes[gi].2, gboxes[gi].3,
                     bbox.0, bbox.1, bbox.2, bbox.3,
                     gain, lg,

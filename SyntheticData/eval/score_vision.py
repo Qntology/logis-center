@@ -73,6 +73,7 @@ def main() -> int:
     cover = Counter()
     per_cat = defaultdict(Counter)
     plan_sizes = []
+    crop_counts = []
     for r in rows:
         stem, page = r["page"].rsplit("_p", 1)
         if stem not in docs:
@@ -88,6 +89,7 @@ def main() -> int:
         words = meta["words"]
         area = meta["width"] * meta["height"]
         plans = r["plans"]
+        crop_counts.append(len(plans))
         plan_sizes.append(sum((p["bbox"][2] - p["bbox"][0]) * (p["bbox"][3] - p["bbox"][1]) for p in plans) / area)
         for field, values in doc["truth"].items():
             cat = cats.get(field)
@@ -112,7 +114,7 @@ def main() -> int:
     print("예측 분포", Counter(x["code"] for x in first).most_common(8))
     if cover["값"]:
         print(f"크롭 커버리지 값 {cover['값']}개 | 어느 크롭 {cover['어느 크롭'] / cover['값']:.1%} | 자기 카테고리 크롭 {cover['자기 카테고리 크롭'] / cover['값']:.1%}")
-    print(f"페이지 대비 크롭 면적 합 평균 {sum(plan_sizes) / max(1, len(plan_sizes)):.2f}")
+    print(f"페이지 대비 크롭 면적 합 평균 {sum(plan_sizes) / max(1, len(plan_sizes)):.2f} | 페이지당 크롭 {sum(crop_counts) / max(1, len(crop_counts)):.2f}개")
     for cat, c in sorted(per_cat.items()):
         print(f"  {cat:14s} {c['hit']:4d}/{c['값']:4d} = {c['hit'] / max(1, c['값']):.1%}")
     if a.dump:
