@@ -121,6 +121,13 @@ fn query_language_ignores_quoted_and_embedded_names() {
     assert_eq!(detect_query_lang("在こもれび商店商品详情页更改选项的记录", "korean"), Some("zh-hans"));
     assert_eq!(detect_query_lang("株式会社ひなた工房发运的提单", "korean"), Some("zh-hans"));
     assert_eq!(detect_query_lang("在소래마켓进入结算页面却没有付款的记录", "korean"), Some("zh-hans"));
+    // 짧은 로망스어 문장(낱말 셋) 속 두 어절 한자 이름: 문장 낱말이 이름 어절보다 많으면 이름을 빼고 정합니다 (예전엔 중국어로 판정, v2 C8)
+    assert_eq!(detect_query_lang("productos que 加藤 芽依 reseñó", "korean"), Some("es"));
+    // 가나 없는 한자만: 일본어 신자체(気 · 圧)가 간체보다 많으면 일본어 (앱 언어가 일본어가 아니어도), 간체가 많으면 중국어
+    assert_eq!(detect_query_lang("主蒸気圧力", "korean"), Some("ja"));
+    assert_eq!(detect_query_lang("货物的保险单", "korean"), Some("zh-hans"));
+    // 숫자가 든 번호의 로마자는 문장 언어가 아님 (아랍어 문장 + 서류 번호)
+    assert_eq!(detect_query_lang("مستندات BL-DE-260911", "korean"), Some("ar"));
 }
 
 /// 배포 사전(full-bias)의 언어 구역 낱말 투표: whatlang 이 짧은 질의에서 틀리던 라틴 언어 질의 (v2 질의; fr → es, en → de,
@@ -138,9 +145,41 @@ fn latin_queries_vote_with_dictionary_sections() {
         ("met welk cognossement is Keramisch koksmes verscheept?", "nl"),
         // 근거 낱말이 쇼핑몰 이름 하나(goods)뿐이면 투표하지 않습니다
         ("aggiunte al carrello su Copperleaf Goods", "it"),
+        // 표가 한 언어에 하나뿐이어도 그 언어 구역에만 있는 긴 소문자 낱말(prodotti)이면 그 언어, 이름 줄(Felix Wagner)은 세지 않음:
+        // 예전엔 whatlang 이 pt 로 (v2 C3-kranich-es · C8-sorae-it · C8-komorebi-it)
+        ("prodotti recensiti da 이예준", "it"),
+        ("productos que pidió Felix Wagner", "es"),
+        ("produtos que Felix Wagner encomendou", "pt"),
+        ("prodotti recensiti da 加藤 芽依", "it"),
+        // 이름 줄(Copperleaf Goods)을 빼면 영어 근거가 add 하나라 투표하지 않고 whatlang 이 정함
+        ("add-to-cart actions on Copperleaf Goods", "en"),
     ] {
         assert_eq!(detect_query_lang(q, "korean"), Some(want), "{q}");
     }
+}
+
+/// 질의 목록(JSONL 의 id · query, `LOGIS_LANG_LIST`, 여러 파일은 `;`)마다 판정 언어를 찍고 id 끝 언어와 대조합니다 (v2 N:N 질의 전체 확인용).
+#[test]
+#[ignore = "진단 (LOGIS_LANG_LIST)"]
+fn print_query_languages() {
+    let Ok(list) = std::env::var("LOGIS_LANG_LIST") else {
+        return;
+    };
+    let (mut ok, mut n) = (0, 0);
+    for path in list.split(';').filter(|p| !p.trim().is_empty()) {
+        for line in std::fs::read_to_string(path.trim()).unwrap().lines().filter(|l| !l.trim().is_empty()) {
+            let v: Value = serde_json::from_str(line).unwrap();
+            let (id, q) = (v["id"].as_str().unwrap_or(""), v["query"].as_str().unwrap_or(""));
+            let want = tauri_app_lib::stanza::LANGS.iter().copied().filter(|l| id.ends_with(&format!("-{l}"))).max_by_key(|l| l.len());
+            let got = detect_query_lang(q, "korean");
+            n += 1;
+            if got == want {
+                ok += 1;
+            }
+            println!("@@LANG {id}\t{}\t{}\t{}\t{q}", want.unwrap_or("-"), got.unwrap_or("-"), if got == want { "ok" } else { "MISS" });
+        }
+    }
+    println!("@@LANG 언어 판정 {ok}/{n}");
 }
 
 #[test]

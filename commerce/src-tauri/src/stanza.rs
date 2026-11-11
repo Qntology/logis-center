@@ -117,17 +117,31 @@ fn collect_vocab(v: &Value, out: &mut HashSet<String>) {
 
 /// 라틴 문자 질의의 사전 투표: 질의 낱말이 든 언어 구역마다 1 / (그 낱말이 든 구역 수)를 더해, 1위 언어의 낱말이 둘 이상이고
 /// 2위보다 1 이상 앞설 때만 그 언어입니다. whatlang 은 짧은 질의에서 cs → pt · nl → fr · de → en · fr → es 로 자주 틀렸습니다
-/// (v2 질의 라틴 8개 언어 184개 중 16개). 투표가 그중 9개를 바로잡고 새로 틀린 것은 없었습니다 (쇼핑몰 이름 Copperleaf Goods 의
-/// goods 처럼 낱말 하나뿐인 근거는 쓰지 않습니다).
+/// (v2 질의 라틴 8개 언어 184개 중 16개). 투표가 그중 9개를 바로잡고 새로 틀린 것은 없었습니다.
+///
+/// 이름 줄(문장 처음이 아닌 곳에서 대문자로 시작하는 낱말이 둘 이상 이어진 것: 고객 Felix Wagner · 쇼핑몰 Copperleaf Goods)은 세지 않습니다.
+/// 사전 구역에는 예시 이름도 들어 있어 'wagner' 가 독일어 표를 받았습니다 (productos que pidió Felix Wagner → whatlang 이 pt).
+/// 표가 한 언어에만 하나 있을 때는, 그 낱말이 그 언어 구역에만 그대로 있는 여섯 글자 이상 소문자 낱말이면 그 언어입니다
+/// (prodotti recensiti da 이예준 의 prodotti → it, whatlang 은 pt). 굴절 꼴 맞추기는 이 사전에서 로망스어끼리 엇갈려
+/// (incluían → 포르투갈어 incluído, contenant → 영어 contents) 넣지 않았습니다 — v2 질의 468개로 잼 (blueprint-sandbox 의 작은 도메인 사전과 다름).
 fn latin_vocab_vote(text: &str) -> Option<&'static str> {
     let vocab = LATIN_VOCAB.as_ref()?;
+    let names = name_words(text);
     let mut score: Vec<(&'static str, f32, usize)> = LATIN_LANGS.iter().map(|(_, c)| (*c, 0.0, 0)).collect();
     let mut seen: HashSet<String> = HashSet::new();
-    for w in vocab_words(text) {
+    let mut sole: Option<&'static str> = None;
+    for raw in text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        if raw.chars().count() < 3 || raw.chars().any(|c| c.is_numeric() || c == '_') || names.contains(&raw) {
+            continue;
+        }
+        let w = raw.to_lowercase();
         if !seen.insert(w.clone()) {
             continue;
         }
         if let Some(owners) = vocab.get(&w) {
+            if owners.len() == 1 && raw == w && w.chars().count() >= 6 && sole.is_none() {
+                sole = Some(owners[0]);
+            }
             for s in score.iter_mut().filter(|s| owners.contains(&s.0)) {
                 s.1 += 1.0 / owners.len() as f32;
                 s.2 += 1;
@@ -136,7 +150,33 @@ fn latin_vocab_vote(text: &str) -> Option<&'static str> {
     }
     score.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let (top, first, hits) = score[0];
-    (hits >= 2 && first - score[1].1 >= 0.999).then_some(top)
+    if hits >= 2 && first - score[1].1 >= 0.999 {
+        return Some(top);
+    }
+    (hits == 1 && score[1].1 == 0.0 && sole == Some(top)).then_some(top)
+}
+
+/// 이름 줄의 낱말 (원문 꼴): 문장 처음이 아닌 곳에서 대문자로 시작하는 낱말(전부 대문자인 약어는 아님)이 둘 이상 이어진 것.
+/// 독일어 명사처럼 따로 선 대문자 낱말(Artikel der Aktion 의 Aktion)은 이름이 아닙니다.
+fn name_words(text: &str) -> HashSet<&str> {
+    let capital = |t: &str| {
+        let mut cs = t.chars();
+        cs.next().is_some_and(|c| c.is_uppercase()) && (t.chars().count() == 1 || cs.any(|c| c.is_lowercase()))
+    };
+    let tokens: Vec<&str> = text.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty() && t.chars().all(|c| c.is_alphabetic())).collect();
+    let mut out = HashSet::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let mut j = i;
+        while j < tokens.len() && capital(tokens[j]) {
+            j += 1;
+        }
+        if j - i >= 2 && i > 0 {
+            out.extend(&tokens[i..j]);
+        }
+        i = j.max(i + 1);
+    }
+    out
 }
 
 fn is_latin_letter(c: char) -> bool {
@@ -250,6 +290,11 @@ pub fn quoted_token_flags(query: &str, tokens: &[String]) -> Vec<bool> {
 /// 일본어 이름(こもれび商店 · 株式会社ひなた工房)이 든 중국어 문장인지 가립니다.
 const SIMPLIFIED_ONLY: &str = "单发运购订货车录页选结进领优费详记关实东们这么吗呢给让说话时间门问题对应开买卖务产业场报价钱银账码张网认证书动华汇过还达递邮输转统计设备线级类样历现为处见观视规则质从项阳伞";
 
+/// 일본어 신자체에만 쓰는 한자: 간체와도 번체와도 모양이 다른 것 (気 ↔ 气 · 氣, 圧 ↔ 压 · 壓, 図 ↔ 图 · 圖, 発 ↔ 发 · 發 …).
+/// 가나 없이 한자만 쓴 질의가 일본어인지 정할 때 간체 전용 한자 수와 비교합니다. 번체와 같은 글자(風 · 機 · 熱)는 넣지 않습니다 —
+/// 번체 중국어 질의(앱은 zh-hans 로 처리)가 일본어로 판정되지 않게.
+const KANJI_NOT_SIMPLIFIED: &str = "気圧弁変発図転関検験続価売読様鉄総録駅険済戦単囲伝両歓観証豊軽辺銭帰広拡処歯恵団児浄渋猟獣稲穂穏粋継絵緑縁縄繊聴臓舎薬蔵覧訳謡譲賛酔醸釈鋳錬隠雑霊頼顕駆騒髄髪鶏黒黙齢";
+
 /// 라틴 · 아랍 문장에 든 한중일 이름 어절을 뺀 글. 문장 낱말(숫자 · 대문자 약어 · 코드를 뺀 라틴 · 아랍 낱말)이
 /// 셋 이상이고 한중일 글자가 든 어절의 두 배 이상일 때만 뺍니다 (products 이예준 wrote a review for →
 /// products wrote a review for). 한국어 · 일본어 문장에 든 영어 이름(Felix Wagner 고객이 …)은 그대로 둡니다.
@@ -276,7 +321,10 @@ fn drop_cjk_names(text: &str) -> String {
         }
     }
     let sentence_words = latin_words.max(arabic_words);
-    if cjk_tokens > 0 && sentence_words >= 3 && sentence_words >= 2 * cjk_tokens {
+    // 문장 낱말이 셋 이상이고 한중일 어절의 두 배 이상, 또는 셋 이상이고 한중일 어절보다 많을 때. 뒤 조건은 짧은 로망스어 문장 속 두 어절
+    // 이름(productos que 加藤 芽依 reseñó · prodotti recensiti da 加藤 芽依: 문장 낱말 3 · 이름 어절 2)이 중국어로 판정되던 것 (blueprint-sandbox
+    // 다국어 검색에서 같은 규칙을 다듬으며 찾음). 한국어 · 일본어 문장 속 영어 이름(Felix Wagner 고객이 주문한 …)은 한중일 어절이 더 많아 그대로입니다.
+    if cjk_tokens > 0 && sentence_words >= 3 && (sentence_words >= 2 * cjk_tokens || sentence_words > cjk_tokens) {
         tokens.into_iter().filter(|t| !has_cjk(t)).collect::<Vec<_>>().join(" ")
     } else {
         text.to_string()
@@ -298,15 +346,20 @@ pub fn detect_query_lang(query: &str, ui_language: &str) -> Option<&'static str>
     let text = drop_cjk_names(&strip_quoted(query));
     let query = text.as_str();
     let (mut hangul, mut kana, mut han, mut arabic, mut latin, mut other) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-    for c in query.chars() {
-        match Script::of(c) {
-            Some(Script::Hangul) => hangul += 1,
-            Some(Script::Kana) => kana += 1,
-            Some(Script::Han) => han += 1,
-            Some(Script::Arabic) => arabic += 1,
-            Some(Script::Latin) => latin += 1,
-            Some(Script::Other) => other += 1,
-            None => {}
+    for word in query.split_whitespace() {
+        // 숫자가 든 낱말(서류 번호 BL-DE-260911 · 주문 번호 · 코드)의 로마자는 문장 언어가 아님 (blueprint-sandbox: 10LABI0AA102 عالق 이 라틴 문자로 판정되던 것)
+        let id_like = word.chars().any(|c| c.is_ascii_digit());
+        for c in word.chars() {
+            match Script::of(c) {
+                Some(Script::Hangul) => hangul += 1,
+                Some(Script::Kana) => kana += 1,
+                Some(Script::Han) => han += 1,
+                Some(Script::Arabic) => arabic += 1,
+                Some(Script::Latin) if !id_like => latin += 1,
+                Some(Script::Latin) => {}
+                Some(Script::Other) => other += 1,
+                None => {}
+            }
         }
     }
     // 어절 끝 한중일 글자의 문자 체계: 한국어는 조사 · 어미가 어절 끝에 붙습니다 (…工房에서 · Goods에서)
@@ -326,8 +379,15 @@ pub fn detect_query_lang(query: &str, ui_language: &str) -> Option<&'static str>
         return Some(if simplified >= 2 { "zh-hans" } else { "ja" });
     }
     if han > 0 {
-        // 가나 없는 한자만: 앱 언어가 일본어면 일본어, 아니면 중국어
-        return Some(if lang_code(ui_language) == Some("ja") { "ja" } else { "zh-hans" });
+        // 가나 없는 한자만: 앱 언어가 일본어면 일본어. 아니면 일본어 신자체에만 쓰는 한자(気 · 圧 · 弁 · 発 …)가 간체 전용 한자보다 많으면
+        // 일본어, 아니면 중국어 (blueprint-sandbox 다국어 검색: 主蒸気圧力 이 앱 언어가 일본어가 아닐 때 중국어로 판정되던 것).
+        // 번체와 같은 글자만 쓴 질의(誘引通風機)는 가릴 근거가 없어 예전처럼 중국어입니다.
+        if lang_code(ui_language) == Some("ja") {
+            return Some("ja");
+        }
+        let ja_sig = query.chars().filter(|c| KANJI_NOT_SIMPLIFIED.contains(*c)).count();
+        let zh_sig = query.chars().filter(|c| SIMPLIFIED_ONLY.contains(*c)).count();
+        return Some(if ja_sig > zh_sig { "ja" } else { "zh-hans" });
     }
     if arabic > 0 && arabic >= latin {
         return Some("ar");
