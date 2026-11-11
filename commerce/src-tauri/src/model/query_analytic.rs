@@ -203,6 +203,8 @@ impl crate::model::LogisModel {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
+        // 기간 어휘 근거(PERIOD LEXICAL GATE)는 기능어로 서지 않습니다 ('that' ≈ 'thaw' — analytic::period_function_words 설명).
+        let period_function_words = crate::analytic::period_function_words(tokens.iter().map(|(w, t, _)| (w.as_str(), t.as_str())));
         let (det_time_key, det_season_key) = if verbal_words.is_empty() || (det_time_key.is_empty() && det_season_key.is_empty()) {
             (det_time_key, det_season_key)
         } else {
@@ -533,7 +535,8 @@ impl crate::model::LogisModel {
                 // 🌟 [PERIOD LEXICAL GATE] 기간(시간 · 계절)은 청크 낱말이 그 키의 구 낱말을 품을 때만 후보가 됩니다.
                 if ck.0 == "time_filters" || ck.0 == "season_filters" {
                     let phrases: Vec<&str> = idxs.iter().filter_map(|&i| bank_defs.get(i).map(|d| d.2.as_str())).collect();
-                    if !crate::analytic::period_lexical_support(&not_verbal(&chunk_texts[ci]), &phrases) {
+                    let period_text = crate::analytic::strip_period_function_words(&not_verbal(&chunk_texts[ci]), &period_function_words);
+                    if !crate::analytic::period_lexical_support(&period_text, &phrases) {
                         period_unsupported += 1;
                         continue;
                     }

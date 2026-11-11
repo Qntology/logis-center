@@ -4,8 +4,8 @@
 
 use serde_json::{json, Value};
 use tauri_app_lib::analytic::{
-    evidence_visits, in_evidence_visit, negated_conditions, page_kind_of, page_kinds_in_query, period_lexical_support, record_window,
-    url_host_path, NegatedConditions, VISIT_IDLE_MS,
+    evidence_visits, in_evidence_visit, negated_conditions, page_kind_of, page_kinds_in_query, period_function_words, period_lexical_support,
+    record_window, strip_period_function_words, url_host_path, NegatedConditions, VISIT_IDLE_MS,
 };
 use tauri_app_lib::stanza::quoted_token_flags;
 use tauri_app_lib::utils::ai_utils::closed_tail_lemma;
@@ -83,6 +83,23 @@ fn period_needs_a_period_word_in_the_chunk() {
     assert!(!period_lexical_support("bij", &this_year));
     assert!(!period_lexical_support("2026", &this_year), "숫자는 절대 기간 해석기 몫");
     assert!(period_lexical_support("올해는", &this_year));
+}
+
+/// 기능어는 기간의 글자 근거가 아닙니다: 영어 'that'(PRON)이 봄 구 낱말 'thaw' 와 앞 세 글자로 맞아 가짜 봄 기간이 붙었습니다(v2 질의 A4 영어).
+/// 품사로 빼므로 내용어의 굴절 일치(체코어 létě ↔ léto)는 그대로입니다.
+#[test]
+fn function_words_are_not_period_evidence() {
+    let spring = ["spring", "springtime", "vernal equinox", "blooming", "flowers", "sprout", "thaw", "rebirth", "blossom"];
+    let summer = ["summer", "léto"];
+    let tagged = [("visits", "NOUN"), ("on", "ADP"), ("소래마켓", "NUM"), ("that", "PRON"), ("reached", "VERB"), ("checkout", "NOUN"), ("but", "CCONJ")];
+    let fw = period_function_words(tagged.iter().copied());
+    assert!(fw.contains("that") && fw.contains("on") && !fw.contains("checkout") && !fw.contains("소래마켓"), "{fw:?}");
+    let chunk = "on 소래마 that";
+    assert!(period_lexical_support(chunk, &spring), "고치기 전: 'that' 이 'thaw' 근거로 읽힘");
+    assert!(!period_lexical_support(&strip_period_function_words(chunk, &fw), &spring));
+    let cs = period_function_words([("v", "ADP"), ("létě", "NOUN")]);
+    assert!(period_lexical_support(&strip_period_function_words("v létě", &cs), &summer), "내용어 굴절은 그대로");
+    assert!(period_function_words([("の", "ADP"), ("이번", "DET")]).is_empty(), "한중일 · 한글 기능어는 글자 포함 규칙이라 빼지 않음");
 }
 
 /// 따옴표 안 낱말 표시: 이름('Summer getaway picks')은 기간 · 이벤트 청크로 올리지 않고 키워드로만 남깁니다.
