@@ -1800,14 +1800,31 @@ impl LogisModel {
     pub async fn ensure_siglip2_ext(&self, needs_vision: bool, needs_text: bool) -> anyhow::Result<()> {
         let dir = std::path::PathBuf::from(&self.siglip2_model_path);
         let dev = self.device_config.device.clone();
-        let dtype = if self.is_cpu_mode || dev.is_vulkan() {
+        // 🌟 [PYRAMID-QUANT] GPU 는 계획의 dtype (기본 BF16, 양자화 계획은 F32), CPU · Vulkan 은 F32.
+        let dtype = if self.is_cpu_mode {
             candle_core::DType::F32
         } else {
-            candle_core::DType::BF16
+            crate::models::siglip2::quant::dtype_for(&dev)
         };
 
         // 🌟 [SPLIT-GGUF] BF16 으로 올리는 장치는 타워별 GGUF 를 한 번 만들어 둡니다. 실패해도 safetensors 로 계속합니다.
         //    다음 타워의 페이지도 배경에서 읽어 둡니다. 비전 → 텍스트 전환이 페이지 폴트를 기다리지 않게 하려는 것입니다.
+        // 🌟 [PYRAMID-QUANT] 양자화 계획(ROCm 기본 q8)은 원본에서 타워 GGUF 를 한 번 만들고(지문이 맞으면 건너뜀) 페이지를 미리 읽습니다.
+        let plan = crate::models::siglip2::quant::plan_for(&dev);
+        if !self.is_cpu_mode && plan.is_quantized() {
+            let source = dir.clone();
+            let prepared = tokio::task::spawn_blocking(move || {
+                crate::models::siglip2::gguf::prepare_quant(&source, &plan)?;
+                crate::models::siglip2::gguf::announce_quant(&source, &plan);
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            match prepared {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => println!("[MODEL] SigLIP2 양자화 타워를 만들지 못해 원본 F32 로 읽습니다: {}", e),
+                Err(e) => println!("[MODEL] SigLIP2 양자화 작업이 비정상 종료했습니다: {}", e),
+            }
+        }
         if dtype == candle_core::DType::BF16 {
             let source = dir.clone();
             let prepared = tokio::task::spawn_blocking(move || {

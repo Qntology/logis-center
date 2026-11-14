@@ -27,7 +27,8 @@ impl Track {
         }
     }
     pub fn from_name(name: &str) -> Option<Track> {
-        match name {
+        // 스코프 키의 트랙 칸에는 정밀도 꼬리표가 붙을 수 있습니다 (`vision@q8-…`, [`Scope::track_key`]).
+        match name.split('@').next().unwrap_or(name) {
             "vision" => Some(Track::Vision),
             "trading" => Some(Track::Trading),
             "commerce" => Some(Track::Commerce),
@@ -108,14 +109,25 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// 🌟 [WEIGHTS FINGERPRINT] 키의 트랙 칸. 비전 트랙은 SigLIP2 가 예전 정밀도(GPU BF16 · CPU F32)가 아닐 때(ROCm 기본 q8 ·
+    /// F32 강제 · 양자화 계획) 그 꼬리표를 붙여(`vision@<계획>`) 다른 정밀도에서 쌓은 기준선 · 적응 임계치와 섞이지 않게 합니다.
+    /// 예전 정밀도의 키는 그대로입니다.
+    pub fn track_key(&self) -> String {
+        if self.track_name == Track::Vision.as_str() {
+            if let Some(s) = crate::models::siglip2::quant::fingerprint_suffix() {
+                return format!("{}@{}", self.track_name, s);
+            }
+        }
+        self.track_name.clone()
+    }
     pub fn key_secondary(&self) -> String {
-        format!("{}|{}|{}", self.track_name, self.primary, self.secondary)
+        format!("{}|{}|{}", self.track_key(), self.primary, self.secondary)
     }
     pub fn key_primary(&self) -> String {
-        format!("{}|{}|", self.track_name, self.primary)
+        format!("{}|{}|", self.track_key(), self.primary)
     }
     pub fn key_global(&self) -> String {
-        format!("{}||", self.track_name)
+        format!("{}||", self.track_key())
     }
     pub fn is_empty(&self) -> bool {
         self.track_name.is_empty()

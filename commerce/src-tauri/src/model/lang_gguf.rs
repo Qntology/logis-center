@@ -19,9 +19,22 @@ pub const CHAT_TEMPLATE: &str = "{%- for message in messages -%}{{- '<|im_start|
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Precision {
+pub enum Precision {
     Q4KM,
     Exact,
+    /// 측정 기준: 양자화하는 텐서를 모두 Q8_0 으로 (앱은 쓰지 않습니다)
+    Q8,
+}
+
+/// 🌟 [PYRAMID-QUANT] 블록 척도를 고르는 방법.
+///
+/// `Candle` 은 candle 의 `QTensor::quantize` (Q4_K · Q5_K 는 가중치 없는 반복 탐색 `make_qkx1_quants`, Q6_K 는
+/// `make_qx_quants`, Q8_0 은 최댓값/127). `Wls` 는 `ggml-kquant` 의 중요도(`rms + |x|`) 가중 최소제곱 탐색과 F16 슈퍼 척도
+/// 1 ULP 올림입니다. 둘 다 원본 BF16 에서 한 번 양자화합니다.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quantizer {
+    Candle,
+    Wls,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -126,6 +139,12 @@ impl StFile {
             bail!("{} 의 바이트 수 {} 가 형상 {:?} 와 맞지 않습니다", name, raw.len(), e.shape);
         }
         Ok(raw)
+    }
+
+    /// 파일 처음부터 텐서 바이트가 시작하는 위치
+    pub(crate) fn offset(&self, name: &str) -> Result<usize> {
+        let e = self.entries.get(name).ok_or_else(|| anyhow!("model.safetensors 에 {} 가 없습니다", name))?;
+        Ok((self.data_start + e.begin) as usize)
     }
 
     fn load(&self, name: &str) -> Result<Tensor> {
@@ -250,7 +269,7 @@ pub fn load_runtime(model_dir: &Path, device: &Device) -> Result<Qwen3_5Generate
     load_from(model_dir, &gguf, device)
 }
 
-pub(crate) fn load_from(model_dir: &Path, gguf: &Path, device: &Device) -> Result<Qwen3_5GenerateModel> {
+pub fn load_from(model_dir: &Path, gguf: &Path, device: &Device) -> Result<Qwen3_5GenerateModel> {
     let rdir = gguf
         .parent()
         .ok_or_else(|| anyhow!("{:?} 의 상위 폴더를 알 수 없습니다", gguf))?;
@@ -477,6 +496,7 @@ fn plan(cfg: &TextCfg, names: &HashSet<String>, precision: Precision, tiled: boo
         match precision {
             Precision::Q4KM => Store::Q(d),
             Precision::Exact => Store::F32,
+            Precision::Q8 => Store::Q(GgmlDType::Q8_0),
         }
     };
     let mut items: Vec<Item> = Vec::new();
@@ -740,6 +760,25 @@ fn load_src(st: &StFile, it: &Item) -> Result<Tensor> {
 }
 
 pub fn quantize_rows(t: &Tensor, dtype: GgmlDType, threads: usize) -> Result<Vec<u8>> {
+    quantize_rows_with(t, dtype, threads, Quantizer::Candle)
+}
+
+fn kquant_format(dtype: GgmlDType) -> Option<ggml_kquant::Format> {
+    Some(match dtype {
+        GgmlDType::Q8_0 => ggml_kquant::Format::Q8_0,
+        GgmlDType::Q6K => ggml_kquant::Format::Q6K,
+        GgmlDType::Q5K => ggml_kquant::Format::Q5K,
+        GgmlDType::Q4K => ggml_kquant::Format::Q4K,
+        _ => return None,
+    })
+}
+
+pub fn quantize_rows_with(t: &Tensor, dtype: GgmlDType, threads: usize, quantizer: Quantizer) -> Result<Vec<u8>> {
+    if let (Quantizer::Wls, Some(fmt)) = (quantizer, kquant_format(dtype)) {
+        let cols = t.dim(1)?;
+        let data = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        return ggml_kquant::encode(&data, cols, fmt, None).map_err(|e| anyhow!("{e}"));
+    }
     let rows = t.dim(0)?;
     let per = rows.div_ceil(threads.max(1)).max(1);
     let chunks: Vec<(usize, usize)> = (0..rows)
@@ -771,7 +810,7 @@ pub fn quantize_rows(t: &Tensor, dtype: GgmlDType, threads: usize) -> Result<Vec
     Ok(out)
 }
 
-fn produce(st: &StFile, it: &Item, cfg: &TextCfg, threads: usize, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+fn produce(st: &StFile, it: &Item, cfg: &TextCfg, threads: usize, quantizer: Quantizer, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
     let src = load_src(st, it)?;
     let v_per_k = cfg.v_heads / cfg.k_heads;
     let two_d = if src.rank() == 1 { src.reshape((src.dim(0)?, 1))? } else { src };
@@ -816,7 +855,7 @@ fn produce(st: &StFile, it: &Item, cfg: &TextCfg, threads: usize, sink: &mut dyn
                 sink(&bytes)?;
             }
             Store::Q(d) => {
-                let bytes = quantize_rows(&blk, d, threads)?;
+                let bytes = quantize_rows_with(&blk, d, threads, quantizer)?;
                 sink(&bytes)?;
             }
         }
@@ -826,6 +865,21 @@ fn produce(st: &StFile, it: &Item, cfg: &TextCfg, threads: usize, sink: &mut dyn
 }
 
 pub(crate) fn convert_with(model_dir: &Path, out: &Path, precision: Precision, progress: &(dyn Fn(u64, u64) + Sync)) -> Result<()> {
+    convert_variant(model_dir, out, precision, QUANTIZER, progress)
+}
+
+/// 앱이 쓰는 블록 척도 탐색.
+///
+/// 가중 최소제곱은 바꾸지 않았습니다. Qwen3.5-4B-kor, 같은 원본의 Q8_0 기준, 한국어 무역 · 주문 문장 640 토큰
+/// (tests/it/p2b_models.rs `p2b_qwen35_4b_quantizer`, RX 6600):
+///   candle   ΔNLL +0.032 [+0.005, +0.060] · KLD 0.0455 · top-1 89.6 %
+///   wls      ΔNLL +0.040 [+0.013, +0.067] · KLD 0.0398 · top-1 89.3 %
+/// KLD 는 13 % 줄지만 NLL 은 나아지지 않아(구간 겹침) 레시피를 그대로 둡니다 — 바꾸면 언어마다 4B 를 다시 변환해야 합니다.
+/// 같은 측정에서 Q8_0 은 디코드 72 ms/토큰으로 Q4_K_M(87 ms)보다 빠르지만 3.8 GB 대 2.2 GB 입니다.
+pub const QUANTIZER: Quantizer = Quantizer::Candle;
+
+/// 정밀도 · 척도 탐색을 골라 `out` 에 변환합니다 (측정용). `out` 이 모델의 런타임 폴더 밖이면 앱의 준비 표식은 건드리지 않습니다.
+pub fn convert_variant(model_dir: &Path, out: &Path, precision: Precision, quantizer: Quantizer, progress: &(dyn Fn(u64, u64) + Sync)) -> Result<()> {
     let cfg = read_text_cfg(model_dir)?;
     let st = StFile::open(&model_dir.join("model.safetensors"))?;
     let names: HashSet<String> = st.entries.keys().cloned().collect();
@@ -865,11 +919,14 @@ pub(crate) fn convert_with(model_dir: &Path, out: &Path, precision: Precision, p
         ("alphaedge.recipe", Meta::Str(RECIPE.into())),
         ("alphaedge.v_head_order", Meta::Str(if tiled { "tiled" } else { "grouped" }.into())),
         ("alphaedge.precision", Meta::Str(format!("{:?}", precision))),
+        ("logis.quantizer", Meta::Str(format!("{:?}", quantizer))),
     ];
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let _ = std::fs::remove_file(runtime_dir(model_dir).join(READY_FILE));
+    if out.starts_with(runtime_dir(model_dir)) {
+        let _ = std::fs::remove_file(runtime_dir(model_dir).join(READY_FILE));
+    }
     let part = out.with_extension("gguf.part");
     let file = std::fs::File::create(&part).with_context(|| format!("{:?} 를 만들 수 없습니다", part))?;
     let mut w = BufWriter::with_capacity(8 << 20, file);
@@ -906,7 +963,7 @@ pub(crate) fn convert_with(model_dir: &Path, out: &Path, precision: Precision, p
     progress(0, total);
     for (it, size) in items.iter().zip(sizes.iter()) {
         let mut wrote = 0u64;
-        produce(&st, it, &cfg, threads, &mut |bytes: &[u8]| {
+        produce(&st, it, &cfg, threads, quantizer, &mut |bytes: &[u8]| {
             w.write_all(bytes)?;
             wrote += bytes.len() as u64;
             Ok(())

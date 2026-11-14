@@ -1,6 +1,8 @@
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
+use super::gguf::MappedGguf;
+use super::quant::{linear, SLinear};
 use super::Siglip2Config;
 
 pub struct Siglip2PatchEmbedding {
@@ -38,24 +40,25 @@ impl Siglip2PatchEmbedding {
 }
 
 pub struct Siglip2Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    out_proj: Linear,
+    q_proj: SLinear,
+    k_proj: SLinear,
+    v_proj: SLinear,
+    out_proj: SLinear,
     num_heads: usize,
     head_dim: usize,
 }
 
 impl Siglip2Attention {
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    /// `q`: 양자화 계획의 타워 GGUF (블록 형식 가중치). 없으면 VarBuilder 의 밀집 가중치.
+    pub fn new(config: &Siglip2Config, vb: VarBuilder, q: Option<&MappedGguf>) -> Result<Self> {
         let hidden = config.vision_hidden_size;
         let num_heads = config.vision_num_heads;
         let head_dim = hidden / num_heads;
 
-        let q_proj = candle_nn::linear(hidden, hidden, vb.pp("q_proj"))?;
-        let k_proj = candle_nn::linear(hidden, hidden, vb.pp("k_proj"))?;
-        let v_proj = candle_nn::linear(hidden, hidden, vb.pp("v_proj"))?;
-        let out_proj = candle_nn::linear(hidden, hidden, vb.pp("out_proj"))?;
+        let q_proj = linear(&vb.pp("q_proj"), q, hidden, hidden)?;
+        let k_proj = linear(&vb.pp("k_proj"), q, hidden, hidden)?;
+        let v_proj = linear(&vb.pp("v_proj"), q, hidden, hidden)?;
+        let out_proj = linear(&vb.pp("out_proj"), q, hidden, hidden)?;
 
         Ok(Self {
             q_proj,
@@ -113,17 +116,17 @@ impl Siglip2Attention {
 // MLP (Feed-Forward Network)
 // =====================================================================
 pub struct Siglip2MLP {
-    fc1: Linear,
-    fc2: Linear,
+    fc1: SLinear,
+    fc2: SLinear,
 }
 
 impl Siglip2MLP {
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &Siglip2Config, vb: VarBuilder, q: Option<&MappedGguf>) -> Result<Self> {
         let hidden = config.vision_hidden_size;
         let intermediate = config.vision_intermediate_size;
 
-        let fc1 = candle_nn::linear(hidden, intermediate, vb.pp("fc1"))?;
-        let fc2 = candle_nn::linear(intermediate, hidden, vb.pp("fc2"))?;
+        let fc1 = linear(&vb.pp("fc1"), q, hidden, intermediate)?;
+        let fc2 = linear(&vb.pp("fc2"), q, intermediate, hidden)?;
 
         Ok(Self { fc1, fc2 })
     }
@@ -146,12 +149,12 @@ pub struct Siglip2EncoderLayer {
 }
 
 impl Siglip2EncoderLayer {
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &Siglip2Config, vb: VarBuilder, q: Option<&MappedGguf>) -> Result<Self> {
         let hidden = config.vision_hidden_size;
         let eps = 1e-6;
 
-        let self_attn = Siglip2Attention::new(config, vb.pp("self_attn"))?;
-        let mlp = Siglip2MLP::new(config, vb.pp("mlp"))?;
+        let self_attn = Siglip2Attention::new(config, vb.pp("self_attn"), q)?;
+        let mlp = Siglip2MLP::new(config, vb.pp("mlp"), q)?;
         let layer_norm1 = candle_nn::layer_norm(hidden, eps, vb.pp("layer_norm1"))?;
         let layer_norm2 = candle_nn::layer_norm(hidden, eps, vb.pp("layer_norm2"))?;
 
@@ -199,10 +202,10 @@ impl Siglip2EncoderLayer {
 //    return h[:, 0]
 // =====================================================================
 pub struct Siglip2AttentionPoolingHead {
-    probe: Tensor,          // (1, 1, D)
-    in_proj_weight: Tensor, // (3D, D)
-    in_proj_bias: Tensor,   // (3D)
-    out_proj: Linear,
+    probe: Tensor, // (1, 1, D)
+    /// in_proj 를 q(0) · k(1) · v(2) 로 적재 때 한 번 잘라 둡니다. 예전에는 호출마다 narrow + contiguous 로 세 번 복사했습니다.
+    in_proj: [SLinear; 3],
+    out_proj: SLinear,
     layernorm: candle_nn::LayerNorm,
     mlp: Siglip2MLP,
     num_heads: usize,
@@ -211,7 +214,7 @@ pub struct Siglip2AttentionPoolingHead {
 }
 
 impl Siglip2AttentionPoolingHead {
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &Siglip2Config, vb: VarBuilder, q: Option<&MappedGguf>) -> Result<Self> {
         let hidden = config.vision_hidden_size;
         let num_heads = config.vision_num_heads;
         let head_dim = hidden / num_heads;
@@ -219,18 +222,34 @@ impl Siglip2AttentionPoolingHead {
         let probe = vb.get((1, 1, hidden), "probe")?;
 
         let attn_vb = vb.pp("attention");
-        let in_proj_weight = attn_vb.get((3 * hidden, hidden), "in_proj_weight")?;
-        let in_proj_bias = attn_vb.get(3 * hidden, "in_proj_bias")?;
-        let out_proj = candle_nn::linear(hidden, hidden, attn_vb.pp("out_proj"))?;
+        // 양자화 타워 GGUF 는 q · k · v 를 미리 나눠 둡니다 (`in_proj_{q,k,v}`).
+        let split = q.is_some_and(|f| f.info(&format!("{}.in_proj_q.weight", attn_vb.prefix())).is_some());
+        let in_proj = if split {
+            [
+                linear(&attn_vb.pp("in_proj_q"), q, hidden, hidden)?,
+                linear(&attn_vb.pp("in_proj_k"), q, hidden, hidden)?,
+                linear(&attn_vb.pp("in_proj_v"), q, hidden, hidden)?,
+            ]
+        } else {
+            let in_proj_weight = attn_vb.get((3 * hidden, hidden), "in_proj_weight")?;
+            let in_proj_bias = attn_vb.get(3 * hidden, "in_proj_bias")?;
+            let slot = |s: usize| -> Result<SLinear> {
+                Ok(SLinear::Dense(Linear::new(
+                    in_proj_weight.narrow(0, s * hidden, hidden)?.contiguous()?,
+                    Some(in_proj_bias.narrow(0, s * hidden, hidden)?.contiguous()?),
+                )))
+            };
+            [slot(0)?, slot(1)?, slot(2)?]
+        };
+        let out_proj = linear(&attn_vb.pp("out_proj"), q, hidden, hidden)?;
 
         let layernorm =
             candle_nn::layer_norm(hidden, config.vision_layer_norm_eps, vb.pp("layernorm"))?;
-        let mlp = Siglip2MLP::new(config, vb.pp("mlp"))?;
+        let mlp = Siglip2MLP::new(config, vb.pp("mlp"), q)?;
 
         Ok(Self {
             probe,
-            in_proj_weight,
-            in_proj_bias,
+            in_proj,
             out_proj,
             layernorm,
             mlp,
@@ -240,17 +259,9 @@ impl Siglip2AttentionPoolingHead {
         })
     }
 
-    /// in_proj_weight 를 q(0) / k(1) / v(2) 로 잘라 선형 투영합니다.
+    /// in_proj 의 q(0) / k(1) / v(2) 선형 투영
     fn proj(&self, x: &Tensor, slot: usize) -> Result<Tensor> {
-        let w = self
-            .in_proj_weight
-            .narrow(0, slot * self.hidden, self.hidden)?
-            .contiguous()?;
-        let b = self
-            .in_proj_bias
-            .narrow(0, slot * self.hidden, self.hidden)?
-            .contiguous()?;
-        Linear::new(w, Some(b)).forward(x)
+        self.in_proj[slot].forward(x)
     }
 
     /// 헤드의 잔차 블록. (attention 이후 / 패치 투영 이후 공통)
@@ -339,12 +350,23 @@ pub struct Siglip2VisionModel {
     ///    매 순전파마다 16×16 격자를 bilinear 로 리샘플링해야 합니다.
     pos_grid: Vec<f32>,
     pos_side: usize,
+    /// 🌟 [POS PRE-FOLD] 격자 (rows, cols) 별 보간 결과. 문서 쪽은 종횡비가 몇 가지라 같은 격자가 되풀이됩니다.
+    ///    값은 매번 계산한 것과 비트까지 같습니다(같은 식 · 같은 dtype 변환).
+    pos_cache: std::sync::Mutex<Vec<((usize, usize), Tensor)>>,
     device: Device,
     dtype: DType,
 }
 
+/// 보간 결과를 보관하는 격자 수 (한 격자 BF16 약 0.6 MB)
+const POS_CACHE_GRIDS: usize = 16;
+
 impl Siglip2VisionModel {
     pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+        Self::new_with(config, vb, None)
+    }
+
+    /// `q`: 양자화 계획의 타워 GGUF. 블록 형식 가중치는 여기서 장치로 올리고, 나머지(F32)는 `vb` 에서 읽습니다.
+    pub fn new_with(config: &Siglip2Config, vb: VarBuilder, q: Option<&MappedGguf>) -> Result<Self> {
         let device = vb.device().clone();
         let dtype = vb.dtype();
         let hidden = config.vision_hidden_size;
@@ -367,7 +389,7 @@ impl Siglip2VisionModel {
         let encoder_vb = vb.pp("encoder");
         for i in 0..config.vision_num_layers {
             let layer_vb = encoder_vb.pp(format!("layers.{}", i));
-            layers.push(Siglip2EncoderLayer::new(config, layer_vb)?);
+            layers.push(Siglip2EncoderLayer::new(config, layer_vb, q)?);
         }
 
         let post_layernorm = candle_nn::layer_norm(
@@ -376,7 +398,7 @@ impl Siglip2VisionModel {
             vb.pp("post_layernorm"),
         )?;
 
-        let head = Siglip2AttentionPoolingHead::new(config, vb.pp("head"))?;
+        let head = Siglip2AttentionPoolingHead::new(config, vb.pp("head"), q)?;
 
         Ok(Self {
             patch_embedding,
@@ -386,9 +408,28 @@ impl Siglip2VisionModel {
             hidden_size: hidden,
             pos_grid,
             pos_side: side,
+            pos_cache: std::sync::Mutex::new(Vec::new()),
             device,
             dtype,
         })
+    }
+
+    /// 격자의 위치 임베딩. 보관한 것이 있으면 그것을, 없으면 보간해 보관합니다.
+    fn pos_for(&self, rows: usize, cols: usize) -> Result<Tensor> {
+        let mut cache = self.pos_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = cache.iter().position(|(k, _)| *k == (rows, cols)) {
+            // 최근에 쓴 것을 뒤로 보내 오래 안 쓴 것부터 버립니다.
+            let hit = cache.remove(i);
+            let t = hit.1.clone();
+            cache.push(hit);
+            return Ok(t);
+        }
+        let t = self.interpolate_pos(rows, cols)?;
+        if cache.len() >= POS_CACHE_GRIDS {
+            cache.remove(0);
+        }
+        cache.push(((rows, cols), t.clone()));
+        Ok(t)
     }
 
     /// 🌟 [NaFlex POSITION INTERPOLATION]
@@ -446,8 +487,8 @@ impl Siglip2VisionModel {
         // 1. 패치 임베딩 (Linear)
         let mut x = self.patch_embedding.forward(pixel_values)?;
 
-        // 2. 위치 임베딩 bilinear 보간 후 덧셈
-        let pos = self.interpolate_pos(grid_rows, grid_cols)?;
+        // 2. 위치 임베딩 bilinear 보간 후 덧셈 (격자별로 한 번 보간)
+        let pos = self.pos_for(grid_rows, grid_cols)?;
         x = (x + pos)?;
 
         // 3. 27층 Transformer

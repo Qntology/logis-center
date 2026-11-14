@@ -31,13 +31,23 @@ impl PhraseCache {
         }
     }
 
+    /// 🌟 [WEIGHTS FINGERPRINT] 예전 정밀도(GPU BF16 · CPU F32)의 키는 예전과 같고, 다른 정밀도(ROCm 기본 q8 · F32 강제 ·
+    /// 양자화 계획)는 그 꼬리표가 키에 들어가 같은 구라도 따로 저장됩니다 (`siglip2::quant::fingerprint_suffix`).
     pub fn key_of(phrase: &str) -> u64 {
+        Self::key_with(phrase, crate::models::siglip2::quant::fingerprint_suffix().as_deref())
+    }
+
+    pub fn key_with(phrase: &str, suffix: Option<&str>) -> u64 {
         use std::hash::Hasher;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         h.write_u32(CACHE_VERSION);
         h.write_usize(EMBED_DIM);
         h.write(phrase.as_bytes());
         h.write_u8(0xFF);
+        if let Some(s) = suffix {
+            h.write(s.as_bytes());
+            h.write_u8(0xFE);
+        }
         h.finish()
     }
 
