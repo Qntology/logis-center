@@ -14,6 +14,7 @@
 | `score_pages.py` | 페이지 유형 · 목록/상세 판정 (실행 로그에서 읽음) |
 | `score_commerce.py` · `score_trading.py` | 저장된 아이템과 정답 비교. `score_commerce.py --pool` 은 `{"id":"dump","kind":"dump"}` 계획으로 남긴 저장소 끝 상태로 찾습니다. 상세가 앞서 저장된 목록 문서에 합쳐지면 그 페이지의 결과에는 아이템이 남지 않기 때문입니다 |
 | `score_vision.py` | SigLIP2 서식 판정 · 크롭 커버리지 |
+| `score_vision_quant.py` | SigLIP2 정밀도 계획끼리 비교: 원본 F32 기준 히트맵 AP(쪽 부트스트랩 구간) · 서식 판정 · 크롭 · 문서번호 회수 · 시간 |
 | `score_verdict.py` | 이미지 경로의 최종 서식(언어 모델 재판정 포함). `LOGIS_SYNTH_STOP_ON="Document identified as"` 로 돌린 로그를 읽습니다 |
 | `score_search.py` | 질의 종류별 MRR · Recall@10 · nDCG@10. `--seeds` 를 주면 프론트엔드 조건 필터를 거친 화면 순위로 잽니다 |
 | `apply_plans.py` | `main.ts` 의 `executeDexiePlan` 을 옮긴 것. 잘못된 조건이 정답을 지우는 실패는 후보 순위에 보이지 않습니다 |
@@ -88,6 +89,45 @@ python score_vision_gates.py labels labels_out.jsonl
   상한 측정입니다.
 - 크롭 하한(분할 크롭)은 `vision` 모드(vision_probe)로 크롭 계획을 남기고 `score_vision.py` 로 정답 값이 크롭 안에 드는지 봅니다.
   `LOGIS_SYNTH_LIST` 로 쪽 순서(기준선을 쌓을 쪽 먼저)를 정합니다. `LOGIS_SYNTH_CPU=1` 은 CPU 로 돌지만 첫 쪽 구 인코딩만 수십 분이라 GPU 를 씁니다.
+
+### 모델 정밀도 (PYRAMID-QUANT)
+
+SigLIP2 는 계획(`LOGIS_SIGLIP2_QUANT`: `bf16` · `f32` · `q8` · `pyramid` · `<기준>;<묶음>=<형식>`)마다 새 평가 폴더에서 같은 쪽 순서로 돌리고
+원본 F32 와 쌍으로 비교합니다. `LOGIS_SYNTH_HEAT=1` 이 카테고리 히트맵을 `<덤프>/<쪽>.heat.json` 으로 남깁니다.
+`LOGIS_SIGLIP2_QUANT_SIM=1` 은 블록을 F32 로 풀어 올리는 측정 경로입니다(계획끼리 연산이 같아 가중치 값의 영향만 봅니다).
+
+```bat
+set "LOGIS_SYNTH_HEAT=1"
+set "LOGIS_SIGLIP2_QUANT=f32" & run_eval.bat pq-f32 vision pages f32\result.jsonl f32\log.txt korean f32\dump
+set "LOGIS_SIGLIP2_QUANT=q8"  & run_eval.bat pq-q8  vision pages q8\result.jsonl  q8\log.txt  korean q8\dump
+python score_vision_quant.py pages f32=f32 q8=q8
+```
+
+언어 모델 쪽은 실모델 시험입니다(`LOGIS_TEST_MODELS=1 ... -- --ignored --nocapture --test-threads 1`, 시험 하나씩 돌릴 때
+`LOGIS_TEST_FAST_EXIT=1` 이면 ROCm 종료 멈춤 없이 끝납니다): `p2b_qmatmul_parity` · `p2b_lm_head_cost` · `p2b_qwen35_2b_lm_head_q8` ·
+`p2b_qwen35_4b_quantizer`(`LOGIS_LANG_QUANT_DIR` 에 변환본을 만듭니다).
+
+RX 6600 (gfx1032) 실측, 2026-11-15:
+
+| SigLIP2 (원본 F32 기준) | 영어 88쪽 ΔAP [95 %] | 문서번호 | 크롭 잃음 | 88쪽 시간 | 11개 언어 110쪽 ΔAP | F32 와 같은 서식 | 110쪽 시간 | VRAM 최대 |
+|---|---|---|---|---|---|---|---|---|
+| bf16 (예전 ROCm 기본) | −0.0008 [−0.0044, +0.0020] | 44/45 | 5 | 602 s | +0.0009 [−0.0014, +0.0034] | 39/55 | 688 s | 2,088 MB |
+| **q8 (새 ROCm 기본)** | +0.0006 [−0.0005, +0.0017] | 45/45 | 2 | 538 s ¹ | +0.0008 [−0.0005, +0.0023] | 50/55 | 616 s | 1,438 MB |
+| pyramid (지시문 4계층) | −0.0006 [−0.0036, +0.0020] | **43/45** | 6 | — | — | — | — | — |
+| f32 | 0 | 45/45 | 0 | 461 s | 0 | — | 609 s | 3,954 MB |
+
+¹ 타워 GGUF 를 처음 한 번 만드는 49 s 제외. 첫 쪽(구 1,230개 인코딩)은 bf16 134 s · q8 90 s · f32 69 s — 이 GPU 는 BF16 GEMM 이 F32 보다 느립니다.
+
+- 4계층은 평균 AP 는 기준 안이지만 문서번호 크롭 두 개를 놓쳐(게이트 '문서번호 회수 100 %') 기각했습니다. q8 보다 아끼는 것은 비전 87 MB 입니다.
+- 4304 는 32 의 배수도 아니라(32 × 134 + 16) 'Block=32 코덱으로 분기' 로는 안 되고, fc1 에 0 행을 붙여 fc2 입력을 4320 으로 냅니다.
+- 커널 대조(`p2b_qmatmul_parity`): Q8_0 · Q6_K · Q5_K · Q4_K, 행 1 ~ 256 모두 ‖Δ‖/‖기준‖ ≤ 6.5e-7.
+- Qwen3.5-2B 출력 헤드(묶인 임베딩): F16 역양자화본 → GGUF 의 Q8_0 그대로. 디코드 45.4 → 35.4 ms/토큰, 상주 −508 MB, teacher-forcing top-1 100 % ·
+  KLD 7e-6, 탐욕 생성 3 × 96 토큰 같음 → ROCm 기본.
+- 출력 헤드 자르기(16,384 행)의 상한: 한 토큰 0.6B Q8_0 3.5 → 0.3 ms, 2B Q8_0 8.4 → 0.5 ms. 12개 언어 값을 내는 모델이라 잘린 어휘의 오독을
+  막을 정확한 방법(잘린 행 밖의 최댓값 보장)이 없어 넣지 않았습니다.
+- 4B Q4_K_M 척도 탐색(Q8_0 기준): candle ΔNLL +0.032 · KLD 0.0455, 가중 최소제곱 ΔNLL +0.040 · KLD 0.0398 → 레시피 그대로.
+- 검색 게이트(`SyntheticData/relational`, Phase 3 최종과 같은 SDS 스냅숏): 2B 생성을 타는 무역 · 행동 로그 질의의 5개 언어(ko · en · ja · ar · cs)
+  부분집합 65개가 질의별로 같음(상위 10 결과 65/65, MRR 0.9736 그대로). 커머스 질의는 0.6B(바뀌지 않음)를 씁니다.
 
 ## 분할
 
