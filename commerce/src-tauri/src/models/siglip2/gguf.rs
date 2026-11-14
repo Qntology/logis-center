@@ -35,6 +35,8 @@ use rayon::prelude::*;
 
 use crate::model::lang_gguf::{pad_to, put_meta, put_str, Meta, StFile, ALIGN};
 
+pub use super::gguf_quant::{prepare_quant, quant_ready, quant_text_path, quant_vision_path};
+
 const RUNTIME_DIR: &str = "runtime-bf16";
 const VISION_FILE: &str = "mmproj-siglip2-bf16.gguf";
 const TEXT_FILE: &str = "siglip2-text-bf16.gguf";
@@ -206,7 +208,13 @@ pub fn open_cached(path: &Path) -> Result<Arc<MappedGguf>> {
 
 /// 열어 둔 매핑을 닫습니다. `model_dir` 이 없으면 전부 닫습니다. 부착된 텍스트 타워가 쥔 매핑은 타워를 내릴 때 닫힙니다.
 pub fn close_handles(model_dir: Option<&Path>) {
-    let inside = |path: &Path| model_dir.is_none_or(|dir| path.starts_with(runtime_dir(dir)));
+    let inside = |path: &Path| {
+        model_dir.is_none_or(|dir| {
+            path.parent().is_some_and(|p| {
+                p.parent() == Some(dir) && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("runtime-"))
+            })
+        })
+    };
     HANDLES.lock().unwrap_or_else(|e| e.into_inner()).retain(|path, _| !inside(path));
     WARMED.lock().unwrap_or_else(|e| e.into_inner()).retain(|path| !inside(path));
 }
@@ -220,6 +228,16 @@ pub fn announce(model_dir: &Path) {
             text.warm(&[TOKEN_TABLE]);
         }
         (Err(e), _) | (_, Err(e)) => println!("[SigLIP2-GGUF] 타워 파일을 미리 읽지 못했습니다: {}", e),
+    }
+}
+
+/// 🌟 [PYRAMID-QUANT] 양자화 계획의 두 타워 페이지를 배경에서 읽어 둡니다 (토큰 표는 원본에서 행만 읽으므로 대상이 아님).
+pub fn announce_quant(model_dir: &Path, plan: &super::quant::WeightPlan) {
+    for path in [quant_vision_path(model_dir, plan), quant_text_path(model_dir, plan)] {
+        match open_cached(&path) {
+            Ok(f) => f.warm(&[]),
+            Err(e) => println!("[SigLIP2-GGUF] 양자화 타워 파일을 미리 읽지 못했습니다: {}", e),
+        }
     }
 }
 
@@ -256,23 +274,40 @@ impl MappedGguf {
     }
 
     fn range(&self, name: &str, info: &TensorInfo) -> Result<std::ops::Range<usize>> {
-        if info.ggml_dtype != GgmlDType::BF16 {
-            bail!("{} 는 BF16 이어야 합니다: {:?}", name, info.ggml_dtype);
+        let dt = info.ggml_dtype;
+        let n = info.shape.elem_count();
+        if !matches!(dt, GgmlDType::BF16 | GgmlDType::F32 | GgmlDType::Q8_0 | GgmlDType::Q6K | GgmlDType::Q5K | GgmlDType::Q4K) {
+            bail!("{} 의 형식 {:?} 는 읽지 않습니다", name, dt);
+        }
+        if n % dt.block_size() != 0 {
+            bail!("{} 의 원소 수 {} 가 {:?} 블록으로 나뉘지 않습니다", name, n, dt);
         }
         let start = (self.content.tensor_data_offset + info.offset) as usize;
-        let end = start + info.shape.elem_count() * 2;
+        let end = start + n / dt.block_size() * dt.type_size();
         if end > self.map.len() {
             bail!("{:?} 가 잘렸습니다 ({})", self.path, name);
         }
         Ok(start..end)
     }
 
-    fn elements(&self, range: std::ops::Range<usize>) -> Result<&[bf16]> {
-        let (head, body, tail) = unsafe { self.map[range].align_to::<bf16>() };
+    fn elements<T>(&self, range: std::ops::Range<usize>) -> Result<&[T]> {
+        let (head, body, tail) = unsafe { self.map[range].align_to::<T>() };
         if !head.is_empty() || !tail.is_empty() {
             bail!("{:?} 의 텐서 위치가 원소 경계에 맞지 않습니다", self.path);
         }
         Ok(body)
+    }
+
+    /// 텐서의 저장 형식과 형상
+    pub fn info(&self, name: &str) -> Option<(GgmlDType, Vec<usize>)> {
+        self.content.tensor_infos.get(name).map(|i| (i.ggml_dtype, i.shape.dims().to_vec()))
+    }
+
+    /// 🌟 [PYRAMID-QUANT] 블록 형식 텐서를 매핑에서 장치로 바로 올립니다.
+    pub fn qtensor(&self, name: &str, device: &Device) -> Result<candle_core::quantized::QTensor> {
+        let info = self.content.tensor_infos.get(name).ok_or_else(|| anyhow!("{:?} 에 {} 가 없습니다", self.path, name))?;
+        let range = self.range(name, info)?;
+        Ok(candle_core::quantized::ggml_file::qtensor_from_ggml(info.ggml_dtype, &self.map[range], info.shape.dims().to_vec(), device)?)
     }
 
     /// 이 파일의 페이지를 배경에서 읽어 둡니다. `skip` 의 텐서는 읽지 않습니다. 파일마다 프로세스에서 한 번만 합니다.
@@ -317,26 +352,44 @@ impl MappedGguf {
     }
 
     /// 텐서를 매핑에서 장치로 바로 복사해 VarBuilder 로 돌려줍니다. `skip` 의 텐서는 올리지 않습니다.
+    /// 블록 형식 텐서는 넣지 않습니다([`Self::qtensor`] 로 따로 올립니다). F32 텐서가 있는 파일(양자화 계획)이면 F32 로 읽습니다.
     pub fn var_builder(&self, skip: &[&str], device: &Device) -> Result<VarBuilder<'static>> {
-        let names: Vec<&String> = self.content.tensor_infos.keys().filter(|n| !skip.contains(&n.as_str())).collect();
+        let names: Vec<&String> = self
+            .content
+            .tensor_infos
+            .iter()
+            .filter(|(n, i)| !skip.contains(&n.as_str()) && matches!(i.ggml_dtype, GgmlDType::BF16 | GgmlDType::F32))
+            .map(|(n, _)| n)
+            .collect();
         let mut spans = Vec::with_capacity(names.len());
         for name in &names {
             spans.push(self.range(name, &self.content.tensor_infos[*name])?);
         }
         let mut tensors = HashMap::with_capacity(names.len());
+        let mut any_f32 = false;
         for (name, range) in names.iter().zip(spans) {
-            let dims = self.content.tensor_infos[*name].shape.dims().to_vec();
-            tensors.insert((*name).clone(), Tensor::from_slice(self.elements(range)?, dims, device)?);
+            let info = &self.content.tensor_infos[*name];
+            let dims = info.shape.dims().to_vec();
+            let t = if info.ggml_dtype == GgmlDType::F32 {
+                any_f32 = true;
+                Tensor::from_slice(self.elements::<f32>(range)?, dims, device)?
+            } else {
+                Tensor::from_slice(self.elements::<bf16>(range)?, dims, device)?
+            };
+            tensors.insert((*name).clone(), t);
         }
-        Ok(VarBuilder::from_tensors(tensors, DType::BF16, device))
+        Ok(VarBuilder::from_tensors(tensors, if any_f32 { DType::F32 } else { DType::BF16 }, device))
     }
 
     /// 2차원 표의 행을 매핑에서 읽는 핸들
     pub fn rows(&self, name: &str) -> Result<MappedRows> {
         let info = self.content.tensor_infos.get(name).ok_or_else(|| anyhow!("{:?} 에 {} 가 없습니다", self.path, name))?;
         let (rows, cols) = info.shape.dims2()?;
+        if info.ggml_dtype != GgmlDType::BF16 {
+            bail!("{} 는 BF16 이어야 합니다: {:?}", name, info.ggml_dtype);
+        }
         let range = self.range(name, info)?;
-        Ok(MappedRows { map: Arc::clone(&self.map), start: range.start, rows, cols })
+        Ok(MappedRows { map: Arc::clone(&self.map), start: range.start, rows, cols, f32: false })
     }
 }
 
@@ -346,25 +399,57 @@ pub struct MappedRows {
     start: usize,
     rows: usize,
     cols: usize,
+    /// 원소가 F32 인가 (아니면 BF16)
+    f32: bool,
 }
 
 impl MappedRows {
-    /// `ids` 모양 뒤에 열 차원을 붙인 BF16 텐서를 `device` 에 만듭니다.
+    /// 🌟 [PYRAMID-QUANT] 원본 safetensors 의 F32 표에서 행만 읽는 핸들. 양자화 계획의 텍스트 타워가 원본 값 그대로의 토큰 행을 씁니다.
+    pub fn from_safetensors(path: &Path, name: &str) -> Result<MappedRows> {
+        let st = StFile::open(path)?;
+        let e = st.entries.get(name).ok_or_else(|| anyhow!("{:?} 에 {} 가 없습니다", path, name))?;
+        if e.dtype != DType::F32 || e.shape.len() != 2 {
+            bail!("{} 는 F32 2차원 표여야 합니다 ({:?} {:?})", name, e.dtype, e.shape);
+        }
+        let (rows, cols) = (e.shape[0], e.shape[1]);
+        let start = st.offset(name)?;
+        drop(st);
+        let file = std::fs::File::open(path).with_context(|| format!("{:?} 를 열 수 없습니다", path))?;
+        let map = unsafe { Mmap::map(&file) }.with_context(|| format!("{:?} 를 매핑할 수 없습니다", path))?;
+        if start + rows * cols * 4 > map.len() {
+            bail!("{:?} 가 잘렸습니다 ({})", path, name);
+        }
+        Ok(MappedRows { map: Arc::new(map), start, rows, cols, f32: true })
+    }
+
+    /// `ids` 모양 뒤에 열 차원을 붙인 텐서(BF16 표는 BF16, F32 표는 F32)를 `device` 에 만듭니다.
     pub fn gather(&self, ids: &Tensor, device: &Device) -> candle_core::Result<Tensor> {
         let flat = ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
-        let mut out: Vec<bf16> = Vec::with_capacity(flat.len() * self.cols);
-        for id in flat {
-            let id = id as usize;
-            if id >= self.rows {
-                candle_core::bail!("토큰 {} 이 표 크기 {} 를 넘습니다", id, self.rows);
-            }
-            let start = self.start + id * self.cols * 2;
-            let row = &self.map[start..start + self.cols * 2];
-            out.extend(row.chunks_exact(2).map(|b| bf16::from_le_bytes([b[0], b[1]])));
-        }
         let mut dims = ids.dims().to_vec();
         dims.push(self.cols);
-        Tensor::from_vec(out, dims, device)
+        let width = if self.f32 { 4 } else { 2 };
+        for &id in &flat {
+            if id as usize >= self.rows {
+                candle_core::bail!("토큰 {} 이 표 크기 {} 를 넘습니다", id, self.rows);
+            }
+        }
+        let row = |id: u32| {
+            let start = self.start + id as usize * self.cols * width;
+            &self.map[start..start + self.cols * width]
+        };
+        if self.f32 {
+            let mut out: Vec<f32> = Vec::with_capacity(flat.len() * self.cols);
+            for id in flat {
+                out.extend(row(id).chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+            }
+            Tensor::from_vec(out, dims, device)
+        } else {
+            let mut out: Vec<bf16> = Vec::with_capacity(flat.len() * self.cols);
+            for id in flat {
+                out.extend(row(id).chunks_exact(2).map(|b| bf16::from_le_bytes([b[0], b[1]])));
+            }
+            Tensor::from_vec(out, dims, device)
+        }
     }
 }
 
@@ -524,6 +609,8 @@ mod tests {
         }
         let config = Siglip2Config::from_json(&dir.join("config.json"))?;
         let device = Device::new_rocm(0)?;
+        // 이 시험은 BF16 타워 GGUF 를 봅니다 (ROCm 기본 계획은 q8).
+        crate::models::siglip2::quant::set_active(Some(crate::models::siglip2::quant::WeightPlan::bf16()));
         let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(640, 480, |x, y| image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])));
         let phrases = vec!["logis gguf 비교 문구 하나".to_string(), "logis gguf comparison phrase two".to_string()];
         let read = |label: &str| -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {

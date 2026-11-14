@@ -558,13 +558,19 @@ fn vision_probe() {
     // `LOGIS_SYNTH_CPU=1`: CPU(F32)로 돕니다 — GPU 검색 평가와 함께 돌릴 때. 판정 코드는 같고 수치만 장치 · 정밀도 차이만큼 다릅니다.
     let cpu = std::env::var("LOGIS_SYNTH_CPU").map(|v| v == "1").unwrap_or(false);
     let device = if cpu { candle_core::Device::Cpu } else { tauri_app_lib::utils::new_gpu_device(0).expect("GPU") };
-    let dtype = if cpu || device.is_vulkan() { candle_core::DType::F32 } else { candle_core::DType::BF16 };
+    // 정밀도는 앱과 같이 SigLIP2 가중치 계획(LOGIS_SIGLIP2_QUANT, 기본 bf16)을 따릅니다.
+    let dtype = tauri_app_lib::models::siglip2::quant::dtype_for(&device);
+    let plan_tag = tauri_app_lib::models::siglip2::quant::weights_tag(&device);
     let config = Siglip2Config::from_json(&dir.join("config.json")).expect("config.json");
     let encode_only = std::env::var("LOGIS_SYNTH_ENCODE_ONLY").map(|v| v == "1").unwrap_or(false);
+    let t_load = std::time::Instant::now();
     let mut model = Siglip2Model::load_vision_only(&dir.join("model.safetensors"), &config, &device, dtype).expect("비전 타워");
     if !encode_only {
         model.load_text_encoder(&dir).expect("텍스트 타워");
     }
+    println!("@@EVAL WEIGHTS {} {:?} load {:.1} s", plan_tag, dtype, t_load.elapsed().as_secs_f64());
+    // `LOGIS_SYNTH_HEAT`: 카테고리 히트맵 점수(타이틀 행 가리기 · 아레나 전)를 쪽마다 <덤프>/<쪽>.heat.json 으로 남깁니다.
+    let heat = std::env::var("LOGIS_SYNTH_HEAT").map(|v| v == "1").unwrap_or(false);
     // 패치 수 실험: 앱은 256 을 씁니다. 가중치의 위치 임베딩 격자는 그대로 두고 전처리의 상한만 바꿉니다.
     if let Some(n) = std::env::var("LOGIS_SYNTH_PATCHES").ok().and_then(|v| v.parse::<usize>().ok()) {
         model.config.max_num_patches = n;
@@ -618,8 +624,15 @@ fn vision_probe() {
         sds::refine_primary(&verdict.code);
         let title_prej: Vec<String> =
             if verdict.title_text.is_empty() { Vec::new() } else { vec![verdict.title_text.clone()] };
+        let t_heat = std::time::Instant::now();
         let mut heatmaps = build_column_heatmaps(&model, &grid, &verdict.code, &lang, Some(&legibility), &title_prej, &emit)
             .expect("build_column_heatmaps");
+        let heat_secs = t_heat.elapsed().as_secs_f64();
+        if let (true, Some(d)) = (heat, dump.as_ref()) {
+            let maps: Vec<Value> = heatmaps.iter().map(|h| json!({"category": h.category, "scores": h.scores})).collect();
+            let body = json!({"rows": grid.grid_rows, "cols": grid.grid_cols, "maps": maps});
+            std::fs::write(d.join(format!("{stem}.heat.json")), body.to_string()).expect("히트맵 덤프");
+        }
         let raw_maps: Vec<Value> = heatmaps
             .iter()
             .map(|h| {
@@ -655,7 +668,8 @@ fn vision_probe() {
             &emit,
         );
         let line = json!({
-            "page": stem, "rows": grid.grid_rows, "cols": grid.grid_cols, "encode_secs": encode_secs,
+            "page": stem, "rows": grid.grid_rows, "cols": grid.grid_cols, "encode_secs": encode_secs, "heat_secs": heat_secs,
+            "weights": plan_tag,
             "group": verdict.group, "group_score": verdict.group_score, "group_margin": verdict.group_margin,
             "code": verdict.code, "code_score": verdict.code_score, "code_margin": verdict.code_margin,
             "title_confirmed": verdict.title_confirmed, "title_text": verdict.title_text,
@@ -936,7 +950,7 @@ fn embed_dump() {
     let device = tauri_app_lib::utils::new_gpu_device(0).expect("GPU");
     let rows: Vec<Vec<f32>> = if which == "siglip2" {
         let dir = crate::common::models_dir().join("siglip2-so400m-patch16-naflex");
-        let dtype = if device.is_vulkan() { candle_core::DType::F32 } else { candle_core::DType::BF16 };
+        let dtype = tauri_app_lib::models::siglip2::quant::dtype_for(&device);
         let config = Siglip2Config::from_json(&dir.join("config.json")).expect("config.json");
         let model = Siglip2Model::load_text_only(&dir, &config, &device, dtype).expect("텍스트 타워");
         encode_phrase_rows(&model, &texts, true).expect("인코딩")

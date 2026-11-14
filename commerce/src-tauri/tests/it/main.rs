@@ -61,6 +61,8 @@ mod research;
 mod p2b_models;
 // FlashAttention / TurboQuant 정확도 teacher-forcing (목업 Qwen3, FA on/off × TQ KV on/off, CPU + GPU)
 mod accel_accuracy;
+// 원본에서 한 번 양자화하는 블록 인코더(ggml-kquant) · SigLIP2 정밀도 계획과 지문 (CPU)
+mod pyramid_quant;
 // GPU 메모리 보고 · 반환 · KV 계층 강제 (장치 공통: Metal · Vulkan · CUDA · ROCm)
 mod gpu_memory;
 mod qwen35_kv;

@@ -2,6 +2,14 @@
 //!
 //! - `p2b_qwen35_2b_fused_gdn`  : Qwen3.5-2B Q8_0 — 융합 GDN vs 기존 텐서 경로, Q8_0 forward_exact vs 기존 선형층.
 //!   teacher-forcing (프리필 270 + 디코드 30 스텝): max |Δlogit|, top-1 일치율, 호출당 시간.
+//! - `p2b_qwen35_2b_lm_head_q8` : Qwen3.5-2B — 묶인 입력 임베딩 · 출력 헤드를 F16 역양자화본(기본, 1,017 MB)으로 둘 때와 GGUF 의
+//!   Q8_0 블록 그대로(`LOGIS_EMBED_Q8=1`, 540 MB) 둘 때. teacher-forcing 로짓 KLD · top-1, 디코드 시간, 상주 VRAM.
+//! - `p2b_qwen35_4b_quantizer`  : Qwen3.5-4B-kor — 같은 Q4_K_M 배정을 candle 척도 탐색(앱의 기존 변환)과 가중 최소제곱
+//!   (`ggml-kquant`)으로 만들어 Q8_0 기준과 비교. teacher-forcing 토큰별 NLL · KLD · top-1, 디코드 시간 (`LOGIS_LANG_QUANT_DIR`).
+//! - `p2b_lm_head_cost`         : 출력 헤드 한 토큰 행렬-벡터 곱의 시간 (모델 없음, 무작위 가중치). 전체 어휘 vs 16,384 행으로
+//!   잘랐을 때 — 어휘 자르기로 아낄 수 있는 디코드 시간의 상한입니다.
+//! - `p2b_qmatmul_parity`       : 장치의 양자화 행렬곱(Q8_0 · Q6_K · Q5_K · Q4_K, 행 1 ~ 256) vs 같은 블록을 CPU 에서 풀어 F64 로
+//!   곱한 기준. ‖Δ‖/‖기준‖ ≤ 1e-5 (지시문 게이트 1). 블록은 `ggml-kquant` 로 만듭니다.
 //! - `p2b_qwen35_4b_timing`     : Qwen3.5-4B-kor (alphaedge q4km) — 프리필 ~900 + 디코드 40 스텝 호출 시간 (융합/기존).
 //! - `p2b_qwen3_q8_resident`    : Qwen3-0.6B Q8_0 — 기존 BF16 역양자화 vs Q8 상주(정확 W8A16) vs F32 기준
 //!   (Q8 가중치 정확 복원 + F32 활성·matmul·logits). KLD, top-1/top-5, 상주 VRAM, 디코드 tok/s.
@@ -35,12 +43,20 @@ fn gpu() -> Option<Device> {
         Ok(d) => return Some(d),
         Err(e) => println!("[P2B-TEST] CUDA 장치를 열 수 없어 건너뜁니다: {e}"),
     }
+    // 앱의 진입점으로 열어 ROCm 사용을 기록합니다 (`finish_gpu_test` 의 빠른 종료 판정).
     #[cfg(feature = "rocm")]
-    match Device::new_rocm(0) {
-        Ok(d) => return Some(d),
-        Err(e) => println!("[P2B-TEST] ROCm 장치를 열 수 없어 건너뜁니다: {e}"),
+    match tauri_app_lib::utils::new_gpu_device(0) {
+        Some(d) => return Some(d),
+        None => println!("[P2B-TEST] ROCm 장치를 열 수 없어 건너뜁니다"),
     }
     None
+}
+
+/// `LOGIS_TEST_FAST_EXIT=1` 이면 시험이 끝난 뒤 바로 프로세스를 끝냅니다 (Windows ROCm 의 종료 멈춤 회피, 시험 하나만 돌릴 때).
+fn finish_gpu_test() {
+    if std::env::var("LOGIS_TEST_FAST_EXIT").map(|v| v == "1").unwrap_or(false) {
+        tauri_app_lib::utils::device_utils::rocm_exit_now_if_used(0);
+    }
 }
 
 /// 한국어 + 영어가 섞인 고정 프롬프트 (주문·상품 추출 작업과 비슷한 문장).
@@ -165,6 +181,31 @@ fn q35_run(
     Ok(Q35Run { rows, prefill_s, decode_ms })
 }
 
+/// 탐욕 생성: `prompt` 를 프리필하고 가장 높은 로짓 토큰을 `steps` 번 이어 붙입니다.
+fn q35_greedy(
+    rt: &tokio::runtime::Runtime,
+    g: &mut tauri_app_lib::models::qwen3_5::generate::Qwen3_5GenerateModel,
+    dev: &Device,
+    prompt: &[u32],
+    steps: usize,
+) -> anyhow::Result<Vec<u32>> {
+    tauri_app_lib::models::qwen3_5::model::IGNORE_STOP_SIGNAL_FOR_TESTS.store(true, std::sync::atomic::Ordering::Relaxed);
+    g.clear_kv_cache();
+    let p = prompt.len();
+    let full = Tensor::from_slice(prompt, (1, p), dev)?;
+    let _ = g.qwen3_5.compute_and_set_rope_deltas(&full, None, None);
+    let mut last = row_f32(&rt.block_on(g.qwen3_5.forward(&full, None, None, None, None, None, 0, None, None))?)?;
+    let mut out = Vec::with_capacity(steps);
+    for j in 0..steps {
+        let next = argmax(&last) as u32;
+        out.push(next);
+        let one = Tensor::from_slice(&[next], (1, 1), dev)?;
+        last = row_f32(&rt.block_on(g.qwen3_5.forward(&one, None, None, None, None, None, p + j, None, None))?)?;
+    }
+    g.clear_kv_cache();
+    Ok(out)
+}
+
 fn set_paths(fused: bool, exact: bool) {
     tauri_app_lib::models::common::set_gdn_fused_override(Some(fused));
     tauri_app_lib::models::common::gguf::set_q8_exact_override(Some(exact));
@@ -217,6 +258,303 @@ fn p2b_qwen35_2b_fused_gdn() -> R {
         println!("[P2B-RESULT]  시간 {name:<10}: 프리필 {:.3} s · 디코드 {:.1} ms/토큰", r.prefill_s, r.decode_ms);
     }
     assert!(gdn.top1 >= 90.0, "융합 GDN top-1 {:.1}%", gdn.top1);
+    Ok(())
+}
+
+/// 🌟 [PYRAMID-QUANT / LM HEAD] 2B 의 출력 헤드(= 묶인 입력 임베딩)를 F16 으로 풀어 둘지, GGUF 의 Q8_0 블록 그대로 쓸지.
+/// F16 표는 Q8_0 값(정수 × F16 척도)을 다시 F16 으로 반올림한 것이라 정보가 늘지 않습니다. 같은 프롬프트를 두 적재로 돌려
+/// 로짓 차이와 디코드 시간, 상주 VRAM 을 잽니다. 한 번에 한 적재만 올립니다.
+#[test]
+#[ignore = "실모델 (LOGIS_TEST_MODELS=1)"]
+fn p2b_qwen35_2b_lm_head_q8() -> R {
+    if !enabled() {
+        return Ok(());
+    }
+    let Some(dev) = gpu() else { return Ok(()) };
+    let file = models_dir().join("Qwen3.5-2B-Instruct-gguf").join("Qwen3.5-2B-Q8_0.gguf");
+    if !file.exists() {
+        println!("[P2B-TEST] {file:?} 없음 → 건너뜀");
+        return Ok(());
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    let decode = 40;
+    let mut runs: Vec<(&str, Q35Run, f64)> = Vec::new();
+    let mut greedy: Vec<Vec<Vec<u32>>> = Vec::new();
+    let mut ids_once: Option<Vec<u32>> = None;
+    // F16 → Q8 → F16 (마지막 F16 은 같은 적재의 반복 차이 = 측정 잡음)
+    for (name, q8) in [("F16 표", false), ("Q8_0 표", true), ("F16 표(반복)", false)] {
+        std::env::set_var("LOGIS_EMBED_Q8", if q8 { "1" } else { "0" });
+        let _ = dev.trim_memory_pool(0);
+        let before = free_bytes(&dev);
+        let mut g = tauri_app_lib::models::qwen3_5::generate::Qwen3_5GenerateModel::init_from_gguf(file.to_str().unwrap(), None, Some(&dev))?;
+        let ids = match &ids_once {
+            Some(ids) => ids.clone(),
+            None => {
+                let ids = g.tokenizer.text_encode_vec(prompt_text(3), false)?;
+                let Some(ids) = tokens_or_skip(ids, 300, "2B") else { return Ok(()) };
+                ids_once = Some(ids.clone());
+                ids
+            }
+        };
+        set_paths(true, true);
+        let _warm = q35_run(&rt, &mut g, &dev, &ids[..60], 4)?;
+        let r = q35_run(&rt, &mut g, &dev, &ids, decode)?;
+        let resident = (before - free_bytes(&dev)) / 1e6;
+        // 탐욕 생성 세 가지: 한국어 · 영어가 섞인 주문 문장의 앞부분 이어 쓰기
+        let mut gen = Vec::new();
+        for cut in [48usize, 120, 200] {
+            gen.push(q35_greedy(&rt, &mut g, &dev, &ids[..cut], 96)?);
+        }
+        greedy.push(gen);
+        drop(g);
+        let _ = dev.synchronize_all();
+        let _ = dev.trim_memory_pool(0);
+        runs.push((name, r, resident));
+    }
+    std::env::remove_var("LOGIS_EMBED_Q8");
+    tauri_app_lib::models::common::set_gdn_fused_override(None);
+    tauri_app_lib::models::common::gguf::set_q8_exact_override(None);
+
+    let noise = compare(&runs[0].1.rows, &runs[2].1.rows);
+    let q8 = compare(&runs[0].1.rows, &runs[1].1.rows);
+    let n_ids = ids_once.as_ref().map_or(0, |v| v.len());
+    println!("[P2B-RESULT] Qwen3.5-2B 출력 헤드 · 프리필 {} + 디코드 {}", n_ids - decode, decode);
+    for (i, (a, b)) in greedy[0].iter().zip(&greedy[1]).enumerate() {
+        let same = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+        println!("[P2B-RESULT]  탐욕 생성 {i}: F16 · Q8_0 같은 앞부분 {same}/{} 토큰", a.len());
+    }
+    println!("[P2B-RESULT]  F16 반복 (잡음) : max|Δ| {:.3e} · top-1 {:.1}% · top-5 {:.1}% · KLD {:.3e}", noise.max_abs, noise.top1, noise.top5, noise.kld);
+    println!("[P2B-RESULT]  Q8_0 vs F16      : max|Δ| {:.3e} · top-1 {:.1}% · top-5 {:.1}% · KLD {:.3e}", q8.max_abs, q8.top1, q8.top5, q8.kld);
+    for (name, r, mb) in &runs {
+        println!("[P2B-RESULT]  {name:<12}: 프리필 {:.3} s · 디코드 {:.2} ms/토큰 · 상주 {:.0} MB", r.prefill_s, r.decode_ms, mb);
+    }
+    finish_gpu_test();
+    Ok(())
+}
+
+/// 🌟 [PYRAMID-QUANT / LM HEAD TRIM] 출력 헤드 행렬-벡터 곱 한 번의 장치 시간. 디코드 한 토큰마다 한 번 돕니다.
+/// 0.6B 는 Q8_0 [151,936 × 1,024], 2B 는 F16 표(기본) 또는 Q8_0 [248,320 × 2,048]. 잘린 헤드는 16,384 행입니다.
+#[test]
+#[ignore = "GPU (LOGIS_TEST_MODELS=1)"]
+fn p2b_lm_head_cost() -> R {
+    use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+    use candle_core::Module;
+    if !enabled() {
+        return Ok(());
+    }
+    let Some(dev) = gpu() else { return Ok(()) };
+    let reps = 60;
+    let time = |f: &dyn Fn() -> candle_core::Result<Tensor>| -> anyhow::Result<f64> {
+        for _ in 0..5 {
+            f()?;
+        }
+        dev.synchronize_all()?;
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            f()?;
+        }
+        dev.synchronize_all()?;
+        Ok(t0.elapsed().as_secs_f64() * 1000.0 / reps as f64)
+    };
+    for (name, vocab, hidden) in [("0.6B", 151_936usize, 1024usize), ("2B", 248_320, 2048), ("4B-16384", 16_384, 2560)] {
+        for rows in [vocab, 16_384] {
+            if rows > vocab {
+                continue;
+            }
+            let w = Tensor::randn(0f32, 0.02, (rows, hidden), &Device::Cpu)?;
+            let x = Tensor::randn(0f32, 1.0, (1, 1, hidden), &dev)?;
+            let q = QMatMul::from_qtensor(QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev)?)?;
+            let q8 = time(&|| q.forward(&x))?;
+            let wf = w.to_dtype(DType::F16)?.to_device(&dev)?;
+            let f16 = QMatMul::TensorF16(wf);
+            let dense = time(&|| f16.forward(&x))?;
+            println!("[P2B-RESULT] 출력 헤드 {name} {rows:>6} × {hidden}: Q8_0 {q8:.3} ms · F16 {dense:.3} ms");
+            drop(q);
+            drop(f16);
+            let _ = dev.synchronize_all();
+            let _ = dev.trim_memory_pool(0);
+        }
+    }
+    finish_gpu_test();
+    Ok(())
+}
+
+/// 🌟 [PYRAMID-QUANT / PARITY] 장치 커널이 블록을 정확히 곱하는가. 양자화 오차가 아니라 커널 오차만 봅니다:
+/// 기준은 같은 바이트를 candle 의 CPU 역양자화기로 풀어 F64 로 곱한 값입니다.
+#[test]
+#[ignore = "GPU (LOGIS_TEST_MODELS=1)"]
+fn p2b_qmatmul_parity() -> R {
+    use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul};
+    use ggml_kquant::Format;
+    if !enabled() {
+        return Ok(());
+    }
+    let Some(dev) = gpu() else { return Ok(()) };
+    let (n, k) = (384usize, 1280usize);
+    let w: Vec<f32> = Tensor::randn(0f32, 0.02, (n, k), &Device::Cpu)?.flatten_all()?.to_vec1()?;
+    let mut worst = 0f64;
+    for (fmt, dt) in [(Format::Q8_0, GgmlDType::Q8_0), (Format::Q6K, GgmlDType::Q6K), (Format::Q5K, GgmlDType::Q5K), (Format::Q4K, GgmlDType::Q4K)] {
+        let bytes = ggml_kquant::encode(&w, k, fmt, None).map_err(anyhow::Error::msg)?;
+        let mut words = vec![0u64; bytes.len().div_ceil(8)];
+        let (_, raw, _) = unsafe { words.align_to_mut::<u8>() };
+        raw[..bytes.len()].copy_from_slice(&bytes);
+        let deq: Vec<f32> = qtensor_from_ggml(dt, &raw[..bytes.len()], vec![n, k], &Device::Cpu)?.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1()?;
+        let qm = QMatMul::from_qtensor(qtensor_from_ggml(dt, &raw[..bytes.len()], vec![n, k], &dev)?)?;
+        for rows in [1usize, 4, 8, 9, 32, 256] {
+            let x: Vec<f32> = Tensor::randn(0f32, 1.0, (rows, k), &Device::Cpu)?.flatten_all()?.to_vec1()?;
+            let y: Vec<f32> = qm.forward_exact(&Tensor::from_slice(&x, (rows, k), &dev)?)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
+            let (mut num, mut den) = (0f64, 0f64);
+            for r in 0..rows {
+                for c in 0..n {
+                    let mut acc = 0f64;
+                    for i in 0..k {
+                        acc += x[r * k + i] as f64 * deq[c * k + i] as f64;
+                    }
+                    num += (y[r * n + c] as f64 - acc).powi(2);
+                    den += acc * acc;
+                }
+            }
+            let rel = (num / den.max(1e-30)).sqrt();
+            worst = worst.max(rel);
+            println!("[P2B-RESULT] 커널 대조 {dt:?} 행 {rows:>3}: ‖Δ‖/‖기준‖ {rel:.2e}");
+        }
+    }
+    assert!(worst <= 1e-5, "양자화 행렬곱 커널 오차 {worst:.2e} > 1e-5");
+    finish_gpu_test();
+    Ok(())
+}
+
+/// 4B 의 언어 문맥(한국어 무역 · 주문 문장). 토큰별 다음 토큰 NLL 을 잽니다.
+fn lang_text() -> String {
+    let trade = "선하증권 BL-2026-08814 에 따르면 화주 글로벌테크로지스틱스(주)는 부산항에서 로스앤젤레스항으로 산업용 마이크로컨트롤러 \
+        1,200 상자를 선적했으며, 신용장 LC-88492011 의 조건에 따라 상업송장 CI-2026-08001 과 포장명세서, 원산지증명서를 함께 제출해야 합니다. \
+        수입자 노바임포터스는 도착통지서를 받은 뒤 관세사를 통해 통관을 진행하고, 적하보험증권의 보험금액은 송장 금액의 110% 로 정했습니다. \
+        운임은 선불(Freight Prepaid)이며 컨테이너 번호는 MSKU 7731025, 봉인 번호는 SL-559102 입니다. ";
+    format!("{}{}", trade.repeat(2), prompt_text(1))
+}
+
+struct NllRun {
+    rows: Vec<Vec<f32>>,
+    nll: Vec<f64>,
+    decode_ms: f64,
+}
+
+/// teacher-forcing: 앞 `warm` 토큰을 프리필하고 나머지를 한 토큰씩 디코드하며, 다음 토큰의 NLL 과 로짓을 남깁니다.
+fn nll_run(rt: &tokio::runtime::Runtime, g: &mut tauri_app_lib::models::qwen3_5::generate::Qwen3_5GenerateModel, dev: &Device, ids: &[u32], warm: usize) -> anyhow::Result<NllRun> {
+    tauri_app_lib::models::qwen3_5::model::IGNORE_STOP_SIGNAL_FOR_TESTS.store(true, std::sync::atomic::Ordering::Relaxed);
+    g.clear_kv_cache();
+    let n = ids.len();
+    let full = Tensor::from_slice(ids, (1, n), dev)?;
+    let _ = g.qwen3_5.compute_and_set_rope_deltas(&full, None, None);
+    let pre = Tensor::from_slice(&ids[..warm], (1, warm), dev)?;
+    let mut last = row_f32(&rt.block_on(g.qwen3_5.forward(&pre, None, None, None, None, None, 0, None, None))?)?;
+    let (mut rows, mut nll) = (Vec::with_capacity(n - warm), Vec::with_capacity(n - warm));
+    let t0 = Instant::now();
+    for j in warm..n {
+        nll.push(-log_softmax(&last)[ids[j] as usize]);
+        rows.push(std::mem::take(&mut last));
+        if j + 1 == n {
+            break;
+        }
+        let one = Tensor::from_slice(&ids[j..j + 1], (1, 1), dev)?;
+        last = row_f32(&rt.block_on(g.qwen3_5.forward(&one, None, None, None, None, None, j, None, None))?)?;
+    }
+    let decode_ms = t0.elapsed().as_secs_f64() * 1000.0 / (n - warm).max(1) as f64;
+    g.clear_kv_cache();
+    Ok(NllRun { rows, nll, decode_ms })
+}
+
+/// 🌟 [PYRAMID-QUANT / 4B] 같은 Q4_K_M 배정(앱의 `plan`)에서 블록 척도 탐색만 바꿉니다: candle(앱의 기존 변환본) vs 가중 최소제곱.
+/// 기준은 같은 원본에서 만든 Q8_0 입니다. 변환본은 `LOGIS_LANG_QUANT_DIR` 에 만들고 앱의 런타임 폴더 · 준비 표식은 건드리지 않습니다.
+#[test]
+#[ignore = "실모델 (LOGIS_TEST_MODELS=1, LOGIS_LANG_QUANT_DIR)"]
+fn p2b_qwen35_4b_quantizer() -> R {
+    use tauri_app_lib::model::lang_gguf::{self, Precision, Quantizer};
+    if !enabled() {
+        return Ok(());
+    }
+    let Ok(out_dir) = std::env::var("LOGIS_LANG_QUANT_DIR") else {
+        println!("[P2B-TEST] LOGIS_LANG_QUANT_DIR 없음 → 건너뜀");
+        return Ok(());
+    };
+    let Some(dev) = gpu() else { return Ok(()) };
+    let lang = std::env::var("LOGIS_LANG_QUANT_LANG").unwrap_or_else(|_| "kor".into());
+    let dir = models_dir().join(format!("Qwen3.5-4B-{lang}-16384"));
+    if !dir.join("model.safetensors").exists() {
+        println!("[P2B-TEST] {dir:?} 원본 없음 → 건너뜀");
+        return Ok(());
+    }
+    let out_dir = PathBuf::from(out_dir).join(&lang);
+    std::fs::create_dir_all(&out_dir)?;
+    let mut arms: Vec<(&str, PathBuf)> = Vec::new();
+    for (name, precision, quantizer) in [("q8_0 기준", Precision::Q8, Quantizer::Candle), ("q4km candle", Precision::Q4KM, Quantizer::Candle), ("q4km wls", Precision::Q4KM, Quantizer::Wls)] {
+        let file = out_dir.join(format!("{}.gguf", name.replace(' ', "-")));
+        if !file.exists() {
+            let t0 = Instant::now();
+            lang_gguf::convert_variant(&dir, &file, precision, quantizer, &|_, _| {})?;
+            println!("[P2B-RESULT] 변환 {name}: {:.1} s · {:.0} MB", t0.elapsed().as_secs_f64(), std::fs::metadata(&file)?.len() as f64 / 1e6);
+        }
+        arms.push((name, file));
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    let mut runs: Vec<(&str, NllRun, u64)> = Vec::new();
+    let mut ids_once: Option<Vec<u32>> = None;
+    for (name, file) in &arms {
+        let mut g = lang_gguf::load_from(&dir, file, &dev)?;
+        let ids = match &ids_once {
+            Some(ids) => ids.clone(),
+            None => {
+                let ids = g.tokenizer.text_encode_vec(lang_text(), false)?;
+                let ids: Vec<u32> = ids.into_iter().take(640).collect();
+                ids_once = Some(ids.clone());
+                ids
+            }
+        };
+        set_paths(true, true);
+        let r = nll_run(&rt, &mut g, &dev, &ids, 32)?;
+        drop(g);
+        let _ = dev.synchronize_all();
+        let _ = dev.trim_memory_pool(0);
+        runs.push((*name, r, std::fs::metadata(file)?.len()));
+    }
+    tauri_app_lib::models::common::set_gdn_fused_override(None);
+    tauri_app_lib::models::common::gguf::set_q8_exact_override(None);
+
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+    let reference = &runs[0].1;
+    println!("[P2B-RESULT] Qwen3.5-4B-{lang} · 토큰 {} (프리필 32)", ids_once.as_ref().map_or(0, |v| v.len()));
+    for (name, r, bytes) in &runs {
+        let c = compare(&reference.rows, &r.rows);
+        let d: Vec<f64> = r.nll.iter().zip(&reference.nll).map(|(a, b)| a - b).collect();
+        let (nll, dnll) = (mean(&r.nll[..]), mean(&d[..]));
+        // 토큰 단위 부트스트랩 95 % 구간 (고정 씨앗)
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut boots: Vec<f64> = (0..2000)
+            .map(|_| {
+                let mut acc = 0.0;
+                for _ in 0..d.len() {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    acc += d[(s >> 33) as usize % d.len()];
+                }
+                acc / d.len() as f64
+            })
+            .collect();
+        boots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "[P2B-RESULT]  {name:<12}: NLL {:.4} (ppl {:.3}) · ΔNLL {:+.4} [{:+.4}, {:+.4}] · KLD {:.4e} · top-1 {:.1}% · top-5 {:.1}% · 디코드 {:.1} ms/토큰 · {:.0} MB",
+            nll,
+            nll.exp(),
+            dnll,
+            boots[50],
+            boots[1949],
+            c.kld,
+            c.top1,
+            c.top5,
+            r.decode_ms,
+            *bytes as f64 / 1e6
+        );
+    }
+    finish_gpu_test();
     Ok(())
 }
 

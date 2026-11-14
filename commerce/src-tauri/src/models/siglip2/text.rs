@@ -1,6 +1,8 @@
 use candle_core::{Result, Tensor};
-use candle_nn::{Embedding, Linear, Module, VarBuilder};
+use candle_nn::{Embedding, Module, VarBuilder};
 
+use super::gguf::MappedGguf;
+use super::quant::{linear, SLinear};
 use super::Siglip2Config;
 
 /// 토큰 임베딩 표를 어디에 둘지
@@ -23,7 +25,7 @@ pub struct Siglip2TextModel {
     position_embedding: Embedding,
     layers: Vec<TextEncoderLayer>,
     final_layernorm: candle_nn::LayerNorm,
-    head: Linear,
+    head: SLinear,
     hidden_size: usize,
     max_seq_len: usize,
     device: candle_core::Device,
@@ -39,17 +41,17 @@ pub struct TextEncoderLayer {
 }
 
 pub struct TextAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    out_proj: Linear,
+    q_proj: SLinear,
+    k_proj: SLinear,
+    v_proj: SLinear,
+    out_proj: SLinear,
     num_heads: usize,
     head_dim: usize,
 }
 
 pub struct TextMLP {
-    fc1: Linear,
-    fc2: Linear,
+    fc1: SLinear,
+    fc2: SLinear,
 }
 
 impl Siglip2TextModel {
@@ -57,6 +59,16 @@ impl Siglip2TextModel {
         config: &Siglip2Config,
         vb: VarBuilder,
         tokens: TokenSource,
+    ) -> Result<Self> {
+        Self::new_with(config, vb, tokens, None)
+    }
+
+    /// `q`: 양자화 계획의 타워 GGUF (블록 형식 가중치). 없으면 VarBuilder 의 밀집 가중치.
+    pub fn new_with(
+        config: &Siglip2Config,
+        vb: VarBuilder,
+        tokens: TokenSource,
+        q: Option<&MappedGguf>,
     ) -> Result<Self> {
         let hidden = config.text_hidden_size;
         let device = vb.device().clone();
@@ -87,7 +99,7 @@ impl Siglip2TextModel {
         let encoder_vb = vb.pp("encoder");
         for i in 0..config.text_num_layers {
             let layer_vb = encoder_vb.pp(format!("layers.{}", i));
-            let layer = TextEncoderLayer::new(config, layer_vb)?;
+            let layer = TextEncoderLayer::new(config, layer_vb, q)?;
             layers.push(layer);
         }
 
@@ -103,7 +115,7 @@ impl Siglip2TextModel {
             vb.pp("final_layer_norm"),
         )?;
 
-        let head = candle_nn::linear(hidden, hidden, vb.pp("head"))?;
+        let head = linear(&vb.pp("head"), q, hidden, hidden)?;
 
         match &token_embedding {
             TokenTable::Dense { on_cpu: true, .. } => println!(
@@ -222,12 +234,12 @@ impl Siglip2TextModel {
 }
 
 impl TextEncoderLayer {
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &Siglip2Config, vb: VarBuilder, q: Option<&MappedGguf>) -> Result<Self> {
         let hidden = config.text_hidden_size;
         let eps = config.text_layer_norm_eps;
 
-        let self_attn = TextAttention::new(config, vb.pp("self_attn"))?;
-        let mlp = TextMLP::new(config, vb.pp("mlp"))?;
+        let self_attn = TextAttention::new(config, vb.pp("self_attn"), q)?;
+        let mlp = TextMLP::new(config, vb.pp("mlp"), q)?;
         let layer_norm1 = candle_nn::layer_norm(hidden, eps, vb.pp("layer_norm1"))?;
         let layer_norm2 = candle_nn::layer_norm(hidden, eps, vb.pp("layer_norm2"))?;
 
@@ -255,16 +267,16 @@ impl TextEncoderLayer {
 }
 
 impl TextAttention {
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &Siglip2Config, vb: VarBuilder, q: Option<&MappedGguf>) -> Result<Self> {
         let hidden = config.text_hidden_size;
         let num_heads = config.text_num_heads;
         let head_dim = hidden / num_heads;
 
         Ok(Self {
-            q_proj: candle_nn::linear(hidden, hidden, vb.pp("q_proj"))?,
-            k_proj: candle_nn::linear(hidden, hidden, vb.pp("k_proj"))?,
-            v_proj: candle_nn::linear(hidden, hidden, vb.pp("v_proj"))?,
-            out_proj: candle_nn::linear(hidden, hidden, vb.pp("out_proj"))?,
+            q_proj: linear(&vb.pp("q_proj"), q, hidden, hidden)?,
+            k_proj: linear(&vb.pp("k_proj"), q, hidden, hidden)?,
+            v_proj: linear(&vb.pp("v_proj"), q, hidden, hidden)?,
+            out_proj: linear(&vb.pp("out_proj"), q, hidden, hidden)?,
             num_heads,
             head_dim,
         })
@@ -311,18 +323,10 @@ impl TextAttention {
 }
 
 impl TextMLP {
-    pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(config: &Siglip2Config, vb: VarBuilder, q: Option<&MappedGguf>) -> Result<Self> {
         Ok(Self {
-            fc1: candle_nn::linear(
-                config.text_hidden_size,
-                config.text_intermediate_size,
-                vb.pp("fc1"),
-            )?,
-            fc2: candle_nn::linear(
-                config.text_intermediate_size,
-                config.text_hidden_size,
-                vb.pp("fc2"),
-            )?,
+            fc1: linear(&vb.pp("fc1"), q, config.text_hidden_size, config.text_intermediate_size)?,
+            fc2: linear(&vb.pp("fc2"), q, config.text_intermediate_size, config.text_hidden_size)?,
         })
     }
 

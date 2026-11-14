@@ -4766,6 +4766,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ggml-kquant"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "rayon",
+]
+
+[[package]]
 name = "ghash"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7015,6 +7023,7 @@ dependencies = [
  "fantoccini",
  "flate2",
  "futures",
+ "ggml-kquant",
  "half",
  "image",
  "io-uring",

@@ -9,6 +9,15 @@ use super::legibility::LegibilityMap;
 use super::vision_encoder::{CategoryHeatmap, DocTypeVerdict, PatchGrid};
 
 const LAYOUT_RECIPE: &str = "layout-v1:siglip2-so400m-naflex/label-anchor-int8/raw-heatmap";
+
+/// 🌟 [WEIGHTS FINGERPRINT] 템플릿의 앵커는 SigLIP2 히트맵에서 나오므로 정밀도가 다르면 레시피도 다릅니다.
+/// 예전 정밀도(GPU BF16 · CPU F32)는 예전 레시피 · 파일 그대로입니다.
+fn layout_recipe() -> String {
+    match crate::models::siglip2::quant::fingerprint_suffix() {
+        Some(s) => format!("{LAYOUT_RECIPE}|w={s}"),
+        None => LAYOUT_RECIPE.to_string(),
+    }
+}
 const MAX_TEMPLATES: usize = 64;
 const ANCHOR_MAX: usize = 48;
 const ANCHOR_MIN: usize = 6;
@@ -392,37 +401,51 @@ pub struct LayoutCache {
 
 impl LayoutCache {
     fn ensure_loaded(&self) {
-        if self.file.read().map(|g| g.is_some()).unwrap_or(true) {
+        let recipe = layout_recipe();
+        let current = |g: &Option<LayoutFile>| g.as_ref().is_some_and(|f| f.recipe == recipe);
+        if self.file.read().map(|g| current(&*g)).unwrap_or(true) {
             return;
         }
         let mut g = match self.file.write() {
             Ok(g) => g,
             Err(_) => return,
         };
-        if g.is_some() {
+        if current(&*g) {
             return;
         }
-        let loaded = std::fs::read_to_string(&self.path)
+        if let Some(old) = g.as_ref() {
+            // 프로세스 안에서 정밀도가 바뀌었습니다. 쌓던 템플릿은 그 정밀도의 파일에 남기고 이 정밀도의 것을 엽니다.
+            self.persist(&LayoutFile { recipe: old.recipe.clone(), templates: old.templates.clone() });
+        }
+        let loaded = std::fs::read_to_string(self.path_for(&recipe))
             .ok()
             .and_then(|s| serde_json::from_str::<LayoutFile>(&s).ok());
         let file = match loaded {
-            Some(f) if f.recipe == LAYOUT_RECIPE => {
+            Some(f) if f.recipe == recipe => {
                 println!(
                     "[LAYOUT CACHE] 서식 템플릿 {}개를 복원했습니다. (신뢰 {}개) | {:?}",
                     f.templates.len(),
                     f.templates.iter().filter(|t| t.trusted).count(),
-                    self.path
+                    self.path_for(&recipe)
                 );
                 f
             }
             Some(_) => {
                 println!("[LAYOUT CACHE] 템플릿 형식이 현재 판정 방식과 달라 폐기하고 새로 쌓습니다.");
-                let _ = std::fs::remove_file(&self.path);
-                LayoutFile { recipe: LAYOUT_RECIPE.to_string(), templates: Vec::new() }
+                let _ = std::fs::remove_file(self.path_for(&recipe));
+                LayoutFile { recipe: recipe.clone(), templates: Vec::new() }
             }
-            None => LayoutFile { recipe: LAYOUT_RECIPE.to_string(), templates: Vec::new() },
+            None => LayoutFile { recipe: recipe.clone(), templates: Vec::new() },
         };
         *g = Some(file);
+    }
+
+    /// 레시피의 파일. 예전 정밀도는 예전 파일(templates.json), 다른 정밀도는 꼬리표를 붙인 파일입니다.
+    fn path_for(&self, recipe: &str) -> PathBuf {
+        match recipe.split_once("|w=") {
+            Some((_, suffix)) => self.path.with_file_name(format!("templates-{suffix}.json")),
+            None => self.path.clone(),
+        }
     }
 
     fn persist(&self, file: &LayoutFile) {
@@ -433,13 +456,14 @@ impl LayoutCache {
                 return;
             }
         };
-        if let Some(parent) = self.path.parent() {
+        let path = self.path_for(&file.recipe);
+        if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::rename(&tmp, &self.path);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::rename(&tmp, &path);
         }
     }
 
@@ -742,10 +766,11 @@ impl LayoutCache {
     }
 
     pub fn clear_all(&self) {
+        let recipe = layout_recipe();
+        let _ = std::fs::remove_file(self.path_for(&recipe));
         if let Ok(mut g) = self.file.write() {
-            *g = Some(LayoutFile { recipe: LAYOUT_RECIPE.to_string(), templates: Vec::new() });
+            *g = Some(LayoutFile { recipe, templates: Vec::new() });
         }
-        let _ = std::fs::remove_file(&self.path);
         println!("[LAYOUT CACHE] 서식 템플릿을 전량 삭제했습니다.");
     }
 }

@@ -10,6 +10,8 @@ pub mod value_grounding;
 pub mod tokenizer;
 pub mod phrase_cache;
 pub mod layout_cache;
+pub mod quant;
+pub mod gguf_quant;
 
 
 use candle_core::{DType, Device};
@@ -91,24 +93,71 @@ fn root_scalar(vb: &VarBuilder, name: &str) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// 양자화 타워 GGUF 의 매핑 (블록 형식 가중치를 여기서 올립니다)
+type QuantFile = Option<std::sync::Arc<gguf::MappedGguf>>;
+
+/// `LOGIS_SIGLIP2_QUANT_SIM=1`: 양자화 계획을 블록 그대로 곱하지 않고 F32 로 풀어 올립니다 (민감도 측정 경로, quant.rs).
+fn quant_sim() -> bool {
+    std::env::var("LOGIS_SIGLIP2_QUANT_SIM").map(|v| v == "1").unwrap_or(false)
+}
+
+/// 🌟 [PYRAMID-QUANT] 계획의 타워 GGUF 를 (없으면 원본에서 만들어) 엽니다. 실패하면 `None` — 호출부는 원본 F32 로 읽습니다.
+fn quant_tower(model_dir: &Path, plan: &quant::WeightPlan, path: std::path::PathBuf, skip: &[&str], device: &Device) -> Option<(VarBuilder<'static>, std::sync::Arc<gguf::MappedGguf>)> {
+    let opened = gguf::prepare_quant(model_dir, plan)
+        .and_then(|_| gguf::open_cached(&path))
+        .and_then(|f| Ok((f.var_builder(skip, device)?, f)));
+    match opened {
+        Ok(parts) => Some(parts),
+        Err(e) => {
+            println!("[SigLIP2-QUANT] 계획 '{}' 의 타워 GGUF 를 쓰지 못해 원본 F32 로 읽습니다: {}", plan.tag, e);
+            None
+        }
+    }
+}
+
 /// 🌟 [SPLIT-GGUF] 비전 타워를 읽을 VarBuilder. 타워별 GGUF 가 있으면 매핑에서 바로 올리고, 아니면 safetensors 를 읽습니다.
-fn vision_builder(model_dir: &Path, device: &Device, dtype: DType) -> anyhow::Result<VarBuilder<'static>> {
+fn vision_builder(model_dir: &Path, device: &Device, dtype: DType) -> anyhow::Result<(VarBuilder<'static>, QuantFile)> {
+    // 🌟 [PYRAMID-QUANT] 양자화 계획이면 원본에서 한 번 만든 블록을 그대로 올립니다 (gguf_quant.rs).
+    let plan = quant::plan_for(device);
+    if plan.is_quantized() {
+        if quant_sim() {
+            return Ok((quant::dequantized_tower(model_dir, "vision_model.", &[], device, &plan)?, None));
+        }
+        if let Some((vb, f)) = quant_tower(model_dir, &plan, gguf::quant_vision_path(model_dir, &plan), &[], device) {
+            return Ok((vb, Some(f)));
+        }
+    }
     if gguf::usable(model_dir, dtype) {
         match gguf::open_cached(&gguf::vision_path(model_dir)).and_then(|f| f.var_builder(&[], device)) {
-            Ok(vb) => return Ok(vb),
+            Ok(vb) => return Ok((vb, None)),
             Err(e) => println!("[SigLIP2] mmproj 를 읽지 못해 safetensors 로 읽습니다: {}", e),
         }
     }
     let path = model_dir.join("model.safetensors");
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&[path], dtype, device)? })
+    Ok((unsafe { VarBuilder::from_mmaped_safetensors(&[path], dtype, device)? }, None))
 }
 
 /// 🌟 [SPLIT-GGUF] 텍스트 타워를 읽을 VarBuilder 와 토큰 표의 위치.
-fn text_builder(model_dir: &Path, device: &Device, dtype: DType) -> anyhow::Result<(VarBuilder<'static>, text::TokenSource<'static>)> {
+fn text_builder(model_dir: &Path, device: &Device, dtype: DType) -> anyhow::Result<(VarBuilder<'static>, text::TokenSource<'static>, QuantFile)> {
+    let plan = quant::plan_for(device);
+    if plan.is_quantized() {
+        let source = model_dir.join("model.safetensors");
+        if quant_sim() {
+            let vb = quant::dequantized_tower(model_dir, "text_model.", &[gguf::TOKEN_TABLE], device, &plan)?;
+            return Ok((vb, text::TokenSource::Mapped(gguf::MappedRows::from_safetensors(&source, gguf::TOKEN_TABLE)?), None));
+        }
+        if let Some((vb, f)) = quant_tower(model_dir, &plan, gguf::quant_text_path(model_dir, &plan), &[], device) {
+            // 토큰 표는 원본 F32 에서 쓰는 행만 읽습니다 (VRAM · 호스트 메모리 0).
+            match gguf::MappedRows::from_safetensors(&source, gguf::TOKEN_TABLE) {
+                Ok(rows) => return Ok((vb, text::TokenSource::Mapped(rows), Some(f))),
+                Err(e) => println!("[SigLIP2-QUANT] 원본 토큰 표를 매핑하지 못해 원본 F32 로 읽습니다: {}", e),
+            }
+        }
+    }
     if gguf::usable(model_dir, dtype) {
         let opened = gguf::open_cached(&gguf::text_path(model_dir)).and_then(|f| {
             let vb = f.var_builder(&[gguf::TOKEN_TABLE], device)?;
-            Ok((vb, text::TokenSource::Mapped(f.rows(gguf::TOKEN_TABLE)?)))
+            Ok((vb, text::TokenSource::Mapped(f.rows(gguf::TOKEN_TABLE)?), None))
         });
         match opened {
             Ok(parts) => return Ok(parts),
@@ -132,7 +181,7 @@ fn text_builder(model_dir: &Path, device: &Device, dtype: DType) -> anyhow::Resu
             }
         }
     };
-    Ok((vb, tokens))
+    Ok((vb, tokens, None))
 }
 
 impl Siglip2Model {
@@ -143,9 +192,12 @@ impl Siglip2Model {
         dtype: DType,
     ) -> anyhow::Result<Self> {
         let model_dir = safetensors_path.parent().unwrap_or_else(|| Path::new("."));
-        let vb = vision_builder(model_dir, device, dtype)?;
+        // 양자화 계획은 F32 활성으로 돕니다. 호출부가 예전 규칙(GPU BF16)으로 dtype 을 넘겨도 계획을 따릅니다.
+        let dtype = if quant::plan_for(device).is_quantized() { DType::F32 } else { dtype };
+        let (vb, q) = vision_builder(model_dir, device, dtype)?;
+        quant::note_loaded(device);
 
-        let vision_model = vision::Siglip2VisionModel::new(config, vb.pp("vision_model"))?;
+        let vision_model = vision::Siglip2VisionModel::new_with(config, vb.pp("vision_model"), q.as_deref())?;
 
         let logit_scale = root_scalar(&vb, "logit_scale");
         let logit_bias = root_scalar(&vb, "logit_bias");
@@ -177,8 +229,10 @@ impl Siglip2Model {
         device: &Device,
         dtype: DType,
     ) -> anyhow::Result<Self> {
-        let (vb, tokens) = text_builder(model_dir, device, dtype)?;
-        let text_model = text::Siglip2TextModel::new(config, vb.pp("text_model"), tokens)?;
+        let dtype = if quant::plan_for(device).is_quantized() { DType::F32 } else { dtype };
+        let (vb, tokens, q) = text_builder(model_dir, device, dtype)?;
+        quant::note_loaded(device);
+        let text_model = text::Siglip2TextModel::new_with(config, vb.pp("text_model"), tokens, q.as_deref())?;
 
         let logit_scale = root_scalar(&vb, "logit_scale");
         let logit_bias = root_scalar(&vb, "logit_bias");
@@ -212,8 +266,9 @@ impl Siglip2Model {
         if self.vision.is_some() {
             return Ok(());
         }
-        let vb = vision_builder(model_dir, &self.device, self.dtype)?;
-        let vision_model = vision::Siglip2VisionModel::new(&self.config, vb.pp("vision_model"))?;
+        let (vb, q) = vision_builder(model_dir, &self.device, self.dtype)?;
+        quant::note_loaded(&self.device);
+        let vision_model = vision::Siglip2VisionModel::new_with(&self.config, vb.pp("vision_model"), q.as_deref())?;
         self.vision = Some(vision_model);
         println!(
             "[SigLIP2] Vision encoder ATTACHED to existing instance (layers={}, patch={}).",
@@ -223,8 +278,9 @@ impl Siglip2Model {
     }
 
     pub fn load_text_encoder(&mut self, model_dir: &Path) -> anyhow::Result<()> {
-        let (vb, tokens) = text_builder(model_dir, &self.device, self.dtype)?;
-        let text_model = text::Siglip2TextModel::new(&self.config, vb.pp("text_model"), tokens)?;
+        let (vb, tokens, q) = text_builder(model_dir, &self.device, self.dtype)?;
+        quant::note_loaded(&self.device);
+        let text_model = text::Siglip2TextModel::new_with(&self.config, vb.pp("text_model"), tokens, q.as_deref())?;
         self.text = Some(text_model);
 
         let tok = tokenizer::Siglip2Tokenizer::from_dir(

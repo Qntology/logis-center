@@ -66,8 +66,15 @@ fn embed_q8_env() -> Option<bool> {
     })
 }
 
+/// 🌟 [PYRAMID-QUANT / LM HEAD] 묶인 입력 임베딩 · 출력 헤드를 GGUF 의 Q8_0 블록 그대로 둘지.
+///
+/// F16 표는 Q8_0 값(정수 × F16 척도)을 F16 으로 다시 반올림한 것이라 값이 더 정확하지 않고, 크기는 두 배입니다.
+/// ROCm(RX 6600) 실측 (tests/it/p2b_models.rs `p2b_qwen35_2b_lm_head_q8` · `p2b_lm_head_cost`):
+///   2B 출력 헤드 한 토큰 F16 19.4 ms → Q8_0 8.4 ms, 디코드 45.4 → 35.4 ms/토큰, 상주 VRAM −508 MB,
+///   teacher-forcing top-1 100 % · KLD 7e-6, 탐욕 생성 같음.
+/// 그래서 Vulkan 에 더해 ROCm 도 기본으로 Q8_0 를 씁니다. CUDA 는 재지 않아 그대로 F16 입니다 (`LOGIS_EMBED_Q8=1` 로 켬).
 fn use_quant_embed(device: &Device) -> bool {
-    embed_q8_env().unwrap_or_else(|| device.is_vulkan())
+    embed_q8_env().unwrap_or_else(|| device.is_vulkan() || device.is_rocm())
 }
 
 fn quant_embed_ok(dtype: candle_core::quantized::GgmlDType) -> bool {
