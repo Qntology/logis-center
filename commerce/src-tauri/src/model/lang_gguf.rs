@@ -154,6 +154,65 @@ impl StFile {
     }
 }
 
+/// 🌟 [SHARDED] 한 파일(`model.safetensors`) 또는 색인(`model.safetensors.index.json`)으로 나뉜 조각 파일들.
+/// 원본 Qwen/Qwen3.5-4B 는 두 조각입니다.
+pub(crate) struct StSet {
+    files: Vec<StFile>,
+    which: HashMap<String, usize>,
+}
+
+impl StSet {
+    pub(crate) fn open_dir(dir: &Path) -> Result<Self> {
+        let mut files = Vec::new();
+        let mut which = HashMap::new();
+        for (i, p) in weight_files(dir)?.iter().enumerate() {
+            let f = StFile::open(p)?;
+            for k in f.entries.keys() {
+                if which.insert(k.clone(), i).is_some() {
+                    bail!("{} 가 두 조각 파일에 함께 있습니다", k);
+                }
+            }
+            files.push(f);
+        }
+        Ok(Self { files, which })
+    }
+
+    pub(crate) fn names(&self) -> HashSet<String> {
+        self.which.keys().cloned().collect()
+    }
+
+    fn load(&self, name: &str) -> Result<Tensor> {
+        let i = *self.which.get(name).ok_or_else(|| anyhow!("가중치 파일에 {} 가 없습니다", name))?;
+        self.files[i].load(name)
+    }
+}
+
+/// 가중치 파일: `model.safetensors` 가 있으면 그것, 없으면 색인이 가리키는 조각들 (이름 순)
+pub(crate) fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let single = dir.join("model.safetensors");
+    if single.is_file() {
+        return Ok(vec![single]);
+    }
+    let index = dir.join("model.safetensors.index.json");
+    let v = read_json(&index).with_context(|| format!("{:?} 에 model.safetensors 도 색인도 없습니다", dir))?;
+    let map = v.get("weight_map").and_then(|m| m.as_object()).ok_or_else(|| anyhow!("{:?} 에 weight_map 이 없습니다", index))?;
+    let mut names: Vec<String> = map.values().filter_map(|x| x.as_str()).map(str::to_string).collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        bail!("{:?} 의 weight_map 이 비었습니다", index);
+    }
+    let mut out = Vec::with_capacity(names.len());
+    for n in names {
+        // 받은 색인은 믿지 않습니다: 폴더 밖을 가리키는 이름은 거부
+        if n.contains('/') || n.contains('\\') || n.contains("..") || !n.ends_with(".safetensors") {
+            bail!("색인의 조각 이름 {:?} 를 쓸 수 없습니다", n);
+        }
+        out.push(dir.join(n));
+    }
+    Ok(out)
+}
+
 struct TextCfg {
     vocab: usize,
     hidden: usize,
@@ -210,9 +269,10 @@ pub fn v_head_order() -> Result<&'static str> {
 }
 
 fn recipe_key(model_dir: &Path, precision: Precision) -> Result<String> {
-    let src = std::fs::metadata(model_dir.join("model.safetensors"))
-        .with_context(|| format!("{:?} 에 model.safetensors 가 없습니다", model_dir))?
-        .len();
+    let mut src = 0u64;
+    for p in weight_files(model_dir)? {
+        src += std::fs::metadata(&p).with_context(|| format!("{:?} 가 없습니다", p))?.len();
+    }
     Ok(format!(
         "{}|{:?}|vhead={}|src={}",
         RECIPE,
@@ -747,7 +807,7 @@ pub(crate) fn pad_to<W: Write>(w: &mut W, written: u64) -> Result<u64> {
     Ok(written + pad)
 }
 
-fn load_src(st: &StFile, it: &Item) -> Result<Tensor> {
+fn load_src(st: &StSet, it: &Item) -> Result<Tensor> {
     let t = st.load(&it.src)?;
     if t.dims() != it.src_shape.as_slice() {
         bail!("{} 의 형상 {:?} 가 config 기준 {:?} 와 다릅니다", it.src, t.dims(), it.src_shape);
@@ -810,7 +870,7 @@ pub fn quantize_rows_with(t: &Tensor, dtype: GgmlDType, threads: usize, quantize
     Ok(out)
 }
 
-fn produce(st: &StFile, it: &Item, cfg: &TextCfg, threads: usize, quantizer: Quantizer, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+fn produce(st: &StSet, it: &Item, cfg: &TextCfg, threads: usize, quantizer: Quantizer, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
     let src = load_src(st, it)?;
     let v_per_k = cfg.v_heads / cfg.k_heads;
     let two_d = if src.rank() == 1 { src.reshape((src.dim(0)?, 1))? } else { src };
@@ -881,8 +941,8 @@ pub const QUANTIZER: Quantizer = Quantizer::Candle;
 /// 정밀도 · 척도 탐색을 골라 `out` 에 변환합니다 (측정용). `out` 이 모델의 런타임 폴더 밖이면 앱의 준비 표식은 건드리지 않습니다.
 pub fn convert_variant(model_dir: &Path, out: &Path, precision: Precision, quantizer: Quantizer, progress: &(dyn Fn(u64, u64) + Sync)) -> Result<()> {
     let cfg = read_text_cfg(model_dir)?;
-    let st = StFile::open(&model_dir.join("model.safetensors"))?;
-    let names: HashSet<String> = st.entries.keys().cloned().collect();
+    let st = StSet::open_dir(model_dir)?;
+    let names: HashSet<String> = st.names();
     let tiled = v_head_order()? == "tiled";
     let items = plan(&cfg, &names, precision, tiled)?;
     let (tokens, token_types, eos, pad) = read_tokenizer_meta(model_dir, cfg.vocab)?;

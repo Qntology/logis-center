@@ -4,13 +4,13 @@
 //!   teacher-forcing (프리필 270 + 디코드 30 스텝): max |Δlogit|, top-1 일치율, 호출당 시간.
 //! - `p2b_qwen35_2b_lm_head_q8` : Qwen3.5-2B — 묶인 입력 임베딩 · 출력 헤드를 F16 역양자화본(기본, 1,017 MB)으로 둘 때와 GGUF 의
 //!   Q8_0 블록 그대로(`LOGIS_EMBED_Q8=1`, 540 MB) 둘 때. teacher-forcing 로짓 KLD · top-1, 디코드 시간, 상주 VRAM.
-//! - `p2b_qwen35_4b_quantizer`  : Qwen3.5-4B-kor — 같은 Q4_K_M 배정을 candle 척도 탐색(앱의 기존 변환)과 가중 최소제곱
+//! - `p2b_qwen35_4b_quantizer`  : Qwen3.5-4B (원본, 언어 엔진) — 같은 Q4_K_M 배정을 candle 척도 탐색(앱의 기존 변환)과 가중 최소제곱
 //!   (`ggml-kquant`)으로 만들어 Q8_0 기준과 비교. teacher-forcing 토큰별 NLL · KLD · top-1, 디코드 시간 (`LOGIS_LANG_QUANT_DIR`).
 //! - `p2b_lm_head_cost`         : 출력 헤드 한 토큰 행렬-벡터 곱의 시간 (모델 없음, 무작위 가중치). 전체 어휘 vs 16,384 행으로
 //!   잘랐을 때 — 어휘 자르기로 아낄 수 있는 디코드 시간의 상한입니다.
 //! - `p2b_qmatmul_parity`       : 장치의 양자화 행렬곱(Q8_0 · Q6_K · Q5_K · Q4_K, 행 1 ~ 256) vs 같은 블록을 CPU 에서 풀어 F64 로
 //!   곱한 기준. ‖Δ‖/‖기준‖ ≤ 1e-5 (지시문 게이트 1). 블록은 `ggml-kquant` 로 만듭니다.
-//! - `p2b_qwen35_4b_timing`     : Qwen3.5-4B-kor (alphaedge q4km) — 프리필 ~900 + 디코드 40 스텝 호출 시간 (융합/기존).
+//! - `p2b_qwen35_4b_timing`     : Qwen3.5-4B (원본 → q4km 실행용) — 프리필 ~900 + 디코드 40 스텝 호출 시간 (융합/기존).
 //! - `p2b_qwen3_q8_resident`    : Qwen3-0.6B Q8_0 — 기존 BF16 역양자화 vs Q8 상주(정확 W8A16) vs F32 기준
 //!   (Q8 가중치 정확 복원 + F32 활성·matmul·logits). KLD, top-1/top-5, 상주 VRAM, 디코드 tok/s.
 //! - `p2b_qwen3_kv_tier_forced` : Qwen3-0.6B Q8 상주 — 디코드 진입 시 KV 를 Vram / Ram / Ssd 로 강제, 원본 KV · Vram 대비 로짓.
@@ -478,13 +478,12 @@ fn p2b_qwen35_4b_quantizer() -> R {
         return Ok(());
     };
     let Some(dev) = gpu() else { return Ok(()) };
-    let lang = std::env::var("LOGIS_LANG_QUANT_LANG").unwrap_or_else(|_| "kor".into());
-    let dir = models_dir().join(format!("Qwen3.5-4B-{lang}-16384"));
-    if !dir.join("model.safetensors").exists() {
+    let dir = tauri_app_lib::model::lang_llm::model_dir(tauri_app_lib::model::lang_llm::LANG_ENGINE);
+    if !dir.join("model.safetensors").exists() && !dir.join("model.safetensors.index.json").exists() {
         println!("[P2B-TEST] {dir:?} 원본 없음 → 건너뜀");
         return Ok(());
     }
-    let out_dir = PathBuf::from(out_dir).join(&lang);
+    let out_dir = PathBuf::from(out_dir).join(tauri_app_lib::model::lang_llm::LANG_ENGINE);
     std::fs::create_dir_all(&out_dir)?;
     let mut arms: Vec<(&str, PathBuf)> = Vec::new();
     for (name, precision, quantizer) in [("q8_0 기준", Precision::Q8, Quantizer::Candle), ("q4km candle", Precision::Q4KM, Quantizer::Candle), ("q4km wls", Precision::Q4KM, Quantizer::Wls)] {
@@ -522,7 +521,7 @@ fn p2b_qwen35_4b_quantizer() -> R {
 
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
     let reference = &runs[0].1;
-    println!("[P2B-RESULT] Qwen3.5-4B-{lang} · 토큰 {} (프리필 32)", ids_once.as_ref().map_or(0, |v| v.len()));
+    println!("[P2B-RESULT] Qwen3.5-4B · 토큰 {} (프리필 32)", ids_once.as_ref().map_or(0, |v| v.len()));
     for (name, r, bytes) in &runs {
         let c = compare(&reference.rows, &r.rows);
         let d: Vec<f64> = r.nll.iter().zip(&reference.nll).map(|(a, b)| a - b).collect();
@@ -565,7 +564,7 @@ fn p2b_qwen35_4b_timing() -> R {
         return Ok(());
     }
     let Some(dev) = gpu() else { return Ok(()) };
-    let dir = models_dir().join("Qwen3.5-4B-kor-16384");
+    let dir = tauri_app_lib::model::lang_llm::model_dir(tauri_app_lib::model::lang_llm::LANG_ENGINE);
     if !dir.join("runtime-q4km").join("READY").exists() {
         println!("[P2B-TEST] {dir:?} 런타임 GGUF 없음 → 건너뜀");
         return Ok(());
@@ -584,7 +583,7 @@ fn p2b_qwen35_4b_timing() -> R {
     tauri_app_lib::models::common::set_gdn_fused_override(None);
     tauri_app_lib::models::common::gguf::set_q8_exact_override(None);
     let c = compare(&old.rows, &fused.rows);
-    println!("[P2B-RESULT] Qwen3.5-4B-kor · 프리필 {} + 디코드 {}", ids.len() - decode, decode);
+    println!("[P2B-RESULT] Qwen3.5-4B · 프리필 {} + 디코드 {}", ids.len() - decode, decode);
     for (name, r) in [("융합(콜드)", &fused_cold), ("기존 GDN", &old), ("융합(웜)", &fused)] {
         println!(
             "[P2B-RESULT]  {name:<10}: 프리필 {:.2} s · 디코드 {:.1} ms/토큰 · 호출 합계(프리필+디코드 {decode}) {:.2} s",

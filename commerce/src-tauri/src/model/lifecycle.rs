@@ -1095,7 +1095,7 @@ impl LogisModel {
         match crate::model::lang_llm::bound_translit_code() {
             Some(code) => {
                 if let Err(e) = self.ensure_qwen3_5_lang(&code).await {
-                    println!("[TRANSLIT] ⚠️ Qwen3.5-4B-{} 를 쓸 수 없어 이번 호출은 Qwen3.5-2B 로 진행합니다: {}", code, e);
+                    println!("[TRANSLIT] ⚠️ {} 를 쓸 수 없어 이번 호출은 Qwen3.5-2B 로 진행합니다: {}", code, e);
                     self.ensure_qwen3_5(false).await?;
                 }
             }
@@ -1125,7 +1125,7 @@ impl LogisModel {
         let why = format!("음차 생성 실패: {}", err);
         crate::model::lang_llm::mark_runtime_failure(&code, &why);
         println!(
-            "[TRANSLIT] ⚠️ Qwen3.5-4B-{} {} — 이번 세션 동안 음차는 Qwen3.5-2B 로 진행하고, 이번 호출도 2B 로 다시 수행합니다.",
+            "[TRANSLIT] ⚠️ {} {} — 이번 세션 동안 음차는 Qwen3.5-2B 로 진행하고, 이번 호출도 2B 로 다시 수행합니다.",
             code, why
         );
         self.ensure_qwen3_5(false).await?;
@@ -1178,10 +1178,10 @@ impl LogisModel {
             }
         }
         if let Some(why) = lang_llm::runtime_failure(code) {
-            return Err(anyhow!("Qwen3.5-4B-{} 는 이번 세션에서 쓸 수 없습니다: {}", code, why));
+            return Err(anyhow!("{} 는 이번 세션에서 쓸 수 없습니다: {}", code, why));
         }
         if let Some(why) = lang_llm::transient_shortage(code) {
-            return Err(anyhow!("Qwen3.5-4B-{} 는 잠시 쉬는 중입니다: {}", code, why));
+            return Err(anyhow!("{} 는 잠시 쉬는 중입니다: {}", code, why));
         }
         let loader = lang_llm::loader()
             .ok_or_else(|| anyhow!("Qwen3.5-4B safetensors 런타임 로더가 연결되지 않았습니다"))?;
@@ -1209,7 +1209,7 @@ impl LogisModel {
 
         let dir = lang_llm::model_dir(code);
         println!(
-            "[MODEL] Loading Qwen3.5-4B-{} (alphaedge-ai · vocab 16384 · 텍스트 전용) from {:?} | 예산 {}MB",
+            "[MODEL] Loading {} (원본 · 텍스트 전용 · 출력 투영은 문서 언어의 행만) from {:?} | 예산 {}MB",
             code, dir, need
         );
         let _load_hold = self.hold_generation();
@@ -1220,7 +1220,7 @@ impl LogisModel {
             let free = self.get_free_vram_mb();
             if free < need && self.embedding_resident().await {
                 println!(
-                    "[CROSSOVER] 🔻 [SWAP-OUT EMBED] Qwen3.5-4B-{} | 자유 {}MB < 4B 예산 {}MB → 임베딩을 먼저 반환합니다.",
+                    "[CROSSOVER] 🔻 [SWAP-OUT EMBED] {} | 자유 {}MB < 4B 예산 {}MB → 임베딩을 먼저 반환합니다.",
                     code, free, need
                 );
                 self.unload_embedding().await;
@@ -1228,7 +1228,7 @@ impl LogisModel {
             } else if self.embedding_resident().await {
                 self.costs().mark_coexist();
                 println!(
-                    "[MODEL] 🤝 [CROSSOVER/COEXIST] 자유 {}MB >= Qwen3.5-4B-{} 예산 {}MB. 임베딩을 상주시킨 채 로드합니다.",
+                    "[MODEL] 🤝 [CROSSOVER/COEXIST] 자유 {}MB >= {} 예산 {}MB. 임베딩을 상주시킨 채 로드합니다.",
                     free, code, need
                 );
             }
@@ -1259,17 +1259,17 @@ impl LogisModel {
                 } else {
                     lang_llm::mark_runtime_failure(code, &msg);
                 }
-                return Err(anyhow!("Qwen3.5-4B-{} load failed: {}", code, e));
+                return Err(anyhow!("{} load failed: {}", code, e));
             }
             Ok(Err(join_err)) => {
                 *self.current_size.lock().await = None;
                 lang_llm::mark_runtime_failure(code, &join_err.to_string());
-                return Err(anyhow!("Qwen3.5-4B-{} load task join error: {}", code, join_err));
+                return Err(anyhow!("{} load task join error: {}", code, join_err));
             }
             Err(_) => {
                 *self.current_size.lock().await = None;
                 lang_llm::mark_runtime_failure(code, "load timeout (900s)");
-                return Err(anyhow!("Qwen3.5-4B-{} load timeout (900s)", code));
+                return Err(anyhow!("{} load timeout (900s)", code));
             }
         };
         // 🌟 [QWEN4-EXP] 로더가 config.json 으로 판별한 아키텍처에 맞는 슬롯에 둡니다.
@@ -1290,7 +1290,7 @@ impl LogisModel {
         let load_ms = started.elapsed().as_millis() as f32;
         crate::utils::score_dynamics::record_baseline("model.lang4b_load_ms", load_ms);
         println!(
-            "[MODEL] 🎉 Qwen3.5-4B-{} 로드 완료 ({:.2}초). 자유 {}MB",
+            "[MODEL] 🎉 {} 로드 완료 ({:.2}초). 자유 {}MB",
             code,
             load_ms / 1000.0,
             self.get_free_vram_mb()
@@ -1316,7 +1316,7 @@ impl LogisModel {
                     Ok(()) => {
                         let phase = self.sync_crossover_phase().await;
                         println!(
-                            "[CROSSOVER] 🧠 [GENERATION PHASE] {} | Qwen3.5-4B-{} 상주 확정 (phase={} | 자유 {}MB)",
+                            "[CROSSOVER] 🧠 [GENERATION PHASE] {} | {} 상주 확정 (phase={} | 자유 {}MB)",
                             reason,
                             code,
                             phase,
@@ -1326,7 +1326,7 @@ impl LogisModel {
                     }
                     Err(e) => {
                         println!(
-                            "[CROSSOVER] ⚠️ Qwen3.5-4B-{} 로 전환하지 못해 Qwen3.5-2B 로 진행합니다: {}",
+                            "[CROSSOVER] ⚠️ {} 로 전환하지 못해 Qwen3.5-2B 로 진행합니다: {}",
                             code, e
                         );
                     }
@@ -1360,7 +1360,7 @@ impl LogisModel {
             return lang_llm::closed_verdict(
                 track,
                 step,
-                lang_llm::alphaedge_code(doc_lang),
+                lang_llm::engine_code(doc_lang),
                 "CPU 모드입니다. 4B 는 0.6B 보다 토큰당 연산이 여러 배 많아 아이템·질의마다 반복되는 이 단계에는 쓰지 않습니다. 문서당 몇 건뿐인 음차는 기존대로 4B 를 씁니다",
             );
         }
@@ -1419,7 +1419,7 @@ impl LogisModel {
             Some(s) => s,
             None => {
                 println!(
-                    "[CROSSOVER] ⚪ 다른 언어의 4B 가 생성 슬롯을 쓰고 있어 {} 는 기존 모델로 진행합니다. (요청 4B-{})",
+                    "[CROSSOVER] ⚪ 다른 언어의 4B 가 생성 슬롯을 쓰고 있어 {} 는 기존 모델로 진행합니다. (요청 {})",
                     reason, code
                 );
                 return None;
@@ -1430,7 +1430,7 @@ impl LogisModel {
             Ok(()) => {
                 let phase = self.sync_crossover_phase().await;
                 println!(
-                    "[CROSSOVER] 🧠 [GENERATION PHASE] {} | Qwen3.5-4B-{} 상주 확정 (phase={} | 자유 {}MB)",
+                    "[CROSSOVER] 🧠 [GENERATION PHASE] {} | {} 상주 확정 (phase={} | 자유 {}MB)",
                     reason,
                     code,
                     phase,
@@ -1440,7 +1440,7 @@ impl LogisModel {
             }
             Err(e) => {
                 println!(
-                    "[CROSSOVER] ⚠️ Qwen3.5-4B-{} 로 전환하지 못해 {} 는 기존 모델로 진행합니다: {}",
+                    "[CROSSOVER] ⚠️ {} 로 전환하지 못해 {} 는 기존 모델로 진행합니다: {}",
                     code, reason, e
                 );
                 None
@@ -1488,7 +1488,7 @@ impl LogisModel {
             let mut guard = self.qwen3_5_generator.lock().await;
             let gen = guard
                 .as_mut()
-                .ok_or_else(|| anyhow!("Qwen3.5-4B-{} 생성기가 슬롯에 없습니다", code))?;
+                .ok_or_else(|| anyhow!("{} 생성기가 슬롯에 없습니다", code))?;
             let r = gen.generate(params, cancel_token, None, None, ignore_list, None).await;
             let _ = gen.clear_kv_cache();
             r
@@ -1511,7 +1511,7 @@ impl LogisModel {
                 } else {
                     crate::model::lang_llm::mark_runtime_failure(code, &format!("필드·검증 생성 실패: {}", msg));
                 }
-                return Err(anyhow!("Qwen3.5-4B-{} generation failed: {}", code, e));
+                return Err(anyhow!("{} generation failed: {}", code, e));
             }
         };
         Ok(crate::model::lang_llm::normalize_lang_json(&raw, expected_keys))
@@ -1529,7 +1529,7 @@ impl LogisModel {
 
     pub async fn deep_purge_keep_lang(&self, doc_lang: &str) -> Option<String> {
         use crate::model::lang_llm;
-        let code = lang_llm::alphaedge_code(doc_lang).map(|c| c.to_string());
+        let code = lang_llm::engine_code(doc_lang).map(|c| c.to_string());
         let resident_here = code.as_deref().is_some() && lang_llm::resident_variant().as_deref() == code.as_deref();
         let kept = if resident_here { self.qwen3_5_generator.lock().await.take() } else { None };
         let kept_q4 = if resident_here { self.qwen4_exp_generator.lock().await.take() } else { None };
