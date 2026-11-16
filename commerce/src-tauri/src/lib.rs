@@ -658,6 +658,7 @@ async fn reindex_pending_embeddings(
 
         let link = data.get("link").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let doc_lang = crate::utils::lang_utils::detect_document_language(&text);
+        let _vocab_scope = crate::models::common::vocab_trim::DocLangScope::text(&doc_lang, &text);
         // 🌟 v4 : mode 는 봉투 물리 컬럼이므로 doc.mode 가 항상 채워져 있습니다.
         //    다만 구버전 데이터를 대비해 data.mode 까지 폴백을 둡니다.
         let mode = if !doc.mode.trim().is_empty() {
@@ -2378,7 +2379,7 @@ pub fn ground_trade_conditions<E: Fn(&str)>(structured: &mut Value, query: &str,
             i += 1;
         }
     }
-    let this_year = chrono::Datelike::year(&chrono::Local::now()).to_string();
+    let this_year = chrono::Datelike::year(&crate::utils::time_guide::now_local()).to_string();
     let null_like = |v: &str| matches!(v.trim().to_lowercase().as_str(), "" | "none" | "null" | "n/a" | "na" | "nil" | "unknown" | "-" | "없음" | "なし" | "无");
     let Some(ctxs) = structured.get_mut("context").and_then(|c| c.as_array_mut()) else { return };
     for ctx in ctxs.iter_mut() {
@@ -2980,6 +2981,11 @@ async fn ai_search_complex(
             search_mode.clone()
         };
 
+        // 🌟 [VOCAB TRIM] 텍스트 맥락: 질의 글의 언어(현지 언어 + 영어)와 질의에 나온 문자 체계(데이터 언어로 적힌 고객 · 수출자 이름 등)의
+        //    행만 출력 투영에 남깁니다. 커머스 · 무역 · 행동 로그 모두, 검색이 끝나면 되돌립니다.
+        let _vocab_scope = crate::models::common::vocab_trim::DocLangScope::text(&crate::utils::lang_utils::detect_document_language(&query), &query);
+        // 답변 · 질의 해석의 "Write in {LANG}" 은 앱 언어입니다 (질의 언어와 다를 수 있음)
+        _vocab_scope.also(&language);
         let mut structured_query = match search_mode.as_str() {
             "shipping" => {
                 model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
@@ -3880,7 +3886,7 @@ async fn ai_search_complex(
                 if explicit_period {
                     emit_term("[AI-SEARCH] ⏱️ [RECENCY] 질의에 명시적 기간이 있어 시간 감쇠를 적용하지 않습니다. (구간은 이미 SQL 이 잘랐고, 그 안에서 앞부분을 누르면 부당합니다)");
                 } else if let Some(store) = store_opt.as_ref() {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let now_ms = crate::utils::time_guide::now_ms();
                     // ① 회수 문서의 행동 시각을 모읍니다.
                     //    report 문서는 U-1 이 남긴 episode_ended_at 이 실제 행동 시각이고,
                     //    created_at 은 '합성 시각' 이라 시의성 판정에 쓰면 안 됩니다.
@@ -4596,7 +4602,7 @@ async fn ai_search_complex(
                             //   안정적으로 계산하지 못합니다. 시스템 시각이 프롬프트에 있어도
                             //   뺄셈을 틀립니다. 계산된 일수를 직접 주는 편이 확실합니다.
                             let age_days = {
-                                let now = chrono::Utc::now().timestamp_millis();
+                                let now = crate::utils::time_guide::now_ms();
                                 ((now - at).max(0) as f64 / 86_400_000.0 * 10.0).round() / 10.0
                             };
                             records.push(json!({
@@ -4634,7 +4640,7 @@ async fn ai_search_complex(
                     tb.cmp(ta)
                 });
                 if !records.is_empty() {
-                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let now_ms = crate::utils::time_guide::now_ms();
                     let current_iso = chrono::DateTime::from_timestamp_millis(now_ms)
                         .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
                         .unwrap_or_default();

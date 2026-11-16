@@ -310,6 +310,17 @@ jobs:
             exit 1
           fi
           notice_lines "suite result" "$RUNNER_TEMP/suite.log" '^test result'
+      # The lib's own unit tests (src/**/mod tests) are not in `--test it`. These need no GPU or model files:
+      # vocab trim (row choice, per-flow language scopes, trimmed head = original rows), stable search ranking, store.
+      - name: "lib unit tests (vocab trim · stable search ranking · store)"
+        if: matrix.name == 'linux-cpu' || matrix.name == 'windows-cpu'
+        working-directory: logis-center/commerce/src-tauri
+        run: |
+          . "$RUNNER_TEMP/annot.sh"; set +e; ort_path
+          f="${{ matrix.features }}"
+          cargo test --lib --no-default-features ${f:+--features $f} -- vocab_trim stable_rank store:: --test-threads 2 2>&1 | tee "$RUNNER_TEMP/lib.log" | tail -5
+          rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/lib.log"; exit 1; }
+          notice_lines "lib unit tests" "$RUNNER_TEMP/lib.log" '^test result'
       - name: "vision batch (ignored device tests — phrase encoding invariance on the device)"
         if: contains(fromJSON('["linux-vulkan","mac-metal","mac-vulkan"]'), matrix.name)
         working-directory: logis-center/commerce/src-tauri

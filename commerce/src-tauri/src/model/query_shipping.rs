@@ -4099,7 +4099,7 @@ impl crate::model::LogisModel {
                     break;
                 }
             }
-            let today = chrono::Local::now().date_naive();
+            let today = crate::utils::time_guide::now_local().date_naive();
             let group_parts: Vec<ShipTimePart> = group.iter().map(|(_, p)| p.clone()).collect();
             let mut tokens: Vec<usize> = Vec::new();
             for (k, _) in group.iter() {

@@ -2996,6 +2996,8 @@ pub async fn process_trading_task(
     
     doc_lang = crate::utils::lang_utils::detect_document_language(&light_pug);
     println!("[TRADING] Detected document language (page {}): {}", page_idx + 1, doc_lang);
+    // 🌟 [VOCAB TRIM] 텍스트 맥락: 이 쪽의 문서 언어(현지 언어 + 영어)의 행만 출력 투영에 남깁니다.
+    let _vocab_scope = crate::models::common::vocab_trim::DocLangScope::text(&doc_lang, &light_pug);
     if page_idx == 0 {
         if let Some(line) = crate::model::lang_llm::prefetch(&doc_lang, app_handle, &task.id) {
             emit_term(&format!("[TRADING] {}", line));

@@ -13,6 +13,7 @@ pub mod gguf;
 pub mod kv_turbo;
 // 🌟 [ACCEL-CHECK] GPU 가속 커널(FlashAttention / TurboQuant) 자가 검증과 실측 정확도 감시
 pub mod accel_check;
+pub mod vocab_trim;
 
 use crate::{
     position_embed::rope::{RoPE, apply_rotary_pos_emb, apply_rotary_pos_emb_roformer},

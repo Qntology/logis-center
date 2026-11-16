@@ -1489,6 +1489,7 @@ pub async fn run_analytic_structuring(
         let doc_lang = crate::utils::lang_utils::detect_document_language(
             &data.get("action").map(|v| v.to_string()).unwrap_or_default()
         );
+        let _vocab_scope = crate::models::common::vocab_trim::DocLangScope::text(&doc_lang, &data.get("action").map(|v| v.to_string()).unwrap_or_default());
 
         // ── ① HTML → PUG → 속성 전량 제거 (사전 계산된 값 재사용) ──
         let mut target_pug = target_pug_pre;
@@ -1952,6 +1953,7 @@ pub async fn run_analytic_structuring(
             if records.len() < 2 { continue; }
             let records_json = serde_json::to_string_pretty(&records).unwrap_or_else(|_| "[]".to_string());
             let doc_lang = crate::utils::lang_utils::detect_document_language(&records_json);
+            let _vocab_scope = crate::models::common::vocab_trim::DocLangScope::text(&doc_lang, &records_json);
             let prompt = crate::prompts::analytic_flow_prompt_scoped(
                 &doc_lang,
                 &records_json,
@@ -2490,7 +2492,7 @@ pub async fn parse_analytic_search_query(
         "query",
         "",
     );
-    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_ms = crate::utils::time_guide::now_ms();
     let current_iso = chrono::DateTime::from_timestamp_millis(now_ms)
         .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
         .unwrap_or_default();

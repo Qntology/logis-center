@@ -593,6 +593,30 @@ pub struct QwenVLGenerateModel {
 }
 
 impl QwenVLGenerateModel {
+    /// 🌟 [VOCAB TRIM] 지금의 문서 언어(`vocab_trim::DocLangScope`)로 출력 투영의 남긴 행을 맞춥니다. 생성 · 미리 읽기마다 처음에 부릅니다.
+    pub fn refresh_vocab(&mut self) -> Result<()> {
+        self.refresh_vocab_for("", false)
+    }
+
+    /// [`Self::refresh_vocab`] + 이번 생성의 프롬프트 글에 나온 문자 체계. 샘플링(온도 > 0)이면 전체 행 (`vocab_trim::refresh_for`)
+    pub fn refresh_vocab_for(&mut self, prompt: &str, sampling: bool) -> Result<()> {
+        let tok = &self.tokenizer.tokenizer;
+        match &mut self.qwen {
+            ModelVariant::QuantizedVL(m) => {
+                if let Some(src) = m.head_src.clone() {
+                    crate::models::common::vocab_trim::refresh_for(&mut m.trim_head, &src, tok, &m.text_device, prompt, sampling)?;
+                }
+            }
+            ModelVariant::QuantizedText(m) => {
+                if let Some(src) = m.head_src.clone() {
+                    crate::models::common::vocab_trim::refresh_for(&mut m.trim_head, &src, tok, &m.text_device, prompt, sampling)?;
+                }
+            }
+            ModelVariant::Standard(_) => {}
+        }
+        Ok(())
+    }
+
     /// config.json에서 로드된 모델의 최대 토큰 한계치를 반환합니다.
     pub fn get_max_tokens(&self) -> usize {
         match &self.qwen {
@@ -669,6 +693,7 @@ impl QwenVLGenerateModel {
     }
 
     pub async fn prefill_only(&mut self, raw_text: String, _cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _relay_target: Option<&mut QwenVLGenerateModel>, _kv_name: Option<String>) -> Result<usize> {
+        self.refresh_vocab_for(&raw_text, false)?;
         self.clear_kv_cache();
         if let ModelVariant::QuantizedVL(m) = &mut self.qwen { m.language_model.truncate_kv_cache(0)?; }
         if let ModelVariant::QuantizedText(m) = &mut self.qwen { m.language_model.truncate_kv_cache(0)?; }
@@ -698,6 +723,7 @@ impl QwenVLGenerateModel {
 
     // 🌟 [추가] semantic_prejudice 파라미터를 받습니다.
     pub async fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, session_id: Option<String>, _kv_name: Option<String>, semantic_prejudice: Option<&str>) -> Result<String> {
+        self.refresh_vocab_for(&crate::models::common::vocab_trim::prompt_text(&mes), mes.temperature.unwrap_or(0.0) > 1e-7)?;
         let mut is_reference_snapshot = false;
         if let Some(s_id) = &session_id {
             let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
@@ -1016,6 +1042,7 @@ impl QwenVLGenerateModel {
         } 
     }
     pub async fn prefill_chunk(&mut self, text: String, _cancel_flag: Option<Arc<AtomicBool>>, _relay_target: Option<&mut QwenVLGenerateModel>) -> Result<usize> {
+        self.refresh_vocab_for(&text, false)?;
         let chunk_ids_vec = self.tokenizer.text_encode_vec(text, false)?;
         let chunk_size = chunk_ids_vec.len();
         let current_pos = self.get_kv_len();

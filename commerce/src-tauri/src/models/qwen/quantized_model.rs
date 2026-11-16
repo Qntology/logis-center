@@ -3159,6 +3159,10 @@ pub struct QuantizedQwenVLModel {
     pub visual: Option<QwenVLVisionModel>, 
     pub language_model: QuantizedQwenVLTextModel,
     pub lm_head: QLinear,
+    /// 🌟 [VOCAB TRIM] 남긴 행만의 출력 투영 (있으면 `lm_head` 대신) · 그 행을 읽을 매핑된 표. 생성기가 문서 언어로 맞춥니다
+    /// (`QwenVLGenerateModel::refresh_vocab`). 이 슬롯은 입력 임베딩이 비전 병합과 얽혀 있어 출력 투영만 자릅니다.
+    pub trim_head: Option<crate::models::common::vocab_trim::TrimmedHead>,
+    pub head_src: Option<crate::models::common::vocab_trim::TableSource>,
     pub rope_deltas: Option<Tensor>,
     pub rope_deltas_cpu: Option<Vec<i64>>,
     pub text_device: Device,
@@ -3211,7 +3215,11 @@ impl QuantizedQwenVLModel {
         let main_mmap = main_mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
         let mut reader_main = std::io::Cursor::new(main_mmap);
         let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
-        let lm_head = if let Ok(l) = get_qlinear(&ct_main, &mut reader_main, "lm_head", text_device, head_dtype) {
+        // 🌟 [VOCAB TRIM] 잘라 내기가 켜지면 전체 출력 투영을 올리지 않습니다 (쓰지 않는 1 × 1 자리).
+        let head_src = crate::models::common::vocab_trim::mapped_table(text_device, main_mmap_handle.as_ref(), Some(&ct_main));
+        let lm_head = if head_src.is_some() {
+            QLinear::new(QMatMul::Tensor(Tensor::zeros((1, 1), head_dtype, text_device)?), None, text_device.clone())
+        } else if let Ok(l) = get_qlinear(&ct_main, &mut reader_main, "lm_head", text_device, head_dtype) {
             l
         } else if let Ok(l) = get_qlinear(&ct_main, &mut reader_main, "output", text_device, head_dtype) {
             l
@@ -3222,13 +3230,15 @@ impl QuantizedQwenVLModel {
         Ok(Self { 
             config: config.clone(), 
             visual, 
-            language_model, 
-            lm_head, 
-            rope_deltas: None, 
-            rope_deltas_cpu: None, 
-            text_device: text_device.clone(), 
-            vision_device: vision_device.clone(), 
-            mmap: main_mmap_handle, 
+            language_model,
+            lm_head,
+            trim_head: None,
+            head_src,
+            rope_deltas: None,
+            rope_deltas_cpu: None,
+            text_device: text_device.clone(),
+            vision_device: vision_device.clone(),
+            mmap: main_mmap_handle,  
             mmproj_mmap: mmproj_mmap_handle,
             // 🌟 [VISION-JIT] 재구성 재료 보관
             vision_ct: Some(ct_vision),
@@ -3279,13 +3289,15 @@ impl QuantizedQwenVLModel {
         Ok(Self { 
             config: config.clone(), 
             visual, 
-            language_model, 
-            lm_head, 
-            rope_deltas: None, 
-            rope_deltas_cpu: None, 
-            text_device: text_device.clone(), 
-            vision_device: vision_device.clone(), 
-            mmap: None, 
+            language_model,
+            lm_head,
+            trim_head: None,
+            head_src: None,
+            rope_deltas: None,
+            rope_deltas_cpu: None,
+            text_device: text_device.clone(),
+            vision_device: vision_device.clone(),
+            mmap: None,  
             mmproj_mmap: None,
             // 🌟 [VISION-JIT] 이 경로는 호출자 소유 reader 를 쓰므로 재구성 소스를 보관할 수 없습니다.
             //    vision_ct 를 None 으로 두어 JIT 을 비활성화하고 기존 거동을 100% 유지합니다.
@@ -3539,7 +3551,19 @@ impl QuantizedQwenVLModel {
         ).await?;
         
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
-        
+        // 🌟 [VOCAB TRIM] 남긴 행만 곱하고 전체 어휘 길이로 펼쳐(잘린 행 −∞) 원래 출력 투영의 장치로 돌려줍니다
+        //    (선입견 벡터 등 아래 단계가 그 장치에 있습니다).
+        if let Some(head) = &self.trim_head {
+            // 원래 출력 투영(`QLinear`)과 같은 수치: 은닉을 출력 dtype(GPU BF16)으로 맞춘 뒤 F32 로 곱하고, 로짓을 다시 그 dtype 으로
+            // (BF16 반올림을 빼면 경계 토큰의 확률이 달라져 샘플링이 다른 토큰을 뽑았음 — N:N 검색 "20.0" → "20.5")
+            let head_dtype = if self.text_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
+            let h = hidden_state.to_dtype(head_dtype)?.to_dtype(DType::F32)?.to_device(&self.text_device)?;
+            return Ok(head.logits(&h)?.to_dtype(head_dtype)?);
+        }
+        if self.head_src.is_some() {
+            return Err(anyhow!("출력 투영(잘라 낸 행)이 아직 없습니다: 생성기가 refresh_vocab 을 먼저 불러야 합니다"));
+        }
+
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         
@@ -3567,10 +3591,12 @@ impl QuantizedQwenVLModel {
         if let Some(v) = &mut self.visual {
             v.to_device(device)?;
         }
-        self.language_model.to_device(device)?; 
+        self.language_model.to_device(device)?;
         self.lm_head.to_device_keep_quantized(device)?;
-        self.text_device = device.clone(); 
-        self.vision_device = device.clone(); 
+        // 잘라 낸 출력 투영은 다음 refresh_vocab 이 새 장치에 다시 모읍니다
+        self.trim_head = None;
+        self.text_device = device.clone();
+        self.vision_device = device.clone();  
         Ok(()) 
     }
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, total_len) }
@@ -3580,6 +3606,9 @@ impl QuantizedQwenVLModel {
 pub struct QuantizedQwenTextModel {
     pub language_model: QuantizedQwenVLTextModel,
     pub lm_head: Option<QLinear>,
+    /// 🌟 [VOCAB TRIM] [`QuantizedQwenVLModel::trim_head`] 와 같음
+    pub trim_head: Option<crate::models::common::vocab_trim::TrimmedHead>,
+    pub head_src: Option<crate::models::common::vocab_trim::TableSource>,
     pub text_device: Device,
     pub mmap: Option<Arc<Mmap>>,
 }
@@ -3602,7 +3631,13 @@ impl QuantizedQwenTextModel {
         let language_model = QuantizedQwenVLTextModel::new_with_mmap(
             &t_config, ct_main.clone(), mmap_handle.clone(), "model", text_device, text_device_id, dtype, kv_reserve, baking_only
         )?;
-        let lm_head = if !baking_only {
+        // 🌟 [VOCAB TRIM] 잘라 내기가 켜지면 전체 출력 투영을 올리지 않습니다.
+        let head_src = if baking_only {
+            None
+        } else {
+            crate::models::common::vocab_trim::mapped_table(text_device, mmap_handle.as_ref(), Some(&ct_main))
+        };
+        let lm_head = if !baking_only && head_src.is_none() {
             let mmap = mmap_handle.as_ref().map(|m| &m[..]).unwrap_or(&[]);
             let mut reader = std::io::Cursor::new(mmap);
             let head_dtype = if text_device.is_cpu() { DType::F32 } else { dtype };
@@ -3610,7 +3645,7 @@ impl QuantizedQwenTextModel {
             else if let Ok(l) = get_qlinear(&ct_main, &mut reader, "output", text_device, head_dtype) { Some(l) }
             else { get_qlinear(&ct_main, &mut reader, "token_embd", text_device, head_dtype).ok() }
         } else { None };
-        Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: mmap_handle })
+        Ok(Self { language_model, lm_head, trim_head: None, head_src, text_device: text_device.clone(), mmap: mmap_handle })
     }
 
     pub fn new<R: std::io::Seek + std::io::Read>(
@@ -3636,7 +3671,7 @@ impl QuantizedQwenTextModel {
             else if let Ok(l) = get_qlinear(&ct_main, reader_main, "output", text_device, head_dtype) { Some(l) }
             else { get_qlinear(&ct_main, reader_main, "token_embd", text_device, head_dtype).ok() }
         } else { None };
-        Ok(Self { language_model, lm_head, text_device: text_device.clone(), mmap: None })
+        Ok(Self { language_model, lm_head, trim_head: None, head_src: None, text_device: text_device.clone(), mmap: None })
     }
 
     pub async fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
@@ -3736,7 +3771,18 @@ impl QuantizedQwenTextModel {
         }
         
         let hidden_state = final_hidden_state.unwrap();
-        
+        // 🌟 [VOCAB TRIM] [`QuantizedQwenVLModel::forward`] 와 같음
+        if let Some(head) = &self.trim_head {
+            // 원래 출력 투영(`QLinear`)과 같은 수치: 은닉을 출력 dtype(GPU BF16)으로 맞춘 뒤 F32 로 곱하고, 로짓을 다시 그 dtype 으로
+            // (BF16 반올림을 빼면 경계 토큰의 확률이 달라져 샘플링이 다른 토큰을 뽑았음 — N:N 검색 "20.0" → "20.5")
+            let head_dtype = if self.text_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
+            let h = hidden_state.to_dtype(head_dtype)?.to_dtype(DType::F32)?.to_device(&self.text_device)?;
+            return Ok(head.logits(&h)?.to_dtype(head_dtype)?);
+        }
+        if self.head_src.is_some() {
+            return Err(anyhow!("출력 투영(잘라 낸 행)이 아직 없습니다: 생성기가 refresh_vocab 을 먼저 불러야 합니다"));
+        }
+
         let head_dev = self.lm_head.as_ref().map(|h| h.device()).unwrap_or(&self.text_device);
         let head_dtype = if head_dev.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         
@@ -3771,7 +3817,7 @@ impl QuantizedQwenTextModel {
         self.language_model.load_kv_cache(path, device, expected_len, upscale_refill_len, kv_name) 
     }
     
-    pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device_keep_quantized(device)?; } self.text_device = device.clone(); Ok(()) }
+    pub fn to_device(&mut self, device: &Device) -> Result<()> { self.language_model.to_device(device)?; if let Some(head) = &mut self.lm_head { head.to_device_keep_quantized(device)?; } self.trim_head = None; self.text_device = device.clone(); Ok(()) }
     
     pub fn rebalance_layers(&mut self, device_id: usize, offset: usize, _total_len: usize) -> Result<()> { self.language_model.rebalance_layers(device_id, offset, _total_len) }
 }
