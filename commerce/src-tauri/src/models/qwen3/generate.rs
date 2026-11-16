@@ -76,6 +76,19 @@ pub fn qwen3_kv_bytes_per_token(layers: usize, kv_heads: usize, head_dim: usize,
 const VOCAB_CHUNK: usize = 16_384;
 
 impl Qwen3GenerateModel {
+    /// 🌟 [VOCAB TRIM] 지금의 문서 언어로 출력 투영의 남긴 행을 맞춥니다. 생성마다 처음에 부릅니다.
+    pub fn refresh_vocab(&mut self) -> Result<()> {
+        self.refresh_vocab_for("", false)
+    }
+
+    /// [`Self::refresh_vocab`] + 이번 생성의 프롬프트 글에 나온 문자 체계. 샘플링(온도 > 0)이면 전체 행 (`vocab_trim::refresh_for`)
+    pub fn refresh_vocab_for(&mut self, prompt: &str, sampling: bool) -> Result<()> {
+        if let Some(src) = self.qwen3.vocab_table() {
+            crate::models::common::vocab_trim::refresh_for(&mut self.qwen3.trim_head, &src, &self.tokenizer.tokenizer, &self.device, prompt, sampling)?;
+        }
+        Ok(())
+    }
+
     pub fn init(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
         let chat_template = ChatTemplate::init(path)?;
         let tokenizer = TokenizerModel::init(path)?;
@@ -134,13 +147,19 @@ impl Qwen3GenerateModel {
             // mmap 페이지에서 GPU 로 바로 복사합니다 (힙 사본·F32/F16 중간 사본 없음). 맵은 로드 직후 닫습니다.
             let loaded = (|| -> Result<Qwen3Model> {
                 let file = std::fs::File::open(model_file)?;
-                let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+                let mmap = std::sync::Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
                 let ct = candle_core::quantized::gguf_file::Content::read(&mut std::io::Cursor::new(&mmap[..]))?;
                 println!(
                     "[QWEN3-Q8] Q8_0 가중치를 역양자화 없이 GPU 에 상주시킵니다 (정확 W8A16 · 활성 {:?} · F32 logits)",
                     dtype
                 );
-                Qwen3Model::new_from_gguf_q8(&cfg, &ct, &mmap, &device, dtype)
+                let mut m = Qwen3Model::new_from_gguf_q8(&cfg, &ct, &mmap, &device, dtype)?;
+                // 🌟 [VOCAB TRIM] 잘라 내기가 켜지면 입력 임베딩은 매핑(장치 0), 출력 투영은 생성할 때 문서 언어로 남긴 행만
+                //    (`refresh_vocab_for`, 샘플링이면 전체 행).
+                if let Some(src) = crate::models::common::vocab_trim::mapped_table(&device, Some(&mmap), Some(&ct)) {
+                    m.use_mapped_table(src, &device)?;
+                }
+                Ok(m)
             })();
             match loaded {
                 Ok(qwen3) => {
@@ -301,7 +320,8 @@ impl Qwen3GenerateModel {
             vocab,
             (vocab + VOCAB_CHUNK - 1) / VOCAB_CHUNK
         );
-        Ok(prejudice)
+        // 🌟 [VOCAB TRIM] 잘린 행 자리는 +∞ (빼면 −∞): 선입견 블록의 채움값이 로짓으로 새어 나가지 않게
+        Ok(crate::models::common::vocab_trim::exclude_dropped(self.qwen3.trim_head.as_ref(), prejudice)?)
     }
 
     /// 🌟 [KV-PRECISION] 이번 생성의 KV 를 원본 정밀도(BF16)로 둘지, TurboQuant 로 압축할지 정해 모델에 설정하고 돌려줍니다.
@@ -475,6 +495,7 @@ impl Qwen3GenerateModel {
         ignore_list: Option<&[String]>,
         semantic_prejudice: Option<&str>,
     ) -> Result<String> {
+        self.refresh_vocab_for(&crate::models::common::vocab_trim::prompt_text(mes), mes.temperature.unwrap_or(0.0) > 1e-7)?;
         if is_prefill {
             self.clear_kv_cache();
         } else {
@@ -768,6 +789,7 @@ impl Qwen3GenerateModel {
     }
 
     pub fn generate(&mut self, mes: ChatCompletionParameters, cancel_flag: Option<Arc<AtomicBool>>, ignore_list: Option<&[String]>, semantic_prejudice: Option<&str>) -> Result<String> {
+        self.refresh_vocab_for(&crate::models::common::vocab_trim::prompt_text(&mes), mes.temperature.unwrap_or(0.0) > 1e-7)?;
         let temperature = mes
             .temperature
             .unwrap_or(self.generation_config.temperature as f64);

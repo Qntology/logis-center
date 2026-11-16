@@ -195,6 +195,59 @@ pub fn resolve_envelope_field(arg: Option<&str>, data: &Value, key: &str) -> Str
         .to_string()
 }
 
+/// 🌟 [STABLE RANK] LanceDB 결과 행의 순서: `key` 열(벡터 검색 `_distance` 오름차순 · 전문 검색 `_score` 내림차순) → 첫 열(id) 오름차순.
+///
+/// LanceDB 는 거리 · 점수가 같은 행(여러 주문의 같은 청크 글 "Its sender name is Taylor Marsh" 등)을 병렬로 모은 순서대로 돌려주므로
+/// 동점의 순서와 `limit` 경계에서 잘리는 행이 실행마다 같다는 보장이 없습니다. 그 순서는 청크 트랙의 속성별 상한에 남는 문서와
+/// 순위 점수(1 − 순위 × 0.001)를 바꾸므로 여기서 정해 둡니다 (실행마다 결과가 달랐던 주원인은 `search_chunks` 의 문서별 묶기였음).
+/// `key` 열이 없는 결과는 `None` (원래 순서를 그대로 둡니다).
+fn stable_rows(batches: &[RecordBatch], key: &str, descending: bool) -> Option<Vec<(usize, usize, f32)>> {
+    let mut rows: Vec<(usize, usize, f32, String)> = Vec::new();
+    for (bi, b) in batches.iter().enumerate() {
+        if b.num_rows() == 0 {
+            continue;
+        }
+        let k = b.column_by_name(key)?.as_any().downcast_ref::<Float32Array>()?;
+        let ids = b.column(0).as_any().downcast_ref::<StringArray>()?;
+        for r in 0..b.num_rows() {
+            let v = k.value(r);
+            rows.push((bi, r, if descending { -v } else { v }, ids.value(r).to_string()));
+        }
+    }
+    rows.sort_by(|a, b| a.2.total_cmp(&b.2).then_with(|| a.3.cmp(&b.3)));
+    Some(rows.into_iter().map(|(bi, r, v, _)| (bi, r, v)).collect())
+}
+
+/// `run(창)` 으로 받은 결과에서 [`stable_rows`] 순서의 앞 `limit` 행 (배치, 행). 받은 행이 창을 채웠고 `limit` 번째 행의 값이 마지막 행과
+/// 같으면 동점 묶음이 창 밖으로 이어질 수 있으므로 창을 두 배로 넓혀 다시 받습니다 (`limit` 의 32 배까지). 벡터 색인이 없는 정확 검색이고
+/// 전문 검색 점수도 창과 무관하므로, 넓혀 받은 뒤 자른 앞 `limit` 행은 원래 결과와 동점의 순서만 다릅니다.
+async fn fetch_stable<F, Fut>(limit: usize, key: &str, descending: bool, run: F) -> Result<(Vec<RecordBatch>, Vec<(usize, usize)>)>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<RecordBatch>>>,
+{
+    if limit == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let cap = limit.saturating_mul(32);
+    let mut window = limit.saturating_mul(2).max(limit + 16);
+    loop {
+        let batches = run(window).await?;
+        let Some(rows) = stable_rows(&batches, key, descending) else {
+            // 정렬 열이 없으면 받은 순서 그대로 (창을 넓히지 않음)
+            let batches = run(limit).await?;
+            let order = batches.iter().enumerate().flat_map(|(bi, b)| (0..b.num_rows()).map(move |r| (bi, r))).take(limit).collect();
+            return Ok((batches, order));
+        };
+        let n = rows.len();
+        if n < window || n <= limit || rows[limit - 1].2 < rows[n - 1].2 || window >= cap {
+            let order = rows.into_iter().take(limit).map(|(b, r, _)| (b, r)).collect();
+            return Ok((batches, order));
+        }
+        window = window.saturating_mul(2).min(cap);
+    }
+}
+
 impl VectorStore {
     pub async fn new(base_path: &str) -> Result<Self> {
         let conn = connect(base_path).execute().await?;
@@ -1694,18 +1747,24 @@ impl VectorStore {
              if t.is_empty() { None } else { Some(t.to_string()) }
          });
          if !query_text.trim().is_empty() {
-             let mut q = table.query();
              let has_fts_index = target == "items"; // FTS 인덱스는 items 에만 존재
 
-             if use_fts && has_fts_index {
+             // 🌟 [STABLE RANK] 전문 검색은 점수(_score) → id 순으로 잘라, 점수가 같은 문서가 실행마다 바뀌지 않게 합니다 (fetch_stable).
+             let text_rows: Option<Vec<(String, String)>> = if use_fts && has_fts_index {
                  let fts_query_str = query_text
                      .split_whitespace()
                      .map(|w| format!("\"{}\"", w.replace("\"", "\\\"")))
                      .collect::<Vec<_>>()
                      .join(" ");
-                 q = q.full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query_str));
-                 if let Some(ref f) = scope { q = q.only_if(f.clone()); }
+                 let run = |w: usize| {
+                     let mut q = table.query().full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query_str.clone()));
+                     if let Some(ref f) = scope { q = q.only_if(f.clone()); }
+                     let q = q.limit(w);
+                     async move { Ok(q.execute().await?.try_collect::<Vec<_>>().await?) }
+                 };
+                 fetch_stable(fetch_limit, "_score", true, run).await.ok().map(|(batches, order)| Self::ordered_id_data(&batches, &order))
              } else {
+                 let mut q = table.query();
                  let sql_clean = query_text.replace("'", "''");
                  let mut ilike_conditions = Vec::new();
                  for w in sql_clean.split_whitespace() {
@@ -1719,54 +1778,41 @@ impl VectorStore {
                      (None, true)     => String::new(),
                  };
                  if !final_filter.is_empty() { q = q.only_if(final_filter); }
-             }
-
-             if let Ok(res) = q.limit(fetch_limit).execute().await {
-                if let Ok(batches) = res.try_collect::<Vec<_>>().await {
-                    for b in batches {
-                        let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-                        // 🌟 data 컬럼 인덱스가 13 → 9 로 이동했습니다.
-                        let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
-                        for i in 0..b.num_rows() {
-                            let id = ids.value(i).to_string();
-                            if let Some((_, s)) = combined.get_mut(&id) { *s += 2.0; }
-                            else { combined.insert(id, (txs.value(i).to_string(), 2.0)); }
-                        }
-                    }
-                }
+                 match q.limit(fetch_limit).execute().await {
+                     Ok(res) => res.try_collect::<Vec<_>>().await.ok().map(|batches| {
+                         let order: Vec<(usize, usize)> = batches.iter().enumerate().flat_map(|(bi, b)| (0..b.num_rows()).map(move |r| (bi, r))).collect();
+                         Self::ordered_id_data(&batches, &order)
+                     }),
+                     Err(_) => None,
+                 }
+             };
+             for (id, tx) in text_rows.unwrap_or_default() {
+                 if let Some((_, s)) = combined.get_mut(&id) { *s += 2.0; }
+                 else { combined.insert(id, (tx, 2.0)); }
              }
          }
 
          let is_empty_vec = query_vec.iter().all(|&x| x == 0.0);
 
          if !is_empty_vec {
-             let mut vq = table.query();
              let embed_scope = match &scope {
                  Some(f) => format!("({}) AND data LIKE '%\"embed\":1%'", f),
                  None => "data LIKE '%\"embed\":1%'".to_string(),
              };
-             vq = vq.only_if(embed_scope);
-
-             if let Ok(vq_with_vector) = vq.limit(fetch_limit).nearest_to(query_vec) {
-                 let vq_with_vector = vq_with_vector.column("vector");
-                 if let Ok(vres) = vq_with_vector.execute().await {
-                     if let Ok(batches) = vres.try_collect::<Vec<_>>().await {
-                         let mut rank = 0;
-                         for b in batches {
-                             let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-                             let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
-                             for i in 0..b.num_rows() {
-                                 let id = ids.value(i).to_string();
-                                 let vec_score = 1.0 - (rank as f32 * 0.001);
-                                 if let Some((_, s)) = combined.get_mut(&id) { *s += vec_score; }
-                                 else { combined.insert(id, (txs.value(i).to_string(), vec_score)); }
-                                 rank += 1;
-                             }
-                         }
+             // 🌟 [STABLE RANK] 순위 점수(1 − 순위 × 0.001)는 거리 → id 순서로 매깁니다 (fetch_stable).
+             let run = |w: usize| {
+                 let q = table.query().only_if(embed_scope.clone()).limit(w).nearest_to(query_vec.clone());
+                 async move { Ok(q?.column("vector").execute().await?.try_collect::<Vec<_>>().await?) }
+             };
+             match fetch_stable(fetch_limit, "_distance", false, run).await {
+                 Ok((batches, order)) => {
+                     for (rank, (id, tx)) in Self::ordered_id_data(&batches, &order).into_iter().enumerate() {
+                         let vec_score = 1.0 - (rank as f32 * 0.001);
+                         if let Some((_, s)) = combined.get_mut(&id) { *s += vec_score; }
+                         else { combined.insert(id, (tx, vec_score)); }
                      }
-                 } else {
-                     println!("[STORE] ⚠️ Text vector track failed to execute (column='vector').");
                  }
+                 Err(_) => println!("[STORE] ⚠️ Text vector track failed to execute (column='vector')."),
              }
          }
         if let Some(ref vvec) = vision_query_vec {
@@ -1783,33 +1829,26 @@ impl VectorStore {
                     Some(f) => format!("({}) AND data LIKE '%\"has_vision\":1%'", f),
                     None => "data LIKE '%\"has_vision\":1%'".to_string(),
                 };
-                let mut vvq = table.query();
-                vvq = vvq.only_if(vision_scope.clone());
-                if let Ok(vvq_with_vector) = vvq.limit(fetch_limit).nearest_to(vvec.clone()) {
-                    let vvq_with_vector = vvq_with_vector.column("vision_vec");
-                    if let Ok(vvres) = vvq_with_vector.execute().await {
-                        if let Ok(vbatches) = vvres.try_collect::<Vec<_>>().await {
-                            let mut vrank = 0;
-                            for b in vbatches {
-                                let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-                                let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
-                                for i in 0..b.num_rows() {
-                                    let id = ids.value(i).to_string();
-                                    let v_score = 1.0 - (vrank as f32 * 0.001);
-                                    if let Some((_, s)) = combined.get_mut(&id) { *s += v_score; }
-                                    else { combined.insert(id, (txs.value(i).to_string(), v_score)); }
-                                    vrank += 1;
-                                }
-                            }
-                            if vrank > 0 {
-                                println!("[STORE] 👁️ Vision track hit {} row(s) on column 'vision_vec' (scope: {}).", vrank, vision_scope);
-                            } else {
-                                println!("[STORE] ⚪ Vision track matched 0 rows. 이미지 추출 문서가 없거나, 마커 도입 이전에 저장되어 재추출이 필요합니다.");
-                            }
+                let run = |w: usize| {
+                    let q = table.query().only_if(vision_scope.clone()).limit(w).nearest_to(vvec.clone());
+                    async move { Ok(q?.column("vision_vec").execute().await?.try_collect::<Vec<_>>().await?) }
+                };
+                match fetch_stable(fetch_limit, "_distance", false, run).await {
+                    Ok((vbatches, order)) => {
+                        let rows = Self::ordered_id_data(&vbatches, &order);
+                        let vrank = rows.len();
+                        for (r, (id, tx)) in rows.into_iter().enumerate() {
+                            let v_score = 1.0 - (r as f32 * 0.001);
+                            if let Some((_, s)) = combined.get_mut(&id) { *s += v_score; }
+                            else { combined.insert(id, (tx, v_score)); }
                         }
-                    } else {
-                        println!("[STORE] ⚠️ Vision vector track failed to execute (column='vision_vec').");
+                        if vrank > 0 {
+                            println!("[STORE] 👁️ Vision track hit {} row(s) on column 'vision_vec' (scope: {}).", vrank, vision_scope);
+                        } else {
+                            println!("[STORE] ⚪ Vision track matched 0 rows. 이미지 추출 문서가 없거나, 마커 도입 이전에 저장되어 재추출이 필요합니다.");
+                        }
                     }
+                    Err(_) => println!("[STORE] ⚠️ Vision vector track failed to execute (column='vision_vec')."),
                 }
             }
         }
@@ -1840,7 +1879,8 @@ impl VectorStore {
              );
          }
          let mut final_list: Vec<_> = combined.into_iter().map(|(id, (txt, s))| (id, txt, s)).collect();
-         final_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+         // 🌟 [STABLE RANK] combined 는 HashMap 이라 점수가 같은 문서의 순서가 프로세스마다 달랐습니다 → 점수 동점은 id 순
+         final_list.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
 
          let start = offset.min(final_list.len());
          let end = (start + limit).min(final_list.len());
@@ -1875,17 +1915,13 @@ impl VectorStore {
             return Ok(Vec::new());
         }
         let table = self.conn.open_table("items").execute().await?;
-        let batches = table
-            .query()
-            .only_if(format!("({}) AND data LIKE '%\"embed\":1%'", scope))
-            .limit(limit)
-            .nearest_to(query_vec.to_vec())?
-            .column("vector")
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(Self::named_rows(&batches, query_text))
+        let filter = format!("({}) AND data LIKE '%\"embed\":1%'", scope);
+        let run = |w: usize| {
+            let q = table.query().only_if(filter.clone()).limit(w).nearest_to(query_vec.to_vec());
+            async move { Ok(q?.column("vector").execute().await?.try_collect::<Vec<_>>().await?) }
+        };
+        let (batches, order) = fetch_stable(limit, "_distance", false, run).await?;
+        Ok(Self::named_rows(&batches, &order, query_text))
     }
 
     /// 🌟 [WHOLE QUERY FUSION] FTS 순서 그대로 (id, data) 를 돌려줍니다.
@@ -1899,34 +1935,39 @@ impl VectorStore {
             .map(|w| format!("\"{}\"", w.replace('"', "\\\"")))
             .collect::<Vec<_>>()
             .join(" ");
-        let batches = table
-            .query()
-            .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query))
-            .only_if(scope.to_string())
-            .limit(limit)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        Ok(Self::named_rows(&batches, query_text))
+        let run = |w: usize| {
+            let q = table
+                .query()
+                .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query.clone()))
+                .only_if(scope.to_string())
+                .limit(w);
+            async move { Ok(q.execute().await?.try_collect::<Vec<_>>().await?) }
+        };
+        let (batches, order) = fetch_stable(limit, "_score", true, run).await?;
+        Ok(Self::named_rows(&batches, &order, query_text))
     }
 
-    fn named_rows(batches: &[RecordBatch], query_text: &str) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        for b in batches {
-            let ids = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-            let txs = b.column(9).as_any().downcast_ref::<StringArray>().unwrap();
-            for i in 0..b.num_rows() {
-                let keep = match serde_json::from_str::<Value>(txs.value(i)) {
-                    Ok(doc) => !is_relay_draft(&doc) || draft_named_by_query(&doc, query_text),
-                    Err(_) => true,
-                };
-                if keep {
-                    out.push((ids.value(i).to_string(), txs.value(i).to_string()));
-                }
-            }
-        }
-        out
+    /// `order` (배치, 행) 순서의 (id, data) (첫 열 · 10 번째 열)
+    fn ordered_id_data(batches: &[RecordBatch], order: &[(usize, usize)]) -> Vec<(String, String)> {
+        order
+            .iter()
+            .filter_map(|&(bi, r)| {
+                let b = &batches[bi];
+                let ids = b.column(0).as_any().downcast_ref::<StringArray>()?;
+                let txs = b.column(9).as_any().downcast_ref::<StringArray>()?;
+                Some((ids.value(r).to_string(), txs.value(r).to_string()))
+            })
+            .collect()
+    }
+
+    fn named_rows(batches: &[RecordBatch], order: &[(usize, usize)], query_text: &str) -> Vec<(String, String)> {
+        Self::ordered_id_data(batches, order)
+            .into_iter()
+            .filter(|(_, tx)| match serde_json::from_str::<Value>(tx) {
+                Ok(doc) => !is_relay_draft(&doc) || draft_named_by_query(&doc, query_text),
+                Err(_) => true,
+            })
+            .collect()
     }
 
     /// 🌟 [CONDITION GROUNDING] 범위 안에서 data 에 이 글자가 든 행의 저장 JSON 을 돌려줍니다.
@@ -2180,12 +2221,6 @@ impl VectorStore {
             .map(|f| f.contains("property = '"))
             .unwrap_or(false);
 
-        let mut q = table.query();
-        if let Some(f) = filter {
-            if !f.trim().is_empty() {
-                q = q.only_if(f.to_string());
-            }
-        }
         let normalized_query: Vec<f32> = {
             let norm: f32 = query_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 0.0 {
@@ -2195,14 +2230,21 @@ impl VectorStore {
             }
         };
         let overfetch = if property_pinned { limit * 12 } else { limit * 6 };
-        let results = q
-            .limit(overfetch)
-            .nearest_to(normalized_query)?
-            .column("vector")
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
+        // 🌟 [STABLE RANK] 같은 글의 청크(여러 주문의 같은 보낸 사람 이름 등)는 거리가 정확히 같아, 받은 순서가 실행마다 달랐습니다.
+        //    거리 → 청크 id 순으로 자르고(fetch_stable), 아래 속성별 상한도 그 순서로 채웁니다.
+        let run = |w: usize| {
+            let mut q = table.query();
+            if let Some(f) = filter {
+                if !f.trim().is_empty() {
+                    q = q.only_if(f.to_string());
+                }
+            }
+            let q = q.limit(w).nearest_to(normalized_query.clone());
+            async move { Ok(q?.column("vector").execute().await?.try_collect::<Vec<_>>().await?) }
+        };
+        let (batches, order) = fetch_stable(overfetch, "_distance", false, run).await?;
+        // 아래 루프는 배치를 차례로 읽으므로, 정한 순서대로 한 행짜리 조각(복사 없음)을 늘어놓습니다
+        let results: Vec<RecordBatch> = order.iter().map(|&(bi, r)| batches[bi].slice(r, 1)).collect();
 
         let mut chunks: Vec<(String, String, String, String, f32)> = Vec::new();
 
@@ -2233,7 +2275,7 @@ impl VectorStore {
                 ));
             }
         }
-        chunks.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        chunks.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
         if property_pinned {
             println!(
                 "  🎯 [PROPERTY PINNED] property 고정 검색 감지. 다양성 캡을 적용하지 않습니다. (후보 {}행 전량 보존)",
@@ -2314,10 +2356,14 @@ impl VectorStore {
                 (id, total, best)
             })
             .collect();
+        // 🌟 [STABLE RANK] item_scores 는 HashMap 이라 into_iter 순서가 프로세스마다 다릅니다. 여러 주문이 같은 청크 글
+        //    ("Its sender name is Taylor Marsh")을 하나씩 가지면 최고 · 합계 점수가 똑같아, 동점의 순서와 아래 take(limit) 에
+        //    남는 주문이 실행마다 바뀌었습니다 (같은 입력의 N:N 검색 96 질의 중 결과 id 가 전부 같은 것 57). 동점은 문서 id 순.
         sorted_items.sort_by(|a, b| {
             b.2.partial_cmp(&a.2)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.0.cmp(&b.0))
         });
 
         for (item_id, total_score, _best) in sorted_items.into_iter().take(limit) {
@@ -2399,6 +2445,68 @@ pub struct TradeDocument {
 }
 
 #[cfg(test)]
+mod stable_rank_tests {
+    //! 🌟 [STABLE RANK] LanceDB 가 동점 행을 어떤 순서로 돌려주든(병렬 모으기) 같은 행을 같은 순서로 고르는지
+    use super::*;
+
+    /// 40 행: 거리 0.1 하나 · 0.5 동점 38 · 0.9 하나. 동점 묶음 안의 순서를 `seed` 로 섞어, `w` 행까지만 돌려주는 가짜 검색
+    fn shuffled_db(seed: u64) -> Vec<(String, f32)> {
+        let mut tie: Vec<(String, f32)> = (0..38).map(|i| (format!("t{i:02}"), 0.5)).collect();
+        let mut x = seed;
+        for i in (1..tie.len()).rev() {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            tie.swap(i, (x >> 33) as usize % (i + 1));
+        }
+        let mut rows = vec![("first".to_string(), 0.1)];
+        rows.extend(tie);
+        rows.push(("last".to_string(), 0.9));
+        rows
+    }
+
+    fn batch(rows: &[(String, f32)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false), Field::new("_distance", DataType::Float32, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>())),
+                Arc::new(Float32Array::from(rows.iter().map(|r| r.1).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn pick(seed: u64, limit: usize) -> Vec<String> {
+        let db = shuffled_db(seed);
+        let run = |w: usize| {
+            let rows = db[..w.min(db.len())].to_vec();
+            async move { Ok(vec![batch(&rows)]) }
+        };
+        let (batches, order) = fetch_stable(limit, "_distance", false, run).await.unwrap();
+        order
+            .iter()
+            .map(|&(bi, r)| batches[bi].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(r).to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ties_are_cut_the_same_way_whatever_order_lancedb_returns() {
+        let a = pick(1, 4).await;
+        let b = pick(99, 4).await;
+        assert_eq!(a, vec!["first", "t00", "t01", "t02"], "거리 → id 순 (창을 넓혀 동점 묶음 전체에서 고름)");
+        assert_eq!(a, b);
+        // 정렬 열이 없으면 받은 순서 그대로
+        let run = |w: usize| async move {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+            let ids: Vec<String> = (0..w.min(5)).map(|i| format!("z{}", 4 - i)).collect();
+            Ok(vec![RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(ids))]).unwrap()])
+        };
+        let (batches, order) = fetch_stable(3, "_distance", false, run).await.unwrap();
+        let got: Vec<&str> = order.iter().map(|&(bi, r)| batches[bi].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(r)).collect();
+        assert_eq!(got, vec!["z4", "z3", "z2"]);
+    }
+}
+
+#[cfg(test)]
 mod embed_space_tests {
     //! 🌟 [EMBED SPACE MIGRATION] 임시 LanceDB 에서 공간 전환을 검증합니다(사용자 DB 는 건드리지 않습니다).
     use super::*;
@@ -2424,6 +2532,32 @@ mod embed_space_tests {
         let doc = store.get_item_by_id("items", id).await.unwrap()?;
         let v: Value = serde_json::from_str(&doc.json_data).unwrap();
         v.get("embed").and_then(|e| e.as_i64().or_else(|| e.as_bool().map(|b| b as i64)))
+    }
+
+    /// 🌟 [STABLE RANK] 같은 글의 청크를 하나씩 가진 문서들(점수 · 합계 동점)은 몇 번을 불러도 같은 문서가 id 순으로 나옵니다
+    /// (문서별 묶기의 HashMap 순서가 남으면 부를 때마다 순서가 바뀝니다).
+    #[tokio::test]
+    async fn chunk_search_cuts_tied_items_by_id() {
+        let dir = temp_db("ties");
+        let store = VectorStore::new(dir.to_str().unwrap()).await.unwrap();
+        store.init_all_tables().await.unwrap();
+        store.init_chunks_table().await.unwrap();
+        for i in [7, 3, 9, 1, 5, 8] {
+            let item = format!("item{i}");
+            store
+                .upsert_chunk(&format!("{item}_c0"), &item, "order", "Its sender name is Taylor Marsh", "sender_name", "Text", "Taylor Marsh", Some(unit(4)), None, None, None, Some("commerce"))
+                .await
+                .unwrap();
+        }
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let got: Vec<String> = store.search_chunks(&unit(4), 6, None).await.unwrap().into_iter().map(|r| r.1).collect();
+            seen.push(got);
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+        assert_eq!(seen[0], vec!["item1", "item3", "item5"], "속성별 상한 3 · 동점은 id 순");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

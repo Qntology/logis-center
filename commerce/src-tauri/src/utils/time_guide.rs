@@ -1,6 +1,29 @@
 use chrono::{Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
 use serde_json::json;
 
+/// 평가 하네스가 현재 시각을 고정하는 환경 변수 (epoch ms). 없으면 실제 시각입니다.
+///
+/// 검색 순위의 최근성 감쇠, 분석 답변 프롬프트의 "Current UTC time" · `days_ago`, 질의 해석의 '오늘' 이 모두 현재 시각에서
+/// 나옵니다. 두 실행을 같은 입력으로 대조하려면 (예: 어휘 자르기 off 와 full) 실행 시각이 달라도 이 값들이 같아야 합니다.
+pub const EVAL_NOW_ENV: &str = "LOGIS_EVAL_NOW_MS";
+
+/// 현재 시각 (UTC epoch ms). [`EVAL_NOW_ENV`] 가 있으면 그 값
+pub fn now_ms() -> i64 {
+    static PIN: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+    PIN.get_or_init(|| std::env::var(EVAL_NOW_ENV).ok().and_then(|v| v.trim().parse::<i64>().ok()).filter(|v| *v > 0))
+        .unwrap_or_else(|| Utc::now().timestamp_millis())
+}
+
+/// [`now_ms`] 의 UTC 시각
+pub fn now_utc() -> chrono::DateTime<Utc> {
+    chrono::DateTime::from_timestamp_millis(now_ms()).unwrap_or_else(Utc::now)
+}
+
+/// [`now_ms`] 의 지역 시각
+pub fn now_local() -> chrono::DateTime<chrono::Local> {
+    now_utc().with_timezone(&chrono::Local)
+}
+
 // 🌟 벡터 매칭 결과와 언어(국가) 코드를 입력받아 동적으로 완벽한 날짜 필터를 생성합니다.
 pub fn get_deterministic_time_guide(vector_guide: &str, lang_code: &str) -> (String, Option<serde_json::Value>) {
     let time_key = marker_key(vector_guide, "Time Intent [");
@@ -115,7 +138,7 @@ pub fn lang_clock(lang_code: &str) -> (FixedOffset, bool) {
 }
 
 pub fn today_in(offset: &FixedOffset) -> NaiveDate {
-    Utc::now().with_timezone(offset).date_naive()
+    now_utc().with_timezone(offset).date_naive()
 }
 
 pub fn date_of_ms(offset: &FixedOffset, ms: i64) -> Option<NaiveDate> {

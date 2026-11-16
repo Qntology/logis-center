@@ -41,6 +41,19 @@ pub struct Qwen3_5GenerateModel {
 }
 
 impl Qwen3_5GenerateModel {
+    /// 🌟 [VOCAB TRIM] 지금 흐름의 문서 언어(`vocab_trim::DocLangScope`)로 출력 투영의 남긴 행을 맞춥니다. 생성마다 처음에 부릅니다.
+    pub fn refresh_vocab(&mut self) -> Result<()> {
+        self.refresh_vocab_for("", false)
+    }
+
+    /// [`Self::refresh_vocab`] + 이번 생성의 프롬프트 글에 나온 문자 체계. 샘플링(온도 > 0)이면 전체 행 (`vocab_trim::refresh_for`)
+    pub fn refresh_vocab_for(&mut self, prompt: &str, sampling: bool) -> Result<()> {
+        if let Some(src) = self.qwen3_5.vocab_table() {
+            crate::models::common::vocab_trim::refresh_for(&mut self.qwen3_5.trim_head, &src, &self.tokenizer.tokenizer, &self.device, prompt, sampling)?;
+        }
+        Ok(())
+    }
+
     /// 로드 시 설정된 max_position_embeddings 값을 반환합니다.
     pub fn get_max_tokens(&self) -> usize {
         self.max_position_embeddings
@@ -255,6 +268,7 @@ impl Qwen3_5GenerateModel {
         ignore_list: Option<&[String]>,
         semantic_prejudice: Option<&str> // 🌟 [추가] Semantic Prejudice 타겟
     ) -> Result<String> {
+        self.refresh_vocab_for(&crate::models::common::vocab_trim::prompt_text(&mes), mes.temperature.unwrap_or(0.0) > 1e-7)?;
         let seed = mes.seed.unwrap_or(32768) as u64;
         let temperature = mes.temperature.unwrap_or(0.0);
         let top_p = mes.top_p.unwrap_or(0.95);
@@ -406,7 +420,8 @@ impl Qwen3_5GenerateModel {
                         let one = Tensor::new(1.0f32, &self.device)?;
                         let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
                         let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
-                        Ok(prejudice) 
+                        // 🌟 [VOCAB TRIM] 잘린 행 자리는 +∞ (빼면 −∞): 선입견 블록의 채움값이 로짓으로 새어 나가지 않게
+                        Ok(crate::models::common::vocab_trim::exclude_dropped(self.qwen3_5.trim_head.as_ref(), prejudice)?)
                     };
                     match calc_prej() {
                         Ok(prej) => {
@@ -693,7 +708,8 @@ impl Qwen3_5GenerateModel {
             Some(80), 
             mes.seed.unwrap_or(32768) as u64
         );
-        
+
+        self.refresh_vocab_for(&crate::models::common::vocab_trim::prompt_text(mes), mes.temperature.unwrap_or(0.0) > 1e-7)?;
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
         self.qwen3_5.language_model.set_planned_decode_tokens(sample_len as usize); // 🌟 [KV-PLAN v2] KV 여유 토큰 = 실제 max_tokens
@@ -839,7 +855,8 @@ impl Qwen3_5GenerateModel {
                         let one = Tensor::new(1.0f32, &self.device)?;
                         let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
                         let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
-                        Ok(prejudice)
+                        // 🌟 [VOCAB TRIM] 잘린 행 자리는 +∞ (빼면 −∞): 선입견 블록의 채움값이 로짓으로 새어 나가지 않게
+                        Ok(crate::models::common::vocab_trim::exclude_dropped(self.qwen3_5.trim_head.as_ref(), prejudice)?)
                     };
                     match calc_prej() {
                         Ok(prej) => {

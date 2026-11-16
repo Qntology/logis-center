@@ -59,6 +59,8 @@ mod calibration;
 mod research;
 // P2b 실모델 대조: 융합 GDN(Qwen3.5) · Qwen3-0.6B Q8_0 상주 정확 W8A16 (LOGIS_TEST_MODELS=1, --ignored)
 mod p2b_models;
+// 어휘 잘라 내기: 0.6B · 2B · 4B 의 텍스트 · 이미지 맥락 실측, 원본 4B 받기 (LOGIS_TEST_MODELS=1, --ignored)
+mod vocab_trim;
 // FlashAttention / TurboQuant 정확도 teacher-forcing (목업 Qwen3, FA on/off × TQ KV on/off, CPU + GPU)
 mod accel_accuracy;
 // 원본에서 한 번 양자화하는 블록 인코더(ggml-kquant) · SigLIP2 정밀도 계획과 지문 (CPU)

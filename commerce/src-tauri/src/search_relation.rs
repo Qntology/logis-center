@@ -1359,7 +1359,7 @@ pub async fn analytic_visit_complement(
 /// 질의의 절대 기간 (오늘 기준; 'in September' · '9월' · 'from X to Y')
 fn query_period(query: &str) -> Option<(chrono::NaiveDate, chrono::NaiveDate)> {
     let words: Vec<String> = crate::stanza::strip_quoted(query).split_whitespace().map(String::from).collect();
-    let today = chrono::Local::now().date_naive();
+    let today = crate::utils::time_guide::now_local().date_naive();
     crate::utils::ai_utils::exact_absolute_period(&words, today).map(|p| (p.start, p.end))
 }
 

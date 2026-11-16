@@ -7,8 +7,14 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::Emitter;
 
-pub const LANG_LLM_OWNER: &str = "alphaedge-ai";
-pub const LANG_LLM_FILES: [&str; 9] = [
+// 🌟 [SINGLE 4B] 언어 엔진은 원본 Qwen/Qwen3.5-4B 하나입니다. 언어마다 다른 것은 출력 투영의 남긴 행이고
+//    (`models::common::vocab_trim`, 문서 언어 = 현지 언어 + 영어), 예전의 언어별 alphaedge-ai 4B(어휘 16,384, 언어당 약 10 GB)는 쓰지 않습니다.
+//    그래서 언어 코드 대신 엔진 이름 하나([`LANG_ENGINE`])가 다운로드 · 상주 · 바인딩의 열쇠입니다.
+pub const LANG_LLM_OWNER: &str = "Qwen";
+pub const LANG_ENGINE: &str = "Qwen3.5-4B";
+/// 받는 커밋 (저장소가 바뀌어도 같은 가중치)
+pub const LANG_LLM_REVISION: &str = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a";
+pub const LANG_LLM_FILES: [&str; 11] = [
     "config.json",
     "tokenizer.json",
     "tokenizer_config.json",
@@ -17,9 +23,17 @@ pub const LANG_LLM_FILES: [&str; 9] = [
     "vocab.json",
     "preprocessor_config.json",
     "video_preprocessor_config.json",
-    "model.safetensors",
+    "model.safetensors.index.json",
+    "model.safetensors-00001-of-00002.safetensors",
+    "model.safetensors-00002-of-00002.safetensors",
 ];
-pub const LANG_LLM_REQUIRED: [&str; 3] = ["config.json", "model.safetensors", "tokenizer.json"];
+pub const LANG_LLM_REQUIRED: [&str; 5] = [
+    "config.json",
+    "tokenizer.json",
+    "model.safetensors.index.json",
+    "model.safetensors-00001-of-00002.safetensors",
+    "model.safetensors-00002-of-00002.safetensors",
+];
 pub const LANG_LLM_MIN_WEIGHT_BYTES: u64 = 400_000_000;
 pub const LANG_LLM_RESIDENT_RATIO: f64 = 0.30;
 
@@ -78,7 +92,8 @@ const ISO1_TO_ALPHAEDGE: &[(&str, &str)] = &[
     ("yi", "ydd"), ("af", "afr"), ("as", "asm"),
 ];
 
-pub fn alphaedge_code(doc_lang: &str) -> Option<&'static str> {
+/// 문서 언어의 3 글자 코드 (언어 엔진의 대상 언어 표, 예전 언어별 모델의 목록)
+pub fn lang3_code(doc_lang: &str) -> Option<&'static str> {
     let lower = doc_lang.trim().to_lowercase();
     if lower.is_empty() {
         return None;
@@ -98,13 +113,18 @@ pub fn alphaedge_code(doc_lang: &str) -> Option<&'static str> {
         .map(|(_, code)| *code)
 }
 
+/// 🌟 [SINGLE 4B] 이 문서 언어를 언어 엔진이 맡는가 → 맡으면 엔진 이름([`LANG_ENGINE`]). 모든 대상 언어가 같은 엔진입니다.
+pub fn engine_code(doc_lang: &str) -> Option<&'static str> {
+    lang3_code(doc_lang).map(|_| LANG_ENGINE)
+}
+
 pub fn needs_lang_engine(doc_lang: &str) -> bool {
-    alphaedge_code(doc_lang).is_some()
+    engine_code(doc_lang).is_some()
         && !crate::nl_convert::is_latin_dominant(&crate::nl_convert::native_script_sample(doc_lang, "", ""))
 }
 
-pub fn repo_name(code: &str) -> String {
-    format!("Qwen3.5-4B-{}-16384", code)
+pub fn repo_name(_code: &str) -> String {
+    LANG_ENGINE.to_string()
 }
 
 pub fn repo_id(code: &str) -> String {
@@ -116,7 +136,7 @@ pub fn model_dir(code: &str) -> PathBuf {
 }
 
 fn file_url(code: &str, file: &str) -> String {
-    format!("https://huggingface.co/{}/resolve/main/{}", repo_id(code), file)
+    format!("https://huggingface.co/{}/resolve/{}/{}", repo_id(code), LANG_LLM_REVISION, file)
 }
 
 fn weight_bytes(dir: &Path) -> u64 {
@@ -343,7 +363,7 @@ impl TranslitEngine {
 
     pub fn label(&self) -> String {
         match self {
-            TranslitEngine::Lang4B { code } => format!("Qwen3.5-4B-{} (alphaedge-ai)", code),
+            TranslitEngine::Lang4B { code } => format!("{} (원본 · 문서 언어 어휘)", code),
             TranslitEngine::Base2B => "Qwen3.5-2B".to_string(),
         }
     }
@@ -394,13 +414,13 @@ pub fn resolve_engine(
     task_id: &str,
     fetch: bool,
 ) -> (TranslitEngine, String) {
-    let code = match alphaedge_code(doc_lang) {
+    let code = match engine_code(doc_lang) {
         Some(c) => c,
         None => {
             return (
                 TranslitEngine::Base2B,
                 format!(
-                    "🔤 [TRANSLIT ENGINE] 문서 언어 '{}' 에 대응하는 alphaedge-ai Qwen3.5-4B 언어 모델이 없어 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+                    "🔤 [TRANSLIT ENGINE] 문서 언어 '{}' 는 Qwen3.5-4B 언어 엔진의 대상 언어가 아니어서 Qwen3.5-2B + 발음 게이트로 음차합니다.",
                     doc_lang
                 ),
             )
@@ -410,7 +430,7 @@ pub fn resolve_engine(
         return (
             TranslitEngine::Base2B,
             format!(
-                "⚠️ [TRANSLIT ENGINE] Qwen3.5-4B-{} 는 이번 세션에서 쓸 수 없습니다 ({}). 앱을 다시 시작하기 전까지 Qwen3.5-2B + 발음 게이트로 음차합니다.",
+                "⚠️ [TRANSLIT ENGINE] {} 는 이번 세션에서 쓸 수 없습니다 ({}). 앱을 다시 시작하기 전까지 Qwen3.5-2B + 발음 게이트로 음차합니다.",
                 code, why
             ),
         );
@@ -419,7 +439,7 @@ pub fn resolve_engine(
         return (
             TranslitEngine::Base2B,
             format!(
-                "⏳ [TRANSLIT ENGINE] Qwen3.5-4B-{} 는 방금 VRAM 이 모자라 잠시 쉬고 있습니다 ({}). 이번 호출만 Qwen3.5-2B + 발음 게이트로 음차하고, 세션 전체를 2B 로 묶지 않습니다.",
+                "⏳ [TRANSLIT ENGINE] {} 는 방금 VRAM 이 모자라 잠시 쉬고 있습니다 ({}). 이번 호출만 Qwen3.5-2B + 발음 게이트로 음차하고, 세션 전체를 2B 로 묶지 않습니다.",
                 code, why
             ),
         );
@@ -492,7 +512,7 @@ pub fn resolve_engine(
     (
         TranslitEngine::Lang4B { code: code.to_string() },
         format!(
-            "🧠 [TRANSLIT ENGINE] 음차 엔진: Qwen3.5-4B-{} (alphaedge-ai · vocab 16384) | 상주 예상 {}MB",
+            "🧠 [TRANSLIT ENGINE] 음차 엔진: {} (원본 · 출력 투영은 문서 언어의 행만) | 상주 예상 {}MB",
             code,
             resident_estimate_mb(code)
         ),
@@ -500,15 +520,15 @@ pub fn resolve_engine(
 }
 
 pub fn lang_engine_available(doc_lang: &str) -> bool {
-    match alphaedge_code(doc_lang) {
+    match engine_code(doc_lang) {
         Some(c) => loader().is_some() && runtime_failure(c).is_none() && transient_shortage(c).is_none() && is_ready(c),
         None => false,
     }
 }
 
 pub fn engine_tag(doc_lang: &str) -> String {
-    match alphaedge_code(doc_lang) {
-        Some(c) if lang_engine_available(doc_lang) => format!("4B-{}", c),
+    match engine_code(doc_lang) {
+        Some(c) if lang_engine_available(doc_lang) => c.to_string(),
         _ => "2B".to_string(),
     }
 }
@@ -517,7 +537,7 @@ pub fn prefetch(doc_lang: &str, app: &tauri::AppHandle, task_id: &str) -> Option
     if !needs_lang_engine(doc_lang) {
         return None;
     }
-    let code = alphaedge_code(doc_lang)?;
+    let code = engine_code(doc_lang)?;
     if runtime_failure(code).is_some() {
         return None;
     }
@@ -568,8 +588,9 @@ pub fn prefetch(doc_lang: &str, app: &tauri::AppHandle, task_id: &str) -> Option
 /// 🌟 [TRANSLIT ENGINE / VALUE] 음차할 값 하나를 언어별 4B 로 읽을지, 다국어 2B 로 읽을지 가립니다.
 ///
 ///  ── 왜 값마다 가르나 ──
-///   언어별 4B(alphaedge-ai · 어휘 16,384)는 영어 기반에 문서 언어 하나를 더한 모델이라, 영어 단어를 문서 언어로
-///   옮기는 두 언어 음차는 2B 보다 가볍고(임베딩 84MB vs 1,017MB) 정확합니다. 예전에는 모든 값을 4B 로 읽고
+///   (이 판단은 예전 언어별 4B(alphaedge-ai · 어휘 16,384)의 실측입니다. 지금 4B 는 원본 하나이고 출력 투영을 문서 언어
+///   (현지 언어 + 영어)의 행만 남겨 같은 두 언어 음차를 합니다.) 언어별 4B 는 영어 기반에 문서 언어 하나를 더한 모델이라, 영어 단어를 문서 언어로
+///   옮기는 두 언어 음차는 2B 보다 가볍고(임베딩 84MB vs 1,017MB) 정확했습니다. 예전에는 모든 값을 4B 로 읽고
 ///   게이트를 못 넘은 값만 2B 로 다시 읽었는데(SECOND READ), 그 2B 적재가 이미지 문서 한 건에 11초를 넘겼고
 ///   단일 언어 값에서는 2B 가 4B 보다 낫다는 근거가 없었습니다('Shorts' → 2B '스카우트' 도 발음 게이트에서 폐기).
 ///   그래서 엔진은 '4B 가 틀렸는가' 가 아니라 '값에 몇 개 언어가 섞였는가' 로 정합니다.
@@ -678,7 +699,7 @@ pub async fn await_engine(
     if !needs_lang_engine(doc_lang) {
         return resolve_engine(doc_lang, app, task_id, false);
     }
-    let code = match alphaedge_code(doc_lang) {
+    let code = match engine_code(doc_lang) {
         Some(c) => c,
         None => return resolve_engine(doc_lang, app, task_id, false),
     };
@@ -1356,12 +1377,8 @@ fn installed_codes() -> Vec<String> {
     if let Ok(rd) = std::fs::read_dir(&root) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if let Some(rest) = name.strip_prefix("Qwen3.5-4B-") {
-                if let Some(code) = rest.strip_suffix("-16384") {
-                    if !code.is_empty() && !out.iter().any(|c| c == code) {
-                        out.push(code.to_string());
-                    }
-                }
+            if name == LANG_ENGINE && !out.iter().any(|c| c == LANG_ENGINE) {
+                out.push(LANG_ENGINE.to_string());
             }
         }
     }
@@ -1399,7 +1416,7 @@ pub fn status_json(code: &str) -> Value {
 }
 
 pub fn status_report(doc_lang: Option<&str>) -> Value {
-    if let Some(code) = doc_lang.and_then(alphaedge_code) {
+    if let Some(code) = doc_lang.and_then(engine_code) {
         return status_json(code);
     }
     let langs: Vec<Value> = installed_codes().iter().map(|c| status_json(c)).collect();
@@ -1638,7 +1655,7 @@ pub fn closed_verdict(track: &str, step: &str, code: Option<&str>, why: &str) ->
             "🧭 [LANG ROUTE] {}.{} | 기존 모델 유지 ({}) — {}",
             track,
             step,
-            code.map(|c| format!("4B-{} 후보", c)).unwrap_or_else(|| "대응 4B 없음".to_string()),
+            code.map(|c| format!("{} 후보", c)).unwrap_or_else(|| "대응 4B 없음".to_string()),
             why
         ),
         probe: false,
@@ -1648,17 +1665,17 @@ pub fn closed_verdict(track: &str, step: &str, code: Option<&str>, why: &str) ->
 pub fn step_contract_block(track: &str, step: &str) -> Option<&'static str> {
     match (track, step) {
         ("search", "commerce_verify") => Some(
-            "이 단계의 답은 후보 목록에 있는 영문 이름(카테고리·속성)과 영문 JSON 키·연산자를 글자 그대로 옮겨야 합니다. 어휘 16,384 의 4B 는 영문 식별자를 옮길 때 글자를 바꾸거나 줄입니다(goods→good, transcription→trancription, condition→con). 다국어 어휘의 Qwen3 로 둡니다",
+            "이 단계의 답은 후보 목록에 있는 영문 이름(카테고리·속성)과 영문 JSON 키·연산자를 글자 그대로 옮겨야 합니다. 예전 언어별 4B(어휘 16,384)는 영문 식별자를 옮길 때 글자를 바꾸거나 줄였고(goods→good, transcription→trancription, condition→con), 원본 4B 는 이 단계를 아직 검증하지 않았습니다. 다국어 어휘의 Qwen3 로 둡니다",
         ),
         _ => None,
     }
 }
 
 pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, reference: &Path) -> RouteVerdict {
-    let code = match alphaedge_code(doc_lang) {
+    let code = match engine_code(doc_lang) {
         Some(c) => c,
         None => {
-            return closed_verdict(track, step, None, &format!("문서 언어 '{}' 에 대응하는 alphaedge-ai 4B 모델이 없습니다", doc_lang))
+            return closed_verdict(track, step, None, &format!("문서 언어 '{}' 는 4B 언어 엔진의 대상 언어가 아닙니다", doc_lang))
         }
     };
     if let Some(why) = step_contract_block(track, step) {
@@ -1714,7 +1731,7 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
             track,
             step,
             Some(code),
-            &format!("4B 토크나이저가 이 문서 글자 {}자를 원래대로 되돌리지 못합니다 (어휘 16,384 에 없는 글자)", fit.lost_chars),
+            &format!("4B 토크나이저가 이 문서 글자 {}자를 원래대로 되돌리지 못합니다 (토크나이저에 없는 글자)", fit.lost_chars),
         );
     }
     crate::utils::score_dynamics::record_baseline(&format!("{}.lang4b_expansion", track), fit.expansion());
@@ -1790,7 +1807,7 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
         code: Some(code.to_string()),
         probe: !probe.is_empty(),
         line: format!(
-            "🧭 [LANG ROUTE] {}.{} | Qwen3.5-4B-{} (alphaedge-ai) 로 보냅니다 | 문자 비율 문서언어 {:.1}% · 라틴 {:.1}% · 기타 {:.1}% (글자 {}자) | 토큰 4B {} / 기준 {} = {:.2}배 · 왕복 손실 0자{}{}",
+            "🧭 [LANG ROUTE] {}.{} | {} 로 보냅니다 | 문자 비율 문서언어 {:.1}% · 라틴 {:.1}% · 기타 {:.1}% (글자 {}자) | 토큰 4B {} / 기준 {} = {:.2}배 · 왕복 손실 0자{}{}",
             track,
             step,
             code,
@@ -1871,7 +1888,7 @@ impl LangSession {
     }
 
     pub fn label(&self) -> String {
-        format!("Qwen3.5-4B-{} (alphaedge-ai)", self.code)
+        format!("{} (원본 · 문서 언어 어휘)", self.code)
     }
 }
 
@@ -1916,7 +1933,7 @@ pub fn close_query_route(why: &str) {
     if let Ok(mut g) = QUERY_ROUTE.lock() {
         if let Some(code) = g.take() {
             println!(
-                "[LANG ROUTE] ⚠️ 이번 질의의 Qwen3.5-4B-{} 검증 경로를 닫고 Qwen3 로 이어 갑니다: {}",
+                "[LANG ROUTE] ⚠️ 이번 질의의 {} 검증 경로를 닫고 Qwen3 로 이어 갑니다: {}",
                 code, why
             );
         }
@@ -1929,7 +1946,7 @@ pub fn record_query_value(pass: bool) {
 
 pub fn query_engine_label() -> String {
     match query_route() {
-        Some(code) => format!("Qwen3.5-4B-{}", code),
+        Some(code) => code.to_string(),
         None => "Qwen3".to_string(),
     }
 }

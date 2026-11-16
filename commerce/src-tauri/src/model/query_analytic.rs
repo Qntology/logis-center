@@ -83,7 +83,7 @@ impl crate::model::LogisModel {
         emit_term("\n[ANALYTIC-QUERY] 🔍 행동 로그 질의 파싱 시작 (v3 / Vector-First NMS)");
         emit_term(&format!("   질의: \"{}\"", query));
 
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        let now_ms = crate::utils::time_guide::now_ms();
         let current_iso = chrono::DateTime::from_timestamp_millis(now_ms)
             .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
             .unwrap_or_default();

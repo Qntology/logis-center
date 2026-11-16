@@ -38,6 +38,9 @@ impl crate::model::LogisModel {
 
         emit_term("\n=======================================");
         emit_term(&format!("[ENGINE] 🚀 Starting Image Extraction Pipeline for Task: {}", task_id));
+        // 🌟 [VOCAB TRIM] 이미지 맥락: 문서 언어를 미리 모르므로 12 개 언어의 행으로 시작하고, 판독 글이 정하면
+        //    (`chat_with_qwen3_5_image_spinner` 의 `observe_read`) 그 언어의 행으로 줄입니다. 문서가 끝나면 되돌립니다.
+        let _vocab_scope = crate::models::common::vocab_trim::DocLangScope::image();
         crate::utils::score_dynamics::enter_scope(
             "",
             crate::utils::score_dynamics::Track::Vision,
@@ -5099,6 +5102,14 @@ impl crate::model::LogisModel {
         ).await.map_err(|e| anyhow!("Qwen 3.5 Inference failed: {}", e));
         if let Some(d) = kv_dir {
             let _ = std::fs::remove_dir_all(&d);
+        }
+        // 🌟 [VOCAB TRIM] 이미지 맥락: 판독 글의 값이 문서 언어를 가리키면 다음 생성부터 그 언어의 행만 남깁니다.
+        if let Ok(text) = &out {
+            if let Some(langs) = crate::models::common::vocab_trim::observe_read(text) {
+                let msg = format!("  ✂️ [VOCAB TRIM] 첫 판독 글로 문서 언어를 정했습니다: {} — 다음 생성부터 그 행만 출력 투영에 남깁니다.", langs.label());
+                println!("{}", msg);
+                let _ = _app_handle.emit("task-console-log", json!({ "task_id": base_payload.get("task_id").cloned().unwrap_or_default(), "text": format!("{}\n", msg) }));
+            }
         }
         out
     }

@@ -339,6 +339,8 @@ pub struct Qwen3Model {
     norm: RmsNorm,
     rotary_emb: RoPE,
     lm_head: ProjKind,
+    /// 🌟 [VOCAB TRIM] 남긴 행만의 출력 투영 (있으면 `lm_head` 대신). 생성기가 문서 언어로 맞춥니다.
+    pub trim_head: Option<crate::models::common::vocab_trim::TrimmedHead>,
     // 🌟 [Q8-RESIDENT] Some(활성 dtype) 이면 Q8_0 상주 경로 (마지막 노름·lm_head 는 F32 → F32 logits)
     q8_act_dtype: Option<candle_core::DType>,
     // 🌟 [KV RESIDENCY] KV 크기 계산에 필요한 형상 정보를 보관합니다.
@@ -372,6 +374,7 @@ impl Qwen3Model {
             norm,
             rotary_emb,
             lm_head: ProjKind::LinearProj(lm_head),
+            trim_head: None,
             q8_act_dtype: None,
             kv_num_layers: config.num_hidden_layers,
             kv_num_heads: config.num_key_value_heads,
@@ -423,6 +426,7 @@ impl Qwen3Model {
             norm,
             rotary_emb,
             lm_head,
+            trim_head: None,
             q8_act_dtype: Some(act_dtype),
             kv_num_layers: config.num_hidden_layers,
             kv_num_heads: config.num_key_value_heads,
@@ -433,6 +437,21 @@ impl Qwen3Model {
     /// 🌟 [Q8-RESIDENT] Q8_0 가중치 상주 경로인지.
     pub fn is_q8_resident(&self) -> bool {
         self.q8_act_dtype.is_some()
+    }
+
+    /// 🌟 [VOCAB TRIM] 입력 임베딩을 매핑에서 행만 읽고(장치의 표를 내려놓음), 출력 투영은 [`Self::trim_head`] 로 곱합니다.
+    /// 묶인 출력 투영(`lm_head`)이 장치의 표를 함께 쥐고 있으므로 쓰지 않는 1 행 자리로 바꿉니다.
+    pub fn use_mapped_table(&mut self, src: crate::models::common::vocab_trim::TableSource, device: &candle_core::Device) -> Result<()> {
+        let cols = src.cols;
+        println!("[VOCAB-TRIM] 입력 임베딩 {} × {} 을 장치에 올리지 않고 매핑에서 행만 읽습니다.", src.rows, cols);
+        self.embed_tokens = EmbedTable::Mapped { src, device: device.clone() };
+        self.lm_head = ProjKind::LinearProj(Linear::new(Tensor::zeros((1, cols), candle_core::DType::F32, device)?, None));
+        Ok(())
+    }
+
+    /// 매핑된 출력 투영 표 (잘라 내기가 켜진 경우)
+    pub fn vocab_table(&self) -> Option<crate::models::common::vocab_trim::TableSource> {
+        self.embed_tokens.mapped_source().cloned()
     }
 
     pub fn forward(
@@ -495,6 +514,16 @@ impl Qwen3Model {
             // 🌟 [Q8-RESIDENT] 마지막 행만 F32 로 올려 F32 노름 → 정확 mat-vec lm_head → F32 logits.
             let last = hidden_states.narrow(1, seq_len - 1, 1)?.to_dtype(candle_core::DType::F32)?;
             let last = self.norm.forward(&last)?;
+            // 🌟 [VOCAB TRIM] 남긴 행만 곱하고 장치에서 전체 어휘 길이로 펼칩니다 (잘린 행 −∞).
+            if self.trim_head.is_none() {
+                if let Some(src) = self.embed_tokens.mapped_source().cloned() {
+                    // 생성기가 언어를 정하기 전(refresh_vocab 없이) 불린 계산은 전체 행으로 곱합니다 (off 와 같은 로짓)
+                    self.trim_head = Some(crate::models::common::vocab_trim::all_rows(&src, last.device())?);
+                }
+            }
+            if let Some(head) = &self.trim_head {
+                return Ok(head.logits(&last)?);
+            }
             return Ok(self.lm_head.forward(&last)?);
         }
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -504,7 +533,7 @@ impl Qwen3Model {
     }
 
     pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {
-        Ok(self.embed_tokens.forward(input_ids)?)
+        Ok(self.embed_tokens.forward_with_head(input_ids, self.trim_head.as_ref())?)
     }
 
     /// 🌟 [VOCAB CHUNK] 어휘 수.
@@ -514,7 +543,7 @@ impl Qwen3Model {
 
     /// 🌟 [VOCAB CHUNK] 임베딩 행 `off..off+take` 를 F32 로. (Dense: narrow + F32 승격 — 기존과 같음 / Quant: 행만 정확 복원)
     pub fn embed_rows_f32(&self, off: usize, take: usize) -> Result<Tensor> {
-        Ok(self.embed_tokens.rows_f32(off, take)?)
+        Ok(self.embed_tokens.rows_f32_with_head(off, take, self.trim_head.as_ref())?)
     }
 
     pub fn clear_kv_cache(&mut self) {

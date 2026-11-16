@@ -336,7 +336,7 @@ fn run_plan() {
     // 판정 단계만 잴 때: 로그에 이 문구가 나오면 태스크를 취소합니다. 언어 모델 단계 앞에서 끊을 수 있습니다.
     if let Some(stop_on) = std::env::var("LOGIS_SYNTH_STOP_ON").ok().filter(|v| !v.is_empty()) {
         // 언어 모델까지 가지 않는 실행이므로 언어 엔진 다운로드도 시작하지 않습니다. 다른 프로세스가 받는 중일 수 있습니다.
-        tauri_app_lib::model::lang_llm::mark_runtime_failure("kor", "판정 단계만 재는 실행");
+        tauri_app_lib::model::lang_llm::mark_runtime_failure(tauri_app_lib::model::lang_llm::LANG_ENGINE, "판정 단계만 재는 실행");
         let stop = cancel.clone();
         app.listen("task-console-log", move |e| {
             if e.payload().contains(&stop_on) {

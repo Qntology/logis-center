@@ -147,7 +147,7 @@ async fn run_synthesis_pass(
         let engine = verdict
             .code
             .as_deref()
-            .map(|c| format!("Qwen3.5-4B-{}", c))
+            .map(|c| c.to_string())
             .unwrap_or_else(|| "Qwen3".to_string());
         let resident = model.generation_engine_resident(verdict.code.as_deref()).await;
         let probe_axis = format!("{}|{}", crate::model::lang_llm::synthesis_drop_axis(routed_lang), step);
@@ -847,6 +847,8 @@ pub async fn process_task(
         "[Scheduler] 🌐 [DOC LANG] Early detection (cache-independent): '{}'",
         doc_lang
     );
+    // 🌟 [VOCAB TRIM] 텍스트 맥락: 생성 전에 정한 문서 언어(현지 언어 + 영어)의 행만 출력 투영에 남깁니다. 태스크가 끝나면 되돌립니다.
+    let vocab_scope = crate::models::common::vocab_trim::DocLangScope::text(&doc_lang, &lang_probe_text);
     if let Some(line) = crate::model::lang_llm::prefetch(&doc_lang, app_handle, &task.id) {
         emit_term(&format!("[Scheduler] {}", line));
     }
@@ -1603,6 +1605,7 @@ pub async fn process_task(
                 ));
             }
             doc_lang = refined_lang;
+            vocab_scope.set(&doc_lang, &filtered_light_pug);
             println!("[Scheduler] Deterministic Detected Language: {}", doc_lang);
             
             let dedup_idxs: Vec<usize> = {
@@ -9555,7 +9558,7 @@ pub async fn process_task(
         };
         match kept_lang.as_deref() {
             Some(code) => emit_term(&format!(
-                "[Scheduler] 🔁 [HANDOVER KEEP] 필드 추출에 쓴 Qwen3.5-4B-{} 를 음차 단계까지 둡니다. 음차가 같은 언어 모델을 쓰므로 내렸다가 다시 올리는 적재 한 번을 줄입니다. 임베딩 적재가 동시 상주를 허용하지 않으면 그 자리에서 기존 교차 규칙대로 내립니다.",
+                "[Scheduler] 🔁 [HANDOVER KEEP] 필드 추출에 쓴 {} 를 음차 단계까지 둡니다. 음차가 같은 언어 모델을 쓰므로 내렸다가 다시 올리는 적재 한 번을 줄입니다. 임베딩 적재가 동시 상주를 허용하지 않으면 그 자리에서 기존 교차 규칙대로 내립니다.",
                 code
             )),
             None => {

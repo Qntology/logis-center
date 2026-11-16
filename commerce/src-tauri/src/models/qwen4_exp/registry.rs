@@ -165,7 +165,7 @@ impl TextGenerator {
 
 /// 앱의 언어 엔진 런타임 로더 (`lang_llm::register_loader` 에 등록, `lang_llm::LangLlmLoader` 형태).
 ///  - config.json 이 Qwen4-Exp 면 safetensors 를 직접 읽어 `TextGenerator::Qwen4Exp`
-///  - 그 밖(Qwen3.5 alphaedge 엔진 등) 은 지금까지와 똑같이 `lang_gguf::load_runtime` → `TextGenerator::Qwen35`
+///  - 그 밖(Qwen3.5-4B 언어 엔진 등) 은 지금까지와 똑같이 `lang_gguf::load_runtime` → `TextGenerator::Qwen35`
 ///    (config 의 model_type 이 무엇이든 기존 동작을 바꾸지 않습니다; 변환기가 직접 판단합니다)
 pub fn load_lang_runtime(model_dir: &Path, device: &Device) -> Result<TextGenerator> {
     match detect_text_arch(model_dir) {

@@ -17,6 +17,12 @@ pub enum EmbedTable {
         q: std::sync::Arc<candle_core::quantized::QTensor>,
         hidden: usize,
     },
+    /// 🌟 [VOCAB TRIM] 표를 장치에 올리지 않고 매핑된 GGUF 에서 쓰는 행만 읽어 풀어 올립니다 (입력 임베딩 VRAM 0).
+    /// 출력 투영은 남긴 행만의 [`crate::models::common::vocab_trim::TrimmedHead`] 입니다.
+    Mapped {
+        src: crate::models::common::vocab_trim::TableSource,
+        device: Device,
+    },
 }
 
 impl EmbedTable {
@@ -24,13 +30,76 @@ impl EmbedTable {
         match self {
             Self::Dense(e) => e.forward(ids),
             Self::Quant { q, .. } => q.embedding(ids),
+            Self::Mapped { src, device } => {
+                let flat = ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+                let mut dims = ids.dims().to_vec();
+                dims.push(src.cols);
+                Self::mapped_rows(src, &flat, device)?.reshape(dims)
+            }
         }
+    }
+
+    /// [`Self::rows_f32`] + 매핑된 표면 어휘 블록(의미 선입견의 코사인)을 남긴 행의 출력 투영(`head`, 장치)에서 꺼냅니다.
+    /// 잘린 행 자리는 남긴 행 하나(0 번)로 채웁니다: 코사인은 행마다 따로 계산되어(블록 모양도 그대로) 남긴 행의 값은 같고, 0 으로 채우면
+    /// 노름 0 이라 NaN 이 됩니다. 채운 자리의 선입견은 생성기가 `vocab_trim::exclude_dropped` 로 +∞(빼면 −∞)로 바꿔 쓰이지 않습니다. 매핑에서 어휘 전체를 읽으면
+    /// 생성마다 표 페이지를 다시 들여와 0.6B 목록 추출에서 호출당 약 59 ms 가 더 들었습니다.
+    pub fn rows_f32_with_head(&self, off: usize, take: usize, head: Option<&crate::models::common::vocab_trim::TrimmedHead>) -> candle_core::Result<Tensor> {
+        let (Self::Mapped { device, .. }, Some(head)) = (self, head) else {
+            return self.rows_f32(off, take);
+        };
+        let rows: Vec<u32> = (off..off + take).map(|id| head.row_of(id as u32).unwrap_or(0)).collect();
+        head.embed_rows(&rows, device)
+    }
+
+    /// [`Self::forward`] + 매핑된 표면 남긴 행의 출력 투영(`head`, 장치)에 있는 토큰은 거기서 꺼내고(`TrimmedHead::embed_rows`),
+    /// 남긴 행 밖의 토큰(HTML 의 NBSP 같은 기호 등)만 매핑에서 읽어 원래 순서로 합칩니다. 둘 다 원래 표의 행이라 값은 같습니다.
+    /// 투영이 아직 없으면 매핑에서 읽습니다.
+    pub fn forward_with_head(&self, ids: &Tensor, head: Option<&crate::models::common::vocab_trim::TrimmedHead>) -> candle_core::Result<Tensor> {
+        let (Self::Mapped { src, device }, Some(head)) = (self, head) else {
+            return self.forward(ids);
+        };
+        let flat = ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+        let mut dims = ids.dims().to_vec();
+        dims.push(src.cols);
+        let (mut kept, mut miss, mut order) = (Vec::new(), Vec::new(), Vec::with_capacity(flat.len()));
+        for &id in &flat {
+            match head.row_of(id) {
+                Some(j) => {
+                    order.push((false, kept.len()));
+                    kept.push(j);
+                }
+                None => {
+                    order.push((true, miss.len()));
+                    miss.push(id);
+                }
+            }
+        }
+        let x = if miss.is_empty() {
+            head.embed_rows(&kept, device)?
+        } else if kept.is_empty() {
+            Self::mapped_rows(src, &flat, device)?
+        } else {
+            let nk = kept.len();
+            let both = Tensor::cat(&[&head.embed_rows(&kept, device)?, &Self::mapped_rows(src, &miss, device)?], 0)?;
+            let perm: Vec<u32> = order.iter().map(|&(m, i)| if m { (nk + i) as u32 } else { i as u32 }).collect();
+            both.index_select(&Tensor::from_vec(perm, flat.len(), device)?, 0)?
+        };
+        x.reshape(dims)
+    }
+
+    /// 매핑된 표의 `ids` 행을 F32 로 풀어 `device` 에. Q8_0 은 장치에서 풀어도 CPU 와 비트까지 같으므로(f16 척도 × int8 이 f32 에서 정확)
+    /// 양자화 행만 올리고 장치에서 풉니다 (CPU 에서 F32 로 풀어 올리면 올리는 양이 3.8 배이고 CPU 풀기가 더해집니다).
+    fn mapped_rows(src: &crate::models::common::vocab_trim::TableSource, ids: &[u32], device: &Device) -> candle_core::Result<Tensor> {
+        let on = if src.dtype == candle_core::quantized::GgmlDType::Q8_0 { device.clone() } else { Device::Cpu };
+        let q = src.gather(ids, &on).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+        q.dequantize(&on)?.to_device(device)
     }
 
     pub fn vocab(&self) -> candle_core::Result<usize> {
         match self {
             Self::Dense(e) => e.embeddings().dim(0),
             Self::Quant { q, .. } => Ok(q.shape().dims()[0]),
+            Self::Mapped { src, .. } => Ok(src.rows),
         }
     }
 
@@ -41,13 +110,25 @@ impl EmbedTable {
                 let ids = Tensor::arange(off as u32, (off + take) as u32, &q.device())?;
                 q.embedding(&ids)
             }
+            Self::Mapped { src, device } => {
+                let ids: Vec<u32> = (off as u32..(off + take) as u32).collect();
+                Self::mapped_rows(src, &ids, device)
+            }
+        }
+    }
+
+    /// 매핑된 표의 자리 (잘라 내기가 켜진 경우)
+    pub fn mapped_source(&self) -> Option<&crate::models::common::vocab_trim::TableSource> {
+        match self {
+            Self::Mapped { src, .. } => Some(src),
+            _ => None,
         }
     }
 
     pub fn dense(&self) -> Option<&Tensor> {
         match self {
             Self::Dense(e) => Some(e.embeddings()),
-            Self::Quant { .. } => None,
+            Self::Quant { .. } | Self::Mapped { .. } => None,
         }
     }
 
@@ -55,6 +136,7 @@ impl EmbedTable {
         match self {
             Self::Dense(e) => e.embeddings().dim(1).unwrap_or(0),
             Self::Quant { hidden, .. } => *hidden,
+            Self::Mapped { src, .. } => src.cols,
         }
     }
 }
@@ -2125,7 +2207,11 @@ impl Qwen3_5TextModel {
         //     이 환경의 실측 free RAM 은 592MB~1.3GB 입니다(로그 KV-PLAN 참조).
         //     CPU 경로는 호스트에 540MB + 1,017MB 를 동시에 요구하므로
         //     VRAM 을 아끼려다 시스템 RAM 을 터뜨립니다. GPU 역양자화가 옳습니다.
-        let quant_embed = if use_quant_embed(device) {
+        // 🌟 [VOCAB TRIM] 잘라 내기가 켜지면(기본 full) 입력 임베딩은 매핑에서 행만 읽고 출력 투영은 남긴 행만 장치에 둡니다.
+        let mapped = crate::models::common::vocab_trim::mapped_table(device, mmap_handle.as_ref(), ct_handle.as_deref());
+        let quant_embed = if mapped.is_some() {
+            None
+        } else if use_quant_embed(device) {
             let q = gguf.tensor("token_embd.weight")?;
             if quant_embed_ok(q.dtype()) {
                 Some(q)
@@ -2135,7 +2221,10 @@ impl Qwen3_5TextModel {
         } else {
             None
         };
-        let embed_tokens = if let Some(q) = quant_embed {
+        let embed_tokens = if let Some(src) = mapped {
+            println!("[VOCAB-TRIM] 입력 임베딩 {} × {} 을 장치에 올리지 않고 매핑에서 행만 읽습니다.", src.rows, src.cols);
+            EmbedTable::Mapped { src, device: device.clone() }
+        } else if let Some(q) = quant_embed {
             EmbedTable::Quant { q: std::sync::Arc::new(q), hidden: hidden_size }
         } else {
             let embed_dtype = if device.is_cpu() { DType::F32 } else { DType::F16 };
@@ -2252,7 +2341,7 @@ impl Qwen3_5TextModel {
                 let headroom = if legacy_plan { QWEN35_DECODE_HEADROOM_TOKENS } else { self.decode_headroom_tokens() };
                 let planned = seqlen_offset + seq_len + headroom;
                 let already = if legacy_plan { 0 } else { self.vram_kv_tokens().min(seqlen_offset) };
-                let label = if crate::model::lang_llm::resident_variant().is_some() { "Qwen3.5-4B(alphaedge)" } else { "Qwen3.5(2B)" };
+                let label = if crate::model::lang_llm::resident_variant().is_some() { "Qwen3.5-4B" } else { "Qwen3.5(2B)" };
                 let mut per_token = if legacy_plan {
                     (full_attn_layers * kv_heads * kv_head_dim * 2 * self.kv_elem_bytes()) as u64
                 } else {
@@ -3681,6 +3770,8 @@ pub struct Qwen3_5Model {
     visual: Option<Qwen3VLVisionModel>,
     pub language_model: Qwen3_5TextModel,
     lm_head: ProjKind,
+    /// 🌟 [VOCAB TRIM] 남긴 행만의 출력 투영 (있으면 `lm_head` 대신). 생성기가 문서 언어로 맞춥니다.
+    pub trim_head: Option<crate::models::common::vocab_trim::TrimmedHead>,
     rope_deltas: Option<Tensor>,
     rope_deltas_cpu: Option<Vec<i64>>,
 }
@@ -3715,6 +3806,7 @@ impl Qwen3_5Model {
             visual: Some(visual),
             language_model,
             lm_head: ProjKind::LinearProj(lm_head),
+            trim_head: None,
             rope_deltas: None,
             rope_deltas_cpu: None,
         })
@@ -3762,6 +3854,10 @@ impl Qwen3_5Model {
                 EmbedTable::Quant { q, .. } => {
                     ProjKind::QuantizedProj(QuantizedLinear::new(QMatMul::from_arc(q.clone())?, None))
                 }
+                // 매핑된 표: 출력 투영은 남긴 행만의 `trim_head` 로 곱합니다 (여기 자리는 쓰지 않는 1 행).
+                EmbedTable::Mapped { src, .. } => {
+                    ProjKind::LinearProj(Linear::new(Tensor::zeros((1, src.cols), DType::F32, device)?, None))
+                }
                 EmbedTable::Dense(e) => {
                     let shared = e.embeddings().clone();
                     let qm = if shared.dtype() == DType::F16 {
@@ -3797,6 +3893,7 @@ impl Qwen3_5Model {
             language_model,
 
             lm_head,
+            trim_head: None,
             rope_deltas: None,
             rope_deltas_cpu: None,
         })
@@ -3891,11 +3988,11 @@ impl Qwen3_5Model {
     }
 
     pub fn embed_rows_f32(&self, off: usize, take: usize) -> candle_core::Result<Tensor> {
-        self.language_model.embed_tokens.rows_f32(off, take)
+        self.language_model.embed_tokens.rows_f32_with_head(off, take, self.trim_head.as_ref())
     }
 
     pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {
-        Ok(self.language_model.embed_tokens.forward(input_ids)?)
+        Ok(self.language_model.embed_tokens.forward_with_head(input_ids, self.trim_head.as_ref())?)
     }
 
     fn get_rope_index(
@@ -4051,7 +4148,7 @@ impl Qwen3_5Model {
             }
         }
         
-        let mut inputs_embeds = self.language_model.embed_tokens.forward(input_ids)?;
+        let mut inputs_embeds = self.language_model.embed_tokens.forward_with_head(input_ids, self.trim_head.as_ref())?;
         let target_dtype = if input_ids.device().is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         inputs_embeds = inputs_embeds.to_dtype(target_dtype)?;
         
@@ -4268,10 +4365,25 @@ impl Qwen3_5Model {
         
         
         let hidden_state_aligned = hidden_state.contiguous()?.to_dtype(DType::F32)?;
+        // 🌟 [VOCAB TRIM] 남긴 행만 곱하고 장치에서 전체 어휘 길이로 펼칩니다 (잘린 행 −∞). 전체 어휘 경로처럼 CPU 로 돌려줍니다.
+        if self.trim_head.is_none() {
+            if let Some(src) = self.language_model.embed_tokens.mapped_source().cloned() {
+                // 생성기가 언어를 정하기 전(refresh_vocab 없이) 불린 계산은 전체 행으로 곱합니다 (off 와 같은 로짓)
+                self.trim_head = Some(crate::models::common::vocab_trim::all_rows(&src, hidden_state_aligned.device())?);
+            }
+        }
+        if let Some(head) = &self.trim_head {
+            return Ok(head.logits(&hidden_state_aligned)?.to_device(&Device::Cpu)?);
+        }
         let logits_gpu = self.lm_head.forward(&hidden_state_aligned)?;
         
         
         Ok(logits_gpu.to_device(&Device::Cpu)?)
+    }
+
+    /// 매핑된 출력 투영 표 (잘라 내기가 켜진 경우)
+    pub fn vocab_table(&self) -> Option<crate::models::common::vocab_trim::TableSource> {
+        self.language_model.embed_tokens.mapped_source().cloned()
     }
 
     pub fn clear_cache(&mut self) {

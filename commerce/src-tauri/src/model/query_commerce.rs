@@ -47,6 +47,8 @@ impl crate::model::LogisModel {
         crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
         let route_lang = crate::utils::lang_utils::detect_document_language(&query);
+        // 🌟 [VOCAB TRIM] 텍스트 맥락: 질의 언어(현지 언어 + 영어)의 행만 출력 투영에 남깁니다.
+        let _vocab_scope = crate::models::common::vocab_trim::DocLangScope::text(&route_lang, &query);
         let route_verdict = self.lang_route("search", "commerce_verify", &route_lang, &query).await;
         emit_term(&format!("  {}", route_verdict.line));
         let _query_route = crate::model::lang_llm::QueryRoute::open(route_verdict.code);
@@ -3148,7 +3150,7 @@ impl crate::model::LogisModel {
                 // 파이프라인이 모두 종료된 후 마지막에 일괄적으로 deep_purge_resources를 통해 해제합니다.
 
                 let mut llm_temporal_guide = String::new();
-                let now = chrono::Local::now();
+                let now = crate::utils::time_guide::now_local();
                 let time_context = format!("Current Time: {}\nTimezone: {}\nLanguage: {}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%z"), language);
                 let temporal_cands = |cat: &str| -> Vec<(String, f32)> {
                     let mut out: Vec<(String, f32)> = filter_candidates.get(cat).cloned().unwrap_or_default();
