@@ -1,6 +1,6 @@
 // ============================================================
 //  commerce/src/modes/types.ts
-//  🌟 [MODE TAXONOMY] 모드(commerce / shipping / analytic) 분류의 단일 소스입니다.
+//  🌟 [MODE TAXONOMY] 모드(commerce / shipping) 분류의 단일 소스입니다.
 //
 //  ── 왜 별도 파일인가 ──
 //   기존에는 main.ts 안에 modeOfType() 과 TYPE_SETS 가 함께 있었고,
@@ -41,14 +41,8 @@ export const COMMERCE_TYPE_SET = new Set<string>([
     'member', 'team', 'user', 'users', 'pages', 'page', 'talk', 'prompt', 'ai_search'
 ]);
 
-// ── analytics 행동 로그 / 관리자 Q&A ──
-export const ANALYTIC_TYPE_SET = new Set<string>([
-    'click', 'hover', 'change', 'report', 'touch', 'question', 'answer'
-]);
-
-export function modeOfType(t: string): 'commerce' | 'shipping' | 'analytic' {
+export function modeOfType(t: string): 'commerce' | 'shipping' {
     const s = String(t || '');
-    if (ANALYTIC_TYPE_SET.has(s)) return 'analytic';
     if (COMMERCE_TYPE_SET.has(s)) return 'commerce';
     if (TRADING_DOC_TYPE_SET.has(s)) return 'shipping';
     return 'commerce';
@@ -61,15 +55,13 @@ export const TYPE_SETS: Record<string, string[]> = {
         ...TRADING_DOC_CODES.map(c => c.toLowerCase()),
         'Unknown', 'unknown'
     ],
-    analytic: ['click', 'hover', 'change', 'report', 'touch', 'question', 'answer'],
     commerce: ['sales', 'goods', 'order', 'tracking', 'event', 'coupon', 'review',
         'receiving', 'shipping']
 };
 
 export const MODE_LABEL: Record<string, string> = {
     commerce: 'Commerce',
-    shipping: 'Trading',
-    analytic: 'Analytic'
+    shipping: 'Trading'
 };
 
 export function modeLabel(m: string): string {

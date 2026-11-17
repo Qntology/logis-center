@@ -84,7 +84,7 @@ describe("item2html", () => {
     expect(relate.getAttribute("event")).toBe("");
   });
 
-  it("routes types to their templates (trade code in any case, coupon, receiving, click, unknown)", () => {
+  it("routes types to their templates (trade code in any case, coupon, receiving, unknown)", () => {
     expect(text(render({ id: "b2", type: "bl", data: { doc_number: "X1" } }), ".doc_number .value")).toBe("X1");
 
     const ev = render({ id: "e1", type: "coupon", data: { status: 1, title: "Sale", discount: 10, code: "C1" } });
@@ -96,11 +96,6 @@ describe("item2html", () => {
     expect(text(tr, ".status .value")).toBe("stop");
     expect(text(tr, ".text .value")).toBe("In transit");
     expect(text(tr, ".more-content .sender_name .value")).toBe("A");
-
-    const an = render({ id: "a1", type: "click", mode: "analytic", data: { action: "clicked buy", summary: "S" } });
-    expect(an.querySelector<HTMLElement>("#a1")!.dataset.mode).toBe("analytic");
-    expect(text(an, ".action .value")).toBe("clicked buy");
-    expect(text(an, ".summary .value")).toBe("S");
 
     const unknown = render({ id: "u1", type: "weird", data: { status: 3, title: "T", vessel: "V" } });
     expect(text(unknown, ".status strong")).toBe("weird");
@@ -140,34 +135,34 @@ describe("item2html", () => {
     expect(html).toContain("&quot;&amp;&#39;");
   });
 
-  it.fails("BUG-RENDER-1 render.ts:110,187 item.type is interpolated unescaped (data-type attribute and status label) -> XSS", () => {
+  it.fails("BUG-RENDER-1 render.ts:110,183 item.type is interpolated unescaped (data-type attribute and status label) -> XSS", () => {
     expect(item2html({ id: "x1", type: XSS, data: { status: 1 } })).not.toContain(XSS);
   });
 
-  it.fails("BUG-RENDER-2 render.ts:391-395 data.search_badge is interpolated unescaped -> XSS", () => {
+  it.fails("BUG-RENDER-2 render.ts:368-372 data.search_badge is interpolated unescaped -> XSS", () => {
     expect(item2html({ id: "x2", type: "goods", data: { search_badge: XSS } })).not.toContain(XSS);
   });
 
-  it.fails("BUG-RENDER-3 render.ts:192-206 non-string values (arrays/objects) bypass escaping -> XSS", () => {
-    expect(item2html({ id: "x3", type: "click", data: { action: "a", relate: [XSS] } })).not.toContain(XSS);
+  it.fails("BUG-RENDER-3 render.ts:188-202 non-string values (arrays/objects) bypass escaping -> XSS", () => {
+    expect(item2html({ id: "x3", type: "goods", data: { title: [XSS] } })).not.toContain(XSS);
   });
 
-  it.fails("BUG-RENDER-4 render.ts:167 data.link is pasted into an inline onclick JS string; a quote breaks out", () => {
+  it.fails("BUG-RENDER-4 render.ts:163 data.link is pasted into an inline onclick JS string; a quote breaks out", () => {
     const html = item2html({ id: "l1", type: "goods", data: { title: "T", link: "x'});alert(1);//" } });
     expect(html).not.toContain("x'});alert(1);//");
   });
 
-  it.fails("BUG-RENDER-5 render.ts:194 backslashes are doubled in displayed values ('C:\\path' shows 'C:\\\\path')", () => {
+  it.fails("BUG-RENDER-5 render.ts:190 backslashes are doubled in displayed values ('C:\\path' shows 'C:\\\\path')", () => {
     expect(text(render({ id: "bs", type: "goods", data: { title: "C:\\path" } }), ".title .value")).toBe("C:\\path");
   });
 
-  it.fails("BUG-RENDER-6 render.ts:179 future dates (eta 14 days ahead) render as negative seconds", () => {
+  it.fails("BUG-RENDER-6 render.ts:175 future dates (eta 14 days ahead) render as negative seconds", () => {
     const eta = text(render({ id: "f1", type: "BL", data: { eta: NOW + 14 * DAY } }), ".eta .value");
     expect(eta).not.toBeNull();
     expect(eta).not.toMatch(/^-/);
   });
 
-  it.fails("BUG-RENDER-7 render.ts:243-251 item2html mutates the caller's item.data (status -> string, doc_type added)", () => {
+  it.fails("BUG-RENDER-7 render.ts:220-228 item2html mutates the caller's item.data (status -> string, doc_type added)", () => {
     const item = { id: "b9", type: "BL", data: { status: 9 } };
     const before = structuredClone(item);
     item2html(item);

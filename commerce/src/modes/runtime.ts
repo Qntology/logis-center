@@ -58,10 +58,6 @@ export interface ModeRuntime {
     getDetectedUrl: () => string;
     getActiveTags: () => ModeTag[];
     getCurrentTab: () => string;
-    isBusy: () => boolean;
-    // 🌟 [PART 2] analytic 구조화(structure_pending_analytics)가 CPU/GPU 선호를 넘깁니다.
-    //    forceCpuToggle 은 main.ts 최하단에서 잡히는 DOM 참조라 반드시 게터여야 합니다.
-    getDevicePref: () => string | null;
     // 🌟 [PART 2] commerce 트랙의 CLOUD TASK LIFECYCLE 판정용.
     //    Map 인스턴스 자체는 main.ts 가 소유하고, 여기서는 참조만 빌려옵니다.
     getCloudPendingTasks: () => Map<string, any>;
@@ -95,8 +91,8 @@ export function rt(): ModeRuntime {
 
 // =====================================================================
 // 🌟 [ADAPTIVE POLLING BACKOFF]
-//  commerce / trading / analytic 세 트랙이 공유하는 단일 백오프입니다.
-//  기존에는 main.ts 안의 모듈 스코프 변수였고, 세 트랙이 모두 직접 대입했습니다.
+//  commerce / trading 두 트랙이 공유하는 단일 백오프입니다.
+//  기존에는 main.ts 안의 모듈 스코프 변수였고, 트랙마다 직접 대입했습니다.
 //  파일이 쪼개지면 그 변수를 공유할 수 없으므로 여기로 승격합니다.
 // =====================================================================
 export const SYNC_BASE_INTERVAL_MS = 3_000;   // 기본 폴링 간격
@@ -144,11 +140,10 @@ export function resetSyncBackoff(): void {
 
 // =====================================================================
 // 🌟 [SHARED BLOB CODEC]
-//  analytic(console.logis.center) 과 trading(trading.logis.center) 이
-//  동일한 gzip/base64 BLOB 포맷을 쓰므로 공용 위치로 승격합니다.
-//  (main.ts 의 decodeAnalyticBlob 원본과 동작이 100% 동일합니다)
+//  trading(trading.logis.center) Worker 가 내려 주는 gzip/base64 BLOB 포맷을 풉니다.
+//  (구 main.ts 의 BLOB 디코더 원본과 동작이 100% 동일합니다)
 // =====================================================================
-export function decodeAnalyticBlob(rawData: any): any {
+export function decodeBlob(rawData: any): any {
     const pako = (window as any).pako;
     try {
         if (rawData && typeof rawData === "object") {
