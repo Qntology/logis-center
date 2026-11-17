@@ -85,9 +85,10 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 - `scheduler/entity.rs` 는 서식 판정(`bias_schema`)을 써서 `logis-schema` 가 아니라 `logis-bias` 에 두었습니다.
 - `utils/img_utils.rs` 는 이미지를 candle 텐서로 바꾸는 VLM 전처리라 "모델 의존 없음" 인 `logis-parsers` 가 아니라 `logis-llm` 쪽이 맞아 앱에 남겼습니다.
 - Analytic 의 이관처는 `premium-discount-nav` · `-nms` 가 아니라 `premium-discount-analytic` 입니다(앞 작업에서 만듦).
-- Stanza · granite 순전파를 `premium-discount-nlp` 로, 스팬 NMS 를 `premium-discount-nms` 로 바꾸는 것은 하지 않았습니다. Stanza 는 두 저장소가
-  같은 이름 · 같은 `links` 의 `onnxruntime(-sys)` crate 를 따로 갖고 있어 한쪽으로 합쳐야 하고, 두 파이프라인 · NMS 의 출력을 실제 모델로
-  대조한 뒤에 바꿔야 합니다(남은 단계).
+- Stanza · granite 순전파를 `premium-discount-nlp` 로, 스팬 NMS 를 `premium-discount-nms` 로 바꾸는 것은 하지 않았습니다. 두 저장소가 따로 갖던
+  `onnxruntime(-sys)` 사본은 이 저장소 판(`commerce/crates`, ORT 1.28.0)을 기준으로 premium-discount 쪽을 다시 맞췄습니다(premium-discount
+  0d83b8d: 이 판 그대로 + 기본 꺼진 `runtime-load` 기능 — 링크 대신 실행할 때 불러옴, premium-discount-nlp 의 stanza 가 켬). 남은 일은 두
+  Stanza 파이프라인 · NMS 의 출력을 실제 모델로 대조한 뒤 이 앱을 그 crate 로 바꾸는 것입니다.
 
 ## 남은 단계 (3 · 4)
 
@@ -98,6 +99,21 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   `CURRENT_UI_CATEGORY` 1곳)를 model · scheduler 가 `crate::` 로 직접 읽는 것과, Qwen 생성 루프의 `tauri::async_runtime::spawn` 입니다. 이것들을 코어로 옮기면 store · residency · model · scheduler 를
   `commerce/app` 으로 옮기고 Tauri 셸(lib.rs 명령 · automation · TauriSink)만 남길 수 있습니다.
 - **LanceDB 0.41**: premium-discount 앱이 옮긴 API 변경(테이블 add · 질의 실행)을 store.rs 에 적용합니다. 이 작업 공간은 아직 0.31 입니다.
+
+## 검증 (2026-11-18, 이 PC: Windows · RAM 16 GB)
+
+- 1단계만: release ROCm `cargo build`(lib + bin) 통과 (51분 56초 — ethers 를 빼며 호스트 syn 기능이 바뀌어 거의 전체 재빌드).
+- 1~4단계 합친 상태:
+  - debug `cargo check --no-default-features --features rocm --lib --bins --test it` 통과.
+  - CI(windows-cpu)와 같은 조건(debug · CPU · `CARGO_PROFILE_DEV_DEBUG=0`): `cargo test --test it` 286 통과 · 0 실패 · 65 무시,
+    lib 단위 시험(`vocab_trim stable_rank store::`) 8 통과. 시험 수는 388 → 375 로, 지운 분석 시험 13개(analytic_page 10 · search_relation 3)만큼.
+  - crate 단위 시험(`-p logis-schema … -p logis-search`) 통과, 프런트엔드 tsc 0 오류 · vitest 217 통과(지운 분석 · OAuth 시험 74개 제외).
+- 함정: 같은 `target/debug` 에 `cargo check`(ROCm, 메타데이터만)와 CPU 빌드를 섞으면 boa 의 타입이 엉뚱하게 읽혀 `str` 크기 오류 · "rlib 형식이
+  없음" 오류가 났습니다(폴더를 비우고 다시 빌드하면 사라짐). debug 정보를 켠 채 `it` 시험 exe 를 링크하면 PDB 가 1.7 GB 를 넘어 LNK1318(LIMIT 12) —
+  CI 처럼 `CARGO_PROFILE_DEV_DEBUG=0` 을 씁니다.
+- 2026-11-18 08:00 쯤부터 `github.com/microsoft/onnxruntime` 저장소가 404 라(07:20 엔 받아졌음) onnxruntime-sys 빌드 스크립트의 내려받기가
+  실패합니다. 새 빌드 폴더에는 이미 받은 zip 을 OUT_DIR 에 두거나 `ORT_STRATEGY=system` + `ORT_LIB_LOCATION` 을 씁니다. 캐시 없는 CI 도 같은 이유로
+  실패할 수 있습니다(이 브랜치는 루트 작업 공간 때문에 path 패키지 해시가 바뀌어 CI 도 다시 받으려 함).
 
 ## 빌드 · 시험
 
