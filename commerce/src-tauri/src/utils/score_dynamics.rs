@@ -259,146 +259,18 @@ fn current_track() -> Option<Track> {
     Track::from_name(s.track_name.as_str())
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Welford {
-    pub n: u64,
-    pub mean: f64,
-    pub m2: f64,
-    #[serde(default)]
-    pub ring: Vec<f64>,
-}
-
-impl Welford {
-    pub fn push(&mut self, x: f64, ring_len: usize) {
-        if !x.is_finite() { return; }
-        self.n += 1;
-        let d = x - self.mean;
-        self.mean += d / (self.n as f64);
-        self.m2 += d * (x - self.mean);
-        self.ring.push(x);
-        if ring_len > 0 && self.ring.len() > ring_len {
-            let excess = self.ring.len() - ring_len;
-            self.ring.drain(0..excess);
-        }
-    }
-    pub fn variance(&self) -> f64 {
-        if self.n < 2 { 0.0 } else { self.m2 / ((self.n - 1) as f64) }
-    }
-    pub fn sd(&self) -> f64 {
-        self.variance().max(0.0).sqrt()
-    }
-    pub fn recent_mean(&self) -> f64 {
-        if self.ring.is_empty() { return self.mean; }
-        self.ring.iter().sum::<f64>() / (self.ring.len() as f64)
-    }
-    pub fn drift_z(&self) -> f64 {
-        let sd = self.sd();
-        if sd <= 0.0 || self.ring.is_empty() { return 0.0; }
-        (self.recent_mean() - self.mean) / sd
-    }
-    pub fn merge(&mut self, other: &Welford, ring_len: usize) {
-        if other.n == 0 { return; }
-        if self.n == 0 {
-            self.n = other.n;
-            self.mean = other.mean;
-            self.m2 = other.m2;
-            self.ring = other.ring.clone();
-        } else {
-            let na = self.n as f64;
-            let nb = other.n as f64;
-            let n = na + nb;
-            let delta = other.mean - self.mean;
-            self.mean += delta * (nb / n);
-            self.m2 += other.m2 + delta * delta * (na * nb / n);
-            self.n += other.n;
-            self.ring.extend(other.ring.iter().cloned());
-        }
-        if ring_len > 0 && self.ring.len() > ring_len {
-            let excess = self.ring.len() - ring_len;
-            self.ring.drain(0..excess);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DecayShape {
-    pub n: usize,
-    pub top1: f64,
-    pub top2: f64,
-    pub margin: f64,
-    pub top_gap_ratio: f64,
-    pub tail_flatness: f64,
-    pub entropy_norm: f64,
-    pub positive_ratio: f64,
-}
-
-pub fn decay_shape(scores: &[f32]) -> Option<DecayShape> {
-    let mut v: Vec<f64> = scores
-        .iter()
-        .filter(|s| s.is_finite())
-        .map(|s| *s as f64)
-        .collect();
-    if v.len() < 2 { return None; }
-    v.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let n = v.len();
-    let top1 = v[0];
-    let top2 = v[1];
-    let margin = top1 - top2;
-    let tail = &v[1..];
-    let tail_median = tail[tail.len() / 2];
-    let span = (top1 - tail_median).abs();
-    let top_gap_ratio = if span > 1e-9 { (margin / span).clamp(0.0, 1.0) } else { 0.0 };
-    let tail_mean = tail.iter().sum::<f64>() / (tail.len() as f64);
-    let tail_var = tail.iter().map(|x| (x - tail_mean).powi(2)).sum::<f64>() / (tail.len() as f64);
-    let full_range = (v[0] - v[n - 1]).abs();
-    let tail_flatness = if full_range > 1e-9 {
-        (tail_var.sqrt() / full_range).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    let entropy_norm = {
-        let tail_sd_for_scale = tail_var.sqrt();
-        if tail_sd_for_scale <= 1e-9 {
-            1.0f64
-        } else {
-            let mx = v[0];
-            let exps: Vec<f64> = v.iter().map(|x| ((x - mx) / tail_sd_for_scale).exp()).collect();
-            let sum: f64 = exps.iter().sum::<f64>().max(1e-12);
-            let mut h = 0.0f64;
-            for e in exps.iter() {
-                let p = e / sum;
-                if p > 1e-12 { h -= p * p.ln(); }
-            }
-            let hmax = (n as f64).ln();
-            if hmax > 1e-9 { (h / hmax).clamp(0.0, 1.0) } else { 0.0 }
-        }
-    };
-
-    let positive_ratio = v.iter().filter(|x| **x > 0.0).count() as f64 / (n as f64);
-
-    Some(DecayShape {
-        n,
-        top1,
-        top2,
-        margin,
-        top_gap_ratio,
-        tail_flatness,
-        entropy_norm,
-        positive_ratio,
-    })
-}
+// 🌟 [PD-SDS] Welford(합치고 뺄 수 있는 모멘트 + 최근 값 고리) · 감쇠 형상 · 혼동 장부 · 동률 판정은 premium-discount-sds 와
+//    같은 코드라 그쪽을 씁니다 (logis 에서 옮겨 간 코드). 필드 이름 · serde 기본값이 같아 기존 장부 파일을 그대로 읽습니다.
+//    다른 점은 표본분산이 반올림으로 음수가 되면 0 으로 자르는 것 하나입니다 (감쇠 형상 · 혼동 · 동률 판정은 토큰 단위로 같음).
+//    logis 고유 레코드(FieldRejectStat · CategoryStat · SpatialStat · SearchFieldStat · ScopeStat(updated_at))와
+//    스코프 · 원장 API(recipe sds-v3) 는 여기 남습니다. PD 의 Ledger 는 recipe(zena-sds-v1) 와 저장 단위가 달라 바꾸지 않습니다.
+pub use premium_discount_sds::{
+    decay_shape, tie_verdict, ConfusionStat, DecayShape, DecayStat, Welford, TIE_SPECIFICITY_SLACK, TIE_WIN_RATE,
+};
 
 // =====================================================================
 // 🌟 [저장 레코드] 기획 6-1 의 통계 레코드 정의를 그대로 옮긴 구조입니다.
 // =====================================================================
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DecayStat {
-    pub margin: Welford,
-    pub top_gap_ratio: Welford,
-    pub tail_flatness: Welford,
-    pub entropy_norm: Welford,
-    pub positive_ratio: Welford,
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FieldRejectStat {
@@ -416,13 +288,6 @@ pub struct FieldRejectStat {
     pub assign_margin: Welford,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ConfusionStat {
-    pub ties: u64,
-    pub a_wins: u64,
-    pub b_wins: u64,
-    pub margin: Welford,
-}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CategoryStat {
@@ -482,15 +347,6 @@ pub struct SdsFile {
 
 // 🌟 [MERGE / ENTRY] 항목 하나의 병합 규칙. absorb(스코프 전체)와 resolve_entry(질의한 항목 하나)가
 //    같은 규칙을 쓰도록 항목 타입마다 한 곳에 둡니다.
-impl DecayStat {
-    pub fn merge_from(&mut self, v: &DecayStat, ring: usize) {
-        self.margin.merge(&v.margin, ring);
-        self.top_gap_ratio.merge(&v.top_gap_ratio, ring);
-        self.tail_flatness.merge(&v.tail_flatness, ring);
-        self.entropy_norm.merge(&v.entropy_norm, ring);
-        self.positive_ratio.merge(&v.positive_ratio, ring);
-    }
-}
 
 impl FieldRejectStat {
     pub fn merge_from(&mut self, v: &FieldRejectStat, ring: usize) {
@@ -505,14 +361,6 @@ impl FieldRejectStat {
     }
 }
 
-impl ConfusionStat {
-    pub fn merge_from(&mut self, v: &ConfusionStat, ring: usize) {
-        self.ties += v.ties;
-        self.a_wins += v.a_wins;
-        self.b_wins += v.b_wins;
-        self.margin.merge(&v.margin, ring);
-    }
-}
 
 impl CategoryStat {
     pub fn merge_from(&mut self, v: &CategoryStat, ring: usize) {
@@ -1776,26 +1624,7 @@ pub fn confusion_winner(a: &str, b: &str) -> Option<(String, f32)> {
     )
 }
 
-/// 🌟 [SDS TIE] 배정 동률(TieKind::PairConfusion)을 혼동 사전의 역사 승자로 깰 때의 승률 하한.
-///  세 배정 호출부(trading.rs 두 곳 · scheduler.rs)는 각자 같은 클로저로 '승률 > 0.5' 이면 받았습니다. 과반이면 받으므로
-///  두 필드가 번갈아 이기는 쌍(진짜 혼동)도 한쪽으로 굳었습니다. ai_utils [T-2] 의 부분 게이팅 원칙대로 강화만 합니다.
-pub const TIE_WIN_RATE: f32 = 0.65;
-/// 역사 승자의 학습형 특이도(값이 서식 · 편견 · 열거 · 자기 식별자로 거절된 비율)가 경쟁자보다 이만큼 넘게 높으면 받지 않습니다.
-pub const TIE_SPECIFICITY_SLACK: f32 = 0.15;
 
-/// 순수 판정: 역사(이 필드가 승자인가, 승률)와 두 필드의 학습형 특이도로 동률을 이 필드 쪽으로 깰지.
-/// 승자가 이 필드이고 승률이 [`TIE_WIN_RATE`] 이상이며, 두 특이도를 다 알면 이 필드가 [`TIE_SPECIFICITY_SLACK`] 넘게 더 자주
-/// 거절되는 필드가 아닐 때만 참입니다. 특이도를 모르면(관측 부족) 승률만 봅니다.
-pub fn tie_verdict(history: Option<(bool, f32)>, spec_self: Option<f32>, spec_rival: Option<f32>) -> bool {
-    let Some((self_wins, rate)) = history else { return false };
-    if !self_wins || !(rate >= TIE_WIN_RATE) {
-        return false;
-    }
-    match (spec_self, spec_rival) {
-        (Some(a), Some(b)) => a <= b + TIE_SPECIFICITY_SLACK,
-        _ => true,
-    }
-}
 
 /// 배정 동률에서 `field` 가 `rival` 을 이기게 둘지: 혼동 사전의 역사 승자(confusion_winner) + 학습형 특이도 대조 ([`tie_verdict`]).
 /// 세 배정 호출부의 allow_tie 가 같이 씁니다 (Flat 동률은 호출부가 먼저 거릅니다).

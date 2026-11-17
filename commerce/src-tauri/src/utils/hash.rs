@@ -1,5 +1,3 @@
-use ethers_core::utils::hash_message;
-use ethers_signers::{LocalWallet, Signer};
 use regex::Regex;
 use once_cell::sync::Lazy;
 
@@ -43,16 +41,19 @@ pub fn crc32(text: &str) -> u32 {
 }
 
 /// JS의 ethers.computeAddress(ethers.hashMessage(text))와 100% 동일한 결과값을 반환합니다.
+///
+/// 계산은 `premium_discount_identity::hash_id`(EIP-191 keccak → secp256k1 주소, `0x` + 소문자 hex 40자)가 합니다.
+/// 메시지 해시가 개인 키 범위 밖이면(확률 약 2^-128) 예전 ethers 판과 같은 순서로 다시 해시합니다:
+/// 다음 입력은 `"logis-rehash:" + 0x + 직전 메시지 해시 hex 64자`(ethers H256 의 `{:?}`), 모두 네 번까지.
 pub fn hash_id(text: &str) -> String {
-    // 1. Ethereum Signed Message 프리픽스를 붙여 Keccak256 해싱
-    let mut message_hash = hash_message(text);
-
+    let mut input = text.to_string();
     for _ in 0..4 {
-        if let Ok(wallet) = LocalWallet::from_bytes(message_hash.as_bytes()) {
-            // 3. 주소 추출 및 소문자 변환
-            return format!("{:?}", wallet.address()).to_lowercase();
+        if let Some(address) = premium_discount_identity::hash_id(&input) {
+            return address;
         }
-        message_hash = hash_message(format!("logis-rehash:{:?}", message_hash));
+        let message_hash = premium_discount_identity::hash_message(&input);
+        let hex: String = message_hash.iter().map(|b| format!("{b:02x}")).collect();
+        input = format!("logis-rehash:0x{hex}");
     }
 
     // 여기까지 오는 것은 암호학적으로 사실상 불가능합니다.

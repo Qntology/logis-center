@@ -1,0 +1,108 @@
+# logis-center 루트 작업 공간.
+#
+#   crates/logis-*      Tauri · LanceDB · tokio 를 모르는 순수 도메인 · 엔진 라이브러리
+#   commerce/src-tauri  데스크톱 앱 (Tauri 셸 + 아직 나누지 않은 헤드리스 코어)
+#
+# premium-discount · raon-zena 와 같은 candle 포크 커밋과 premium-discount-* 리비전을 쓴다.
+# 빌드 산출물은 예전 자리(commerce/src-tauri/target)에 그대로 둔다: .cargo/config.toml 의 target-dir.
+# 배치 파일(commerce/*.bat) · CI 캐시 · Tauri 번들이 모두 그 경로를 본다.
+[workspace]
+resolver = "2"
+members = [
+    "commerce/src-tauri",
+]
+# 자기 [workspace] 를 가진 vendored crate 는 그 작업 공간에 남긴다 (path 의존성으로만 링크).
+# 모바일 셸과 CPU 벤치는 앱과 따로 빌드한다 (모바일은 [workspace] 가 없어 여기 빼지 않으면 그 폴더의 cargo 가 실패한다).
+exclude = [
+    "commerce/crates/boa-engine",
+    "commerce/crates/direct-storage",
+    "commerce/mobile/src-tauri",
+    "commerce/tools/cpu-embed-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Qntology/logis-center"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+once_cell = "1.18"
+regex = "1"
+
+# premium-discount 공용 라이브러리 (raon-zena 와 같은 리비전).
+# 로컬 ../premium-discount 로 같이 고칠 때는 아래 [patch."https://github.com/Qntology/premium-discount"] 의 주석을 푼다.
+premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+
+# candle-rocm-vulkan 포크: premium-discount (crates/ · app/) · raon-zena 와 같은 커밋으로 고정한다.
+# 예전에는 branch = "master" 를 따라가고 커밋은 Cargo.lock 이 정했다 (60ec257, ebaf93d 의 조상).
+# 포크에는 candle-core · candle-nn · candle-flash-attn · candle-backend(candle-rocm) 만 있다. candle-transformers 는
+# crates.io 0.11.0 을 쓰고, 그 의존성인 candle-core · candle-nn 이 아래 패치로 포크에 합쳐진다.
+# 원격에 아직 없는 로컬 포크(../candle-rocm-vulkan)로 빌드하려면 git 3줄을 path 줄로 바꾸고
+# commerce/src-tauri/Cargo.toml 의 candle-rocm 도 같은 경로로 바꾼다.
+[patch.crates-io]
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe" }
+# candle-core = { path = "../candle-rocm-vulkan/candle-core" }
+# candle-nn = { path = "../candle-rocm-vulkan/candle-nn" }
+# candle-flash-attn = { path = "../candle-rocm-vulkan/candle-flash-attn" }
+
+# [patch."https://github.com/Qntology/premium-discount"]
+# premium-discount-identity = { path = "../premium-discount/crates/premium-discount-identity" }
+# premium-discount-sds = { path = "../premium-discount/crates/premium-discount-sds" }
+# premium-discount-quant = { path = "../premium-discount/crates/premium-discount-quant" }
+
+[profile.dev]
+opt-level = 0      # 기본값 0(최적화 없음). 무거운 crate 만 아래에서 3 으로 올린다.
+incremental = true # 변경된 부분만 빌드해서 시간을 아낍니다.
+
+[profile.dev.package.candle-core]
+opt-level = 3
+[profile.dev.package.candle-nn]
+opt-level = 3
+[profile.dev.package.candle-transformers]
+opt-level = 3
+[profile.dev.package.gemm]
+opt-level = 3
+[profile.dev.package.gemm-common]
+opt-level = 3
+[profile.dev.package.gemm-f16]
+opt-level = 3
+[profile.dev.package.gemm-f32]
+opt-level = 3
+[profile.dev.package.gemm-f64]
+opt-level = 3
+[profile.dev.package.embed-cpu-kernels]
+opt-level = 3
+[profile.dev.package.ggml-kquant]
+opt-level = 3
+[profile.dev.package.half]
+opt-level = 3
+[profile.dev.package.naga]
+opt-level = 3
+[profile.dev.package.rayon]
+opt-level = 3
+[profile.dev.package.rayon-core]
+opt-level = 3
+# hash_id(secp256k1) 를 시험에서 수천 번 부르면 debug 에서 수십 초가 걸린다.
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.tiny-keccak]
+opt-level = 3
+
+[profile.release]
+opt-level = 3   # 실행 속도 최대
+strip = true      # 모든 심볼 제거 (함수 이름 등 삭제)
+lto = true        # 전체 프로그램 최적화 (코드 분석을 훨씬 어렵게 함)
+panic = "abort"   # 에러 발생 시 정보를 남기지 않음
+codegen-units = 1 # 빌드 속도 개선

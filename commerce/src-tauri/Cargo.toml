@@ -47,12 +47,12 @@ ahash = "0.8.11"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
 candle-flash-attn = { version = "0.11.0", optional = true, default-features = false }
-# 🌟 [FORK-GIT] candle-rocm-vulkan 포크는 Qntology 원격 master 를 따라갑니다(master 가 메인). 실제 커밋은 Cargo.lock 이 고정합니다.
-#    앱이 쓰는 API(attention_packed · fused_gdn_supported · forward_exact 등)가 원격 master 에 들어 있어야 빌드됩니다.
-#    원격에 아직 없는 로컬 포크로 빌드할 때만 아래 path 줄로 바꾸세요. (아래 [patch.crates-io] 3줄도 함께)
-candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master", optional = true }
+# 🌟 [FORK-GIT] candle-rocm-vulkan 포크는 premium-discount · raon-zena 와 같은 커밋(ebaf93d)으로 고정합니다.
+#    루트 Cargo.toml 의 [patch.crates-io] 3줄(candle-core · candle-nn · candle-flash-attn)과 반드시 같은 git 주소 · 커밋이어야
+#    candle-core 가 하나로 합쳐집니다. 원격에 아직 없는 로컬 포크로 빌드할 때만 아래 path 줄로 바꾸세요 (루트 패치도 함께).
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe", optional = true }
 # candle-rocm = { path = "../../../candle-rocm-vulkan/candle-backend", optional = true }
-tokenizers = "0.22.1"
+tokenizers = "0.22.2"
 num = "0.4.3"
 minijinja = "2.12.0"
 rayon = "1.10"
@@ -65,8 +65,10 @@ once_cell = "1.18"
 scraper = "0.25.0"
 lancedb = { version = "0.31.0", default-features = false }
 safetensors = "0.4"
-ethers-core = "2.0"
-ethers-signers = "2.0"
+# premium-discount 공용 엔진 (루트 Cargo.toml 이 리비전을 고정): hashId(EIP-191) · SDS 통계와 배타 배정 · 어휘 잘라 내기 규칙
+premium-discount-identity.workspace = true
+premium-discount-sds.workspace = true
+premium-discount-quant.workspace = true
 arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
 ego-tree = "0.10"
@@ -114,56 +116,4 @@ turbo-quant = ["candle-core/turbo-quant", "candle-nn/turbo-quant"]
 # (src/utils/bias_schema.rs BIAS_SOURCE). 개발 빌드 기본값은 한국어 · 영어만 담은 bias.json 입니다.
 full-bias = []
 
-# candle-rocm-vulkan 포크는 Qntology 원격 master 브랜치를 따라갑니다(master 가 메인). 어느 커밋을 쓰는지는 Cargo.lock 이 고정하고,
-# 새 커밋을 받으려면 cargo update 로 포크 패키지(candle-core · candle-nn · candle-flash-attn · candle-rocm)를 갱신하세요.
-# 위 candle-rocm 의존성과 아래 3개 패치는 반드시 같은 git 주소·브랜치여야 candle-core 가 하나로 합쳐집니다.
-# 🌟 [FORK-GIT] 원격에 아직 없는 로컬 포크(../../../candle-rocm-vulkan)로 빌드하려면 git 3줄을 주석 처리하고 path 3줄의 주석을 푸세요.
-# ✅ [VERIFY-ROCM] AMD 실기기 검증(RX 6600 · gfx1032) 수정분은 Qntology master(PR #8) 에 들어가 git 줄로 돌아왔습니다.
-[patch.crates-io]
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-# candle-core = { path = "../../../candle-rocm-vulkan/candle-core" }
-# candle-nn = { path = "../../../candle-rocm-vulkan/candle-nn" }
-# candle-flash-attn = { path = "../../../candle-rocm-vulkan/candle-flash-attn" }
-
-
-[profile.dev]
-opt-level = 0      # 기본값 0(최적화 없음)을 2로 올려서 실행 속도를 개선합니다.
-incremental = true # 변경된 부분만 빌드해서 시간을 아낍니다.
-
-[profile.dev.package.candle-core]
-opt-level = 3
-[profile.dev.package.candle-nn]
-opt-level = 3
-[profile.dev.package.candle-transformers]
-opt-level = 3
-[profile.dev.package.gemm]
-opt-level = 3
-[profile.dev.package.gemm-common]
-opt-level = 3
-[profile.dev.package.gemm-f16]
-opt-level = 3
-[profile.dev.package.gemm-f32]
-opt-level = 3
-[profile.dev.package.gemm-f64]
-opt-level = 3
-[profile.dev.package.embed-cpu-kernels]
-opt-level = 3
-[profile.dev.package.ggml-kquant]
-opt-level = 3
-[profile.dev.package.half]
-opt-level = 3
-[profile.dev.package.naga]
-opt-level = 3
-[profile.dev.package.rayon]
-opt-level = 3
-[profile.dev.package.rayon-core]
-opt-level = 3
-
-[profile.release]
-opt-level = 3   # 실행 속도 최대
-strip = true      # 모든 심볼 제거 (함수 이름 등 삭제)
-lto = true        # 전체 프로그램 최적화 (코드 분석을 훨씬 어렵게 함)
-panic = "abort"   # 에러 발생 시 정보를 남기지 않음
-codegen-units = 1 # 빌드 속도 개선
+# [patch.crates-io](candle 포크 커밋)와 [profile.*] 는 루트 Cargo.toml 에 있습니다. 작업 공간 멤버의 것은 무시됩니다.

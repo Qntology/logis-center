@@ -11,7 +11,7 @@
 //!   (일본어 · 중국어 문서도 상위 4,096 개만 남기면 blueprint 의 Zoro-1(같은 Qwen3.5 어휘)에서 일본어 한자 設 · 場 · 階 가 간체로 바뀌고
 //!   중국어 여러 글자 토큰이 빠져 글자가 사라졌습니다.) 12 개 언어 밖(키릴 · 타이 · 데바나가리 문자 등, `other`)은
 //!   그 언어의 문서이거나 글에 나왔을 때만 남깁니다.
-//! - **글에 실제로 나온 문자 체계**: 판정 언어와 합칩니다 ([`Langs::of_document`]). `detect_document_language` 는 라틴 언어를
+//! - **글에 실제로 나온 문자 체계**: 판정 언어와 합칩니다 ([`langs_of_document`]). `detect_document_language` 는 라틴 언어를
 //!   fr · de · es · it · pt · nl · cs 밖이면 `en` 으로 돌려주므로(폴란드어 ł · ś 등), 판정만 따르면 문서에 있는 글자를 잘라 냅니다.
 //! - **도메인 글**: 내장 도메인 사전(`bias.json` · `full_bias.json` 의 모든 글)과 JSON · HTML 표 태그가 쓰는 토큰 전부.
 //! - 남긴 수는 64 의 배수.
@@ -33,294 +33,31 @@ use candle_core::{Device, Module, Tensor};
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 
-/// 남길 한자 토큰 수 (도메인 글 밖으로, 병합 순 상위)
-pub const CJK_COMMON: usize = 4096;
-/// 남긴 행 수를 맞추는 배수
-pub const ALIGN: usize = 64;
+// 🌟 [PD-QUANT TRIM] 토큰 종류(kind_of) · 언어 묶음(Langs) · 규칙(TrimRule) · 남길 행 고르기(select_from) · CJK_COMMON · ALIGN 은
+//    premium-discount-quant::trim 을 씁니다 (이 파일에서 옮겨 간 코드, 주석 · 줄바꿈을 빼면 토큰 단위로 같음). 여기에는 logis 쪽 연결만
+//    남습니다: 환경 변수 · 문서 언어 판정 · 토크나이저 · 출력 투영(TrimmedHead) · 실행 흐름별 언어 범위(DocLangScope).
+pub use premium_discount_quant::trim::{kind_of, select_from, Kind, Langs, TrimRule, ALIGN, CJK_COMMON};
+
+/// 문서 글에서: `detect_document_language` 의 현지 언어 + 영어, 그리고 글에 실제로 나온 문자 체계 (예전 `Langs::of_document`)
+pub fn langs_of_document(text: &str) -> Langs {
+    Langs::of_doc_lang(&crate::utils::lang_utils::detect_document_language(text)).union(Langs::present(text))
+}
+
+/// `LOGIS_VOCAB_TRIM` (기본 `full`, 예전 `TrimRule::from_env`). 읽지 못한 값은 알리고 full 로 둡니다.
+pub fn rule_from_env() -> TrimRule {
+    match std::env::var(TRIM_ENV) {
+        Ok(v) => TrimRule::parse(&v).unwrap_or_else(|e| {
+            println!("[VOCAB-TRIM] {TRIM_ENV}={v:?}: {e} → full");
+            TrimRule::Full
+        }),
+        Err(_) => TrimRule::Full,
+    }
+}
+
 /// 규칙 (`full` · `off`)
 pub const TRIM_ENV: &str = "LOGIS_VOCAB_TRIM";
 /// 언어 (`auto` = 문서 언어, `all`, 또는 `ko,en` 처럼)
 pub const LANGS_ENV: &str = "LOGIS_VOCAB_LANGS";
-
-/// 토큰 한 개의 종류
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Special,
-    Byte,
-    Partial,
-    Ascii,
-    Neutral,
-    Script { hangul: bool, kana: bool, cjk: bool, arabic: bool, latin: bool },
-    Other,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Script {
-    Ascii,
-    Hangul,
-    Kana,
-    Cjk,
-    Arabic,
-    Latin,
-    Neutral,
-    Other,
-}
-
-fn script(c: char) -> Script {
-    match c as u32 {
-        0..=0x7F => Script::Ascii,
-        0xAC00..=0xD7A3 | 0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xD7B0..=0xD7FF => Script::Hangul,
-        0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF65..=0xFF9F => Script::Kana,
-        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0xF900..=0xFAFF => Script::Cjk,
-        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => Script::Arabic,
-        0x00C0..=0x024F | 0x1E00..=0x1EFF | 0x0300..=0x036F => Script::Latin,
-        0x0370..=0x03FF | 0x00A0..=0x00BF | 0x2000..=0x2BFF | 0x3000..=0x303F | 0x3200..=0x33FF | 0xFF00..=0xFFEF => Script::Neutral,
-        _ => Script::Other,
-    }
-}
-
-pub fn kind_of(piece: &[u8], added: bool) -> Kind {
-    if added {
-        return Kind::Special;
-    }
-    if piece.len() == 1 {
-        return Kind::Byte;
-    }
-    let Ok(s) = std::str::from_utf8(piece) else { return Kind::Partial };
-    let (mut hangul, mut kana, mut cjk, mut arabic, mut latin, mut ascii_only) = (false, false, false, false, false, true);
-    for c in s.chars() {
-        match script(c) {
-            Script::Ascii => {}
-            Script::Neutral => ascii_only = false,
-            Script::Hangul => hangul = true,
-            Script::Kana => kana = true,
-            Script::Cjk => cjk = true,
-            Script::Arabic => arabic = true,
-            Script::Latin => latin = true,
-            Script::Other => return Kind::Other,
-        }
-    }
-    if hangul || kana || cjk || arabic || latin {
-        Kind::Script { hangul, kana, cjk, arabic, latin }
-    } else if ascii_only {
-        Kind::Ascii
-    } else {
-        Kind::Neutral
-    }
-}
-
-/// 남길 문자 체계
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Langs {
-    pub hangul: bool,
-    pub kana: bool,
-    pub cjk: bool,
-    pub arabic: bool,
-    pub latin: bool,
-    /// 12 개 언어 밖의 문자 체계 (키릴 · 타이 · 데바나가리 · 벵골 · 히브리 문자 등)
-    pub other: bool,
-    /// 한자를 쓰지 않는 문서에 섞인 한자: 도메인 글 + 상위 [`CJK_COMMON`] 개 (`cjk` 는 한자를 쓰는 언어 ja · zh: 한자 토큰 전부)
-    pub hanja: bool,
-}
-
-impl Langs {
-    fn none() -> Self {
-        Self { hangul: false, kana: false, cjk: false, arabic: false, latin: false, other: false, hanja: false }
-    }
-
-    /// 12 개 언어 (ko · en · ja · zh · de · fr · es · it · pt · nl · cs · ar)
-    pub fn all() -> Self {
-        Self { other: false, ..Self::any() }
-    }
-
-    /// 어떤 문자 체계도 빼지 않음: 언어를 아직 모를 때 (이미지 문서의 첫 판독, 정하기 전)
-    pub fn any() -> Self {
-        Self { hangul: true, kana: true, cjk: true, arabic: true, latin: true, other: true, hanja: false }
-    }
-
-    /// 글에 실제로 나온 문자 체계. 한자는 섞인 한자([`Self::hanja`])로 봅니다: 한자를 쓰는 언어인지는 판정 언어(ja · zh)가 정합니다.
-    pub fn present(text: &str) -> Self {
-        let mut l = Self::none();
-        for c in text.chars() {
-            match script(c) {
-                Script::Hangul => l.hangul = true,
-                Script::Kana => l.kana = true,
-                Script::Cjk => l.hanja = true,
-                Script::Arabic => l.arabic = true,
-                Script::Latin => l.latin = true,
-                Script::Other if c.is_alphabetic() => l.other = true,
-                _ => {}
-            }
-        }
-        l
-    }
-
-    pub fn union(self, o: Self) -> Self {
-        let cjk = self.cjk || o.cjk;
-        Self {
-            hangul: self.hangul || o.hangul,
-            kana: self.kana || o.kana,
-            cjk,
-            arabic: self.arabic || o.arabic,
-            latin: self.latin || o.latin,
-            other: self.other || o.other,
-            hanja: !cjk && (self.hanja || o.hanja),
-        }
-    }
-
-    /// 언어 코드에서 (ko · en · ja · zh · zh-hans · de · fr · es · it · pt · nl · cs · ar). 그 밖의 코드(ru · th · hi · pl …)는
-    /// 문자 체계를 모르므로 라틴 확장과 12 개 언어 밖 문자를 함께 남깁니다. 빈 목록이면 `None`.
-    pub fn from_codes<S: AsRef<str>>(codes: &[S]) -> Option<Self> {
-        if codes.is_empty() {
-            return None;
-        }
-        let mut l = Self::none();
-        for code in codes {
-            match code.as_ref().trim().to_ascii_lowercase().as_str() {
-                "ko" | "korean" => l.hangul = true,
-                "en" | "english" | "" => {}
-                "ja" | "japanese" => {
-                    l.kana = true;
-                    l.cjk = true;
-                }
-                "zh" | "zh-hans" | "zh-cn" | "chinese" => l.cjk = true,
-                "de" | "fr" | "es" | "it" | "pt" | "nl" | "cs" => l.latin = true,
-                "ar" | "arabic" => l.arabic = true,
-                "all" => l = l.union(Self::all()),
-                "any" => l = l.union(Self::any()),
-                _ => {
-                    l.latin = true;
-                    l.other = true;
-                }
-            }
-        }
-        Some(l)
-    }
-
-    /// 문서 언어 하나(현지 언어)에서: 현지 언어 + 영어 두 코드
-    pub fn of_doc_lang(doc_lang: &str) -> Self {
-        Self::from_codes(&[doc_lang, "en"]).unwrap_or_else(Self::any)
-    }
-
-    /// 문서 글에서: `detect_document_language` 의 현지 언어 + 영어, 그리고 글에 실제로 나온 문자 체계
-    pub fn of_document(text: &str) -> Self {
-        Self::of_doc_lang(&crate::utils::lang_utils::detect_document_language(text)).union(Self::present(text))
-    }
-
-    pub fn is_all(&self) -> bool {
-        *self == Self::all()
-    }
-
-    fn keeps_script(&self, k: Kind) -> bool {
-        match k {
-            Kind::Script { hangul, kana, cjk, arabic, latin } => {
-                let allowed = (!hangul || self.hangul)
-                    && (!kana || self.kana)
-                    && (!cjk || self.cjk || self.hanja)
-                    && (!arabic || self.arabic)
-                    && (!latin || self.latin);
-                // 한자를 쓰는 언어면 한자만 쓰는 토큰도 전부. 섞인 한자면 한자만 쓰는 토큰은 상위 한자 단계에서
-                allowed && (hangul || kana || arabic || latin || (cjk && self.cjk))
-            }
-            Kind::Other => self.other,
-            _ => false,
-        }
-    }
-
-    pub fn label(&self) -> String {
-        if self.is_all() {
-            return "all".into();
-        }
-        if *self == Self::any() {
-            return "any".into();
-        }
-        let mut s = Vec::new();
-        for (on, name) in [(self.hangul, "hangul"), (self.kana, "kana"), (self.cjk, "cjk"), (self.arabic, "arabic"), (self.latin, "latin"), (self.other, "other"), (self.hanja, "hanja")] {
-            if on {
-                s.push(name);
-            }
-        }
-        if s.is_empty() { "ascii".into() } else { s.join("+") }
-    }
-}
-
-/// 고르는 규칙. `full` 하나뿐입니다: 행 수에 예산을 두면 남은 자리를 문자 체계와 영어가 나눠 가져 영어 단어가 빠지고
-/// ("영어는 전부 디코딩" 위반), 모델이 그 자리를 다른 토큰으로 메워 off 와 다른 글을 씁니다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrimRule {
-    Off,
-    Full,
-}
-
-impl TrimRule {
-    pub fn parse(spec: &str) -> Result<Self> {
-        Ok(match spec.trim().to_ascii_lowercase().as_str() {
-            "" | "full" => Self::Full,
-            "off" | "none" | "0" => Self::Off,
-            _ => bail!("{TRIM_ENV}={spec:?} 를 읽지 못했습니다 (full · off)"),
-        })
-    }
-
-    /// `LOGIS_VOCAB_TRIM` (기본 `full`)
-    pub fn from_env() -> Self {
-        match std::env::var(TRIM_ENV) {
-            Ok(v) => Self::parse(&v).unwrap_or_else(|e| {
-                println!("[VOCAB-TRIM] {e} → full");
-                Self::Full
-            }),
-            Err(_) => Self::Full,
-        }
-    }
-
-    pub fn label(&self) -> String {
-        match self {
-            Self::Off => "off".into(),
-            Self::Full => "full".into(),
-        }
-    }
-}
-
-/// 남길 행 고르기의 본체 (토큰 종류 · 도메인 번호가 주어졌을 때). 오름차순 번호와 단계별 수.
-pub fn select_from(kinds: &[Kind], domain: &BTreeSet<u32>, rule: TrimRule, langs: Langs) -> (Vec<u32>, Vec<(&'static str, usize)>) {
-    let vocab = kinds.len();
-    if rule == TrimRule::Off {
-        return ((0..vocab as u32).collect(), vec![("off", vocab)]);
-    }
-    let mut keep: BTreeSet<u32> = BTreeSet::new();
-    let mut tiers: Vec<(&'static str, usize)> = Vec::new();
-    let mut add = |name: &'static str, ids: &mut dyn Iterator<Item = u32>, keep: &mut BTreeSet<u32>, cap: Option<usize>| {
-        let before = keep.len();
-        for i in ids {
-            if cap.is_some_and(|c| keep.len() >= c) {
-                break;
-            }
-            keep.insert(i);
-        }
-        tiers.push((name, keep.len() - before));
-    };
-    let all = || 0..vocab as u32;
-    add("core", &mut all().filter(|&i| matches!(kinds[i as usize], Kind::Special | Kind::Byte | Kind::Partial | Kind::Neutral)), &mut keep, None);
-    add("scripts", &mut all().filter(|&i| langs.keeps_script(kinds[i as usize])), &mut keep, None);
-    add("domain", &mut domain.iter().copied().filter(|&i| (i as usize) < vocab), &mut keep, None);
-    add("ascii", &mut all().filter(|&i| kinds[i as usize] == Kind::Ascii), &mut keep, None);
-    // 섞인 한자: 도메인 밖의 상위 한자 (병합 순). 한자를 쓰는 언어면 문자 체계 단계에서 이미 전부
-    if langs.hanja && !langs.cjk {
-        let common: Vec<u32> = all()
-            .filter(|&i| matches!(kinds[i as usize], Kind::Script { cjk: true, hangul: false, kana: false, arabic: false, latin: false }) && !keep.contains(&i))
-            .take(CJK_COMMON)
-            .collect();
-        add("cjk", &mut common.into_iter(), &mut keep, None);
-    }
-    let target = keep.len().next_multiple_of(ALIGN).min(vocab);
-    let pad_cjk = langs.cjk || langs.hanja;
-    add(
-        "pad",
-        &mut all().filter(|&i| pad_cjk && matches!(kinds[i as usize], Kind::Script { cjk: true, .. })).chain(all().filter(|&i| kinds[i as usize] == Kind::Ascii)).chain(all()),
-        &mut keep,
-        Some(target),
-    );
-    (keep.into_iter().collect(), tiers)
-}
 
 // ---------------------------------------------------------------------------------------------
 // 토크나이저에서
@@ -590,7 +327,7 @@ pub fn observe_read(text: &str) -> Option<Langs> {
     if decisive < 3 {
         return None;
     }
-    let langs = Langs::of_document(&values);
+    let langs = langs_of_document(&values);
     g[at].langs = langs;
     g[at].pending = false;
     Some(langs)
@@ -747,7 +484,7 @@ impl TrimmedHead {
 /// 잘라 내기를 켤 수 있으면(규칙이 `off` 가 아니고 GPU · 매핑 · Q8_0 류 블록 표) 입력 임베딩 · 출력 투영 표의 자리.
 /// 이때 입력 임베딩은 이 매핑에서 쓰는 행만 읽고(장치 0), 출력 투영은 남긴 행만 장치에 둡니다.
 pub fn mapped_table(device: &Device, map: Option<&Arc<memmap2::Mmap>>, content: Option<&candle_core::quantized::gguf_file::Content>) -> Option<TableSource> {
-    if TrimRule::from_env() == TrimRule::Off || !(device.is_cuda() || device.is_rocm()) {
+    if rule_from_env() == TrimRule::Off || !(device.is_cuda() || device.is_rocm()) {
         return None;
     }
     let (map, content) = (map?, content?);
@@ -799,7 +536,7 @@ fn sorted_subset(a: &[u32], b: &[u32]) -> bool {
 
 /// 전체 행 출력 투영의 이름표
 pub fn all_rows_label() -> String {
-    format!("{}:all-rows", TrimRule::from_env().label())
+    format!("{}:all-rows", rule_from_env().label())
 }
 
 /// 전체 행 출력 투영 (off 와 같은 로짓). 샘플링과, 생성기가 언어를 정하기 전에 불린 계산에 씁니다.
@@ -822,7 +559,7 @@ pub fn refresh(slot: &mut Option<TrimmedHead>, src: &TableSource, tok: &tokenize
 /// 걸린 후보가 들어가거나 빠지고 같은 난수로도 다른 토큰을 뽑습니다 (N:N 검색에서 0.6B 가 `"percent_total": "20.0"` 대신 `"20.5"`).
 /// 탐욕 디코딩은 off 가 고르는 토큰이 남긴 행에 있으면 결과가 같으므로 잘라 냅니다.
 pub fn refresh_for(slot: &mut Option<TrimmedHead>, src: &TableSource, tok: &tokenizers::Tokenizer, device: &Device, prompt: &str, sampling: bool) -> Result<()> {
-    let rule = TrimRule::from_env();
+    let rule = rule_from_env();
     if rule == TrimRule::Off {
         *slot = None;
         return Ok(());
@@ -869,16 +606,16 @@ mod tests {
         assert_eq!(Langs::of_doc_lang("ko"), Langs::from_codes(&["ko", "en"]).unwrap());
         let ru = Langs::of_doc_lang("ru");
         assert!(ru.other && ru.latin && !ru.hangul && !ru.cjk, "12 개 밖 언어는 라틴 확장 + 그 밖 문자: {ru:?}");
-        assert_eq!(Langs::of_document("주문 번호 20231"), Langs::from_codes(&["ko"]).unwrap());
+        assert_eq!(langs_of_document("주문 번호 20231"), Langs::from_codes(&["ko"]).unwrap());
         // 판정은 en(whatlang 의 폴란드어 → en)이어도 글의 라틴 확장 글자는 남김
-        let pl = Langs::of_document("Zamówienie nr 20231, łączna wartość");
+        let pl = langs_of_document("Zamówienie nr 20231, łączna wartość");
         assert!(pl.latin && !pl.hangul, "{pl:?}");
         assert_eq!(Langs::from_codes(&["all"]).unwrap(), Langs::all());
-        let ko_hanja = Langs::of_document("급수 펌프(給水) 압력 주문");
+        let ko_hanja = langs_of_document("급수 펌프(給水) 압력 주문");
         assert!(ko_hanja.hangul && ko_hanja.hanja && !ko_hanja.cjk, "{ko_hanja:?}");
-        let zh = Langs::of_document("给水泵压力");
+        let zh = langs_of_document("给水泵压力");
         assert!(zh.cjk && !zh.hanja, "{zh:?}");
-        assert!(Langs::any().keeps_script(Kind::Other) && !Langs::all().keeps_script(Kind::Other));
+        // keeps_script(Kind::Other) 는 premium-discount-quant 안의 비공개 함수라 그쪽 kinds_and_languages 시험이 봅니다.
     }
 
     #[test]
