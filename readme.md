@@ -1,6 +1,7 @@
-# Commerce · Trade & Logistics · Website Analytics
+# Commerce · Trade & Logistics
 
-> **Local-first AI Operations Platform** — An open-source operational tool where a browser extension and desktop client work seamlessly together to structure, vectorize, and search e-commerce data, trade & logistics documents, and website behavior logs **completely offline**.
+> **Local-first AI Operations Platform** — An open-source operational tool where a browser extension and desktop client work seamlessly together to structure, vectorize, and search e-commerce data and trade & logistics documents **completely offline**.
+> Website analytics (behaviour logs) moved to [premium-discount](https://github.com/Qntology/premium-discount) (`premium-discount-analytic`, `www` `/analytic`, `tracker.js`).
 
 ---
 
@@ -23,7 +24,6 @@
 |--------|------|
 | **Commerce** | Automatically structures order, goods, tracking, coupon, and review pages of shopping malls and indexes them into a local vector DB. |
 | **Trade & Logistics** | Extracts 55 types of trade forms (B/L, C/I, P/L, L/C, etc.) using SigLIP2 Vision + Qwen3.5 2B and builds a reference graph between documents. |
-| **Website Analytics** | Collects user click, hover, and input events to summarize behavioral flows, preferences, and conversion funnels into natural language reports. |
 
 All inference, embedding, and storage are performed **locally on the client**, with no external API calls. For non-Latin document languages, a **language-specialized Qwen3.5-4B engine from [alphaedge-ai](https://huggingface.co/alphaedge-ai)** is downloaded on demand, converted to a local Q4_K_M GGUF once, and routed into transliteration, synthesis, and field extraction steps when it is a better fit than the base models.
 
@@ -46,10 +46,10 @@ All inference, embedding, and storage are performed **locally on the client**, w
 - **Value Grounding Validation** — Extracted value × patch embedding cosine → hallucination filtering based on extreme value theory.
 - **Document Relay** — Connects a graph of 55 forms using reference axes such as `reference_invoice / reference_bl / reference_lc`.
 
-### Website Analytics Pipeline
-- **Event Collection** — `content.js` loads `click / hover / change` outerHTML into D1.
-- **Structuring** — The 0.6B model generates a natural language summary of behavioral intent and surrounding context.
-- **Reporting** — Synthesizes multi-event sequences into reports along 3 axes: `cross_action_flow / intent_evolution / consistent_preferences`.
+### Website Analytics (moved)
+- Event collection, structuring and reports now live in premium-discount (`premium-discount-analytic` crate, `www` `/analytic`,
+  `tracker.js`, the app's `analytic.rs`). This app no longer syncs, structures or searches behaviour logs; rows already stored with
+  `mode = 'analytic'` stay isolated and are never shown.
 
 ---
 
@@ -59,6 +59,15 @@ All inference, embedding, and storage are performed **locally on the client**, w
 ```
 
 cron-logis-center/
+├── Cargo.toml                          # Root Cargo workspace (crates/logis-* + commerce/src-tauri), candle fork + premium-discount pins
+├── .cargo/config.toml                  # target-cpu=native, build output kept in commerce/src-tauri/target
+├── crates/                             # Pure domain libraries (no Tauri · LanceDB · tokio · models)
+│   ├── logis-schema/                   # canonical (field normalization), logic (trade groups · 28 forms · hub fields), hash, text, embed_space
+│   ├── logis-bias/                     # bias.json / full_bias.json + override, label/prejudice banks, time guide, language detection, entity keys
+│   ├── logis-sds/                      # SDS ledger (scopes, baselines, recipe sds-v3) on premium-discount-sds statistics
+│   ├── logis-pug/                      # HTML↔PUG, ai_utils, LLM JSON parsing, JSON→natural language (nl_convert), prompts, JS templates
+│   ├── logis-parsers/                  # Offline document readers (Excel/Word/HWP/CSV/PDF), gzip helpers
+│   └── logis-search/                   # Search fusion + relation-step rules (anchors → target types); store/model steps stay in the app
 ├── commerce/                           # Desktop client (Tauri v2 + Vite/TS)
 │   ├── src/                            # Frontend (TypeScript)
 │   ├── mobile/                         # Mobile companion app (Tauri)
@@ -75,13 +84,14 @@ cron-logis-center/
 │       ├── tests/it/                   # Integration tests (cargo test --test it)
 │       └── src/
 │           ├── lib.rs                  # Tauri entry, IPC command registration, model downloads
+│           │                           # (utils/{canonical,bias_schema,parsing,ai_utils,nl_convert,...}.rs, logic.rs and prompts.rs
+│           │                           #  are now one-line re-exports of crates/logis-*; only model-bound helpers stay here)
 │           ├── scheduler.rs            # Background task scheduler (main pipeline)
 │           ├── scheduler/
 │           │   ├── worker.rs           # Task worker loop
 │           │   ├── trading.rs          # Trade & logistics pipeline
 │           │   ├── translit.rs         # Transliteration alias generation
 │           │   ├── indexing.rs         # Chunk indexing
-│           │   ├── entity.rs           # Entity key normalization (commerce/trade)
 │           │   ├── list_census.rs      # List page census
 │           │   └── relay_ledger.rs     # Document relay ledger
 │           ├── model.rs                # Model manager (ModelSize, residency budgets)
@@ -93,11 +103,10 @@ cron-logis-center/
 │           │   ├── vision.rs           # Vision inference
 │           │   ├── merge.rs            # Result merging
 │           │   ├── research.rs         # Research flow
-│           │   └── query_{commerce,shipping,analytic}.rs  # Domain search queries
+│           │   └── query_{commerce,shipping}.rs  # Domain search queries
 │           ├── logic.rs                # Business logic (relay, state, trade rules)
 │           ├── store.rs                # LanceDB vector store (envelope schema)
 │           ├── automation.rs           # Chromium browser automation
-│           ├── analytic.rs             # Website analytics tasks
 │           ├── stanza.rs               # Stanza NLP (tokenization/POS/lemma/syntax)
 │           ├── prompts.rs              # Prompt templates
 │           ├── models/
@@ -126,7 +135,6 @@ cron-logis-center/
 │           ├── utils/
 │           │   ├── parsing.rs          # HTML→PUG conversion, schema management
 │           │   ├── bias_schema.rs      # bias.json access layer
-│           │   ├── bias.json / full_bias.json # Multilingual field anchor/bias dictionary
 │           │   ├── ai_utils.rs         # Cosine, exclusive assignment, format gating
 │           │   ├── score_dynamics.rs   # Adaptive baselines (SDS pass rates for routing)
 │           │   ├── json_parse.rs       # LLM JSON parsing/recovery
@@ -221,7 +229,7 @@ cron-logis-center/
 | **AlphaEdge Qwen3.5-4B-{code}** | ~7.9GB download → Q4_K_M runtime | Language-specialized transliteration, list/detail synthesis and field extraction for non-Latin documents | On demand (routed) |
 | **granite-embedding-97m** | ~380MB | 384-dimensional multilingual embeddings (vector search) | Indexing/Search |
 | **SigLIP2** | ~2.2GB | Vision patch × text anchor cosine (Heatmap) | Trade documents |
-| **Stanza** | 0.3–0.8GB/lang (CPU, ONNX Runtime) | Tokenization, MWT, POS, Lemma, Dependency syntax (12 languages) | Search query analysis (commerce · trade · analytics) |
+| **Stanza** | 0.3–0.8GB/lang (CPU, ONNX Runtime) | Tokenization, MWT, POS, Lemma, Dependency syntax (12 languages) | Search query analysis (commerce · trade) |
 
 ### Inference Pipeline Flow
 
@@ -231,8 +239,7 @@ cron-logis-center/
 [Task Queue] → [Scheduler]
 ├── Commerce: PUG conversion → Page classification → Field extraction → Synthesis → Translit → Chunk indexing
 │             (each LLM step: lang_route() → AlphaEdge 4B or Qwen3 0.6B / Qwen3.5 2B)
-├── Trading:  PDF split → Document classification → Heatmap → Crop → Precision extraction → Grounding validation
-└── Analytic: Event collection → Structuring → Report synthesis → Vector indexing
+└── Trading:  PDF split → Document classification → Heatmap → Crop → Precision extraction → Grounding validation
 
 ```
 
@@ -562,8 +569,8 @@ Stanza models are the format 2 export of [stanza-onnx-export](https://github.com
 
 ### Domain Dictionary (`bias.json` / `full_bias.json`)
 
-Debug builds (`tauri dev`, `cargo test`) embed `src/utils/bias.json` (shared sections + Korean / English). Release builds (`tauri build`) embed
-`src/utils/full_bias.json` (the same shared sections + every language section). Enable the `full-bias` Cargo feature to embed the full dictionary
+Debug builds (`tauri dev`, `cargo test`) embed `crates/logis-bias/src/bias.json` (shared sections + Korean / English). Release builds (`tauri build`) embed
+`crates/logis-bias/src/full_bias.json` (the same shared sections + every language section). Enable the `full-bias` Cargo feature to embed the full dictionary
 in a debug build. `tests/it/bias_source.rs` checks that the shared sections of the two files stay identical.
 
 AlphaEdge Qwen3.5-4B language models are **not** part of the initial download. They are fetched automatically in the background the first time a non-Latin document language needs them (about 7.9GB per language), then converted to `runtime-q4km/model-q4km.gguf`. To pre-install manually, download `alphaedge-ai/Qwen3.5-4B-{code}-16384` into `{AppData}/logis-center/models/Qwen3.5-4B-{code}-16384/`; the GGUF conversion runs on first use.

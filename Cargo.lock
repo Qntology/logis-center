@@ -6838,6 +6838,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "logis-bias"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "logis-schema",
+ "once_cell",
+ "serde_json",
+ "whatlang",
+]
+
+[[package]]
 name = "logis-center"
 version = "0.1.0"
 dependencies = [
@@ -6848,7 +6860,6 @@ dependencies = [
  "arrow-schema",
  "base64 0.22.1",
  "boa_engine",
- "calamine",
  "candle-core",
  "candle-flash-attn",
  "candle-nn",
@@ -6856,7 +6867,6 @@ dependencies = [
  "candle-transformers",
  "chromiumoxide",
  "chrono",
- "csv",
  "direct-storage",
  "dirs 6.0.0",
  "drag",
@@ -6864,7 +6874,6 @@ dependencies = [
  "embed-cpu-kernels",
  "encoding_rs",
  "fantoccini",
- "flate2",
  "futures",
  "ggml-kquant",
  "half",
@@ -6872,6 +6881,11 @@ dependencies = [
  "io-uring",
  "lancedb",
  "libc",
+ "logis-bias",
+ "logis-parsers",
+ "logis-pug",
+ "logis-schema",
+ "logis-sds",
  "memmap2",
  "metal 0.33.0",
  "mimalloc",
@@ -6881,11 +6895,9 @@ dependencies = [
  "nvml-wrapper",
  "once_cell",
  "onnxruntime",
- "pdf-extract",
  "premium-discount-identity",
  "premium-discount-quant",
  "premium-discount-sds",
- "quick-xml 0.41.0",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
  "rayon",
@@ -6912,7 +6924,80 @@ dependencies = [
  "which 6.0.3",
  "windows 0.61.3",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "logis-parsers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "calamine",
+ "csv",
+ "flate2",
+ "pdf-extract",
+ "quick-xml 0.41.0",
+ "regex",
+ "serde_json",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "logis-pug"
+version = "0.1.0"
+dependencies = [
+ "any_ascii",
+ "anyhow",
+ "chrono",
+ "ego-tree",
+ "logis-bias",
+ "logis-schema",
+ "logis-sds",
+ "once_cell",
+ "premium-discount-sds",
+ "rayon",
+ "regex",
+ "scraper",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
+name = "logis-schema"
+version = "0.1.0"
+dependencies = [
+ "any_ascii",
+ "chrono",
+ "dirs 6.0.0",
+ "once_cell",
+ "premium-discount-identity",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "logis-sds"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "logis-schema",
+ "once_cell",
+ "premium-discount-sds",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "logis-search"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "logis-bias",
+ "logis-pug",
+ "logis-schema",
+ "once_cell",
+ "serde_json",
 ]
 
 [[package]]

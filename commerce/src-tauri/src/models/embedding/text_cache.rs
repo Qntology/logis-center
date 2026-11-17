@@ -40,8 +40,7 @@ pub const FORWARD_TAG_BATCHED: &str = "granite-r2/fwd-batched/v1";
 /// 배치 순전파(embed_many, 동적 행 수 · CPU/Vulkan) 결과 공간의 태그.
 pub const FORWARD_TAG_BATCHED_DYN: &str = "granite-r2/fwd-batched-dyn/v1";
 
-/// LRU 계층 기본 상한(엔트리). 384×f32 = 1.5KB 이므로 약 38MB.
-pub const DEFAULT_LRU_CAP: usize = 24_576;
+pub use logis_schema::embed_space::{DEFAULT_LRU_CAP};
 /// 고정 계층 기본 상한(엔트리). 약 25MB. 넘치면 새 고정 요청은 LRU 로 들어갑니다.
 pub const DEFAULT_PINNED_CAP: usize = 16_384;
 

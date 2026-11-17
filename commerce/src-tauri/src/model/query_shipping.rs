@@ -98,7 +98,7 @@ impl crate::model::LogisModel {
         // =====================================================================
         // 앱 언어가 아니라 질의 글의 언어로 고릅니다 (독일어 질의에 한국어 모델을 돌리지 않게).
         let stanza_code = crate::stanza::detect_query_lang(&query, language).unwrap_or("");
-        let tokens = crate::analytic::tokenize_query_with_morphology(&query, stanza_code).await;
+        let tokens = tokenize_query_with_morphology(&query, stanza_code).await;
         if tokens.is_empty() {
             emit_term("   ⚠️ [TOKENIZE] 분석 가능한 토큰이 없습니다.");
         } else {
@@ -2935,7 +2935,7 @@ impl crate::model::LogisModel {
         let mut raw_variants: Vec<Vec<String>> = vec![Vec::new(); n];
         for &i in pending.iter() {
             let lemma = lemmas.get(i).map(|s| s.as_str()).unwrap_or("");
-            raw_variants[i] = crate::analytic::morphological_variants(&words[i], lemma);
+            raw_variants[i] = morphological_variants(&words[i], lemma);
         }
 
         let mut texts: Vec<String> = Vec::new();
@@ -4743,4 +4743,154 @@ pub fn ship_relation_exact(core: &str) -> bool {
         }
     }
     false
+}
+
+// =====================================================================
+// 🌟 [QUERY MORPHOLOGY] 질의 어절의 품사 · 원형과 검색용 원형 후보 (무역 질의 해석이 씁니다; 예전 analytic.rs 에서 옮김)
+// =====================================================================
+
+/// 🌟 [STANZA TOKENIZE + MORPHOLOGY] 질의를 단위로 나누고 대표 UPOS 와 어간(원형)을 붙입니다.
+///  ── 단위 ──
+///   공백으로 낱말을 나누는 언어는 공백 어절, 일본어 · 중국어는 Stanza 토큰입니다 (crate::stanza::analyze_query).
+///  ── 왜 원형(어간)까지 필요한가 ──
+///   교착어 어절은 한 토큰입니다. "클릭한게" 는 bias.json 의 exact_match("클릭")와 완전일치하지 않고,
+///   영어 구 뱅크("clicked")와의 코사인도 낮아 슬라이딩 윈도우에서 NMS 후보가 없었습니다.
+///   한국어는 KAIST 품사로 실질 형태소만 이은 어간(클릭+하+ㄴ+것+이 → 클릭), 그 밖의 언어는 대표 낱말의 원형을 씁니다.
+///  ── 반환 ──
+///   (표면형, UPOS 태그, 어간). 모델이 없거나 실패하면 공백 분할에 태그 · 어간은 빈 문자열입니다.
+pub async fn tokenize_query_with_morphology(
+    query: &str,
+    lang_code: &str,
+) -> Vec<(String, String, String)> {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Stanza 가 없으면(모델 미설치 · 언어 미지원) 품사 없이 공백으로 나누되, 한글 · 가나 · 한자 어절은 닫힌 조사 · 어미 표로 벗긴 어간을
+    // 원형 자리에 둡니다. 원형이 비면 '결제를 안 한' · '않은' 의 부정 판정과 원형 기반 유형 확정이 끊겼습니다.
+    let fallback: Vec<(String, String, String)> = words
+        .iter()
+        .map(|w| {
+            let glued = w.chars().any(|c| matches!(c as u32, 0x3040..=0x30FF | 0x3400..=0x9FFF | 0xAC00..=0xD7A3));
+            let lemma = if glued { crate::utils::ai_utils::closed_tail_lemma(w).unwrap_or_default() } else { String::new() };
+            (w.clone(), String::new(), lemma)
+        })
+        .collect();
+    if words.is_empty() {
+        return fallback;
+    }
+    let q = query.to_string();
+    let code = lang_code.to_string();
+    match tokio::task::spawn_blocking(move || crate::stanza::analyze_query(&q, &code)).await {
+        Ok(Ok(qa)) => {
+            println!(
+                "[MORPH] 🧠 Stanza ({}, {} ms, 단위: {}): {:?}",
+                qa.lang,
+                qa.elapsed_ms,
+                if qa.whitespace_units { "공백 어절" } else { "Stanza 토큰" },
+                qa.describe()
+            );
+            // 내용어가 있는 단위는 기능어 태그로 내지 않습니다 (한국어 '따뜻하게' SCONJ → 첫 실질 형태소 태그)
+            qa.units.into_iter().map(|u| (u.surface, u.upos, u.stem)).collect()
+        }
+        Ok(Err(e)) => {
+            println!("[MORPH] ⚠️ Stanza 분석을 건너뜁니다 ({}): {:#}. 공백 분할로 폴백합니다.", lang_code, e);
+            fallback
+        }
+        Err(e) => {
+            println!("[MORPH] ⚠️ Stanza 분석 작업 실패({}). 공백 분할로 폴백합니다.", e);
+            fallback
+        }
+    }
+}
+
+/// 🌟 [MORPHOLOGICAL VARIANTS] 교착어 어절 하나에서 '검색 가능한 원형 후보'를 만들어 냅니다.
+///  ── 근거 3단 ──
+///   ① Stanza Lemma      : 모델이 직접 알려준 원형 ("클릭한게" → "클릭")
+///   ② bias.json 접두 사전: exact_match 원소가 표면형의 접두이면 그 원소를 어간으로 확정
+///   ③ 문자 접두 n-gram   : ①②가 모두 실패했을 때의 순수 구조 폴백
+///  ── 왜 필요한가 ──
+///   commerce 는 질의에 다른 토큰('제품')이 함께 있어 shared_prefix_stems 로 어간을 얻지만,
+///   "가장 많이 클릭한게 뭐야?" 처럼 어간을 공유하는 형제 토큰이 없는 질의에서는
+///   그 장치가 동작하지 않습니다. 세 근거를 순서대로 시도합니다.
+///  ── 상한 ──
+///   토큰당 최대 3개. 청크 폭발을 막고, 무의미한 조각은 SURPRISAL/편견 게이트가 걸러냅니다.
+pub fn morphological_variants(word: &str, lemma: &str) -> Vec<String> {
+    let surface = word.trim();
+    let mut out: Vec<String> = Vec::new();
+    if surface.chars().count() < 2 {
+        return out;
+    }
+
+    fn push(v: &mut Vec<String>, surface: &str, cand: String) {
+        let c = cand.trim().to_string();
+        if c.is_empty() { return; }
+        if c.chars().count() < 2 { return; }
+        if c == surface { return; }
+        if v.iter().any(|e| e == &c) { return; }
+        v.push(c);
+    }
+
+    // ① Stanza Lemma 원형
+    let l = lemma.trim();
+    if !l.is_empty() && l != surface {
+        let lc: String = l.chars().filter(|c| c.is_alphanumeric()).collect();
+        let sc: String = surface.chars().filter(|c| c.is_alphanumeric()).collect();
+        if !lc.is_empty()
+            && sc.chars().count() > lc.chars().count()
+            && (sc.starts_with(&lc) || sc.ends_with(&lc))
+        {
+            push(&mut out, surface, lc);
+        } else if !lc.is_empty() {
+            push(&mut out, surface, l.to_string());
+        }
+    }
+
+    // ② bias.json exact_match 접두 사전
+    // analytic_event_filters 는 웹 분석이 premium-discount 로 옮겨 간 뒤에도 bias.json 에 남은 어휘입니다(클릭 · 변경 등의 어간 사전).
+    for cat in ["analytic_event_filters", "time_filters", "season_filters"] {
+        if let Some((_, stem)) = crate::utils::ai_utils::prefix_match_filter_stem(cat, surface) {
+            push(&mut out, surface, stem);
+        }
+    }
+
+    let chars: Vec<char> = surface.chars().collect();
+    let code_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '/' | '.' | '_');
+    {
+        let run = chars.iter().take_while(|c| code_char(**c)).count();
+        if run >= 2
+            && run < chars.len()
+            && chars[..run].iter().any(|c| c.is_ascii_alphabetic())
+            && chars[run].is_alphabetic()
+        {
+            let stem: String = chars[..run].iter().collect();
+            push(
+                &mut out,
+                surface,
+                stem.trim_end_matches(|c: char| !c.is_ascii_alphanumeric()).to_string(),
+            );
+        }
+    }
+    let tails: Vec<String> = crate::utils::ai_utils::closed_tail_stems(surface)
+        .into_iter()
+        .map(|(stem, _)| stem)
+        .collect();
+    if tails.is_empty() && chars.len() >= 3 {
+        let hi = (chars.len() - 1).min(4);
+        for n in 2..=hi {
+            if code_char(chars[n - 1]) && code_char(chars[n]) {
+                continue;
+            }
+            push(&mut out, surface, chars[..n].iter().collect::<String>());
+        }
+    }
+
+    if out.len() > 3 {
+        out.truncate(3);
+    }
+    for stem in tails {
+        push(&mut out, surface, stem);
+    }
+    out
 }

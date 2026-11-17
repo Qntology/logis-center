@@ -1,0 +1,18 @@
+[package]
+name = "logis-parsers"
+description = "logis-center 오프라인 문서 리더: Excel · Word · HWP · CSV · PDF 글 · 쪽 추출과 gzip(JSON) 압축. 모델 · DB · Tauri 없음"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+calamine = "0.36.0"
+csv = "1.4.0"
+flate2 = "1.0"
+pdf-extract = "0.12.0"
+quick-xml = "0.41.0"
+regex.workspace = true
+serde_json.workspace = true
+zip = "8.6.0"

@@ -1,0 +1,17 @@
+[package]
+name = "logis-schema"
+description = "logis-center 데이터 계약: 필드 정규화(canonical) · 무역 28종 서식과 허브 규칙(logic) · 엔터티 해시 · 글 도우미 · 임베딩 공간 눈금 · 봉투 컬럼. 모델 · DB · Tauri 없음"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+any_ascii = "0.3.3"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0.0"
+once_cell.workspace = true
+premium-discount-identity.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

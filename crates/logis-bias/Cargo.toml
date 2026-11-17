@@ -1,0 +1,19 @@
+[package]
+name = "logis-bias"
+description = "logis-center 다국어 도메인 사전: bias.json(개발 ko · en) / full_bias.json(배포 12개 언어) 과 덮어쓰기, 필드 라벨 · 선입견 뱅크, 결정론적 시간 가이드, 문서 언어 판정, 엔터티 · 릴레이 키. 모델 · DB · Tauri 없음"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# 디버그 빌드에서도 모든 언어 사전(full_bias.json)을 넣습니다 (릴리스 빌드는 이 기능 없이도 full_bias.json).
+full-bias = []
+
+[dependencies]
+anyhow.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+logis-schema.workspace = true
+once_cell.workspace = true
+serde_json.workspace = true
+whatlang = "0.18.0"

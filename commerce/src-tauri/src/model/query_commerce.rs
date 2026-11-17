@@ -1347,7 +1347,7 @@ impl crate::model::LogisModel {
                         format!("'{}' 도메인에는 유효 기간 축이 없어 기간을 하드 조건으로 싣지 않습니다(DATE FIELD SCOPE 와 같은 규칙). 꼬리가 전부 닫힌 어휘라 기간 조각으로만 확정해 수치·문자 속성 배정에서 빼고 FTS 검색어로 남깁니다.", seg_type)
                     };
                     emit_term(&format!(
-                        "  📅 [EXACT PERIOD] {} ~ {} | op={} | 단위={} | 연도명시={} | 토큰={:?} | 근거={:?} — analytic·shipping 과 같은 12개 언어 닫힌 어휘 표(연·월·일 단위, 시간 연산자)로 확정했습니다. 이 토큰들은 속성 배정에서 빠지고, {}",
+                        "  📅 [EXACT PERIOD] {} ~ {} | op={} | 단위={} | 연도명시={} | 토큰={:?} | 근거={:?} — shipping 과 같은 12개 언어 닫힌 어휘 표(연·월·일 단위, 시간 연산자)로 확정했습니다. 이 토큰들은 속성 배정에서 빠지고, {}",
                         p.start,
                         p.end,
                         p.operator,
@@ -2560,7 +2560,7 @@ impl crate::model::LogisModel {
 
                 // 🌟 [QUOTED NAME / PERIOD LEXICAL GATE] 따옴표로 묶은 이름('Bereit für den Sommerurlaub' · 「夏休み準備セール」)의
                 //    계절어는 기간이 아닙니다. 확정어는 따옴표 밖 낱말에서만 찾고, 벡터 후보는 따옴표 밖 질의에 그 키의 구 낱말이
-                //    있을 때만 LLM 에게 묻습니다 (analytic::period_lexical_support, 행동 로그 질의와 같은 규칙).
+                //    있을 때만 LLM 에게 묻습니다 (utils::time_guide::period_lexical_support).
                 //    v2 질의: 영어 · 중국어 · 스페인어 · 이탈리아어 · 포르투갈어 · 체코어의 C7 이 이름 속 Sommer 로 여름 기간이 걸려
                 //    행사 기간 → 주문 → 상품 연결 대신 행사 4건만 보였습니다 (R@all 0).
                 //    동사 · 조동사로 쓰인 낱말(프랑스어 'a été expédiée' 의 été = être 의 과거분사, 영어 'prices fall' 의 fall)도
@@ -2577,14 +2577,14 @@ impl crate::model::LogisModel {
                     !t.is_empty() && !verbal(w.trim_matches(|c: char| !c.is_alphanumeric())) && unquoted_query.contains(&t)
                 };
                 let period_phrases = crate::utils::ai_utils::filter_category_phrases(&["time_filters", "season_filters"]);
-                // 기능어('that' ≈ 'thaw')는 기간의 글자 근거가 아닙니다 (analytic::period_function_words 설명).
+                // 기능어('that' ≈ 'thaw')는 기간의 글자 근거가 아닙니다 (utils::time_guide::period_function_words 설명).
                 let period_function_words =
-                    crate::analytic::period_function_words(word_pos_map.iter().map(|(w, t)| (w.as_str(), t.as_str())));
-                let period_text = crate::analytic::strip_period_function_words(&unquoted_query, &period_function_words);
+                    crate::utils::time_guide::period_function_words(word_pos_map.iter().map(|(w, t)| (w.as_str(), t.as_str())));
+                let period_text = crate::utils::time_guide::strip_period_function_words(&unquoted_query, &period_function_words);
                 let period_supported = |cat: &str, key: &str| -> bool {
                     let phrases: Vec<&str> =
                         period_phrases.iter().filter(|(c, k, _)| c == cat && k == key).map(|(_, _, p)| p.as_str()).collect();
-                    crate::analytic::period_lexical_support(&period_text, &phrases)
+                    crate::utils::time_guide::period_lexical_support(&period_text, &phrases)
                 };
                 let mut exact_season_key = String::new();
                 let mut exact_time_key = String::new();
@@ -3174,7 +3174,7 @@ impl crate::model::LogisModel {
                     // 🌟 [QWEN3 VERIFICATION: TIME & SEASON] Plinko에서 대충 잡힌 시간/시즌을 LLM으로 2차 검증하여 환각을 원천 차단합니다.
                     let mut verified_time = String::new();
                     if exact_period.is_some() {
-                        emit_term("  🕒 [TIME / EXACT PERIOD] 절대 기간이 확정되어 상대 시간 의도는 LLM 에게 묻지 않습니다. analytic 과 같은 우선순위입니다.");
+                        emit_term("  🕒 [TIME / EXACT PERIOD] 절대 기간이 확정되어 상대 시간 의도는 LLM 에게 묻지 않습니다.");
                     } else if !exact_time_key.is_empty() {
                         verified_time = exact_time_key.clone();
                         emit_term(&format!("  🕒 [TIME EXACT MATCH] Time Intent 를 bias.json exact_match 로 '{}' 확정합니다 (LLM 에게 되묻지 않습니다). 계절과 같은 규칙입니다. 지금까지는 이 확정이 결정론 시간 가이드에 전달되지 않아 '오늘'·'지난달' 이 속성 배정에서만 빠지고 기간 조건은 만들어지지 않았습니다.", verified_time));

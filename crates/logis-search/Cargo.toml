@@ -1,0 +1,15 @@
+[package]
+name = "logis-search"
+description = "logis-center 검색 규칙: 질의 전체 트랙 · 문서 트랙 융합, 질의 속 고정점 → 목표 유형 관계 단계(유형 · 고정점 · 연결 · 서식 질의 근거 · 음성 고정점 · 교차 언어 제목 조각). 저장소 · 모델 없음"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+logis-bias.workspace = true
+logis-pug.workspace = true
+logis-schema.workspace = true
+once_cell.workspace = true
+serde_json.workspace = true

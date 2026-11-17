@@ -191,7 +191,6 @@ pub async fn index_item_chunks(
 
     // 🌟 [MODE GUARD] mode 가 비면 item_chunks 의 mode 컬럼이 빈 문자열이 되고,
     //    STAGE-4 의 `mode = 'commerce'` 필터에서 전량 탈락합니다.
-    //    (analytic 트랙에서 청크 검색이 0건이던 원인)
     //    호출부가 빈 값을 넘겨도 안전하도록 여기서 방어합니다.
     let search_mode = if search_mode.trim().is_empty() {
         item_json.get("mode").and_then(|v| v.as_str()).unwrap_or("commerce")
@@ -209,14 +208,14 @@ pub async fn index_item_chunks(
     //
     //  ── mode 값의 실제 집합 ──
     //   lib.rs 의 ai_search_complex 가 진실의 원천입니다.
-    //     match search_mode.as_str() { "shipping" => .., "analytic" => .., _ => commerce }
-    //   즉 mode 는 commerce / shipping / analytic 3종이며 "trading" 은 존재하지 않습니다.
+    //     match search_mode.as_str() { "shipping" => .., _ => commerce }
+    //   즉 mode 는 commerce / shipping 2종이며 "trading" 은 존재하지 않습니다 (웹 분석 analytic 은 premium-discount 로 옮김).
     //   ("trading" 은 scheduler/trading.rs 라는 파이프라인 이름일 뿐입니다)
     //
     //  ── 왜 단방향인가 ──
     //   shipping 모드에서 commerce 스키마(tracking/배송 축)가 등장하는 것은 정상입니다.
     //   배송 축은 두 도메인에 걸쳐 있기 때문입니다.
-    //   막아야 하는 것은 그 반대, 즉 commerce·analytic 모드에서
+    //   막아야 하는 것은 그 반대, 즉 commerce 모드에서
     //   무역 서식 87필드 스키마가 로드되는 경우뿐입니다.
     //
     //  ── 실측 사고 (log.txt) ──
@@ -255,11 +254,6 @@ pub async fn index_item_chunks(
         crate::parsing::get_list_schema_fields(page_type, url, doc_lang)
     };
 
-    // 🌟 [SCHEMA GUARD] analytics 트랙(click / hover / change / report)은 bias.json 에
-    //    대응 스키마가 없어 fields 가 항상 비어 있습니다.
-    //    뱅크가 비면 PLINKO 는 전 청크를 unclassified 로 떨어뜨리므로,
-    //    임베딩 배치를 헛돌리지 않고 여기서 즉시 종료합니다.
-    //    (아이템 레벨 벡터는 reindex_pending_embeddings 가 이미 만들어 두었습니다)
     // 🌟 [CHUNK TYPE GUARD] 비검색 타입은 스키마 필드 조회 전에 구조적으로 차단합니다.
     //    fields.is_empty() 판정만으로는 bias.json 에 우연히 남은 키가 있으면
     //    불필요한 임베딩 배치가 실행됩니다.
@@ -557,7 +551,7 @@ pub async fn index_item_chunks(
     let metas: Vec<&crate::nl_convert::ChunkMetadata> =
         indexable_chunks.iter().map(|(_, c)| *c).collect();
 
-    // 🌟 [ANALYTIC TRANSLIT SKIP] 전처리에서 이미 음차를 완료한 경우 건너뜁니다.
+    // 🌟 [TRANSLIT SKIP] 음차를 이미 했거나(호출부가 앞 단계에서 완료) 언어 모델 없이 색인할 때(합성 평가 seed) 건너뜁니다.
     //    이제 이 호출 시점에는 임베딩이 필요한 계산이 전부 끝나 있으므로,
     //    generate_transliteration_aliases 가 임베딩을 반환시키고
     //    Qwen3.5 를 올려도 두 가중치가 겹치지 않습니다.

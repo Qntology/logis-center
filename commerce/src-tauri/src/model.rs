@@ -17,7 +17,6 @@ pub mod research;
 pub mod query_shipping;
 pub mod query_commerce;
 pub mod merge;
-pub mod query_analytic;
 pub mod lang_llm;
 pub mod lang_gguf;
 

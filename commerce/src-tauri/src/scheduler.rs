@@ -17,7 +17,8 @@ use std::sync::Mutex as StdMutex;
 pub mod translit;
 pub mod indexing;
 mod worker;
-mod entity;
+// 엔터티 키 · index · id · bcc 는 crates/logis-bias 로 옮겼습니다 (예전 경로 crate::scheduler::entity 그대로).
+pub use logis_bias::entity;
 pub mod relay_ledger;
 pub mod trading;
 pub mod list_census;
@@ -566,10 +567,10 @@ pub async fn process_task(
 =======================================");
     emit_term(&format!("[PROCESS] ⚙️ Task {} started processing.", task.id));
 
+    // 웹 분석(analytic_extraction)은 premium-discount 로 옮겼습니다. 예전에 쌓인 작업이 남아 있어도 이 앱은 처리하지 않습니다.
     if task.r#type == "analytic_extraction" {
-        return crate::analytic::process_analytic_task(
-            task, store_mutex, model_mutex, cancellation_token, app_handle, device_preference
-        ).await;
+        emit_term("[PROCESS] ⏭️ analytic_extraction 작업은 premium-discount 로 옮겨 이 앱에서 처리하지 않습니다.");
+        return Err(anyhow::anyhow!("analytic_extraction moved to premium-discount"));
     }
 
     let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
@@ -658,7 +659,7 @@ pub async fn process_task(
         model_lock.as_ref().unwrap().clone()
     };
 
-    if task.r#type != "image_extraction" && task.r#type != "analytic_extraction" {
+    if task.r#type != "image_extraction" {
         model.check_embedding_downloaded().await?;
     }
 
@@ -719,8 +720,6 @@ pub async fn process_task(
     {
         let track = if search_mode == "shipping" {
             crate::utils::score_dynamics::Track::Trading
-        } else if search_mode == "analytic" {
-            crate::utils::score_dynamics::Track::Analytic
         } else {
             crate::utils::score_dynamics::Track::Commerce
         };
@@ -861,7 +860,7 @@ pub async fn process_task(
     //   하나로 강제 분류되므로, 그 전에 갈라야 합니다.
     //
     //  ── mode 값의 실제 집합 ──
-    //   lib.rs 의 ai_search_complex 기준으로 mode 는 commerce / shipping / analytic 3종입니다.
+    //   lib.rs 의 ai_search_complex 기준으로 mode 는 commerce / shipping 2종입니다 (웹 분석 analytic 은 premium-discount 로 옮김).
     //   "trading" 은 파이프라인 이름일 뿐 mode 값이 아니므로, 리라우트 대상 mode 는 shipping 입니다.
     //   process_trading_task 가 저장 시 data.mode 를 'shipping' 으로 확정하므로
     //   여기서는 파이프라인만 바꾸면 됩니다.
@@ -869,22 +868,7 @@ pub async fn process_task(
     //  ── 비용 ──
     //   자기선언 라벨이 없는 페이지(커머스 목록/상세)는 라벨 임베딩 몇 개만 쓰고 즉시 빠집니다.
     // =====================================================================
-    // 🌟 [ANALYTIC GUARD] analytic 은 코사인 mode 판정 대상이 아닙니다.
-    //
-    //  ── 근거 ──
-    //   analytic 은 이 함수 최상단에서 task.r#type == "analytic_extraction" 로
-    //   결정론 분기되며, 이후 type(click / hover / change / touch / report)은
-    //   Worker 가 내려준 D1 row 의 type 컬럼에서 옵니다. 코사인이 개입하지 않습니다.
-    //
-    //  ── 그래도 가드가 필요한 이유 ──
-    //   main.ts 의 WebRTC mobile_upload 경로는 document_extraction 을 만들면서
-    //   search_mode: currentSearchMode 를 그대로 실어 보냅니다.
-    //   즉 search_mode='analytic' + type='document_extraction' 조합이 성립하고,
-    //   그 경우 무역 프로브를 타서 mode='shipping' 으로 저장될 수 있습니다.
-    //   index_item_chunks 의 DOMAIN CONSISTENCY GATE 가 청크는 막아 주지만
-    //   아이템 자체는 이미 잘못된 mode 로 기록된 뒤입니다.
     if search_mode != "shipping"
-        && search_mode != "analytic"
         && (task.r#type == "html_extraction" || task.r#type == "document_extraction")
     {
         model.check_embedding_downloaded().await?;

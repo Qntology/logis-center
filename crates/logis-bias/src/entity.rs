@@ -26,14 +26,14 @@ pub fn normalize_entity_key(raw: &str) -> String {
     if has_alpha {
         stripped
     } else {
-        crate::utils::hash::normalize_numeric_homoglyphs(&stripped)
+        logis_schema::hash::normalize_numeric_homoglyphs(&stripped)
     }
 }
 
 /// 🌟 [ENTITY KEY v5] 문서 index. 이 식 외의 index 계산은 존재해서는 안 됩니다.
 pub fn entity_index(type_: &str, team_id: &str, raw_no: &str) -> u32 {
     let clean = normalize_entity_key(raw_no);
-    crate::utils::hash::crc32(&crate::utils::hash::hash_id(&format!(
+    logis_schema::hash::crc32(&logis_schema::hash::hash_id(&format!(
         "{}{}{}",
         type_, team_id, clean
     )))
@@ -45,18 +45,18 @@ pub fn entity_index(type_: &str, team_id: &str, raw_no: &str) -> u32 {
 ///   id 가 index 와 무관한 식으로 만들어지면, index 로는 찾았는데
 ///   저장은 다른 id 로 되어 같은 문서가 두 행이 됩니다.
 pub fn entity_id(team_id: &str, index: u32) -> String {
-    crate::utils::hash::hash_id(&format!("{}{}", team_id, index))
+    logis_schema::hash::hash_id(&format!("{}{}", team_id, index))
 }
 
 /// 🌟 [ENTITY KEY v5] 봉투 bcc. 타입별 목록 필터가 이 값으로 동작합니다.
 pub fn entity_bcc(type_: &str, cc: &str) -> String {
-    crate::utils::hash::hash_id(&format!("{}{}", type_, cc))
+    logis_schema::hash::hash_id(&format!("{}{}", type_, cc))
 }
 
 pub fn entity_seed(cc: &str, raw: &str) -> String {
     let t = raw.trim();
     let scope = cc.trim();
-    if t.is_empty() || scope.is_empty() || crate::utils::hash::is_valid_relay_key(t) {
+    if t.is_empty() || scope.is_empty() || logis_schema::hash::is_valid_relay_key(t) {
         return t.to_string();
     }
     format!("{}:{}", scope, t)
@@ -64,10 +64,10 @@ pub fn entity_seed(cc: &str, raw: &str) -> String {
 
 pub fn relay_type_key(type_: &str) -> String {
     let t = type_.trim();
-    if let Some(code) = crate::utils::bias_schema::canonical_trade_doc_code(t) {
+    if let Some(code) = crate::bias_schema::canonical_trade_doc_code(t) {
         return code.to_string();
     }
-    let family = crate::utils::canonical::relay_type_family(t);
+    let family = logis_schema::canonical::relay_type_family(t);
     match family.as_str() {
         "goods" | "order" | "tracking" => family,
         _ => t.to_lowercase(),
@@ -79,10 +79,10 @@ pub fn relay_seed(type_key: &str, scope: &str, raw: &str) -> String {
     if t.is_empty() {
         return String::new();
     }
-    if crate::utils::bias_schema::is_trade_doc_type(type_key) {
+    if crate::bias_schema::is_trade_doc_type(type_key) {
         return t.to_string();
     }
-    if type_key == "tracking" && crate::utils::hash::is_valid_relay_key(t) {
+    if type_key == "tracking" && logis_schema::hash::is_valid_relay_key(t) {
         return t.to_string();
     }
     let s = scope.trim();

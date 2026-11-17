@@ -39,11 +39,11 @@ pub struct AppConfig {
     pub auth_token: Option<String>,
 }
 
-pub const ENVELOPE_COLUMNS: [&str; 11] = [
-    "id", "type", "flag", "from", "to", "cc", "bcc", "ref", "mode",
-    "created_at", "updated_at",
-];
+// 봉투 물리 컬럼은 logis-schema 에 있습니다 (자연어 변환도 씁니다).
+pub use logis_schema::envelope::ENVELOPE_COLUMNS;
 
+/// 웹 분석(analytic) 트랙의 이벤트 · 리포트 유형. 트랙은 premium-discount 로 옮겼고 이 앱은 더 만들지 않지만, 기존 DB 에 남은 행이
+/// mode 'analytic' 으로 격리된 채 검색 · 임베딩 · 도메인 시딩에 섞이지 않도록 유형 구분은 남겨 둡니다. 프런트엔드(modes/types.ts)는 이 유형을 더 모르고 커머스로 읽지만, 그런 행은 mode 를 달고 오지 않으면 생기지 않습니다.
 pub const ANALYTIC_TYPES: [&str; 7] = [
     "click", "hover", "change", "touch", "report", "question", "answer",
 ];
@@ -110,14 +110,12 @@ pub fn needs_domain_seed(target_table: &str, type_: &str) -> bool {
 }
 
 /// 로컬 임베딩(reindex_pending_embeddings) 대상에서 제외할 타입인가.
-/// analytic 원시 이벤트(click/hover/change/touch)와 report 는 제외하지 않습니다.
-/// 그것들이 빠지면 D1 에서 받아온 행동 로그가 검색에 절대 잡히지 않습니다.
 pub fn is_embed_excluded_type(type_: &str) -> bool {
     let t = type_.trim().to_lowercase();
     if t == "pages" || t == "page" { return true; }
     if is_talk_type(&t) { return true; }
     if t == "users" || is_user_type(&t) { return true; }
-    // question / answer 는 관리자 채팅 말풍선이며 parse_analytic_query 의 검색 스코프에서도 제외됩니다.
+    // question / answer 는 관리자 채팅 말풍선입니다.
     if t == "question" || t == "answer" { return true; }
     false
 }
