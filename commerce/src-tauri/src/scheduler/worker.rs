@@ -7,13 +7,12 @@ use crate::store::VectorStore;
 use crate::model::LogisModel;
 use crate::scheduler::{PROGRESS_TX, process_task};
 use crate::utils::logger::log_task_progress;
-use tauri::Emitter;
 
 pub async fn start_background_worker(
     store: Arc<Mutex<Option<VectorStore>>>,
     model: Arc<Mutex<Option<LogisModel>>>,
     cancellation_token: Arc<AtomicBool>,
-    app_handle: tauri::AppHandle,
+    app_handle: crate::sink::Sink,
 ) {
     println!("[Scheduler] Background worker waiting for UI Ready signal...");
     
@@ -21,7 +20,6 @@ pub async fn start_background_worker(
     let _ = PROGRESS_TX.set(ptx);
     let app_handle_prog = app_handle.clone();
     tokio::spawn(async move {
-        use tauri::Emitter;
         while let Some(payload) = prx.recv().await {
             if let Ok(mut w) = crate::LATEST_PROGRESS_PAYLOAD.write() {
                 *w = Some(payload.clone());
@@ -269,7 +267,7 @@ pub async fn start_background_worker(
                                 let _ = app_handle.emit("extraction-progress", &payload);
 
                                 
-                                let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task.id);
+                                let log_path = crate::utils::paths::get_task_log_file(&task.id);
                                 let _ = std::fs::remove_file(&log_path);
                                 
                                 {
@@ -301,7 +299,7 @@ pub async fn start_background_worker(
                                     current_device_pref = Some("cpu".to_string());
 
 
-                                    let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task.id);
+                                    let log_path = crate::utils::paths::get_task_log_file(&task.id);
                                     let _ = std::fs::remove_file(&log_path);
 
                                     log_task_progress(&app_handle, &task.id, &json!({

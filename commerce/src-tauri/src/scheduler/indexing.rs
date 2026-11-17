@@ -3,7 +3,6 @@ use serde_json::{json, Value};
 use crate::store::VectorStore;
 use crate::model::LogisModel;
 use crate::scheduler::translit::generate_transliteration_aliases;
-use tauri::Emitter;
 
 /// [SYNONYM EXPANSION] 생성된 별칭을 item_chunks 에 추가 행으로 저장합니다.
 ///
@@ -173,7 +172,7 @@ pub async fn index_item_chunks(
     search_mode: &str,
     url: &str,
     cancel: &Arc<AtomicBool>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::sink::Sink,
     task_id: &str,
     skip_transliteration: bool,
 ) -> anyhow::Result<usize> {

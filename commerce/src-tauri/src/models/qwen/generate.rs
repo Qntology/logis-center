@@ -154,7 +154,7 @@ pub struct LayerBlockInfo {
 pub static INDEX_TX: Lazy<mpsc::Sender<SlotTask>> = Lazy::new(|| {
     let (tx, mut rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let kv_dir = crate::utils::paths::get_kv_dir();
         while let Some(task) = rx.recv().await {
             if let SlotTask::IndexUpdate { kv_name, layer_idx, offset, len, file_name } = task {
                 let index_path = kv_dir.join(&kv_name).join(format!("layer{}.json", layer_idx));
@@ -702,7 +702,7 @@ impl QwenVLGenerateModel {
         let total_toks = full_ids.len();
         self.qwen.forward(&Tensor::from_vec(full_ids.clone(), (1, total_toks), &self.text_device)?, None, None, None, None, None, 0, total_toks, session_id.clone(), _kv_name.clone()).await?;
         if let Some(s_id) = &session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            let path = crate::utils::paths::get_kv_dir().join(s_id);
             if !path.exists() { fs::create_dir_all(&path)?; }
             fs::write(path.join("tokens.json"), serde_json::to_string(&full_ids)?)?;
             let _ = self.force_flush_all_active_blocks(s_id, _kv_name.as_deref()).await;
@@ -726,7 +726,7 @@ impl QwenVLGenerateModel {
         self.refresh_vocab_for(&crate::models::common::vocab_trim::prompt_text(&mes), mes.temperature.unwrap_or(0.0) > 1e-7)?;
         let mut is_reference_snapshot = false;
         if let Some(s_id) = &session_id {
-            let snapshot_root = crate::utils::paths::get_kv_dir(None).join(s_id);
+            let snapshot_root = crate::utils::paths::get_kv_dir().join(s_id);
             
             let paths_to_try = vec![
                 snapshot_root.join("inference").join("text"),

@@ -1345,7 +1345,7 @@ impl Qwen3_5Attention {
 
                     // ... SSD 읽어오는 로직 생략 (기존과 동일하게 작동함) ...
                     if k_cpu.is_none() {
-                        let kv_dir = crate::utils::paths::get_kv_dir(None);
+                        let kv_dir = crate::utils::paths::get_kv_dir();
                         let sid = self.active_session_id.as_deref().unwrap_or("default_session");
                         let kv_name_raw = self.active_kv_name.as_deref().unwrap_or("text");
                         let kv_type = kv_name_raw.split('/').last().unwrap_or("text");
@@ -2567,7 +2567,7 @@ impl Qwen3_5TextModel {
                 let (conv_opt, rec_opt) = layer.get_ssm_states();
                 if conv_opt.is_none() || rec_opt.is_none() {
                     if let Some(sid) = &session_id {
-                        let kv_dir = crate::utils::paths::get_kv_dir(None);
+                        let kv_dir = crate::utils::paths::get_kv_dir();
                         
                         let kv_name_raw = kv_name.as_deref().unwrap_or("text");
                         let mut safe_kv_type = kv_name_raw.split('/').last().unwrap_or("text");
@@ -2763,7 +2763,7 @@ impl Qwen3_5TextModel {
 
             
             if let Some(sid) = &session_id {
-                let kv_dir = crate::utils::paths::get_kv_dir(None);
+                let kv_dir = crate::utils::paths::get_kv_dir();
                 let kv_name_raw = kv_name.as_deref().unwrap_or("text");
                 let last_part = kv_name_raw.split('/').last().unwrap_or("text");
                 let kv_type = if last_part == "inference" || last_part == "reference" || last_part.is_empty() { "text" } else { last_part };
@@ -3470,7 +3470,7 @@ impl Qwen3_5TextModel {
 
     pub fn restore_kv_registry(&mut self, kv_name: &str) -> Result<()> {
         use crate::models::qwen::generate::LayerIndex;
-        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let kv_dir = crate::utils::paths::get_kv_dir();
         let index_path = kv_dir.join(kv_name).join("layer0.json");
         
         if !index_path.exists() { return Ok(()); }
@@ -3692,7 +3692,7 @@ impl Qwen3_5TextModel {
             }
         }
 
-        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let kv_dir = crate::utils::paths::get_kv_dir();
         let mode = false; 
         
         

@@ -64,7 +64,7 @@ pub fn get_local_network_prefix() -> String {
 }
 
 // TCP 시그널링 리스너 (Answer 회신 대기 기능 포함)
-pub fn start_signal_listener(app_handle: tauri::AppHandle, seed: u64) {
+pub fn start_signal_listener(app_handle: crate::sink::Sink, seed: u64) {
     // 🌟 [CRITICAL FIX] 명령이 들어올 때마다 시드(Seed) 번호만 최신화합니다.
     ACTIVE_SEED.store(seed, Ordering::SeqCst);
     
@@ -106,7 +106,6 @@ pub fn start_signal_listener(app_handle: tauri::AppHandle, seed: u64) {
                                     map.insert(ip_str.clone(), tx);
                                 }
 
-                                use tauri::Emitter;
                                 let _ = app_handle_clone.emit("webrtc-offer", (msg.sdp, ip_str.clone()));
 
                                 // 프론트엔드로부터 Answer가 올 때까지 대기 (최대 10초)

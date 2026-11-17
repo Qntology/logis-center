@@ -411,7 +411,7 @@ impl Qwen3GenerateModel {
         }
         if tensors.is_empty() { return Ok(()); }
         
-        let dir = cache_dir.unwrap_or_else(|| crate::utils::paths::get_kv_dir(None).to_string_lossy().into_owned());
+        let dir = cache_dir.unwrap_or_else(|| crate::utils::paths::get_kv_dir().to_string_lossy().into_owned());
         std::fs::create_dir_all(&dir)?;
         let path = std::path::Path::new(&dir).join(format!("{}.safetensors", session_id));
         candle_core::safetensors::save(&tensors, path)?;
@@ -419,7 +419,7 @@ impl Qwen3GenerateModel {
     }
 
     pub fn load_kv_cache(&mut self, session_id: &str, cache_dir: Option<String>) -> Result<bool> {
-        let dir = cache_dir.unwrap_or_else(|| crate::utils::paths::get_kv_dir(None).to_string_lossy().into_owned());
+        let dir = cache_dir.unwrap_or_else(|| crate::utils::paths::get_kv_dir().to_string_lossy().into_owned());
         let path = std::path::Path::new(&dir).join(format!("{}.safetensors", session_id));
         if !path.exists() { return Ok(false); }
         

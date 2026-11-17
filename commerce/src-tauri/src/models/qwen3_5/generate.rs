@@ -1192,7 +1192,7 @@ impl Qwen3_5GenerateModel {
         ).await?;
 
         if let Some(s_id) = &session_id {
-            let path = crate::utils::paths::get_kv_dir(None).join(s_id);
+            let path = crate::utils::paths::get_kv_dir().join(s_id);
             if !path.exists() { std::fs::create_dir_all(&path)?; }
             
             std::fs::write(path.join("tokens.json"), serde_json::to_string(&safe_input_ids)?)?;

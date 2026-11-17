@@ -1,15 +1,14 @@
 use serde_json::Value;
 
-pub fn log_task_progress(app: &tauri::AppHandle, task_id: &str, payload: &Value) {
+pub fn log_task_progress(app: &crate::sink::Sink, task_id: &str, payload: &Value) {
     use std::io::Write;
-    use tauri::Emitter;
 
     let mut final_payload = payload.clone();
     if let Some(obj) = final_payload.as_object_mut() {
         obj.insert("task_id".to_string(), serde_json::json!(task_id));
     }
 
-    let log_path = crate::utils::paths::get_task_log_file(Some(app), task_id);
+    let log_path = crate::utils::paths::get_task_log_file(task_id);
     
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)

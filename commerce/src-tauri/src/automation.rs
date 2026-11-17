@@ -328,14 +328,14 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 
                 if current_is_shop {
                     println!("[AUTO] Active Shop Context Sync: {}", last_detected_url);
-                    let tmp_root = crate::utils::paths::get_app_tmp_root(None);
+                    let tmp_root = crate::utils::paths::get_app_tmp_root();
                     let _ = std::fs::create_dir_all(&tmp_root);
                     let shared_data = json!({
                         "origin": last_detected_url,
                         "type": "",
                         "step": "idle",
                         "session_id": "",
-                        "kv_path": crate::utils::paths::get_kv_dir(None).to_string_lossy().into_owned()
+                        "kv_path": crate::utils::paths::get_kv_dir().to_string_lossy().into_owned()
                     });
                     if let Ok(json_str) = serde_json::to_string(&shared_data) {
                         let _ = std::fs::write(tmp_root.join("index.json"), json_str);
@@ -424,7 +424,7 @@ async fn run_driverless_automation(browser: &str, url: &str, _script: &str, app_
                 .no_sandbox()
                 .viewport(None);
 
-            let tmp_root = crate::utils::paths::get_app_tmp_root(None);
+            let tmp_root = crate::utils::paths::get_app_tmp_root();
             let profile_dir = tmp_root.join("browser_profiles").join(browser);
             let _ = std::fs::create_dir_all(&profile_dir);
             let mut p_str = std::fs::canonicalize(&profile_dir).unwrap_or(profile_dir).to_string_lossy().to_string();

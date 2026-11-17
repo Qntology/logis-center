@@ -471,7 +471,7 @@ fn vocab_trim_fetch_4b() -> R {
     let handle = app.handle().clone();
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let phase = lang_llm::request_download(code, &handle, "trim_fetch_4b");
+        let phase = lang_llm::request_download(code, &tauri_app_lib::sink::tauri(&handle), "trim_fetch_4b");
         println!("[TRIM-TEST] 다운로드 요청: {phase:?}");
         let t0 = Instant::now();
         loop {

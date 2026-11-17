@@ -32,7 +32,7 @@ pub enum ModelSize {
 
 #[derive(Clone)]
 pub struct LogisModel {
-    pub app_handle: tauri::AppHandle,
+    pub app_handle: crate::sink::Sink,
     pub generator: Arc<TokioMutex<Option<QwenVLGenerateModel>>>, 
     pub qwen3_generator: Arc<TokioMutex<Option<Qwen3GenerateModel>>>, 
     pub qwen3_5_generator: Arc<TokioMutex<Option<Qwen3_5GenerateModel>>>,

@@ -25,6 +25,8 @@ pub mod position_embed;
 pub mod openai_types;
 pub mod chat_template;
 pub mod tokenizer;
+// 🌟 [EVENT SINK] model · scheduler 는 tauri::AppHandle 대신 Sink 로 이벤트를 내보냅니다 (명령 진입점에서 sink::tauri 로 감쌈).
+pub mod sink;
 
 use tauri::{State, Manager, Listener, Emitter}; 
 use tokio::sync::Mutex as TokioMutex;
@@ -102,10 +104,10 @@ async fn stop_current_extraction(
             let _ = db.delete_message_by_task_id(id).await;
             
             // [CLEANUP] 작업 취소 시 해당 세션의 무거운 KV 캐시와 임시 데이터 폴더를 즉각 삭제하여 디스크 용량을 확보합니다.
-            let kv_dir = crate::utils::paths::get_kv_dir(None).join(id);
-            let base_kv_dir = crate::utils::paths::get_kv_dir(None).join(format!("{}_base", id));
-            let task_data_dir = crate::utils::paths::get_task_specific_dir(None, id);
-            let pug_log_dir = crate::utils::paths::get_pug_logs_dir(None, id);
+            let kv_dir = crate::utils::paths::get_kv_dir().join(id);
+            let base_kv_dir = crate::utils::paths::get_kv_dir().join(format!("{}_base", id));
+            let task_data_dir = crate::utils::paths::get_task_specific_dir(id);
+            let pug_log_dir = crate::utils::paths::get_pug_logs_dir(id);
 
             let _ = std::fs::remove_dir_all(&kv_dir);
             let _ = std::fs::remove_dir_all(&base_kv_dir);
@@ -242,7 +244,7 @@ async fn get_embedding_batch_for_translit(
     let model = {
         let mut model_guard = state.model.lock().await;
         if model_guard.is_none() {
-            match LogisModel::new(app_handle.clone(), None).await {
+            match LogisModel::new(crate::sink::tauri(&app_handle), None).await {
                 Ok(m) => { *model_guard = Some(m); },
                 Err(e) => return Err(format!("Model load failed: {}", e)),
             }
@@ -278,7 +280,7 @@ async fn get_query_embedding(
         }
 
         if model_guard.is_none() {
-            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+            match LogisModel::new(crate::sink::tauri(&app_handle), device_preference.as_deref()).await {
                 Ok(m) => { *model_guard = Some(m); },
                 Err(e) => return Err(format!("Model load failed: {}", e)),
             }
@@ -466,7 +468,7 @@ async fn reindex_pending_embeddings(
             }
         }
         if model_guard.is_none() {
-            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+            match LogisModel::new(crate::sink::tauri(&app_handle), device_preference.as_deref()).await {
                 Ok(m) => { *model_guard = Some(m); },
                 Err(e) => return Err(format!("Model load failed: {}", e)),
             }
@@ -602,7 +604,7 @@ async fn reindex_pending_embeddings(
         if needs_chunks {
             let _ = crate::scheduler::indexing::index_item_chunks(
                 &store, &model, &doc.id, &doc.r#type, &doc_lang, &data, true,
-                &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &app_handle, "cloud_sync",
+                &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &crate::sink::tauri(&app_handle), "cloud_sync",
                 false,
             ).await;
         }
@@ -2681,7 +2683,7 @@ async fn ai_search_complex(
             }
         }
         if model_guard.is_none() {
-            if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await { 
+            if let Ok(m) = LogisModel::new(crate::sink::tauri(&app_handle), device_preference.as_deref()).await { 
                 *model_guard = Some(m);
             } else { 
                 IS_SEARCHING.store(false, Ordering::SeqCst); 
@@ -2714,7 +2716,7 @@ async fn ai_search_complex(
         "spinner": "⠋" 
     });
     let _ = app_handle.emit("extraction-progress", &payload_start);
-    crate::utils::logger::log_task_progress(&app_handle, &task_id, &payload_start);
+    crate::utils::logger::log_task_progress(&crate::sink::tauri(&app_handle), &task_id, &payload_start);
 
     
     let search_process = async {
@@ -2786,10 +2788,10 @@ async fn ai_search_complex(
         _vocab_scope.also(&language);
         let mut structured_query = match search_mode.as_str() {
             "shipping" => {
-                model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
+                model.parse_shipping_query(&task_id, &crate::sink::tauri(&app_handle), query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
             },
             _ => { // default: commerce
-                model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
+                model.parse_commerce_query(&task_id, &crate::sink::tauri(&app_handle), query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
             }
         };
 
@@ -4109,7 +4111,7 @@ async fn deep_research_command(
     }
 
     if model_guard.is_none() {
-        if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+        if let Ok(m) = LogisModel::new(crate::sink::tauri(&app_handle), device_preference.as_deref()).await {
             *model_guard = Some(m);
         } else {
             return Err("Failed to load model".to_string());
@@ -4161,7 +4163,7 @@ async fn deep_research_command(
     drop(store_guard);
 
     // 2. Run Deep Research (Reduce: 생성 한 번)
-    model.run_deep_research(query, &digest, top_documents, &app_handle, Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
+    model.run_deep_research(query, &digest, top_documents, &crate::sink::tauri(&app_handle), Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -4327,7 +4329,7 @@ async fn connect_with_seed(_target_ip: String, _seed: u64) -> Result<(), String>
 
 #[tauri::command]
 async fn start_listener_command(app_handle: tauri::AppHandle, seed: u64) -> Result<(), String> {
-    crate::utils::network::start_signal_listener(app_handle, seed);
+    crate::utils::network::start_signal_listener(crate::sink::tauri(&app_handle), seed);
     println!("Signal Listener started on port 9999 with seed: {}", seed);
     Ok(())
 }
@@ -4551,7 +4553,7 @@ async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>
 
 #[tauri::command]
 async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<Vec<Value>, String> {
-    let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task_id);
+    let log_path = crate::utils::paths::get_task_log_file(&task_id);
     
     
     // 메모리에 떠도는 최신 퍼센트를 강제로 끝에 끼워 넣으면 스텝 순서(stepMap)가 꼬입니다.
@@ -5310,7 +5312,7 @@ pub fn run() {
             }
 
             // [INIT] AppData/tmp 내부의 kv, logs, task_data 디렉토리를 초기화하여 이전 실행의 찌꺼기 완벽 삭제
-            crate::utils::paths::cleanup_temp_dirs(Some(app.handle()));
+            crate::utils::paths::cleanup_temp_dirs();
 
             // [INIT] KV Bake Worker (Immediate)
             crate::models::qwen::generate::init_bake_worker();
@@ -5378,7 +5380,7 @@ pub fn run() {
             let scheduler_store = app.state::<AppState>().store.clone();
             let scheduler_model = app.state::<AppState>().model.clone();
             let scheduler_cancel = app.state::<AppState>().cancellation_token.clone();
-            let scheduler_handle = app.handle().clone();
+            let scheduler_handle = crate::sink::tauri(app.handle());
             tauri::async_runtime::spawn(async move {
                 scheduler::start_background_worker(scheduler_store, scheduler_model, scheduler_cancel, scheduler_handle).await;
             });

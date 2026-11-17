@@ -7,7 +7,6 @@ use crate::scheduler::{Task, PugMode, normalize_entity_key, entity_index, entity
 use crate::scheduler::indexing::save_item;
 use crate::utils::logger::log_task_progress;
 use crate::parsing;
-use tauri::Emitter;
 use crate::logic::TRADE_DOC_TITLES;
 
 use crate::logic::{
@@ -2167,7 +2166,7 @@ async fn extract_continuation_page(
     page_idx: usize,
     carry_section: &str,
     cancellation_token: &Arc<AtomicBool>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::sink::Sink,
     emit_term: &(dyn Fn(&str) + Send + Sync),
 ) -> anyhow::Result<(serde_json::Map<String, Value>, String)> {
     let _ = (task_id, app_handle);
@@ -2753,14 +2752,13 @@ pub async fn process_trading_task(
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
     cancellation_token: &Arc<AtomicBool>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::sink::Sink,
     device_preference: Option<String>,
 ) -> anyhow::Result<()> {
     let app_handle_clone = app_handle.clone();
     let tid_clone = task.id.clone();
     let emit_term = move |msg: &str| {
         println!("{}", msg);
-        use tauri::Emitter;
         let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": tid_clone, "text": format!("{}\n", msg)}));
     };
 

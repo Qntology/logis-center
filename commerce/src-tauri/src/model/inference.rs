@@ -82,7 +82,7 @@ impl crate::model::LogisModel {
         &self, 
         system: &str, 
         user_input: &str,
-        app_handle: &tauri::AppHandle,
+        app_handle: &crate::sink::Sink,
         event_name: &str,
         base_payload: Value,
         max_tokens: usize,
@@ -121,7 +121,7 @@ impl crate::model::LogisModel {
     pub async fn chat_params_with_spinner(
         &self, 
         params: ChatCompletionParameters,
-        app_handle: &tauri::AppHandle,
+        app_handle: &crate::sink::Sink,
         _event_name: &str,
         mut base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
@@ -159,7 +159,7 @@ impl crate::model::LogisModel {
         &self, 
         prompt: String, 
         image: Option<DynamicImage>,
-        _app_handle: &tauri::AppHandle,
+        _app_handle: &crate::sink::Sink,
         _event_name: &str,
         _base_payload: Value,
         max_tokens: usize,
@@ -260,7 +260,7 @@ impl crate::model::LogisModel {
         system: &str,       // 🌟 추가
         user_input: &str,   // 🌟 변경
         image: Option<DynamicImage>, 
-        _app_handle: &tauri::AppHandle,
+        _app_handle: &crate::sink::Sink,
         _event_name: &str,
         mut base_payload: Value,
         cancel_token: Option<Arc<AtomicBool>>,
@@ -329,7 +329,7 @@ impl crate::model::LogisModel {
         gen.generate(params, cancel_token, session_id, kv_name, None).await.map_err(|e| anyhow!("Inference failed: {}", e))
     }
 
-    pub async fn process_image_full(&self, image_path: String, app_handle: &tauri::AppHandle, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {
+    pub async fn process_image_full(&self, image_path: String, app_handle: &crate::sink::Sink, cancel_token: Option<Arc<AtomicBool>>) -> anyhow::Result<Value> {
         println!("[PROCESS] General image analysis for: {}", image_path);
         
         let full_img_raw = image::open(&image_path)?;

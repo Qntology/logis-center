@@ -1,7 +1,7 @@
 # crates 작업 공간 · premium-discount 공용 엔진 통합 (2026-11-18)
 
-기획서 "웹 분석(`analytic`) 이관 이후 `crates/` 모듈화 및 `premium-discount` 공용 엔진 통합"의 1 · 2단계와 3단계의 검색 crate 를 반영한 기록입니다.
-나머지 3 · 4단계(문서 비전 · 생성 LLM crate, `EventSink` 와 `commerce/app` 분리)는 아래 "남은 단계"에 실측한 결합도와 함께 적었습니다.
+기획서 "웹 분석(`analytic`) 이관 이후 `crates/` 모듈화 및 `premium-discount` 공용 엔진 통합"의 1 · 2단계, 3단계의 검색 crate, 4단계의
+`EventSink` 를 반영한 기록입니다. 나머지(문서 비전 · 생성 LLM crate, `commerce/app` 분리)는 아래 "남은 단계"에 실측한 결합도와 함께 적었습니다.
 
 ## 1단계: 루트 작업 공간 · candle 포크 고정 · premium-discount 링크
 
@@ -64,6 +64,15 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 - SDS 원장은 모델 계층을 모르도록, 비전 트랙 키의 정밀도 꼬리표(SigLIP2 양자화 지문)를 앱의 `enter_scope` 가 등록합니다(`set_vision_precision`).
 - 각 crate 는 모델 · DB · Tauri 없이 `cargo test -p logis-schema -p logis-bias -p logis-sds -p logis-pug -p logis-parsers -p logis-search` 로 몇 초 안에 돕니다.
 
+## 4단계 첫 조각: EventSink
+
+- `commerce/src-tauri/src/sink.rs`: `EventSink`(`emit_json` · `log_progress`) · `Sink = Arc<dyn EventSink>` · `TauriSink` · `NoopSink`.
+  `dyn EventSink` 에 `tauri::Emitter::emit` 과 같은 모양의 `emit` 을 두어, model · scheduler 의 `app_handle.emit(…)` · `app_handle.clone()` 호출은 그대로입니다.
+- model · scheduler · utils(logger · network) 의 `tauri::AppHandle` 인자 · 필드(`LogisModel::app_handle` 포함)는 `Sink` 입니다. lib.rs 의 명령 진입점이
+  `sink::tauri(&app_handle)` 로 감싸 넘기고, 시험 · CLI 는 `sink::noop()` 을 넘길 수 있습니다. `tauri::` 가 lib.rs · automation.rs 밖에 남은 곳은
+  Qwen 생성 루프의 `tauri::async_runtime::spawn` 9곳과 utils/network.rs 의 `#[tauri::command]` 3개뿐입니다.
+- 경로 도우미(`get_kv_dir` · `get_task_log_file` …)의 쓰지 않던 `Option<&AppHandle>` 인자를 뺐습니다(37곳).
+
 ## 기획서와 다른 점 (코드 · 저장소로 확인)
 
 - 기획서의 candle 커밋 `ebaf93db1c65fe2fb3bf3ebde3fc2bdab07ff311` 은 포크에 없습니다. 실제 커밋은 `ebaf93db065f22be67a9a4a250eec5a212e143fe` 이고,
@@ -85,9 +94,9 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 - **logis-search 의 나머지**: 기획서가 이 crate 에 넣은 `model/merge.rs`(병합 · 그라운딩, SigLIP2 결과를 씀)와 `model/research.rs` 의 집계는
   모델 · 저장소 호출과 섞여 있어 순수 부분을 먼저 떼어야 합니다 (`merge_rules` 로 두 규칙만 옮김).
 - **logis-vision-doc · logis-llm**: candle 텐서 · 장치 · 자원 관리(`utils::resources` · `paths` · `scheduler`)에 묶여 있어, 자원 · 경로 결합을 먼저 끊어야 합니다.
-- **EventSink · commerce/app**: `tauri::AppHandle` 은 lib.rs 밖에서 69개 시그니처 · 56번의 `emit` · 24번의 clone 으로 퍼져 있습니다
-  (lang_llm 33 · automation 18 · translit 17 · relay_ledger 13 · scheduler 11 · trading 11 · vision 11 · inference 11 · paths 11 …).
-  `EventSink`(emit_json) · `TauriSink` · `NoopSink` 를 두고 model · scheduler 의 인자를 바꾼 뒤, store · residency · model · scheduler 를 `commerce/app` 으로 옮깁니다.
+- **commerce/app 분리**: EventSink 다음 걸림돌은 lib.rs 에 있는 전역 상태 3개(`ACTIVE_TASK_MEM` 6곳 · `LATEST_PROGRESS_PAYLOAD` 2곳 ·
+  `CURRENT_UI_CATEGORY` 1곳)를 model · scheduler 가 `crate::` 로 직접 읽는 것과, Qwen 생성 루프의 `tauri::async_runtime::spawn` 입니다. 이것들을 코어로 옮기면 store · residency · model · scheduler 를
+  `commerce/app` 으로 옮기고 Tauri 셸(lib.rs 명령 · automation · TauriSink)만 남길 수 있습니다.
 - **LanceDB 0.41**: premium-discount 앱이 옮긴 API 변경(테이블 add · 질의 실행)을 store.rs 에 적용합니다. 이 작업 공간은 아직 0.31 입니다.
 
 ## 빌드 · 시험

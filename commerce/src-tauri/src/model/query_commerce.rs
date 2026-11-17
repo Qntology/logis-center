@@ -5,8 +5,7 @@ use crate::utils::GpuDeviceExt;
 
 impl crate::model::LogisModel {
 
-    pub async fn parse_commerce_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, metrics_json: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
-        use tauri::Emitter;
+    pub async fn parse_commerce_query(&self, task_id: &str, app_handle: &crate::sink::Sink, query: String, language: &str, metrics_json: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
 
         // 🌟 [신규] 터미널 로거 헬퍼 주입
         let emit_term = |msg: &str| {

@@ -833,7 +833,7 @@ impl QuantizedQwenVLTextAttention {
 
                     // ... SSD 파일 로딩 부분 생략 (동일하게 유지하되 inner 갱신을 생략함) ...
                     if k_cpu.is_none() {
-                        let kv_dir = crate::utils::paths::get_kv_dir(None);
+                        let kv_dir = crate::utils::paths::get_kv_dir();
                         let sid = self.active_session_id.as_deref().ok_or_else(|| anyhow!("Session ID missing"))?;
                         let mut path_candidates = Vec::new();
                         
@@ -1175,7 +1175,7 @@ impl QuantizedQwenVLTextAttention {
 
             tauri::async_runtime::spawn(async move {
                 if let Some(tx) = crate::models::qwen::generate::BAKE_TX.get() {
-                    let kv_dir = crate::utils::paths::get_kv_dir(None);
+                    let kv_dir = crate::utils::paths::get_kv_dir();
                     let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
                     if !block_dir.exists() { let _ = std::fs::create_dir_all(&block_dir); }
 
@@ -1215,7 +1215,7 @@ impl QuantizedQwenVLTextAttention {
 
     pub fn batch_load_layer_kv(&mut self, kv_name: &str) -> Result<()> {
         use crate::models::qwen::generate::LayerIndex;
-        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let kv_dir = crate::utils::paths::get_kv_dir();
         let mut index_path = kv_dir.join(kv_name).join(format!("layer{}.json", self.layer_idx));
         
         if !index_path.exists() {
@@ -2080,7 +2080,7 @@ impl QuantizedQwenVLTextModel {
 
     pub fn load_kv_cache_chunked(&mut self, kv_name: &str) -> Result<()> {
         use crate::models::qwen::generate::LayerIndex;
-        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let kv_dir = crate::utils::paths::get_kv_dir();
         let index_path = kv_dir.join(kv_name).join("layer0.json");
         
         if !index_path.exists() { return Ok(()); }
@@ -2635,7 +2635,7 @@ impl QuantizedQwenVLTextModel {
             }
         }
 
-        let kv_dir = crate::utils::paths::get_kv_dir(None);
+        let kv_dir = crate::utils::paths::get_kv_dir();
         let mode = self.baking_only; 
         
         let kv_name_raw = kv_name.unwrap_or("text");
@@ -2776,7 +2776,7 @@ impl QuantizedQwenVLTextModel {
 
         if !dumps_to_send.is_empty() {
             if let Some(tx) = BAKE_TX.get() {
-                let kv_dir = crate::utils::paths::get_kv_dir(None);
+                let kv_dir = crate::utils::paths::get_kv_dir();
                 let mode = self.baking_only;
                 
                 let kv_name_raw = self.active_kv_name.as_deref().unwrap_or("text");

@@ -2,7 +2,6 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use serde_json::json;
 use crate::model::LogisModel;
 use crate::scheduler::TRANSLIT_MEM_CACHE;
-use tauri::Emitter;
 
 
 fn translit_lang(lang: &str) -> String {
@@ -57,7 +56,7 @@ fn first_recheck(word: &str, lang: &str, engine: &str) -> bool {
 }
 
 async fn dexie_translit_lookup(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::sink::Sink,
     word: &str,
     lang: &str,
 ) -> Option<Vec<(String, String)>> {
@@ -102,7 +101,7 @@ async fn dexie_translit_lookup(
 }
 
 async fn query_translit_cache(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::sink::Sink,
     word: &str,
     lang: &str,
 ) -> Option<(String, String)> {
@@ -160,7 +159,7 @@ async fn query_translit_cache(
 }
 
 fn save_translit_cache(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::sink::Sink,
     word: &str,
     lang: &str,
     native: &str,
@@ -317,7 +316,7 @@ pub async fn generate_transliteration_aliases(
     doc_lang: &str,
     page_type: &str,
     cancel: &Arc<AtomicBool>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::sink::Sink,
     task_id: &str,
 ) -> Vec<(String, String)> {
     let mut memo: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
@@ -343,7 +342,7 @@ pub async fn generate_transliteration_aliases_deferred(
     doc_lang: &str,
     page_type: &str,
     cancel: &Arc<AtomicBool>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::sink::Sink,
     task_id: &str,
     memo: &mut std::collections::HashMap<String, (String, String)>,
 ) -> (Vec<(String, String)>, Vec<(String, (String, String))>) {
@@ -998,7 +997,7 @@ pub async fn run_multilingual_reads(
     pending: &[(String, (String, String))],
     doc_lang: &str,
     cancel: &Arc<AtomicBool>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::sink::Sink,
     task_id: &str,
 ) -> std::collections::HashMap<String, (String, String)> {
     let emit = |msg: &str| {

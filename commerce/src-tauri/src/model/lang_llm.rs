@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::Emitter;
 
 // 🌟 [SINGLE 4B] 언어 엔진은 원본 Qwen/Qwen3.5-4B 하나입니다. 언어마다 다른 것은 출력 투영의 남긴 행이고
 //    (`models::common::vocab_trim`, 문서 언어 = 현지 언어 + 영어), 예전의 언어별 alphaedge-ai 4B(어휘 16,384, 언어당 약 10 GB)는 쓰지 않습니다.
@@ -231,7 +230,7 @@ impl DlState {
 
 static STATES: Lazy<Mutex<HashMap<String, DlState>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static RUNTIME_FAIL: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static QUEUE: Lazy<Mutex<VecDeque<(String, tauri::AppHandle, String)>>> =
+static QUEUE: Lazy<Mutex<VecDeque<(String, crate::sink::Sink, String)>>> =
     Lazy::new(|| Mutex::new(VecDeque::new()));
 static WORKER: AtomicBool = AtomicBool::new(false);
 static RESIDENT: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
@@ -410,7 +409,7 @@ fn progress_line(code: &str, st: &DlState) -> String {
 
 pub fn resolve_engine(
     doc_lang: &str,
-    app: &tauri::AppHandle,
+    app: &crate::sink::Sink,
     task_id: &str,
     fetch: bool,
 ) -> (TranslitEngine, String) {
@@ -533,7 +532,7 @@ pub fn engine_tag(doc_lang: &str) -> String {
     }
 }
 
-pub fn prefetch(doc_lang: &str, app: &tauri::AppHandle, task_id: &str) -> Option<String> {
+pub fn prefetch(doc_lang: &str, app: &crate::sink::Sink, task_id: &str) -> Option<String> {
     if !needs_lang_engine(doc_lang) {
         return None;
     }
@@ -691,7 +690,7 @@ pub fn translit_demand(item: &Value, doc_lang: &str) -> usize {
 
 pub async fn await_engine(
     doc_lang: &str,
-    app: &tauri::AppHandle,
+    app: &crate::sink::Sink,
     task_id: &str,
     cancel: &std::sync::Arc<AtomicBool>,
     demand: usize,
@@ -848,7 +847,7 @@ fn console_targets(task_id: &str) -> Vec<String> {
     out
 }
 
-fn announce(app: &tauri::AppHandle, task_id: &str, msg: &str) {
+fn announce(app: &crate::sink::Sink, task_id: &str, msg: &str) {
     println!("{}", msg);
     for t in console_targets(task_id) {
         let _ = app.emit(
@@ -858,7 +857,7 @@ fn announce(app: &tauri::AppHandle, task_id: &str, msg: &str) {
     }
 }
 
-fn announce_fresh_line(app: &tauri::AppHandle, task_id: &str, msg: &str) {
+fn announce_fresh_line(app: &crate::sink::Sink, task_id: &str, msg: &str) {
     println!("\n{}", msg);
     for t in console_targets(task_id) {
         let _ = app.emit(
@@ -891,7 +890,7 @@ impl Drop for WaitGuard {
     }
 }
 
-fn progress_card(app: &tauri::AppHandle, task_id: &str, category: &str, summary: &str) {
+fn progress_card(app: &crate::sink::Sink, task_id: &str, category: &str, summary: &str) {
     if task_id.is_empty() {
         return;
     }
@@ -905,11 +904,11 @@ fn progress_card(app: &tauri::AppHandle, task_id: &str, category: &str, summary:
     crate::utils::logger::log_task_progress(app, task_id, &payload);
 }
 
-fn publish(app: &tauri::AppHandle, code: &str) {
+fn publish(app: &crate::sink::Sink, code: &str) {
     let _ = app.emit("lang-llm-status", status_json(code));
 }
 
-pub fn request_download(code: &str, app: &tauri::AppHandle, task_id: &str) -> DlPhase {
+pub fn request_download(code: &str, app: &crate::sink::Sink, task_id: &str) -> DlPhase {
     if is_ready(code) {
         return DlPhase::Ready;
     }
@@ -981,7 +980,7 @@ async fn download_file(
     code: &str,
     file: &str,
     dir: &Path,
-    app: &tauri::AppHandle,
+    app: &crate::sink::Sink,
     task_id: &str,
 ) -> Result<u64, DlError> {
     use futures::StreamExt;
@@ -1149,7 +1148,7 @@ async fn download_file(
     Err(DlError::Failed(last_err))
 }
 
-fn fail(code: &str, app: &tauri::AppHandle, task_id: &str, why: &str) {
+fn fail(code: &str, app: &crate::sink::Sink, task_id: &str, why: &str) {
     set_state(code, |s| {
         s.phase = DlPhase::Failed;
         s.error = why.to_string();
@@ -1168,7 +1167,7 @@ fn fail(code: &str, app: &tauri::AppHandle, task_id: &str, why: &str) {
     );
 }
 
-async fn download_repo(code: &str, app: &tauri::AppHandle, task_id: &str) {
+async fn download_repo(code: &str, app: &crate::sink::Sink, task_id: &str) {
     let dir = model_dir(code);
     if files_ready(code) {
         finish_repo(code, app, task_id).await;
@@ -1252,7 +1251,7 @@ async fn download_repo(code: &str, app: &tauri::AppHandle, task_id: &str) {
     finish_repo(code, app, task_id).await;
 }
 
-async fn finish_repo(code: &str, app: &tauri::AppHandle, task_id: &str) {
+async fn finish_repo(code: &str, app: &crate::sink::Sink, task_id: &str) {
     if !convert_runtime(code, app, task_id).await {
         return;
     }
@@ -1280,7 +1279,7 @@ async fn finish_repo(code: &str, app: &tauri::AppHandle, task_id: &str) {
     );
 }
 
-async fn convert_runtime(code: &str, app: &tauri::AppHandle, task_id: &str) -> bool {
+async fn convert_runtime(code: &str, app: &crate::sink::Sink, task_id: &str) -> bool {
     let dir = model_dir(code);
     if crate::model::lang_gguf::runtime_ready(&dir) {
         return true;

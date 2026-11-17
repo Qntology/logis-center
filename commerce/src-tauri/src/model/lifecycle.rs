@@ -11,7 +11,6 @@ use candle_core::{Device, DType};
 use image::DynamicImage;
 use serde_json::{Value, json, Map};
 use std::sync::{Arc, atomic::AtomicBool};
-use tauri::Emitter;
 use std::io::Cursor;
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
@@ -549,7 +548,7 @@ impl LogisModel {
         let task_id_str = task_id.to_string();
         
         tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-            let path = crate::utils::paths::get_kv_dir(None).join(format!("{}.safetensors", task_id_str));
+            let path = crate::utils::paths::get_kv_dir().join(format!("{}.safetensors", task_id_str));
             if is_q35 {
                 // Qwen3.5는 자체 flush 매커니즘을 사용하므로 패스만 반환
                 Ok(path.to_string_lossy().to_string())
@@ -601,7 +600,7 @@ impl LogisModel {
         let kv_name_str = kv_name.unwrap_or_else(|| "text".to_string());
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let kv_root = crate::utils::paths::get_kv_dir(None).join(&task_id_str);
+            let kv_root = crate::utils::paths::get_kv_dir().join(&task_id_str);
             let kv_type = kv_name_str.split('/').last().unwrap_or("text");
             let kv_type = if kv_type == "inference" || kv_type == "reference" || kv_type.is_empty() { "text" } else { kv_type };
 
@@ -610,7 +609,7 @@ impl LogisModel {
                 let mut q35_guard = q35_arc.blocking_lock();
                 if let Some(gen) = q35_guard.as_mut() {
                     let target_kv_name = format!("{}/inference/{}", task_id_str, kv_type);
-                    let target_kv_name = if !crate::utils::paths::get_kv_dir(None).join(&target_kv_name).exists() {
+                    let target_kv_name = if !crate::utils::paths::get_kv_dir().join(&target_kv_name).exists() {
                         format!("{}/reference/{}", task_id_str, kv_type)
                     } else { target_kv_name };
                     
@@ -962,7 +961,7 @@ impl LogisModel {
         let gen = match tokio::time::timeout(
             std::time::Duration::from_secs(60), 
             tokio::task::spawn_blocking(move || {
-                let kv_root = crate::utils::paths::get_kv_dir(Some(&handle_clone));
+                let kv_root = crate::utils::paths::get_kv_dir();
                 QwenVLGenerateModel::init_with_config(
                     &path_clone, None, None,
                     Some(&target_device), dev_id, Some(&target_device), dev_id, dtype, Some(limit as usize),
@@ -1705,7 +1704,6 @@ impl LogisModel {
         if !weights_path.exists() {
             let err_msg = "Embedding model is missing. Please go to the Settings tab and download the required models.";
             println!("[MODEL] 🚨 {}", err_msg);
-            use tauri::Emitter;
             let _ = self.app_handle.emit("app_error_alert", serde_json::json!({
                 "message": err_msg,
                 "action": "open_settings"
@@ -2000,7 +1998,7 @@ impl LogisModel {
             pug.to_string()
         }
     }
-    pub async fn new(app_handle: tauri::AppHandle, device_preference: Option<&str>) -> anyhow::Result<Self> {
+    pub async fn new(app_handle: crate::sink::Sink, device_preference: Option<&str>) -> anyhow::Result<Self> {
         let is_disk_swap = match device_preference {
             Some("cpu") => false,
             _ => true,

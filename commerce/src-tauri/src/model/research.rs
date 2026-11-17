@@ -197,7 +197,7 @@ impl crate::model::LogisModel {
         query: String,
         digest: &ResearchDigest,
         top_documents: String,
-        app_handle: &tauri::AppHandle,
+        app_handle: &crate::sink::Sink,
         cancel_token: Option<Arc<AtomicBool>>,
     ) -> anyhow::Result<String> {
         let mut status_history = format!("### 🔍 Deep Research: '{}'\n\n", query);

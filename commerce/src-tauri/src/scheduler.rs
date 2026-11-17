@@ -9,7 +9,6 @@ use crate::utils::parsing::{self, PugMode};
 use crate::model::LogisModel;
 use serde_json::{Value, json};
 use anyhow::Result;
-use tauri::Emitter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use once_cell::sync::{Lazy, OnceCell};
 use std::sync::Mutex as StdMutex;
@@ -541,7 +540,7 @@ pub async fn process_task(
     store_mutex: &Arc<Mutex<Option<VectorStore>>>,
     model_mutex: &Arc<Mutex<Option<LogisModel>>>,
     cancellation_token: &Arc<AtomicBool>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::sink::Sink,
     device_preference: Option<String>,
 ) -> Result<()> {
     if cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
@@ -552,7 +551,6 @@ pub async fn process_task(
     let tid_clone = task.id.clone();
     let emit_term = move |msg: &str| {
         println!("{}", msg);
-        use tauri::Emitter;
         let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": tid_clone, "text": format!("{}
 ", msg)}));
     };
@@ -573,7 +571,7 @@ pub async fn process_task(
         return Err(anyhow::anyhow!("analytic_extraction moved to premium-discount"));
     }
 
-    let kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&task.id);
+    let kv_path = utils::paths::get_kv_dir().join(&task.id);
     if kv_path.exists() {
         emit_term(&format!("[PROCESS] Found existing KV cache for task {}. Ready to reuse.", task.id));
     }
@@ -1044,7 +1042,7 @@ pub async fn process_task(
         if base_model_size == crate::model::ModelSize::Qwen {
             if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
             
-            let base_kv_path = utils::paths::get_kv_dir(Some(app_handle)).join(&base_session_id);
+            let base_kv_path = utils::paths::get_kv_dir().join(&base_session_id);
             if !base_kv_path.exists() {
                 println!("[Scheduler] Baking Base PUG Context to SSD...");
                 log_task_progress(app_handle, &task.id, &json!({ "category": "Preparation", "summary": "Reading document structure...", "spinner": "⠋" }));

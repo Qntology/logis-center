@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use serde_json::{json, Value};
-use tauri::Emitter;
 use crate::model::merge::{trade_resolve_condition_value, trade_resolve_condition_operator};
 
 impl crate::model::LogisModel {
@@ -16,7 +15,7 @@ impl crate::model::LogisModel {
     //   ⑥ Depth 2 배타 배정     : 승리 카테고리의 필드만 경쟁, 1청크 1필드
     //   ⑦ Depth 3 값 확정       : Rust 결정론. 실패 시에만 LLM 1회
     //  마진이 충분하면 LLM 호출이 0회로 끝납니다.
-    pub async fn parse_shipping_query(&self, task_id: &str, app_handle: &tauri::AppHandle, query: String, language: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
+    pub async fn parse_shipping_query(&self, task_id: &str, app_handle: &crate::sink::Sink, query: String, language: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
         let app_handle_clone = app_handle.clone();
         let task_id_clone = task_id.to_string();
         let emit_term = move |msg: &str| {
@@ -25,7 +24,6 @@ impl crate::model::LogisModel {
             let handle = app_handle_clone.clone();
             let tid = task_id_clone.clone();
             tokio::spawn(async move {
-                use tauri::Emitter;
                 let _ = handle.emit("task-console-log", serde_json::json!({"task_id": tid, "text": format!("{}\n", m)}));
             });
         };

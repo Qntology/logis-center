@@ -123,7 +123,7 @@ async fn seed_record(
     entry: &Value,
     team: &str,
     cancel: &Arc<AtomicBool>,
-    handle: &tauri::AppHandle,
+    sink: &tauri_app_lib::sink::Sink,
 ) -> anyhow::Result<usize> {
     let (host, kind) = (str_of(entry, "host"), str_of(entry, "type"));
     let id = hash_id(str_of(entry, "id"));
@@ -156,7 +156,7 @@ async fn seed_record(
         "commerce",
         str_of(entry, "url"),
         cancel,
-        handle,
+        sink,
         str_of(entry, "id"),
         true,
     )
@@ -182,7 +182,7 @@ async fn seed_linked(
     entry: &Value,
     team: &str,
     cancel: &Arc<AtomicBool>,
-    handle: &tauri::AppHandle,
+    sink: &tauri_app_lib::sink::Sink,
 ) -> anyhow::Result<(String, u32, usize)> {
     let mode = match str_of(entry, "mode") { "" => "commerce", m => m };
     let kind = str_of(entry, "type");
@@ -233,7 +233,7 @@ async fn seed_linked(
     save_item(db, "items", &id, kind, data.clone(), Some(vector), ZERO_ADDR, team, &cc, &bcc, &r#ref, Some(&digest)).await;
     let chunks = index_item_chunks(
         db, model, &id, kind, str_of(entry, "lang"), &data, entry["detail"].as_bool().unwrap_or(true), &cc, &bcc, &r#ref,
-        mode, str_of(entry, "url"), cancel, handle, str_of(entry, "id"), true,
+        mode, str_of(entry, "url"), cancel, sink, str_of(entry, "id"), true,
     )
     .await?;
     Ok((id, index, chunks))
@@ -293,6 +293,8 @@ fn run_plan() {
     })
     .expect("앱 핸들");
     let handle = app.handle().clone();
+    // model · scheduler 는 이벤트를 Sink 로 내보냅니다 (앱과 같은 TauriSink)
+    let sink = tauri_app_lib::sink::tauri(&handle);
     app.listen("translit-cache-query", |e| {
         let Ok(v) = serde_json::from_str::<Value>(e.payload()) else { return };
         if let Some(tx) = TRANSLIT_PENDING.lock().unwrap().remove(str_of(&v, "request_id")) {
@@ -341,7 +343,7 @@ fn run_plan() {
                 line["ok"] = json!(true);
             } else if str_of(entry, "kind") == "lang_engine" {
                 let (engine, note) =
-                    tauri_app_lib::model::lang_llm::await_engine(str_of(entry, "lang"), &handle, &id, &cancel, 1).await;
+                    tauri_app_lib::model::lang_llm::await_engine(str_of(entry, "lang"), &sink, &id, &cancel, 1).await;
                 line["ok"] = json!(engine.is_lang());
                 line["note"] = json!(note);
             } else if str_of(entry, "kind") == "seed" {
@@ -349,12 +351,12 @@ fn run_plan() {
                 let logis = {
                     let mut g = model.lock().await;
                     if g.is_none() {
-                        *g = Some(LogisModel::new(handle.clone(), None).await.expect("모델"));
+                        *g = Some(LogisModel::new(sink.clone(), None).await.expect("모델"));
                     }
                     g.as_ref().unwrap().clone()
                 };
                 logis.ensure_embedding().await.expect("임베딩 모델");
-                let r = seed_record(&db, &logis, entry, &team, &cancel, &handle).await;
+                let r = seed_record(&db, &logis, entry, &team, &cancel, &sink).await;
                 line["ok"] = json!(r.is_ok());
                 match r {
                     Ok(chunks) => line["chunks"] = json!(chunks),
@@ -366,12 +368,12 @@ fn run_plan() {
                 let logis = {
                     let mut g = model.lock().await;
                     if g.is_none() {
-                        *g = Some(LogisModel::new(handle.clone(), None).await.expect("모델"));
+                        *g = Some(LogisModel::new(sink.clone(), None).await.expect("모델"));
                     }
                     g.as_ref().unwrap().clone()
                 };
                 logis.ensure_embedding().await.expect("임베딩 모델");
-                match seed_linked(&db, &logis, entry, &team, &cancel, &handle).await {
+                match seed_linked(&db, &logis, entry, &team, &cancel, &sink).await {
                     Ok((item_id, index, chunks)) => {
                         line["ok"] = json!(true);
                         line["item_id"] = json!(item_id);
@@ -437,7 +439,7 @@ fn run_plan() {
                 if let Some(db) = store.lock().await.as_ref() {
                     let _ = db.add_task(task.clone()).await;
                 }
-                let r = process_task(task.clone(), &store, &model, &cancel, &handle, None).await;
+                let r = process_task(task.clone(), &store, &model, &cancel, &sink, None).await;
                 line["ok"] = json!(r.is_ok());
                 if let Err(e) = r {
                     line["error"] = json!(format!("{:#}", e));

@@ -3,7 +3,6 @@ use std::sync::atomic::AtomicBool;
 use serde_json::{json, Value};
 use anyhow::anyhow;
 use image::DynamicImage;
-use tauri::Emitter;
 use crate::openai_types::*;
 use crate::model::merge::{record_grounding_claims, collect_claimed, merge_extracted, apply_grounding_verdicts, record_claim_violations};
 static VISION_KV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -24,7 +23,7 @@ impl crate::model::LogisModel {
         image_path: String,
         language: String,
         search_mode: String,
-        app_handle: &tauri::AppHandle,
+        app_handle: &crate::sink::Sink,
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
@@ -32,7 +31,6 @@ impl crate::model::LogisModel {
         let task_id_clone = task_id.clone();
         let emit_term = move |msg: &str| {
             println!("{}", msg);
-            use tauri::Emitter;
             let _ = app_handle_clone.emit("task-console-log", serde_json::json!({"task_id": task_id_clone, "text": format!("{}\n", msg)}));
         };
 
@@ -5006,7 +5004,7 @@ impl crate::model::LogisModel {
         system: &str,       
         user_input: &str,   
         image: Option<DynamicImage>,
-        _app_handle: &tauri::AppHandle,
+        _app_handle: &crate::sink::Sink,
         _event_name: &str,
         mut base_payload: Value,
         max_tokens: usize,
@@ -5091,7 +5089,7 @@ impl crate::model::LogisModel {
         });
         let kv_dir = kv_session
             .as_ref()
-            .map(|s| crate::utils::paths::get_kv_dir(Some(_app_handle)).join(s));
+            .map(|s| crate::utils::paths::get_kv_dir().join(s));
         let out = gen.generate(
             params,
             cancellation_token.clone(),

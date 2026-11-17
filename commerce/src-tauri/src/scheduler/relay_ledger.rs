@@ -1,5 +1,4 @@
 use serde_json::{json, Value};
-use tauri::Emitter;
 use crate::store::{TradeDocument, VectorStore};
 use crate::scheduler::{entity_bcc, entity_id, entity_key_index, normalize_entity_key};
 use crate::scheduler::indexing::save_item;
@@ -13,7 +12,7 @@ pub type StatsDiff = std::collections::HashMap<String, (i64, i64, i64)>;
 
 pub struct RelayEnv<'a> {
     pub store: &'a VectorStore,
-    pub app_handle: &'a tauri::AppHandle,
+    pub app_handle: &'a crate::sink::Sink,
     pub task_id: &'a str,
     pub team_id: &'a str,
     pub from: &'a str,

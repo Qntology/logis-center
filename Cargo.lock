@@ -6886,6 +6886,7 @@ dependencies = [
  "logis-pug",
  "logis-schema",
  "logis-sds",
+ "logis-search",
  "memmap2",
  "metal 0.33.0",
  "mimalloc",
