@@ -321,6 +321,15 @@ jobs:
           cargo test --lib --no-default-features ${f:+--features $f} -- vocab_trim stable_rank store:: --test-threads 2 2>&1 | tee "$RUNNER_TEMP/lib.log" | tail -5
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/lib.log"; exit 1; }
           notice_lines "lib unit tests" "$RUNNER_TEMP/lib.log" '^test result'
+      # crates/logis-* : pure domain crates split out of the app (no Tauri, LanceDB, models or GPU).
+      - name: "domain crates (crates/logis-*)"
+        if: matrix.name == 'linux-cpu' || matrix.name == 'windows-cpu'
+        working-directory: logis-center
+        run: |
+          . "$RUNNER_TEMP/annot.sh"; set +e
+          cargo test -p logis-schema -p logis-bias -p logis-sds -p logis-pug -p logis-parsers -p logis-search 2>&1 | tee "$RUNNER_TEMP/crates.log" | tail -5
+          rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/crates.log"; exit 1; }
+          notice_lines "domain crates" "$RUNNER_TEMP/crates.log" '^test result'
       - name: "vision batch (ignored device tests — phrase encoding invariance on the device)"
         if: contains(fromJSON('["linux-vulkan","mac-metal","mac-vulkan"]'), matrix.name)
         working-directory: logis-center/commerce/src-tauri
