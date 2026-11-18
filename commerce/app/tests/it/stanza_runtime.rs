@@ -308,3 +308,41 @@ fn hub_format2_manifests() {
         println!("{code}: 파일 {}개", files.len());
     }
 }
+
+/// 출력 덤프 (모델 필요): 기준 JSON(stanza-onnx-export reference_outputs.json)의 원문마다 `analyze` 와 `analyze_query`
+/// 결과를 JSON 줄로 씁니다. logis-center 와 premium-discount-nlp 의 같은 시험 출력을 바이트 단위로 비교하는 데 씁니다.
+///   LOGIS_STANZA_DIR=<stanza 폴더> STANZA_REF=<reference_outputs.json> STANZA_DUMP=<out.jsonl> cargo test … dump_analyses -- --ignored
+#[test]
+#[ignore = "LOGIS_STANZA_DIR · STANZA_REF · STANZA_DUMP 필요"]
+fn dump_analyses() {
+    #[derive(serde::Serialize)]
+    struct Row<'a> {
+        lang: &'a str,
+        text: &'a str,
+        sentences: Vec<logis_app::stanza::SentenceAnalysis>,
+        query: Option<logis_app::stanza::QueryAnalysis>,
+        query_error: Option<String>,
+    }
+    let root = std::path::PathBuf::from(std::env::var("LOGIS_STANZA_DIR").expect("LOGIS_STANZA_DIR"));
+    let reference: Value = serde_json::from_str(&std::fs::read_to_string(std::env::var("STANZA_REF").expect("STANZA_REF")).unwrap()).unwrap();
+    let mut langs: Vec<&String> = reference.as_object().unwrap().keys().collect();
+    langs.sort();
+    let mut out = String::new();
+    for lang in langs {
+        let mut st = logis_app::stanza::StanzaLang::load(&root.join(lang)).expect("변환본 열기");
+        for item in reference[lang.as_str()].as_array().unwrap() {
+            let text = item["text"].as_str().unwrap();
+            let sentences = st.analyze(text).expect("analyze");
+            let (query, query_error) = match logis_app::stanza::analyze_query(text, lang) {
+                Ok(mut q) => {
+                    q.elapsed_ms = 0;
+                    (Some(q), None)
+                }
+                Err(e) => (None, Some(e.to_string())),
+            };
+            out.push_str(&serde_json::to_string(&Row { lang, text, sentences, query, query_error }).unwrap());
+            out.push('\n');
+        }
+    }
+    std::fs::write(std::env::var("STANZA_DUMP").expect("STANZA_DUMP"), out).unwrap();
+}

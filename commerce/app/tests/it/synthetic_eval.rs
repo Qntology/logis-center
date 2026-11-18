@@ -912,7 +912,8 @@ fn embed_dump() {
         return;
     };
     let texts: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&texts_path).expect("문장 파일")).expect("JSON 배열");
-    let device = logis_app::utils::new_gpu_device(0).expect("GPU");
+    // GPU 빌드면 GPU, CPU 빌드(--no-default-features)면 CPU
+    let device = logis_app::utils::new_gpu_device(0).unwrap_or(candle_core::Device::Cpu);
     let rows: Vec<Vec<f32>> = if which == "siglip2" {
         let dir = crate::common::models_dir().join("siglip2-so400m-patch16-naflex");
         let dtype = logis_app::models::siglip2::quant::dtype_for(&device);
@@ -923,8 +924,15 @@ fn embed_dump() {
         let dir = crate::common::model_subdir("granite-embedding-97m-multilingual-r2", "model.safetensors").expect("granite");
         let model = EmbeddingModel::new_with_device(&dir, &device).expect("granite 로드");
         let mut out = Vec::with_capacity(texts.len());
-        for part in texts.chunks(256) {
-            out.extend(model.embed_batch(part).expect("임베딩"));
+        if std::env::var("LOGIS_SYNTH_EMBED_SINGLE").map_or(false, |v| v == "1") {
+            // 문장마다 embed() (배치 순전파를 거치지 않는 경로)
+            for t in &texts {
+                out.push(model.embed(t).expect("임베딩"));
+            }
+        } else {
+            for part in texts.chunks(256) {
+                out.extend(model.embed_batch(part).expect("임베딩"));
+            }
         }
         out
     };
@@ -937,6 +945,65 @@ fn embed_dump() {
     std::fs::write(&out_path, flat).expect("결과 쓰기");
     println!("@@EVAL EMBED {} rows × {} dims → {}", rows.len(), rows.first().map_or(0, |r| r.len()), out_path);
     logis_app::utils::device_utils::rocm_exit_now_if_used(0);
+}
+
+/// SigLIP2 타워 대조 덤프 (CPU F32): premium-discount-vision 의 `tests/siglip2_dump.rs` 와 같은 입력으로 견줍니다.
+///   LOGIS_SYNTH_IMAGES=<이미지 폴더> LOGIS_SYNTH_TEXTS=<문장 JSON 배열> LOGIS_SYNTH_OUT=<출력 폴더>
+/// 이미지마다 `<이름>.rgb`(디코딩한 RGB8, 상대 쪽이 같은 픽셀로 시작하게) · `.dims`(w h) · `.logis.pix`(전처리 (3, H, W) f32) ·
+/// `.logis.grid`(rows cols) · `.logis.pooled`(풀링 벡터) · `.logis.dense`(패치 공유공간 행, rows·cols × D), 문장은
+/// `texts.logis.ids.json` · `texts.logis.f32`(정규화한 구 행). 벡터는 f32 little-endian.
+#[test]
+#[ignore = "SigLIP2 대조: LOGIS_SYNTH_IMAGES · LOGIS_SYNTH_TEXTS · LOGIS_SYNTH_OUT"]
+fn siglip2_dump() {
+    use candle_core::{DType, Device};
+    use logis_app::models::siglip2::preprocessor::preprocess_image;
+    use logis_app::models::siglip2::vision_encoder::encode_phrase_rows;
+    use logis_app::models::siglip2::{Siglip2Config, Siglip2Model};
+
+    let (Ok(img_dir), Ok(texts_path), Ok(out)) = (
+        std::env::var("LOGIS_SYNTH_IMAGES"),
+        std::env::var("LOGIS_SYNTH_TEXTS"),
+        std::env::var("LOGIS_SYNTH_OUT"),
+    ) else {
+        println!("LOGIS_SYNTH_IMAGES · LOGIS_SYNTH_TEXTS · LOGIS_SYNTH_OUT 이 없어 건너뜁니다.");
+        return;
+    };
+    let out = PathBuf::from(out);
+    let f32_bytes = |rows: &[f32]| -> Vec<u8> { rows.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let device = Device::Cpu;
+    let dir = crate::common::models_dir().join("siglip2-so400m-patch16-naflex");
+    let config = Siglip2Config::from_json(&dir.join("config.json")).expect("config.json");
+
+    let texts: Vec<String> = serde_json::from_str(&std::fs::read_to_string(&texts_path).expect("문장 파일")).expect("JSON 배열");
+    let tm = Siglip2Model::load_text_only(&dir, &config, &device, DType::F32).expect("텍스트 타워");
+    let tok = tm.tokenizer.as_ref().expect("토크나이저");
+    let ids: Vec<Vec<u32>> = texts.iter().map(|t| tok.encode_one(t).expect("토큰").0).collect();
+    std::fs::write(out.join("texts.logis.ids.json"), serde_json::to_string(&ids).unwrap()).unwrap();
+    let rows = encode_phrase_rows(&tm, &texts, true).expect("구 인코딩");
+    std::fs::write(out.join("texts.logis.f32"), f32_bytes(&rows.concat())).unwrap();
+    drop(tm);
+
+    let vm = Siglip2Model::load_vision_only(&dir.join("model.safetensors"), &config, &device, DType::F32).expect("비전 타워");
+    let vision = vm.vision.as_ref().expect("비전");
+    let mut names: Vec<PathBuf> = std::fs::read_dir(&img_dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).collect();
+    names.sort();
+    for path in names.iter().filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("png" | "jpg" | "jpeg"))) {
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let rgb = image::open(path).expect("이미지").to_rgb8();
+        let (w, h) = rgb.dimensions();
+        std::fs::write(out.join(format!("{stem}.rgb")), rgb.as_raw()).unwrap();
+        std::fs::write(out.join(format!("{stem}.dims")), format!("{w} {h}")).unwrap();
+        let pre = preprocess_image(&image::DynamicImage::ImageRgb8(rgb), &config, &device).expect("전처리");
+        let pix: Vec<f32> = pre.pixel_values.flatten_all().unwrap().to_vec1().unwrap();
+        std::fs::write(out.join(format!("{stem}.logis.pix")), f32_bytes(&pix)).unwrap();
+        std::fs::write(out.join(format!("{stem}.logis.grid")), format!("{} {}", pre.grid_rows, pre.grid_cols)).unwrap();
+        let f = vision.forward(&pre.pixel_values, pre.grid_rows, pre.grid_cols).expect("순전파");
+        let pooled: Vec<f32> = f.pooled.flatten_all().unwrap().to_vec1().unwrap();
+        let dense: Vec<f32> = f.patch_shared.flatten_all().unwrap().to_vec1().unwrap();
+        std::fs::write(out.join(format!("{stem}.logis.pooled")), f32_bytes(&pooled)).unwrap();
+        std::fs::write(out.join(format!("{stem}.logis.dense")), f32_bytes(&dense)).unwrap();
+        println!("@@SIGLIP2 {stem}: {w}x{h} → grid {}x{}", pre.grid_rows, pre.grid_cols);
+    }
 }
 
 /// 🌟 [SYNTH EVAL / CENSUS] DOM 구조 집계만 돌립니다. 모델이 필요 없어 GPU 작업과 함께 돌릴 수 있습니다.

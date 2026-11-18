@@ -57,9 +57,13 @@ logis-app = { path = "commerce/app" }
 
 # premium-discount 공용 라이브러리 (raon-zena 와 같은 리비전).
 # 로컬 ../premium-discount 로 같이 고칠 때는 아래 [patch."https://github.com/Qntology/premium-discount"] 의 주석을 푼다.
-premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
-premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
-premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "9925011128c2af1bcf8000cabafdd208a2119c77" }
+premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "25497674a0b86756ba56a17d69a8c5173e95a6dd" }
+premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "25497674a0b86756ba56a17d69a8c5173e95a6dd" }
+premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "25497674a0b86756ba56a17d69a8c5173e95a6dd" }
+# AI 엔진: Stanza (ONNX Runtime, 실행할 때 불러옴) · granite 임베딩 인코더 (candle). logis 쪽은 이 위의 얇은 층입니다.
+premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "25497674a0b86756ba56a17d69a8c5173e95a6dd", default-features = false }
+# 스팬 NMS (Stanza 역할 · granite 임베딩 위의 의미 NMS). 아직 쓰는 crate 는 없습니다 — 이 앱의 NMS 는 비전 패치(logis-vision-doc nms_arena)뿐.
+premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "25497674a0b86756ba56a17d69a8c5173e95a6dd" }
 
 # candle-rocm-vulkan 포크: premium-discount (crates/ · app/) · raon-zena 와 같은 커밋으로 고정한다.
 # 예전에는 branch = "master" 를 따라가고 커밋은 Cargo.lock 이 정했다 (60ec257, ebaf93d 의 조상).
@@ -82,6 +86,7 @@ candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", re
 # premium-discount-identity = { path = "../premium-discount/crates/premium-discount-identity" }
 # premium-discount-sds = { path = "../premium-discount/crates/premium-discount-sds" }
 # premium-discount-quant = { path = "../premium-discount/crates/premium-discount-quant" }
+# premium-discount-nlp = { path = "../premium-discount/crates/premium-discount-nlp" }
 
 [profile.dev]
 opt-level = 0      # 기본값 0(최적화 없음). 무거운 crate 만 아래에서 3 으로 올린다.

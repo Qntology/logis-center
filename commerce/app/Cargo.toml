@@ -42,10 +42,10 @@ logis-schema.workspace = true
 logis-sds.workspace = true
 logis-search.workspace = true
 logis-vision-doc.workspace = true
-ndarray = "0.15.1"
 num = "0.4.3"
 once_cell = "1.18"
-onnxruntime = { path = "../crates/onnxruntime" }
+# Stanza 실행기 (src/stanza.rs 는 이 crate 의 stanza 를 감싸는 층). ONNX Runtime 은 실행할 때 불러옴(runtime-load).
+premium-discount-nlp = { workspace = true, features = ["stanza"] }
 rand = "0.8"
 rand_chacha = "0.3"
 rayon = "1.10"

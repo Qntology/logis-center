@@ -5,6 +5,8 @@
 //! 리눅스 실행 예:
 //!   ORT_STRATEGY=system ORT_LIB_LOCATION=<onnxruntime-linux-x64-1.28.0> \
 //!   cargo test -p logis-app --test it --no-default-features --features vulkan
+//! (Stanza 의 ONNX Runtime 은 링크하지 않고 실행할 때 불러옵니다 — premium-discount-nlp 의 `runtime-load`. 위 두 변수는 빌드가
+//!  시험용 라이브러리 자리를 기억하게 하고, 없으면 ORT_DYLIB_PATH=<…/libonnxruntime.so> 로 줍니다.)
 //!
 //! GPU 가 없는 리눅스(클라우드)에서는 Mesa llvmpipe 를 쓰도록 다음도 지정합니다:
 //!   CANDLE_VULKAN_ALLOW_CPU=1   (포크는 기본적으로 CPU 타입 Vulkan 디바이스를 건너뜀)

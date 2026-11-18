@@ -86,8 +86,6 @@ cron-logis-center/
 │   ├── test_linux.sh                   # Linux integration tests (vulkan|cuda|rocm)
 │   ├── crates/
 │   │   ├── boa-engine/                 # Boa JS engine (local build)
-│   │   ├── onnxruntime/                # ONNX Runtime bindings (local build)
-│   │   ├── onnxruntime-sys/            # ONNX Runtime FFI
 │   │   └── direct-storage/             # DirectStorage (Windows)
 │   ├── app/                            # Headless core (crate logis-app, no Tauri): model residency, LanceDB store, scheduler, search
 │   │   ├── Cargo.toml                  # GPU features only forward to logis-llm / logis-vision-doc (the core code has no #[cfg(feature)])
@@ -115,7 +113,7 @@ cron-logis-center/
 │   │       │   ├── research.rs         # Research flow
 │   │       │   └── query_{commerce,shipping}.rs  # Domain search queries
 │   │       ├── store.rs                # LanceDB vector store (envelope schema)
-│   │       ├── stanza.rs               # Stanza NLP (tokenization/POS/lemma/syntax)
+│   │       ├── stanza.rs               # Stanza NLP adapter over premium-discount-nlp (model folder rule, query language, downloads)
 │   │       ├── search_fusion.rs / search_relation.rs  # Search fusion + relation steps (rules in crates/logis-search)
 │   │       ├── sink.rs                 # EventSink · Sink · NoopSink (TauriSink lives in the shell)
 │   │       ├── browser_state.rs        # Active browser tab state (written by the shell's automation, read by url_utils)
@@ -545,6 +543,9 @@ Stanza models are the format 2 export of [stanza-onnx-export](https://github.com
 (raw text → tokens → MWT → POS → lemma → dependencies) against PyTorch Stanza for all 12 languages. The downloader reads `vocab.json` from
 `huggingface.co/Qntology/stanza-<lang>` first and fetches the files it lists; a format 1 repository is reported as an error instead of being installed.
 `LOGIS_STANZA_DIR=<folder>` makes the app read `<folder>/<lang>/` instead of the app data folder (evaluation, development).
+The runtime itself is `premium-discount-nlp`'s `stanza` (the same code this app had, byte-identical output on the 278 reference sentences); ONNX
+Runtime is loaded at run time by full path (`ORT_DYLIB_PATH`, next to the executable, `<app data>/models/onnxruntime/`, or the library the build
+prepared), never linked. The granite embedding encoder is `premium-discount-nlp`'s `granite::Encoder` (this app's forward pass, bit-identical).
 
 ### Domain Dictionary (`bias.json` / `full_bias.json`)
 
@@ -613,7 +614,7 @@ Apache License 2.0
 | num | MIT OR Apache-2.0 |
 | nvml-wrapper | MIT OR Apache-2.0 |
 | once_cell | MIT OR Apache-2.0 |
-| onnxruntime (local build) | MIT OR Apache-2.0 |
+| onnxruntime (premium-discount copy, runtime-loaded) | MIT OR Apache-2.0 |
 | pdf-extract | MIT |
 | quick-xml | MIT |
 | rand / rand_chacha | MIT OR Apache-2.0 |
