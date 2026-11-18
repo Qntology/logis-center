@@ -14,7 +14,6 @@ export interface FakeRuntimeOptions {
   activeTags?: ModeTag[];
   itemTombstones?: string[];
   talkTombstones?: string[];
-  busy?: boolean;
   cloudPendingTasks?: Map<string, any>;
   kv?: Record<string, unknown>;
 }
@@ -23,7 +22,6 @@ export function makeRuntime(opts: FakeRuntimeOptions = {}) {
   const kv = new Map<string, unknown>(Object.entries(opts.kv ?? {}));
   const state = {
     session: { hash: "", ...opts.session } as ModeSession,
-    busy: opts.busy ?? false,
     cloudPendingTasks: opts.cloudPendingTasks ?? new Map<string, any>(),
   };
 
@@ -43,8 +41,6 @@ export function makeRuntime(opts: FakeRuntimeOptions = {}) {
     getDetectedUrl: () => opts.detectedUrl ?? "",
     getActiveTags: () => opts.activeTags ?? [],
     getCurrentTab: () => opts.currentTab ?? "list",
-    isBusy: () => state.busy,
-    getDevicePref: () => null,
     getCloudPendingTasks: () => state.cloudPendingTasks,
     renderNavigation: vi.fn(async () => {}),
     loadMoreDocs: vi.fn(async () => {}),

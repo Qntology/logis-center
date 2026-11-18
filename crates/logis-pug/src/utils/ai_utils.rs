@@ -1,0 +1,7877 @@
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 { 0.0 } else { granite_scale(a.len(), dot_product / (norm_a * norm_b)) }
+}
+
+/// 🌟 [COS CALIBRATION] granite(384차원) 코사인만 예전 순전파 눈금으로 옮깁니다(models::embedding::calibrate_cos).
+///    SigLIP2(1152차원) 등 다른 공간의 코사인은 그대로입니다. 0벡터의 0.0 은 이 함수까지 오지 않습니다.
+#[inline]
+pub fn granite_scale(dim: usize, raw: f32) -> f32 {
+    if dim == logis_schema::embed_space::EMBED_DIM {
+        logis_schema::embed_space::calibrate_cos(raw)
+    } else {
+        raw
+    }
+}
+
+// =====================================================================
+// 🌟 [STANZA IMPROVEMENT] 언어 중립(Language-Agnostic) 형태·구문 판별 엔진
+// ---------------------------------------------------------------------
+// 판별 근거는 아래 4가지뿐이며, 전부 언어에 무관한 보편 자원입니다.
+//   ① UD UPOS 태그셋      (vocab.json 의 pos.upos 배열 — 전 언어 공통 규격)
+//   ② UD DEPREL 태그셋    (vocab.json 의 depparse.deprel 배열 — 전 언어 공통 규격)
+//   ③ Stanza Lemma 출력   (표면형-원형 차이로 굴절/교착 여부를 모델이 직접 알려줌)
+//   ④ 문자열 구조 규칙    (숫자 밀도 / 구분자 — 문자 체계와 무관)
+// 특정 언어의 어휘·조사·어미 사전은 일절 사용하지 않습니다.
+// =====================================================================
+
+/// [PHASE 1] UD UPOS 중 개체명(PII)이 될 수 없는 태그 — 전 언어 공통
+const UPOS_HARD_REJECT: &[&str] = &[
+    "VERB", "AUX", "ADV", "ADP", "PART", "SCONJ", "CCONJ", "CONJ",
+    "DET", "PRON", "INTJ", "PUNCT", "SYM",
+];
+
+/// [PHASE 1] 개체명 후보로 인정되는 핵심 체언 태그 — 전 언어 공통
+const UPOS_STRONG_ENTITY: &[&str] = &["NOUN", "PROPN"];
+
+/// [PHASE 1] 단독으로는 개체명 근거가 되지 못하고 보조 근거(구문/복합어)가 필요한 태그
+const UPOS_WEAK_ENTITY: &[&str] = &["ADJ", "NUM", "X"];
+
+/// UPOS 서브타입(`NOUN:xxx` 형태) 제거 후 상위 태그만 반환
+fn upos_base(tag: &str) -> &str {
+    match tag.find(':') {
+        Some(i) => &tag[..i],
+        None => tag,
+    }
+}
+
+/// UD DEPREL 서브타입(`nsubj:pass`, `flat:name` 등) 제거 후 소문자 상위 레이블 반환
+fn deprel_base(label: &str) -> String {
+    let l = label.to_lowercase();
+    match l.find(':') {
+        Some(i) => l[..i].to_string(),
+        None => l,
+    }
+}
+
+/// [PHASE 2] UD 수식어·기능어 의존관계 → 개체명 기각 근거 (전 언어 공통)
+fn is_modifier_deprel(label: &str) -> bool {
+    matches!(
+        deprel_base(label).as_str(),
+        "acl" | "advcl" | "advmod" | "amod" | "aux" | "cop" | "case" | "mark"
+            | "cc" | "det" | "discourse" | "expl" | "punct" | "dep"
+    )
+}
+
+/// UD 기능어 관계 (조동사 · 계사 · 격 표지 · 접속 · 한정사 · 구두점). `is_modifier_deprel` 과 달리 내용 수식어
+/// (amod · advmod · acl · advcl)는 넣지 않습니다. 의존 구문이 실제로 맞게 나오면서(stanza format 2) 'beige'(amod) 같은
+/// 조건어가 기능어로 빠지지 않게 하려는 것입니다.
+fn is_function_deprel(label: &str) -> bool {
+    matches!(
+        deprel_base(label).as_str(),
+        "aux" | "cop" | "case" | "mark" | "cc" | "det" | "discourse" | "expl" | "punct"
+    )
+}
+
+/// [PHASE 2] UD 체언 논항·복합어 의존관계 → 개체명 후보 근거 (전 언어 공통)
+fn is_nominal_deprel(label: &str) -> bool {
+    matches!(
+        deprel_base(label).as_str(),
+        "nsubj" | "obj" | "iobj" | "obl" | "nmod" | "flat" | "compound"
+            | "appos" | "conj" | "root" | "vocative" | "list" | "nummod"
+    )
+}
+
+/// [PHASE 4] 구분자 포함 여부 (전화·주민번호 등 식별번호의 보편적 구조 신호)
+fn has_identifier_separator(word: &str) -> bool {
+    word.chars().any(|c| matches!(c, '-' | '.' | '/' | '+' | '(' | ')' | ' ' | '_'))
+}
+
+/// [PHASE 4] 식별번호 후보가 실제 식별번호 '구조'인지 검증.
+/// 언어별 단위 사전(도/명/원 등) 없이, 숫자 개수와 구분자 유무만으로 판정하므로
+/// 어떤 문자 체계에서도 동일하게 동작합니다. ('38도','119에','24절기','12일' → 전부 기각)
+fn is_valid_identifier_shape(word: &str, base_target: &str) -> bool {
+    let digits = word.chars().filter(|c| c.is_ascii_digit()).count();
+    let sep = has_identifier_separator(word);
+
+    match base_target {
+        // 이메일: 로컬파트@도메인 구조와 도메인 내 점(.) 존재를 요구
+        "email" => {
+            if let Some(at) = word.find('@') {
+                let domain = &word[at + 1..];
+                !word[..at].is_empty() && domain.contains('.') && domain.len() >= 4
+            } else {
+                false
+            }
+        }
+        // 주민등록/사회보장번호류: 최소 8자리 이상 숫자. 구분자가 없으면 10자리 이상 요구
+        "national_id" => (digits >= 8 && sep) || digits >= 10,
+        // 연락처: 구분자 없는 순수 숫자열 9자리 이상, 또는 구분자 포함 7자리 이상
+        "contact_number" => (digits >= 9) || (digits >= 7 && sep),
+        _ => false,
+    }
+}
+
+/// [PHASE 3] Stanza Lemma 출력과 표면형을 비교하여 '굴절/교착이 일어난 토큰'인지 판정.
+/// 접두 일치(prefix) / 접미 일치(suffix) 양쪽을 모두 검사하므로
+/// 교착어(한국어·일본어·터키어), 굴절어(러시아어·독일어), 고립어(중국어)를 함께 커버합니다.
+fn is_inflected_surface(surface: &str, lemma: &str) -> bool {
+    if lemma.trim().is_empty() { return false; }
+    let s: String = surface.chars().filter(|c| c.is_alphanumeric()).collect();
+    let l: String = lemma.chars().filter(|c| c.is_alphanumeric()).collect();
+    if l.is_empty() || s.is_empty() { return false; }
+    if s == l { return false; }
+    let sc = s.chars().count();
+    let lc = l.chars().count();
+    // 원형이 표면형의 앞/뒤에 포함되며 길이가 더 짧다면 굴절이 발생한 것으로 간주
+    (sc > lc) && (s.starts_with(&l) || s.ends_with(&l) || s.contains(&l))
+}
+
+/// [PHASE 3] Lemma 를 이용한 언어 중립 접미 절단.
+/// 언어별 조사/어미 목록 대신 모델이 산출한 원형을 그대로 신뢰하여 잘라냅니다.
+fn trim_surface_by_lemma(surface: &str, lemma: &str) -> Option<String> {
+    if !is_inflected_surface(surface, lemma) { return None; }
+    let l: String = lemma.chars().filter(|c| c.is_alphanumeric()).collect();
+    if l.chars().count() < 2 { return None; }
+    if surface.starts_with(&l) && surface.chars().count() > l.chars().count() {
+        return Some(l);
+    }
+    if let Some(idx) = surface.rfind(&l) {
+        // 원형이 표면형 뒤쪽에 붙은 형태(접두 굴절)는 원형만 남깁니다.
+        if idx > 0 { return Some(l); }
+    }
+    None
+}
+
+/// 형태·구문 판별 결과
+#[derive(Debug, Clone)]
+pub struct MorphVerdict {
+    pub accept: bool,
+    pub reason: String,
+}
+
+impl MorphVerdict {
+    fn ok(reason: &str) -> Self { Self { accept: true, reason: reason.to_string() } }
+    fn no(reason: &str) -> Self { Self { accept: false, reason: reason.to_string() } }
+}
+
+/// [PHASE 1 + 2 + 4] 개체명 후보 최종 판정 (언어 중립).
+/// - identifier 계열은 구조 검증으로 대체
+/// - PROPN 단독 통과 금지: UD DEPREL 체언 관계 또는 복합 체언 구성일 때만 인정
+/// - 전 토큰이 UD 수식어 관계이면 강제 기각
+pub fn evaluate_entity_candidacy(
+    surface: &str,
+    words: &[String],
+    tags: &[&str],
+    deprels: Option<&[String]>,
+    lemmas: Option<&[String]>,
+    base_target: &str,
+    is_sub_language: bool,
+) -> MorphVerdict {
+    // ── 0) 식별번호 계열: 형태소가 아니라 '구조'로 판정 (언어 무관) ──
+    if matches!(base_target, "email" | "contact_number" | "national_id") {
+        return if is_valid_identifier_shape(surface, base_target) {
+            MorphVerdict::ok("IDENTIFIER-SHAPE 검증 통과")
+        } else {
+            MorphVerdict::no("식별번호 구조(숫자 밀도/구분자) 미충족")
+        };
+    }
+
+    // ── 1) 유효 토큰 수집 (구두점·기호 제외) ──
+    let mut core: Vec<usize> = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if i >= tags.len() { break; }
+        if w.chars().any(|c| c.is_alphanumeric()) {
+            let t = upos_base(tags[i]);
+            if t != "PUNCT" && t != "SYM" { core.push(i); }
+        }
+    }
+
+    if core.is_empty() {
+        // 메인 언어와 다른 표기(로마자 약어 등)는 태거 신뢰도가 낮으므로 최소 조건으로 구제
+        let alnum = surface.chars().filter(|c| c.is_alphanumeric()).count();
+        if is_sub_language && alnum >= 2 {
+            return MorphVerdict::ok("SUB-LANGUAGE 구제 (태거 신뢰도 낮음)");
+        }
+        return MorphVerdict::no("유효 토큰 없음 (전부 구두점/기호)");
+    }
+
+    // ── 2) UPOS 1차 게이트 ──
+    let mut has_strong = false;
+    let mut has_weak = false;
+    let mut all_hard_reject = true;
+    for &i in &core {
+        let t = upos_base(tags[i]);
+        if UPOS_STRONG_ENTITY.contains(&t) { has_strong = true; }
+        if UPOS_WEAK_ENTITY.contains(&t) { has_weak = true; }
+        if !UPOS_HARD_REJECT.contains(&t) { all_hard_reject = false; }
+    }
+
+    if all_hard_reject {
+        if is_sub_language {
+            return MorphVerdict::ok("SUB-LANGUAGE 구제 (UPOS 기각 면제)");
+        }
+        return MorphVerdict::no("UD UPOS 전량 비체언(용언/부사/조사/접속사 등)");
+    }
+
+    // ── 3) UD DEPREL 교차 검증 (Phase 2 핵심) ──
+    if let Some(rels) = deprels {
+        let mut nominal_support = false;
+        let mut modifier_hits = 0usize;
+        let mut checked = 0usize;
+        for &i in &core {
+            if i >= rels.len() { continue; }
+            checked += 1;
+            if is_nominal_deprel(&rels[i]) { nominal_support = true; }
+            else if is_modifier_deprel(&rels[i]) { modifier_hits += 1; }
+        }
+        if checked > 0 && !nominal_support && modifier_hits == checked {
+            return MorphVerdict::no("UD DEPREL 전량 수식어 관계(acl/amod/advmod 등)");
+        }
+        // PROPN 단독 토큰은 구문상 체언 논항일 때만 인정 (PROPN 남발 차단)
+        if core.len() == 1 && !has_weak {
+            let i = core[0];
+            let t = upos_base(tags[i]);
+            if t == "PROPN" && i < rels.len() && !is_nominal_deprel(&rels[i]) {
+                return MorphVerdict::no("단일 PROPN 이나 UD DEPREL 체언 근거 부재");
+            }
+        }
+        if nominal_support {
+            return MorphVerdict::ok("UD DEPREL 체언 논항 근거 확보");
+        }
+    }
+
+    // ── 4) DEPREL 미확보 시 폴백: 체언 태그 + 비굴절 여부로 판단 ──
+    if !has_strong {
+        // 약체언(ADJ/NUM/X) 단독은 개체명 근거로 불충분
+        if core.len() >= 2 {
+            return MorphVerdict::ok("복합 구성 내 약체언 (보조 근거 인정)");
+        }
+        if is_sub_language {
+            return MorphVerdict::ok("SUB-LANGUAGE 구제 (약체언 단독)");
+        }
+        return MorphVerdict::no("체언(NOUN/PROPN) 부재 — 약체언 단독은 개체명 불가");
+    }
+
+    // 단일 토큰이 굴절형이면(모델 원형 ≠ 표면형) 개체명보다 활용형일 가능성이 높음
+    if core.len() == 1 {
+        if let Some(lm) = lemmas {
+            let i = core[0];
+            if i < lm.len() && is_inflected_surface(&words[i], &lm[i]) {
+                let t = upos_base(tags[i]);
+                if t != "PROPN" {
+                    return MorphVerdict::no("단일 굴절형 토큰 (Lemma 상이) — 활용형으로 판단");
+                }
+            }
+        }
+    }
+
+    MorphVerdict::ok("UD UPOS 체언 근거 확보")
+}
+
+pub fn max_pool_sim(target: &[f32], phrase_embs: &Vec<Vec<f32>>) -> f32 {
+    let mut best = 0.0f32;
+    for pe in phrase_embs {
+        let s = cosine_similarity(target, pe);
+        if s > best { best = s; }
+    }
+    best
+}
+
+pub use logis_schema::text::{numeric_run_count, normalize_digits_ascii, month_from_name, lower_alnum, short_tail_ok, MONTH_NAMES_ML, is_abbreviation_slash, split_phrase_list, split_bias_phrases, split_bias_phrases_weighted, split_bias_phrases_full, split_bias_phrases_weighted_full};
+
+
+
+
+// 🌟 [WEIGHTED MAX-POOL] 센트로이드(평균) 대신 구 단위 최대 유사도를 사용합니다.
+// 거대한 콤마 나열 문자열 하나를 통째로 임베딩하면 모든 개념의 평균이 되어
+// 어떤 라인과도 0.0x 수준의 무의미한 값만 나오는 문제를 원천 차단합니다.
+pub fn weighted_max_pool_sim(target: &[f32], phrase_embs: &Vec<Vec<f32>>, weights: &Vec<f32>) -> f32 {
+    let mut best = 0.0f32;
+    for (i, pe) in phrase_embs.iter().enumerate() {
+        if pe.iter().all(|&v| v == 0.0) { continue; }
+        let w = weights.get(i).copied().unwrap_or(1.0);
+        let s = cosine_similarity(target, pe) * w;
+        if s > best { best = s; }
+    }
+    best
+}
+
+
+
+// 🌟 [SEMANTIC ANCHOR] 필드의 '정체성 문구'(semantic)를 bias.json 에서 언어 중립으로 꺼냅니다.
+//    ko.goods.title.semantic = "상품명, 의류명, 제품명, 품목명, 이름" 처럼
+//    정답 변별 구가 bias 가 아니라 semantic 에만 존재하는 경우가 많은데
+//    (로그의 '가디건' → title 이 정답인 근거는 '의류명' 단 하나입니다)
+//    기존 파이프라인은 semantic 을 프롬프트 설명문으로만 쓰고 벡터 공간에는 올리지 않았습니다.
+//    루트 전역 노드(color, metrics.*, operators.* ...)까지 깊이 무관 탐색으로 찾아냅니다.
+pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
+    let primary = crate::utils::bias_schema::lang_code_of(doc_lang);
+
+    for lk in [primary.as_str(), "en", "ko"] {
+        let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
+        if let Some(s) = lang_node
+            .get(page_type)
+            .and_then(|p| p.get(field_name))
+            .and_then(|n| n.get("semantic"))
+            .and_then(|v| v.as_str())
+        {
+            if !s.trim().is_empty() { return s.to_string(); }
+        }
+        if canon != page_type {
+            if let Some(s) = lang_node
+                .get(canon)
+                .and_then(|p| p.get(field_name))
+                .and_then(|n| n.get("semantic"))
+                .and_then(|v| v.as_str())
+            {
+                if !s.trim().is_empty() { return s.to_string(); }
+            }
+        }
+        if let Some(s) = lang_node
+            .get("default")
+            .and_then(|p| p.get(field_name))
+            .and_then(|n| n.get("semantic"))
+            .and_then(|v| v.as_str())
+        {
+            if !s.trim().is_empty() { return s.to_string(); }
+        }
+    }
+
+    let mut stack: Vec<&serde_json::Value> = vec![dict];
+    let mut hops = 0usize;
+    while let Some(node) = stack.pop() {
+        hops += 1;
+        if hops > 8192 { break; }
+        if let Some(obj) = node.as_object() {
+            if let Some(child) = obj.get(field_name) {
+                if let Some(s) = child.get("semantic").and_then(|v| v.as_str()) {
+                    if !s.trim().is_empty() { return s.to_string(); }
+                }
+            }
+            for (_, v) in obj {
+                if v.is_object() { stack.push(v); }
+            }
+        }
+    }
+
+    humanize_url_token(field_name)
+}
+
+// 🌟 [ABSTRACT BRIDGE — FIELD SCOPE] search_bridge.abstract_bridge 에서
+//    이 필드를 목표로 하는 브릿지 구만 뽑아냅니다.
+//    키는 "substantial_filters.weight" 형태이므로 '.' 뒤 조각이 필드명과 같으면 채택합니다.
+//    정방향은 이 구들로 '무거운' → weight 를 라우팅하는데, 역방향(저장)에는 이 축이
+//    통째로 빠져 있어서 "정방향이 잡은 의도를 받아줄 벡터가 DB에 없는" 상태였습니다.
+pub fn abstract_bridge_field_phrases(field_name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("abstract_bridge"))
+        .and_then(|v| v.as_object())
+    { Some(n) => n, None => return out };
+
+    for (target, val) in node {
+        let key = match target.rsplitn(2, '.').next() { Some(k) => k, None => continue };
+        if key != field_name { continue; }
+        for field in ["semantic", "bias"] {
+            if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                for p in split_bias_phrases_full(s) {
+                    if !out.iter().any(|e| e == &p) { out.push(p); }
+                }
+            }
+        }
+    }
+    if out.len() > 48 { out.truncate(48); }
+    out
+}
+
+// 🌟 [INDEXING ANCHOR] 저장(역방향) 시점에 청크 벡터 위에 얹을 '다국어 라벨 앵커'입니다.
+//    json_to_natural_language() 는 무조건 영어 문장을 만들지만 질의는 문서 언어이므로,
+//    저장 벡터에 문서 언어 라벨을 반드시 섞어야 코사인이 성립합니다.
+//
+//    🌟 [편입 순서 역전] 기존 순서는
+//        ① semantic ② label_phrase_bank ③ abstract_bridge ④ multilingual_value_anchor
+//    였고 마지막에 truncate(32) 를 걸었습니다.
+//    그 결과 앞 세 축이 창을 다 먹고 나면 ④ 는 영어 앞부분만 들어가,
+//    정작 크로스링구얼 매칭의 핵심인 '니트 / 가디건 / ニット / カーディガン' 이
+//    저장 벡터에 단 한 번도 실리지 못했습니다.
+//    다국어 값 축을 최우선으로 편입하고 상한을 제거합니다.
+//    (앵커 가중치는 Text 0.10 / 그 외 0.30 이므로 구 수가 늘어도 값 벡터를 침범하지 않습니다)
+//
+//    🌟 [LABEL-ONLY] 이 함수의 출력은 '라벨 개념' 전용입니다.
+//    로컬라이즈(값 결합) 텍스트에 이 블롭을 그대로 쓰면 값이 수십 토큰 중 3토큰으로
+//    희석되어, 값 질의("니트 가디건")가 어떤 청크와도 구분되지 않습니다.
+//    값 결합용으로는 반드시 indexing_leaf_label() 을 사용하십시오.
+pub fn indexing_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -> String {
+    let mut phrases: Vec<String> = Vec::new();
+
+    // ① [최우선] 다국어 값 도메인 축 — 크로스링구얼 매칭의 유일한 근거
+    //    🌟 page_type 이 이미 인자로 들어와 있는데 쓰지 않아, 저장 벡터에도
+    //       goods/review/tracking 세 도메인 어휘가 전부 섞여 있었습니다.
+    for p in multilingual_value_anchor_phrases_scoped(page_type, field_name) {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    // ② 문서 언어 semantic 앵커
+    for p in split_bias_phrases_full(&semantic_anchor_text(doc_lang, page_type, field_name)) {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    // ③ 문서 언어 라벨 뱅크
+    let (label_phrases, _w) = label_phrase_bank(doc_lang, page_type, field_name);
+    for p in label_phrases {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    // ④ 추상 수식어 브릿지 (heavy / expensive / fast ...)
+    for p in abstract_bridge_field_phrases(field_name) {
+        if !phrases.iter().any(|e| e == &p) { phrases.push(p); }
+    }
+
+    if phrases.is_empty() {
+        return humanize_url_token(field_name);
+    }
+    phrases.join(", ")
+}
+
+// 🌟 [INDEXING LEAF LABEL] 값과 결합할 '단 하나의 짧은 문서 언어 라벨'입니다.
+//    indexing_anchor_text() 는 라벨 10~32구를 join 한 블롭이라
+//    "상품명, 의류명, 제품명, 품목명, 이름, ... Cable Knit Cardigan" 처럼
+//    값이 통째로 희석됩니다.
+//    (new_log2.txt: title 청크가 후보 진입조차 못 하고 status 가 상위 9건 독점)
+//    여기서는 semantic 의 '첫 구' 하나만 뽑아 "상품명 Cable Knit Cardigan" 형태로
+//    값이 지배하는 로컬라이즈 텍스트를 만듭니다.
+pub fn indexing_leaf_label(doc_lang: &str, page_type: &str, field_name: &str) -> String {
+    let sem = semantic_anchor_text(doc_lang, page_type, field_name);
+    for p in split_bias_phrases_full(&sem) {
+        let t = p.trim();
+        if t.is_empty() { continue; }
+        // 예시값(숫자 리터럴/장문)은 라벨이 아닙니다.
+        if is_value_example_phrase(t) { continue; }
+        return t.to_string();
+    }
+    humanize_url_token(field_name)
+}
+
+// 🌟 [MULTILINGUAL VALUE ANCHOR] bias.json 의 search_bridge.multilingual_value_anchor 에서
+//    이 필드의 '값이 속한 의미 도메인'을 다국어로 기술한 구를 읽습니다.
+//
+//    🌟 [양방향 공용] 이 노드는 '스키마 속성 뱅크' 에만 편입됩니다.
+//    filter_category_phrases() 는 substantial/find/status/time/season 만 읽고,
+//    abstract_bridge_phrases() 는 search_bridge.abstract_bridge 만 읽으므로
+//    정방향 필터 뱅크·SURPRISAL 게이트·연산자 뱅크는 전혀 오염되지 않습니다.
+//    역방향은 indexing_anchor_text() 로, 정방향은 속성 뱅크 구축부로 편입되어
+//    질의 벡터와 저장 벡터가 같은 다국어 값 축을 공유하게 됩니다.
+//
+//    🌟 [상한 제거 이유] 이 노드의 구 순서는 (semantic → 영어 → 한국어 → 일본어 → 중국어 → …)
+//    이므로 48구 상한은 일본어 3구째에서 잘려, 그 뒤 40여 개 언어의 값 어휘가 통째로 소멸합니다.
+//    다국어 크로스링구얼 매칭이 이 노드의 유일한 존재 이유이므로 상한을 두지 않습니다.
+//    (Max-Pool 은 구 개수가 늘어도 최댓값만 취하고, 뱅크 크기 편향은
+//     bank_size_equalized_mask() 가 질의 시점에 상대 통계로 별도 정규화합니다)
+// 🌟 [DOMAIN-SCOPED ANCHOR] bias.json 의 키는 "goods.title" / "review.title" / "tracking.title"
+//    처럼 도메인 접두를 갖습니다. 그런데 기존 판정은
+//        target.rsplitn(2, '.').next()   →  "goods.title" 에서 "title"
+//    이라 field_name="title" 하나로 세 도메인이 전부 병합되었습니다.
+//    그 결과 review 검색의 title 뱅크에 의류 어휘 200여 구가 실려
+//    review.title 과 goods.title 이 벡터 공간에서 구분되지 않습니다.
+//    page_type 을 알고 있으면 "page_type.field_name" 정확 일치를 우선하고,
+//    그 도메인 항목이 없을 때만 기존 접미 일치로 폴백합니다.
+pub fn multilingual_value_anchor_phrases_scoped(page_type: &str, field_name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("multilingual_value_anchor"))
+        .and_then(|v| v.as_object())
+    { Some(n) => n, None => return out };
+
+    // 🌟 [BIAS TYPE CANONICALIZE] "BL.pol" 은 bias.json 에 없고 "shipping_doc.pol" 만
+    //    존재합니다. 정규화하지 않으면 무역 문서의 저장 벡터에 다국어 값 축이
+    //    한 구도 실리지 않아 크로스링구얼 리콜이 0 이 됩니다.
+    let scoped_key = if page_type.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{}.{}",
+            crate::utils::bias_schema::canonical_bias_type(page_type.trim()),
+            field_name
+        )
+    };
+
+    // ① 도메인 정확 일치 (goods.title 질의에는 goods.title 만)
+    if !scoped_key.is_empty() {
+        if let Some(val) = node.get(&scoped_key) {
+            for field in ["semantic", "bias"] {
+                if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                    for p in split_bias_phrases_full(s) {
+                        if !out.iter().any(|e| e == &p) { out.push(p); }
+                    }
+                }
+            }
+        }
+    }
+    if !out.is_empty() { return out; }
+
+    // ② 폴백 : 이 필드에 도메인 항목이 아예 없을 때만 접미 일치로 전 도메인 수집.
+    //    (page_type 이 비어 오는 호출부의 기존 동작을 그대로 보존합니다)
+    for (target, val) in node {
+        let key = match target.rsplitn(2, '.').next() { Some(k) => k, None => continue };
+        if key != field_name { continue; }
+        for field in ["semantic", "bias"] {
+            if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                for p in split_bias_phrases_full(s) {
+                    if !out.iter().any(|e| e == &p) { out.push(p); }
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn multilingual_value_anchor_phrases(field_name: &str) -> Vec<String> {
+    // 🌟 도메인을 모르는 레거시 호출부용. 기존 접미 일치 동작을 그대로 유지합니다.
+    multilingual_value_anchor_phrases_scoped("", field_name)
+}
+
+// 🌟 [METRICS FAMILY] bias.json 의 metrics.* 노드를 (family_key, phrase) 목록으로 펼칩니다.
+//    metrics.price.bias 에는 이미 "won" 이 들어 있어서, 다국어 임베딩이
+//    '원' ↔ 'won' 을 연결해 줍니다. 따라서 "5000원 이하로" 의 수치 대상이
+//    quantity 가 아니라 price 계열이라는 사실을 어휘 하드코딩 없이 판정할 수 있습니다.
+pub fn metrics_family_phrases() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    if let Some(node) = crate::parsing::BIAS_DICT.get("metrics").and_then(|v| v.as_object()) {
+        for (key, val) in node {
+            for field in ["semantic", "bias"] {
+                if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                    for p in split_bias_phrases_full(s) {
+                        if out.iter().any(|(k, e)| k == key && e == &p) { continue; }
+                        out.push((key.clone(), p));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [METRICS FAMILY — 단일 벡터 argmax] 임베딩 하나가 어떤 metrics 계열에 가장 가까운지
+//    (family_key, score) 로 반환합니다. 그룹별 Max-Pool 이라 뱅크 크기 편향이 없습니다.
+pub fn metrics_family_argmax(target: &[f32], bank: &[(String, Vec<f32>)]) -> (String, f32) {
+    let mut group: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for (k, e) in bank {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let s = cosine_similarity(target, e);
+        let entry = group.entry(k.clone()).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_key = String::new();
+    let mut best = f32::MIN;
+    for (k, s) in &group {
+        if *s > best { best = *s; best_key = k.clone(); }
+    }
+    (best_key, if best == f32::MIN { 0.0 } else { best })
+}
+
+// 🌟 [METRICS FAMILY — 필드 뱅크 argmax] 그 필드의 구 뱅크 전체가 어떤 metrics 계열인지 판정합니다.
+//    sale_price 뱅크는 metrics.price 와, quantity 뱅크는 metrics.quantity 와 붙습니다.
+pub fn metrics_family_of_bank(field_bank: &Vec<Vec<f32>>, bank: &[(String, Vec<f32>)]) -> String {
+    if field_bank.is_empty() { return String::new(); }
+    let mut group: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for (k, e) in bank {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let s = max_pool_sim(e, field_bank);
+        let entry = group.entry(k.clone()).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_key = String::new();
+    let mut best = f32::MIN;
+    for (k, s) in &group {
+        if *s > best { best = *s; best_key = k.clone(); }
+    }
+    best_key
+}
+
+// 🌟 [CROSS-FIELD AMBIGUITY MASK] bias.json 을 수정하지 않고 런타임에서 무변별 구를 구조적으로 제거합니다.
+//    ① 두 개 이상 필드의 bias 뱅크에 '문자 그대로 동일한 구'가 들어 있으면
+//       그 구는 어떤 필드도 지목하지 못합니다.
+//       (ko.goods 의 title / model_name / brand_name 이 "goods 상품명, goods 상품제목, goods 상품이름" 을
+//        완전히 공유 → 로그의 '가디건 → brand_name' 오배정의 직접 원인)
+//    ② 자기 필드의 prejudice 에 동일한 구가 존재하면 자기모순입니다.
+//       (ko.goods.brand_name 은 bias 와 prejudice 양쪽에 "상품명" 을 갖고 있어 스스로 점수를 깎습니다)
+//    문자열 집합 비교이므로 의미 판정(contains)이 아니라 순수 구조 판정이며 상수를 쓰지 않습니다.
+pub fn cross_field_ambiguous_phrase_mask(
+    bias_banks: &Vec<Vec<String>>,
+    prejudice_banks: &Vec<Vec<String>>,
+) -> Vec<Vec<bool>> {
+    let mut counter: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for bank in bias_banks.iter() {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for p in bank.iter() {
+            if seen.insert(p.as_str()) {
+                *counter.entry(p.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut out: Vec<Vec<bool>> = Vec::with_capacity(bias_banks.len());
+    for (i, bank) in bias_banks.iter().enumerate() {
+        let empty: Vec<String> = Vec::new();
+        let own_prej: &Vec<String> = prejudice_banks.get(i).unwrap_or(&empty);
+        let mut keep: Vec<bool> = bank
+            .iter()
+            .map(|p| {
+                let shared = counter.get(p).copied().unwrap_or(0) > 1;
+                let self_contradiction = own_prej.iter().any(|q| q == p);
+                !shared && !self_contradiction
+            })
+            .collect();
+        // 전량 탈락 시 뱅크 소멸을 막기 위해 원본을 그대로 유지합니다.
+        if keep.iter().all(|k| !*k) { keep = vec![true; bank.len()]; }
+        out.push(keep);
+    }
+    out
+}
+
+pub fn residual_value_tokens(
+    token_embs: &[(String, Vec<f32>)],
+    label_bank: &[Vec<f32>],
+    value_bank: &[Vec<f32>],
+) -> Vec<String> {
+    if token_embs.is_empty() { return Vec::new(); }
+    if label_bank.is_empty() || value_bank.is_empty() {
+        return token_embs.iter().map(|(t, _)| t.clone()).collect();
+    }
+    let mut kept: Vec<String> = Vec::new();
+    for (tok, emb) in token_embs.iter() {
+        if emb.iter().all(|&v| v == 0.0) { continue; }
+        let l = max_pool_sim(emb, &label_bank.to_vec());
+        let v = max_pool_sim(emb, &value_bank.to_vec());
+        if v > l { kept.push(tok.clone()); }
+    }
+    if kept.is_empty() {
+        return token_embs.iter().map(|(t, _)| t.clone()).collect();
+    }
+    kept
+}
+
+pub fn residual_value_text(
+    token_embs: &[(String, Vec<f32>)],
+    label_bank: &[Vec<f32>],
+    value_bank: &[Vec<f32>],
+) -> String {
+    residual_value_tokens(token_embs, label_bank, value_bank).join(" ")
+}
+
+pub fn deterministic_condition_value(chunks: &Vec<String>, numeric_only: bool) -> String {
+    let joined = chunks
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if numeric_only {
+        return joined.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+    }
+    joined.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+// 🌟 [QUERY FORMAT GATE] 자연어 질의 청크가 '이 속성의 값이 될 생김새'인지 배정 전에 검증합니다.
+//    detect_field_format 이 이미 필드명에서 물리적 형식을 결정론적으로 판정하므로
+//    다국어 어휘 리터럴을 단 하나도 쓰지 않고, 숫자 밀도 / 알파벳 존재 / 토큰 길이만 봅니다.
+//    (로그: '가디건' 이 supply_price(Number) 2순위로 살아남아 LLM 후보 목록을 오염시켰습니다)
+//    - Synthesis(insight/summary) : 합성 문장이라 DB 필터 조건이 될 수 없음
+//    - Link                        : 조건 대상이 아님 (호출부에서 이미 제외하지만 방어적으로 차단)
+pub fn query_chunk_matches_property(field_name: &str, chunk: &str) -> bool {
+    let v = chunk.trim();
+    if v.is_empty() { return false; }
+
+    match detect_field_format(field_name) {
+        FieldFormat::Synthesis => false,
+        FieldFormat::Link => false,
+        FieldFormat::Enum => true,
+        FieldFormat::Numeric => v.chars().any(|c| c.is_ascii_digit()),
+        // 🌟 [NATURAL LANGUAGE TIME] 날짜 필드는 리터럴(2026-03-15)뿐 아니라
+        //    자연어 시간 표현('올해', '여름', 'last year')도 값이 될 수 있습니다.
+        //    기존 숫자 존재 판정만으로는 '올해' 가 ASCII 숫자 0개라 차단되어
+        //    started_at / expired_at / registration_date 후보 12개가 통째로 학살되었습니다.
+        //    (로그: [FORMAT GATE] "올해→started_at(0.5521)", "올해→expired_at(0.5342)" ...)
+        //    bias.json 의 time_filters / season_filters exact_match 배열은
+        //    50개 언어의 시간·계절 표현을 문자열 그대로 담은 확정 사전이므로
+        //    다국어 하드코딩 없이 완전일치(==)로 되살릴 수 있습니다.
+        FieldFormat::Date => {
+            if v.chars().any(|c| c.is_ascii_digit()) { return true; }
+            v.split_whitespace().any(|w| {
+                !exact_match_filter_keys("time_filters", w).is_empty()
+                    || !exact_match_filter_keys("season_filters", w).is_empty()
+            })
+        },
+        FieldFormat::Phone => v.chars().filter(|c| c.is_ascii_digit()).count() >= 7,
+        FieldFormat::TrackingCode => longest_code_token_len(v) >= 8,
+        FieldFormat::Identifier => longest_code_token_len(v) >= 4,
+        FieldFormat::Address => v.chars().any(|c| c.is_alphabetic()),
+        FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()),
+    }
+}
+
+// 🌟 [QUERY FORMAT GATE — VECTOR EXTENDED]
+//    query_chunk_matches_property 의 Date 분기는 bias.json 의 exact_match 배열에 전적으로 의존합니다.
+//    그런데 time_filters 노드에는 exact_match 가 아예 존재하지 않습니다(season_filters 에만 있음).
+//      "this_year": { "semantic": ..., "bias": ..., "prejudice": ... }   ← exact_match 없음
+//    그래서 '올해' 는 (ASCII 숫자 0개) AND (exact_match 미등록) 이 되어 통째로 차단되고,
+//    로그처럼 started_at(0.5521) / expired_at(0.5342) / registration_date(0.5202) 라는
+//    1순위보다 높은 정답 후보 12개가 배정 이전에 전멸합니다.
+//    그 상태에서 Qwen3 는 남은 쓰레기(title/color/address/status/first_purchase_only) 중에서만
+//    고를 수 있어 '올해 → new_customer_only' 오배정이 확정됩니다.
+//
+//    여기서는 bias.json 을 수정하지 않고, 호출부가 임베딩 코사인/문자열 구조 파싱으로 확정한
+//      ① temporal_hint         : 이 청크가 시간·계절 의도인가 (time/season 뱅크 우위)
+//      ② numeric_comparison_hint : 이 청크가 (숫자 + 비교 표현) 구조인가
+//    두 힌트를 받아 게이트를 확장합니다. 어휘 리터럴과 contains 판정은 일절 사용하지 않습니다.
+pub fn query_chunk_matches_property_ext(
+    field_name: &str,
+    chunk: &str,
+    temporal_hint: bool,
+    numeric_comparison_hint: bool,
+) -> bool {
+    let v = chunk.trim();
+    if v.is_empty() { return false; }
+
+    let fmt = detect_field_format(field_name);
+
+    // 🌟 [RECORD ID EXCLUSIVE] 주문번호 20260413-302272 · 운송장 472339038575 처럼 생긴 값은 수량 · 금액 · 날짜가 아닙니다.
+    //    식별자 · 운송장 · 전화 칸만 받습니다 (비교 표현이 붙어 보여도: '20260413-302272의').
+    if record_id_token(v).is_some() {
+        return matches!(fmt, FieldFormat::Identifier | FieldFormat::TrackingCode | FieldFormat::Phone);
+    }
+
+    // 🌟 [NUMERIC COMPARISON EXCLUSIVE] '5000원 이하로' 처럼 숫자와 비교 표현이 결합된 청크는
+    //    물리적으로 수치 비교 조건입니다.
+    //    currency.bias 의 '원' 이 '5000원' 과 공명해 String 필드가 이 청크를 선점하면
+    //        currency contains "5000원 이하로"   (convert_conditions_to_sql 에서 통째로 스킵)
+    //    라는 SQL 무효 조건만 남고, 정답인 sale_price lte 5000 은 영원히 발행되지 않습니다.
+    //    cross_field_ambiguous_phrase_mask 는 '문자 그대로 동일한 구'만 제거하므로
+    //    '원'(currency.bias) vs '29900원'(sale_price.bias) 은 잡을 수 없습니다.
+    //    따라서 배정 '전' 에 문자열/열거형 필드의 후보 자격 자체를 박탈합니다.
+    if numeric_comparison_hint {
+        return matches!(fmt, FieldFormat::Numeric | FieldFormat::Date);
+    }
+
+    match fmt {
+        FieldFormat::Synthesis => false,
+        FieldFormat::Link => false,
+        FieldFormat::Enum => true,
+        FieldFormat::Numeric => v.chars().any(|c| c.is_ascii_digit()),
+        FieldFormat::Date => {
+            if v.chars().any(|c| c.is_ascii_digit()) { return true; }
+            if temporal_hint { return true; }
+            // 🌟 [SEMANTIC ANCHOR TEMPORAL] bias.json 의 time_filters.*.semantic 에
+            //    "current year", "previous day" 등의 영어 구가 있습니다.
+            //    exact_match 배열이 없는 time_filters 를 위해,
+            //    semantic 필드의 구를 split_bias_phrases_full 로 쪼개
+            //    다국어 임베딩 코사인으로 매칭합니다.
+            //    '올해' 와 embed("current year") 의 코사인은 multilingual 모델에서 0.6+ 입니다.
+            if temporal_semantic_match(v) { return true; }
+            v.split_whitespace().any(|w| {
+                !exact_match_filter_keys("time_filters", w).is_empty()
+                    || !exact_match_filter_keys("season_filters", w).is_empty()
+            })
+        },
+        FieldFormat::Phone => v.chars().filter(|c| c.is_ascii_digit()).count() >= 7,
+        FieldFormat::TrackingCode => longest_code_token_len(v) >= 8,
+        FieldFormat::Identifier => longest_code_token_len(v) >= 4,
+        FieldFormat::Address => v.chars().any(|c| c.is_alphabetic()),
+        FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()),
+    }
+}
+
+// 🌟 [TEMPORAL SEMANTIC MATCH] bias.json 의 time_filters / season_filters 각 키의
+//    "semantic" 필드에는 "current year", "spring season" 같은 핵심 의미 구가 있습니다.
+//    exact_match 배열이 없는 time_filters 를 위해, 이 semantic 구를
+//    split_bias_phrases_full 로 쪼개 임베딩하고, 질의 청크와의 코사인을 계산합니다.
+//    판정 기준은 '해당 카테고리 내 semantic 구들과의 Max-Pool 코사인'이
+//    '다른 모든 필터 카테고리 semantic 구들과의 Max-Pool 코사인'보다 높은지입니다.
+//    절대 임계치 없이 상대 비교만 사용하므로 매직 상수가 없습니다.
+//    이 함수는 임베딩을 내부에서 생성하지 않고, 호출부가 미리 계산한
+//    temporal_semantic_scores 맵을 참조하는 구조로 model.rs 에서 호출됩니다.
+//    여기서는 bias.json 에서 semantic 구 목록을 추출하는 순수 결정론 함수입니다.
+pub fn temporal_semantic_phrases() -> Vec<(String, String)> {
+    // (category_key, semantic_phrase) 쌍을 반환
+    let mut out: Vec<(String, String)> = Vec::new();
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    for cat in ["time_filters", "season_filters"] {
+        if let Some(node) = dict.get(cat).and_then(|v| v.as_object()) {
+            for (key, val) in node {
+                if let Some(semantic) = val.get("semantic").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(semantic) {
+                        out.push((format!("{}.{}", cat, key), phrase));
+                    }
+                }
+                // bias 도 구 단위로 추가 (semantic 이 짧을 수 있으므로)
+                if let Some(bias) = val.get("bias").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(bias) {
+                        out.push((format!("{}.{}", cat, key), phrase));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [TEMPORAL SEMANTIC MATCH - LIGHTWEIGHT] 임베딩 없이 문자열 구조로 판정하는 폴백.
+//    bias.json 의 time_filters.*.semantic / bias 구 중에
+//    질의 청크의 '공백 제거 소문자'와 완전일치하는 구가 있으면 temporal 로 판정.
+//    예: chunk="올해" → bias 구 "this year" 와는 불일치하지만,
+//    season_filters 의 exact_match 에는 없으므로 이 경로로는 불가.
+//    따라서 이 함수는 보조 수단이며, 주 경로는 model.rs 의 임베딩 코사인입니다.
+pub fn temporal_semantic_match(_chunk: &str) -> bool {
+    // 이 함수는 model.rs 에서 임베딩 기반으로 대체되므로
+    // 여기서는 항상 false 를 반환하여 기존 exact_match 경로를 유지합니다.
+    // 실제 temporal 판정은 model.rs 의 TEMPORAL PRE-GATE 개선에서 수행합니다.
+    false
+}
+
+// 🌟 [FILTER CATEGORY PHRASE BANK] substantial_filters / find_filters / status_filters 의
+//    bias + semantic 구를 쪼개 (category, key, phrase) 목록을 반환합니다.
+//    bias.json 에 exact_match 배열이 없는 필터 카테고리(time_filters 포함)를 위해
+//    임베딩 코사인 Max-Pool 로 매칭할 수 있는 구 뱅크를 동적으로 구축합니다.
+//    다국어 어휘 리터럴을 추가하지 않고, bias.json 의 기존 bias/semantic 필드만 읽습니다.
+pub fn filter_category_phrases(categories: &[&str]) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for cat in categories {
+        if let Some(node) = crate::parsing::BIAS_DICT.get(cat).and_then(|v| v.as_object()) {
+            for (key, val) in node {
+                if let Some(bias) = val.get("bias").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(bias) {
+                        out.push((cat.to_string(), key.clone(), phrase));
+                    }
+                }
+                if let Some(semantic) = val.get("semantic").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(semantic) {
+                        if !out.iter().any(|(_, _, p)| p == &phrase) {
+                            out.push((cat.to_string(), key.clone(), phrase));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [FILTER ROUTE VERDICT] 질의 청크가 스키마 속성보다 필터 카테고리에 더 적합한지
+//    임베딩 코사인 Max-Pool 상대 비교로 판정합니다.
+//    절대 임계치 없이 '필터 Max-Pool > 스키마 속성 Max-Pool' 상대 우위만 사용합니다.
+//    반환: Some((category, key)) 이면 필터 라우팅, None 이면 스키마 속성 배정 유지.
+pub fn filter_route_verdict(
+    chunk_emb: &[f32],
+    filter_phrase_embs: &[(String, String, Vec<f32>)],
+    best_schema_score: f32,
+) -> Option<(String, String)> {
+    // (category, key) 그룹별 Max-Pool: 개별 구 코사인의 비대칭을 해소합니다.
+    // 스키마 측이 weighted_max_pool_sim(구 단위 최대)을 사용하므로
+    // 필터 측도 동일 그룹 내 최대 코사인으로 비교해야 공정한 판정입니다.
+    let mut group_max: std::collections::HashMap<(String, String), f32> = std::collections::HashMap::new();
+    for (cat, key, emb) in filter_phrase_embs {
+        if emb.iter().all(|&v| v == 0.0) { continue; }
+        let s = cosine_similarity(chunk_emb, emb);
+        let entry = group_max.entry((cat.clone(), key.clone())).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_cat = String::new();
+    let mut best_key = String::new();
+    let mut best_score = f32::MIN;
+    for ((cat, key), score) in &group_max {
+        if *score > best_score {
+            best_score = *score;
+            best_cat = cat.clone();
+            best_key = key.clone();
+        }
+    }
+    if best_score > best_schema_score && best_score > 0.0 {
+        Some((best_cat, best_key))
+    } else {
+        None
+    }
+}
+
+// 🌟 [SUBSTANTIAL/FIND PRE-GATE] substantial_filters / find_filters / status_filters 의
+//    bias+semantic 구 뱅크와 청크 간 Max-Pool 코사인을 계산하여,
+//    스키마 속성보다 필터 의도가 우세한 청크를 배정 전에 차단합니다.
+//    filter_route_verdict 가 단어 단위(1토큰)에서만 동작하는 반면,
+//    이 함수는 Plinko 청크(다중 토큰) 단위에서도 동작합니다.
+//    (로그: '무거운' 이 summer(0.5610) 에 밀려 substantial_filters.weight 로 라우팅 실패)
+//    판정 기준: '필터 Max-Pool > 스키마 Max-Pool' 상대 비교만 사용. 매직 상수 없음.
+//    반환: Some((category, key, score)) 이면 필터 라우팅, None 이면 스키마 배정 유지.
+pub fn substantial_find_pre_gate(
+    chunk_emb: &[f32],
+    filter_phrase_embs: &[(String, String, Vec<f32>)],
+    best_schema_score: f32,
+) -> Option<(String, String, f32)> {
+    if filter_phrase_embs.is_empty() { return None; }
+    // (category, key) 그룹별 Max-Pool
+    let mut group_max: std::collections::HashMap<(String, String), f32> = std::collections::HashMap::new();
+    for (cat, key, emb) in filter_phrase_embs {
+        if emb.iter().all(|&v| v == 0.0) { continue; }
+        // substantial / find / status 카테고리만 대상
+        if cat != "substantial_filters" && cat != "find_filters" && cat != "status_filters" { continue; }
+        let s = cosine_similarity(chunk_emb, emb);
+        let entry = group_max.entry((cat.clone(), key.clone())).or_insert(f32::MIN);
+        if s > *entry { *entry = s; }
+    }
+    let mut best_cat = String::new();
+    let mut best_key = String::new();
+    let mut best_score = f32::MIN;
+    for ((cat, key), score) in &group_max {
+        if *score > best_score {
+            best_score = *score;
+            best_cat = cat.clone();
+            best_key = key.clone();
+        }
+    }
+    if best_score > best_schema_score && best_score > 0.0 {
+        Some((best_cat, best_key, best_score))
+    } else {
+        None
+    }
+}
+
+// =====================================================================
+// 🌟 [GLOBAL-BASELINE SURPRISAL] 뱅크 크기 편향 제거 + 절대 신호 보존
+// ---------------------------------------------------------------------
+// 직전 구현은 각 뱅크를 '자기 자신의' 평균/표준편차로 표준화했습니다.
+// 극값이론이 E[z of max] ≈ √(2 ln N) 을 예측하므로, 그 값으로 다시 나누면
+// 무관한 질의에 대해 결과가 정의상 1.0 으로 수렴합니다.
+// (로그 실측: 6개 단어 전부 0.9475 ~ 1.1919 — 판별력 0)
+//
+// 여기서는 '모든 뱅크를 합친 전역 코사인 분포'를 공통 기준선으로 삼고,
+// 뱅크 크기가 만드는 기대 최댓값 √(2 ln N) 만큼만 차감합니다.
+//     surprisal = (max - μ_global) / σ_global - √(2 ln N)
+// 반환값 0 = 무작위로 N개 뽑은 기대치와 동일(= 근거 없음)
+//         > 0 = 그 기대치를 넘는 실제 의미적 근거 존재
+// 0 은 극값이론에서 유도된 값이므로 매직 상수가 아닙니다.
+// =====================================================================
+
+#[derive(Debug, Clone)]
+pub struct SurprisalScore {
+    pub category: String,
+    pub key: String,
+    pub max_cos: f32,
+    pub n: usize,
+    pub surprisal: f32,
+}
+pub fn gumbel_expected_z(n: usize) -> f32 {
+    if n <= 1 { 0.0 } else { (2.0f32 * (n as f32).ln()).sqrt() }
+}
+
+pub fn gumbel_max_sd(n: usize) -> f32 {
+    let z = gumbel_expected_z(n);
+    if z <= 1e-6 { 0.0 } else { std::f32::consts::PI / 6.0f32.sqrt() / z }
+}
+
+pub fn gumbel_decision_z(n: usize) -> f32 {
+    gumbel_expected_z(n) + gumbel_max_sd(n)
+}
+pub fn axis_snr(scores: &[f32]) -> Option<f32> {
+    let mut v: Vec<f32> = scores.iter().cloned().filter(|s| s.is_finite()).collect();
+    if v.len() < 3 { return None; }
+    v.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+    let tail = &v[1..];
+    let mut sorted_tail = tail.to_vec();
+    sorted_tail.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let tail_median = sorted_tail[sorted_tail.len() / 2];
+
+    let n = tail.len() as f32;
+    let tail_mean = tail.iter().sum::<f32>() / n;
+    let tail_var = tail.iter().map(|x| (x - tail_mean) * (x - tail_mean)).sum::<f32>() / n;
+    let tail_sd = tail_var.max(0.0).sqrt();
+
+    // 꼬리가 완전히 균일하면(표준편차 0) 잡음 추정이 불가능합니다.
+    // 이 경우 비율이 발산하므로 판정을 포기하고 호출부에 위임합니다.
+    if tail_sd <= 1e-6 { return None; }
+
+    let signal = v[0] - tail_median;
+    if !signal.is_finite() { return None; }
+    Some((signal / tail_sd).max(0.0))
+}
+fn group_sims<V: AsRef<Vec<f32>>>(
+    query: &[f32],
+    src: &[(String, String, V)],
+    pool: &mut Vec<f32>,
+) -> (Vec<(String, String)>, Vec<Vec<f32>>) {
+    use std::collections::HashMap;
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut sims: Vec<Vec<f32>> = Vec::new();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    for (c, k, e) in src {
+        let ev = e.as_ref();
+        if ev.iter().all(|&v| v == 0.0) { continue; }
+        let s = cosine_similarity(query, ev);
+        pool.push(s);
+        let key = (c.clone(), k.clone());
+        match index.get(&key) {
+            Some(&i) => sims[i].push(s),
+            None => {
+                index.insert(key.clone(), order.len());
+                order.push(key);
+                sims.push(vec![s]);
+            }
+        }
+    }
+    (order, sims)
+}
+
+/// 필터 뱅크와 스키마 뱅크를 **하나의 공통 기준선**으로 동시에 채점합니다.
+/// 두 결과가 같은 척도이므로 그대로 대소 비교할 수 있습니다.
+/// 각 필터 키의 prejudice 구가 자기 기대치를 넘으면 그만큼 상쇄합니다.
+/// (bias.json 이 이미 갖고 있는 편견 사전을 필터 경로에서 처음으로 활용)
+/// 🌟 [GENERIC] filter 뱅크의 벡터 소유 형태를 일반화합니다.
+///    vision_encoder 는 Arc<Vec<f32>>, model.rs 는 Vec<f32> 를 넘깁니다.
+pub fn surprisal_dual_scores<V: AsRef<Vec<f32>>>(
+    query: &[f32],
+    filter_bias: &[(String, String, V)],
+    filter_prej: &[(String, String, V)],
+    schema_names: &[String],
+    schema_banks: &[Vec<Vec<f32>>],
+    schema_skip: &[bool],
+) -> (Vec<SurprisalScore>, Vec<SurprisalScore>) {
+    let mut pool: Vec<f32> = Vec::new();
+
+    let (f_order, f_sims) = group_sims(query, filter_bias, &mut pool);
+    let (p_order, p_sims) = group_sims(query, filter_prej, &mut pool);
+
+    let mut s_sims: Vec<Vec<f32>> = Vec::with_capacity(schema_banks.len());
+    for (i, bank) in schema_banks.iter().enumerate() {
+        let mut v: Vec<f32> = Vec::new();
+        if !schema_skip.get(i).copied().unwrap_or(false) {
+            for e in bank {
+                if e.iter().all(|&x| x == 0.0) { continue; }
+                let s = cosine_similarity(query, e);
+                pool.push(s);
+                v.push(s);
+            }
+        }
+        s_sims.push(v);
+    }
+
+    surprisal_finish(&pool, &f_order, &f_sims, &p_order, &p_sims, schema_names, &s_sims)
+}
+
+/// surprisal_dual_scores 의 공통 후반부(풀 통계 → 필터/스키마 점수).
+/// 뱅크 캐시 버전(surprisal_dual_scores_bank)도 같은 풀·같은 순서를 만들어 이 함수를 거치므로
+/// 두 경로의 결과는 비트 단위로 같습니다.
+fn surprisal_finish(
+    pool: &[f32],
+    f_order: &[(String, String)],
+    f_sims: &[Vec<f32>],
+    p_order: &[(String, String)],
+    p_sims: &[Vec<f32>],
+    schema_names: &[String],
+    s_sims: &[Vec<f32>],
+) -> (Vec<SurprisalScore>, Vec<SurprisalScore>) {
+    if pool.len() < 2 { return (Vec::new(), Vec::new()); }
+    let mean: f32 = pool.iter().sum::<f32>() / (pool.len() as f32);
+    let var: f32 = pool.iter().map(|s| (s - mean) * (s - mean)).sum::<f32>() / (pool.len() as f32);
+    let std = var.sqrt().max(1e-6);
+
+    let raw = |sims: &Vec<f32>| -> Option<(f32, usize, f32)> {
+        if sims.is_empty() { return None; }
+        let m = sims.iter().cloned().fold(f32::MIN, f32::max);
+        let n = sims.len();
+        Some((m, n, (m - mean) / std - gumbel_expected_z(n)))
+    };
+
+    let mut fout: Vec<SurprisalScore> = Vec::new();
+    for (i, (c, k)) in f_order.iter().enumerate() {
+        let (m, n, mut sc) = match raw(&f_sims[i]) { Some(v) => v, None => continue };
+        if let Some(pi) = p_order.iter().position(|(a, b)| a == c && b == k) {
+            if let Some((_, _, ps)) = raw(&p_sims[pi]) {
+                if ps > 0.0 { sc -= ps; }
+            }
+        }
+        fout.push(SurprisalScore { category: c.clone(), key: k.clone(), max_cos: m, n, surprisal: sc });
+    }
+    fout.sort_by(|a, b| b.surprisal.partial_cmp(&a.surprisal).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut sout: Vec<SurprisalScore> = Vec::new();
+    for (i, name) in schema_names.iter().enumerate() {
+        let (m, n, sc) = match raw(&s_sims[i]) { Some(v) => v, None => continue };
+        sout.push(SurprisalScore { category: "schema".to_string(), key: name.clone(), max_cos: m, n, surprisal: sc });
+    }
+    sout.sort_by(|a, b| b.surprisal.partial_cmp(&a.surprisal).unwrap_or(std::cmp::Ordering::Equal));
+    (fout, sout)
+}
+// =====================================================================
+// 🌟 [BANK-NEUTRAL TEXT SCORING] 뱅크 크기 편향을 제거한 텍스트 채점기
+// ---------------------------------------------------------------------
+//  ── 왜 필요한가 ──
+//   surprisal_dual_scores 는 √(2 ln N) 을 차감합니다.
+//   그런데 한 코드의 앵커 구는 "purchase order / order form / buyer order" 처럼
+//   동의어 나열이라 실효 표본 수가 N 보다 훨씬 작습니다.
+//   앵커가 적은 코드(CI)가 앵커가 많은 코드(PO)를 구조적으로 이깁니다.
+//   models/siglip2/vision_encoder.rs 의 score_patches_bank_neutral 이
+//   이미 같은 문제를 행/열 이중 센터링으로 해결했으므로 그 도구를 그대로 이식합니다.
+//
+//  ── 왜 다국어가 성립하는가 ──
+//   이 함수는 문자열을 전혀 보지 않습니다. 입력은 이미 다국어 임베딩 모델
+//   (granite-embedding-97m-multilingual-r2)이 만든 벡터뿐이므로,
+//   앵커가 영어 한 벌이어도 문서 언어와 무관하게 동작합니다.
+//
+//  ── 반환 ──
+//   (keys, net[key][query], raw_cos[key][query])
+//   net  : 행/열 이중 센터링 후 순위 점수 (뱅크 크기 무관)
+//   raw_cos : 원시 Max-Pool 코사인 (진단 / 구조 게이트용)
+// =====================================================================
+pub fn bank_neutral_key_matrix<V: AsRef<Vec<f32>>>(
+    queries: &[Vec<f32>],
+    bias: &[(String, String, V)],
+    prejudice: &[(String, String, V)],
+) -> (Vec<String>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    use std::collections::HashMap;
+    let n = queries.len();
+    if n == 0 || bias.is_empty() {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    // ── ① (category, key) 그룹 색인 ──
+    let mut order: Vec<String> = Vec::new();
+    let mut bias_idx: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut key_cat: HashMap<String, String> = HashMap::new();
+    for (i, (c, k, _)) in bias.iter().enumerate() {
+        if !bias_idx.contains_key(k) { order.push(k.clone()); }
+        bias_idx.entry(k.clone()).or_default().push(i);
+        key_cat.entry(k.clone()).or_insert_with(|| c.clone());
+    }
+    let mut prej_idx: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (_, k, _)) in prejudice.iter().enumerate() {
+        prej_idx.entry(k.clone()).or_default().push(i);
+    }
+    // ── ② 편견 Max-Pool 은 그룹당 1회만 ──
+    //    (bias 의 key 가 필드명, prejudice 의 key 가 카테고리명인 호출부가 있으므로
+    //     조회는 key → 실패 시 category 순으로 해석합니다)
+    let mut prej_pool: HashMap<String, Vec<f32>> = HashMap::new();
+    for (gname, list) in prej_idx.iter() {
+        let mut v = vec![f32::MIN; n];
+        for i in 0..n {
+            let q = &queries[i];
+            if q.iter().all(|&x| x == 0.0) { continue; }
+            let mut mp = f32::MIN;
+            for &j in list {
+                let e = prejudice[j].2.as_ref();
+                if e.iter().all(|&x| x == 0.0) { continue; }
+                let s = cosine_similarity(q, e);
+                if s > mp { mp = s; }
+            }
+            v[i] = mp;
+        }
+        prej_pool.insert(gname.clone(), v);
+    }
+    // ── ③ 원시 Max-Pool 행렬 ──
+    let m = order.len();
+    let mut raw_b = vec![vec![f32::MIN; n]; m];
+    let mut raw_p = vec![vec![f32::MIN; n]; m];
+    for (ki, key) in order.iter().enumerate() {
+        let bi = &bias_idx[key];
+        let pv: Option<&Vec<f32>> = prej_pool
+            .get(key)
+            .or_else(|| key_cat.get(key).and_then(|c| prej_pool.get(c)));
+        for i in 0..n {
+            let q = &queries[i];
+            if q.iter().all(|&x| x == 0.0) { continue; }
+            let mut mb = f32::MIN;
+            for &j in bi {
+                let e = bias[j].2.as_ref();
+                if e.iter().all(|&x| x == 0.0) { continue; }
+                let s = cosine_similarity(q, e);
+                if s > mb { mb = s; }
+            }
+            raw_b[ki][i] = mb;
+            if let Some(pv) = pv { raw_p[ki][i] = pv[i]; }
+        }
+    }
+    // ── ④ 행 기준선 + 전역 pooled σ ──
+    //    뱅크마다 σ 를 쓰면 1구 뱅크의 z 가 무한히 부풀기 때문에 pooled 를 씁니다.
+    let single = n < 2;
+    let mut pooled_var = 0.0f32;
+    let mut pooled_cnt = 0usize;
+    let mut mu_b = vec![0.0f32; m];
+    let mut mu_p = vec![0.0f32; m];
+    for ki in 0..m {
+        let (mut sb, mut sp, mut c) = (0.0f32, 0.0f32, 0usize);
+        for i in 0..n {
+            if raw_b[ki][i] == f32::MIN { continue; }
+            sb += raw_b[ki][i];
+            if raw_p[ki][i] != f32::MIN { sp += raw_p[ki][i]; }
+            c += 1;
+        }
+        if c == 0 { continue; }
+        mu_b[ki] = sb / c as f32;
+        mu_p[ki] = sp / c as f32;
+        for i in 0..n {
+            if raw_b[ki][i] == f32::MIN { continue; }
+            let d = raw_b[ki][i] - mu_b[ki];
+            pooled_var += d * d;
+            pooled_cnt += 1;
+        }
+    }
+    let sd = if pooled_cnt > 1 {
+        (pooled_var / pooled_cnt as f32).sqrt().max(1e-6)
+    } else {
+        1.0
+    };
+    // ── ⑤ 행 센터링 + 편견 상쇄 ──
+    //    🌟 [SINGLE QUERY GUARD] 질의가 1개뿐이면 행 센터링이 자기 자신을 소거해
+    //       전부 0 이 됩니다. 그 경우 원시 코사인 차를 그대로 씁니다.
+    let mut net = vec![vec![f32::MIN; n]; m];
+    for ki in 0..m {
+        for i in 0..n {
+            if raw_b[ki][i] == f32::MIN { continue; }
+            if single {
+                let p = if raw_p[ki][i] == f32::MIN { 0.0 } else { raw_p[ki][i].max(0.0) };
+                net[ki][i] = raw_b[ki][i] - p;
+            } else {
+                let zb = (raw_b[ki][i] - mu_b[ki]) / sd;
+                let zp = if raw_p[ki][i] == f32::MIN {
+                    0.0
+                } else {
+                    ((raw_p[ki][i] - mu_p[ki]) / sd).max(0.0)
+                };
+                net[ki][i] = zb - zp;
+            }
+        }
+    }
+    // ── ⑥ 열 센터링 : '전 개념에 반응하는 잡음 라인' 공통 성분 제거 ──
+    for i in 0..n {
+        let (mut s, mut c) = (0.0f32, 0usize);
+        for ki in 0..m {
+            if net[ki][i] == f32::MIN { continue; }
+            s += net[ki][i];
+            c += 1;
+        }
+        if c < 2 { continue; }
+        let mean = s / c as f32;
+        for ki in 0..m {
+            if net[ki][i] == f32::MIN { continue; }
+            net[ki][i] -= mean;
+        }
+    }
+    (order, net, raw_b)
+}
+/// 🌟 [BANK-NEUTRAL KEY SCORES] 위 행렬을 (key → 질의 전체 최댓값) 으로 축소합니다.
+///    √(2 ln N) 차감이 없으므로 앵커 구 수에 무관한 공정한 경쟁이 됩니다.
+pub fn bank_neutral_key_scores<V: AsRef<Vec<f32>>>(
+    queries: &[Vec<f32>],
+    bias: &[(String, String, V)],
+    prejudice: &[(String, String, V)],
+) -> Vec<(String, f32)> {
+    let (keys, net, _) = bank_neutral_key_matrix(queries, bias, prejudice);
+    let mut out: Vec<(String, f32)> = keys
+        .iter()
+        .enumerate()
+        .map(|(ki, k)| {
+            let mx = net[ki].iter().cloned().fold(f32::MIN, f32::max);
+            (k.clone(), if mx == f32::MIN { 0.0 } else { mx })
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+// =====================================================================
+// 🌟 [RELATIVE PREJUDICE GATE] 절대 대소 비교를 상대 우위 비교로 교체합니다.
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 (실측) ──
+//   기존 게이트는 `if prej >= own { skip }` 입니다.
+//   그런데 편견 뱅크는 '다른 필드의 라벨' 이므로,
+//     recipient_address 의 편견에 sender_address 라벨이 들어 있고
+//     라벨 'address' 는 두 필드 모두와 0.8+ 로 공명합니다.
+//   결과:
+//     🚫 'address' → 'recipient_address' | Label: 0.8061 <= Prej: 0.8374
+//   전 조합 중 최고 점수(0.8061)가 삭제되고,
+//   편견이 약한 party_address 만 살아남아 두 회사 주소가 한 값으로 접합되었습니다.
+//
+//  ── 대체 원리 ──
+//   "이 라벨이 이 필드보다 다른 필드를 더 잘 설명하는가" 는
+//   배타 배정(exclusive_assign_by_score)이 이미 판정합니다.
+//   편견의 진짜 역할은 '이 라벨이 이 필드의 개념과 정반대인가' 이므로,
+//   자기 라벨 뱅크와의 유사도를 기준선으로 삼아 상대 비교합니다.
+//
+//     drop  ⟺  prej > own * (1 + relief)
+//     relief = 이 필드 라벨 뱅크의 내부 응집도로부터 유도
+//
+//   응집도가 높은 뱅크(동의어가 촘촘한 필드)는 편견과도 가깝게 나오므로
+//   그만큼 관대해야 공정합니다. 새 매직 상수가 없습니다.
+// =====================================================================
+/// 라벨 뱅크의 내부 응집도. 구끼리의 평균 코사인입니다.
+/// 뱅크가 1구면 응집도를 정의할 수 없으므로 0을 돌려줍니다.
+///
+/// 🌟 [EMB-BANK] 구마다 노름을 한 번만 계산합니다(예전에는 쌍마다 두 노름을 다시 계산).
+///   구가 많은 뱅크는 행 단위 코사인을 병렬로 구해 두고, 합은 예전과 같은 (i, j) 순서로 순차 누적하므로
+///   결과가 비트 단위로 같습니다. 병렬 버퍼는 n²/2 개라 COHESION_PAR_MAX 를 넘는 뱅크는 순차로 계산합니다.
+pub fn bank_internal_cohesion(bank: &[Vec<f32>]) -> f32 {
+    const COHESION_PAR_MIN: usize = 128;
+    const COHESION_PAR_MAX: usize = 4096;
+    let valid: Vec<&Vec<f32>> = bank.iter().filter(|e| !e.iter().all(|&v| v == 0.0)).collect();
+    if valid.len() < 2 {
+        return 0.0;
+    }
+    let n = valid.len();
+    let norms: Vec<f32> = valid.iter().map(|e| l2_norm_exact(e)).collect();
+    let mut sum = 0.0f32;
+    let mut cnt = 0usize;
+    if (COHESION_PAR_MIN..=COHESION_PAR_MAX).contains(&n) {
+        use rayon::prelude::*;
+        let rows: Vec<Vec<f32>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                ((i + 1)..n)
+                    .map(|j| cosine_with_norms(valid[i], norms[i], valid[j], norms[j]))
+                    .collect()
+            })
+            .collect();
+        for row in rows.iter() {
+            for c in row.iter() {
+                sum += *c;
+                cnt += 1;
+            }
+        }
+    } else {
+        for i in 0..n {
+            for j in (i + 1)..n {
+                sum += cosine_with_norms(valid[i], norms[i], valid[j], norms[j]);
+                cnt += 1;
+            }
+        }
+    }
+    if cnt == 0 { 0.0 } else { (sum / cnt as f32).max(0.0) }
+}
+
+pub fn discriminative_phrase_mask(
+    own_bank: &[Vec<f32>],
+    rival_bank: &[Vec<f32>],
+) -> Vec<bool> {
+    let n = own_bank.len();
+    if n == 0 || rival_bank.is_empty() {
+        return vec![true; n];
+    }
+    let own_cohesion = bank_internal_cohesion(own_bank);
+    let rival_vec: Vec<Vec<f32>> = rival_bank.to_vec();
+    let mut keep = vec![false; n];
+    let mut any = false;
+    for (i, e) in own_bank.iter().enumerate() {
+        if e.iter().all(|&v| v == 0.0) { continue; }
+        let cross = max_pool_sim(e, &rival_vec);
+        if cross < own_cohesion {
+            keep[i] = true;
+            any = true;
+        }
+    }
+    if !any { return vec![true; n]; }
+    keep
+}
+
+pub fn discriminative_anchor_verdict(
+    label_emb: &[f32],
+    own_bank: &[Vec<f32>],
+    rival_bank: &[Vec<f32>],
+) -> Option<(f32, f32, usize, usize)> {
+    if own_bank.is_empty() || rival_bank.is_empty() { return None; }
+
+    let own_keep = discriminative_phrase_mask(own_bank, rival_bank);
+    let rival_keep = discriminative_phrase_mask(rival_bank, own_bank);
+
+    let own_only: Vec<Vec<f32>> = own_bank
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| own_keep.get(*i).copied().unwrap_or(false))
+        .map(|(_, e)| e.clone())
+        .collect();
+    let rival_only: Vec<Vec<f32>> = rival_bank
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| rival_keep.get(*i).copied().unwrap_or(false))
+        .map(|(_, e)| e.clone())
+        .collect();
+
+    if own_only.is_empty() || rival_only.is_empty() { return None; }
+    if own_only.len() == own_bank.len() && rival_only.len() == rival_bank.len() {
+        return None;
+    }
+
+    let own_score = max_pool_sim(label_emb, &own_only);
+    let rival_score = max_pool_sim(label_emb, &rival_only);
+    Some((own_score, rival_score, own_only.len(), rival_only.len()))
+}
+
+pub fn prejudice_dominates(own: f32, prej: f32, cohesion: f32) -> bool {
+    if own <= 0.0 {
+        return true;
+    }
+    // 응집도가 높을수록 편견과의 근접이 구조적으로 불가피하므로 여유를 넓힙니다.
+    let relief = cohesion.clamp(0.0, 0.5);
+    prej > own * (1.0 + relief)
+}
+/// [FILTER PREJUDICE BANK] 필터 카테고리의 prejudice 구를 수집합니다.
+/// filter_category_phrases 의 prejudice 판입니다.
+pub fn filter_category_prejudice_phrases(categories: &[&str]) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for cat in categories {
+        if let Some(node) = crate::parsing::BIAS_DICT.get(cat).and_then(|v| v.as_object()) {
+            for (key, val) in node {
+                if let Some(p) = val.get("prejudice").and_then(|v| v.as_str()) {
+                    for phrase in split_bias_phrases_full(p) {
+                        if out.iter().any(|(c, k, e)| c == cat && k == key && e == &phrase) { continue; }
+                        out.push((cat.to_string(), key.clone(), phrase));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [ABSTRACT BRIDGE PREJUDICE] search_bridge.abstract_bridge 의 prejudice 구.
+pub fn abstract_bridge_prejudice_phrases() -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("abstract_bridge"))
+        .and_then(|v| v.as_object())
+    { Some(n) => n, None => return out };
+
+    for (target, val) in node {
+        let mut it = target.splitn(2, '.');
+        let cat = match it.next() { Some(c) if !c.is_empty() => c.to_string(), _ => continue };
+        let key = match it.next() { Some(k) if !k.is_empty() => k.to_string(), _ => continue };
+        if let Some(p) = val.get("prejudice").and_then(|v| v.as_str()) {
+            for phrase in split_bias_phrases_full(p) {
+                if out.iter().any(|(c, k, e)| c == &cat && k == &key && e == &phrase) { continue; }
+                out.push((cat.clone(), key.clone(), phrase));
+            }
+        }
+    }
+    out
+}
+
+/// [STEM CANDIDATES] 같은 질의의 다른 토큰들과 공유하는 접두 어간 후보를 뽑습니다.
+/// 언어별 조사/어미 사전을 쓰지 않고 '문자 접두 공유'라는 구조적 사실만 사용합니다.
+/// 반환값은 길이 내림차순 어간 목록입니다.
+pub fn shared_prefix_stems(word: &str, others: &[String]) -> Vec<String> {
+    let w: Vec<char> = word.chars().collect();
+    let mut stems: Vec<String> = Vec::new();
+    for o in others {
+        if o == word { continue; }
+        let oc: Vec<char> = o.chars().collect();
+        let mut n = 0usize;
+        while n < w.len() && n < oc.len() && w[n] == oc[n] { n += 1; }
+        if n < 2 { continue; }
+        if n >= w.len() { continue; }
+        let stem: String = w[..n].iter().collect();
+        if !stems.iter().any(|s| s == &stem) { stems.push(stem); }
+    }
+    stems.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+    stems
+}
+
+/// [ABSTRACT BRIDGE] bias.json 의 search_bridge.abstract_bridge 에서
+/// (category, key, phrase) 트리플을 수집합니다.
+/// 키는 "substantial_filters.weight" 처럼 "카테고리.키" 형태입니다.
+/// 언어별 어휘를 코드에 두지 않고 bias.json 의 영어 브릿지 구만 사용하며,
+/// 다국어 임베딩 모델이 교차언어 매칭을 담당합니다.
+pub fn abstract_bridge_phrases() -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let node = match crate::parsing::BIAS_DICT
+        .get("search_bridge")
+        .and_then(|sb| sb.get("abstract_bridge"))
+        .and_then(|v| v.as_object())
+    {
+        Some(n) => n,
+        None => return out,
+    };
+
+    for (target, val) in node {
+        let mut it = target.splitn(2, '.');
+        let cat = match it.next() { Some(c) if !c.is_empty() => c.to_string(), _ => continue };
+        let key = match it.next() { Some(k) if !k.is_empty() => k.to_string(), _ => continue };
+
+        for field in ["semantic", "bias"] {
+            if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
+                for p in split_bias_phrases_full(s) {
+                    if out.iter().any(|(c, k, e)| c == &cat && k == &key && e == &p) { continue; }
+                    out.push((cat.clone(), key.clone(), p));
+                }
+            }
+        }
+    }
+    out
+}
+
+// 🌟 [QWEN3 CORRECTION COSINE VERIFY] Qwen3 가 교정한 속성이 원본 속성보다
+//    청크와 실제로 더 관련 있는지 코사인으로 검증합니다.
+//    (로그: '남긴' → color → Qwen3 교정 → name. 그러나 name 도 '남긴' 과 무관)
+//    교정 후 코사인이 교정 전보다 낮으면 교정을 폐기하고 UNASSIGN 합니다.
+//    새 매직 상수 없이 '교정 후 < 교정 전' 부호 판정만 사용합니다.
+pub fn correction_cosine_degraded(
+    chunk_emb: &[f32],
+    old_prop_embs: &Vec<Vec<f32>>,
+    old_prop_weights: &Vec<f32>,
+    new_prop_embs: &Vec<Vec<f32>>,
+    new_prop_weights: &Vec<f32>,
+) -> bool {
+    let old_score = weighted_max_pool_sim(chunk_emb, old_prop_embs, old_prop_weights);
+    let new_score = weighted_max_pool_sim(chunk_emb, new_prop_embs, new_prop_weights);
+    new_score < old_score
+}
+
+pub fn window_assign_verdict(
+    own_neutral: f32,
+    rival_neutral: f32,
+    asked_in_window: bool,
+) -> (bool, &'static str) {
+    if !asked_in_window {
+        return (false, "이 창이 묻지 않은 축");
+    }
+    if rival_neutral <= 0.0 {
+        return (true, "창 안 1위이며 경쟁 축도 양수 근거가 없음");
+    }
+    if own_neutral > 0.0 && rival_neutral - own_neutral < 1.0 {
+        return (true, "창 안 1위이며 경쟁 축과의 격차가 pooled σ 한 칸 미만");
+    }
+    if own_neutral > 0.0 {
+        return (false, "자기 중립점수는 양수이지만 경쟁 축이 pooled σ 한 칸 이상 앞섬");
+    }
+    (false, "자기 중립점수가 음수인데 경쟁 축은 양수 근거를 가짐")
+}
+
+pub fn greedy_exclusive_assign(matrix: &Vec<Vec<f32>>) -> Vec<Option<(usize, f32, f32)>> {
+    let field_count = matrix.len();
+    let mut result: Vec<Option<(usize, f32, f32)>> = vec![None; field_count];
+    if field_count == 0 { return result; }
+
+    let mut line_count = 0usize;
+    for row in matrix.iter() { if row.len() > line_count { line_count = row.len(); } }
+    if line_count == 0 { return result; }
+
+    let get = |f: usize, l: usize| -> f32 {
+        matrix.get(f).and_then(|row| row.get(l)).copied().unwrap_or(-1.0)
+    };
+
+    // 라인별 2순위 점수 (margin 보고용). 무효 칸(-1.0)은 절대 포함되지 않습니다.
+    let mut runner_up = vec![-1.0f32; line_count];
+    for l in 0..line_count {
+        let mut best = -1.0f32;
+        let mut second = -1.0f32;
+        for f in 0..field_count {
+            let v = get(f, l);
+            if v < 0.0 { continue; }
+            if v > best { second = best; best = v; }
+            else if v > second { second = v; }
+        }
+        runner_up[l] = second;
+    }
+
+    let mut claims: Vec<(usize, usize, f32)> = Vec::new();
+    for f in 0..field_count {
+        for l in 0..line_count {
+            let own = get(f, l);
+            if own < 0.0 { continue; }
+            claims.push((f, l, own));
+        }
+    }
+    claims.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut claimed_lines = vec![false; line_count];
+    for (f, l, own) in claims {
+        if result[f].is_some() { continue; }
+        if claimed_lines[l] { continue; }
+        let margin = if runner_up[l] < 0.0 { own } else { own - runner_up[l] };
+        result[f] = Some((l, own, margin));
+        claimed_lines[l] = true;
+    }
+
+    result
+}
+
+// 🌟 [SQL-EFFECTIVE FORMAT] 이 속성이 실제 SQL 필터를 바꾸는 '형식 확정' 필드인지 판정합니다.
+//    lib.rs 의 convert_conditions_to_sql 이 물리 컬럼으로 매핑하는 것은
+//    금액(amount) / 날짜(created_at, updated_at) / 송장(tracking_number LIKE) 계열뿐입니다.
+//    문자열 속성(color/title/tags)은 SQL 을 전혀 바꾸지 않으므로
+//    N:N 조합에서 별도 쿼리를 발행할 가치가 없고, 조건 완화 티어의 기준이 됩니다.
+pub fn is_sql_effective_field(field_name: &str) -> bool {
+    matches!(
+        detect_field_format(field_name),
+        FieldFormat::Date | FieldFormat::Numeric | FieldFormat::TrackingCode
+    )
+}
+pub fn bank_size_normalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>) -> Vec<bool> {
+    let n = phrase_embs.len();
+    let mut keep = vec![true; n];
+    if n == 0 { return keep; }
+
+    // 유효 구가 다른 스키마 뱅크(수 개~수십 개)와 같은 규모면 정규화가 불필요합니다.
+    let valid: Vec<usize> = (0..n).filter(|&i| !phrase_embs[i].iter().all(|&v| v == 0.0)).collect();
+    if valid.len() < 64 { return keep; }
+
+    let mut sims: Vec<f32> = Vec::with_capacity(valid.len());
+    for &i in &valid { sims.push(cosine_similarity(query_emb, &phrase_embs[i])); }
+
+    let mut sorted = sims.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if sorted.len() % 2 == 0 {
+        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+    } else {
+        sorted[sorted.len() / 2]
+    };
+
+    for (vi, &i) in valid.iter().enumerate() {
+        if sims[vi] < median { keep[i] = false; }
+    }
+    keep
+}
+pub fn bank_size_equalized_mask(query_emb: &[f32], phrase_embs: &Vec<Vec<f32>>, target_size: usize) -> Vec<bool> {
+    let n = phrase_embs.len();
+    let mut keep = vec![true; n];
+    if n == 0 || target_size == 0 { return keep; }
+
+    let mut valid: Vec<usize> = (0..n).filter(|&i| !phrase_embs[i].iter().all(|&v| v == 0.0)).collect();
+    if valid.len() <= target_size { return keep; }
+
+    let mut guard = 0usize;
+    while valid.len() > target_size && guard < 64 {
+        guard += 1;
+
+        let mut sims: Vec<f32> = Vec::with_capacity(valid.len());
+        for &i in &valid { sims.push(cosine_similarity(query_emb, &phrase_embs[i])); }
+
+        let mut sorted = sims.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if sorted.len() % 2 == 0 {
+            (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+        } else {
+            sorted[sorted.len() / 2]
+        };
+
+        let mut next: Vec<usize> = Vec::with_capacity(valid.len() / 2 + 1);
+        for (vi, &i) in valid.iter().enumerate() {
+            if sims[vi] < median { keep[i] = false; } else { next.push(i); }
+        }
+
+        // 코사인이 전부 동률이면 한 구도 줄지 않아 무한 루프가 되므로 즉시 중단합니다.
+        if next.len() == valid.len() { break; }
+        valid = next;
+    }
+
+    keep
+}
+pub fn is_functional_word_chunk(
+    chunk: &str,
+    words: &[String],
+    lemmas: Option<&[String]>,
+    deprels: Option<&[String]>,
+) -> bool {
+    let c = chunk.trim();
+    if c.is_empty() { return true; }
+
+    let idx_opt = words.iter().position(|w| w == c);
+
+    // ① 이 토큰 자체가 UD 기능어 관계인가 (deprel 이 있을 때만)
+    if let (Some(rels), Some(idx)) = (deprels, idx_opt) {
+        if let Some(r) = rels.get(idx) {
+            if is_function_deprel(r) { return true; }
+        }
+    }
+
+    // ② Stanza lemma 가 유효할 때의 잔여 판정 (기존 경로 유지)
+    if let (Some(lm), Some(idx)) = (lemmas, idx_opt) {
+        if let Some(l) = lm.get(idx) {
+            let lt = l.trim();
+            if !lt.is_empty() && c != lt {
+                let core: String = lt.chars().filter(|ch| ch.is_alphanumeric()).collect();
+                let surf: String = c.chars().filter(|ch| ch.is_alphanumeric()).collect();
+                if !core.is_empty() && surf.chars().count() > core.chars().count() && surf.starts_with(&core) {
+                    let residue_len = surf.chars().count() - core.chars().count();
+                    if core.chars().count() < residue_len { return true; }
+                }
+            }
+        }
+    }
+
+    // ③ [LEMMA-FREE] 같은 질의의 다른 토큰을 원형으로 삼아 잔여를 구합니다.
+    //    '제품' 이 단독 토큰으로 존재하므로 '제품중에서' 의 잔여 '중에서' 를 얻습니다.
+    let surf: String = c.chars().filter(|ch| ch.is_alphanumeric()).collect();
+    if surf.is_empty() { return true; }
+
+    let mut residues: Vec<String> = Vec::new();
+    for w in words.iter() {
+        if w == c { continue; }
+        let core: String = w.chars().filter(|ch| ch.is_alphanumeric()).collect();
+        if core.is_empty() { continue; }
+        if core.chars().count() >= surf.chars().count() { continue; }
+        if !surf.starts_with(&core) { continue; }
+        let residue: String = surf.chars().skip(core.chars().count()).collect();
+        if residue.is_empty() { continue; }
+        // 실질 형태소보다 잔여가 더 길면 그 토큰은 실질이 아니라 기능 표현입니다.
+        if core.chars().count() < residue.chars().count() { return true; }
+        if !residues.iter().any(|r| r == &residue) { residues.push(residue); }
+    }
+
+    // ④ 이 청크 자체가 다른 토큰에서 떨어져 나온 '잔여' 와 완전히 같으면 기능어입니다.
+    //    ('중에서' 는 '제품중에서' 의 잔여와 완전일치)
+    for other in words.iter() {
+        if other == c { continue; }
+        let o_surf: String = other.chars().filter(|ch| ch.is_alphanumeric()).collect();
+        if o_surf.chars().count() <= surf.chars().count() { continue; }
+        for base in words.iter() {
+            if base == other || base == c { continue; }
+            let b_core: String = base.chars().filter(|ch| ch.is_alphanumeric()).collect();
+            if b_core.is_empty() { continue; }
+            if b_core.chars().count() >= o_surf.chars().count() { continue; }
+            if !o_surf.starts_with(&b_core) { continue; }
+            let residue: String = o_surf.chars().skip(b_core.chars().count()).collect();
+            if residue == surf { return true; }
+        }
+    }
+
+    let _ = residues;
+    false
+}
+
+// 🌟 [EXACT MATCH FILTER] bias.json 의 season_filters.*.exact_match 는
+//    각 언어의 계절명을 '문자열 그대로' 담고 있는 확정 사전입니다. ("여름", "summer", "夏" ...)
+//    로그에서 '여름' 은 summer(0.5591) 가 top(0.5596) 에 0.0005 차이로 밀려 2순위가 되었고,
+//    그 결과 계절 감지 LLM 이 오염된 컨텍스트를 받아 'autumn' 을 환각했습니다.
+//    코사인 경쟁 이전에 완전일치(==)로 확정하면 이 경로가 물리적으로 사라집니다.
+//    부분문자열 포함(contains)이 아니라 배열 원소 완전일치이므로 의미 판정이 아닙니다.
+pub fn exact_match_filter_keys(category: &str, chunk: &str) -> Vec<String> {
+    let c = chunk.trim();
+    if c.is_empty() { return Vec::new(); }
+    let lower = c.to_lowercase();
+
+    let node = match crate::parsing::BIAS_DICT.get(category).and_then(|v| v.as_object()) {
+        Some(n) => n,
+        None => return Vec::new(),
+    };
+    let mut keys: Vec<String> = Vec::new();
+    for (key, val) in node {
+        let arr = match val.get("exact_match").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
+        let hit = arr
+            .iter()
+            .any(|item| item.as_str().map_or(false, |s| s == c || s.to_lowercase() == lower));
+        if hit && !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    keys
+}
+
+pub fn exact_match_filter_key(category: &str, chunk: &str) -> Option<String> {
+    let mut keys = exact_match_filter_keys(category, chunk);
+    if keys.len() != 1 { return None; }
+    keys.pop()
+}
+
+// 🌟 [AGGLUTINATIVE PREFIX MATCH] exact_match 배열을 '접두 사전' 으로 재사용합니다.
+//  ── 왜 필요한가 ──
+//   exact_match_filter_key 는 완전일치(==)만 봅니다. 그런데 교착어는
+//     "클릭" + "한" + "게" → "클릭한게"
+//     "올해" + "는"        → "올해는"
+//   처럼 조사·어미가 어절에 붙어 한 토큰으로 도착하므로 완전일치가 구조적으로 실패합니다.
+//   (로그 실측: exact_match 에 "클릭"/"클릭한" 이 있는데도 "클릭한게" 가 미매칭 →
+//    슬라이딩 윈도우에 원형이 한 번도 올라가지 못해 NMS CANDIDATE 0건)
+//  ── 판정 규칙 ──
+//   exact_match 원소가 토큰의 '접두' 이고, 그 원소가 토큰보다 짧으면 어간으로 확정합니다.
+//   가장 긴 접두를 우선하므로 "클릭한게" 는 "클릭" 보다 "클릭한" 을 먼저 채택합니다.
+//   사전은 bias.json 이 소유하므로 코드에는 어떤 언어의 어휘도 등장하지 않습니다.
+//  ── 반환 ──
+//   Some((필터 키, 매칭된 접두 리터럴)) / 접두 후보가 없으면 None
+pub fn prefix_match_filter_stem(category: &str, chunk: &str) -> Option<(String, String)> {
+    let c = chunk.trim();
+    if c.chars().count() < 3 { return None; }
+    let lower = c.to_lowercase();
+
+    let node = crate::parsing::BIAS_DICT.get(category)?.as_object()?;
+    let mut best_key = String::new();
+    let mut best_stem = String::new();
+    let mut tied = false;
+
+    for (key, val) in node {
+        let arr = match val.get("exact_match").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
+        for item in arr {
+            let s = match item.as_str() { Some(x) => x.trim(), None => continue };
+            if s.is_empty() { continue; }
+            let sl = s.to_lowercase();
+            if sl.chars().count() < 2 { continue; }
+            if sl.chars().count() >= lower.chars().count() { continue; }
+            if !lower.starts_with(&sl) { continue; }
+            let n = sl.chars().count();
+            let cur = best_stem.chars().count();
+            if n > cur {
+                best_stem = s.to_string();
+                best_key = key.clone();
+                tied = false;
+            } else if n == cur && *key != best_key {
+                tied = true;
+            }
+        }
+    }
+
+    if best_stem.is_empty() || tied { None } else { Some((best_key, best_stem)) }
+}
+// =====================================================================
+// 🌟 [COUNT-UNIT SPLIT] '30 PLTS' 처럼 수량과 포장단위가 한 셀에 붙은 값을 분해합니다.
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 (실측 로그) ──
+//   ✨ [PLINKO ASSIGN] 'total_packages' → 'package_unit'  ("50 PLTS")
+//   ✨ [PLINKO ASSIGN] 'packages'       → 'package_unit'  ("30 PLTS")
+//   package_unit 은 detect_field_format 상 Enum 입니다.
+//   ENUM NUMERIC GATE 는 is_pure_numeric_value 로 판정하는데
+//   "30 PLTS" 는 알파벳이 4자라 letters <= 1 이 거짓 → 게이트를 그대로 통과합니다.
+//   그 결과 수량 30 이 소실되고 단위 필드에 복합 문자열이 저장되며,
+//   SR 의 item_package_type: "30 PLTS" 오염이 여기서 확정됩니다.
+//
+//  ── 왜 split_numeric_and_comparator 로는 안 되는가 ──
+//   그 함수는 '숫자 + 비교 표현' 을 전제로 만들어졌고, 반환값 rest 에
+//   단위 제거 휴리스틱(첫 토큰 2자 이하)이 들어 있어 'PLTS'(4자)를 단위로 인정하지 않습니다.
+//   또한 호출부가 전부 검색 경로(query_chunk_matches_property_ext)라
+//   저장 경로에서 재사용하면 의미가 어긋납니다.
+//
+//  ── 판정 규칙 (전부 구조, 어휘 사전 없음) ──
+//   R1 숫자 토큰이 정확히 하나 존재해야 합니다. (2개 이상이면 표 셀 병합 사고이므로 손대지 않음)
+//   R2 그 숫자 앞뒤의 잔여가 '숫자를 포함하지 않는 짧은 토큰' 이어야 단위로 인정합니다.
+//   R3 잔여가 4단어를 넘으면 설명문이므로 분해하지 않습니다.
+//   국제 포장단위(CTN/PLT/PKG/BOX/DRUM/BALE/CASE/ROLL/BAG/BDL)는 전부 1~5자이며,
+//   한국어('팔레트')·일본어('パレット')·중국어('托盘')도 이 길이 안에 들어옵니다.
+//
+//  ── 반환 ──
+//   Some((수량 문자열, 단위 문자열)) / 분해 불가면 None
+// =====================================================================
+pub fn split_count_and_unit(value: &str) -> Option<(String, String)> {
+    let v = value.trim();
+    if v.is_empty() { return None; }
+
+    // R1 : 숫자 덩어리를 훑되, 두 개 이상이면 즉시 포기합니다.
+    let chars: Vec<char> = v.chars().collect();
+    let mut num_start: Option<usize> = None;
+    let mut num_end: usize = 0;
+    let mut num_groups = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() { i += 1; continue; }
+        let s = i;
+        while i < chars.len()
+            && (chars[i].is_ascii_digit()
+                || ((chars[i] == '.' || chars[i] == ',')
+                    && i + 1 < chars.len()
+                    && chars[i + 1].is_ascii_digit()))
+        {
+            i += 1;
+        }
+        num_groups += 1;
+        if num_groups > 1 { return None; }
+        num_start = Some(s);
+        num_end = i;
+    }
+    let ns = match num_start { Some(s) => s, None => return None };
+
+    let number: String = chars[ns..num_end].iter().filter(|c| **c != ',').collect();
+    if number.is_empty() { return None; }
+
+    // R2/R3 : 숫자 앞뒤 잔여를 합쳐 단위 후보를 만듭니다.
+    let head: String = chars[..ns].iter().collect();
+    let tail: String = chars[num_end..].iter().collect();
+    let unit_raw = format!("{} {}", head.trim(), tail.trim());
+    let unit: String = unit_raw
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if unit.is_empty() { return None; }
+    if unit.chars().any(|c| c.is_ascii_digit()) { return None; }
+    let words: Vec<&str> = unit.split_whitespace().collect();
+    if words.len() > 4 { return None; }
+    if unit.chars().count() > 24 { return None; }
+
+    Some((number, unit))
+}
+
+/// 🌟 [COUNT-UNIT PAIR] 이 필드가 '수량 축' 인지 '단위 축' 인지 결정론으로 답합니다.
+///
+///  ── 왜 이름 규칙인가 ──
+///   trade_schema 는 수량과 단위를 항상 짝으로 정의합니다.
+///     package_count ↔ package_unit
+///     item_package_count ↔ item_package_type
+///     container_package_count ↔ (컨테이너 단위 없음)
+///     quantity ↔ unit
+///   접미사만으로 짝을 유도하므로 새 축이 늘어도 이 함수는 수정 대상이 아닙니다.
+///
+///  ── 반환 ──
+///   Some((수량 필드명, 단위 필드명)) — 둘 중 어느 쪽으로 들어왔든 같은 쌍을 돌려줍니다.
+pub fn count_unit_pair_of(field: &str) -> Option<(&'static str, &'static str)> {
+    match field {
+        "package_count" | "package_unit" => Some(("package_count", "package_unit")),
+        "item_package_count" | "item_package_type" => Some(("item_package_count", "item_package_type")),
+        "container_package_count" => Some(("container_package_count", "")),
+        "quantity" | "unit" => Some(("quantity", "unit")),
+        _ => None,
+    }
+}
+
+// 🌟 [NUMERIC COMPARISON SPLIT] '5000원 이하로' 처럼 숫자와 비교 표현이 붙은 청크를
+//    (숫자 / 나머지) 로 구조 분해합니다.
+//    로그에서 이 청크는 currency(0.5943) 로 배정되었는데, currency.bias 의 '원' 이
+//    '5000원' 과 공명한 결과이며 정답은 sale_price lte 5000 입니다.
+//    분해된 나머지("원 이하로")를 operators 뱅크와 코사인 비교하면
+//    다국어 어휘 리터럴 없이 lte 를 확정할 수 있습니다.
+//    반환: (숫자 문자열, 비교 표현 문자열). 숫자가 없으면 None.
+pub fn split_numeric_and_comparator(chunk: &str) -> Option<(String, String)> {
+    let c = chunk.trim();
+    if c.is_empty() { return None; }
+
+    let mut digits = String::new();
+    let mut rest = String::new();
+    let mut prev_digit = false;
+    for ch in c.chars() {
+        if ch.is_ascii_digit() || (ch == '.' && prev_digit) {
+            digits.push(ch);
+            prev_digit = ch.is_ascii_digit();
+        } else if ch == ',' && prev_digit {
+            // 천 단위 구분자는 숫자의 일부이므로 버립니다.
+            prev_digit = true;
+        } else {
+            if !ch.is_whitespace() || !rest.ends_with(' ') { rest.push(ch); }
+            prev_digit = false;
+        }
+    }
+
+    let d = digits.trim_end_matches('.').to_string();
+    if d.is_empty() { return None; }
+    // 🌟 [COMPARATOR ENRICHMENT] rest 가 "원 이하로" 처럼 단위+비교 표현이면
+    //    단위 문자를 제거하고 순수 비교 표현만 남깁니다.
+    //    판정 기준: rest 의 첫 토큰이 알파벳/한글 1~2자이면서 숫자가 없으면 '단위'로 간주.
+    //    다국어 하드코딩 없이 '토큰 길이 + 숫자 부재' 라는 구조 규칙만 사용합니다.
+    let rest_trimmed = rest.trim();
+    let rest_tokens: Vec<&str> = rest_trimmed.split_whitespace().collect();
+    let comparator = if rest_tokens.len() >= 2 {
+        let first_tok = rest_tokens[0];
+        let first_has_digit = first_tok.chars().any(|c| c.is_ascii_digit());
+        let first_len = first_tok.chars().count();
+        // 첫 토큰이 2자 이하이고 숫자가 없으면 단위(원, 원, 円, $, € 등)로 간주하고 제거
+        if !first_has_digit && first_len <= 2 {
+            rest_tokens[1..].join(" ")
+        } else {
+            rest_trimmed.to_string()
+        }
+    } else {
+        rest_trimmed.to_string()
+    };
+    Some((d, comparator))
+}
+
+pub use logis_bias::bank::{bias_node, is_value_example_phrase, label_phrase_bank, BANK_LANGS, bank_lang_order, bank_lang_coverage, label_phrase_bank_multilingual, prejudice_phrase_bank_multilingual, prejudice_phrase_bank};
+
+
+
+
+
+
+
+
+/// 전문 비교 키: 소문자 + 각 언어의 문자·숫자만 남깁니다.
+/// "Air Waybill" / "AIRWAYBILL" / "Air-Waybill" 이 같은 키가 됩니다.
+pub fn trade_title_key(s: &str) -> String {
+    lower_alnum(s)
+}
+
+fn build_all_trade_doc_titles() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    let mut push = |code: &str, title: &str| {
+        let t = title.trim();
+        if t.is_empty() { return; }
+        if !seen.insert((code.to_string(), trade_title_key(t))) { return; }
+        out.push((code.to_string(), t.to_string()));
+    };
+    for (code, title) in crate::logic::TRADE_DOC_TITLES.iter() {
+        push(code, title);
+    }
+    for (code, title) in crate::logic::TRADE_DOC_TITLES_ML.iter() {
+        push(code, title);
+    }
+    for (code, title) in crate::logic::trade_title_pairs().iter() {
+        push(code, title);
+    }
+    let en_keys: Vec<(String, String)> = crate::logic::TRADE_DOC_TITLES
+        .iter()
+        .map(|(c, t)| (c.to_string(), trade_title_key(t)))
+        .collect();
+    for (en_title, ml) in crate::logic::TRADE_DOC_TITLES_ML_FULL.iter() {
+        let k = trade_title_key(en_title);
+        for (code, key) in en_keys.iter() {
+            if *key != k { continue; }
+            for phrase in ml.split(',') {
+                push(code, phrase);
+            }
+        }
+    }
+    out
+}
+
+/// 서식 전문 전체표 (코드, 전문). 영문·기존 ML·title bank·12개 언어 확장표를 합치고
+/// (코드, 정규화 키) 로 중복을 접습니다. 프로세스당 한 번만 만듭니다.
+pub fn all_trade_doc_titles() -> Vec<(String, String)> {
+    static TABLE: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_all_trade_doc_titles).clone()
+}
+
+/// 코드 하나의 전문 전체 (영문 + 기존 ML + 12개 언어 확장표).
+pub fn trade_code_title_phrases(code: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (c, title) in all_trade_doc_titles().into_iter() {
+        if c != code { continue; }
+        if out.iter().any(|x| x.eq_ignore_ascii_case(&title)) { continue; }
+        out.push(title);
+    }
+    out
+}
+
+fn build_trade_title_index() -> (Vec<(String, Vec<String>, bool)>, usize) {
+    let mut titles: Vec<(String, Vec<String>)> = Vec::new();
+    for (code, title) in all_trade_doc_titles().into_iter() {
+        match titles.iter_mut().find(|(t, _)| t.eq_ignore_ascii_case(&title)) {
+            Some((_, codes)) => {
+                if !codes.iter().any(|c| *c == code) {
+                    codes.push(code);
+                }
+            }
+            None => titles.push((title, vec![code])),
+        }
+    }
+    let mut index: Vec<(String, Vec<String>, bool)> = Vec::new();
+    for (t, codes) in titles.iter() {
+        let k = lower_alnum(t);
+        if k.chars().count() < 2 {
+            continue;
+        }
+        let specific = t.split_whitespace().count() >= 2
+            || k.chars().any(|c| {
+                c.is_alphabetic() && !(c.is_ascii_alphabetic() || ('\u{00C0}'..='\u{024F}').contains(&c))
+            });
+        match index.iter_mut().find(|(x, _, _)| *x == k) {
+            Some((_, cs, sp)) => {
+                for c in codes.iter() {
+                    if !cs.contains(c) {
+                        cs.push(c.clone());
+                    }
+                }
+                *sp = *sp || specific;
+            }
+            None => index.push((k, codes.clone(), specific)),
+        }
+    }
+    let max_w = titles
+        .iter()
+        .map(|(t, _)| t.split_whitespace().count())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    (index, max_w)
+}
+
+fn trade_title_index() -> &'static (Vec<(String, Vec<String>, bool)>, usize) {
+    static INDEX: std::sync::OnceLock<(Vec<(String, Vec<String>, bool)>, usize)> = std::sync::OnceLock::new();
+    INDEX.get_or_init(build_trade_title_index)
+}
+
+pub fn trade_title_max_words() -> usize {
+    trade_title_index().1
+}
+
+pub fn trade_title_exact(joined: &str) -> Option<Vec<String>> {
+    let index = &trade_title_index().0;
+    let tail_ok = |key: &str| -> bool {
+        match joined.strip_prefix(key) {
+            Some(rest) if !rest.is_empty() => {
+                closed_suffix_fits(key, rest)
+                    || (key.is_ascii() && key.chars().count() >= 6 && (rest == "s" || rest == "es"))
+            }
+            _ => false,
+        }
+    };
+    index
+        .iter()
+        .find(|(k, _, sp)| *sp && k.as_str() == joined)
+        .or_else(|| index.iter().find(|(k, _, sp)| *sp && tail_ok(k.as_str())))
+        .map(|(_, codes, _)| codes.clone())
+}
+
+pub fn trade_code_mention(core: &str) -> Option<Vec<String>> {
+    let is_code = |s: &str| {
+        s.chars().any(|c| c.is_ascii_uppercase()) && s.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+    };
+    let code: String = if is_code(core) {
+        core.to_string()
+    } else {
+        closed_tail_stems(core)
+            .into_iter()
+            .find(|(stem, tail)| is_code(stem.as_str()) && !LOCATIVE_TAILS_ML.contains(tail))
+            .map(|(stem, _)| stem)?
+    };
+    let title = crate::logic::TRADE_DOC_TITLES
+        .iter()
+        .find(|(c, _)| *c == code.as_str())?
+        .1;
+    Some(
+        crate::logic::TRADE_DOC_TITLES
+            .iter()
+            .filter(|(_, t)| *t == title)
+            .map(|(c, _)| c.to_string())
+            .collect(),
+    )
+}
+
+#[derive(Debug, Clone)]
+pub struct TradeDocMention {
+    pub text: String,
+    pub codes: Vec<String>,
+    pub by_title: bool,
+    pub partial: bool,
+    pub at: (usize, usize),
+}
+
+pub const TRADE_QUERY_SEPARATORS: &[char] = &[
+    ',', '、', '，', '|', '(', ')', '[', ']', '（', '）', ';', ':', '；', '：', '。', '？', '！', '?', '!',
+    '「', '」', '『', '』', '【', '】', '《', '》', '〈', '〉', '〔', '〕', '“', '”', '\u{22}', '…',
+];
+
+fn trade_query_cores(query: &str) -> Vec<String> {
+    let chars: Vec<char> = query
+        .chars()
+        .map(|c| match c {
+            '／' => '/',
+            'ㆍ' | '・' | '•' | '･' => '·',
+            _ => c,
+        })
+        .collect();
+    let mut norm = String::with_capacity(query.len());
+    let mut collapsed = vec![false; chars.len()];
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if c == '/' || c == '·' {
+            let prev_single = i >= 1
+                && chars[i - 1].is_ascii_uppercase()
+                && (i < 2 || (!chars[i - 2].is_ascii_alphanumeric() && !collapsed[i - 2]));
+            let next_single = i + 1 < chars.len()
+                && chars[i + 1].is_ascii_uppercase()
+                && (i + 2 >= chars.len() || !chars[i + 2].is_ascii_alphanumeric());
+            if prev_single && next_single {
+                collapsed[i] = true;
+            } else {
+                norm.push(' ');
+            }
+            continue;
+        }
+        if TRADE_QUERY_SEPARATORS.contains(&c) {
+            norm.push(' ');
+            continue;
+        }
+        norm.push(c);
+    }
+    norm.split_whitespace()
+        .flat_map(trade_split_ascii_runs)
+        .map(|w| normalize_digits_ascii(w.trim_matches(|c: char| !c.is_alphanumeric())))
+        .collect()
+}
+
+pub const TRADE_RUN_RIGHT_EDGE: &[char] = &[
+    '和', '与', '與', '及', '或', '的', '号', '號', '番', '等', '们', '們', '中', '内', '里', '裡', '上',
+];
+
+pub const TRADE_RUN_LABELS: &[&str] = &[
+    "金额", "金額", "日期", "日付", "编号", "編號", "号码", "總額", "总额", "数量", "數量", "条款", "條款",
+    "项下", "項下", "开证", "開證", "有效", "一览", "一覧", "列表",
+];
+
+fn trade_split_ascii_runs(token: &str) -> Vec<String> {
+    let chars: Vec<char> = token.chars().collect();
+    if !chars.iter().any(|c| trade_title_cjk_char(*c)) {
+        return vec![token.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if !chars[i].is_ascii_alphabetic() {
+            cur.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < chars.len() && chars[j].is_ascii_alphabetic() {
+            j += 1;
+        }
+        let glued_ident = i > 0 && chars[i - 1].is_ascii_digit();
+        let after: String = chars[j..].iter().take(2).collect();
+        let free = !glued_ident
+            && match chars.get(j) {
+                None => true,
+                Some(nc) => {
+                    (!trade_title_cjk_char(*nc) && !nc.is_ascii_digit() && !matches!(*nc, '-' | '_' | '.'))
+                        || TRADE_RUN_RIGHT_EDGE.contains(nc)
+                        || ('\u{3040}'..='\u{309F}').contains(nc)
+                        || TRADE_RUN_LABELS.iter().any(|l| after == *l)
+                }
+            };
+        let run: String = chars[i..j].iter().collect();
+        if free {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            out.push(run);
+        } else {
+            cur.push_str(&run);
+        }
+        i = j;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn trade_title_cjk_char(c: char) -> bool {
+    ('\u{3040}'..='\u{30FF}').contains(&c)
+        || ('\u{3400}'..='\u{4DBF}').contains(&c)
+        || ('\u{4E00}'..='\u{9FFF}').contains(&c)
+        || ('\u{F900}'..='\u{FAFF}').contains(&c)
+}
+
+fn trade_title_han_char(c: char) -> bool {
+    ('\u{3400}'..='\u{4DBF}').contains(&c)
+        || ('\u{4E00}'..='\u{9FFF}').contains(&c)
+        || ('\u{F900}'..='\u{FAFF}').contains(&c)
+}
+
+pub const TRADE_TITLE_CJK_RIGHT_EDGE: &[char] = &[
+    '和', '与', '與', '及', '或', '的', '号', '號', '番', '中', '内', '里', '裡', '上', '等', '们', '們',
+    '编', '編', '金', '总', '總', '日', '项', '項', '条', '條', '开', '開', '一', '也', '是', '有', '列', '数', '數',
+];
+
+fn trade_title_cjk_spans(token: &str) -> Vec<(usize, String, Vec<String>, bool)> {
+    let norm: Vec<char> = lower_alnum(token).chars().collect();
+    if !norm.iter().any(|c| trade_title_cjk_char(*c)) {
+        return Vec::new();
+    }
+    let mut keys: Vec<(&String, &Vec<String>)> = trade_title_index()
+        .0
+        .iter()
+        .filter(|(k, _, sp)| *sp && k.chars().count() >= 2 && k.chars().all(trade_title_cjk_char))
+        .map(|(k, codes, _)| (k, codes))
+        .collect();
+    keys.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
+    let mut used = vec![false; norm.len()];
+    let mut out: Vec<(usize, String, Vec<String>, bool)> = Vec::new();
+    for (k, codes) in keys {
+        let kc: Vec<char> = k.chars().collect();
+        if kc.len() > norm.len() {
+            continue;
+        }
+        for s in 0..=(norm.len() - kc.len()) {
+            if norm[s..s + kc.len()] == kc[..] && !used[s..s + kc.len()].iter().any(|u| *u) {
+                for u in used[s..s + kc.len()].iter_mut() {
+                    *u = true;
+                }
+                let bounded = match norm.get(s + kc.len()) {
+                    None => true,
+                    Some(nc) => !trade_title_han_char(*nc) || TRADE_TITLE_CJK_RIGHT_EDGE.contains(nc),
+                };
+                out.push((s, k.clone(), codes.clone(), bounded));
+            }
+        }
+    }
+    out.sort_by_key(|(s, _, _, _)| *s);
+    out
+}
+
+pub fn trade_doc_mentions_exact(query: &str) -> Vec<TradeDocMention> {
+    let cores = trade_query_cores(query);
+    let n = cores.len();
+    let content: Vec<bool> = cores
+        .iter()
+        .map(|c| !c.is_empty() && !c.chars().any(|ch| ch.is_ascii_digit()))
+        .collect();
+    let mut taken = vec![false; n];
+    let mut out: Vec<TradeDocMention> = Vec::new();
+    for i in 0..n {
+        if !content[i] {
+            continue;
+        }
+        let hit = trade_code_mention(&cores[i]).or_else(|| {
+            closed_tail_stems(&cores[i])
+                .into_iter()
+                .find(|(stem, _)| crate::logic::TRADE_HUB_TYPES.contains(&stem.as_str()))
+                .and_then(|(stem, _)| trade_code_mention(&stem))
+        });
+        if let Some(codes) = hit {
+            taken[i] = true;
+            out.push(TradeDocMention { text: cores[i].clone(), codes, by_title: false, partial: false, at: (i, 0) });
+        }
+    }
+    let max_w = trade_title_max_words();
+    let mut s = 0usize;
+    while s < n {
+        if !content[s] || taken[s] {
+            s += 1;
+            continue;
+        }
+        let mut found: Option<(usize, Vec<String>)> = None;
+        for w in (1..=max_w).rev() {
+            if s + w > n || !(s..s + w).all(|k| content[k] && !taken[k]) {
+                continue;
+            }
+            let joined: String = cores[s..s + w].iter().map(|c| lower_alnum(c)).collect();
+            if let Some(codes) = trade_title_exact(&joined) {
+                found = Some((w, codes));
+                break;
+            }
+        }
+        match found {
+            Some((w, codes)) => {
+                for k in s..s + w {
+                    taken[k] = true;
+                }
+                out.push(TradeDocMention { text: cores[s..s + w].join(" "), codes, by_title: true, partial: false, at: (s, 0) });
+                s += w;
+            }
+            None => s += 1,
+        }
+    }
+    for i in 0..n {
+        if taken[i] || cores[i].is_empty() {
+            continue;
+        }
+        for (pos, k, codes, bounded) in trade_title_cjk_spans(&cores[i]) {
+            out.push(TradeDocMention { text: k, codes, by_title: true, partial: !bounded, at: (i, pos) });
+        }
+    }
+    out.sort_by_key(|m| m.at);
+    out
+}
+
+pub fn trade_mention_is_hub(m: &TradeDocMention) -> bool {
+    m.codes.iter().any(|c| crate::logic::TRADE_HUB_TYPES.contains(&c.as_str()))
+}
+
+pub fn trade_mentions_decisive(mentions: &[TradeDocMention]) -> Option<(String, String)> {
+    let hubs = |m: &TradeDocMention| -> Vec<String> {
+        m.codes
+            .iter()
+            .filter(|c| crate::logic::TRADE_HUB_TYPES.contains(&c.as_str()))
+            .cloned()
+            .collect()
+    };
+    for (i, a) in mentions.iter().enumerate() {
+        let ha = hubs(a);
+        if a.partial || ha.is_empty() {
+            continue;
+        }
+        for b in mentions.iter().skip(i + 1) {
+            let hb = hubs(b);
+            if b.partial || hb.is_empty() || hb.iter().any(|x| ha.contains(x)) {
+                continue;
+            }
+            return Some((ha[0].clone(), format!("'{}' {:?} ↔ '{}' {:?}", a.text, a.codes, b.text, b.codes)));
+        }
+    }
+    None
+}
+
+/// 12개 언어 확장표에서 TRADE_DOC_TITLES 의 어떤 영문 전문과도 맞지 않는 키.
+pub fn trade_title_ml_orphans() -> Vec<String> {
+    let en: std::collections::HashSet<String> = crate::logic::TRADE_DOC_TITLES
+        .iter()
+        .map(|(_, t)| trade_title_key(t))
+        .collect();
+    crate::logic::TRADE_DOC_TITLES_ML_FULL
+        .iter()
+        .filter(|(t, _)| !en.contains(&trade_title_key(t)))
+        .map(|(t, _)| t.to_string())
+        .collect()
+}
+
+/// 그룹 개념표에서 TRADE_GROUP_CODES 에 없는 그룹명.
+pub fn trade_group_ml_orphans() -> Vec<String> {
+    crate::logic::TRADE_GROUPS_ML
+        .iter()
+        .filter(|(g, _)| !crate::logic::TRADE_GROUP_CODES.iter().any(|(x, _)| x == g))
+        .map(|(g, _)| g.to_string())
+        .collect()
+}
+
+/// 그룹 뱅크 구: 소속 코드의 전문 전체(12개 언어) + 그룹 개념 구.
+pub fn trade_group_title_phrases(group: &str) -> Vec<String> {
+    let codes: Vec<&str> = crate::logic::TRADE_GROUP_CODES
+        .iter()
+        .find(|(g, _)| *g == group)
+        .map(|(_, cs)| cs.to_vec())
+        .unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for (code, title) in all_trade_doc_titles().into_iter() {
+        if !codes.iter().any(|c| *c == code.as_str()) { continue; }
+        if out.iter().any(|x| x.eq_ignore_ascii_case(&title)) { continue; }
+        out.push(title);
+    }
+    for (g, ml) in crate::logic::TRADE_GROUPS_ML.iter() {
+        if *g != group { continue; }
+        for p in ml.split(',') {
+            let p = p.trim();
+            if p.is_empty() || out.iter().any(|x| x.eq_ignore_ascii_case(p)) { continue; }
+            out.push(p.to_string());
+        }
+    }
+    out
+}
+
+// =====================================================================
+// 🌟 [T-2 / 감쇠 곡선 기반 적응형 마진]
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   실측 로그: ✨ [PLINKO ASSIGN] 'related_po_number' → 'marks_numbers' | Margin: +0.0001
+//   트레이딩 경로의 호출은 exclusive_assign_by_score(&t_matrix, 0.0, 0.0) 이므로
+//   마진 게이트가 아예 0 입니다. +0.0001 이든 +3.5 든 동일하게 확정됩니다.
+//
+//  ── 마진 절대값이 구분하지 못하는 세 상황 ──
+//   같은 '마진 0.01' 이어도 라인의 점수 분포에 따라 의미가 정반대입니다.
+//     [0.85, 0.84, 0.12, 0.09]  1·2위만 붙고 나머지는 멀리 → 두 필드의 구조적 혼동
+//     [0.60, 0.59, 0.58, 0.57]  전체가 평탄 → 변별력 없음 또는 다중 속성 값
+//   전자는 혼동 사전으로 해소해야 하고, 후자는 배정 자체를 보류해야 합니다.
+//   현재는 둘 다 무조건 확정됩니다.
+//
+//  ── 판정 기준을 어디서 얻는가 ──
+//   이 코드베이스는 이미 '마진을 분포 표준편차와 비교' 하는 패턴을 씁니다.
+//     CONTINUATION DRIFT : 격차 +0.0774 > 분포 표준편차 0.0725
+//     MODE PROBE         : margin < noise_band (EVT 표준편차)
+//     EVIDENCE DEDUP     : dedup_floor = μ + 3σ
+//   그 패턴을 배타 배정 안으로 이식하는 것이므로 새 상수가 생기지 않습니다.
+//   잡음 마진 = 그 라인 경쟁 점수의 '꼬리(2위 이하) 표준편차' 입니다.
+//   1위와 2위의 격차가 무리 자체의 흩어짐보다 작으면 우연입니다.
+//
+//  ── 왜 강화 단방향인가 ──
+//   승자독식형에서 임계를 완화할 수도 있지만, 그것은 '기존에 보류되던 것이
+//   확정됨' 이라 회귀 위험이 있습니다. 기획의 부분 게이팅 원칙에 따라
+//   Phase 1 에서는 강화만 적용합니다.
+//   표적 사고(+0.0001 확정)는 강화만으로 완전히 해결되므로 완화가 불필요합니다.
+// =====================================================================
+// 🌟 [PD-SDS MATRIX] 배타 배정(마진 순 · 점수 순) · 라인 동률 형상([T-2] 잡음 마진 = 2위 이하 꼬리의 표준편차, 1·2위 격차가
+//    그보다 작으면 PairConfusion / Flat 으로 보고 호출부의 allow_tie 가 정함, 강화 단방향) · 이중 센터링은
+//    premium-discount-sds::matrix 를 씁니다 (logis 에서 옮겨 간 코드, 이름만 바뀜: double_center · exclusive_assign_adaptive).
+//    유한한 점수에서는 결과 · 진단 · allow_tie 호출 순서까지 비트 단위로 같습니다 (무작위 행렬 20만 개 차등 시험).
+//    NaN · ±inf 칸은 PD 가 후보와 평균에서 뺍니다. 예전 코드는 NaN 이 정렬 비교자로 들어가 Rust 1.81+ 정렬이 패닉했습니다
+//    (NaN 이 섞인 무작위 행렬의 약 2 %, release 는 panic = "abort" 라 앱이 끝남).
+pub use premium_discount_sds::matrix::{
+    double_center as double_center_matrix, exclusive_assign, exclusive_assign_adaptive as exclusive_assign_by_score_adaptive,
+    exclusive_assign_by_score, line_tie_shape, AssignDiag, TieKind,
+};
+
+
+pub fn residual_assign_blocked(
+    matrix: &Vec<Vec<f32>>,
+    assign: &mut Vec<Option<(usize, f32, f32)>>,
+    eligible: &[bool],
+    abs_threshold: f32,
+) -> Vec<(usize, usize, usize, f32)> {
+    let field_count = matrix.len().min(assign.len());
+    let mut line_count = 0usize;
+    for row in matrix.iter() {
+        if row.len() > line_count { line_count = row.len(); }
+    }
+    let mut rescued: Vec<(usize, usize, usize, f32)> = Vec::new();
+    if field_count == 0 || line_count == 0 { return rescued; }
+    let get = |f: usize, l: usize| -> f32 {
+        matrix.get(f).and_then(|row| row.get(l)).copied().unwrap_or(-1.0)
+    };
+    let mut claimed = vec![false; line_count];
+    for a in assign.iter() {
+        if let Some((l, _, _)) = a {
+            if *l < line_count { claimed[*l] = true; }
+        }
+    }
+    loop {
+        let mut pick: Option<(usize, usize, f32, f32, usize)> = None;
+        for l in 0..line_count {
+            if claimed[l] { continue; }
+            let mut top: Option<(usize, f32)> = None;
+            for f in 0..field_count {
+                let s = get(f, l);
+                if s < abs_threshold { continue; }
+                if top.map_or(true, |(_, v)| s > v) { top = Some((f, s)); }
+            }
+            let blocker = match top {
+                Some((f, _)) if assign[f].is_some() => f,
+                _ => continue,
+            };
+            let mut cands: Vec<(usize, f32)> = (0..field_count)
+                .filter(|f| assign[*f].is_none())
+                .map(|f| (f, get(f, l)))
+                .filter(|(_, s)| *s >= abs_threshold)
+                .collect();
+            if cands.is_empty() { continue; }
+            cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let (f, s) = cands[0];
+            if !eligible.get(f).copied().unwrap_or(false) { continue; }
+            let margin = match cands.get(1) {
+                Some((_, s2)) => s - *s2,
+                None => s - abs_threshold,
+            };
+            if margin <= 1e-6 { continue; }
+            if cands.len() >= 3 {
+                let tail: Vec<f32> = cands[1..].iter().map(|(_, v)| *v).collect();
+                let n = tail.len() as f32;
+                let mean = tail.iter().sum::<f32>() / n;
+                let noise = (tail.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).max(0.0).sqrt();
+                if margin < noise { continue; }
+            }
+            if (0..line_count).any(|l2| l2 != l && !claimed[l2] && get(f, l2) > s) { continue; }
+            if pick.map_or(true, |p| s > p.2) { pick = Some((f, l, s, margin, blocker)); }
+        }
+        match pick {
+            Some((f, l, s, margin, blocker)) => {
+                assign[f] = Some((l, s, margin));
+                claimed[l] = true;
+                rescued.push((f, l, blocker, margin));
+            }
+            None => break,
+        }
+    }
+    rescued
+}
+
+pub fn self_poisoned_prejudice_mask(
+    own_label_embs: &Vec<Vec<f32>>,
+    prej_embs: &Vec<Vec<f32>>,
+    all_label_embs: &[Vec<Vec<f32>>],
+    self_index: usize,
+) -> Vec<bool> {
+    let mut mask = vec![false; prej_embs.len()];
+    if own_label_embs.is_empty() { return mask; }
+    for (pi, pe) in prej_embs.iter().enumerate() {
+        if pe.iter().all(|&v| v == 0.0) { continue; }
+        let own = max_pool_sim(pe, own_label_embs);
+        let mut rival = 0.0f32;
+        for (fi, bank) in all_label_embs.iter().enumerate() {
+            if fi == self_index { continue; }
+            if bank.is_empty() { continue; }
+            let s = max_pool_sim(pe, bank);
+            if s > rival { rival = s; }
+        }
+        if own >= rival { mask[pi] = true; }
+    }
+    mask
+}
+
+// 🌟 [SELECT GROUP] 상태(status)는 PUG 로는 절대 판정할 수 없습니다.
+//    parsing.rs 의 generate_pug_lines 가 selected 가 아닌 option 을 전부 버리기 때문에
+//    '배송완료 / 반품 / 교환' 이라는 열거 후보 집합 자체가 PUG 에서 소멸합니다.
+//    따라서 원본 HTML 에서 select 컨트롤과 그 옵션 전체를 따로 수집합니다.
+#[derive(Debug, Clone)]
+pub struct SelectGroup {
+    pub selector: String,     // 실제 CSS selector (LLM 이 복사할 원본)
+    pub role_phrase: String,  // name/id 를 자연어화 + 같은 tr 의 th 라벨
+    pub options: Vec<String>, // 모든 옵션 텍스트
+    pub selected: String,     // selected 된 옵션 텍스트
+}
+
+pub fn collect_select_groups(html: &str) -> Vec<SelectGroup> {
+    let doc = scraper::Html::parse_document(html);
+    let sel_select = match scraper::Selector::parse("select") { Ok(s) => s, Err(_) => return Vec::new() };
+    let sel_option = match scraper::Selector::parse("option") { Ok(s) => s, Err(_) => return Vec::new() };
+    let sel_th = scraper::Selector::parse("th").ok();
+
+    let mut out: Vec<SelectGroup> = Vec::new();
+    for (idx, el) in doc.select(&sel_select).enumerate() {
+        let name = el.value().attr("name").unwrap_or("").to_string();
+        let id = el.value().attr("id").unwrap_or("").to_string();
+
+        let selector = if !id.is_empty() {
+            format!("select#{}", id)
+        } else if !name.is_empty() {
+            format!("select[name=\"{}\"]", name)
+        } else {
+            format!("select:nth-of-type({})", idx + 1)
+        };
+
+        let mut options: Vec<String> = Vec::new();
+        let mut selected = String::new();
+        for opt in el.select(&sel_option) {
+            let txt = opt.text().collect::<Vec<_>>().join(" ")
+                .split_whitespace().collect::<Vec<_>>().join(" ");
+            if txt.is_empty() { continue; }
+            if opt.value().attr("selected").is_some() && selected.is_empty() {
+                selected = txt.clone();
+            }
+            if !options.iter().any(|o| o == &txt) { options.push(txt); }
+        }
+        if options.is_empty() { continue; }
+        if selected.is_empty() { selected = options[0].clone(); }
+        if options.len() > 40 { options.truncate(40); }
+
+        // 역할 문구 : name/id 자연어화 + '같은 tr 안의 th' 라벨
+        let mut role = humanize_url_token(&format!("{} {}", name, id));
+        let mut cur = el.parent();
+        let mut hops = 0usize;
+        while let Some(p) = cur {
+            hops += 1;
+            if hops > 8 { break; }
+            if let Some(pe) = p.value().as_element() {
+                let tag = pe.name().to_lowercase();
+                if tag == "tr" {
+                    if let (Some(pref), Some(th_sel)) = (scraper::ElementRef::wrap(p), sel_th.as_ref()) {
+                        if let Some(l) = pref.select(th_sel).next() {
+                            let t = l.text().collect::<Vec<_>>().join(" ")
+                                .split_whitespace().collect::<Vec<_>>().join(" ");
+                            if !t.is_empty() { role = format!("{} {}", t, role).trim().to_string(); }
+                        }
+                    }
+                    break;
+                }
+                if tag == "form" || tag == "body" { break; }
+            }
+            cur = p.parent();
+        }
+        if role.trim().is_empty() { role = "select control".to_string(); }
+
+        out.push(SelectGroup { selector, role_phrase: role, options, selected });
+    }
+    if out.len() > 24 { out.truncate(24); }
+    out
+}
+
+// 🌟 [STATUS CANONICAL BANK] 상태는 '취소' 라는 한국어 리터럴을 찾는 게 아니라,
+//    bias.json 의 status_filters(영어 캐노니컬)와 코사인으로 대조합니다.
+//    '배송완료' → complete, '반품' → return, '교환' → exchange 가 다국어 임베딩으로 연결됩니다.
+pub fn enum_status_keys(page_type: &str) -> Vec<&'static str> {
+    match page_type {
+        "tracking" => vec!["draft", "progress", "return", "complete"],
+        "goods" => vec!["draft", "show", "hide", "progress", "stop", "cancel", "refund", "return", "exchange", "expire", "complete"],
+        "order" => vec!["draft", "progress", "stop", "cancel", "refund", "return", "exchange", "expire", "complete"],
+        "coupon" | "event" => vec!["show", "progress", "hide", "stop", "cancel", "expire", "complete"],
+        "review" => vec!["progress", "stop", "cancel", "refund", "return", "exchange", "expire", "complete"],
+        _ => vec!["show", "progress", "remove", "hide", "stop", "cancel", "refund", "return", "exchange", "expire", "complete"],
+    }
+}
+
+pub fn status_key_phrases(key: &str) -> Vec<String> {
+    let mut v: Vec<String> = vec![key.to_string()];
+    if let Some(node) = crate::parsing::BIAS_DICT.get("status_filters").and_then(|s| s.get(key)) {
+        if let Some(b) = node.get("bias").and_then(|x| x.as_str()) {
+            for p in split_bias_phrases(b) {
+                if !v.iter().any(|e| e == &p) { v.push(p); }
+            }
+        }
+    }
+    if v.len() > 24 { v.truncate(24); }
+    v
+}
+
+
+pub fn status_key_scores(emb: &[f32], banks: &[(String, Vec<Vec<f32>>)]) -> Vec<(String, f32)> {
+    banks.iter().map(|(k, kb)| (k.clone(), max_pool_sim(emb, kb))).collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusKeyPick {
+    pub key: String,
+    pub top: f32,
+    pub second: f32,
+}
+
+impl StatusKeyPick {
+    pub fn margin(&self) -> f32 {
+        if self.second == f32::MIN { self.top } else { self.top - self.second }
+    }
+    pub fn accepted_with(&self, min_top: f32, min_margin: f32) -> bool {
+        !self.key.is_empty() && self.top > min_top && (self.top - self.second) > min_margin
+    }
+    pub fn accepted(&self) -> bool {
+        self.accepted_with(0.35, 0.01)
+    }
+}
+
+pub fn pick_status_key(scores: &[(String, f32)]) -> StatusKeyPick {
+    let mut key = String::new();
+    let mut top = f32::MIN;
+    let mut second = f32::MIN;
+    for (k, s) in scores.iter() {
+        if *s > top {
+            second = top;
+            top = *s;
+            key = k.clone();
+        } else if *s > second {
+            second = *s;
+        }
+    }
+    StatusKeyPick { key, top, second }
+}
+
+pub const STATUS_PIVOT_ALIGN_Z: f32 = 2.0;
+
+pub fn status_bank_list(lang: &str, page_type: &str) -> Vec<String> {
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    let lang_node = match dict.get(lang) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let canon = crate::utils::bias_schema::canonical_bias_type(page_type);
+    lang_node
+        .get(page_type)
+        .and_then(|p| p.get("status"))
+        .or_else(|| lang_node.get(canon).and_then(|p| p.get("status")))
+        .and_then(|n| n.get("bias"))
+        .and_then(|b| b.as_str())
+        .map(split_phrase_list)
+        .unwrap_or_default()
+}
+
+fn status_exact_hits(raw: &str, page_type: &str, with_phrases: bool) -> Vec<&'static str> {
+    let norm = lower_alnum(raw);
+    if norm.is_empty() {
+        return Vec::new();
+    }
+    let keys: Vec<&'static str> = enum_status_keys(page_type)
+        .into_iter()
+        .filter(|k| crate::logic::parse_status(k) != 0)
+        .collect();
+    let mut hits: Vec<&'static str> = Vec::new();
+    let take = |ek: Option<String>, hits: &mut Vec<&'static str>| {
+        if let Some(ek) = ek {
+            if let Some(k) = keys.iter().find(|k| **k == ek.as_str()) {
+                if !hits.contains(k) {
+                    hits.push(*k);
+                }
+            }
+        }
+    };
+    if with_phrases {
+        for k in keys.iter() {
+            if status_key_phrases(k).iter().any(|p| lower_alnum(p) == norm) && !hits.contains(k) {
+                hits.push(*k);
+            }
+        }
+    }
+    take(exact_match_filter_key_tailed("status_filters", raw), &mut hits);
+    if hits.is_empty() {
+        let t = raw.trim();
+        for tail in STATUS_PREDICATE_TAILS_ML.iter() {
+            if let Some(stem) = t.strip_suffix(tail) {
+                if stem.chars().count() >= 2 {
+                    take(exact_match_filter_key_tailed("status_filters", stem), &mut hits);
+                }
+            }
+        }
+    }
+    hits
+}
+
+pub fn status_exact_key(raw: &str, page_type: &str) -> Option<String> {
+    let hits = status_exact_hits(raw, page_type, true);
+    if hits.len() == 1 {
+        Some(hits[0].to_string())
+    } else {
+        None
+    }
+}
+
+pub fn status_curated_key(raw: &str, page_type: &str) -> Option<String> {
+    let hits = status_exact_hits(raw, page_type, false);
+    if hits.len() == 1 {
+        Some(hits[0].to_string())
+    } else {
+        None
+    }
+}
+
+pub fn bank_alignment_z(src: &[Vec<f32>], dst: &[Vec<f32>]) -> Option<f32> {
+    let n = src.len();
+    if n < 3 || dst.len() != n {
+        return None;
+    }
+    if src.iter().chain(dst.iter()).any(|v| v.iter().all(|&x| x == 0.0)) {
+        return None;
+    }
+    let mut diag = 0.0f32;
+    let mut off: Vec<f32> = Vec::with_capacity(n * (n - 1));
+    for i in 0..n {
+        for j in 0..n {
+            let s = cosine_similarity(&src[i], &dst[j]);
+            if i == j {
+                diag += s;
+            } else {
+                off.push(s);
+            }
+        }
+    }
+    let mean_diag = diag / n as f32;
+    let mean_off = off.iter().sum::<f32>() / off.len() as f32;
+    let var_off = off.iter().map(|x| (x - mean_off) * (x - mean_off)).sum::<f32>() / off.len() as f32;
+    let se = var_off.sqrt().max(1e-6) / (n as f32).sqrt();
+    Some((mean_diag - mean_off) / se)
+}
+
+#[derive(Debug, Clone)]
+pub struct StatusPivot {
+    pub lang: String,
+    pub src: Vec<String>,
+    pub dst: Vec<String>,
+    pub align_z: f32,
+}
+
+impl StatusPivot {
+    pub fn usable(&self) -> bool {
+        self.align_z >= STATUS_PIVOT_ALIGN_Z
+    }
+
+    pub fn resolve(&self, raw: &str, page_type: &str) -> Option<(String, String)> {
+        if !self.usable() {
+            return None;
+        }
+        let norm = lower_alnum(raw);
+        if norm.is_empty() {
+            return None;
+        }
+        let hits: Vec<usize> = self
+            .src
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| lower_alnum(p) == norm)
+            .map(|(i, _)| i)
+            .collect();
+        if hits.len() != 1 {
+            return None;
+        }
+        let pivot = self.dst.get(hits[0])?.clone();
+        status_exact_key(&pivot, page_type).map(|k| (k, pivot))
+    }
+}
+
+
+pub fn status_canonical_exact(
+    raw: &str,
+    page_type: &str,
+    pivot: Option<&StatusPivot>,
+) -> Option<(String, String)> {
+    if let Some(k) = status_exact_key(raw, page_type) {
+        return Some((k, "status_filters 완전일치".to_string()));
+    }
+    let p = pivot?;
+    p.resolve(raw, page_type)
+        .map(|(k, via)| (k, format!("{} 상태 목록 ↔ en '{}' 같은 자리", p.lang, via)))
+}
+// 🌟 [FORMAT FAMILY] 스키마 필드가 물리적으로 어떤 "생김새"의 값을 가져야 하는지 분류합니다.
+// 다국어 임베딩은 짧은 한국어 문자열끼리 기본 유사도가 0.5를 넘기 때문에
+// ("번호" vs "운송장번호" = 0.67) 코사인 임계치만으로는 컬럼을 절대 분리할 수 없습니다.
+// 유사도를 재기 "전에" 값의 형태부터 검증해야 오매칭이 원천 차단됩니다.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldFormat {
+    Date,         // registration_date, payment_date, started_at, expired_at ...
+    TrackingCode, // tracking_number, barcode, gtin, mpn
+    Identifier,   // id, code, no, index, stock_keeping_unit
+    Link,         // link, url
+    Numeric,      // price, amount, quantity, weight, fee, discount ...
+    Enum,         // status, payment_method, condition, currency, bank, card
+    Synthesis,    // insight, summary, analysis (LLM 이 문장을 합성하는 필드)
+    // 🌟 [NEW] 연락처는 '문자를 포함해야 한다'는 Text 규칙과 정반대의 생김새(숫자+하이픈)라
+    //    Text 로 두면 'test3@gmail.com' 같은 이메일 셀이 형식 게이트를 그대로 통과합니다.
+    Phone,        // sender_phone, recipient_phone, telephone, cellphone, number(연락처)
+    // 🌟 [NEW] 주소는 반드시 2토큰 이상입니다. '우체국' / 'https://…' 같은 단일 토큰을 원천 차단합니다.
+    Address,      // sender_address, recipient_address, address
+    Text,         // title, name, description ...
+}
+
+pub fn detect_field_format(field_name: &str) -> FieldFormat {
+    let lower = field_name.to_lowercase();
+    let keys: Vec<String> = lower.split(',').map(|s| s.trim().to_string()).collect();
+    let has = |k: &str| keys.iter().any(|x| x == k);
+    if keys.iter().any(|k| k.contains("insight") || k.contains("summary") || k.contains("analysis")) {
+        return FieldFormat::Synthesis;
+    }
+    if keys.iter().any(|k| k.contains("tracking_number") || k == "barcode" || k == "gtin" || k == "mpn") {
+        return FieldFormat::TrackingCode;
+    }
+    // 🌟 [TRADE IDENTIFIER] hs_code / container_number / seal_number 는 값이 순수 숫자이거나
+    //    '영문 4자 + 숫자 7자' 구조입니다. Text 로 두면 is_alphabetic() 게이트에서
+    //    "583948392" 가 탈락해 청크가 저장조차 되지 않습니다.
+    //    (has("code") 는 완전일치라 "hs_code" 를 잡지 못했습니다)
+    if has("hs_code") || has("container_number") || has("seal_number") {
+        return FieldFormat::Identifier;
+    }
+    if has("id") || has("code") || has("no") || has("index") || has("stock_keeping_unit") {
+        return FieldFormat::Identifier;
+    }
+    if keys.iter().any(|k| k.contains("link") || k.contains("url")) {
+        return FieldFormat::Link;
+    }
+    // 🌟 [TRADE DATE] etd / eta 는 'date' 도 '_at' 도 포함하지 않아 Text 로 떨어졌습니다.
+    //    무역 서식에서 이 두 축은 항상 날짜입니다.
+    if keys.iter().any(|k| k.contains("date") || k.ends_with("_at") || k == "etd" || k == "eta") {
+        return FieldFormat::Date;
+    }
+    // 🌟 tracking_number 는 위에서 이미 반환되었으므로 여기의 "number" 는 순수 연락처입니다.
+    if keys.iter().any(|k| {
+        k.ends_with("phone") || k == "tel" || k == "telephone" || k == "mobile"
+            || k == "cellphone" || k == "contact" || k == "number"
+    }) {
+        return FieldFormat::Phone;
+    }
+    if keys.iter().any(|k| k == "address" || k.ends_with("_address")) {
+        return FieldFormat::Address;
+    }
+    // 🌟 [TRADE ENUM] incoterms / transport_mode / payment_terms / freight_payment_term /
+    //    package_unit / unit / type_size 는 전부 '정해진 코드 집합' 입니다.
+    //    Enum 은 어떤 값이든 통과시키므로 오탐이 없고, Text 의 알파벳 요구를 우회합니다.
+    if keys.iter().any(|k| {
+        k.contains("status") || k.contains("payment_method") || k.contains("payment_origin")
+            || k.contains("condition") || k.contains("currency") || k == "bank" || k == "card"
+            || k.contains("incoterm") || k.contains("_term") || k.contains("transport_mode")
+            || k == "unit" || k == "package_unit" || k == "type_size"
+    }) {
+        return FieldFormat::Enum;
+    }
+    // 🌟 [TRADE NUMERIC] package_count / volume / local_charges 는 기존 어느 패턴에도
+    //    걸리지 않아 Text 로 떨어졌고, "4" / "12.5" / "150" 이 전부
+    //    FORMAT GATE 에서 unclassified 로 강등 → 인덱싱 대상에서 폐기되었습니다.
+    if keys.iter().any(|k| {
+        k.contains("price") || k.contains("amount") || k.contains("quantity") || k.contains("weight")
+            || k == "width" || k == "height" || k == "length" || k.contains("fee")
+            || k.contains("discount") || k.contains("usage_") || k.contains("threshold")
+            || k.contains("duration")
+            || k.ends_with("_count") || k == "volume" || k.contains("charge")
+    }) {
+        return FieldFormat::Numeric;
+    }
+    FieldFormat::Text
+}
+
+/// 🌟 [CONTACT FORMAT] 필드 이름까지 보고 값 형식을 판정합니다.
+///
+///  ── 실측 ──
+///   party_contact 의 스키마 정의는 'Phone, fax or email of this party' 인데, detect_field_format 은
+///   이름 완전일치('contact')만 Phone 으로 보므로 party_contact · emergency_contact 는 Text 가 됩니다.
+///   그래서 '+82-2-1234-5678' 같은 전화번호가 [TRADING VALUE FORMAT GATE] 에서 '형식 불일치' 로 떨어지고,
+///   연락처 라벨이 id,link · container_number 와의 동점 경쟁으로 밀려났습니다.
+///
+///  ── 무엇을 바꾸나 ──
+///   연락처 축(contact · *_contact)은 그 축의 형식(이메일·문구 = Text)이나 Phone 중 하나만 맞으면 통과합니다.
+///   한 형식으로 바꾸면 이메일이나 전화번호 한쪽을 잃으므로 둘 다 받습니다. 다른 축은 예전과 같습니다.
+pub fn field_value_matches(field_name: &str, fmt: FieldFormat, value: &str) -> bool {
+    if value_matches_format(fmt, value) {
+        return true;
+    }
+    let lower = field_name.to_lowercase();
+    let contact = lower.split(',').map(|s| s.trim()).any(|k| k == "contact" || k.ends_with("_contact"));
+    contact && value_matches_format(FieldFormat::Phone, value)
+}
+
+pub fn query_value_format(field_name: &str) -> FieldFormat {
+    let f = detect_field_format(field_name);
+    if matches!(f, FieldFormat::Text | FieldFormat::Enum)
+        && crate::utils::canonical::kind_of(field_name) == crate::utils::canonical::CanonKind::Identifier
+    {
+        return FieldFormat::Identifier;
+    }
+    f
+}
+
+// 🌟 "a-b-c" / "a/b/c" / "a.b.c" 형태의 실제 날짜 리터럴이 있는지 판정합니다.
+// "615600", "9", "26031514155635" 같은 순수 숫자 덩어리는 날짜로 인정하지 않습니다.
+pub fn has_date_literal(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut i = 0usize;
+    while i < n {
+        if chars[i].is_ascii_digit() {
+            let start1 = i;
+            let mut j = i;
+            while j < n && chars[j].is_ascii_digit() { j += 1; }
+            let g1 = j - start1;
+
+            if j < n && (chars[j] == '-' || chars[j] == '/' || chars[j] == '.') {
+                let sep = chars[j];
+                let mut k = j + 1;
+                let start2 = k;
+                while k < n && chars[k].is_ascii_digit() { k += 1; }
+                let g2 = k - start2;
+
+                if g2 >= 1 && k < n && chars[k] == sep {
+                    let mut m = k + 1;
+                    let start3 = m;
+                    while m < n && chars[m].is_ascii_digit() { m += 1; }
+                    let g3 = m - start3;
+                    // 🌟 [DATE SHAPE GATE] 월(g2)·일(g3)은 물리적으로 최대 2자리.
+                    //    "010-3333-3333"(g2=4, g3=4) 같은 전화번호를 날짜로 오인하는 것을 원천 차단.
+                    if g3 >= 1 && g1 >= 2 && g1 <= 4 && g2 <= 2 && g3 <= 2 { return true; }
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+
+
+const DATE_UNIT_MARKERS: [&str; 8] = ["年", "月", "日", "년", "월", "일", "号", "號"];
+
+
+
+
+pub const TEMPORAL_OPERATOR_PIVOTS_ML: [(&str, &str, &str); 2] = [
+    (
+        "gte",
+        "after, since, onward, later than, on or after",
+        "nach, seit, später als, am oder nach, \
+         después de, desde, a partir de, posterior a, en o después de, \
+         après, depuis, à partir de, postérieur à, le ou après, \
+         dopo, a partire da, successivo a, il o dopo, \
+         depois de, a partir de, posterior a, em ou depois de, \
+         sinds, vanaf, later dan, op of na, \
+         počínaje, později než, v den nebo po, \
+         بعد, منذ, اعتبارا من, لاحقا لـ, في أو بعد, \
+         以降, 以後, 以来, より後, それ以降, \
+         之后, 以后, 晚于, 自此之后, \
+         이후, 부터, 이래, 보다 늦은, 그 이후",
+    ),
+    (
+        "lte",
+        "before, until, earlier than, no later than, on or before",
+        "vor, bis, früher als, spätestens, am oder vor, \
+         antes de, hasta, anterior a, a más tardar, en o antes de, \
+         avant, jusqu'à, antérieur à, au plus tard, le ou avant, \
+         prima di, fino a, precedente a, entro, il o prima, \
+         antes de, até, anterior a, no máximo até, em ou antes de, \
+         voor, tot, eerder dan, uiterlijk, op of voor, \
+         před, dříve než, nejpozději, v den nebo před, \
+         قبل, حتى, أبكر من, في موعد أقصاه, في أو قبل, \
+         以前, まで, より前, 遅くとも, それ以前, \
+         之前, 以前, 早于, 最迟, 截至, \
+         이전, 까지, 보다 이른, 늦어도, 그 이전",
+    ),
+];
+
+pub const TIME_UNIT_PIVOTS_ML: [(&str, &str); 3] = [
+    (
+        "year",
+        "year, years, yr, calendar year, annual, \
+         Jahr, Jahre, Jahres, Kalenderjahr, \
+         año, años, \
+         année, années, \
+         anno, anni, \
+         ano, anos, \
+         jaar, jaren, kalenderjaar, \
+         rok, roku, roky, \
+         سنة, سنوات, عام, أعوام, \
+         년, 년도, 연도, 해, \
+         年, 年度, 年份, ねん",
+    ),
+    (
+        "month",
+        "month, months, calendar month, \
+         Monat, Monate, Monats, Kalendermonat, \
+         mes, meses, \
+         mois, \
+         mese, mesi, \
+         mês, \
+         maand, maanden, \
+         měsíc, měsíce, měsíců, \
+         شهر, شهور, أشهر, \
+         월, \
+         月, 月份, がつ",
+    ),
+    (
+        "day",
+        "day, days, \
+         Tag, Tage, Tages, \
+         día, días, \
+         jour, jours, \
+         giorno, giorni, \
+         dia, dias, \
+         dag, dagen, \
+         den, dny, dní, dne, \
+         يوم, أيام, \
+         일, 일자, 날, \
+         日, 号, にち",
+    ),
+];
+
+pub const COMPARATOR_PIVOTS_ML: [(&str, &str); 4] = [
+    (
+        "gte",
+        "at least, no less than, not less than, minimum, or more, or above, or higher, and above, \
+         mindestens, wenigstens, nicht weniger als, oder mehr, \
+         al menos, como mínimo, mínimo, no menos de, o más, \
+         au moins, au minimum, pas moins de, ou plus, \
+         almeno, come minimo, non meno di, o più, \
+         pelo menos, no mínimo, não menos que, ou mais, \
+         minstens, ten minste, minimaal, niet minder dan, of meer, \
+         alespoň, nejméně, minimálně, a více, \
+         على الأقل, كحد أدنى, لا يقل عن, أو أكثر, \
+         이상, 최소, 최소한, 적어도, \
+         以上, 最低, 最小, 少なくとも, \
+         至少, 不少于, 不低于, 最少",
+    ),
+    (
+        "gt",
+        "more than, greater than, higher than, larger than, exceeding, in excess of, \
+         mehr als, größer als, höher als, \
+         más de, mayor que, superior a, \
+         plus de, supérieur à, supérieure à, \
+         più di, maggiore di, superiore a, \
+         mais de, maior que, acima de, \
+         meer dan, groter dan, hoger dan, \
+         více než, víc než, vyšší než, větší než, \
+         أكثر من, أعلى من, أكبر من, يتجاوز, \
+         초과, 초과하는, 초과한, 넘는, 넘은, 넘게, 넘어가는, 넘어서는, \
+         超, 超える, 超過, より多い, より大きい, \
+         超过, 大于, 多于, 高于",
+    ),
+    (
+        "lte",
+        "at most, no more than, not more than, not exceeding, up to, maximum, or less, or below, or lower, or under, \
+         höchstens, bis zu, nicht mehr als, oder weniger, \
+         como máximo, a lo sumo, máximo, no más de, hasta, o menos, \
+         au plus, au maximum, pas plus de, jusqu'à, ou moins, \
+         al massimo, massimo, non più di, fino a, o meno, \
+         no máximo, não mais que, até, ou menos, \
+         hoogstens, ten hoogste, maximaal, niet meer dan, of minder, \
+         nejvýše, maximálně, nanejvýš, a méně, \
+         على الأكثر, كحد أقصى, لا يزيد عن, أو أقل, \
+         이하, 이내, 최대, 넘지 않는, 넘지 않은, \
+         以下, 以内, 最大, 多くとも, \
+         至多, 最多, 不超过, 不多于, 不高于",
+    ),
+    (
+        "lt",
+        "less than, fewer than, lower than, smaller than, \
+         weniger als, kleiner als, niedriger als, \
+         menos de, menor que, inferior a, \
+         moins de, inférieur à, inférieure à, \
+         meno di, minore di, inferiore a, \
+         menos que, abaixo de, \
+         minder dan, kleiner dan, lager dan, \
+         méně než, míň než, nižší než, menší než, \
+         أقل من, أدنى من, أصغر من, \
+         미만, 미달, \
+         未満, より少ない, より小さい, \
+         小于, 少于, 低于, 不足",
+    ),
+];
+
+pub const NOMINAL_TAILS_ML: &[&str] = &[
+    "이", "가", "을", "를", "은", "는", "과", "와", "으로", "로",
+    "의", "에", "에서", "도", "만", "들", "들을", "들의", "들이", "과의", "와의",
+    "の", "で", "は", "が", "を", "に", "と", "や", "も", "から",
+    "的", "和", "与",
+];
+
+pub const COPULA_TAILS_ML: &[&str] = &[
+    "이고", "이며", "이면", "인데", "인지", "이다", "입니다", "이어야", "이라면", "이거나",
+    "だ", "です",
+];
+
+pub const OPERATOR_TAILS_ML: &[&str] = &["인", "일", "な", "了"];
+
+pub const LOCATIVE_TAILS_ML: &[&str] = &["에", "에서", "으로", "로", "から", "で", "に"];
+
+pub const STATUS_PREDICATE_TAILS_ML: &[&str] = &["된", "됨", "인", "한", "중인", "중"];
+
+pub const NEGATION_NEXT_ML: &[&str] = &[
+    "안", "못", "not", "no", "non", "never", "without", "cannot", "n't", "n’t", "except", "excluding",
+    "nicht", "kein", "keine", "keinen", "ohne", "sin", "pas", "sans", "ne", "senza", "não", "sem",
+    "niet", "geen", "zonder", "bez", "غير", "ليس", "بدون", "不", "没", "没有", "非", "未",
+];
+
+pub const NEGATION_PREV_ML: &[&str] = &[
+    "않은", "않는", "않고", "않음", "없는", "없이", "없음",
+    "안된", "안됨", "안한", "안함", "못한", "못함", "불가",
+    "ない", "無い", "なし", "無し",
+];
+
+pub const NEGATION_SCOPE_PREV_ML: &[&str] = &[
+    "제외", "제외하고", "제외한", "제외된", "제외하면", "빼고", "빼면", "뺀", "말고", "이외", "아닌", "아님",
+    "以外", "除く",
+];
+
+pub const NEGATION_LIGHT_VERBS_ML: &[&str] = &["된", "됨", "되는", "된것", "한", "함", "하는", "한것"];
+
+pub const POLARITY_SKIP_ML: &[&str] = &[
+    "very", "so", "too", "that", "really", "quite", "the", "a", "an", "most", "more",
+    "sehr", "zu", "der", "die", "das", "am", "très", "trop", "si", "le", "la", "les", "plus",
+    "muy", "tan", "demasiado", "el", "los", "las", "más", "molto", "troppo", "così", "il", "più",
+    "muito", "tão", "o", "os", "mais", "heel", "erg", "zo", "het", "de", "meer", "velmi", "moc",
+    "그렇게", "너무", "아주", "매우", "많이", "그리", "별로", "가장", "제일",
+    "とても", "あまり", "很", "太", "那么", "最",
+    "yet", "been", "be", "being", "have", "has", "had", "ever", "encore", "été", "ancora", "stato", "stati",
+    "sido", "han", "ha", "ainda",
+];
+
+pub const NEGATION_AUX_JI_ML: &[&str] = &["되지", "하지", "되진", "하진", "되지는", "하지는"];
+
+pub const ORDER_HOP_ML: &[&str] = &[
+    "by", "most", "least", "the", "price", "prices", "가격", "가격이", "가격을", "가격으로", "par", "por", "nach", "per",
+];
+
+pub const ORDERING_SUN_EXCLUDED_ML: &[&str] = &["선착순", "초순", "중순", "하순", "상순"];
+
+pub const DOWNWARD_MARKERS_ML: &[&str] = &[
+    "less", "least", "fewer", "moins", "menos", "meno", "weniger", "minder", "méně", "덜", "أقل",
+];
+
+pub const ORDERING_MARKERS_ML: &[&str] = &[
+    "순", "순으로", "순서", "순서로", "순서대로", "것부터", "거부터",
+    "sort", "sorted", "sorting", "first", "順", "順に", "排序", "trier", "ordenar", "sortieren",
+];
+
+pub const ORDERING_SUFFIXES_ML: &[&str] = &["순으로", "순서로", "순서대로", "것부터", "거부터"];
+
+pub const PRICE_COMPARE_WORDS_ML: &[&str] = &[
+    "under", "over", "below", "above", "within", "unter", "über", "sous", "bajo", "sotto", "abaixo", "onder", "boven",
+];
+
+pub const PRICE_TAILS_ML: &[&str] = &[
+    "대", "짜리", "선", "정도", "내외", "가량", "쯤", "어치", "보다", "부터", "까지", "이내", "이하", "이상", "미만", "초과",
+];
+
+fn polarity_norm(w: &str) -> String {
+    w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase()
+}
+
+fn negation_next(w: &str) -> bool {
+    NEGATION_NEXT_ML.contains(&w) || w.ends_with("n't") || w.ends_with("n’t")
+}
+
+pub fn is_negation_marker(word: &str) -> bool {
+    let w = polarity_norm(word);
+    !w.is_empty()
+        && (negation_next(&w)
+            || NEGATION_PREV_ML.contains(&w.as_str())
+            || NEGATION_SCOPE_PREV_ML.contains(&w.as_str()))
+}
+
+pub fn is_ordering_marker(word: &str) -> bool {
+    let w = polarity_norm(word);
+    !w.is_empty()
+        && (ORDERING_MARKERS_ML.contains(&w.as_str())
+            || ORDERING_SUFFIXES_ML.iter().any(|s| w.ends_with(s) && w.as_str() != *s)
+            || (w.ends_with('순')
+                && w.chars().count() >= 3
+                && !ORDERING_SUN_EXCLUDED_ML.iter().any(|x| w.ends_with(x))))
+}
+
+pub const STATUS_STOP_VERBS_ML: &[&str] = &[
+    "중지", "중단", "종료", "해제", "정지", "終了", "停止", "中止", "ended", "stopped",
+];
+
+pub fn is_status_stop_verb(word: &str) -> bool {
+    let w = polarity_norm(word);
+    !w.is_empty() && STATUS_STOP_VERBS_ML.iter().any(|v| w.starts_with(v))
+}
+
+pub fn negated_core(word: &str) -> &str {
+    let t = word.trim();
+    for aux in NEGATION_AUX_JI_ML.iter() {
+        if let Some(stem) = t.strip_suffix(aux) {
+            if stem.chars().count() >= 2 {
+                return stem;
+            }
+        }
+    }
+    t
+}
+
+fn time_quantity(w: &str) -> bool {
+    let d = normalize_digits_ascii(w);
+    if !d.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let after: String = d
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .skip_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+        .filter(|c| c.is_alphabetic())
+        .collect();
+    time_unit_exact(&after).is_some()
+}
+
+pub fn polarity_marks<S: AsRef<str>>(
+    words: &[S],
+) -> (std::collections::HashSet<usize>, std::collections::HashSet<usize>) {
+    let norm: Vec<String> = words.iter().map(|w| polarity_norm(w.as_ref())).collect();
+    let mut negated: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut downward: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let hop = |from: usize| -> Option<usize> {
+        let mut j = from;
+        let mut hops = 0;
+        while j < norm.len() && hops < 2 && POLARITY_SKIP_ML.contains(&norm[j].as_str()) {
+            j += 1;
+            hops += 1;
+        }
+        if j < norm.len() { Some(j) } else { None }
+    };
+    for i in 0..norm.len() {
+        let w = norm[i].as_str();
+        if w.is_empty() {
+            continue;
+        }
+        let within = w == "안" && i > 0 && time_quantity(&norm[i - 1]);
+        if negation_next(w) && !within {
+            if let Some(j) = hop(i + 1) {
+                negated.insert(j);
+                if DOWNWARD_MARKERS_ML.contains(&norm[j].as_str()) {
+                    if let Some(k) = hop(j + 1) {
+                        negated.insert(k);
+                    }
+                }
+            }
+            if (w == "안" || w == "못")
+                && i > 0
+                && i + 1 < norm.len()
+                && NEGATION_LIGHT_VERBS_ML.contains(&norm[i + 1].as_str())
+            {
+                negated.insert(i - 1);
+            }
+        } else if DOWNWARD_MARKERS_ML.contains(&w) {
+            if let Some(j) = hop(i + 1) {
+                downward.insert(j);
+            }
+        }
+        if NEGATION_PREV_ML.contains(&w) && i > 0 {
+            negated.insert(i - 1);
+            if i > 1 && NEGATION_AUX_JI_ML.contains(&norm[i - 1].as_str()) {
+                negated.insert(i - 2);
+            }
+        }
+        if NEGATION_SCOPE_PREV_ML.contains(&w) {
+            if i > 0 {
+                negated.insert(i - 1);
+            }
+            if i > 1 {
+                negated.insert(i - 2);
+            }
+        }
+    }
+    (negated, downward)
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct QualifierMarks {
+    pub negated: std::collections::HashSet<usize>,
+    pub downward: std::collections::HashSet<usize>,
+    pub ordered: std::collections::HashSet<usize>,
+    pub price_bound: std::collections::HashSet<usize>,
+}
+
+pub fn qualifier_marks<S: AsRef<str>>(words: &[S], period: &dyn Fn(usize) -> bool) -> QualifierMarks {
+    let raw: Vec<&str> = words.iter().map(|w| w.as_ref()).collect();
+    let n = raw.len();
+    let (negated, downward) = polarity_marks(&raw);
+    let mut ordered: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for i in 0..n {
+        if !is_ordering_marker(raw[i]) {
+            continue;
+        }
+        let w = polarity_norm(raw[i]);
+        if w == "first" {
+            if i > 0 && i + 1 == n {
+                ordered.insert(i - 1);
+            }
+            continue;
+        }
+        if (w == "sort" || w == "sorted") && raw.get(i + 1).map_or(false, |x| polarity_norm(x) == "of") {
+            continue;
+        }
+        for j in i.saturating_sub(2)..=(i + 2).min(n - 1) {
+            if j != i {
+                ordered.insert(j);
+            }
+        }
+        let mut j = i + 1;
+        let mut hops = 0;
+        while j < n && hops < 3 && ORDER_HOP_ML.contains(&polarity_norm(raw[j]).as_str()) {
+            j += 1;
+            hops += 1;
+        }
+        if j < n {
+            ordered.insert(j);
+        }
+    }
+    let mut span = vec![false; n];
+    for j in 0..n {
+        if period(j) {
+            continue;
+        }
+        let prev = if j > 0 { Some(raw[j - 1]) } else { None };
+        if price_anchor_token(raw[j], prev, raw.get(j + 1).copied()) {
+            span[j] = true;
+            if j > 0 && price_marker_word(raw[j - 1]) {
+                span[j - 1] = true;
+            }
+            if j + 1 < n && price_marker_word(raw[j + 1]) {
+                span[j + 1] = true;
+            }
+        }
+    }
+    let mut price_bound: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for i in 0..n {
+        let lo = i.saturating_sub(2);
+        let hi = (i + 2).min(n - 1);
+        if (lo..=hi).any(|j| j != i && span[j]) {
+            price_bound.insert(i);
+        }
+    }
+    QualifierMarks { negated, downward, ordered, price_bound }
+}
+
+fn numeral_unit_char(c: char) -> bool {
+    "십백천만억조千万萬億兆".contains(c)
+}
+
+fn currency_head(s: &str) -> bool {
+    let n = lower_alnum(s);
+    if n.is_empty() {
+        return false;
+    }
+    CURRENCY_NAMES_ML.iter().any(|(_, raw)| {
+        raw.split(',').any(|p| {
+            let p = lower_alnum(p);
+            if p.is_empty() || !n.starts_with(p.as_str()) {
+                return false;
+            }
+            let rest = &n[p.len()..];
+            p.chars().count() >= 2
+                || rest.is_empty()
+                || closed_tail_fits(&p, rest)
+                || PRICE_TAILS_ML.iter().any(|t| rest.starts_with(t))
+                || comparator_exact_in_text(rest).is_some()
+        })
+    })
+}
+
+pub fn money_token(word: &str) -> bool {
+    let norm = normalize_digits_ascii(word);
+    let chars: Vec<char> = norm.chars().collect();
+    match chars.iter().rposition(|c| c.is_ascii_digit()) {
+        Some(last) => {
+            if has_currency_symbol(&norm) || currency_code_of(&norm).is_some() {
+                return true;
+            }
+            let first = chars.iter().position(|c| c.is_ascii_digit()).unwrap_or(0);
+            let before: String = chars[..first].iter().filter(|c| c.is_alphabetic()).collect();
+            let after_raw: String = chars[last + 1..].iter().filter(|c| c.is_alphabetic()).collect();
+            currency_head(after_raw.trim_start_matches(numeral_unit_char))
+                || (!before.is_empty() && currency_name_exact(&before).is_some())
+        }
+        None => {
+            let core = norm.trim_matches(|c: char| !c.is_alphanumeric());
+            let rest = core.trim_start_matches(numeral_unit_char);
+            rest.len() < core.len() && currency_head(rest)
+        }
+    }
+}
+
+pub fn price_anchor_token(word: &str, prev: Option<&str>, next: Option<&str>) -> bool {
+    if money_token(word) {
+        return true;
+    }
+    let norm = normalize_digits_ascii(word);
+    if !norm.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let last = norm
+        .char_indices()
+        .filter(|(_, c)| c.is_ascii_digit())
+        .map(|(i, c)| i + c.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let after: String = norm[last..].chars().filter(|c| c.is_alphabetic()).collect();
+    if time_unit_exact(&after).is_some() {
+        return false;
+    }
+    if comparator_exact_in_text(&norm).is_some() {
+        return true;
+    }
+    let bare = !norm.contains('%') && norm.chars().filter(|c| c.is_alphabetic()).all(numeral_unit_char);
+    bare && [prev, next].iter().flatten().any(|n| price_marker_word(n))
+}
+
+pub fn price_marker_word(word: &str) -> bool {
+    let core = word.trim_matches(|c: char| !c.is_alphanumeric());
+    !core.is_empty()
+        && !core.chars().any(|c| c.is_ascii_digit())
+        && (currency_name_exact(core).is_some()
+            || crate::logic::canonical_currency_code(core).is_some()
+            || money_token(core)
+            || comparator_exact_in_text(core).is_some()
+            || PRICE_COMPARE_WORDS_ML.contains(&core.to_lowercase().as_str()))
+}
+
+fn hangul_tail_agrees(stem: &str, tail: &str) -> bool {
+    let last = match stem.chars().last() {
+        Some(c) => c as u32,
+        None => return false,
+    };
+    if !(0xAC00..=0xD7A3).contains(&last) {
+        return true;
+    }
+    let jong = (last - 0xAC00) % 28;
+    let has_final = jong != 0;
+    let rieul = jong == 8;
+    match tail {
+        "이" | "을" | "은" | "과" | "과의" => has_final,
+        "가" | "를" | "는" | "와" | "와의" => !has_final,
+        "으로" => has_final && !rieul,
+        "로" => !has_final || rieul,
+        _ => true,
+    }
+}
+
+fn tail_is_allomorphic(tail: &str) -> bool {
+    hangul_tail_agrees("가", tail) != hangul_tail_agrees("각", tail)
+}
+
+pub fn noun_tail_fits(stem: &str, rest: &str) -> bool {
+    if COPULA_TAILS_ML.iter().any(|t| *t == rest) {
+        return !stem.is_empty();
+    }
+    NOMINAL_TAILS_ML.iter().any(|t| *t == rest) && hangul_tail_agrees(stem, rest)
+}
+
+pub fn closed_suffix_fits(stem: &str, rest: &str) -> bool {
+    if noun_tail_fits(stem, rest) {
+        return true;
+    }
+    NOMINAL_TAILS_ML.iter().any(|inner| {
+        rest.strip_prefix(inner).map_or(false, |outer| {
+            !outer.is_empty()
+                && noun_tail_fits(stem, inner)
+                && noun_tail_fits(&format!("{}{}", stem, inner), outer)
+        })
+    })
+}
+
+pub fn closed_tail_fits(stem: &str, rest: &str) -> bool {
+    OPERATOR_TAILS_ML.iter().any(|t| *t == rest) || closed_suffix_fits(stem, rest)
+}
+
+pub fn closed_class_exact(norm: &str, key: &str) -> bool {
+    if key.is_empty() { return false; }
+    if norm == key { return true; }
+    match norm.strip_prefix(key) {
+        Some(rest) => closed_suffix_fits(key, rest),
+        None => false,
+    }
+}
+
+fn tails_longest_first(with_copula: bool) -> Vec<&'static str> {
+    let mut tails: Vec<&'static str> = NOMINAL_TAILS_ML.to_vec();
+    if with_copula {
+        tails.extend_from_slice(COPULA_TAILS_ML);
+    }
+    tails.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+    tails
+}
+
+fn closed_tail_parses(core: &str, with_copula: bool) -> Vec<(&str, &'static str)> {
+    let mut out = Vec::new();
+    let mut outer: Option<&'static str> = None;
+    for t in tails_longest_first(with_copula) {
+        let stem = match core.strip_suffix(t) {
+            Some(s) => s.trim_end_matches(|c: char| !c.is_alphanumeric()),
+            None => continue,
+        };
+        if let Some(o) = outer {
+            let stacked = o.strip_suffix(t).map_or(false, |lead| {
+                NOMINAL_TAILS_ML.contains(&lead) && tail_is_allomorphic(lead)
+            });
+            if !stacked {
+                break;
+            }
+        }
+        outer = Some(t);
+        if !stem.is_empty() && noun_tail_fits(stem, t) {
+            out.push((stem, t));
+        }
+    }
+    out
+}
+
+fn closed_tail_peel(core: &str) -> Vec<(&str, &'static str)> {
+    let mut out: Vec<(&str, &'static str)> = Vec::new();
+    for (stem, t) in closed_tail_parses(core, true) {
+        if !out.iter().any(|(s, _)| *s == stem) {
+            out.push((stem, t));
+        }
+        for (inner, it) in closed_tail_parses(stem, false) {
+            if !out.iter().any(|(s, _)| *s == inner) {
+                out.push((inner, it));
+            }
+        }
+    }
+    out
+}
+
+/// 닫힌 조사 · 어미 표로 가장 많이 벗겨 낸 어간 하나 ('않은' → '않' · '장바구니에' → '장바구니' · '상품들을' → '상품').
+/// Stanza 가 없을 때 원형 자리를 채웁니다 (한 글자 어간도 둡니다 — 부정 보조 용언 '않' · '없' 이 그 꼴).
+pub fn closed_tail_lemma(word: &str) -> Option<String> {
+    let core = word.trim_matches(|c: char| !c.is_alphanumeric());
+    closed_tail_peel(core).into_iter().next().map(|(stem, _)| stem.to_string()).filter(|s| !s.is_empty())
+}
+
+pub fn closed_tail_stems(word: &str) -> Vec<(String, &'static str)> {
+    let core = word.trim_matches(|c: char| !c.is_alphanumeric());
+    closed_tail_peel(core)
+        .into_iter()
+        .filter(|(stem, _)| stem.chars().count() >= 2)
+        .map(|(stem, t)| (stem.to_string(), t))
+        .collect()
+}
+
+pub fn exact_match_filter_key_tailed(category: &str, chunk: &str) -> Option<String> {
+    if let Some(k) = exact_match_filter_key(category, chunk) {
+        return Some(k);
+    }
+    let core = chunk.trim_matches(|c: char| !c.is_alphanumeric());
+    if let Some(k) = exact_match_filter_key(category, core) {
+        return Some(k);
+    }
+    closed_tail_peel(core)
+        .into_iter()
+        .find_map(|(stem, _)| exact_match_filter_key(category, stem))
+}
+
+/// 검색어에서 기능어로 보고 빼는 UPOS. VERB 는 넣지 않습니다: 품사가 맞게 나오면 'cancelled' · 'expiring' · '식히는' 같은
+/// 내용 동사가 조건(상태 · 용도)인데, 이전 목록은 이것까지 지웠습니다 (이전 변환본은 품사가 무작위라 목록이 실제로 쓰이지 않음).
+/// 명령 동사('찾아줘' · 'find')는 parse_commerce_query 의 ACTION VERB 판정이 가립니다.
+pub const STANZA_DROP_TAGS: &[&str] = &["ADP", "PUNCT", "PART", "SCONJ", "CCONJ", "PRON"];
+
+fn time_unit_prefix(norm: &str) -> Option<(&'static str, String)> {
+    let mut best: Option<(&'static str, usize, String)> = None;
+    for (unit, raw) in TIME_UNIT_PIVOTS_ML.iter() {
+        for p in raw.split(',') {
+            let p = lower_alnum(p);
+            if p.is_empty() { continue; }
+            let rest = match norm.strip_prefix(p.as_str()) {
+                Some(r) => r,
+                None => continue,
+            };
+            if rest.chars().any(|c| c.is_ascii_alphabetic()) { continue; }
+            let len = p.chars().count();
+            if best.as_ref().map_or(true, |b| len > b.1) {
+                best = Some((*unit, len, rest.to_string()));
+            }
+        }
+    }
+    best.map(|(unit, _, rest)| (unit, rest))
+}
+
+pub fn time_unit_exact(residue: &str) -> Option<&'static str> {
+    let norm = lower_alnum(residue);
+    if norm.is_empty() { return None; }
+    match time_unit_prefix(&norm) {
+        Some((unit, rest)) if rest.chars().count() <= 3 => Some(unit),
+        _ => None,
+    }
+}
+
+pub fn time_unit_split(residue: &str) -> Option<(&'static str, String)> {
+    let norm = lower_alnum(residue);
+    if norm.is_empty() { return None; }
+    time_unit_prefix(&norm)
+}
+
+pub fn comparator_exact(parts: &[String]) -> Option<&'static str> {
+    if parts.is_empty() { return None; }
+    let norm: String = parts.iter().map(|p| lower_alnum(p)).collect();
+    if norm.is_empty() { return None; }
+    for (key, raw) in COMPARATOR_PIVOTS_ML.iter() {
+        for p in raw.split(',') {
+            let p = lower_alnum(p);
+            if p.is_empty() { continue; }
+            let ascii = p.chars().all(|c| c.is_ascii());
+            if ascii && p.chars().count() < 2 { continue; }
+            if norm == p { return Some(*key); }
+            if parts.len() != 1 || ascii || p.chars().count() < 2 { continue; }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if closed_tail_fits(&p, rest) {
+                    return Some(*key);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn comparator_exact_in_text(text: &str) -> Option<&'static str> {
+    let norm = normalize_digits_ascii(text);
+    let mut segs: Vec<Vec<String>> = vec![Vec::new()];
+    for raw in norm.split(|c: char| c.is_whitespace() || c == '|') {
+        let mut piece = String::new();
+        let mut in_num = false;
+        for ch in raw.chars() {
+            if ch.is_ascii_digit() {
+                if !in_num {
+                    let t = piece.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+                    if !t.is_empty() {
+                        if let Some(last) = segs.last_mut() { last.push(t); }
+                    }
+                    piece.clear();
+                    segs.push(Vec::new());
+                }
+                in_num = true;
+            } else if in_num && (ch == '.' || ch == ',') {
+                continue;
+            } else {
+                in_num = false;
+                piece.push(ch);
+            }
+        }
+        let t = piece.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+        if !t.is_empty() {
+            if let Some(last) = segs.last_mut() { last.push(t); }
+        }
+    }
+    for seg in segs.iter() {
+        for s in 0..seg.len() {
+            for w in (1..=3usize).rev() {
+                if s + w > seg.len() { continue; }
+                if let Some(k) = comparator_exact(&seg[s..s + w]) {
+                    return Some(k);
+                }
+            }
+            let t = &seg[s];
+            let cjk_lead = t.chars().next().map_or(false, |c| (c as u32) >= 0x1100);
+            if !cjk_lead { continue; }
+            for skip in 1..=2usize {
+                if t.chars().count() <= skip + 1 { break; }
+                let tail: String = t.chars().skip(skip).collect();
+                if let Some(k) = comparator_exact(&[tail]) {
+                    return Some(k);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn numeric_comparator_exact(chunk: &str) -> Option<&'static str> {
+    if !normalize_digits_ascii(chunk).chars().any(|c| c.is_ascii_digit()) { return None; }
+    comparator_exact_in_text(chunk)
+}
+
+pub fn temporal_operator_exact(parts: &[String]) -> Option<&'static str> {
+    if parts.is_empty() { return None; }
+    let norm: String = parts.iter().map(|p| lower_alnum(p)).collect();
+    if norm.is_empty() { return None; }
+    for (key, en, ml) in TEMPORAL_OPERATOR_PIVOTS_ML.iter() {
+        for raw in [*en, *ml] {
+            for p in raw.split(',') {
+                let p = lower_alnum(p);
+                if p.is_empty() { continue; }
+                let ascii = p.chars().all(|c| c.is_ascii());
+                if ascii && p.chars().count() < 2 { continue; }
+                if norm == p { return Some(*key); }
+                if parts.len() != 1 || ascii || p.chars().count() < 2 { continue; }
+                if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                    if closed_tail_fits(&p, rest) {
+                        return Some(*key);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn temporal_operator_phrases(key: &str) -> Vec<String> {
+    for (k, en, ml) in TEMPORAL_OPERATOR_PIVOTS_ML.iter() {
+        if *k == key {
+            return crate::logic::anchor_phrases(en, ml);
+        }
+    }
+    Vec::new()
+}
+
+pub fn period_operator_exact(parts: &[String]) -> Option<&'static str> {
+    if let Some(k) = temporal_operator_exact(parts) {
+        return Some(k);
+    }
+    match comparator_exact(parts) {
+        Some("gte") | Some("gt") => Some("gte"),
+        Some("lte") | Some("lt") => Some("lte"),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExactTimePart {
+    Year(i32),
+    Month(u32),
+    Day(u32),
+}
+
+#[derive(Clone, Debug)]
+pub struct ExactPeriod {
+    pub start: chrono::NaiveDate,
+    pub end: chrono::NaiveDate,
+    pub operator: &'static str,
+    pub granularity: &'static str,
+    pub year_explicit: bool,
+    pub range: bool,
+    pub tokens: Vec<usize>,
+    pub evidence: Vec<String>,
+}
+
+fn exact_numeric_date(core: &str) -> Option<(i32, u32, u32)> {
+    let groups: Vec<&str> = core.split(|c: char| c == '-' || c == '/' || c == '.').collect();
+    if groups.len() != 3 { return None; }
+    if !groups.iter().all(|g| !g.is_empty() && g.len() <= 4 && g.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    let n: Vec<u32> = groups.iter().filter_map(|g| g.parse::<u32>().ok()).collect();
+    if n.len() != 3 { return None; }
+    let ymd = if groups[0].len() == 4 && groups[1].len() <= 2 && groups[2].len() <= 2 {
+        (n[0] as i32, n[1], n[2])
+    } else if groups[2].len() == 4 && groups[0].len() <= 2 && groups[1].len() <= 2 {
+        let (a, b) = (n[0], n[1]);
+        if a > 12 && b <= 12 {
+            (n[2] as i32, b, a)
+        } else if b > 12 && a <= 12 {
+            (n[2] as i32, a, b)
+        } else {
+            (n[2] as i32, b, a)
+        }
+    } else {
+        return None;
+    };
+    chrono::NaiveDate::from_ymd_opt(ymd.0, ymd.1, ymd.2)?;
+    Some(ymd)
+}
+
+fn exact_year_month(core: &str) -> Option<(i32, u32)> {
+    let groups: Vec<&str> = core.split(|c: char| c == '-' || c == '/').collect();
+    if groups.len() != 2 { return None; }
+    if groups[0].len() != 4 || groups[1].is_empty() || groups[1].len() > 2 { return None; }
+    if !groups.iter().all(|g| g.chars().all(|c| c.is_ascii_digit())) { return None; }
+    let y: i32 = groups[0].parse().ok()?;
+    let m: u32 = groups[1].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1900..=2100).contains(&y) { return None; }
+    Some((y, m))
+}
+
+fn exact_compose(
+    parts: &[(usize, ExactTimePart)],
+    inherit: Option<(i32, Option<u32>)>,
+    today: chrono::NaiveDate,
+) -> Option<(chrono::NaiveDate, chrono::NaiveDate, &'static str, bool)> {
+    use chrono::Datelike;
+    let (mut y, mut m, mut d): (Option<i32>, Option<u32>, Option<u32>) = (None, None, None);
+    for (_, p) in parts.iter() {
+        match p {
+            ExactTimePart::Year(v) => { if y.is_none() { y = Some(*v); } }
+            ExactTimePart::Month(v) => { if m.is_none() { m = Some(*v); } }
+            ExactTimePart::Day(v) => { if d.is_none() { d = Some(*v); } }
+        }
+    }
+    let explicit = y.is_some();
+    if y.is_none() {
+        if let Some((iy, _)) = inherit { y = Some(iy); }
+    }
+    if m.is_none() && d.is_some() {
+        if let Some((_, Some(im))) = inherit { m = Some(im); }
+    }
+    let yy = y.unwrap_or(today.year());
+    let month_end = |yv: i32, mv: u32| -> Option<chrono::NaiveDate> {
+        let next = if mv == 12 {
+            chrono::NaiveDate::from_ymd_opt(yv + 1, 1, 1)?
+        } else {
+            chrono::NaiveDate::from_ymd_opt(yv, mv + 1, 1)?
+        };
+        next.pred_opt()
+    };
+    match (y.is_some(), m, d) {
+        (_, Some(mm), Some(dd)) => {
+            let day = chrono::NaiveDate::from_ymd_opt(yy, mm, dd)?;
+            Some((day, day, "day", explicit))
+        }
+        (_, Some(mm), None) => {
+            let s = chrono::NaiveDate::from_ymd_opt(yy, mm, 1)?;
+            Some((s, month_end(yy, mm)?, "month", explicit))
+        }
+        (true, None, _) => {
+            let s = chrono::NaiveDate::from_ymd_opt(yy, 1, 1)?;
+            let e = chrono::NaiveDate::from_ymd_opt(yy, 12, 31)?;
+            Some((s, e, "year", explicit))
+        }
+        _ => None,
+    }
+}
+
+/// 날짜 사이에 끼는 채움말 (스페인어 · 포르투갈어 '12 de septiembre de 2026', 영어 '12th of September').
+/// 채움말이 달 이름과 숫자 사이를 갈라 달 이름이 숫자 옆 조각으로 인정되지 않았습니다(v2 질의 A6 es · pt 기간 없음).
+const DATE_FILLERS: [&str; 3] = ["de", "of", "the"];
+
+/// 두 날짜 조각을 잇지 않는 목록 접속어 (and · und · et · y · e · en · i · و · 和 · と · 및 · or …)
+const LIST_CONJUNCTIONS: [&str; 22] = [
+    "and", "und", "et", "y", "e", "ed", "en", "i", "och", "og", "و", "和", "及", "与", "と", "および", "및", "or", "oder", "ou", "o", "nebo",
+];
+
+/// 기간 사이 낱말 (between · zwischen · entre · tra · fra · tussen · mezi · بين): 이 낱말이 있으면 'and' 도 구간을 잇습니다.
+const BETWEEN_WORDS: [&str; 8] = ["between", "zwischen", "entre", "tra", "fra", "tussen", "mezi", "بين"];
+
+/// 숫자 없이 달 이름만 오는 자리의 앞말 ('in September' · 'im Juni' · 'en junio' · 'a giugno' · 'em junho' · 'v červnu' · 'في يونيو').
+/// 이 앞말 뒤의 달 이름은 숫자가 붙지 않아도 그 달입니다 (올해). 앞말 없이 홀로 선 달 이름(영어 may · march)은 보지 않습니다.
+const MONTH_PREPOSITIONS: [&str; 22] = [
+    "in", "im", "en", "a", "em", "v", "ve", "في", "during", "durante", "nel", "nello", "since", "until", "seit", "bis", "desde", "hasta",
+    "dal", "fino", "sinds", "od",
+];
+
+/// 질의 낱말에서 절대 기간을 읽습니다. 날짜 채움말(de · of · the)은 건너뛰고 읽고, 결과의 낱말 위치는 원래 위치로 돌려줍니다.
+pub fn exact_absolute_period(words: &[String], today: chrono::NaiveDate) -> Option<ExactPeriod> {
+    let filler = |w: &str| DATE_FILLERS.contains(&w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase().as_str());
+    let kept: Vec<usize> = (0..words.len()).filter(|&i| !filler(&words[i])).collect();
+    if kept.len() == words.len() {
+        return exact_absolute_period_core(words, today);
+    }
+    let sub: Vec<String> = kept.iter().map(|&i| words[i].clone()).collect();
+    let mut p = exact_absolute_period_core(&sub, today)?;
+    p.tokens = p.tokens.iter().filter_map(|&t| kept.get(t).copied()).collect();
+    Some(p)
+}
+
+fn exact_absolute_period_core(words: &[String], today: chrono::NaiveDate) -> Option<ExactPeriod> {
+    #[derive(Clone)]
+    enum Piece {
+        Num(i64, usize),
+        Word(String),
+    }
+    let core_of = |w: &str| -> String {
+        normalize_digits_ascii(w.trim_matches(|c: char| !c.is_alphanumeric()))
+    };
+    let mut parts: Vec<(usize, ExactTimePart)> = Vec::new();
+    let mut tail_ops: Vec<(usize, &'static str)> = Vec::new();
+    let mut evidence: Vec<String> = Vec::new();
+    let mut pieces: Vec<(usize, Piece)> = Vec::new();
+    for (ti, w) in words.iter().enumerate() {
+        let core = core_of(w);
+        if core.is_empty() { continue; }
+        if let Some((y, m, d)) = exact_numeric_date(&core) {
+            parts.push((ti, ExactTimePart::Year(y)));
+            parts.push((ti, ExactTimePart::Month(m)));
+            parts.push((ti, ExactTimePart::Day(d)));
+            evidence.push(format!("\"{}\"→{:04}-{:02}-{:02}", core, y, m, d));
+            continue;
+        }
+        if let Some((y, m)) = exact_year_month(&core) {
+            parts.push((ti, ExactTimePart::Year(y)));
+            parts.push((ti, ExactTimePart::Month(m)));
+            evidence.push(format!("\"{}\"→{:04}-{:02}", core, y, m));
+            continue;
+        }
+        for sub in core.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()) {
+            let mut cur = String::new();
+            let mut cur_digit: Option<bool> = None;
+            for ch in sub.chars().chain(std::iter::once('\u{0}')) {
+                let is_end = ch == '\u{0}';
+                let d = ch.is_ascii_digit();
+                if !cur.is_empty() && (is_end || cur_digit != Some(d)) {
+                    let piece = if cur_digit == Some(true) {
+                        match cur.parse::<i64>() {
+                            Ok(v) => Piece::Num(v, cur.chars().count()),
+                            Err(_) => Piece::Word(cur.clone()),
+                        }
+                    } else {
+                        Piece::Word(cur.clone())
+                    };
+                    pieces.push((ti, piece));
+                    cur.clear();
+                }
+                if is_end { break; }
+                cur.push(ch);
+                cur_digit = Some(d);
+            }
+        }
+    }
+
+    let mut piece_part: Vec<Option<ExactTimePart>> = vec![None; pieces.len()];
+    for k in 0..pieces.len() {
+        let (ti, v, digits) = match &pieces[k] {
+            (ti, Piece::Num(v, d)) => (*ti, *v, *d),
+            _ => continue,
+        };
+        let word = match pieces.get(k + 1) {
+            Some((tj, Piece::Word(w))) if *tj == ti => w.clone(),
+            _ => continue,
+        };
+        let (unit, tail) = match time_unit_split(&word) {
+            Some(x) => x,
+            None => continue,
+        };
+        let tail_len = tail.chars().count();
+        let tail_hit: Option<(String, &'static str)> = (1..=tail_len).rev().find_map(|n| {
+            let head: String = tail.chars().take(n).collect();
+            period_operator_exact(&[head.clone()]).map(|op| (head, op))
+        });
+        let tail_op = tail_hit.as_ref().map(|(_, op)| *op);
+        let cjk_unit = word.chars().next().map_or(false, |c| {
+            let u = c as u32;
+            (0x3040..=0x30FF).contains(&u) || (0x4E00..=0x9FFF).contains(&u)
+        });
+        if tail_len > 3 && tail_op.is_none() && !cjk_unit { continue; }
+        let part = match unit {
+            "year" if digits == 4 && (1900..=2100).contains(&v) => ExactTimePart::Year(v as i32),
+            "month" if (1..=12).contains(&v) => ExactTimePart::Month(v as u32),
+            "day" if (1..=31).contains(&v) => ExactTimePart::Day(v as u32),
+            _ => continue,
+        };
+        evidence.push(format!(
+            "\"{}{}\"→{:?}{}",
+            v, word, part,
+            match tail_hit.as_ref() { Some((head, op)) => format!(" + 꼬리 '{}'={}", head, op), None => String::new() }
+        ));
+        parts.push((ti, part.clone()));
+        piece_part[k] = Some(part.clone());
+        piece_part[k + 1] = Some(part);
+        if let Some(op) = tail_op { tail_ops.push((ti, op)); }
+    }
+    let token_pure: Vec<bool> = (0..words.len())
+        .map(|ti| {
+            let t = words[ti].trim_matches(|c: char| "?!:;\"'(),.…".contains(c));
+            if t.is_empty() || !t.chars().all(|c| c.is_alphanumeric() || "-/.·".contains(c)) {
+                return false;
+            }
+            pieces.iter().enumerate().filter(|(_, (tj, _))| *tj == ti).all(|(k, (_, p))| match p {
+                Piece::Num(_, _) => true,
+                Piece::Word(w) => month_from_name(w).is_some() || piece_part[k].is_some(),
+            })
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for k in 0..pieces.len() {
+            if piece_part[k].is_some() { continue; }
+            let is_num = |j: usize| matches!(pieces.get(j), Some((_, Piece::Num(_, _))));
+            let is_month = |j: usize, pp: &Vec<Option<ExactTimePart>>| {
+                matches!(pp.get(j), Some(Some(ExactTimePart::Month(_))))
+            };
+            match pieces[k].clone() {
+                (ti, Piece::Word(w)) => {
+                    let pure_num = |j: usize| {
+                        is_num(j) && pieces.get(j).map_or(false, |(tj, _)| token_pure.get(*tj).copied().unwrap_or(false))
+                    };
+                    let after_preposition = k > 0
+                        && matches!(&pieces[k - 1], (_, Piece::Word(p)) if MONTH_PREPOSITIONS.contains(&p.to_lowercase().as_str()))
+                        && month_from_name(&w).is_some();
+                    let adj_num = (k > 0 && pure_num(k - 1)) || pure_num(k + 1) || after_preposition;
+                    if !adj_num { continue; }
+                    if let Some(m) = month_from_name(&w) {
+                        parts.push((ti, ExactTimePart::Month(m)));
+                        piece_part[k] = Some(ExactTimePart::Month(m));
+                        evidence.push(format!("\"{}\"→Month({})", w, m));
+                        changed = true;
+                        continue;
+                    }
+                    if time_unit_exact(&w) == Some("year") {
+                        for j in [k.wrapping_sub(1), k + 1] {
+                            if let Some((tj, Piece::Num(v, d))) = pieces.get(j).cloned() {
+                                if piece_part[j].is_none()
+                                    && d == 4
+                                    && (1900..=2100).contains(&v)
+                                    && token_pure.get(tj).copied().unwrap_or(false)
+                                {
+                                    parts.push((tj.min(ti), ExactTimePart::Year(v as i32)));
+                                    if tj != ti { parts.push((tj.max(ti), ExactTimePart::Year(v as i32))); }
+                                    piece_part[j] = Some(ExactTimePart::Year(v as i32));
+                                    piece_part[k] = Some(ExactTimePart::Year(v as i32));
+                                    evidence.push(format!("\"{} {}\"→Year({})", w, v, v));
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                (ti, Piece::Num(v, d)) => {
+                    if !token_pure.get(ti).copied().unwrap_or(false) { continue; }
+                    let is_day = |j: usize, pp: &Vec<Option<ExactTimePart>>| {
+                        matches!(pp.get(j), Some(Some(ExactTimePart::Day(_))))
+                    };
+                    let is_month_name = |j: usize, pp: &Vec<Option<ExactTimePart>>| {
+                        is_month(j, pp)
+                            && matches!(pieces.get(j), Some((_, Piece::Word(w))) if month_from_name(w).is_some())
+                    };
+                    let near_month = (k > 0 && is_month(k - 1, &piece_part)) || is_month(k + 1, &piece_part);
+                    let near_day = (k > 0 && is_day(k - 1, &piece_part)) || is_day(k + 1, &piece_part);
+                    let year_follows = matches!(
+                        pieces.get(k + 2),
+                        Some((tj, Piece::Num(yv, 4))) if (1900..=2100).contains(yv) && token_pure.get(*tj).copied().unwrap_or(false)
+                    );
+                    let day_slot = (k > 0 && is_month_name(k - 1, &piece_part))
+                        || (is_month_name(k + 1, &piece_part) && year_follows);
+                    let part = if d == 4 && (1900..=2100).contains(&v) && (near_month || near_day) {
+                        ExactTimePart::Year(v as i32)
+                    } else if d <= 2 && (1..=31).contains(&v) && day_slot {
+                        ExactTimePart::Day(v as u32)
+                    } else {
+                        continue;
+                    };
+                    evidence.push(format!("\"{}\"→{:?} (월·일 조각과 맞닿음)", v, part));
+                    parts.push((ti, part.clone()));
+                    piece_part[k] = Some(part);
+                    changed = true;
+                }
+            }
+        }
+        if !changed { break; }
+    }
+    if parts.is_empty() { return None; }
+    parts.sort_by_key(|(t, _)| *t);
+
+    // 🌟 [RANGE CONNECTOR] 두 날짜 조각 사이에 숫자 없는 낱말이 1 ~ 2개 끼면 한 구간으로 잇습니다
+    //    ('from September 12, 2026 to October 2, 2026' · 'vom 12. September 2026 bis 2. Oktober 2026' · 'od 12. září 2026 do 2. října 2026'
+    //    · 'من 12 سبتمبر 2026 إلى 2 أكتوبر 2026'). 꼬리 연산자(부터 · から)가 붙지 않는 언어는 이어지지 않아 첫 날 하루만 기간이 되었습니다
+    //    (v2 질의 A6 en · fr · it · cs · ar). 목록 접속어(and · und · y · و …)는 'between' 류 낱말이 앞에 있을 때만 잇습니다.
+    let between = words.iter().any(|w| BETWEEN_WORDS.contains(&core_of(w).to_lowercase().as_str()));
+    let range_gap = |a: usize, b: usize| -> bool {
+        b > a + 1
+            && b - a - 1 <= 2
+            && (a + 1..b).all(|k| {
+                let c = core_of(&words[k]).to_lowercase();
+                !c.chars().any(|ch| ch.is_ascii_digit())
+                    && c.chars().count() <= 8
+                    && (between || !LIST_CONJUNCTIONS.contains(&c.as_str()))
+            })
+    };
+    let mut groups: Vec<Vec<(usize, ExactTimePart)>> = Vec::new();
+    for p in parts.into_iter() {
+        let joins = match groups.last() {
+            Some(g) => {
+                let last = g.last().map(|x| x.0).unwrap_or(0);
+                p.0 == last || p.0 == last + 1 || range_gap(last, p.0)
+            }
+            None => false,
+        };
+        if joins {
+            if let Some(g) = groups.last_mut() { g.push(p); }
+        } else {
+            groups.push(vec![p]);
+        }
+    }
+    let part_tokens: Vec<usize> = groups.iter().flat_map(|g| g.iter().map(|(t, _)| *t)).collect();
+    let window = |s: usize, e: usize| -> Vec<String> {
+        words[s..e].iter().map(|w| core_of(w)).collect()
+    };
+    let adjacent_op = |first: usize, last: usize| -> Option<(&'static str, Vec<usize>)> {
+        for w in (1..=3usize).rev() {
+            let (s, e) = (last + 1, last + 1 + w);
+            if e > words.len() || (s..e).any(|k| part_tokens.contains(&k)) { continue; }
+            if let Some(op) = period_operator_exact(&window(s, e)) {
+                return Some((op, (s..e).collect()));
+            }
+        }
+        for w in (1..=3usize).rev() {
+            if first < w { continue; }
+            let (s, e) = (first - w, first);
+            if (s..e).any(|k| part_tokens.contains(&k)) { continue; }
+            if let Some(op) = period_operator_exact(&window(s, e)) {
+                return Some((op, (s..e).collect()));
+            }
+        }
+        None
+    };
+    let span_of = |g: &Vec<(usize, ExactTimePart)>| -> (usize, usize) {
+        (g.first().map(|x| x.0).unwrap_or(0), g.last().map(|x| x.0).unwrap_or(0))
+    };
+    let inherit_of = |parts: &[(usize, ExactTimePart)], start: chrono::NaiveDate| -> Option<(i32, Option<u32>)> {
+        use chrono::Datelike;
+        let has_month = parts.iter().any(|(_, p)| matches!(p, ExactTimePart::Month(_)));
+        Some((start.year(), if has_month { Some(start.month()) } else { None }))
+    };
+    let tokens_of = |g: &[(usize, ExactTimePart)]| -> Vec<usize> {
+        let mut t: Vec<usize> = Vec::new();
+        for (k, _) in g.iter() {
+            if !t.contains(k) { t.push(*k); }
+        }
+        t
+    };
+
+    let g1 = groups[0].clone();
+    let (f1, l1) = span_of(&g1);
+    let mut segs: Vec<Vec<(usize, ExactTimePart)>> = vec![Vec::new()];
+    for p in g1.iter() {
+        let repeat = segs.last().map_or(false, |cur| {
+            cur.iter().any(|(_, q)| {
+                std::mem::discriminant(q) == std::mem::discriminant(&p.1) && *q != p.1
+            })
+        });
+        if repeat { segs.push(Vec::new()); }
+        if let Some(cur) = segs.last_mut() { cur.push(p.clone()); }
+    }
+    if segs.len() >= 2 {
+        let left = segs[0].clone();
+        let right = segs[segs.len() - 1].clone();
+        let (ls, _, lg, lx) = exact_compose(&left, None, today)?;
+        let (_, re, _, _) = exact_compose(&right, inherit_of(&left, ls), today)?;
+        if re >= ls {
+            let mut tokens = tokens_of(&g1[..]);
+            if let Some((_, ts)) = adjacent_op(f1, l1) {
+                let lte_after = ts.iter().all(|t| *t > l1);
+                if lte_after {
+                    for t in ts.into_iter() {
+                        if !tokens.contains(&t) { tokens.push(t); }
+                    }
+                }
+            }
+            tokens.sort();
+            evidence.push(format!("같은 단위가 {}번 나와 첫 조각을 시작, 마지막 조각을 끝으로 묶음", segs.len()));
+            return Some(ExactPeriod {
+                start: ls,
+                end: re,
+                operator: "between",
+                granularity: lg,
+                year_explicit: lx,
+                range: true,
+                tokens,
+                evidence,
+            });
+        }
+    }
+    let g1_tails: Vec<(usize, &'static str)> = tail_ops
+        .iter()
+        .filter(|(t, _)| *t >= f1 && *t <= l1)
+        .cloned()
+        .collect();
+    let split_at = g1_tails.iter().find(|(_, op)| *op == "gte").map(|x| x.0);
+    let close_at = split_at.and_then(|a| g1_tails.iter().find(|(t, op)| *t > a && *op == "lte").map(|x| x.0));
+    if let (Some(a), Some(b)) = (split_at, close_at) {
+        let left: Vec<(usize, ExactTimePart)> = g1.iter().filter(|(t, _)| *t <= a).cloned().collect();
+        let right: Vec<(usize, ExactTimePart)> = g1.iter().filter(|(t, _)| *t > a && *t <= b).cloned().collect();
+        let (ls, _, lg, lx) = exact_compose(&left, None, today)?;
+        let (_, re, _, _) = exact_compose(&right, inherit_of(&left, ls), today)?;
+        if re < ls { return None; }
+        evidence.push(format!("꼬리 연산자 gte(토큰 {}) · lte(토큰 {}) → 한 구간", a, b));
+        return Some(ExactPeriod {
+            start: ls,
+            end: re,
+            operator: "between",
+            granularity: lg,
+            year_explicit: lx,
+            range: true,
+            tokens: tokens_of(&g1[..]),
+            evidence,
+        });
+    }
+    let (s1, e1, gran1, ex1) = exact_compose(&g1, None, today)?;
+    let mut tokens = tokens_of(&g1[..]);
+    let (op1, op1_tokens) = match g1_tails.last() {
+        Some((_, op)) => (*op, Vec::new()),
+        None => adjacent_op(f1, l1).unwrap_or(("between", Vec::new())),
+    };
+    for t in op1_tokens.iter() {
+        if !tokens.contains(t) { tokens.push(*t); }
+    }
+    if op1 == "gte" {
+        if let Some(g2) = groups.get(1).cloned() {
+            let (f2, l2) = span_of(&g2);
+            let anchor = op1_tokens.iter().copied().max().unwrap_or(l1).max(l1);
+            if f2 <= anchor + 2 {
+                let g2_tail = tail_ops.iter().filter(|(t, _)| *t >= f2 && *t <= l2).map(|x| x.1).last();
+                let g2_op = match g2_tail {
+                    Some(op) => Some((op, Vec::new())),
+                    None => adjacent_op(f2, l2).filter(|(_, ts)| ts.iter().all(|t| !op1_tokens.contains(t))),
+                };
+                if let Some(("lte", op2_tokens)) = g2_op {
+                    if let Some((_, e2, _, _)) = exact_compose(&g2, inherit_of(&g1, s1), today) {
+                        if e2 >= s1 {
+                            for t in tokens_of(&g2[..]).into_iter().chain(op2_tokens.into_iter()) {
+                                if !tokens.contains(&t) { tokens.push(t); }
+                            }
+                            tokens.sort();
+                            evidence.push("시작 조각 gte + 끝 조각 lte → 한 구간".to_string());
+                            return Some(ExactPeriod {
+                                start: s1,
+                                end: e2,
+                                operator: "between",
+                                granularity: gran1,
+                                year_explicit: ex1,
+                                range: true,
+                                tokens,
+                                evidence,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tokens.sort();
+    Some(ExactPeriod {
+        start: s1,
+        end: e1,
+        operator: op1,
+        granularity: gran1,
+        year_explicit: ex1,
+        range: false,
+        tokens,
+        evidence,
+    })
+}
+
+pub fn exact_period_tail_closed(words: &[String], p: &ExactPeriod) -> bool {
+    if p.tokens.is_empty() { return false; }
+    for &ti in p.tokens.iter() {
+        let w = match words.get(ti) { Some(w) => w, None => return false };
+        let core = normalize_digits_ascii(w.trim_matches(|c: char| !c.is_alphanumeric()));
+        let residue: String = core.trim_start_matches(|c: char| c.is_ascii_digit()).to_string();
+        if residue.is_empty() { continue; }
+        if month_from_name(&residue).is_some() { continue; }
+        let (_, tail) = match time_unit_split(&residue) { Some(x) => x, None => continue };
+        if tail.is_empty() { continue; }
+        let norm = lower_alnum(&residue);
+        if tail.len() > norm.len() { return false; }
+        let surface = &norm[..norm.len() - tail.len()];
+        if closed_tail_fits(surface, &tail) { continue; }
+        if period_operator_exact(&[tail.clone()]).is_some() { continue; }
+        return false;
+    }
+    true
+}
+
+pub fn has_date_shape(s: &str) -> bool {
+    if has_date_literal(s) { return true; }
+    let norm = normalize_digits_ascii(s);
+    if has_date_literal(&norm) { return true; }
+    let mut segs: Vec<String> = Vec::new();
+    for tok in norm.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        let mut cur = String::new();
+        let mut cur_digit: Option<bool> = None;
+        for ch in tok.chars() {
+            let d = ch.is_ascii_digit();
+            if cur_digit.map_or(false, |x| x != d) && !cur.is_empty() {
+                segs.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+            cur_digit = Some(d);
+        }
+        if !cur.is_empty() { segs.push(cur); }
+    }
+    let toks: Vec<String> = segs
+        .into_iter()
+        .filter(|t| {
+            if t.chars().all(|c| c.is_ascii_digit()) { return true; }
+            if DATE_UNIT_MARKERS.iter().any(|u| *u == t.as_str()) { return false; }
+            if month_from_name(t).is_some() { return true; }
+            t.chars().count() > 2
+        })
+        .collect();
+    if toks.len() < 2 || toks.len() > 3 { return false; }
+
+    let mut years = 0usize;
+    let mut days = 0usize;
+    let mut months = 0usize;
+    for t in toks.iter() {
+        if t.chars().all(|c| c.is_ascii_digit()) {
+            let n = t.chars().count();
+            let v: u32 = match t.parse() { Ok(v) => v, Err(_) => return false };
+            if n == 4 && (1000..=9999).contains(&v) { years += 1; continue; }
+            if n <= 2 && (1..=31).contains(&v) { days += 1; continue; }
+            return false;
+        }
+        if month_from_name(t).is_some() { months += 1; continue; }
+        return false;
+    }
+    years == 1 && months <= 1 && (days + months) >= 1
+}
+
+/// 🌟 [RECORD ID] 질의 청크에 든 숫자 식별자 토큰 (주문번호 20260413-302272 · 운송장 472339038575).
+///  · 하이픈 등으로 나뉜 숫자 묶음이 둘 이상이고 숫자가 8개 이상 (날짜 2026-04-13 · 2026.4.13 은 아님)
+///  · 숫자만 10개 이상 (8자리 날짜 20260413 · 금액 29900 · 소수 46.05 · 수량 5 는 아님)
+/// 글자가 섞인 코드(CP5052 · BL-JP81652912)는 상품 모델명(iPhone15 · RTX4090)과 구별되지 않아 여기서 다루지 않습니다
+/// — 저장된 식별자와 같을 때만 식별자로 봅니다(search_relation).
+/// v2 질의 C1 은 주문번호 20260413-302272 가 12개 언어 모두 '수량 · 금액 ≤ 20260413302272' 로 풀렸습니다.
+pub fn record_id_token(chunk: &str) -> Option<String> {
+    for raw in chunk.split(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '_' | '/' | '.'))) {
+        let t = raw.trim_matches(|c: char| matches!(c, '-' | '_' | '/' | '.'));
+        let groups: Vec<&str> = t.split(|c: char| !c.is_ascii_digit()).filter(|g| !g.is_empty()).collect();
+        let digits: usize = groups.iter().map(|g| g.len()).sum();
+        if digits == 0 {
+            continue;
+        }
+        let date_like = (groups.len() == 3 && groups[0].len() == 4 && groups[1].len() <= 2 && groups[2].len() <= 2)
+            || (groups.len() == 1 && digits == 8 && (t.starts_with("19") || t.starts_with("20")));
+        if !date_like && (digits >= 10 || (groups.len() >= 2 && digits >= 8 && !t.contains('.'))) {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+// 🌟 값 안에서 "숫자를 포함한 영숫자 토큰"의 최대 길이를 구합니다. (운송장/코드 판정용)
+pub fn longest_code_token_len(s: &str) -> usize {
+    let mut best = 0usize;
+    for tok in s.split(|c: char| !c.is_alphanumeric()) {
+        if !tok.chars().any(|c| c.is_ascii_digit()) { continue; }
+        let l = tok.chars().count();
+        if l > best { best = l; }
+    }
+    best
+}
+
+// 🌟 값이 실제로 URL(href) 안에 박혀 있는 식별자인지 판정합니다.
+// id 의 정의는 "링크로 이어지는 키"이므로, href 풀에 없는 숫자는 id 가 아니라 code 입니다.
+pub fn value_token_in_url_pool(value: &str, url_pool: &str) -> bool {
+    if url_pool.trim().is_empty() { return false; }
+    let pool = url_pool.to_lowercase();
+    for tok in value.split(|c: char| !c.is_alphanumeric()) {
+        if tok.chars().count() < 4 { continue; }
+        if !tok.chars().any(|c| c.is_ascii_digit()) { continue; }
+        if pool.contains(&tok.to_lowercase()) { return true; }
+    }
+    false
+}
+
+// 🌟 [MARKUP RESIDUE] 0.6B 모델은 [VECTOR MATCH RESULT] 라인을 복사할 때
+//    "tr", "td | 364235" 처럼 구조 태그를 그대로 반환합니다.
+//    Text 게이트는 알파벳 2자면 통과시키므로 "tr" 이 정상값으로 저장되어 버립니다.
+pub fn is_bare_markup_token(value: &str) -> bool {
+    const TAGS: [&str; 31] = [
+        "html", "head", "body", "div", "span", "p", "a", "ul", "ol", "li", "dl", "dt", "dd",
+        "table", "thead", "tbody", "tfoot", "tr", "td", "th", "form", "input", "select", "option",
+        "textarea", "button", "label", "img", "section", "colgroup", "col",
+    ];
+    let v = value.trim().to_ascii_lowercase();
+    if v.is_empty() { return true; }
+    if TAGS.contains(&v.as_str()) { return true; }
+    if v.contains('|') {
+        let head = v.split('|').next().unwrap_or("").trim().to_string();
+        let token = head.split(|c: char| c == '[' || c == ' ' || c == '(').next().unwrap_or("");
+        if TAGS.contains(&token) { return true; }
+    }
+    false
+}
+
+// 🌟 [MARKUP STRIP] "td | 24120419364235" 처럼 태그 접두어가 붙어 돌아온 답변에서
+//    실제 값 부분만 남깁니다. (파이프가 없거나 앞이 태그가 아니면 원문 그대로 보존)
+pub fn strip_markup_prefix(value: &str) -> String {
+    const TAGS: [&str; 31] = [
+        "html", "head", "body", "div", "span", "p", "a", "ul", "ol", "li", "dl", "dt", "dd",
+        "table", "thead", "tbody", "tfoot", "tr", "td", "th", "form", "input", "select", "option",
+        "textarea", "button", "label", "img", "section", "colgroup", "col",
+    ];
+    let v = value.trim();
+    if let Some(p) = v.find('|') {
+        let head = v[..p].trim().to_ascii_lowercase();
+        let token = head.split(|c: char| c == '[' || c == ' ' || c == '(').next().unwrap_or("");
+        if TAGS.contains(&token) {
+            return v[p + 1..].trim().to_string();
+        }
+    }
+    v.to_string()
+}
+
+// 🌟 [DATE LITERAL] LLM 을 거치지 않고 벡터가 짚어준 라인에서 날짜 리터럴만 직접 뽑아냅니다.
+pub fn extract_date_literal(s: &str) -> Option<String> {
+    let re = regex::Regex::new(r"\d{2,4}[-/\.]\d{1,2}[-/\.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?").ok()?;
+    re.find(s).map(|m| m.as_str().trim().to_string())
+}
+
+// 🌟 [PURE NUMERIC] 열거형(Enum)은 '상태/수단/기관명' 이므로 순수 금액·수량이 될 수 없습니다.
+//    '615600원', '(-) 0원', '0' 처럼 숫자와 단위 한 글자로만 이루어진 값을 구조적으로 판별합니다.
+//    (특정 통화 문자를 하드코딩하지 않고 '알파벳류 글자 수 <= 1' 로 일반화합니다)
+pub fn is_pure_numeric_value(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() { return false; }
+    let digits = v.chars().filter(|c| c.is_ascii_digit()).count();
+    if digits == 0 { return false; }
+    let letters = v.chars().filter(|c| c.is_alphabetic()).count();
+    letters <= 1
+}
+
+pub fn enum_value_reject(field_name: &str, value: &str) -> Option<&'static str> {
+    let t = value.trim();
+    if t.is_empty() { return None; }
+    if field_name.to_lowercase().contains("currency") {
+        if has_currency_signal(t) { return None; }
+        return Some(if is_pure_numeric_value(t) { "순수 수치" } else { "통화 표지 없음" });
+    }
+    if is_pure_numeric_value(t) { Some("순수 수치") } else { None }
+}
+
+pub const CURRENCY_NAMES_ML: &[(&str, &str)] = &[
+    ("USD", "usd, $, dollar, dollars, us-dollar, dólar, dólares, dollaro, dollari, dolar, dolary, dolarů, 달러, 미국달러, 美元, 美金, 米ドル, ドル, دولار, دولارات, ＄, ﹩"),
+    ("EUR", "eur, €, euro, euros, eura, 유로, 欧元, 歐元, ユーロ, يورو"),
+    ("JPY", "jpy, yen, yens, iene, ienes, jeny, jenů, 엔, 엔화, 円, 日元, 日圓, ين, ين ياباني"),
+    ("CNY", "cny, rmb, yuan, yuans, renminbi, iuane, jüan, jüany, jüanů, 위안, 위안화, 元, 人民币, 人民幣, 人民元, يوان"),
+    ("KRW", "krw, ₩, won, wons, wony, wonů, 원, 원화, 韩元, 韓元, ウォン, وون, ￦"),
+    ("GBP", "gbp, £, sterling, pound sterling, pounds sterling, britisches pfund, livre sterling, livres sterling, libra esterlina, libras esterlinas, sterlina, sterline, britse pond, libra šterlinků, 영국 파운드, 英镑, 英鎊, 英ポンド, جنيه إسترليني, ￡"),
+];
+
+pub fn currency_name_exact(core: &str) -> Option<&'static str> {
+    let norm = lower_alnum(core);
+    if norm.is_empty() { return None; }
+    for (code, raw) in CURRENCY_NAMES_ML.iter() {
+        for p in raw.split(',') {
+            let p = lower_alnum(p);
+            if p.is_empty() { continue; }
+            if norm == p { return Some(*code); }
+            if p.chars().count() < 2 { continue; }
+            if let Some(rest) = norm.strip_prefix(p.as_str()) {
+                if short_tail_ok(rest, 2) {
+                    return Some(*code);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn currency_symbol_in(raw: &str) -> Option<&'static str> {
+    for (code, list) in CURRENCY_NAMES_ML.iter() {
+        for p in list.split(',') {
+            let p = p.trim();
+            if p.is_empty() || p.chars().any(|c| c.is_alphanumeric()) { continue; }
+            if raw.contains(p) { return Some(*code); }
+        }
+    }
+    None
+}
+
+pub fn currency_symbol_strict(raw: &str) -> Option<&'static str> {
+    let chars: Vec<char> = raw.chars().collect();
+    for (code, list) in CURRENCY_NAMES_ML.iter() {
+        for p in list.split(',') {
+            let p = p.trim();
+            if p.is_empty() || p.chars().any(|c| c.is_alphanumeric()) { continue; }
+            let pc: Vec<char> = p.chars().collect();
+            if pc.is_empty() || chars.len() < pc.len() { continue; }
+            for i in 0..=(chars.len() - pc.len()) {
+                if chars[i..i + pc.len()] != pc[..] { continue; }
+                if i > 0 && chars[i - 1].is_alphabetic() { continue; }
+                return Some(*code);
+            }
+        }
+    }
+    None
+}
+
+pub fn currency_code_of(raw: &str) -> Option<&'static str> {
+    let t = raw.trim();
+    if t.is_empty() { return None; }
+    if let Some(c) = crate::logic::canonical_currency_code(t) { return Some(c); }
+    let mut words: Vec<String> = Vec::new();
+    for tok in t.split(|c: char| !c.is_alphanumeric()).filter(|s| !s.is_empty()) {
+        let mut cur = String::new();
+        let mut cur_digit: Option<bool> = None;
+        for ch in tok.chars() {
+            let d = ch.is_ascii_digit();
+            if cur_digit.map_or(false, |x| x != d) && !cur.is_empty() {
+                if cur_digit == Some(false) { words.push(std::mem::take(&mut cur)); } else { cur.clear(); }
+            }
+            cur.push(ch);
+            cur_digit = Some(d);
+        }
+        if !cur.is_empty() && cur_digit == Some(false) { words.push(cur); }
+    }
+    for w in words.iter() {
+        if w.chars().count() == 3 && w.chars().all(|c| c.is_ascii_alphabetic()) {
+            if let Some(c) = crate::logic::canonical_currency_code(w) { return Some(c); }
+        }
+    }
+    match words.len() {
+        0 => currency_symbol_strict(t),
+        1 => {
+            if let Some(c) = crate::logic::canonical_currency_code(&words[0]).or_else(|| currency_name_exact(&words[0])) {
+                return Some(c);
+            }
+            let compact: String = t
+                .chars()
+                .filter(|c| !c.is_whitespace() && !c.is_ascii_digit() && !",.-+".contains(*c))
+                .collect();
+            crate::logic::canonical_currency_code(&compact)
+        }
+        _ => None,
+    }
+}
+
+pub fn default_currency_for_lang(doc_lang: &str) -> &'static str {
+    match doc_lang {
+        "ko" => "KRW",
+        "ja" => "JPY",
+        "zh" | "zh-tw" | "zh-hk" | "zh-hans" => "CNY",
+        "de" | "fr" | "it" | "es" | "nl" | "pt" | "el" => "EUR",
+        "cs" => "CZK",
+        "ru" => "RUB",
+        "th" => "THB",
+        "vi" => "VND",
+        "hi" | "bn" => "INR",
+        "he" => "ILS",
+        _ => "USD",
+    }
+}
+#[derive(Debug, Clone, Default)]
+pub struct SynthesisGate {
+    pub kept: String,
+    pub dropped: Vec<(String, Vec<String>)>,
+    pub total: usize,
+}
+
+const SYN_MONTHS: [(&str, u32); 24] = [
+    ("january", 1), ("february", 2), ("march", 3), ("april", 4), ("may", 5), ("june", 6),
+    ("july", 7), ("august", 8), ("september", 9), ("october", 10), ("november", 11), ("december", 12),
+    ("jan", 1), ("feb", 2), ("mar", 3), ("apr", 4), ("jun", 6), ("jul", 7),
+    ("aug", 8), ("sep", 9), ("sept", 9), ("oct", 10), ("nov", 11), ("dec", 12),
+];
+
+const SYN_CURRENCY_WORDS: [(&str, &str); 16] = [
+    ("krw", "KRW"), ("won", "KRW"), ("usd", "USD"), ("dollar", "USD"), ("dollars", "USD"),
+    ("eur", "EUR"), ("euro", "EUR"), ("euros", "EUR"), ("jpy", "JPY"), ("yen", "JPY"),
+    ("cny", "CNY"), ("rmb", "CNY"), ("yuan", "CNY"), ("renminbi", "CNY"), ("gbp", "GBP"),
+    ("inr", "INR"),
+];
+
+fn syn_month(word: &str) -> Option<u32> {
+    let w = word.trim_end_matches('.').to_lowercase();
+    SYN_MONTHS.iter().find(|(n, _)| *n == w).map(|(_, m)| *m)
+}
+
+fn syn_full_year(y: u32) -> u32 {
+    if y >= 100 {
+        y
+    } else if y < 70 {
+        2000 + y
+    } else {
+        1900 + y
+    }
+}
+
+fn syn_number_key(raw: &str) -> Option<String> {
+    let t: String = raw.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+    let t = t.trim_matches('.');
+    if t.is_empty() {
+        return None;
+    }
+    let (int, frac) = match t.split_once('.') {
+        Some((a, b)) => (a.to_string(), b.trim_end_matches('0').to_string()),
+        None => (t.to_string(), String::new()),
+    };
+    let int = int.trim_start_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    if frac.is_empty() {
+        Some(int.to_string())
+    } else {
+        Some(format!("{}.{}", int, frac))
+    }
+}
+
+fn syn_date_literal(tok: &str) -> Option<(Option<u32>, u32, u32)> {
+    let parts: Vec<&str> = tok
+        .split(|c: char| c == '-' || c == '/' || c == '.')
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let num = |p: &str| -> Option<u32> {
+        if p.chars().all(|c| c.is_ascii_digit()) { p.parse().ok() } else { None }
+    };
+    if let (Some(a), Some(b), Some(c)) = (num(parts[0]), num(parts[1]), num(parts[2])) {
+        if parts[0].len() >= 2 && (1..=12).contains(&b) && (1..=31).contains(&c) {
+            return Some((Some(syn_full_year(a)), b, c));
+        }
+        return None;
+    }
+    if let (Some(m), Some(d), Some(y)) = (syn_month(parts[0]), num(parts[1]), num(parts[2])) {
+        if (1..=31).contains(&d) {
+            return Some((Some(syn_full_year(y)), m, d));
+        }
+    }
+    if let (Some(d), Some(m), Some(y)) = (num(parts[0]), syn_month(parts[1]), num(parts[2])) {
+        if (1..=31).contains(&d) {
+            return Some((Some(syn_full_year(y)), m, d));
+        }
+    }
+    None
+}
+
+fn syn_currencies(tok: &str, iso_ok: bool) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    let chars: Vec<char> = tok.chars().collect();
+    for (i, ch) in chars.iter().enumerate() {
+        let after_digit = i > 0 && chars[i - 1].is_ascii_digit();
+        match ch {
+            '$' => out.push("USD"),
+            '€' => out.push("EUR"),
+            '£' => out.push("GBP"),
+            '₩' => out.push("KRW"),
+            '¥' | '￥' => {
+                out.push("JPY");
+                out.push("CNY");
+            }
+            '원' if after_digit || chars.len() == 1 => out.push("KRW"),
+            '元' if after_digit || chars.len() == 1 => out.push("CNY"),
+            '円' if after_digit || chars.len() == 1 => out.push("JPY"),
+            _ => {}
+        }
+    }
+    for run in tok.split(|c: char| !c.is_ascii_alphabetic()).filter(|r| r.len() >= 3) {
+        let lower = run.to_lowercase();
+        if let Some((_, code)) = SYN_CURRENCY_WORDS.iter().find(|(w, _)| *w == lower) {
+            out.push(code);
+        } else if iso_ok && run.len() == 3 && run.chars().all(|c| c.is_ascii_uppercase()) {
+            if let Some(code) = ISO_4217_ACTIVE.split_whitespace().find(|c| *c == run) {
+                out.push(code);
+            }
+        }
+    }
+    out
+}
+
+fn syn_amount_like(tok: &str) -> bool {
+    let core = syn_core(tok);
+    let digits = core.chars().filter(|c| c.is_ascii_digit()).count();
+    digits >= 3 || (digits >= 2 && core.contains(|c: char| c == ',' || c == '.'))
+}
+
+fn syn_core(tok: &str) -> &str {
+    tok.trim_matches(|c: char| !c.is_alphanumeric())
+}
+
+fn syn_day(tok: &str) -> Option<u32> {
+    let core = syn_core(tok).to_lowercase();
+    let digits: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let rest = &core[digits.len()..];
+    if digits.is_empty() || !["", "st", "nd", "rd", "th"].contains(&rest) {
+        return None;
+    }
+    digits.parse::<u32>().ok().filter(|d| (1..=31).contains(d))
+}
+
+#[derive(Default)]
+struct SynSource {
+    numbers: std::collections::HashSet<String>,
+    years: std::collections::HashSet<u32>,
+    month_days: std::collections::HashSet<(u32, u32)>,
+    months: std::collections::HashSet<u32>,
+    currencies: std::collections::HashSet<&'static str>,
+    times: std::collections::HashSet<(u32, u32)>,
+    text_key: String,
+    roman_key: String,
+    anchors: Vec<(String, Vec<String>)>,
+    bindings: Vec<(String, Vec<SynLit>)>,
+    values: Vec<String>,
+    names: Vec<(String, Vec<char>)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum SynLit {
+    Num(String),
+    Date(Option<u32>, u32, u32),
+}
+
+fn syn_glued_tail(tail: &str) -> bool {
+    let rest = tail.trim_start_matches(|c: char| c == '\'' || c == '\u{2019}');
+    let apostrophe = rest.len() != tail.len();
+    !rest.is_empty() && rest.chars().all(|c| c.is_alphabetic() && (apostrophe || !c.is_ascii()))
+}
+
+const SYN_SCALE_CHARS: [char; 14] = ['십', '백', '천', '만', '억', '조', '十', '百', '千', '万', '萬', '億', '亿', '兆'];
+
+fn syn_numeric_head(core: &str) -> Option<&str> {
+    let cut = core
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_digit() || matches!(c, ',' | '.' | '-' | '/')))
+        .map(|(i, _)| i)?;
+    let head = core[..cut].trim_end_matches(|c: char| matches!(c, ',' | '.' | '-' | '/'));
+    let tail = &core[cut..];
+    if head.is_empty()
+        || !head.chars().any(|c| c.is_ascii_digit())
+        || tail.starts_with(|c: char| SYN_SCALE_CHARS.contains(&c))
+        || !syn_glued_tail(tail)
+    {
+        return None;
+    }
+    Some(head)
+}
+
+const SYN_RANGE_WORDS: [&str; 33] = [
+    "미만", "이하", "이상", "초과", "정도", "가량", "쯤", "내외", "안팎", "넘", "남짓", "수준", "대",
+    "未満", "以下", "以上", "超", "程度", "前後", "左右", "以内",
+    "under", "over", "below", "above", "less", "more", "about", "around", "approximately", "nearly", "roughly", "almost",
+];
+
+fn syn_scale_unit(c: char) -> Option<(f64, bool)> {
+    match c {
+        '십' | '十' => Some((10.0, false)),
+        '백' | '百' => Some((100.0, false)),
+        '천' | '千' => Some((1_000.0, false)),
+        '만' | '万' | '萬' => Some((10_000.0, true)),
+        '억' | '億' | '亿' => Some((100_000_000.0, true)),
+        '조' | '兆' => Some((1_000_000_000_000.0, true)),
+        _ => None,
+    }
+}
+
+fn syn_scaled_part(core: &str) -> Option<(f64, usize, f64)> {
+    if !core.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut total = 0.0f64;
+    let mut section = 0.0f64;
+    let mut num: Option<f64> = None;
+    let mut buf = String::new();
+    let mut end = 0usize;
+    let mut last_big = 0.0f64;
+    let mut saw_scale = false;
+    for (i, c) in core.char_indices() {
+        if c.is_ascii_digit() || c == ',' || c == '.' {
+            buf.push(c);
+            end = i + c.len_utf8();
+            continue;
+        }
+        if !buf.is_empty() {
+            num = Some(buf.replace(',', "").parse::<f64>().ok()?);
+            buf.clear();
+        }
+        match syn_scale_unit(c) {
+            Some((m, false)) => {
+                section += num.take().unwrap_or(1.0) * m;
+                saw_scale = true;
+                last_big = 0.0;
+                end = i + c.len_utf8();
+            }
+            Some((m, true)) => {
+                section += num.take().unwrap_or(0.0);
+                let base = if section == 0.0 { 1.0 } else { section };
+                total += base * m;
+                section = 0.0;
+                saw_scale = true;
+                last_big = m;
+                end = i + c.len_utf8();
+            }
+            None => break,
+        }
+    }
+    if !buf.is_empty() {
+        num = Some(buf.replace(',', "").parse::<f64>().ok()?);
+    }
+    if !saw_scale {
+        return None;
+    }
+    if let Some(n) = num {
+        section += n;
+        last_big = 0.0;
+    }
+    total += section;
+    Some((total, end, last_big))
+}
+
+fn syn_plain_head(tok: &str) -> Option<(f64, usize)> {
+    let end = tok
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_digit() || *c == ','))
+        .map(|(i, _)| i)
+        .unwrap_or(tok.len());
+    if end == 0 || tok[end..].starts_with(|c: char| syn_scale_unit(c).is_some()) {
+        return None;
+    }
+    let n = tok[..end].replace(',', "").parse::<f64>().ok()?;
+    Some((n, end))
+}
+
+fn syn_scaled_span(toks: &[&str], e: usize) -> Option<(f64, usize, String)> {
+    let core = syn_core(toks[e]);
+    let (mut value, end, mut last_big) = syn_scaled_part(core)?;
+    let mut last = e;
+    let mut rest = core[end..].to_string();
+    while last_big > 0.0 && rest.is_empty() {
+        let next = match toks.get(last + 1) {
+            Some(t) => syn_core(t),
+            None => break,
+        };
+        if let Some((v, nend, nbig)) = syn_scaled_part(next).filter(|(v, _, _)| *v < last_big) {
+            value += v;
+            last_big = nbig;
+            rest = next[nend..].to_string();
+        } else if let Some((v, nend)) = syn_plain_head(next).filter(|(v, _)| *v < last_big) {
+            value += v;
+            last_big = 0.0;
+            rest = next[nend..].to_string();
+        } else {
+            break;
+        }
+        last += 1;
+    }
+    Some((value, last, rest))
+}
+
+fn syn_scaled_literal(toks: &[&str], e: usize) -> Option<SynLit> {
+    let (value, last, rest) = syn_scaled_span(toks, e)?;
+    let rest = rest.to_lowercase();
+    let next_word = toks.get(last + 1).map(|t| syn_core(t).to_lowercase()).unwrap_or_default();
+    if SYN_RANGE_WORDS.iter().any(|w| rest.contains(w) || next_word.starts_with(w)) {
+        return None;
+    }
+    syn_number_key(&format!("{}", value.round() as u128)).map(SynLit::Num)
+}
+
+fn syn_label_word(token: &str, word: &str) -> bool {
+    match token.strip_prefix(word) {
+        Some(tail) => tail.is_empty() || syn_glued_tail(tail),
+        None => false,
+    }
+}
+
+fn syn_literal(value: &str) -> Option<SynLit> {
+    let first = value.split_whitespace().next()?;
+    let core = syn_core(first);
+    let date_part = match core.split_once('T') {
+        Some((d, _)) if syn_date_literal(d).is_some() => d,
+        _ => core,
+    };
+    if let Some((y, m, d)) = syn_date_literal(date_part) {
+        return Some(SynLit::Date(y, m, d));
+    }
+    if !core.is_empty() && core.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.') {
+        return syn_number_key(core).map(SynLit::Num);
+    }
+    None
+}
+
+fn syn_lit_matches(bound: &SynLit, got: &SynLit) -> bool {
+    match (bound, got) {
+        (SynLit::Num(a), SynLit::Num(b)) => a == b,
+        (SynLit::Date(ya, ma, da), SynLit::Date(yb, mb, db)) => {
+            ma == mb && da == db && (ya.is_none() || yb.is_none() || ya == yb)
+        }
+        _ => false,
+    }
+}
+
+fn syn_lit_text(lit: &SynLit) -> String {
+    match lit {
+        SynLit::Num(n) => n.clone(),
+        SynLit::Date(Some(y), m, d) => format!("{}-{:02}-{:02}", y, m, d),
+        SynLit::Date(None, m, d) => format!("{:02}-{:02}", m, d),
+    }
+}
+
+fn syn_clock(core: &str) -> Option<(u32, u32)> {
+    let lower = core.to_lowercase();
+    let body = lower.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == '.');
+    let parts: Vec<&str> = body.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    if !parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    if parts[0].len() > 2 || parts[1].len() != 2 {
+        return None;
+    }
+    let h: u32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some((h, m))
+}
+
+fn syn_text_key(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+}
+
+fn syn_quoted_spans(sentence: &str) -> Vec<String> {
+    const PAIRS: [(char, char); 6] = [('"', '"'), ('\'', '\''), ('“', '”'), ('‘', '’'), ('「', '」'), ('『', '』')];
+    let chars: Vec<char> = sentence.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let open_ok = i == 0 || !chars[i - 1].is_alphanumeric();
+        let close = PAIRS.iter().find(|(o, _)| *o == chars[i]).map(|(_, c)| *c);
+        if let (Some(close), true) = (close, open_ok) {
+            let end = (i + 1..chars.len()).find(|&j| chars[j] == close && (j + 1 >= chars.len() || !chars[j + 1].is_alphanumeric()));
+            if let Some(j) = end {
+                let span: String = chars[i + 1..j].iter().collect();
+                if span.chars().filter(|c| c.is_alphanumeric()).count() >= 2 {
+                    out.push(span.trim().to_string());
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn syn_source(source: &str, doc_lang: &str) -> SynSource {
+    let mut s = SynSource::default();
+    s.currencies.insert(default_currency_for_lang(doc_lang));
+    s.text_key = syn_text_key(source);
+    s.roman_key = syn_text_key(&any_ascii::any_ascii(source));
+    let toks: Vec<&str> = source
+        .split(|c: char| c.is_whitespace() || c == '|' || c == '"' || c == '\'' || c == '(' || c == ')' || c == '[' || c == ']' || c == '=')
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (i, raw) in toks.iter().enumerate() {
+        for c in syn_currencies(raw, true) {
+            s.currencies.insert(c);
+        }
+        let core = syn_core(raw);
+        let (date_core, clock_core) = match core.split_once('T') {
+            Some((d, t)) if syn_date_literal(d).is_some() => (d, t),
+            _ => (core, core),
+        };
+        if let Some(t) = syn_clock(clock_core) {
+            s.times.insert(t);
+        }
+        if let Some((y, m, d)) = syn_date_literal(date_core) {
+            if let Some(y) = y {
+                s.years.insert(y);
+            }
+            s.month_days.insert((m, d));
+            s.months.insert(m);
+        }
+        if let Some(m) = syn_month(core) {
+            let next_day = toks.get(i + 1).and_then(|t| syn_day(t));
+            let prev_day = if i > 0 { syn_day(toks[i - 1]) } else { None };
+            if let Some(d) = next_day.or(prev_day) {
+                s.month_days.insert((m, d));
+                s.months.insert(m);
+            }
+        }
+        for run in core.split(|c: char| !(c.is_ascii_digit() || c == ',' || c == '.')) {
+            if !run.chars().any(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if let Some(k) = syn_number_key(run) {
+                if let Ok(y) = k.parse::<u32>() {
+                    if (1900..=2099).contains(&y) {
+                        s.years.insert(y);
+                    }
+                }
+                s.numbers.insert(k);
+            }
+        }
+        let kd: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !kd.is_empty() {
+            let rest: String = core.chars().skip(kd.chars().count()).collect();
+            if let Ok(n) = kd.parse::<u32>() {
+                if rest.starts_with('년') {
+                    s.years.insert(syn_full_year(n));
+                } else if rest.starts_with('월') && (1..=12).contains(&n) {
+                    s.months.insert(n);
+                    if let Some(d) = toks.get(i + 1).and_then(|t| {
+                        let c = syn_core(t);
+                        let dd: String = c.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+                        if !dd.is_empty() && c[dd.len()..].starts_with('일') { dd.parse::<u32>().ok() } else { None }
+                    }) {
+                        s.month_days.insert((n, d));
+                    }
+                }
+            }
+        }
+    }
+    for line in source.lines() {
+        let value = match line.rfind('|') {
+            Some(p) => &line[p + 1..],
+            None => match line.find(": ") {
+                Some(p) => &line[p + 2..],
+                None => line,
+            },
+        };
+        let words: Vec<&str> = value.split_whitespace().map(syn_core).filter(|w| !w.is_empty()).collect();
+        let companions: Vec<String> = words
+            .iter()
+            .filter(|w| w.chars().any(|c| c.is_alphabetic() && !c.is_ascii()))
+            .map(|w| w.to_lowercase())
+            .collect();
+        if companions.is_empty() {
+            continue;
+        }
+        for w in words.iter() {
+            let code_like = w.chars().count() >= 3
+                && w.chars().any(|c| c.is_ascii_alphabetic())
+                && w.chars().any(|c| c.is_ascii_digit())
+                && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if code_like && !s.anchors.iter().any(|(c, _)| c.eq_ignore_ascii_case(w)) {
+                s.anchors.push((w.to_string(), companions.clone()));
+            }
+        }
+    }
+    for line in source.lines() {
+        let (label, value) = match line.rfind('|') {
+            Some(p) => (&line[..p], &line[p + 1..]),
+            None => match line.find(": ") {
+                Some(p) => (&line[..p], &line[p + 2..]),
+                None => continue,
+            },
+        };
+        let label = label.rsplit('>').next().unwrap_or("").trim().to_lowercase();
+        if label.chars().filter(|c| c.is_alphanumeric()).count() < 2 {
+            continue;
+        }
+        let lit = match syn_literal(value) {
+            Some(l) => l,
+            None => continue,
+        };
+        match s.bindings.iter().position(|(l, _)| *l == label) {
+            Some(p) => {
+                if !s.bindings[p].1.contains(&lit) {
+                    s.bindings[p].1.push(lit);
+                }
+            }
+            None => s.bindings.push((label, vec![lit])),
+        }
+    }
+    let mut seen_values: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in source.lines() {
+        let value = match line.rfind('|') {
+            Some(p) => &line[p + 1..],
+            None => match line.find(": ") {
+                Some(p) => &line[p + 2..],
+                None => continue,
+            },
+        };
+        let key = syn_text_key(value);
+        if key.chars().count() < 2 || !seen_values.insert(key.clone()) {
+            continue;
+        }
+        let chars: Vec<char> = key.chars().collect();
+        if chars.len() >= SYN_NAME_MIN_CHARS && chars.iter().filter(|c| c.is_alphabetic()).count() * 2 >= chars.len() {
+            s.names.push((value.trim().to_string(), chars));
+        }
+        s.values.push(key);
+    }
+    s
+}
+
+const SYN_NAME_MIN_CHARS: usize = 10;
+
+fn syn_find_all(hay: &[char], needle: &[char]) -> Vec<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return Vec::new();
+    }
+    (0..=hay.len() - needle.len()).filter(|&i| hay[i..i + needle.len()] == *needle).collect()
+}
+
+fn syn_bigram_dice(a: &[char], b: &[char]) -> f32 {
+    if a.len() < 2 || b.len() < 2 {
+        return 0.0;
+    }
+    let mut pool: Vec<(char, char)> = b.windows(2).map(|w| (w[0], w[1])).collect();
+    let mut common = 0usize;
+    for w in a.windows(2) {
+        if let Some(p) = pool.iter().position(|x| *x == (w[0], w[1])) {
+            pool.swap_remove(p);
+            common += 1;
+        }
+    }
+    2.0 * common as f32 / (a.len() + b.len() - 2) as f32
+}
+
+fn syn_name_mutations(sentence: &str, src: &SynSource) -> Vec<String> {
+    let skey: Vec<char> = syn_text_key(sentence).chars().collect();
+    let mut bad: Vec<String> = Vec::new();
+    for (shown, name) in src.names.iter() {
+        let n = name.len();
+        if !syn_find_all(&skey, name).is_empty() {
+            continue;
+        }
+        let starts = syn_find_all(&skey, &name[..2]);
+        let ends = syn_find_all(&skey, &name[n - 2..]);
+        let mutated = starts.iter().any(|&i| {
+            ends.iter().any(|&j| {
+                let stop = j + 2;
+                j > i
+                    && (stop - i) * 4 >= n * 3
+                    && (stop - i) * 3 <= n * 4
+                    && syn_bigram_dice(&skey[i..stop], name) >= 0.6
+            })
+        });
+        if mutated {
+            bad.push(format!("이름 변형 '{}'", shown));
+        }
+    }
+    bad
+}
+
+fn syn_anchor_hits(sentence: &str, src: &SynSource) -> Vec<String> {
+    let skey = syn_text_key(sentence);
+    let mut hits: Vec<String> = src.values.iter().filter(|v| skey.contains(v.as_str())).cloned().collect();
+    let toks: Vec<&str> = sentence.split_whitespace().collect();
+    for (i, raw) in toks.iter().enumerate() {
+        let core = syn_core(raw);
+        let head = syn_numeric_head(core).unwrap_or(core);
+        let day = if let Some((_, m, d)) = syn_date_literal(head) {
+            Some((m, d))
+        } else if let Some(m) = syn_month(core) {
+            toks.get(i + 1)
+                .and_then(|t| syn_day(t))
+                .or_else(|| if i > 0 { syn_day(toks[i - 1]) } else { None })
+                .map(|d| (m, d))
+        } else {
+            let kd: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
+            match kd.parse::<u32>() {
+                Ok(m) if kd.len() <= 2 && core[kd.len()..].starts_with('월') => toks.get(i + 1).and_then(|t| {
+                    let c = syn_core(t);
+                    let dd: String = c.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+                    if !dd.is_empty() && c[dd.len()..].starts_with('일') { dd.parse::<u32>().ok().map(|d| (m, d)) } else { None }
+                }),
+                _ => None,
+            }
+        };
+        if let Some((m, d)) = day.filter(|md| src.month_days.contains(md)) {
+            hits.push(format!("{:02}-{:02}", m, d));
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    let all = hits.clone();
+    hits.retain(|h| !all.iter().any(|o| o != h && o.contains(h.as_str())));
+    hits
+}
+
+fn syn_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for i in 0..chars.len() {
+        cur.push(chars[i]);
+        let end = matches!(chars[i], '.' | '!' | '?' | '。');
+        let next_ws = i + 1 >= chars.len() || chars[i + 1].is_whitespace();
+        if end && next_ws {
+            let t = cur.trim().to_string();
+            if !t.is_empty() {
+                out.push(t);
+            }
+            cur.clear();
+        }
+    }
+    let t = cur.trim().to_string();
+    if !t.is_empty() {
+        out.push(t);
+    }
+    out
+}
+
+fn syn_ungrounded(sentence: &str, src: &SynSource) -> Vec<String> {
+    let mut bad: Vec<String> = Vec::new();
+    let toks: Vec<&str> = sentence.split_whitespace().collect();
+    let mut used = vec![false; toks.len()];
+    for (i, raw) in toks.iter().enumerate() {
+        let core = syn_core(raw);
+        let lower = core.to_lowercase();
+        if lower.len() == 4 && (lower.starts_with("19") || lower.starts_with("20")) && lower.ends_with("xx") {
+            bad.push(format!("연도 자리표시 {}", core));
+            used[i] = true;
+            continue;
+        }
+        let date_core = syn_numeric_head(core).unwrap_or(core);
+        if let Some((y, m, d)) = syn_date_literal(date_core) {
+            used[i] = true;
+            if !src.month_days.contains(&(m, d)) {
+                bad.push(format!("날짜 {}", date_core));
+            } else if let Some(y) = y {
+                if !src.years.contains(&y) {
+                    bad.push(format!("연도 {}", y));
+                }
+            }
+            continue;
+        }
+        if let Some(m) = syn_month(core) {
+            let next_day = toks.get(i + 1).and_then(|t| syn_day(t));
+            let prev_day = if i > 0 { syn_day(toks[i - 1]) } else { None };
+            match (next_day, prev_day) {
+                (Some(d), _) => {
+                    used[i] = true;
+                    if i + 1 < used.len() {
+                        used[i + 1] = true;
+                    }
+                    if !src.month_days.contains(&(m, d)) {
+                        bad.push(format!("날짜 {} {}", core, d));
+                    }
+                }
+                (None, Some(d)) => {
+                    used[i] = true;
+                    used[i - 1] = true;
+                    if !src.month_days.contains(&(m, d)) {
+                        bad.push(format!("날짜 {} {}", d, core));
+                    }
+                }
+                (None, None) => {
+                    let prev = if i > 0 { syn_core(toks[i - 1]).to_lowercase() } else { String::new() };
+                    let full = lower.len() > 4 || lower == "june" || lower == "july";
+                    if full && ["in", "during", "since", "until", "by"].contains(&prev.as_str()) {
+                        used[i] = true;
+                        if !src.months.contains(&m) {
+                            bad.push(format!("월 {}", core));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let kd: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !kd.is_empty() && kd.len() <= 2 {
+            let rest = &core[kd.len()..];
+            if let Ok(n) = kd.parse::<u32>() {
+                if rest.starts_with('월') && (1..=12).contains(&n) {
+                    used[i] = true;
+                    let day = toks.get(i + 1).and_then(|t| {
+                        let c = syn_core(t);
+                        let dd: String = c.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+                        if !dd.is_empty() && c[dd.len()..].starts_with('일') { dd.parse::<u32>().ok() } else { None }
+                    });
+                    match day {
+                        Some(d) => {
+                            if i + 1 < used.len() {
+                                used[i + 1] = true;
+                            }
+                            if !src.month_days.contains(&(n, d)) {
+                                bad.push(format!("날짜 {}월 {}일", n, d));
+                            }
+                        }
+                        None => {
+                            if !src.months.contains(&n) {
+                                bad.push(format!("월 {}월", n));
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+    for i in 0..toks.len() {
+        if let Some((_, last, _)) = syn_scaled_span(&toks, i) {
+            for j in (i + 1)..=last {
+                used[j] = true;
+            }
+        }
+    }
+    for (i, raw) in toks.iter().enumerate() {
+        let iso_ok = raw.chars().any(|c| c.is_ascii_digit())
+            || (i > 0 && syn_amount_like(toks[i - 1]))
+            || toks.get(i + 1).map_or(false, |t| syn_amount_like(t));
+        let cur = syn_currencies(raw, iso_ok);
+        if !cur.is_empty() && !cur.iter().any(|c| src.currencies.contains(c)) {
+            let shown = raw
+                .trim_start_matches(|c: char| matches!(c, '(' | '\'' | '"'))
+                .trim_end_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | ')' | '\'' | '"'));
+            bad.push(format!("통화 {}", shown));
+        }
+        if let Some((h, m)) = syn_clock(syn_core(raw)) {
+            if !src.times.iter().any(|(sh, sm)| *sm == m && sh % 12 == h % 12) {
+                bad.push(format!("시각 {:02}:{:02}", h, m));
+            }
+            continue;
+        }
+        if used[i] || raw.contains(':') {
+            continue;
+        }
+        let core = syn_core(raw);
+        let letters = core.chars().filter(|c| c.is_alphabetic()).count();
+        let currency_letters = !cur.is_empty();
+        let mut num_core = core;
+        if letters > 0 && !currency_letters {
+            let kd: String = core.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let rest = &core[kd.len()..];
+            if kd.len() == 4 && rest.starts_with('년') {
+                if let Ok(y) = kd.parse::<u32>() {
+                    if !src.years.contains(&y) {
+                        bad.push(format!("연도 {}", y));
+                    }
+                }
+                continue;
+            }
+            match syn_numeric_head(core) {
+                Some(head) => num_core = head,
+                None => continue,
+            }
+        }
+        let digit_part: String = num_core
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
+            .collect();
+        let key = match syn_number_key(&digit_part) {
+            Some(k) => k,
+            None => continue,
+        };
+        let int_digits = key.split('.').next().unwrap_or("").len();
+        if int_digits == 4 && !digit_part.contains(',') {
+            if let Ok(y) = key.parse::<u32>() {
+                if (1900..=2099).contains(&y) {
+                    if !src.years.contains(&y) && !src.numbers.contains(&key) {
+                        bad.push(format!("연도 {}", y));
+                    }
+                    continue;
+                }
+            }
+        }
+        if int_digits < 3 {
+            continue;
+        }
+        if !src.numbers.contains(&key) {
+            bad.push(format!("수치 {}", digit_part.trim_end_matches(|c: char| c == ',' || c == '.')));
+        }
+    }
+    for span in syn_quoted_spans(sentence) {
+        let k = syn_text_key(&span);
+        if k.chars().count() < 2 {
+            continue;
+        }
+        if !src.text_key.contains(&k) && !src.roman_key.contains(&k) {
+            bad.push(format!("인용 '{}'", span));
+        }
+    }
+    if !src.anchors.is_empty() {
+        let lower = sentence.to_lowercase();
+        let cores: Vec<String> = toks.iter().map(|t| syn_core(t).to_lowercase()).collect();
+        for (code, companions) in src.anchors.iter() {
+            let code_lower = code.to_lowercase();
+            if !cores.iter().any(|t| *t == code_lower) {
+                continue;
+            }
+            let found = companions.iter().filter(|w| lower.contains(w.as_str())).count();
+            if found * 2 < companions.len() {
+                bad.push(format!("번역된 이름 {} (원문 표기 {}개 중 {}개)", code, companions.len(), found));
+            }
+        }
+    }
+    if !src.bindings.is_empty() {
+        let lowers: Vec<String> = toks.iter().map(|t| syn_core(t).to_lowercase()).collect();
+        let mut spans: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for (bi, (label, _)) in src.bindings.iter().enumerate() {
+            let words: Vec<&str> = label.split_whitespace().collect();
+            let n = words.len();
+            if n == 0 {
+                continue;
+            }
+            let mut i = 0usize;
+            while i + n <= lowers.len() {
+                let hit = (0..n).all(|w| {
+                    if w + 1 == n {
+                        syn_label_word(&lowers[i + w], words[w])
+                    } else {
+                        lowers[i + w] == words[w]
+                    }
+                });
+                if hit {
+                    spans.push((i, i + n, bi, label.chars().count()));
+                    i += n;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for &(s, e, bi, len) in spans.iter() {
+            let outranked = spans
+                .iter()
+                .any(|&(s2, e2, _, len2)| s2 < e && s < e2 && (e2 - s2, len2) > (e - s, len));
+            if outranked || e >= toks.len() {
+                continue;
+            }
+            let core = syn_core(toks[e]);
+            let head = syn_numeric_head(core).unwrap_or(core);
+            let full_date = syn_date_literal(head).map(|(y, m, d)| SynLit::Date(y, m, d));
+            if full_date.is_none() && (used[e] || core[head.len()..].starts_with('년')) {
+                continue;
+            }
+            let lit = match full_date.or_else(|| syn_literal(head)).or_else(|| syn_scaled_literal(&toks, e)) {
+                Some(l) => l,
+                None => continue,
+            };
+            let (label, lits) = &src.bindings[bi];
+            if !lits.iter().any(|b| syn_lit_matches(b, &lit)) {
+                bad.push(format!(
+                    "바인딩 {} {} ≠ {}",
+                    label,
+                    head,
+                    lits.iter().map(syn_lit_text).collect::<Vec<_>>().join("/")
+                ));
+            }
+        }
+    }
+    bad
+}
+
+pub fn synthesis_fact_gate(text: &str, source: &str, doc_lang: &str) -> SynthesisGate {
+    let src = syn_source(source, doc_lang);
+    let sentences = syn_sentences(text);
+    let mut kept: Vec<String> = Vec::new();
+    let mut dropped: Vec<(String, Vec<String>)> = Vec::new();
+    let mut joined: Vec<String> = Vec::new();
+    for s in sentences.iter() {
+        let mut bad = syn_ungrounded(s, &src);
+        bad.extend(syn_name_mutations(s, &src));
+        let anchors = syn_anchor_hits(s, &src);
+        if bad.is_empty() && anchors.is_empty() {
+            bad.push("원문 값 0개 (값표의 사실을 하나도 담지 않은 문장)".to_string());
+        }
+        if bad.is_empty() {
+            for a in anchors {
+                if !joined.contains(&a) {
+                    joined.push(a);
+                }
+            }
+            kept.push(s.clone());
+        } else {
+            dropped.push((s.clone(), bad));
+        }
+    }
+    let need = src.values.len().min(2);
+    if !kept.is_empty() && joined.len() < need {
+        let why = format!("원문 값 {}개만 이음 (요약은 값 {}개 이상을 이어야 합니다)", joined.len(), need);
+        for s in kept.drain(..) {
+            dropped.push((s, vec![why.clone()]));
+        }
+    }
+    SynthesisGate {
+        kept: kept.join(" "),
+        dropped,
+        total: sentences.len(),
+    }
+}
+
+pub const ISO_4217_ACTIVE: &str = "AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB BRL BSD BTN BWP BYN BZD CAD CDF CHF CLP CNY COP CRC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD HKD HNL HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SLL SOS SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD UYU UZS VES VND VUV WST XAF XCD XOF XPF YER ZAR ZMW ZWL";
+
+pub const CURRENCY_NOUNS_ML: &str = "franc, francs, rupee, rupees, peso, pesos, baht, ringgit, krona, krone, kronor, kroner, lira, dinar, dinars, dirham, dirhams, riyal, riyals, rupiah, zloty, złoty, forint, shekel, shekels, hryvnia, ruble, rubles, rouble, roubles, 프랑, 루피, 페소, 바트, 링깃, 크로나, 크로네, 리라, 디나르, 디르함, 리얄, 루피아, 즈워티, 포린트, 셰켈, 흐리브냐, 루블";
+
+pub fn has_currency_symbol(value: &str) -> bool {
+    value.chars().any(|c| {
+        c == '$'
+            || ('\u{00A2}'..='\u{00A5}').contains(&c)
+            || ('\u{20A0}'..='\u{20CF}').contains(&c)
+            || c == '\u{0E3F}'
+            || c == '\u{FDFC}'
+            || matches!(
+                c,
+                '\u{058F}' | '\u{060B}' | '\u{09F2}' | '\u{09F3}' | '\u{09FB}' | '\u{0AF1}' | '\u{0BF9}' | '\u{17DB}' | '\u{FE69}' | '\u{FF04}'
+            )
+            || ('\u{FFE0}'..='\u{FFE1}').contains(&c)
+            || ('\u{FFE5}'..='\u{FFE6}').contains(&c)
+    })
+}
+
+pub fn has_currency_signal(value: &str) -> bool {
+    let t = value.trim();
+    if t.is_empty() { return false; }
+    if currency_code_of(t).is_some() || has_currency_symbol(t) { return true; }
+    let words: Vec<String> = t
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|tok| tok.chars().filter(|c| c.is_alphabetic()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() || words.len() > 3 { return false; }
+    let word = &words[words.len() - 1];
+    if word.chars().count() == 3
+        && word.chars().all(|c| c.is_ascii_uppercase())
+        && ISO_4217_ACTIVE.split_whitespace().any(|c| c == word.as_str())
+    {
+        return true;
+    }
+    if currency_name_exact(word).is_some() { return true; }
+    let lower = word.to_lowercase();
+    CURRENCY_NOUNS_ML
+        .split(',')
+        .map(|n| n.trim())
+        .chain(CURRENCY_NAMES_ML.iter().flat_map(|(_, list)| list.split(',').map(|n| n.trim())))
+        .any(|n| {
+            if n.is_empty() || !n.chars().any(|c| c.is_alphabetic()) { return false; }
+            if lower == n { return true; }
+            !n.is_ascii() && n.chars().count() >= 2 && lower.ends_with(n)
+        })
+}
+
+pub fn currency_amount_like(value: &str) -> bool {
+    let t = value.trim();
+    !t.is_empty() && !t.chars().any(|c| c.is_alphabetic()) && !has_currency_symbol(t)
+}
+
+pub const CURRENCY_SHORT_MARKS: &str = "kr, zł, zl, ft, tl, rp, rm, rs, lei, лв, руб, грн, din, sfr, fr";
+
+#[derive(Debug, Clone, Default)]
+pub struct CurrencyEvidence {
+    pub bound: Vec<String>,
+    pub loose: Vec<String>,
+    pub unresolved: usize,
+}
+
+impl CurrencyEvidence {
+    pub fn single(&self) -> Option<&str> {
+        if self.unresolved > 0 || self.bound.len() != 1 {
+            return None;
+        }
+        let code = self.bound[0].as_str();
+        if self.loose.iter().any(|c| c != code) {
+            return None;
+        }
+        Some(code)
+    }
+
+    pub fn is_silent(&self) -> bool {
+        self.bound.is_empty() && self.loose.is_empty() && self.unresolved == 0
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "금액에 붙은 코드 {:?} · 떨어진 코드 {:?} · 코드로 못 푼 통화 표지 {}건",
+            self.bound, self.loose, self.unresolved
+        )
+    }
+}
+
+fn currency_amount_digits(t: &str) -> bool {
+    let chars: Vec<char> = t.chars().collect();
+    let digits: String = chars.iter().filter(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return false;
+    }
+    let inner_sep = (1..chars.len().saturating_sub(1)).any(|i| {
+        (chars[i] == ',' || chars[i] == '.') && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit()
+    });
+    if inner_sep {
+        return true;
+    }
+    if digits.len() < 2 {
+        return false;
+    }
+    !(digits.len() == 4 && (digits.starts_with("19") || digits.starts_with("20")))
+}
+
+fn currency_amount_token(t: &str) -> bool {
+    t.chars().all(|c| c.is_ascii_digit() || ",.-+".contains(c)) && currency_amount_digits(t)
+}
+
+pub fn currency_evidence<S: AsRef<str>>(texts: &[S]) -> CurrencyEvidence {
+    let mut ev = CurrencyEvidence::default();
+    for text in texts {
+        let toks: Vec<&str> = text
+            .as_ref()
+            .split(|c: char| c.is_whitespace() || "()[]{}|/:;\"'<>=（）【】「」".contains(c))
+            .filter(|t| !t.is_empty())
+            .collect();
+        for (i, tok) in toks.iter().enumerate() {
+            let bound = (tok.chars().any(|c| c.is_ascii_digit()) && currency_amount_digits(tok))
+                || (i > 0 && currency_amount_token(toks[i - 1]))
+                || toks.get(i + 1).map_or(false, |n| currency_amount_token(n));
+            match currency_code_of(tok) {
+                Some(code) => {
+                    let bucket = if bound { &mut ev.bound } else { &mut ev.loose };
+                    if !bucket.iter().any(|c| c == code) {
+                        bucket.push(code.to_string());
+                    }
+                }
+                None => {
+                    let letters: String = tok
+                        .to_lowercase()
+                        .chars()
+                        .filter(|c| !c.is_ascii_digit() && !",.-+".contains(*c))
+                        .collect();
+                    let short = bound
+                        && !letters.is_empty()
+                        && CURRENCY_SHORT_MARKS.split(',').map(|m| m.trim()).any(|m| m == letters);
+                    if short || has_currency_signal(tok) {
+                        ev.unresolved += 1;
+                    }
+                }
+            }
+        }
+    }
+    ev
+}
+
+pub fn currency_answer_admitted(answer: &str, ev: &CurrencyEvidence) -> bool {
+    if ev.unresolved > 0 {
+        return true;
+    }
+    match currency_code_of(answer) {
+        Some(code) => ev.bound.iter().chain(ev.loose.iter()).any(|c| c == code),
+        None => false,
+    }
+}
+
+pub fn currency_line_unmarked(text: &str) -> bool {
+    let has_amount = text
+        .split(|c: char| c.is_whitespace() || "()[]{}|/:;<>=".contains(c))
+        .any(|t| !t.is_empty() && currency_amount_token(t));
+    has_amount && currency_evidence(&[text]).is_silent()
+}
+
+pub fn normalize_currency_value(raw: &str, doc_lang: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("null") {
+        return default_currency_for_lang(doc_lang).to_string();
+    }
+    if let Some(code) = currency_code_of(t) {
+        return code.to_string();
+    }
+    if t.chars().any(|c| c.is_ascii_digit()) {
+        if let Some(iso) = t.split(|c: char| !c.is_ascii_alphabetic()).find(|w| {
+            w.len() == 3
+                && w.chars().all(|c| c.is_ascii_uppercase())
+                && ISO_4217_ACTIVE.split_whitespace().any(|code| code == *w)
+        }) {
+            return iso.to_string();
+        }
+    }
+    if currency_amount_like(t) {
+        return default_currency_for_lang(doc_lang).to_string();
+    }
+    t.to_uppercase()
+}
+
+pub fn is_bracket_annotation(s: &str) -> bool {
+    let t = s.trim();
+    if t.chars().count() < 2 { return false; }
+    let first = match t.chars().next() { Some(c) => c, None => return false };
+    let last = match t.chars().last() { Some(c) => c, None => return false };
+    matches!(
+        (first, last),
+        ('(', ')') | ('[', ']') | ('（', '）') | ('【', '】') | ('〔', '〕')
+    )
+}
+
+pub fn pug_line_is_ui_control(line: &str) -> bool {
+    let t = line.trim_start();
+    let tag_end = t.find(|c: char| c == '[' || c == ' ' || c == '|').unwrap_or(t.len());
+    let tag = &t[..tag_end];
+    if tag == "button" { return true; }
+    if tag == "input" {
+        let lower = t.to_lowercase();
+        return ["type=\"button\"", "type=\"submit\"", "type=\"reset\"", "type='button'", "type='submit'", "type='reset'"]
+            .iter()
+            .any(|p| lower.contains(p));
+    }
+    false
+}
+
+pub fn pug_line_visible_data(line: &str) -> bool {
+    if pug_line_is_ui_control(line) { return false; }
+    let (head, text) = match line.find('|') {
+        Some(p) => (&line[..p], line[p + 1..].trim()),
+        None => return false,
+    };
+    if text.is_empty() { return false; }
+    let h = head.trim_start();
+    if h.starts_with("input") {
+        let lower = h.to_lowercase();
+        return !["hidden", "checkbox", "radio"].iter().any(|t| {
+            lower.contains(&format!("type=\"{}\"", t)) || lower.contains(&format!("type='{}'", t))
+        });
+    }
+    true
+}
+
+pub fn pug_cell_sole_value(lines: &[String], idxs: &[usize]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for &li in idxs {
+        let line = match lines.get(li) { Some(l) => l, None => continue };
+        if pug_line_is_ui_control(line) { continue; }
+        let (head, text) = match line.find('|') {
+            Some(p) => (&line[..p], line[p + 1..].trim()),
+            None => (line.as_str(), ""),
+        };
+        let h = head.trim_start();
+        if h.starts_with("input") {
+            let lower = h.to_lowercase();
+            if lower.contains("type=\"hidden\"") || lower.contains("type='hidden'") { continue; }
+            return None;
+        }
+        if h.starts_with("select")
+            || h.starts_with("textarea")
+            || h.contains("href=")
+            || h.contains("onclick")
+            || h.contains("data-url")
+        {
+            return None;
+        }
+        if text.is_empty() { continue; }
+        if found.is_some() { return None; }
+        found = Some(text.to_string());
+    }
+    found
+}
+
+pub fn premap_rep_better(new: (u8, u8, i32, f32, usize), old: (u8, u8, i32, f32, usize)) -> bool {
+    if new.0 != old.0 { return new.0 < old.0; }
+    let new_note = new.2 == 0;
+    let old_note = old.2 == 0;
+    if new_note != old_note { return old_note; }
+    if new.1 != old.1 { return new.1 < old.1; }
+    if new.1 == 1 {
+        if (new.3 - old.3).abs() > 0.01 { return new.3 > old.3; }
+        if new.2 != old.2 { return new.2 > old.2; }
+        return new.4 > old.4;
+    }
+    if new.2 != old.2 { return new.2 > old.2; }
+    if (new.3 - old.3).abs() > 0.01 { return new.3 > old.3; }
+    new.4 > old.4
+}
+
+pub fn is_document_number_shaped(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() || !v.chars().any(|c| c.is_numeric()) {
+        return false;
+    }
+    if !has_date_shape(v) {
+        return true;
+    }
+    let norm = normalize_digits_ascii(v);
+    for tok in norm.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
+        let mut segs: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_digit: Option<bool> = None;
+        for ch in tok.chars() {
+            let d = ch.is_ascii_digit();
+            if cur_digit.map_or(false, |x| x != d) && !cur.is_empty() {
+                segs.push(std::mem::take(&mut cur));
+            }
+            cur.push(ch);
+            cur_digit = Some(d);
+        }
+        if !cur.is_empty() {
+            segs.push(cur);
+        }
+        for (i, s) in segs.iter().enumerate() {
+            if s.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if DATE_UNIT_MARKERS.iter().any(|u| *u == s.as_str()) || month_from_name(s).is_some() {
+                continue;
+            }
+            if i > 0 && s.chars().count() <= 2 {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+pub fn is_ip_address_literal(value: &str) -> bool {
+    let parts: Vec<&str> = value.trim().split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 3
+                && p.chars().all(|c| c.is_ascii_digit())
+                && (p.len() == 1 || !p.starts_with('0'))
+                && p.parse::<u16>().map_or(false, |n| n <= 255)
+        })
+}
+
+pub fn resolve_page_asset_link(value: &str, page_lines: &[&str]) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.contains('/') || !v.contains('.') || v.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    let tail = format!("/{}", v.to_lowercase());
+    let mut found: Vec<String> = Vec::new();
+    for line in page_lines.iter() {
+        for attr in ["href=", "src="] {
+            let mut rest: &str = line;
+            while let Some(pos) = rest.find(attr) {
+                let after = &rest[pos + attr.len()..];
+                let quote = match after.chars().next() {
+                    Some(q) if q == '"' || q == '\'' => q,
+                    _ => {
+                        rest = after;
+                        continue;
+                    }
+                };
+                let body = &after[1..];
+                let end = match body.find(quote) {
+                    Some(e) => e,
+                    None => break,
+                };
+                let url = body[..end].trim();
+                let path = url.split(|c| c == '?' || c == '#').next().unwrap_or("");
+                if path.to_lowercase().ends_with(&tail) && !found.iter().any(|u| u == url) {
+                    found.push(url.to_string());
+                }
+                rest = &body[end + 1..];
+            }
+        }
+    }
+    if found.len() == 1 { found.pop() } else { None }
+}
+
+pub fn is_grouped_digit_literal(value: &str) -> bool {
+    let t = value.trim();
+    let body = t.strip_prefix('+').unwrap_or(t);
+    let groups: Vec<&str> = body.split('-').collect();
+    groups.len() >= 3
+        && groups
+            .iter()
+            .all(|g| !g.is_empty() && g.chars().all(|c| c.is_ascii_digit()))
+}
+
+pub fn value_matches_format(fmt: FieldFormat, value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() { return false; }
+    if is_bare_markup_token(v) { return false; }
+    if matches!(fmt, FieldFormat::Phone | FieldFormat::Numeric) && is_ip_address_literal(v) { return false; }
+    match fmt {
+        FieldFormat::Synthesis => true,
+        FieldFormat::Enum => !has_date_shape(v),
+        FieldFormat::Text => v.chars().any(|c| c.is_alphabetic()) && v.chars().count() >= 2,
+        FieldFormat::Numeric => {
+            if has_date_shape(v) || is_grouped_digit_literal(v) {
+                return false;
+            }
+
+            let core: String = v
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != ',' && *c != '%')
+                .collect();
+            if core.is_empty() {
+                return false;
+            }
+            let stripped: String = core
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+                .collect();
+            let symbols = core.chars().count().saturating_sub(stripped.chars().count());
+            if symbols * 2 > core.chars().count() {
+                return false;
+            }
+            stripped.chars().any(|c| c.is_ascii_digit())
+        },
+        FieldFormat::Date => {
+            has_date_shape(v)
+        },
+        FieldFormat::Link => {
+            let lower = v.to_lowercase();
+            v.contains('/') || lower.starts_with("http") || lower.starts_with("www.")
+        },
+        FieldFormat::TrackingCode => !has_date_shape(v) && longest_code_token_len(v) >= 8,
+        FieldFormat::Identifier => !has_date_shape(v) && longest_code_token_len(v) >= 4,
+        FieldFormat::Phone => {
+            let digits = v.chars().filter(|c| c.is_ascii_digit()).count();
+            if digits < 7 { return false; }
+            v.chars().all(|c| c.is_ascii_digit() || c.is_whitespace() || "+-().,".contains(c))
+        },
+        FieldFormat::Address => {
+            if v.split_whitespace().count() < 2 { return false; }
+            if v.chars().count() < 6 { return false; }
+            let lower = v.to_lowercase();
+            if lower.starts_with("http") { return false; }
+            v.chars().any(|c| c.is_alphabetic())
+        },
+    }
+}
+
+pub fn is_id_link_field(field_name: &str) -> bool {
+    let lower = field_name.to_lowercase();
+    let keys: Vec<&str> = lower.split(',').map(|s| s.trim()).collect();
+    keys.contains(&"id") && keys.contains(&"link")
+}
+
+pub fn field_value_vocabulary(doc_lang: &str, page_type: &str, field: &str) -> Vec<String> {
+    let lower = field.to_lowercase();
+    let fmt = detect_field_format(field);
+    if lower.contains("currency") || is_id_link_field(field) || fmt == FieldFormat::Link {
+        return Vec::new();
+    }
+    let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
+    let root = dict.get(field).and_then(|n| n.get("bias")).and_then(|b| b.as_str());
+    if fmt != FieldFormat::Enum && root.is_none() {
+        return Vec::new();
+    }
+    let mut phrases: Vec<String> = Vec::new();
+    if let Some(r) = root {
+        phrases.extend(split_bias_phrases_full(r));
+    }
+    if let Some(node) = bias_node(doc_lang, page_type, field) {
+        if let Some(b) = node.get("bias").and_then(|x| x.as_str()) {
+            phrases.extend(split_bias_phrases_full(b));
+        }
+    }
+    if lower == "status" {
+        for k in enum_status_keys(page_type) {
+            phrases.extend(status_key_phrases(k));
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for p in phrases {
+        let t = p.trim().to_lowercase();
+        let key = if t.is_ascii() {
+            let words: Vec<&str> = t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+            if words.iter().map(|w| w.chars().filter(|c| c.is_alphabetic()).count()).sum::<usize>() < 2 {
+                continue;
+            }
+            format!(" {} ", words.join(" "))
+        } else {
+            let n = lower_alnum(&t);
+            if n.chars().filter(|c| c.is_alphabetic()).count() < 2 {
+                continue;
+            }
+            n
+        };
+        if !out.contains(&key) {
+            out.push(key);
+        }
+    }
+    out
+}
+
+pub fn value_hits_vocabulary(value: &str, vocab: &[String]) -> bool {
+    let norm = lower_alnum(value);
+    if norm.is_empty() {
+        return false;
+    }
+    let spaced = format!(
+        " {} ",
+        value
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let enough_letters = norm.chars().filter(|c| c.is_alphabetic()).count() >= 2;
+    vocab.iter().any(|p| {
+        if p.starts_with(' ') {
+            spaced.contains(p.as_str()) || (enough_letters && p.contains(spaced.as_str()))
+        } else {
+            norm.contains(p.as_str()) || (enough_letters && !norm.is_ascii() && p.contains(norm.as_str()))
+        }
+    })
+}
+
+pub fn value_equals_vocabulary(value: &str, vocab: &[String]) -> bool {
+    let norm = lower_alnum(value);
+    if norm.is_empty() {
+        return false;
+    }
+    let spaced = format!(
+        " {} ",
+        value
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    vocab.iter().any(|p| {
+        if p.starts_with(' ') {
+            *p == spaced || p.split_whitespace().collect::<String>() == norm
+        } else {
+            *p == norm
+        }
+    })
+}
+
+pub fn header_column_foreign(
+    field: &str,
+    line_header: Option<&str>,
+    line_value: &str,
+    vocab: &[String],
+    evaluated: &std::collections::HashSet<String>,
+    plausible: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> bool {
+    if vocab.is_empty() || value_hits_vocabulary(line_value, vocab) {
+        return false;
+    }
+    header_judged_foreign(field, line_header, evaluated, plausible)
+}
+
+pub fn header_judged_foreign(
+    field: &str,
+    line_header: Option<&str>,
+    evaluated: &std::collections::HashSet<String>,
+    plausible: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> bool {
+    let h = match line_header.map(|s| s.trim()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    if !evaluated.contains(h) {
+        return false;
+    }
+    match plausible.get(field) {
+        Some(set) => !set.contains(h),
+        None => false,
+    }
+}
+
+
+pub fn split_href_parts(href: &str) -> (String, String, String) {
+    let mut rest: &str = href.trim();
+    let mut host = String::new();
+
+    if let Some(pos) = rest.find("://") {
+        rest = &rest[pos + 3..];
+        let end = rest.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(rest.len());
+        host = rest[..end].to_string();
+        rest = &rest[end..];
+    } else if rest.starts_with("//") {
+        let tmp = &rest[2..];
+        let end = tmp.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(tmp.len());
+        host = tmp[..end].to_string();
+        rest = &tmp[end..];
+    }
+
+    let no_frag = match rest.find('#') { Some(p) => &rest[..p], None => rest };
+    match no_frag.find('?') {
+        Some(p) => (host, no_frag[..p].to_string(), no_frag[p + 1..].to_string()),
+        None => (host, no_frag.to_string(), String::new()),
+    }
+}
+
+pub fn host_region_end(link: &str) -> usize {
+    let total = link.len();
+    if let Some(p) = link.find("://") {
+        let after = p + 3;
+        let rest = &link[after..];
+        return rest.find(|c: char| c == '/' || c == '?' || c == '#').map(|e| after + e).unwrap_or(total);
+    }
+    if link.starts_with("//") {
+        let rest = &link[2..];
+        return rest.find(|c: char| c == '/' || c == '?' || c == '#').map(|e| 2 + e).unwrap_or(total);
+    }
+    0
+}
+
+/// 🌟 [LABEL SURFACE] 식별자 모양(snake_case) 라벨을 임베딩 전에 단어 표기로 펼칩니다.
+///
+///  ── 실측 ──
+///   YAML·JSON 키를 그대로 인쇄한 문서(합성 SR/SA, 시스템이 출력한 서식)는 라벨이 'measurement_cbm' ·
+///   'estimated_time_of_departure_etd' 처럼 밑줄로 이어져 있습니다. 토크나이저가 밑줄을 별도 조각으로
+///   자르므로 같은 단어끼리도 'issue_date' ↔ 'issue date' 0.9398, 'port_of_discharge' ↔ 'pod' 0.9006 으로
+///   코사인이 깎였고, 그 손실이 eta↔etd(+0.0395) · 총중량 동점처럼 1·2위 마진을 그대로 잡아먹었습니다.
+///   자기·참조 게이트는 이미 같은 이유로 표기를 정규화해서 봅니다(gate_surface).
+///
+///  ── 무엇을 바꾸나 ──
+///   공백 없이 밑줄로만 이어진 라벨만 밑줄을 공백으로 바꿉니다. 대소문자 · 숫자 · '/' 는 그대로라
+///   'B/L No.' · 'VAT/EORI' · 'Port of Loading' 처럼 사람이 인쇄한 라벨은 한 글자도 바뀌지 않습니다.
+pub fn label_embed_surface(label: &str) -> String {
+    let t = label.trim();
+    if t.contains('_') && !t.contains(char::is_whitespace) {
+        let words: Vec<&str> = t.split('_').filter(|s| !s.is_empty()).collect();
+        if !words.is_empty() {
+            return words.join(" ");
+        }
+    }
+    t.to_string()
+}
+
+pub fn humanize_url_token(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::new();
+    for (i, ch) in chars.iter().enumerate() {
+        if ch.is_alphanumeric() {
+            let need_space = if i == 0 {
+                false
+            } else {
+                let p = chars[i - 1];
+                if p.is_alphanumeric() {
+                    (p.is_lowercase() && ch.is_uppercase()) || (p.is_ascii_digit() != ch.is_ascii_digit())
+                } else {
+                    true
+                }
+            };
+            if need_space && !out.is_empty() && !out.ends_with(' ') { out.push(' '); }
+            for lc in ch.to_lowercase() { out.push(lc); }
+        } else if !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[derive(Debug, Clone)]
+pub struct IdLinkCandidate {
+    pub token: String,
+    pub href: String,
+    pub role_phrase: String,
+    pub is_host_part: bool,
+    pub prior: f32,
+}
+
+fn push_candidates_from_href(
+    href: &str,
+    out: &mut Vec<IdLinkCandidate>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    let (host, path, query) = split_href_parts(href);
+    let segs: Vec<String> = path.split('/')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let res_role = segs.last()
+        .map(|s| humanize_url_token(s.split('.').next().unwrap_or(s.as_str())))
+        .unwrap_or_default();
+
+    // 1) 쿼리 파라미터 값 : 파라미터 키가 그대로 역할 문구가 됩니다. (product_no=18 → "product register product no")
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            let (k, v) = match pair.find('=') {
+                Some(p) => (&pair[..p], &pair[p + 1..]),
+                None => continue,
+            };
+            let val = v.trim();
+            if val.is_empty() { continue; }
+            if !val.chars().any(|c| c.is_ascii_digit()) { continue; }
+            if val.chars().count() > 32 { continue; }
+
+            let key_role = humanize_url_token(k);
+            if key_role.is_empty() { continue; }
+            let role = if key_role.split_whitespace().count() >= 2 || res_role.is_empty() {
+                key_role
+            } else {
+                format!("{} {}", res_role, key_role).trim().to_string()
+            };
+
+            let dedup = format!("Q::{}::{}", val, role);
+            if !seen.insert(dedup) { continue; }
+            out.push(IdLinkCandidate {
+                token: val.to_string(),
+                href: href.to_string(),
+                role_phrase: role,
+                is_host_part: false,
+                prior: 1.00,
+            });
+        }
+    }
+
+    // 2) 경로 세그먼트 : 직전 세그먼트들이 역할 문구가 됩니다. (/product/view/18 → "product view")
+    for (i, seg) in segs.iter().enumerate() {
+        let clean = seg.split('.').next().unwrap_or(seg.as_str());
+        if clean.is_empty() { continue; }
+        if !clean.chars().any(|c| c.is_ascii_digit()) { continue; }
+        if clean.chars().count() > 32 { continue; }
+
+        let mut ctx: Vec<String> = Vec::new();
+        if i >= 2 { ctx.push(humanize_url_token(&segs[i - 2])); }
+        if i >= 1 { ctx.push(humanize_url_token(&segs[i - 1])); }
+        let joined = ctx.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+        let role = if joined.is_empty() { "url path segment".to_string() } else { joined };
+
+        let prior = if i + 1 == segs.len() { 0.92 } else { 0.80 };
+        let dedup = format!("P::{}::{}", clean, role);
+        if !seen.insert(dedup) { continue; }
+        out.push(IdLinkCandidate {
+            token: clean.to_string(),
+            href: href.to_string(),
+            role_phrase: role,
+            is_host_part: false,
+            prior,
+        });
+    }
+
+    // 3) 호스트 조각 : 'cafe24' 같은 도메인 파편도 후보로 담되,
+    //    도메인 역할 문구를 붙여 코사인이 스스로 떨어뜨리도록 만듭니다.
+    for part in host.split('.') {
+        if part.is_empty() { continue; }
+        if !part.chars().any(|c| c.is_ascii_digit()) { continue; }
+        let dedup = format!("H::{}", part);
+        if !seen.insert(dedup) { continue; }
+        out.push(IdLinkCandidate {
+            token: part.to_string(),
+            href: href.to_string(),
+            role_phrase: "host name domain name website address server address".to_string(),
+            is_host_part: true,
+            prior: 0.05,
+        });
+    }
+}
+
+pub fn collect_id_link_candidates(lines: &[&str]) -> Vec<IdLinkCandidate> {
+    collect_id_link_candidates_capped(lines, 24)
+}
+
+pub fn collect_id_link_candidates_capped(lines: &[&str], limit: usize) -> Vec<IdLinkCandidate> {
+    let href_re = match regex::Regex::new(r#"href=["']([^"']+)["']"#) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut hrefs: Vec<String> = Vec::new();
+    for line in lines {
+        for cap in href_re.captures_iter(line) {
+            if let Some(m) = cap.get(1) {
+                let v = m.as_str().trim().to_string();
+                if v.is_empty() { continue; }
+                let lower = v.to_ascii_lowercase();
+                if lower.starts_with("javascript:") || lower.starts_with("mailto:") || lower.starts_with("tel:") { continue; }
+                if lower == "#" || lower == "#none" { continue; }
+                if !hrefs.contains(&v) { hrefs.push(v); }
+            }
+        }
+    }
+    if hrefs.is_empty() { return Vec::new(); }
+    let mut out: Vec<IdLinkCandidate> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for href in &hrefs {
+        push_candidates_from_href(href, &mut out, &mut seen);
+    }
+    if out.len() > limit { out.truncate(limit); }
+    out
+}
+
+pub fn collect_id_link_candidates_from_url(page_url: &str) -> Vec<IdLinkCandidate> {
+    let mut out: Vec<IdLinkCandidate> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let u = page_url.trim();
+    if u.is_empty() { return out; }
+    push_candidates_from_href(u, &mut out, &mut seen);
+    out.retain(|c| !c.is_host_part);
+    if out.len() > 24 { out.truncate(24); }
+    out
+}
+
+const ID_KEY_WORDS: &[&str] = &["id", "no", "idx", "seq", "code", "num", "number", "uid", "key", "sn"];
+
+pub fn same_id_token(a: &str, b: &str) -> bool {
+    let norm = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
+    let (x, y) = (norm(a), norm(b));
+    !x.is_empty() && x == y
+}
+
+pub fn href_resource_stem(href: &str) -> String {
+    let (_, path, _) = split_href_parts(href);
+    path.split('/')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .last()
+        .map(|s| s.split('.').next().unwrap_or(s).to_lowercase())
+        .unwrap_or_default()
+}
+
+pub fn href_param_key(href: &str, token: &str) -> Option<String> {
+    let (_, _, query) = split_href_parts(href);
+    for pair in query.split('&') {
+        let p = match pair.find('=') {
+            Some(p) => p,
+            None => continue,
+        };
+        if pair[p + 1..].trim() == token {
+            let k = pair[..p].trim().trim_start_matches("amp;").to_lowercase();
+            if !k.is_empty() {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+pub fn candidate_type_evidence(cand: &IdLinkCandidate, aliases: &[&str]) -> u8 {
+    if cand.is_host_part || aliases.is_empty() {
+        return 0;
+    }
+    let alias_hit = |w: &str| aliases.iter().any(|a| w == *a || (a.len() >= 5 && w.starts_with(*a)));
+    let key = href_param_key(&cand.href, &cand.token).unwrap_or_default();
+    let key_words: Vec<String> = humanize_url_token(&key).split_whitespace().map(|s| s.to_string()).collect();
+    if key_words.iter().any(|w| alias_hit(w)) {
+        return 2;
+    }
+    let key_is_id = key.is_empty() || key_words.iter().any(|w| ID_KEY_WORDS.contains(&w.as_str()));
+    if !key_is_id {
+        return 0;
+    }
+    let mut words: Vec<String> = humanize_url_token(&href_resource_stem(&cand.href))
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    words.extend(cand.role_phrase.split_whitespace().map(|s| s.to_string()));
+    if words.iter().any(|w| alias_hit(w)) { 1 } else { 0 }
+}
+
+pub fn url_typed_self_token(page_url: &str, page_type: &str) -> Option<(String, String, u8)> {
+    let self_aliases = crate::logic::relay_type_aliases(page_type);
+    let mut typed: Vec<(String, String, u8)> = collect_id_link_candidates_from_url(page_url)
+        .into_iter()
+        .map(|c| {
+            let ev = candidate_type_evidence(&c, self_aliases);
+            (c.token, c.role_phrase, ev)
+        })
+        .filter(|(_, _, ev)| *ev >= 1)
+        .collect();
+    typed.sort_by(|a, b| b.2.cmp(&a.2));
+    match typed.first() {
+        Some((tok, role, ev)) if !typed.iter().skip(1).any(|(t2, _, e2)| e2 == ev && !same_id_token(t2, tok)) => {
+            Some((tok.clone(), role.clone(), *ev))
+        }
+        _ => None,
+    }
+}
+
+
+pub fn id_resource_affinity(page_url: &str, cand: &IdLinkCandidate, self_aliases: &[&str]) -> f32 {
+    let page_stem = href_resource_stem(page_url);
+    let same_stem = !page_stem.is_empty() && page_stem == href_resource_stem(&cand.href);
+    (if same_stem { 1.0 } else { 0.0 }) + 0.5 * candidate_type_evidence(cand, self_aliases) as f32
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IdRoleCensus {
+    pub rows: usize,
+    pub roles: std::collections::HashMap<String, (usize, std::collections::HashSet<String>)>,
+}
+
+impl IdRoleCensus {
+    pub fn build(all_lines: &[Vec<String>]) -> Self {
+        let mut roles: std::collections::HashMap<String, (usize, std::collections::HashSet<String>)> =
+            std::collections::HashMap::new();
+        for lines in all_lines.iter() {
+            let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for c in collect_id_link_candidates(&refs) {
+                if c.is_host_part || !seen.insert(c.role_phrase.clone()) {
+                    continue;
+                }
+                let e = roles
+                    .entry(c.role_phrase.clone())
+                    .or_insert_with(|| (0, std::collections::HashSet::new()));
+                e.0 += 1;
+                e.1.insert(c.token.to_lowercase());
+            }
+        }
+        Self { rows: all_lines.len(), roles }
+    }
+
+    pub fn row_unique(&self, role: &str) -> bool {
+        if self.rows < 3 {
+            return false;
+        }
+        match self.roles.get(role) {
+            Some((present, distinct)) => *present * 10 >= self.rows * 8 && distinct.len() == *present,
+            None => false,
+        }
+    }
+
+    pub fn coverage(&self, role: &str) -> (usize, usize) {
+        self.roles.get(role).map(|(p, d)| (*p, d.len())).unwrap_or((0, 0))
+    }
+}
+
+pub fn collect_typed_relay_refs(
+    cands: &[IdLinkCandidate],
+    self_token: &str,
+    foreign_types: &[&str],
+) -> Vec<(String, String, String)> {
+    let mut claims: Vec<(String, String, String)> = Vec::new();
+    for t in foreign_types.iter() {
+        let aliases = crate::logic::relay_type_aliases(t);
+        if aliases.is_empty() {
+            continue;
+        }
+        let mut best: Option<(String, u8, String)> = None;
+        let mut conflict = false;
+        for c in cands.iter() {
+            if c.is_host_part || same_id_token(&c.token, self_token) {
+                continue;
+            }
+            let ev = candidate_type_evidence(c, aliases);
+            if ev == 0 {
+                continue;
+            }
+            match best.as_ref() {
+                None => best = Some((c.token.clone(), ev, c.role_phrase.clone())),
+                Some((tok, bev, _)) => {
+                    if ev > *bev {
+                        best = Some((c.token.clone(), ev, c.role_phrase.clone()));
+                        conflict = false;
+                    } else if ev == *bev && !same_id_token(tok, &c.token) {
+                        conflict = true;
+                    }
+                }
+            }
+        }
+        if conflict {
+            continue;
+        }
+        if let Some((tok, _, role)) = best {
+            claims.push((t.to_string(), tok, role));
+        }
+    }
+    let snapshot = claims.clone();
+    claims.retain(|(t, tok, _)| {
+        !snapshot
+            .iter()
+            .any(|(t2, tok2, _)| t2 != t && same_id_token(tok2, tok))
+    });
+    claims
+}
+
+/// 🌟 [ID/LINK SELF ALIAS] 코사인 게이트를 아무 후보도 통과하지 못했을 때 레거시 해석기보다 먼저 봅니다: 이 페이지 유형의
+/// 별칭을 매개변수 이름으로 가진 링크(주문 목록의 od_id, 상품 목록의 it_id ...)가 한 번호로만 나오면 그것이 행 자신의 식별자입니다.
+///
+/// 한 행에 주문 · 상품 · 운송장 · 쿠폰 링크가 함께 있으면 레거시 해석기가 운송장(invoice) 링크를 주문의 자기 식별자로 잡았고,
+/// 그 주문을 주문번호로 가리키는 배송 행의 연결이 한 건도 성립하지 않았습니다 (v2 관계형 합성 데이터: 배송 → 주문 0/22).
+/// URL 매개변수 이름만 보므로 화면 언어와 무관합니다.
+pub fn self_alias_id_link(cands: &[IdLinkCandidate], page_type: &str) -> Option<(String, String)> {
+    let aliases = crate::logic::relay_type_aliases(page_type);
+    if aliases.is_empty() {
+        return None;
+    }
+    let typed: Vec<&IdLinkCandidate> = cands
+        .iter()
+        .filter(|c| !c.is_host_part && candidate_type_evidence(c, aliases) >= 2)
+        .collect();
+    let first = typed.first()?;
+    if typed.iter().all(|c| same_id_token(&c.token, &first.token)) {
+        Some((first.token.clone(), first.href.clone()))
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LabeledTokenCandidate {
+    pub token: String,
+    pub label_phrase: String,
+}
+
+fn is_structural_tag_label(label: &str) -> bool {
+    let l = label.trim().to_lowercase();
+    let tag = l.split(|c: char| c == '[' || c == ' ' || c == '(').next().unwrap_or("");
+    ["td", "th", "tr", "div", "span", "p", "a", "li", "ul", "ol", "input", "table", "tbody", "thead", "label", "button", "textarea"]
+        .contains(&tag)
+}
+
+pub fn collect_labeled_token_candidates(labeled_lines: &[String]) -> Vec<LabeledTokenCandidate> {
+    let mut out: Vec<LabeledTokenCandidate> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in labeled_lines {
+        let (label_raw, value) = match line.find('|') {
+            Some(p) => (line[..p].trim(), line[p + 1..].trim()),
+            None => continue,
+        };
+        if value.is_empty() { continue; }
+
+        let label = if label_raw.is_empty() || is_structural_tag_label(label_raw) {
+            "identifier code number".to_string()
+        } else {
+            label_raw.to_string()
+        };
+
+        for tok in value.split(|c: char| !c.is_alphanumeric()) {
+            let n = tok.chars().count();
+            if n < 2 || n > 32 { continue; }
+            if !tok.chars().any(|c| c.is_ascii_digit()) { continue; }
+            let dedup = format!("{}::{}", label, tok);
+            if !seen.insert(dedup) { continue; }
+            out.push(LabeledTokenCandidate { token: tok.to_string(), label_phrase: label.clone() });
+        }
+    }
+
+    if out.len() > 48 { out.truncate(48); }
+    out
+}
+
+pub fn id_shape_signature(token: &str) -> (usize, bool) {
+    let n = token.chars().count();
+    let digits_only = !token.is_empty() && token.chars().all(|c| c.is_ascii_digit());
+    (n, digits_only)
+}
+
+pub fn id_shape_allowed(token: &str, learned: &[(usize, bool)]) -> bool {
+    if learned.is_empty() { return true; }
+    let (n, digits_only) = id_shape_signature(token);
+
+    let mut min_len = usize::MAX;
+    let mut max_len = 0usize;
+    let mut any_digits_only = false;
+    let mut any_mixed = false;
+    for (l, d) in learned {
+        if *l < min_len { min_len = *l; }
+        if *l > max_len { max_len = *l; }
+        if *d { any_digits_only = true; } else { any_mixed = true; }
+    }
+
+    if digits_only && !any_digits_only { return false; }
+    if !digits_only && !any_mixed { return false; }
+
+    let lo = min_len.saturating_sub(2);
+    let hi = max_len + 2;
+    n >= lo && n <= hi
+}
+
+pub fn same_host(a: &str, b: &str) -> bool {
+    let (ha, _, _) = split_href_parts(a);
+    let (hb, _, _) = split_href_parts(b);
+    if ha.is_empty() || hb.is_empty() { return true; }
+    ha.eq_ignore_ascii_case(&hb)
+}
+
+pub fn resolve_id_link_from_lines(lines: &[&str]) -> Option<(String, String)> {
+    let href_re = regex::Regex::new(r#"href=["']([^"']+)["']"#).ok()?;
+
+    let mut hrefs: Vec<String> = Vec::new();
+    for line in lines {
+        for cap in href_re.captures_iter(line) {
+            if let Some(m) = cap.get(1) {
+                let v = m.as_str().trim().to_string();
+                if !v.is_empty() && !hrefs.contains(&v) { hrefs.push(v); }
+            }
+        }
+    }
+    if hrefs.is_empty() { return None; }
+
+    let mut tokens: Vec<String> = Vec::new();
+    for line in lines {
+        let value = match line.find('|') {
+            Some(p) => line[p + 1..].trim(),
+            None => continue,
+        };
+        for tok in value.split(|c: char| !c.is_alphanumeric()) {
+            if tok.chars().count() < 6 { continue; }
+            if !tok.chars().any(|c| c.is_ascii_digit()) { continue; }
+            let t = tok.to_string();
+            if !tokens.contains(&t) { tokens.push(t); }
+        }
+    }
+    if tokens.is_empty() { return None; }
+
+    let mut best: Option<(String, String)> = None;
+    for tok in &tokens {
+        let lower_tok = tok.to_ascii_lowercase();
+        for h in &hrefs {
+            let lower_h = h.to_ascii_lowercase();
+            let start = host_region_end(h);
+            if start >= lower_h.len() { continue; }
+            if !lower_h[start..].contains(&lower_tok) { continue; }
+
+            let is_better = match &best {
+                None => true,
+                Some((bt, _)) => tok.chars().count() > bt.chars().count(),
+            };
+            if is_better { best = Some((tok.clone(), h.clone())); }
+        }
+    }
+    best
+}
+
+pub fn extract_url_pattern(id: &str, link: &str) -> Option<(String, String)> {
+    if id.is_empty() || link.is_empty() { return None; }
+    if !id.is_ascii() { return None; }
+
+    let lower_link = link.to_ascii_lowercase();
+    let lower_id = id.to_ascii_lowercase();
+
+    let host_end = host_region_end(link);
+    if host_end >= lower_link.len() { return None; }
+
+    // 식별자는 URL 뒤쪽에 오는 것이 일반적이므로 path/query 구간의 '가장 오른쪽' 매칭을 채택합니다.
+    let mut pos_opt: Option<usize> = None;
+    let mut cursor = host_end;
+    while cursor <= lower_link.len() {
+        match lower_link[cursor..].find(&lower_id) {
+            Some(rel) => {
+                let abs = cursor + rel;
+                pos_opt = Some(abs);
+                cursor = abs + lower_id.len().max(1);
+            },
+            None => break,
+        }
+    }
+
+    let pos = pos_opt?;
+    let end = pos + id.len();
+    if !link.is_char_boundary(pos) || !link.is_char_boundary(end) { return None; }
+
+    let prefix = &link[..pos];
+    let suffix = &link[end..];
+    if prefix.is_empty() && suffix.is_empty() { return None; }
+    Some((prefix.to_string(), suffix.to_string()))
+}
+
+// 🌟 [URL PATTERN APPLY] 추출된 패턴에 새 식별자를 대입하여 link를 생성합니다.
+pub fn apply_url_pattern(prefix: &str, suffix: &str, new_id: &str) -> String {
+    format!("{}{}{}", prefix, new_id, suffix)
+}
+
+pub fn find_identifier_token_in_lines(lines: &[String]) -> Option<String> {
+    for line in lines {
+        let value = match line.find('|') {
+            Some(p) => line[p + 1..].trim(),
+            None => continue,
+        };
+        if value.is_empty() { continue; }
+        for tok in value.split(|c: char| !c.is_alphanumeric()) {
+            let char_count = tok.chars().count();
+            if char_count < 8 { continue; }
+            if !tok.chars().any(|c| c.is_ascii_digit()) { continue; }
+            // 순수 알파벳 토큰은 제외 (숫자가 반드시 포함되어야 함)
+            return Some(tok.to_string());
+        }
+    }
+    None
+}
+
+pub fn is_dead_href(href: &str) -> bool {
+    let h = href.trim().to_ascii_lowercase();
+    if h.is_empty() { return true; }
+    if h.starts_with('#') { return true; }
+    if h.starts_with("javascript:") { return true; }
+    if h.starts_with("mailto:") || h.starts_with("tel:") { return true; }
+    false
+}
+
+pub fn line_real_href(line: &str) -> Option<String> {
+    let re = match regex::Regex::new(r#"href=["']([^"']+)["']"#) {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    for cap in re.captures_iter(line) {
+        if let Some(m) = cap.get(1) {
+            let v = m.as_str().trim();
+            if !is_dead_href(v) { return Some(v.to_string()); }
+        }
+    }
+    None
+}
+
+pub fn line_media_src(line: &str) -> Option<String> {
+    let re = match regex::Regex::new(r#"src=["']([^"']+)["']"#) {
+        Ok(r) => r,
+        Err(_) => return None,
+    };
+    for cap in re.captures_iter(line) {
+        if let Some(m) = cap.get(1) {
+            let v = m.as_str().trim();
+            if v.is_empty() || v.starts_with("data:") || v.starts_with("javascript:") { continue; }
+            if v.starts_with("http://") || v.starts_with("https://") || v.starts_with("//") || v.starts_with('/') {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+pub fn enum_cell_plain(field_name: &str, raw: &str) -> Option<String> {
+    let v: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if v.is_empty() || is_bare_markup_token(&v) { return None; }
+    if v.chars().any(|c| c.is_ascii_digit()) { return None; }
+    if v.chars().any(|c| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '|' | ':' | '/' | ';' | ',' | '<' | '>' | '=')) { return None; }
+    if v.split_whitespace().count() > 3 || v.chars().count() > 24 { return None; }
+    if !v.chars().any(|c| c.is_alphabetic()) { return None; }
+    if enum_value_reject(field_name, &v).is_some() { return None; }
+    Some(v)
+}
+
+pub fn status_display_label(canon: &str, doc_lang: &str) -> Option<String> {
+    let native = crate::scripts::native_scripts(doc_lang);
+    if native.is_empty() || native.contains(&crate::scripts::ScriptKind::Latin) {
+        return None;
+    }
+    crate::parsing::BIAS_DICT
+        .get("status_filters")?
+        .get(canon.trim().to_lowercase().as_str())?
+        .get("exact_match")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .find(|s| {
+            let m = crate::scripts::script_mix(s, &native);
+            m.letters > 0 && m.native == m.letters
+        })
+        .map(|s| s.to_string())
+}
+
+pub fn synthesis_value_sheet(item: &serde_json::Value, page_type: &str, doc_lang: &str) -> Option<String> {
+    let obj = item.as_object()?;
+    let skip = |k: &str| -> bool {
+        let l = k.to_lowercase();
+        l == "id" || l == "link" || l == "index" || l == "type" || l == "detail" || l == "digest"
+            || l == "text" || l == "masked_text" || l == "mode" || l == "updated_at" || l == "created_at"
+            || l == "has_header" || l == "has_footer" || l == "language"
+            || l.contains("phone") || l.contains("email") || l.contains("address") || l.contains("zip")
+            || l.starts_with("rel_") || l.starts_with("reference_") || l.starts_with('_')
+            || l.contains("insight") || l.contains("summary") || l.contains("analysis")
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for (k, v) in obj.iter() {
+        if skip(k) { continue; }
+        if crate::utils::canonical::is_relay_index_key(k) && !crate::utils::canonical::relay_value_is_content(v) {
+            continue;
+        }
+        let text = match v {
+            serde_json::Value::String(s) => s.trim().to_string(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Array(a) => a
+                .iter()
+                .filter_map(|x| match x {
+                    serde_json::Value::String(s) => Some(s.trim().to_string()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    serde_json::Value::Object(o) => o
+                        .get("title")
+                        .or_else(|| o.get("name"))
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.trim().to_string()),
+                    _ => None,
+                })
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(", "),
+            _ => String::new(),
+        };
+        if text.is_empty() || text == "null" { continue; }
+        let text = if k.eq_ignore_ascii_case("status") {
+            status_display_label(&text, doc_lang).unwrap_or(text)
+        } else {
+            text
+        };
+        let label = indexing_leaf_label(doc_lang, page_type, k);
+        let label = if label.trim().is_empty() { humanize_url_token(k) } else { label };
+        lines.push(format!("{}: {}", label.trim(), text));
+    }
+    if lines.len() < 2 {
+        return None;
+    }
+    Some(lines.join("\n"))
+}
+
+pub const COUNTRY_NAMES_ML: &[(&str, &str)] = &[
+    ("KR", "korea, south korea, republic of korea, rok, 대한민국, 한국, 남한, 韓国, 大韓民国, 韩国, 韓國, 大韩民国, corée, corée du sud, corea, corea del sur, coreia, coreia do sul, südkorea, corea del sud, южная корея, корея, hàn quốc, เกาหลี, เกาหลีใต้, korea selatan"),
+    ("CN", "china, people's republic of china, prc, p.r.c., 중국, 중화인민공화국, 中国, 中華人民共和国, 中华人民共和国, 中國, 中華人民共和國, chine, république populaire de chine, volksrepublik china, cina, китай, кнр, trung quốc, จีน, tiongkok"),
+    ("VN", "vietnam, viet nam, 베트남, ベトナム, 越南, viêt nam, việt nam, vietname, вьетнам, เวียดนาม"),
+    ("JP", "japan, 일본, 日本, 日本国, japon, japón, japão, giappone, япония, nhật bản, ญี่ปุ่น, jepang"),
+    ("TW", "taiwan, 대만, 타이완, 台湾, 台灣, 臺灣, taïwan, taiwán, тайвань, đài loan, ไต้หวัน"),
+    ("TH", "thailand, 태국, タイ, 泰国, 泰國, thaïlande, tailandia, tailândia, thailandia, таиланд, thái lan, ประเทศไทย, ไทย"),
+    ("IN", "india, 인도, インド, 印度, inde, índia, индия, ấn độ, อินเดีย"),
+    ("ID", "indonesia, 인도네시아, インドネシア, 印度尼西亚, 印尼, indonésie, indonésia, индонезия, อินโดนีเซีย"),
+    ("MY", "malaysia, 말레이시아, マレーシア, 马来西亚, 馬來西亞, malaisie, malasia, malásia, малайзия, มาเลเซีย"),
+    ("PH", "philippines, 필리핀, フィリピン, 菲律宾, 菲律賓, filipinas, philippinen, filippine, филиппины, ฟิลิปปินส์, filipina"),
+    ("BD", "bangladesh, 방글라데시, バングラデシュ, 孟加拉国, 孟加拉國, бангладеш, บังกลาเทศ"),
+    ("KH", "cambodia, 캄보디아, カンボジア, 柬埔寨, cambodge, camboya, camboja, cambogia, kambodscha, камбоджа, กัมพูชา, kamboja"),
+    ("TR", "turkey, türkiye, turkiye, 터키, 튀르키예, トルコ, 土耳其, turquie, turquía, turquia, turchia, türkei, турция, thổ nhĩ kỳ, ตุรกี, turki"),
+    ("US", "usa, u.s.a., u.s., united states, united states of america, america, 미국, 아메리카, アメリカ, 米国, 美国, 美國, états-unis, etats-unis, estados unidos, stati uniti, vereinigte staaten, сша, hoa kỳ, สหรัฐอเมริกา, สหรัฐ, amerika serikat"),
+    ("MX", "mexico, méxico, 멕시코, メキシコ, 墨西哥, mexique, mexiko, messico, мексика, เม็กซิโก, meksiko"),
+    ("CA", "canada, 캐나다, カナダ, 加拿大, canadá, kanada, канада, แคนาดา"),
+    ("BR", "brazil, brasil, 브라질, ブラジル, 巴西, brésil, brasile, brasilien, бразилия, บราซิล"),
+    ("DE", "germany, deutschland, 독일, ドイツ, 德国, 德國, allemagne, alemania, alemanha, germania, германия, đức, เยอรมนี, jerman"),
+    ("IT", "italy, italia, 이탈리아, イタリア, 意大利, 義大利, italie, itália, italien, италия, ý, อิตาลี"),
+    ("FR", "france, 프랑스, フランス, 法国, 法國, francia, frança, frankreich, франция, pháp, ฝรั่งเศส, prancis"),
+    ("ES", "spain, españa, 스페인, スペイン, 西班牙, espagne, espanha, spagna, spanien, испания, tây ban nha, สเปน, spanyol"),
+    ("GB", "uk, u.k., united kingdom, great britain, britain, england, 영국, イギリス, 英国, 英國, royaume-uni, reino unido, regno unito, vereinigtes königreich, großbritannien, великобритания, anh, สหราชอาณาจักร, อังกฤษ, inggris"),
+    ("NL", "netherlands, the netherlands, holland, 네덜란드, オランダ, 荷兰, 荷蘭, pays-bas, países bajos, países baixos, paesi bassi, niederlande, нидерланды, hà lan, เนเธอร์แลนด์, belanda"),
+    ("PL", "poland, polska, 폴란드, ポーランド, 波兰, 波蘭, pologne, polonia, polónia, polen, польша, ba lan, โปแลนด์, polandia"),
+    ("CZ", "czech republic, czechia, česko, česká republika, 체코, チェコ, 捷克, tchéquie, république tchèque, chequia, república checa, chéquia, cechia, tschechien, чехия, séc, เช็ก"),
+    ("SG", "singapore, 싱가포르, シンガポール, 新加坡, singapour, singapur, singapura, сингапур, สิงคโปร์"),
+    ("HK", "hong kong, hongkong, 홍콩, 香港, гонконг, ฮ่องกง"),
+    ("AU", "australia, 호주, 오스트레일리아, オーストラリア, 澳大利亚, 澳洲, australie, austrália, australien, австралия, úc, ออสเตรเลีย"),
+];
+
+fn country_norm(value: &str) -> String {
+    value
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn country_code_of(value: &str) -> Option<&'static str> {
+    let joined = country_norm(value);
+    if joined.is_empty() || joined.split(' ').count() > 5 {
+        return None;
+    }
+    for (code, raw) in COUNTRY_NAMES_ML.iter() {
+        for name in raw.split(',') {
+            let n = country_norm(name);
+            if n.is_empty() { continue; }
+            if joined == n {
+                return Some(*code);
+            }
+            if joined.ends_with(&format!(" {}", n)) {
+                return Some(*code);
+            }
+            if !n.is_ascii() && joined.starts_with(&n) && joined.chars().count() - n.chars().count() <= 2 {
+                return Some(*code);
+            }
+        }
+    }
+    None
+}
+
+pub fn country_code_exact(value: &str) -> Option<&'static str> {
+    let joined = country_norm(value);
+    if joined.is_empty() {
+        return None;
+    }
+    COUNTRY_NAMES_ML
+        .iter()
+        .find(|(_, raw)| raw.split(',').any(|name| country_norm(name) == joined))
+        .map(|(code, _)| *code)
+}
+
+pub fn is_multi_value_field(field_name: &str) -> bool {
+    let lower = field_name.to_lowercase();
+    ["options", "tags", "goods", "additional_goods", "additional_image", "region_restrictions", "address"]
+        .iter()
+        .any(|k| lower.contains(k))
+}
+
+pub fn pug_line_parts(line: &str) -> (usize, String, String, String) {
+    let indent = line.chars().take_while(|c| c.is_whitespace()).count();
+    let trimmed = line.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+
+    let mut depth = 0i32;
+    let mut in_quote: Option<char> = None;
+    let mut pipe_pos: Option<usize> = None;
+
+    for (i, ch) in chars.iter().enumerate() {
+        match in_quote {
+            Some(q) => { if *ch == q { in_quote = None; } },
+            None => {
+                if *ch == '"' || *ch == '\'' { in_quote = Some(*ch); }
+                else if *ch == '[' { depth += 1; }
+                else if *ch == ']' { depth -= 1; }
+                else if *ch == '|' && depth <= 0 { pipe_pos = Some(i); break; }
+            }
+        }
+    }
+
+    let (head, value) = match pipe_pos {
+        Some(p) => (
+            chars[..p].iter().collect::<String>().trim().to_string(),
+            chars[p + 1..].iter().collect::<String>().trim().to_string(),
+        ),
+        None => (trimmed.to_string(), String::new()),
+    };
+
+    let tag = head.split(|c: char| c == '[' || c == ' ' || c == '(').next().unwrap_or("").to_lowercase();
+    let attrs = match head.find('[') { Some(p) => head[p..].to_string(), None => String::new() };
+    (indent, tag, attrs, value)
+}
+
+// 🌟 PUG 속성부에서 특정 속성값을 꺼냅니다. (구조 파싱 전용, 의미 판정에는 쓰지 않습니다)
+pub fn pug_attr_string(attrs: &str, key: &str) -> Option<String> {
+    let pat = format!("{}=\"", key);
+    let start = attrs.find(&pat)? + pat.len();
+    let rest = &attrs[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+pub fn pug_attr_number(attrs: &str, key: &str) -> Option<usize> {
+    pug_attr_string(attrs, key).and_then(|v| v.trim().parse::<usize>().ok())
+}
+
+pub fn pug_attr_flag(attrs: &str, key: &str) -> bool {
+    attrs.split(|c: char| c == '[' || c == ']' || c == ' ')
+        .any(|t| t == key || t.starts_with(&format!("{}=", key)))
+}
+
+// 🌟 컬럼 '제목' 역할 태그 (값이 될 수 없는 태그)
+pub fn is_label_role_tag(tag: &str) -> bool {
+    matches!(tag, "th" | "label" | "legend" | "caption" | "dt"
+        | "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+}
+
+// 🌟 값 라인이 될 수 없는 태그 (제목 + 순수 컨테이너)
+pub fn is_non_value_role_tag(tag: &str) -> bool {
+    if is_label_role_tag(tag) { return true; }
+    matches!(tag, "tr" | "table" | "thead" | "tbody" | "tfoot"
+        | "colgroup" | "col" | "form" | "button")
+}
+
+pub fn is_heading_tag(tag: &str) -> bool {
+    matches!(tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "legend" | "caption")
+}
+
+// 🌟 [STRUCTURAL LABEL-VALUE PAIR] 상세페이지의 라벨-값 결합 결과
+#[derive(Debug, Clone)]
+pub struct DetailPair {
+    pub label: String,        // 예: "결제방법", "주문상태"
+    pub section: String,      // 가장 가까운 상위 제목 (예: "주문하신 분")
+    pub value: String,        // 대표값 (단일 값 필드용)
+    pub value_all: String,    // 셀 전체 병합값 (주소 등 다중 값 필드용)
+    pub primary_line: usize,  // 대표값이 위치한 라인 인덱스
+    pub label_line: usize,
+    pub cell_start: usize,
+    pub cell_end: usize,
+}
+
+fn detail_block_end(lines: &[&str], parts: &[(usize, String, String, String)], start: usize) -> usize {
+    let base = parts[start].0;
+    let mut end = start;
+    for j in (start + 1)..lines.len() {
+        if lines[j].trim().is_empty() { continue; }
+        if parts[j].0 <= base { break; }
+        end = j;
+    }
+    end
+}
+
+fn detail_cell_label_text(
+    lines: &[&str],
+    parts: &[(usize, String, String, String)],
+    start: usize,
+    end: usize,
+) -> String {
+    if !parts[start].3.trim().is_empty() { return parts[start].3.trim().to_string(); }
+    for j in (start + 1)..=end {
+        if lines[j].trim().is_empty() { continue; }
+        let t = parts[j].3.trim();
+        if t.is_empty() { continue; }
+        if parts[j].1 == "input" || parts[j].1 == "button" { continue; }
+        return t.to_string();
+    }
+    String::new()
+}
+
+fn detail_control_kind(tag: &str, attrs: &str) -> Option<u8> {
+    match tag {
+        "select" => Some(2),
+        "textarea" => Some(0),
+        "input" => match pug_attr_string(attrs, "type").unwrap_or_default().to_lowercase().as_str() {
+            "hidden" | "submit" | "button" | "reset" | "image" | "file" => None,
+            "radio" => Some(1),
+            "checkbox" => Some(3),
+            _ => Some(0),
+        },
+        _ => None,
+    }
+}
+
+fn detail_choice_label(
+    lines: &[&str],
+    parts: &[(usize, String, String, String)],
+    at: usize,
+    end: usize,
+) -> Option<usize> {
+    for k in (at + 1)..=end {
+        if lines[k].trim().is_empty() { continue; }
+        let tag = parts[k].1.as_str();
+        if detail_control_kind(tag, &parts[k].2).is_some() { return None; }
+        if matches!(tag, "" | "label" | "span") && !parts[k].3.trim().is_empty() { return Some(k); }
+    }
+    None
+}
+
+fn detail_cell_controls(
+    lines: &[&str],
+    parts: &[(usize, String, String, String)],
+    start: usize,
+    end: usize,
+) -> Option<(Vec<(String, usize)>, std::collections::HashSet<usize>)> {
+    let mut ctrl_indent = usize::MAX;
+    let mut text_indent = usize::MAX;
+    let mut vals: Vec<(u8, std::cmp::Reverse<usize>, usize, String)> = Vec::new();
+    let mut j = start;
+    while j <= end {
+        if lines[j].trim().is_empty() { j += 1; continue; }
+        let (indent, tag, attrs, text) = &parts[j];
+        if j > start && matches!(tag.as_str(), "table" | "tr" | "td" | "th") { return None; }
+        let kind = detail_control_kind(tag, attrs);
+        let checked = pug_attr_flag(attrs, "checked");
+        let rank = if pug_attr_flag(attrs, "disabled") { 2 } else { 0 };
+        match kind {
+            Some(0) => {
+                ctrl_indent = ctrl_indent.min(*indent);
+                if !text.trim().is_empty() {
+                    vals.push((rank, std::cmp::Reverse(text.trim().chars().count()), j, text.trim().to_string()));
+                }
+            }
+            Some(1) | Some(3) => {
+                if kind == Some(1) || checked { ctrl_indent = ctrl_indent.min(*indent); }
+                if checked {
+                    if let Some(k) = detail_choice_label(lines, parts, j, end) {
+                        vals.push((rank.max(1), std::cmp::Reverse(0), k, parts[k].3.trim().to_string()));
+                    }
+                }
+            }
+            Some(_) => {
+                ctrl_indent = ctrl_indent.min(*indent);
+                let sel_end = detail_block_end(lines, parts, j).min(end);
+                for k in (j + 1)..=sel_end {
+                    if parts[k].1 == "option" && pug_attr_flag(&parts[k].2, "selected") && !parts[k].3.trim().is_empty() {
+                        vals.push((rank.max(1), std::cmp::Reverse(0), k, parts[k].3.trim().to_string()));
+                    }
+                }
+                j = sel_end + 1;
+                continue;
+            }
+            None => {
+                let plain = !text.trim().is_empty()
+                    && !matches!(tag.as_str(), "label" | "button" | "legend" | "caption" | "option" | "input")
+                    && !(tag == "th" && j != start);
+                if plain { text_indent = text_indent.min(*indent); }
+            }
+        }
+        j += 1;
+    }
+    if ctrl_indent == usize::MAX || text_indent < ctrl_indent { return None; }
+    vals.sort();
+    let mut keep: std::collections::HashSet<usize> = vals.iter().filter(|v| v.0 < 2).map(|v| v.2).collect();
+    if keep.is_empty() {
+        if let Some(v) = vals.first() { keep.insert(v.2); }
+    }
+    Some((vals.into_iter().map(|(_, _, l, v)| (v, l)).collect(), keep))
+}
+
+fn detail_cell_value_text(
+    lines: &[&str],
+    parts: &[(usize, String, String, String)],
+    start: usize,
+    end: usize,
+) -> (String, String, usize) {
+    if let Some((vals, _)) = detail_cell_controls(lines, parts, start, end) {
+        let mut in_order: Vec<&(String, usize)> = vals.iter().collect();
+        in_order.sort_by_key(|(_, l)| *l);
+        let mut joined: Vec<String> = Vec::new();
+        for (v, _) in in_order {
+            if !joined.contains(v) { joined.push(v.clone()); }
+        }
+        return match vals.first() {
+            Some((v, l)) => (v.clone(), joined.join(" "), *l),
+            None => (String::new(), String::new(), start),
+        };
+    }
+    if ((start + 1)..=end).any(|j| !lines[j].trim().is_empty() && parts[j].1 == "table") {
+        return (String::new(), String::new(), start);
+    }
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut min_indent = usize::MAX;
+    for j in start..=end {
+        if lines[j].trim().is_empty() { continue; }
+        let (indent, tag, attrs, text) = &parts[j];
+        if text.trim().is_empty() { continue; }
+
+        // 라벨/버튼/제목은 값이 아닙니다.
+        if tag == "label" || tag == "button" || tag == "legend" || tag == "caption" { continue; }
+        if tag == "th" && j != start { continue; }
+        // 히든 인풋은 화면에 없는 내부 상태값이므로 셀 값 병합에서 제외합니다.
+        if tag == "input" && pug_attr_string(attrs, "type").as_deref() == Some("hidden") { continue; }
+
+        if *indent < min_indent { min_indent = *indent; }
+        candidates.push(j);
+    }
+    if candidates.is_empty() { return (String::new(), String::new(), start); }
+
+    let mut best_rank = -1i32;
+    let mut best_text = String::new();
+    let mut best_line = start;
+    let mut joined: Vec<String> = Vec::new();
+
+    for j in candidates {
+        // 🌟 최소 깊이보다 깊은 라인 = 그 셀의 '부가 위젯'이므로 대표값에도 병합값에도 넣지 않습니다.
+        if parts[j].0 > min_indent { continue; }
+
+        let tag = &parts[j].1;
+        let owned = parts[j].3.trim().to_string();
+
+        let rank = if line_real_href(lines[j]).is_some() {
+            3
+        } else if tag == "input" || tag == "option" || tag == "select" || tag == "textarea" {
+            2
+        } else if lines[j].contains("href=") {
+            0
+        } else {
+            1
+        };
+
+        if !joined.iter().any(|e| e == &owned) { joined.push(owned.clone()); }
+
+        if rank > best_rank || (rank == best_rank && owned.chars().count() > best_text.chars().count()) {
+            best_rank = rank;
+            best_text = owned;
+            best_line = j;
+        }
+    }
+
+    (best_text, joined.join(" "), best_line)
+}
+
+pub fn detail_control_noise_lines(lines: &[&str]) -> std::collections::HashSet<usize> {
+    let parts: Vec<(usize, String, String, String)> = lines.iter().map(|l| pug_line_parts(l)).collect();
+    let mut noise: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for i in 0..lines.len() {
+        if lines[i].trim().is_empty() || parts[i].1 != "td" { continue; }
+        let end = detail_block_end(lines, &parts, i).max(i);
+        if let Some((_, keep)) = detail_cell_controls(lines, &parts, i, end) {
+            for l in i..=end {
+                if !lines[l].trim().is_empty() && !keep.contains(&l) { noise.insert(l); }
+            }
+        }
+    }
+    noise
+}
+
+pub fn detail_form_profile(lines: &[&str]) -> (usize, usize) {
+    let parts: Vec<(usize, String, String, String)> = lines.iter().map(|l| pug_line_parts(l)).collect();
+    let mut labeled = 0usize;
+    let mut controlled = 0usize;
+    for i in 0..lines.len() {
+        if lines[i].trim().is_empty() || parts[i].1 != "tr" { continue; }
+        let tr_end = detail_block_end(lines, &parts, i);
+        if tr_end <= i { continue; }
+        let child_indent = match ((i + 1)..=tr_end).find(|&j| !lines[j].trim().is_empty() && parts[j].0 > parts[i].0) {
+            Some(j) => parts[j].0,
+            None => continue,
+        };
+        let mut pending_label = false;
+        for j in (i + 1)..=tr_end {
+            if lines[j].trim().is_empty() || parts[j].0 != child_indent { continue; }
+            let cell_end = detail_block_end(lines, &parts, j).max(j);
+            match parts[j].1.as_str() {
+                "th" => {
+                    pending_label = !detail_cell_label_text(lines, &parts, j, cell_end).is_empty();
+                }
+                "td" => {
+                    if pending_label {
+                        labeled += 1;
+                        if detail_cell_controls(lines, &parts, j, cell_end).is_some() {
+                            controlled += 1;
+                        }
+                    }
+                    pending_label = false;
+                }
+                _ => {}
+            }
+        }
+    }
+    (labeled, controlled)
+}
+
+pub fn collect_detail_label_value_pairs(lines: &[&str]) -> Vec<DetailPair> {
+    let n = lines.len();
+    if n == 0 { return Vec::new(); }
+
+    let parts: Vec<(usize, String, String, String)> =
+        lines.iter().map(|l| pug_line_parts(l)).collect();
+
+    // 가장 가까운 상위 제목(섹션) 계산
+    let mut sections: Vec<String> = vec![String::new(); n];
+    {
+        let mut cur = String::new();
+        for i in 0..n {
+            if !lines[i].trim().is_empty() && is_heading_tag(&parts[i].1) && !parts[i].3.trim().is_empty() {
+                cur = parts[i].3.trim().to_string();
+            }
+            sections[i] = cur.clone();
+        }
+    }
+
+    // 가장 가까운 상위 table 라인
+    let enclosing_table = |idx: usize| -> usize {
+        let mut target_indent = parts[idx].0;
+        for j in (0..idx).rev() {
+            if lines[j].trim().is_empty() { continue; }
+            let ind = parts[j].0;
+            if ind < target_indent {
+                if parts[j].1 == "table" { return j; }
+                target_indent = ind;
+            }
+        }
+        usize::MAX
+    };
+
+    let mut pairs: Vec<DetailPair> = Vec::new();
+    let mut table_headers: std::collections::HashMap<usize, std::collections::HashMap<usize, String>> =
+        std::collections::HashMap::new();
+
+    for i in 0..n {
+        if lines[i].trim().is_empty() { continue; }
+        if parts[i].1 != "tr" { continue; }
+
+        let tr_end = detail_block_end(lines, &parts, i);
+        if tr_end <= i { continue; }
+
+        let child_indent = {
+            let mut ci = None;
+            for j in (i + 1)..=tr_end {
+                if lines[j].trim().is_empty() { continue; }
+                if parts[j].0 > parts[i].0 { ci = Some(parts[j].0); break; }
+            }
+            match ci { Some(v) => v, None => continue }
+        };
+
+        let mut cells: Vec<(usize, String, usize, usize)> = Vec::new();
+        let mut col_cursor = 0usize;
+        for j in (i + 1)..=tr_end {
+            if lines[j].trim().is_empty() { continue; }
+            if parts[j].0 != child_indent { continue; }
+            let tag = parts[j].1.clone();
+            if tag != "td" && tag != "th" { continue; }
+            let colspan = pug_attr_number(&parts[j].2, "colspan").unwrap_or(1).max(1);
+            let cell_end = detail_block_end(lines, &parts, j).max(j);
+            cells.push((j, tag, col_cursor, cell_end));
+            col_cursor += colspan;
+        }
+        if cells.is_empty() { continue; }
+
+        let table_id = enclosing_table(i);
+        let all_th = cells.iter().all(|(_, t, _, _)| t == "th");
+
+        if all_th {
+            let map = table_headers.entry(table_id).or_insert_with(std::collections::HashMap::new);
+            for (line_idx, _, col, cell_end) in &cells {
+                let txt = detail_cell_label_text(lines, &parts, *line_idx, *cell_end);
+                if txt.is_empty() { continue; }
+                map.insert(*col, txt);
+            }
+            continue;
+        }
+
+        let mut pending_label: Option<(String, usize)> = None;
+        for (line_idx, tag, col, cell_end) in &cells {
+            if tag == "th" {
+                let txt = detail_cell_label_text(lines, &parts, *line_idx, *cell_end);
+                if !txt.is_empty() { pending_label = Some((txt, *line_idx)); }
+                continue;
+            }
+
+            let (rep, all_v, prim) = detail_cell_value_text(lines, &parts, *line_idx, *cell_end);
+            let (label, label_line) = if let Some((l, li)) = pending_label.clone() {
+                (l, li)
+            } else if let Some(m) = table_headers.get(&table_id) {
+                match m.get(col) { Some(h) => (h.clone(), *line_idx), None => (String::new(), *line_idx) }
+            } else {
+                (String::new(), *line_idx)
+            };
+            pending_label = None;
+
+            if label.trim().is_empty() || rep.trim().is_empty() { continue; }
+            pairs.push(DetailPair {
+                label: label.trim().to_string(),
+                section: sections[label_line].clone(),
+                value: rep,
+                value_all: all_v,
+                primary_line: prim,
+                label_line,
+                cell_start: *line_idx,
+                cell_end: *cell_end,
+            });
+        }
+    }
+
+    let structural_lines: std::collections::HashSet<usize> =
+        pairs.iter().map(|p| p.primary_line).collect();
+
+    for i in 0..n {
+        if lines[i].trim().is_empty() { continue; }
+        if parts[i].1 != "input" && parts[i].1 != "textarea" { continue; }
+        let ph = match pug_attr_string(&parts[i].2, "placeholder") { Some(v) => v, None => continue };
+        if ph.trim().is_empty() { continue; }
+        let v = parts[i].3.trim().to_string();
+        if v.is_empty() { continue; }
+        if structural_lines.contains(&i) { continue; }
+        pairs.push(DetailPair {
+            label: ph.trim().to_string(),
+            section: sections[i].clone(),
+            value: v.clone(),
+            value_all: v,
+            primary_line: i,
+            label_line: i,
+            cell_start: i,
+            cell_end: i,
+        });
+    }
+
+    pairs
+}
+
+pub fn extract_pug_context(lines: &[&str], target_idx: usize) -> String {
+    if lines.is_empty() { return String::new(); }
+    let mut parent_idx = target_idx;
+    let target_indent = lines[target_idx].chars().take_while(|c| c.is_whitespace()).count();
+    
+    for i in (0..target_idx).rev() {
+        let indent = lines[i].chars().take_while(|c| c.is_whitespace()).count();
+        if indent < target_indent && !lines[i].trim().is_empty() {
+            parent_idx = i;
+            break;
+        }
+    }
+
+    let parent_indent = lines[parent_idx].chars().take_while(|c| c.is_whitespace()).count();
+    let mut context_lines = vec![lines[parent_idx]];
+    
+    for i in (parent_idx + 1)..lines.len() {
+        if lines[i].trim().is_empty() { continue; }
+        let indent = lines[i].chars().take_while(|c| c.is_whitespace()).count();
+        if indent <= parent_indent {
+            break;
+        }
+        context_lines.push(lines[i]);
+    }
+    
+    context_lines.join("\n")
+}
+// =====================================================================
+// 🌟 [EMB-BANK] 노름·0벡터 표식을 미리 계산해 둔 임베딩 뱅크 (비트 단위 동일 채점)
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   cosine_similarity 는 호출마다 두 벡터의 노름을 다시 계산하고,
+//   max-pool 계열은 호출마다 0벡터인지 전 요소를 다시 훑었습니다.
+//   Plinko 는 단어 하나에 뱅크 코사인을 ~1만 번(속성 1115 · 필터 437+ · 동사 500 ·
+//   surprisal 2~4회 × ~1800) 계산하므로, 뱅크 쪽 노름 재계산이 CPU 시간의 2/3 였습니다.
+//
+//  ── 해결 ──
+//   뱅크를 만들 때 행마다 l2_norm_exact 와 0벡터 표식을 한 번만 계산합니다.
+//   질의 벡터의 노름도 질의당 한 번만 계산합니다.
+//   cosine_with_norms 는 cosine_similarity 와 '같은 식, 같은 순서' 로 내적·노름을 계산하므로
+//   (Rust 는 FMA 축약이나 부동소수 재결합을 하지 않습니다) 결과가 비트 단위로 같습니다.
+//   행이 많은 뱅크(≥ PAR_MIN_ROWS)는 rayon 으로 코사인을 병렬 계산하되 원래 순서대로
+//   모은 뒤, max / 풀 적재 / 평균·분산은 기존과 같은 순서로 순차 처리합니다.
+// =====================================================================
+
+/// 병렬 코사인으로 전환하는 최소 행 수. (작은 뱅크는 스레드 전환 비용이 더 큽니다)
+pub const PAR_MIN_ROWS: usize = 256;
+
+/// cosine_similarity 와 같은 식의 L2 노름.
+#[inline]
+pub fn l2_norm_exact(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// cosine_similarity 와 비트 단위로 같은 값을 내는, 노름을 미리 받은 코사인.
+#[inline]
+pub fn cosine_with_norms(a: &[f32], na: f32, b: &[f32], nb: f32) -> f32 {
+    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    if na == 0.0 || nb == 0.0 { 0.0 } else { granite_scale(a.len(), dot_product / (na * nb)) }
+}
+
+/// 기존 코드의 `e.iter().all(|&v| v == 0.0)` 와 같은 판정.
+#[inline]
+pub fn is_zero_vec(v: &[f32]) -> bool {
+    v.iter().all(|&x| x == 0.0)
+}
+
+/// 노름·0벡터 표식을 미리 계산한 뱅크(행은 원본을 빌립니다).
+pub struct NormBank<'a> {
+    pub rows: Vec<&'a [f32]>,
+    pub norms: Vec<f32>,
+    pub zero: Vec<bool>,
+}
+
+impl<'a> NormBank<'a> {
+    pub fn new<V: AsRef<[f32]>>(rows: &'a [V]) -> Self {
+        Self::from_rows(rows.iter().map(|r| r.as_ref()).collect())
+    }
+
+    pub fn from_rows(rows: Vec<&'a [f32]>) -> Self {
+        let norms: Vec<f32> = if rows.len() >= PAR_MIN_ROWS {
+            use rayon::prelude::*;
+            rows.par_iter().map(|r| l2_norm_exact(r)).collect()
+        } else {
+            rows.iter().map(|r| l2_norm_exact(r)).collect()
+        };
+        let zero = rows.iter().map(|r| is_zero_vec(r)).collect();
+        Self { rows, norms, zero }
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// 모든 행과의 코사인(원래 순서). 큰 뱅크는 병렬로 계산하고 순서대로 모읍니다.
+    pub fn sims(&self, q: &[f32], qn: f32) -> Vec<f32> {
+        if self.rows.len() >= PAR_MIN_ROWS {
+            use rayon::prelude::*;
+            self.rows
+                .par_iter()
+                .zip(self.norms.par_iter())
+                .map(|(r, n)| cosine_with_norms(q, qn, r, *n))
+                .collect()
+        } else {
+            self.rows.iter().zip(self.norms.iter()).map(|(r, n)| cosine_with_norms(q, qn, r, *n)).collect()
+        }
+    }
+
+    /// i 번째 행과의 코사인.
+    #[inline]
+    pub fn cos(&self, i: usize, q: &[f32], qn: f32) -> f32 {
+        cosine_with_norms(q, qn, self.rows[i], self.norms[i])
+    }
+}
+
+/// max_pool_sim 과 같은 결과(0.0 바닥 · 엄격한 `>` · 0벡터 행도 포함).
+pub fn max_pool_sim_bank(q: &[f32], qn: f32, bank: &NormBank) -> f32 {
+    let mut best = 0.0f32;
+    for s in bank.sims(q, qn) {
+        if s > best { best = s; }
+    }
+    best
+}
+
+/// weighted_max_pool_sim 과 같은 결과(0벡터 행 건너뜀 · 가중치 없으면 1.0).
+pub fn weighted_max_pool_sim_bank(q: &[f32], qn: f32, bank: &NormBank, weights: &[f32]) -> f32 {
+    let mut best = 0.0f32;
+    if bank.rows.len() >= PAR_MIN_ROWS {
+        let sims = bank.sims(q, qn);
+        for (i, s) in sims.into_iter().enumerate() {
+            if bank.zero[i] { continue; }
+            let w = weights.get(i).copied().unwrap_or(1.0);
+            let s = s * w;
+            if s > best { best = s; }
+        }
+    } else {
+        for i in 0..bank.rows.len() {
+            if bank.zero[i] { continue; }
+            let w = weights.get(i).copied().unwrap_or(1.0);
+            let s = bank.cos(i, q, qn) * w;
+            if s > best { best = s; }
+        }
+    }
+    best
+}
+
+/// `for e in bank { if zero(e) continue; m = max(m, cos) }` (0.0 바닥) 와 같은 결과.
+pub fn max_pool_sim_nonzero_bank(q: &[f32], qn: f32, bank: &NormBank) -> f32 {
+    let mut m = 0.0f32;
+    for (i, s) in bank.sims(q, qn).into_iter().enumerate() {
+        if bank.zero[i] { continue; }
+        if s > m { m = s; }
+    }
+    m
+}
+
+/// (category, key, embedding) 트리플 뱅크 + group_sims 의 묶음 구조를 미리 계산합니다.
+pub struct TripleBank<'a> {
+    pub bank: NormBank<'a>,
+    /// 각 행이 속한 묶음 번호(0벡터 행은 None — group_sims 처럼 건너뜀).
+    group_of: Vec<Option<usize>>,
+    /// 묶음 (category, key) 의 첫 등장 순서.
+    pub order: Vec<(String, String)>,
+}
+
+impl<'a> TripleBank<'a> {
+    pub fn new<V: AsRef<Vec<f32>>>(src: &'a [(String, String, V)]) -> Self {
+        let bank = NormBank::from_rows(src.iter().map(|(_, _, e)| e.as_ref().as_slice()).collect());
+        let mut order: Vec<(String, String)> = Vec::new();
+        let mut index: std::collections::HashMap<(String, String), usize> = std::collections::HashMap::new();
+        let mut group_of = Vec::with_capacity(src.len());
+        for (i, (c, k, _)) in src.iter().enumerate() {
+            if bank.zero[i] {
+                group_of.push(None);
+                continue;
+            }
+            let key = (c.clone(), k.clone());
+            let gi = match index.get(&key) {
+                Some(&g) => g,
+                None => {
+                    index.insert(key.clone(), order.len());
+                    order.push(key);
+                    order.len() - 1
+                }
+            };
+            group_of.push(Some(gi));
+        }
+        Self { bank, group_of, order }
+    }
+
+    /// group_sims 와 같은 (묶음별 sims, 풀 적재) 를 만듭니다.
+    fn group_sims(&self, q: &[f32], qn: f32, pool: &mut Vec<f32>) -> Vec<Vec<f32>> {
+        let mut sims: Vec<Vec<f32>> = vec![Vec::new(); self.order.len()];
+        let all = self.bank.sims(q, qn);
+        for (i, s) in all.into_iter().enumerate() {
+            if let Some(g) = self.group_of[i] {
+                pool.push(s);
+                sims[g].push(s);
+            }
+        }
+        sims
+    }
+
+    /// `for (_, _, e) in src { if zero continue; m = max(m, cos) }` (0.0 바닥).
+    pub fn max_nonzero(&self, q: &[f32], qn: f32) -> f32 {
+        max_pool_sim_nonzero_bank(q, qn, &self.bank)
+    }
+}
+
+/// surprisal_dual_scores 와 비트 단위로 같은 결과를 내는 뱅크 캐시 버전.
+/// (같은 순서로 풀을 채우고 같은 surprisal_finish 를 거칩니다)
+pub fn surprisal_dual_scores_bank(
+    query: &[f32],
+    filter_bias: &TripleBank,
+    filter_prej: &TripleBank,
+    schema_names: &[String],
+    schema_banks: &[NormBank],
+    schema_skip: &[bool],
+) -> (Vec<SurprisalScore>, Vec<SurprisalScore>) {
+    let qn = l2_norm_exact(query);
+    let mut pool: Vec<f32> = Vec::new();
+    let f_sims = filter_bias.group_sims(query, qn, &mut pool);
+    let p_sims = filter_prej.group_sims(query, qn, &mut pool);
+
+    let mut s_sims: Vec<Vec<f32>> = Vec::with_capacity(schema_banks.len());
+    for (i, bank) in schema_banks.iter().enumerate() {
+        let mut v: Vec<f32> = Vec::new();
+        if !schema_skip.get(i).copied().unwrap_or(false) {
+            let all = bank.sims(query, qn);
+            for (j, s) in all.into_iter().enumerate() {
+                if bank.zero[j] { continue; }
+                pool.push(s);
+                v.push(s);
+            }
+        }
+        s_sims.push(v);
+    }
+
+    surprisal_finish(&pool, &filter_bias.order, &f_sims, &filter_prej.order, &p_sims, schema_names, &s_sims)
+}
+
+// =====================================================================
+// 🌟 [STAGE1-CTX] RAW-CHUNK n-gram 채점표 (루프 밖에서 한 번 구축)
+// ---------------------------------------------------------------------
+//  ── 무엇이 문제였나 ──
+//   n-gram 마다 7개 카테고리 × get_multi_pass_contexts() 를 다시 만들고
+//   (ko 42KB · en 89KB 의 bias 문자열 재조립, 질의당 ~294회),
+//   키마다 format! 두 번 + HashMap 조회 + 384 f32 벡터 clone 두 번을 했습니다.
+//
+//  ── 해결 ──
+//   get_multi_pass_contexts 는 (BIAS_DICT, cat, lang) 의 순수 함수이므로
+//   카테고리별 (bias 행, prejudice 행) 인덱스를 미리 만들어 둡니다.
+//   조회 문자열·HashMap(같은 키는 마지막 삽입이 이김)은 기존과 똑같이 써서
+//   같은 벡터를 가리키고, 없는 키는 기존의 0벡터처럼 코사인 0.0 으로 취급합니다.
+//   점수 식(정렬·상위 5개 감쇠 합·앵커 0.5·길이 가중치)은 한 글자도 바꾸지 않습니다.
+// =====================================================================
+pub struct LayoutCatCtx {
+    pub cat: String,
+    /// 컨텍스트 키 순서대로 (bias 행, prejudice 행).
+    pub keys: Vec<(Option<usize>, Option<usize>)>,
+    pub anchor: Option<usize>,
+}
+
+pub struct LayoutScoreTable {
+    rows: Vec<Vec<f32>>,
+    norms: Vec<f32>,
+    row_of_key: std::collections::HashMap<String, usize>,
+    pub cats: Vec<LayoutCatCtx>,
+}
+
+impl LayoutScoreTable {
+    pub fn new() -> Self {
+        Self { rows: Vec::new(), norms: Vec::new(), row_of_key: std::collections::HashMap::new(), cats: Vec::new() }
+    }
+
+    fn intern(&mut self, lookup_key: &str, src: &std::collections::HashMap<String, Vec<f32>>) -> Option<usize> {
+        if let Some(&i) = self.row_of_key.get(lookup_key) {
+            return Some(i);
+        }
+        let v = src.get(lookup_key)?;
+        let i = self.rows.len();
+        self.norms.push(l2_norm_exact(v));
+        self.rows.push(v.clone());
+        self.row_of_key.insert(lookup_key.to_string(), i);
+        Some(i)
+    }
+
+    /// 카테고리 하나를 등록합니다(이미 있으면 아무것도 하지 않음).
+    /// `contexts` = get_multi_pass_contexts(cat, lang) 결과 그대로.
+    pub fn ensure_cat(
+        &mut self,
+        cat: &str,
+        contexts: Vec<(String, String, String)>,
+        layout_embs: &std::collections::HashMap<String, Vec<f32>>,
+        anchor_embs: &std::collections::HashMap<String, Vec<f32>>,
+    ) {
+        if self.cats.iter().any(|c| c.cat == cat) {
+            return;
+        }
+        let mut keys = Vec::with_capacity(contexts.len());
+        for (key, _bias, _prej) in contexts {
+            let b = self.intern(&format!("{}_{}_bias", cat, key), layout_embs);
+            let p = self.intern(&format!("{}_{}_prejudice", cat, key), layout_embs);
+            keys.push((b, p));
+        }
+        let anchor = self.intern_anchor(cat, anchor_embs);
+        self.cats.push(LayoutCatCtx { cat: cat.to_string(), keys, anchor });
+    }
+
+    fn intern_anchor(&mut self, cat: &str, anchor_embs: &std::collections::HashMap<String, Vec<f32>>) -> Option<usize> {
+        let key = format!("\u{0}anchor\u{0}{}", cat);
+        if let Some(&i) = self.row_of_key.get(&key) {
+            return Some(i);
+        }
+        let v = anchor_embs.get(cat)?;
+        let i = self.rows.len();
+        self.norms.push(l2_norm_exact(v));
+        self.rows.push(v.clone());
+        self.row_of_key.insert(key, i);
+        Some(i)
+    }
+
+    pub fn has_cat(&self, cat: &str) -> bool {
+        self.cats.iter().any(|c| c.cat == cat)
+    }
+
+    #[inline]
+    fn cos_row(&self, row: Option<usize>, q: &[f32], qn: f32) -> f32 {
+        match row {
+            Some(i) => cosine_with_norms(q, qn, &self.rows[i], self.norms[i]),
+            // 기존: unwrap_or(vec![0.0; 384]) → 노름 0 → 코사인 0.0
+            None => 0.0,
+        }
+    }
+
+    /// STAGE-1 RAW-CHUNK 의 카테고리별 기초 점수(등록 순서). 기존 인라인 루프와 비트 단위로 같습니다.
+    pub fn raw_chunk_scores(&self, test_emb: &[f32], verb_emb: &[f32], word_count: usize) -> Vec<(String, f32)> {
+        let qn = l2_norm_exact(test_emb);
+        let v_sim = cosine_with_norms(test_emb, qn, verb_emb, l2_norm_exact(verb_emb));
+        let beta = if word_count <= 2 { 0.05 } else { 0.10 };
+        let verb_penalty = v_sim * beta;
+        let penalty_weight = if word_count <= 2 { 0.3 } else { 0.7 };
+
+        let mut out = Vec::with_capacity(self.cats.len());
+        for c in &self.cats {
+            let mut field_scores: Vec<f32> = Vec::with_capacity(c.keys.len());
+            for (b, p) in &c.keys {
+                let bias_score = self.cos_row(*b, test_emb, qn);
+                let prej_score = self.cos_row(*p, test_emb, qn);
+                let field_score = (bias_score - (prej_score * penalty_weight) - verb_penalty).max(0.0);
+                field_scores.push(field_score);
+            }
+            let anchor_score = match c.anchor {
+                Some(i) => cosine_with_norms(test_emb, qn, &self.rows[i], self.norms[i]).max(0.0),
+                None => 0.0,
+            };
+            field_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            let mut multi_pass_score = 0.0;
+            let mut weight = 1.0;
+            let max_pass = field_scores.len().min(5);
+            for i in 0..max_pass {
+                multi_pass_score += field_scores[i] * weight;
+                weight *= 0.5;
+            }
+            multi_pass_score += anchor_score * 0.5;
+            let length_weight = 1.0 + ((word_count as f32 - 2.0) * 0.15);
+            let weighted_base_score = multi_pass_score * length_weight;
+            out.push((c.cat.clone(), weighted_base_score));
+        }
+        out
+    }
+
+    /// GAP BRIDGING 대결 점수: 카테고리의 (bias − prejudice).max(0) 상위 5개 감쇠 합.
+    /// 등록되지 않은 카테고리면 None.
+    pub fn gap_score(&self, emb: &[f32], cat: &str) -> Option<f32> {
+        let c = self.cats.iter().find(|c| c.cat == cat)?;
+        let qn = l2_norm_exact(emb);
+        let mut scores: Vec<f32> = Vec::with_capacity(c.keys.len());
+        for (b, p) in &c.keys {
+            scores.push((self.cos_row(*b, emb, qn) - self.cos_row(*p, emb, qn)).max(0.0));
+        }
+        scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let mut score = 0.0;
+        let mut weight = 1.0;
+        for j in 0..scores.len().min(5) {
+            score += scores[j] * weight;
+            weight *= 0.5;
+        }
+        Some(score)
+    }
+}
+
+impl Default for LayoutScoreTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 🌟 [EMBED-PREFETCH] RAW-CHUNK 가 평가할 n-gram 스팬 (start, end, text) 목록.
+/// 기존 이중 루프(start, end = start+2 ..= min(len, start+8))와 같은 순서입니다.
+pub fn raw_chunk_spans(words: &[&str]) -> Vec<(usize, usize, String)> {
+    let mut spans = Vec::new();
+    for start in 0..words.len() {
+        let max_end = words.len().min(start + 8);
+        for end in (start + 2)..=max_end {
+            spans.push((start, end, words[start..end].join(" ")));
+        }
+    }
+    spans
+}
+
+/// 🌟 [EMBED-PREFETCH] 연속 단어 창(길이 min_len..=max_len) 텍스트. 추측성 프리패치용.
+pub fn contiguous_windows(words: &[&str], min_len: usize, max_len: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for start in 0..words.len() {
+        for len in min_len.max(1)..=max_len {
+            if start + len > words.len() { break; }
+            out.push(words[start..start + len].join(" "));
+        }
+    }
+    out
+}
+
+/// 🌟 [EMBED-PREFETCH] scheduler 의 필드 뱅크 루프가 필드마다 1건씩 요청하는 텍스트
+/// (bias_target · split_bias_phrases_weighted 구)를 같은 규칙으로 모읍니다.
+/// `prej_bank` = Some((doc_lang, page_type)) 이면 필드별 prejudice_phrase_bank 구도 넣습니다.
+/// 결합 prejudice(" , " 로 이은 다른 필드 bias 전부)는 루프가 더 이상 임베딩하지 않으므로 넣지 않습니다([DEAD EMBED]).
+pub fn field_bank_prefetch_texts(fields: &[(String, String, String, String)], prej_bank: Option<(&str, &str)>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (fname, _, bias_target, _) in fields.iter() {
+        out.push(bias_target.clone());
+        let (phrases, _) = split_bias_phrases_weighted(bias_target);
+        out.extend(phrases);
+        if let Some((doc_lang, page_type)) = prej_bank {
+            out.extend(prejudice_phrase_bank(doc_lang, page_type, fname));
+        }
+    }
+    out
+}
+
+/// 🌟 [EMBED-PREFETCH] LABEL BANK 루프(필드마다 라벨 구 + 편견 구 2회 호출)의 텍스트를 한 벌로 모읍니다.
+/// 라벨 구가 비어 있는 필드는 루프처럼 건너뜁니다.
+pub fn label_bank_prefetch_texts(fields: &[(String, String, String, String)], doc_lang: &str, page_type: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (fname, _, _, _) in fields {
+        let (label_phrases, _) = label_phrase_bank(doc_lang, page_type, fname);
+        if label_phrases.is_empty() {
+            continue;
+        }
+        out.extend(label_phrases);
+        out.extend(prejudice_phrase_bank(doc_lang, page_type, fname));
+    }
+    out
+}
+
+#[cfg(test)]
+mod label_surface_tests {
+    use super::*;
+
+    #[test]
+    fn identifier_labels_are_spread_into_words_and_printed_labels_stay_as_is() {
+        assert_eq!(label_embed_surface("measurement_cbm"), "measurement cbm");
+        assert_eq!(label_embed_surface("estimated_time_of_departure_etd"), "estimated time of departure etd");
+        assert_eq!(label_embed_surface("  issue_date "), "issue date");
+        assert_eq!(label_embed_surface("__total__gross_weight_kg"), "total gross weight kg");
+        // 사람이 인쇄한 라벨은 한 글자도 바꾸지 않습니다.
+        for s in ["B/L No.", "VAT/EORI", "Port of Loading", "INVOICE NUMBER", "발행일", "HS CODE", "a_b c"] {
+            assert_eq!(label_embed_surface(s), s.trim());
+        }
+        assert_eq!(label_embed_surface("___"), "___");
+    }
+
+    #[test]
+    fn contact_axes_accept_phone_numbers_and_emails() {
+        let fmt = detect_field_format("party_contact");
+        assert_eq!(fmt, FieldFormat::Text);
+        assert!(field_value_matches("party_contact", fmt, "+82-2-1234-5678"));
+        assert!(field_value_matches("party_contact", fmt, "ops@pacific-ocean.example"));
+        assert!(field_value_matches("emergency_contact", detect_field_format("emergency_contact"), "+1 (800) 424-9300"));
+        assert!(!field_value_matches("party_contact", fmt, "12"));
+        // 연락처가 아닌 축은 예전 판정 그대로입니다.
+        assert!(!field_value_matches("party_name", detect_field_format("party_name"), "+82-2-1234-5678"));
+        assert_eq!(
+            field_value_matches("issue_date", detect_field_format("issue_date"), "2026-08-20"),
+            value_matches_format(detect_field_format("issue_date"), "2026-08-20")
+        );
+    }
+}

@@ -4,7 +4,7 @@ import {
   SYNC_BASE_INTERVAL_MS,
   SYNC_MAX_INTERVAL_MS,
   computeSyncInterval,
-  decodeAnalyticBlob,
+  decodeBlob,
   getRootDomain,
   getSyncIntervalMs,
   resetSyncBackoff,
@@ -31,7 +31,7 @@ describe("getRootDomain", () => {
     expect(getRootDomain(host)).toBe(root);
   });
 
-  it.fails("BUG-RT-1 runtime.ts:206 two-part TLD check is a raw endsWith(), so www.costco.kr / www.telecom.my are not reduced", () => {
+  it.fails("BUG-RT-1 runtime.ts:201 two-part TLD check is a raw endsWith(), so www.costco.kr / www.telecom.my are not reduced", () => {
     expect(getRootDomain("www.costco.kr")).toBe("costco.kr");
     expect(getRootDomain("www.telecom.my")).toBe("telecom.my");
   });
@@ -80,7 +80,7 @@ describe("rt() / bindModeRuntime", () => {
   });
 });
 
-describe("decodeAnalyticBlob", () => {
+describe("decodeBlob", () => {
   it.each<[string, unknown, unknown]>([
     ["null", null, {}],
     ["undefined", undefined, {}],
@@ -93,33 +93,33 @@ describe("decodeAnalyticBlob", () => {
     ["a plain object (returned as is)", { foo: 1 }, { foo: 1 }],
     ["a {data:{...}} wrapper (unwrapped)", { data: { x: 1 }, type: "click" }, { x: 1 }],
   ])("decodes %s", (_label, input, expected) => {
-    expect(decodeAnalyticBlob(input)).toEqual(expected);
+    expect(decodeBlob(input)).toEqual(expected);
   });
 
   it("decodes base64 UTF-8 JSON", () => {
-    expect(decodeAnalyticBlob(base64(utf8('{"t":"한글"}')))).toEqual({ t: "한글" });
+    expect(decodeBlob(base64(utf8('{"t":"한글"}')))).toEqual({ t: "한글" });
   });
 
   it("gunzips base64 gzip payloads larger than 50 bytes", () => {
     const payload = { action: "click", summary: "x".repeat(80) };
     const bytes = gzip(JSON.stringify(payload));
     expect(bytes.length).toBeGreaterThan(50);
-    expect(decodeAnalyticBlob(base64(bytes))).toEqual(payload);
+    expect(decodeBlob(base64(bytes))).toEqual(payload);
   });
 
   it("decodes byte arrays: gzip / plain number[], Node Buffer JSON shape, Uint8Array, numeric-key objects", () => {
-    expect(decodeAnalyticBlob(gzip('{"a":1}'))).toEqual({ a: 1 });
-    expect(decodeAnalyticBlob(utf8('{"a":1}'))).toEqual({ a: 1 });
-    expect(decodeAnalyticBlob({ type: "Buffer", data: gzip('{"a":1}') })).toEqual({ a: 1 });
-    expect(decodeAnalyticBlob(Uint8Array.from(gzip('{"a":1}')))).toEqual({ a: 1 });
-    expect(decodeAnalyticBlob({ ...utf8('{"a":1}') })).toEqual({ a: 1 });
+    expect(decodeBlob(gzip('{"a":1}'))).toEqual({ a: 1 });
+    expect(decodeBlob(utf8('{"a":1}'))).toEqual({ a: 1 });
+    expect(decodeBlob({ type: "Buffer", data: gzip('{"a":1}') })).toEqual({ a: 1 });
+    expect(decodeBlob(Uint8Array.from(gzip('{"a":1}')))).toEqual({ a: 1 });
+    expect(decodeBlob({ ...utf8('{"a":1}') })).toEqual({ a: 1 });
   });
 
   it("falls back to UTF-8 when window.pako is unavailable", () => {
     const saved = (window as any).pako;
     try {
       delete (window as any).pako;
-      expect(decodeAnalyticBlob(utf8('{"a":1}'))).toEqual({ a: 1 });
+      expect(decodeBlob(utf8('{"a":1}'))).toEqual({ a: 1 });
     } finally {
       (window as any).pako = saved;
     }
@@ -129,21 +129,21 @@ describe("decodeAnalyticBlob", () => {
     expect(gzip('{"a":1}').length).toBeLessThanOrEqual(50);
   });
 
-  it.fails("BUG-RT-2 runtime.ts:181 base64 gzip payloads of <= 50 bytes are never gunzipped (decoded as {})", () => {
-    expect(decodeAnalyticBlob(base64(gzip('{"a":1}')))).toEqual({ a: 1 });
+  it.fails("BUG-RT-2 runtime.ts:176 base64 gzip payloads of <= 50 bytes are never gunzipped (decoded as {})", () => {
+    expect(decodeBlob(base64(gzip('{"a":1}')))).toEqual({ a: 1 });
   });
 
-  it.fails("BUG-RT-3 runtime.ts:159-160 a Uint8Array view is decoded from its whole underlying buffer, not the view", () => {
+  it.fails("BUG-RT-3 runtime.ts:154-155 a Uint8Array view is decoded from its whole underlying buffer, not the view", () => {
     const view = new TextEncoder().encode('xx{"a":1}').subarray(2);
-    expect(decodeAnalyticBlob(view)).toEqual({ a: 1 });
+    expect(decodeBlob(view)).toEqual({ a: 1 });
   });
 
-  it.fails("BUG-RT-4 runtime.ts:177 a JSON primitive string ('42') is returned as a number, not an object", () => {
-    const decoded = decodeAnalyticBlob("42");
+  it.fails("BUG-RT-4 runtime.ts:172a JSON primitive string ('42') is returned as a number, not an object", () => {
+    const decoded = decodeBlob("42");
     expect(typeof decoded === "object" && decoded !== null && !Array.isArray(decoded)).toBe(true);
   });
 
-  it.fails("BUG-RT-4 runtime.ts:177 the string 'null' decodes to null, not an object", () => {
-    expect(decodeAnalyticBlob("null")).toEqual({});
+  it.fails("BUG-RT-4 runtime.ts:172the string 'null' decodes to null, not an object", () => {
+    expect(decodeBlob("null")).toEqual({});
   });
 });

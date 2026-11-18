@@ -252,7 +252,7 @@ fn qwen35_kv_ssd_tier_with_session() -> R {
     let gpu = tauri_app_lib::utils::get_gpu_device(0);
     let dev = if gpu.is_cpu() { Device::Cpu } else { gpu };
     let label = format!("{:?}", dev.location());
-    let kv_dir = tauri_app_lib::utils::paths::get_kv_dir(None);
+    let kv_dir = tauri_app_lib::utils::paths::get_kv_dir();
     let ids = tokens();
 
     let session_run = |tier: KvResidency, sid: &str| -> anyhow::Result<(Vec<Vec<f32>>, u64, bool)> {

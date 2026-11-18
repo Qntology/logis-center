@@ -30,8 +30,7 @@
 //!  · `seed2`    : `{id, kind, mode, host, type, self, links, arrays, hub, data ...}` 정답 레코드를 추출 경로와 같은 모양
 //!    (id = entity_id, data.index, 연결 칸 = 대상 index)으로 넣습니다. 관계 질의를 추출 오류와 떼어 잽니다.
 //!  · `keys`     : `{id, kind, hosts, items:[[mode, host, 유형, 번호] ...]}` 정답 엔터티의 연결 번호 · 사이트 cc 를 남깁니다.
-//!  · `analytic` : `{id, kind, events, batch}` 행동 로그 합성 행(JSONL, Cloudflare D1 행 모양)을 앱의 동기화와 같은
-//!    순서(upsert_items → structure_pending_analytics → reindex_pending_embeddings)로 넣습니다. `eval_analytic_ingest`.
+//!  · `analytic` : 웹 분석(행동 로그)은 premium-discount 로 옮겨 이 앱에서는 건너뜁니다 (결과 줄 `skipped`).
 #![cfg(any(windows, target_os = "linux"))]
 
 use serde_json::{json, Value};
@@ -124,7 +123,7 @@ async fn seed_record(
     entry: &Value,
     team: &str,
     cancel: &Arc<AtomicBool>,
-    handle: &tauri::AppHandle,
+    sink: &tauri_app_lib::sink::Sink,
 ) -> anyhow::Result<usize> {
     let (host, kind) = (str_of(entry, "host"), str_of(entry, "type"));
     let id = hash_id(str_of(entry, "id"));
@@ -157,7 +156,7 @@ async fn seed_record(
         "commerce",
         str_of(entry, "url"),
         cancel,
-        handle,
+        sink,
         str_of(entry, "id"),
         true,
     )
@@ -183,7 +182,7 @@ async fn seed_linked(
     entry: &Value,
     team: &str,
     cancel: &Arc<AtomicBool>,
-    handle: &tauri::AppHandle,
+    sink: &tauri_app_lib::sink::Sink,
 ) -> anyhow::Result<(String, u32, usize)> {
     let mode = match str_of(entry, "mode") { "" => "commerce", m => m };
     let kind = str_of(entry, "type");
@@ -234,43 +233,10 @@ async fn seed_linked(
     save_item(db, "items", &id, kind, data.clone(), Some(vector), ZERO_ADDR, team, &cc, &bcc, &r#ref, Some(&digest)).await;
     let chunks = index_item_chunks(
         db, model, &id, kind, str_of(entry, "lang"), &data, entry["detail"].as_bool().unwrap_or(true), &cc, &bcc, &r#ref,
-        mode, str_of(entry, "url"), cancel, handle, str_of(entry, "id"), true,
+        mode, str_of(entry, "url"), cancel, sink, str_of(entry, "id"), true,
     )
     .await?;
     Ok((id, index, chunks))
-}
-
-/// 행동 로그 합성 행(JSONL) → upsert_items 가 받는 아이템. modes/analytic.ts 의 fetchAnalyticsOrigin 이 Worker 응답을
-/// 바꾸는 규칙을 그대로 따릅니다: cc = hash(host), bcc = hash(type + cc), ref = hash(팀 + cc + 경로) (html 작업과 같은 식),
-/// 원시 이벤트(action · relate 가 배열)는 updated_at 0, text 는 비워 둡니다(구조화가 채움).
-fn analytic_rows(path: &str, team: &str) -> Vec<Value> {
-    let text = std::fs::read_to_string(path).expect("행동 로그 파일");
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            let row: Value = serde_json::from_str(l).expect("행동 로그 줄");
-            let (host, path) = (str_of(&row, "host"), str_of(&row, "path"));
-            let r#type = str_of(&row, "type").to_string();
-            let cc = hash_id(host);
-            let bcc = hash_id(&format!("{}{}", r#type, cc));
-            let r#ref = hash_id(&format!("{}{}{}", team, cc, path.to_lowercase()));
-            let mut data = row["data"].clone();
-            let id = str_of(&row, "id").to_string();
-            if let Some(o) = data.as_object_mut() {
-                o.insert("id".into(), json!(id));
-                o.insert("type".into(), json!(r#type));
-                o.insert("mode".into(), json!("analytic"));
-                o.insert("updated_at".into(), json!(0));
-                o.insert("text".into(), json!(""));
-                o.insert("masked_text".into(), json!(""));
-            }
-            json!({
-                "id": id, "type": r#type, "flag": "", "from": str_of(&row, "from"), "to": team, "cc": cc, "bcc": bcc,
-                "ref": r#ref, "status": 9, "mode": "analytic", "created_at": row["created_at"].as_i64().unwrap_or(0),
-                "updated_at": 0, "text": "", "masked_text": "", "data": data,
-            })
-        })
-        .collect()
 }
 
 /// `since` 뒤로 만들어졌거나 바뀐 아이템. 목록 행과 상세 페이지가 같은 레코드로 합쳐지는 경우까지 잡습니다.
@@ -327,6 +293,8 @@ fn run_plan() {
     })
     .expect("앱 핸들");
     let handle = app.handle().clone();
+    // model · scheduler 는 이벤트를 Sink 로 내보냅니다 (앱과 같은 TauriSink)
+    let sink = tauri_app_lib::sink::tauri(&handle);
     app.listen("translit-cache-query", |e| {
         let Ok(v) = serde_json::from_str::<Value>(e.payload()) else { return };
         if let Some(tx) = TRANSLIT_PENDING.lock().unwrap().remove(str_of(&v, "request_id")) {
@@ -375,7 +343,7 @@ fn run_plan() {
                 line["ok"] = json!(true);
             } else if str_of(entry, "kind") == "lang_engine" {
                 let (engine, note) =
-                    tauri_app_lib::model::lang_llm::await_engine(str_of(entry, "lang"), &handle, &id, &cancel, 1).await;
+                    tauri_app_lib::model::lang_llm::await_engine(str_of(entry, "lang"), &sink, &id, &cancel, 1).await;
                 line["ok"] = json!(engine.is_lang());
                 line["note"] = json!(note);
             } else if str_of(entry, "kind") == "seed" {
@@ -383,12 +351,12 @@ fn run_plan() {
                 let logis = {
                     let mut g = model.lock().await;
                     if g.is_none() {
-                        *g = Some(LogisModel::new(handle.clone(), None).await.expect("모델"));
+                        *g = Some(LogisModel::new(sink.clone(), None).await.expect("모델"));
                     }
                     g.as_ref().unwrap().clone()
                 };
                 logis.ensure_embedding().await.expect("임베딩 모델");
-                let r = seed_record(&db, &logis, entry, &team, &cancel, &handle).await;
+                let r = seed_record(&db, &logis, entry, &team, &cancel, &sink).await;
                 line["ok"] = json!(r.is_ok());
                 match r {
                     Ok(chunks) => line["chunks"] = json!(chunks),
@@ -400,12 +368,12 @@ fn run_plan() {
                 let logis = {
                     let mut g = model.lock().await;
                     if g.is_none() {
-                        *g = Some(LogisModel::new(handle.clone(), None).await.expect("모델"));
+                        *g = Some(LogisModel::new(sink.clone(), None).await.expect("모델"));
                     }
                     g.as_ref().unwrap().clone()
                 };
                 logis.ensure_embedding().await.expect("임베딩 모델");
-                match seed_linked(&db, &logis, entry, &team, &cancel, &handle).await {
+                match seed_linked(&db, &logis, entry, &team, &cancel, &sink).await {
                     Ok((item_id, index, chunks)) => {
                         line["ok"] = json!(true);
                         line["item_id"] = json!(item_id);
@@ -439,31 +407,8 @@ fn run_plan() {
                     .collect::<Vec<_>>());
                 line["ok"] = json!(true);
             } else if str_of(entry, "kind") == "analytic" {
-                let rows = analytic_rows(str_of(entry, "events"), &team);
-                line["rows"] = json!(rows.len());
-                let batch = entry["batch"].as_u64().unwrap_or(20) as usize;
-                match tauri_app_lib::eval_analytic_ingest(&handle, rows, batch).await {
-                    Ok(v) => {
-                        line["ok"] = json!(true);
-                        line["ingest"] = v;
-                    }
-                    Err(e) => {
-                        line["ok"] = json!(false);
-                        line["error"] = json!(e);
-                    }
-                }
-                {
-                    let mut g = model.lock().await;
-                    if let Some(m) = g.as_ref() {
-                        m.end_task_cleanup("synthetic eval").await;
-                    }
-                    *g = None;
-                }
-                println!("{}", sds::report());
-                sds::flush();
-                if let Some(db) = store.lock().await.as_ref() {
-                    line["items"] = json!(changed_items(db, t0).await);
-                }
+                line["ok"] = json!(true);
+                line["skipped"] = json!("web analytics moved to premium-discount");
             } else if str_of(entry, "kind") == "search" {
                 let r = tauri_app_lib::eval_ai_search(
                     &handle,
@@ -494,7 +439,7 @@ fn run_plan() {
                 if let Some(db) = store.lock().await.as_ref() {
                     let _ = db.add_task(task.clone()).await;
                 }
-                let r = process_task(task.clone(), &store, &model, &cancel, &handle, None).await;
+                let r = process_task(task.clone(), &store, &model, &cancel, &sink, None).await;
                 line["ok"] = json!(r.is_ok());
                 if let Err(e) = r {
                     line["error"] = json!(format!("{:#}", e));

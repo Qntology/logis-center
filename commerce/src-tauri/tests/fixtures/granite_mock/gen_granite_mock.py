@@ -16,7 +16,7 @@ What it is:
   * seeded weights from an exact integer -> float mapping (no libm calls), so every platform writes the same
     bytes; the script prints the SHA-256 and checks it against MOCK_SHA256 below.
   * tokenizer.json (committed next to this script) is a byte-level BPE trained on the app's own bias
-    dictionaries (src/utils/bias.json, full_bias.json) with a small merge budget, so Korean / English /
+    dictionaries (crates/logis-bias/src/bias.json, full_bias.json) with a small merge budget, so Korean / English /
     Japanese phrases get realistic subword lengths (short bank phrases 2-64 tokens, layout texts 65-512,
     joined texts > 512 that exercise the 512-token chunking). [CLS] $A [SEP] post-processing like the real
     tokenizer's encode(text, add_special_tokens=true).
@@ -137,7 +137,7 @@ def corpus_lines():
                 walk(x)
 
     for f in ("bias.json", "full_bias.json"):
-        with open(os.path.join(SRC_TAURI, "src", "utils", f), encoding="utf-8") as fh:
+        with open(os.path.join(SRC_TAURI, "..", "..", "crates", "logis-bias", "src", f), encoding="utf-8") as fh:
             walk(json.load(fh))
     return lines
 

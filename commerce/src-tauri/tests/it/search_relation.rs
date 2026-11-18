@@ -1,10 +1,9 @@
-//! 🌟 [RELATION] 고정점 → 목표 유형 관계 단계 · 서식 질의 근거 · 숫자 식별자 · 날짜 구간 · 행동 종류 (모델 · 저장소 없음)
+//! 🌟 [RELATION] 고정점 → 목표 유형 관계 단계 · 서식 질의 근거 · 숫자 식별자 · 날짜 구간 (모델 · 저장소 없음)
 //!
 //! v2 관계형 합성 데이터의 12개 언어 질의에서 나온 실패를 규칙 단위로 고정합니다.
 
 use chrono::NaiveDate;
 use serde_json::json;
-use tauri_app_lib::analytic::{action_kinds_in_query, doc_action_kinds, event_type_glued_keys};
 use tauri_app_lib::search_relation::{
     arabic_bare_forms, contains_value, expose_own_number, link_self_token, mentions_period, own_ids, query_id_tokens, query_status_codes,
     target_type, trade_target, type_mentions, validity_period,
@@ -166,34 +165,6 @@ fn date_ranges_with_connector_words() {
     assert_eq!((p.start, p.end), (d(2026, 4, 1), d(2026, 4, 3)));
 }
 
-/// 행동 로그의 버튼 행동: 질의 쪽(12개 언어 어간)과 기록 쪽(누른 버튼 글자)이 같은 종류로 만납니다. 페이지 문구는 행동이 아님
-#[test]
-fn analytic_action_kinds() {
-    for q in [
-        "Copperleaf Goods에서 장바구니에 담은 기록",
-        "add-to-cart actions on Copperleaf Goods",
-        "Copperleaf Goodsでカートに入れた記録",
-        "Copperleaf Goods上加入购物车的记录",
-        "Wann wurde bei Copperleaf Goods etwas in den Warenkorb gelegt?",
-        "ajouts au panier sur Copperleaf Goods",
-        "productos añadidos a la cesta en Copperleaf Goods",
-        "aggiunte al carrello su Copperleaf Goods",
-        "itens adicionados ao carrinho na Copperleaf Goods",
-        "toevoegingen aan de winkelwagen bij Copperleaf Goods",
-        "vložení do košíku na Copperleaf Goods",
-        "عمليات الإضافة إلى السلة على Copperleaf Goods",
-    ] {
-        assert_eq!(action_kinds_in_query(q), vec!["add_to_cart".to_string()], "{q}");
-    }
-    assert!(action_kinds_in_query("coupon downloads on the 'Summer getaway picks' event page").contains(&"coupon".to_string()));
-    assert!(action_kinds_in_query("option changes on product pages of こもれび商店").is_empty());
-    for label in ["Add to cart", "장바구니 담기", "カートに入れる", "In den Warenkorb"] {
-        assert_eq!(doc_action_kinds(&json!({ "action": label })), vec!["add_to_cart".to_string()], "{label}");
-    }
-    assert!(doc_action_kinds(&json!({ "action": "Proceed to checkout" })).is_empty());
-    assert!(doc_action_kinds(&json!({ "action": "Charcoal" })).is_empty());
-}
-
 /// 숫자 없는 달 이름은 앞말(in · im · en · a · em · v · في) 뒤에서만 그 달 (영어 may · march 처럼 홀로 선 낱말은 아님)
 #[test]
 fn month_names_after_prepositions() {
@@ -272,24 +243,6 @@ fn period_words_and_validity() {
     let ev = json!({ "type": "event", "started_at": 1781481600000i64, "expired_at": 1783814400000i64 });
     assert_eq!(validity_period(&ev), Some((d(2026, 6, 15), d(2026, 7, 12))));
     assert_eq!(validity_period(&json!({ "type": "goods" })), None);
-}
-
-/// 띄어 쓰지 않는 일본어 · 중국어: 유형 확정어가 낱말 중간에 있어도 확정
-#[test]
-fn glued_event_words() {
-    assert_eq!(event_type_glued_keys("こもれび商店の商品詳細ページでオプションを変更した記録"), vec!["change".to_string()]);
-    assert_eq!(event_type_glued_keys("2026年9月12日から2026年10月2日までのこもれび商店のモバイルタッチ記録"), vec!["touch".to_string()]);
-    assert_eq!(event_type_glued_keys("在こもれび商店商品详情页更改选项的记录"), vec!["change".to_string()]);
-    assert!(event_type_glued_keys("UVカット日傘をカートに入れた記録").is_empty());
-    assert!(event_type_glued_keys("option changes").is_empty());
-}
-
-/// 'taps' · 'appuis' · 'toques' 는 터치 (모바일 탭)
-#[test]
-fn tap_words_are_touch() {
-    for w in ["taps", "appuis", "toques", "tocchi", "tikken", "タップ"] {
-        assert_eq!(tauri_app_lib::analytic::event_type_exact_match(w).as_deref(), Some("touch"), "{w}");
-    }
 }
 
 /// 번역 제목 고정점의 질의 조각: 낱말 1 ~ 5-그램과, 붙여 쓰는 문자 낱말의 글자 조각 (한글은 띄어 쓰므로 낱말 조각만)

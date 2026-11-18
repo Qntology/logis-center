@@ -1,0 +1,24 @@
+[package]
+name = "logis-pug"
+description = "logis-center 글 파이프라인: HTML ↔ PUG 압축 · 블록 매핑 · 레이아웃 판정, 질의 · 배정 도우미(ai_utils), LLM JSON 파싱, JSON → 검색용 자연어(nl_convert), 프롬프트 · JS 템플릿. 모델 · DB · Tauri 없음"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+any_ascii = "0.3.3"
+anyhow.workspace = true
+chrono = { version = "0.4", features = ["serde"] }
+ego-tree = "0.10"
+logis-bias.workspace = true
+logis-schema.workspace = true
+logis-sds.workspace = true
+once_cell.workspace = true
+premium-discount-sds.workspace = true
+rayon = "1.10"
+regex.workspace = true
+scraper = "0.25.0"
+serde.workspace = true
+serde_json.workspace = true
+url = "2.5.7"

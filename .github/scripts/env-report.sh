@@ -117,7 +117,7 @@ g4="$(
   [ -d "$root" ] || root="./commerce"
   [ -f "$root/dist/index.html" ] && echo "dist/index.html: present" || echo "dist/index.html: MISSING"
   if [ -d "$root/src-tauri/dlls" ] && [ -n "$(ls -A "$root/src-tauri/dlls" 2>/dev/null)" ]; then echo "src-tauri/dlls: non-empty"; else echo "src-tauri/dlls: MISSING or empty"; fi
-  [ -f "$root/src-tauri/Cargo.toml" ] && echo "fork path lines: $(grep -cE '^candle-(rocm|core|nn|flash-attn) = \{ path' "$root/src-tauri/Cargo.toml")"
+  [ -f "$root/src-tauri/Cargo.toml" ] && echo "fork path lines: $(cat "$root/src-tauri/Cargo.toml" "$root/../Cargo.toml" 2>/dev/null | grep -cE '^candle-(rocm|core|nn|flash-attn) = \{ path')"
   present "RUSTFLAGS" "${RUSTFLAGS:-}"
   present "CARGO_ENCODED_RUSTFLAGS" "${CARGO_ENCODED_RUSTFLAGS:-}"
   present "LIB" "${LIB:-}"

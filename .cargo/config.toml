@@ -1,0 +1,6 @@
+# 작업 공간 어디에서 cargo 를 불러도 같은 설정을 쓴다 (예전 commerce/src-tauri/.cargo/config.toml 을 옮김).
+# rustflags 를 여러 config 에 두면 배열이 이어 붙어 지문이 바뀌고 전부 다시 빌드되므로 여기 한 곳에만 둔다.
+[build]
+rustflags = ["-C", "target-cpu=native"]
+# 산출물은 예전 자리에 둔다: commerce/*.bat · CI 캐시(logis-center/commerce/src-tauri/target) · Tauri 번들이 이 경로를 본다.
+target-dir = "commerce/src-tauri/target"

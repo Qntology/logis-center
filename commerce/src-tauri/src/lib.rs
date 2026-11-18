@@ -1,31 +1,14 @@
-// 통합 테스트(tests/it)에서 앱 계층(모델 수명주기·저장소·업무규칙·스케줄러)을 검증할 수 있도록 pub 으로 노출합니다.
-pub mod model;
-pub mod store;
+// 🌟 [APP CORE] 모델 상주 · 저장소 · 업무 규칙 · 스케줄러 · 검색 도우미는 헤드리스 코어 crate(commerce/app, logis-app)에 있습니다.
+//    이 셸(Tauri 명령 · 창 · 브라우저 자동화)은 그 모듈들을 예전 이름으로 다시 내보내므로, 명령과 통합 테스트(tests/it)의
+//    경로(crate::model · tauri_app_lib::store …)는 그대로입니다.
+pub use logis_app::{
+    js_templates, logic, model, models, parsers, prompts, scheduler, search_fusion, search_relation, stanza, store, utils,
+};
+pub use logis_app::{bias_schema, json_parse, nl_convert, parsing, score_dynamics, time_guide};
+pub use logis_app::{chat_template, openai_types, position_embed, tokenizer};
 mod automation;
-pub use utils::parsing;
-pub use utils::bias_schema;
-pub use utils::json_parse;
-pub use utils::nl_convert;
-pub use utils::time_guide;
-// 🌟 [SCORE DYNAMICS] 점수를 신호로 취급하는 관측·통계 계층.
-//    bias.json 이 정적 사전이라면 이것은 동적 사전입니다.
-//    Phase 0 에서는 계측과 영속화만 수행하고 판정에는 개입하지 않습니다.
-pub use utils::score_dynamics;
-pub mod logic;
-pub mod scheduler;
-pub mod analytic;
-pub mod stanza;
-pub mod search_fusion;
-pub mod search_relation;
-pub mod js_templates;
-pub mod prompts; // 🌟 새로 추가된 프롬프트 모듈 선언
-pub mod parsers; // 🌟 문서 파서 모듈 선언
-pub mod models;
-pub mod utils;
-pub mod position_embed;
-pub mod openai_types;
-pub mod chat_template;
-pub mod tokenizer;
+// 🌟 [EVENT SINK] model · scheduler 는 tauri::AppHandle 대신 Sink 로 이벤트를 내보냅니다 (명령 진입점에서 sink::tauri 로 감쌈).
+pub mod sink;
 
 use tauri::{State, Manager, Listener, Emitter}; 
 use tokio::sync::Mutex as TokioMutex;
@@ -38,8 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Value, json};
 
 
-// 🌟 [PUB] analytic.rs 의 구조화 루프가 전경 작업 여부를 확인해야 합니다.
-//    (스케줄러 태스크 / AI 검색이 시작되면 2B 모델을 반환하고 양보)
+// 🌟 [PUB] AI 검색이 도는 동안 임베딩 재색인 · 스케줄러가 VRAM 을 양보할 수 있도록 공개합니다.
 pub static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
 // 브라우저가 실행되는 도중 상태를 방어하기 위한 락 추가
 pub static IS_BROWSER_LAUNCHING: AtomicBool = AtomicBool::new(false);
@@ -48,10 +30,8 @@ pub static IS_BROWSER_LAUNCHING: AtomicBool = AtomicBool::new(false);
 pub static CURRENT_BROWSER_STATE: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("stopped".to_string()));
 pub static LAST_BROWSER_STATE_CHANGE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-pub static ACTIVE_TASK_MEM: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
-pub static CURRENT_UI_CATEGORY: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::from("Processing")));
-
-pub static LATEST_PROGRESS_PAYLOAD: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
+// 작업 문맥 · 화면 분류 · 마지막 진행 이벤트는 코어(스케줄러 · 로거 · 모델)가 쓰므로 logis-app 루트에 있습니다.
+pub use logis_app::{ACTIVE_TASK_MEM, CURRENT_UI_CATEGORY, LATEST_PROGRESS_PAYLOAD};
 
 pub struct AppState {
     pub model: Arc<TokioMutex<Option<LogisModel>>>,
@@ -104,10 +84,10 @@ async fn stop_current_extraction(
             let _ = db.delete_message_by_task_id(id).await;
             
             // [CLEANUP] 작업 취소 시 해당 세션의 무거운 KV 캐시와 임시 데이터 폴더를 즉각 삭제하여 디스크 용량을 확보합니다.
-            let kv_dir = crate::utils::paths::get_kv_dir(None).join(id);
-            let base_kv_dir = crate::utils::paths::get_kv_dir(None).join(format!("{}_base", id));
-            let task_data_dir = crate::utils::paths::get_task_specific_dir(None, id);
-            let pug_log_dir = crate::utils::paths::get_pug_logs_dir(None, id);
+            let kv_dir = crate::utils::paths::get_kv_dir().join(id);
+            let base_kv_dir = crate::utils::paths::get_kv_dir().join(format!("{}_base", id));
+            let task_data_dir = crate::utils::paths::get_task_specific_dir(id);
+            let pug_log_dir = crate::utils::paths::get_pug_logs_dir(id);
 
             let _ = std::fs::remove_dir_all(&kv_dir);
             let _ = std::fs::remove_dir_all(&base_kv_dir);
@@ -244,7 +224,7 @@ async fn get_embedding_batch_for_translit(
     let model = {
         let mut model_guard = state.model.lock().await;
         if model_guard.is_none() {
-            match LogisModel::new(app_handle.clone(), None).await {
+            match LogisModel::new(crate::sink::tauri(&app_handle), None).await {
                 Ok(m) => { *model_guard = Some(m); },
                 Err(e) => return Err(format!("Model load failed: {}", e)),
             }
@@ -280,7 +260,7 @@ async fn get_query_embedding(
         }
 
         if model_guard.is_none() {
-            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+            match LogisModel::new(crate::sink::tauri(&app_handle), device_preference.as_deref()).await {
                 Ok(m) => { *model_guard = Some(m); },
                 Err(e) => return Err(format!("Model load failed: {}", e)),
             }
@@ -305,8 +285,8 @@ async fn reindex_pending_embeddings(
     app_handle: tauri::AppHandle,
     limit: Option<usize>,
     device_preference: Option<String>,
-    // 🌟 [MODE ROUTING] commerce / shipping / analytic 트랙을 구분합니다.
-    //    analytic 은 console.logis.center, 나머지는 commerce.logis.center 로 벡터가 전송됩니다.
+    // 🌟 [MODE ROUTING] commerce / shipping 트랙을 구분합니다.
+    //    (웹 분석 analytic 트랙은 premium-discount 로 옮겨 이 앱에는 없습니다)
     mode: Option<String>,
 ) -> Result<Value, String> {
     // 진행 중인 로컬 작업이 있으면 VRAM 충돌 방지를 위해 즉시 반환합니다.
@@ -337,7 +317,6 @@ async fn reindex_pending_embeddings(
 
     let scan_limit = limit.unwrap_or(20);
     // 🌟 [MODE ROUTING] 트랙별로 격리된 문서만 스캔합니다.
-    //    (analytic 트랙 문서는 syncAnalyticsData 가 mode='analytic' 으로 태깅해 저장합니다)
     let target_mode = mode.unwrap_or_else(|| "commerce".to_string());
     let mode_filter = format!("mode = '{}'", target_mode);
     // 🌟 [SCAN STARVATION FIX]
@@ -385,29 +364,11 @@ async fn reindex_pending_embeddings(
         if pending.len() >= scan_limit { break; }
         if state.cancellation_token.load(Ordering::Relaxed) { break; }
         if doc.id.is_empty() { continue; }
-        // 🌟 question / answer 는 관리자 채팅 말풍선 전용 타입입니다.
-        //    upsert_items 가 items 로 라우팅하는데 제외 목록에는 없어 벡터화되고 있었고,
-        //    parse_analytic_query 는 이 두 타입을 검색 스코프에서 제외하므로
-        //    만들기만 하고 한 번도 쓰이지 않는 벡터였습니다.
         // 🌟 [EMBED TYPE GUARD] 검색 벡터화가 무의미한 타입만 배제합니다.
-        //    pages/talk/prompt/ai_search 는 검색 대상이 아니고,
-        //    question/answer 는 parse_analytic_query 가 검색 스코프에서 제외하며,
+        //    pages/talk/prompt/ai_search 는 검색 대상이 아니고, question/answer 는 관리자 채팅 말풍선 전용,
         //    team/user/member 는 통계 문서라 임베딩 대상이 아닙니다.
-        //
-        //    🌟 [ANALYTICS ALLOW]
-        //     ── 무엇이 문제였나 ──
-        //      click / hover 를 이 목록에 넣고, 바로 아래에서 report 까지 별도로 건너뛰어
-        //      analytics 4종(click/hover/change/report) 중 change 하나만 벡터화되었습니다.
-        //      나머지 3종은 vector 컬럼이 0벡터로 남아 search_items 의 ANN 트랙이
-        //      의미 없는 비교를 하게 되고, item_chunks 도 없어 STAGE-4 가 통째로 비었습니다.
-        //      "D1 에서 이벤트를 받아와도 검색이 아무것도 못 찾는" 상태의 직접 원인입니다.
-        //     ── 비용 ──
-        //      analytics 도메인 타입은 get_detail_schema_fields 에 스키마가 없어
-        //      index_item_chunks 가 조기 종료됩니다. 즉 추가 비용은 '문서 벡터 1개' 뿐입니다.
         // 🌟 [제외 타입 위임] 기존 EMBED_EXCLUDE_TYPES 배열은 talk / user 타입 목록의
         //    네 번째 복제본이었습니다. store.rs::is_embed_excluded_type 하나로 통합합니다.
-        //    analytic 원시 이벤트(click/hover/change/touch)와 report 는 제외되지 않습니다.
-        //    그것들이 빠지면 D1 에서 받아온 행동 로그가 검색에 절대 잡히지 않습니다.
         if crate::store::is_embed_excluded_type(&doc.r#type) {
             continue;
         }
@@ -487,7 +448,7 @@ async fn reindex_pending_embeddings(
             }
         }
         if model_guard.is_none() {
-            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+            match LogisModel::new(crate::sink::tauri(&app_handle), device_preference.as_deref()).await {
                 Ok(m) => { *model_guard = Some(m); },
                 Err(e) => return Err(format!("Model load failed: {}", e)),
             }
@@ -565,57 +526,9 @@ async fn reindex_pending_embeddings(
                 }
             }
         }
-        // 🌟 [ANALYTICS] Cron Worker 가 구조화한 'action'(사용자 의도 문장)이 벡터의 본체입니다.
-        //    action 이 없으면 summary → cross_action_flow → intent_evolution 순으로 폴백합니다.
-        //
-        //    🌟 [RAW ARRAY GUARD] content.js 가 처음 올린 원시 이벤트의 action 은
-        //      ["<div class=...>...</div>"] 형태의 '배열' 입니다.
-        //      as_str() 이 None 을 돌려주므로 값 자체는 무해했지만,
-        //      아래 폴백 체인 끝의 json_to_natural_language 가 relate(HTML 배열)까지
-        //      통째로 펼쳐 벡터에 HTML 덩어리를 밀어 넣습니다.
-        //      Worker 의 GET 은 updated_at > 0 인 구조화 완료 행만 내려주므로
-        //      정상 경로에서는 배열이 오지 않지만, 구버전 잔재를 위해 명시적으로 배제합니다.
-        let analytic_text = data.get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        // 🌟 [EMPTY-AWARE FALLBACK] Option 의 or_else 는 None 일 때만 발화합니다.
-        //    summary 키가 존재하되 빈 문자열이면 Some("") 이 되어
-        //    cross_action_flow 폴백이 영원히 도달하지 않았습니다.
-        let pick = |k: &str| -> Option<String> {
-            data.get(k)
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        };
-        let analytic_fallback = pick("summary")
-            .or_else(|| pick("cross_action_flow"))
-            .or_else(|| pick("intent_evolution"))
-            .unwrap_or_default();
-        // 🌟 [RAW EVENT DETECT] 구조화 전 원시 이벤트인지 판정합니다.
-        //    action 이 배열이거나 relate 가 배열이면 Cron Worker 가 아직 손대지 않은 행입니다.
-        let is_raw_event = data.get("action").map_or(false, |v| v.is_array())
-            || data.get("relate").map_or(false, |v| v.is_array());
-
-        let text = if !analytic_text.is_empty() {
-            analytic_text
-        } else if !doc.text.trim().is_empty() {
+        // 문서 본문(text)이 벡터의 본체입니다. 비어 있으면 JSON 을 자연어로 풀어 씁니다.
+        let text = if !doc.text.trim().is_empty() {
             doc.text.clone()
-        } else if !analytic_fallback.is_empty() {
-            analytic_fallback
-        } else if doc.mode == "analytic" || is_raw_event {
-            // 🌟 [RAW GUARD] analytics 문서에 구조화 문장이 하나도 없으면
-            //    json_to_natural_language 가 relate(원시 outerHTML 배열)를 전부 펼쳐
-            //    수천 토큰짜리 HTML 을 임베딩 입력으로 만듭니다.
-            //    그 벡터는 어떤 질의와도 유사하지 않고, 저장 용량만 잡아먹으며,
-            //    embed=1 로 마킹되어 Cron Worker 가 나중에 구조화해도 재인덱싱되지 않습니다.
-            //    Cron 구조화 이후 updated_at 이 갱신되면 다시 후보로 잡히도록 여기서 건너뜁니다.
-            println!(
-                "[EMBED-LOCAL] ⏭️ analytics 문서 '{}' (type='{}') 는 아직 구조화 문장(action/summary/cross_action_flow)이 없어 임베딩을 보류합니다.",
-                doc.id, doc.r#type
-            );
-            continue;
         } else {
             crate::parsing::json_to_natural_language(&data)
         };
@@ -668,17 +581,11 @@ async fn reindex_pending_embeddings(
         };
 
         let cancel = state.cancellation_token.clone();
-        // 🌟 [ANALYTIC TRANSLIT SKIP] analytic 모드는 전처리(run_analytic_structuring)
-        //    단계에서 이미 음차를 완료했습니다.
-        //    임베딩 단계에서 다시 음차하면
-        //    ① Qwen3.5 를 재로딩하거나 상주시켜야 하고
-        //    ② 이미 확정된 문장을 다시 음차하여 결과를 오염시킵니다.
-        let skip_translit = doc.mode == "analytic";
         if needs_chunks {
             let _ = crate::scheduler::indexing::index_item_chunks(
                 &store, &model, &doc.id, &doc.r#type, &doc_lang, &data, true,
-                &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &app_handle, "cloud_sync",
-                skip_translit,
+                &doc.cc, &doc.bcc, &doc.r#ref, &mode, &link, &cancel, &crate::sink::tauri(&app_handle), "cloud_sync",
+                false,
             ).await;
         }
 
@@ -707,133 +614,6 @@ async fn reindex_pending_embeddings(
         }));
     }
     Ok(json!({ "processed": processed, "mode": target_mode }))
-}
-
-// =====================================================================
-// 🌟 [ANALYTIC STRUCTURING ENTRY] D1 → LanceDB 로 내려온 원시 행동 로그를
-//    HTML → PUG → 속성 제거 → Qwen3.5 2B 요약 으로 확정합니다.
-//  ── 호출 시점 ──
-//   main.ts 의 syncAnalyticsData 직후. 임베딩(reindex_pending_embeddings)보다
-//   반드시 먼저 실행되어야 합니다. 텍스트가 없으면 임베딩 경로가
-//   RAW GUARD 로 그 문서를 건너뛰기 때문입니다.
-// =====================================================================
-#[tauri::command]
-async fn structure_pending_analytics(
-    state: State<'_, AppState>,
-    app_handle: tauri::AppHandle,
-    limit: Option<usize>,
-    device_preference: Option<String>,
-) -> Result<Value, String> {
-    if IS_SEARCHING.load(Ordering::SeqCst) {
-        return Ok(json!({ "processed": 0, "skipped": "searching" }));
-    }
-    if crate::ACTIVE_TASK_MEM.read().unwrap().is_some() {
-        return Ok(json!({ "processed": 0, "skipped": "busy" }));
-    }
-    if state.cancellation_token.load(Ordering::Relaxed) {
-        return Ok(json!({ "processed": 0, "skipped": "cancelled" }));
-    }
-
-    let store_opt = {
-        let mut store_guard = state.store.lock().await;
-        if store_guard.is_none() {
-            let db_path = crate::utils::get_app_dir().join("db").to_string_lossy().into_owned();
-            let _ = std::fs::create_dir_all(&db_path);
-            if let Ok(s) = VectorStore::new(&db_path).await {
-                let _ = s.init_all_tables().await;
-                *store_guard = Some(s);
-            }
-        }
-        store_guard.as_ref().cloned()
-    };
-
-    let store = match store_opt {
-        Some(s) => s,
-        None => return Err("DB not initialized".to_string()),
-    };
-
-    // 🌟 [LAZY MODEL LOAD] 대상이 0건이면 Qwen3.5 2B 를 아예 올리지 않습니다.
-    //    (LanceDB 조회 1회로 끝나므로 유휴 시 부담이 사실상 없습니다)
-    let type_list = crate::analytic::ANALYTIC_EVENT_TYPES
-        .iter()
-        .map(|t| format!("'{}'", t))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let probe_filter = format!(
-        "mode = 'analytic' AND updated_at = 0 AND type IN ({})",
-        type_list
-    );
-
-    let probe = store
-        .get_all_items("items", 1, 0, Some(probe_filter))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if probe.is_empty() {
-        return Ok(json!({ "processed": 0, "skipped": "no_pending" }));
-    }
-
-    // 🌟 [PRE-FILTER PROBE] 모델 로드 전에 실제 요약 가능한 텍스트가 있는지 사전 확인합니다.
-    //    기존에는 원시 이벤트가 1건 이상이면 무조건 모델을 로드했지만,
-    //    그 이벤트의 PUG 변환 결과가 비어있으면 모델 로드가 무의미합니다.
-    //    이제 사전 필터링으로 처리 가능한 항목이 0건이면 모델 로드 없이 조기 반환합니다.
-    let scan_filter = format!(
-        "mode = 'analytic' AND updated_at = 0 AND type IN ({})",
-        crate::analytic::ANALYTIC_EVENT_TYPES
-            .iter()
-            .map(|t| format!("'{}'", t))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let scan_docs = store
-        .get_all_items("items", 100, 0, Some(scan_filter))
-        .await
-        .map_err(|e| e.to_string())?;
-    let actionable_count = crate::analytic::count_pending_structuring_targets(&scan_docs, limit.unwrap_or(20));
-    if actionable_count == 0 {
-        println!("[ANALYTIC] ⚪ 원시 이벤트는 있으나 실제 요약 가능한 텍스트가 0건이라 모델 로드를 건너뜁니다.");
-        return Ok(json!({ "processed": 0, "skipped": "no_actionable" }));
-    }
-
-    println!("[ANALYTIC] Pending raw behaviour event detected. Loading Qwen3.5(2B) for structuring...");
-
-    let model = {
-        let mut model_guard = state.model.lock().await;
-
-        if let Some(m) = model_guard.as_ref() {
-            let wants_cpu = device_preference.as_deref() == Some("cpu");
-            if m.is_cpu_mode != wants_cpu {
-                m.deep_purge_resources().await;
-                *model_guard = None;
-            }
-        }
-
-        if model_guard.is_none() {
-            match LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
-                Ok(m) => { *model_guard = Some(m); },
-                Err(e) => return Err(format!("Model load failed: {}", e)),
-            }
-        }
-
-        model_guard.as_ref().unwrap().clone()
-    };
-
-    // 🌟 [PURGE ON ANY EXIT] 기존 코드는 `?` 로 조기 반환되면
-    //    deep_purge_resources 에 도달하지 못해 Qwen3.5(2B) 가 VRAM 에 상주한 채
-    //    남았습니다. 그 상태로 스케줄러 태스크가 들어오면 secure_vram_relay 가
-    //    2GB 를 다시 내리느라 통째로 낭비합니다.
-    //    결과를 먼저 받아 두고, 성공/실패와 무관하게 정리한 뒤 판정합니다.
-    let structuring_result = crate::analytic::run_analytic_structuring(
-        &store,
-        &model,
-        &state.cancellation_token,
-        &app_handle,
-        "analytic_sync",
-        limit.unwrap_or(20),
-    ).await;
-    model.deep_purge_resources().await;
-    let processed = structuring_result.map_err(|e| e.to_string())?;
-    Ok(json!({ "processed": processed }))
 }
 
 #[tauri::command]
@@ -1187,7 +967,7 @@ fn build_scope_filter(ctx: &Value, search_mode: &str) -> Option<String> {
         filters.push(format!("type IN ({})", quoted.join(", ")));
     }
 
-    // ── mode : commerce / shipping / analytic 트랙 격리 ──
+    // ── mode : commerce / shipping 트랙 격리 ──
     if !search_mode.trim().is_empty() {
         filters.push(format!("mode = '{}'", search_mode.replace('\'', "''")));
     }
@@ -2883,7 +2663,7 @@ async fn ai_search_complex(
             }
         }
         if model_guard.is_none() {
-            if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await { 
+            if let Ok(m) = LogisModel::new(crate::sink::tauri(&app_handle), device_preference.as_deref()).await { 
                 *model_guard = Some(m);
             } else { 
                 IS_SEARCHING.store(false, Ordering::SeqCst); 
@@ -2916,7 +2696,7 @@ async fn ai_search_complex(
         "spinner": "⠋" 
     });
     let _ = app_handle.emit("extraction-progress", &payload_start);
-    crate::utils::logger::log_task_progress(&app_handle, &task_id, &payload_start);
+    crate::utils::logger::log_task_progress(&crate::sink::tauri(&app_handle), &task_id, &payload_start);
 
     
     let search_process = async {
@@ -2988,26 +2768,10 @@ async fn ai_search_complex(
         _vocab_scope.also(&language);
         let mut structured_query = match search_mode.as_str() {
             "shipping" => {
-                model.parse_shipping_query(&task_id, &app_handle, query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
-            },
-            "analytic" => {
-                // 🌟 [ANALYTIC QUERY v2 → model.rs]
-                //    parse_analytic_search_query 를 model.rs 의 LogisModel 메서드로 이동합니다.
-                //    parse_commerce_query / parse_shipping_query 와 동일한 호출 패턴으로 통일되어,
-                //    모델 로드·임베딩·Qwen3.5 호출을 LogisModel 내부에서 일괄 관리합니다.
-                model
-                    .parse_analytic_search_query(
-                        &task_id,
-                        &app_handle,
-                        query.clone(),
-                        &language,
-                        cancel_token.clone(),
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?
+                model.parse_shipping_query(&task_id, &crate::sink::tauri(&app_handle), query.clone(), &language, cancel_token.clone()).await.map_err(|e| e.to_string())?
             },
             _ => { // default: commerce
-                model.parse_commerce_query(&task_id, &app_handle, query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
+                model.parse_commerce_query(&task_id, &crate::sink::tauri(&app_handle), query.clone(), &language, &metrics_json_str, cancel_token.clone()).await.map_err(|e| e.to_string())?
             }
         };
 
@@ -3020,102 +2784,6 @@ async fn ai_search_complex(
         if search_mode == "shipping" {
             ground_trade_conditions(&mut structured_query, &query, &emit_term);
         }
-
-        // 🌟 [ANALYTIC PAGE / SITE] 행동 로그 질의에 사이트 이름이 하나 나오면(앱이 사이트를 고르지 않았을 때) 그 사이트로 좁히고,
-        //    페이지 종류가 나오면 회수한 문서를 link 경로의 페이지 종류로 거릅니다 (analytic.rs 의 도메인 · 경로 정의).
-        let analytic_pages: Vec<String> = if search_mode == "analytic" {
-            structured_query
-                .get("page_kinds")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        // 🌟 [ANALYTIC ACTION] 장바구니 담기 · 바로 구매 · 찜 · 쿠폰 받기 같은 버튼 행동(bias.json analytic_action_filters)을 물으면
-        //    유형을 그 행동이 기록되는 유형(데스크톱 click · 모바일 touch)으로 바꾸고, 회수한 기록을 누른 버튼 글자로 거릅니다.
-        //    v2 질의: '장바구니에 담은 기록' 이 change · hover 로 판정되어 정답 click · touch 기록이 유형 조건에서 빠졌습니다.
-        // 🌟 [ANALYTIC NEGATION] 부정어가 걸린 행동('쿠폰을 받지 않은')은 거를 조건이 아니라 없어야 하는 행동입니다 (페이지는 해석기가 이미 뺌).
-        let analytic_negation = if search_mode == "analytic" {
-            crate::analytic::NegatedConditions::from_query_json(&structured_query)
-        } else {
-            crate::analytic::NegatedConditions::default()
-        };
-        let analytic_actions: Vec<String> = if search_mode == "analytic" {
-            crate::analytic::action_kinds_in_query(&query).into_iter().filter(|k| !analytic_negation.actions.contains(k)).collect()
-        } else {
-            Vec::new()
-        };
-        // 🌟 [ANALYTIC PAGE / TYPE] 페이지 종류(결제 페이지 · 상품 상세 …)가 있고 이벤트 유형이 확정어가 아니라 벡터 추정이면 유형으로 좁히지 않고
-        //    전체 유형을 회수하되, 추정 유형의 기록을 앞에 둡니다 (아래 5-D1). 페이지 조건이 정확한 거름이고, 추정 유형으로 좁히면 추정이
-        //    틀릴 때 정답이 빠졌습니다 (v2 질의 A4 한국어: '결제 페이지까지 갔다가' → hover · touch, 정답은 결제 페이지의 change · click).
-        //    추정이 맞을 때(A2 '옵션을 바꾼' → change)는 순서가 그대로 남습니다 — 전체로만 넓히면 다른 유형이 앞에 섞여 A2 가 1.0 → 0.2 였습니다.
-        //    report 가 질의의 유형이 아니라 안전망으로 덧붙은 것이면(report_fallback, 질의가 요약 · 통계를 묻지 않음) 묻는 유형의 기록을
-        //    report 보다 앞에 둡니다 (v2 질의 A2 일본어 · 중국어: '変更' · '更改' 로 change 가 확정되었는데 같은 상품 페이지의 report 가 1위).
-        let event_exact = structured_query.get("event_exact").and_then(|v| v.as_bool()).unwrap_or(true);
-        let report_fallback = structured_query.get("report_fallback").and_then(|v| v.as_bool()).unwrap_or(false);
-        let widen_types = search_mode == "analytic" && !analytic_pages.is_empty() && analytic_actions.is_empty() && !event_exact;
-        let mut analytic_lift: Vec<String> = Vec::new();
-        if search_mode == "analytic" && analytic_actions.is_empty() && (widen_types || report_fallback) {
-            let all: Vec<String> = crate::analytic::ANALYTIC_SEARCH_TYPES.iter().map(|t| t.to_string()).collect();
-            if let Some(ctxs) = structured_query.get_mut("context").and_then(|c| c.as_array_mut()) {
-                for ctx in ctxs.iter_mut() {
-                    if let Some(o) = ctx.as_object_mut() {
-                        let first = o.get("type").and_then(|v| v.as_str()).map(String::from);
-                        for t in first.into_iter().chain(
-                            o.get("types").and_then(|v| v.as_array()).into_iter().flatten().filter_map(|x| x.as_str().map(String::from)),
-                        ) {
-                            if all.contains(&t) && !(report_fallback && t == "report") && !analytic_lift.contains(&t) {
-                                analytic_lift.push(t);
-                            }
-                        }
-                        if widen_types {
-                            o.insert("types".to_string(), json!(all));
-                        }
-                    }
-                }
-            }
-            if widen_types {
-                emit_term(&format!(
-                    "[AI-SEARCH] 🧭 [ANALYTIC PAGE / TYPE] 페이지 종류 {:?} 가 있고 이벤트 유형은 벡터 추정이라 {:?} 전체를 회수하고, 추정 유형 {:?} 의 기록을 앞에 둡니다.",
-                    analytic_pages, all, analytic_lift
-                ));
-            }
-        }
-        if !analytic_actions.is_empty() {
-            let action_types = crate::analytic::action_event_types(&analytic_actions);
-            if let Some(ctxs) = structured_query.get_mut("context").and_then(|c| c.as_array_mut()) {
-                for ctx in ctxs.iter_mut() {
-                    if let Some(o) = ctx.as_object_mut() {
-                        o.insert("types".to_string(), json!(action_types));
-                        if let Some(first) = action_types.first() {
-                            o.insert("type".to_string(), json!(first));
-                        }
-                    }
-                }
-            }
-            emit_term(&format!(
-                "[AI-SEARCH] 🧭 [ANALYTIC ACTION] 질의의 버튼 행동 {:?} → 유형 {:?}, 회수한 기록을 누른 버튼 글자로 거릅니다.",
-                analytic_actions, action_types
-            ));
-        }
-        let cc = if search_mode == "analytic" && cc.trim().is_empty() {
-            match store_opt.as_ref() {
-                Some(store) => match crate::analytic::site_mention(store, &query).await {
-                    Some((site_cc, name)) => {
-                        emit_term(&format!(
-                            "[AI-SEARCH] 🌐 [SITE SCOPE] 질의에 사이트 '{}' 가 나와 그 사이트의 행동 로그로 좁힙니다 (cc={}).",
-                            name, site_cc
-                        ));
-                        site_cc
-                    }
-                    None => cc,
-                },
-                None => cc,
-            }
-        } else {
-            cc
-        };
 
         // =====================================================================
         // 🌟 [VISION QUERY TRACK] shipping 모드에서 SigLIP2 텍스트 인코더로
@@ -3315,8 +2983,7 @@ async fn ai_search_complex(
                 // 🌟 [RECALL LIMIT] Dexie 가 뒤에서 조건으로 잘라내므로 여기서는 넓게 긁습니다.
                 //    기존 limit 5 는 '조건이 SQL 에 이미 적용되었다' 는 전제였는데,
                 //    v4 에서는 조건이 SQL 에 없으므로 5건만 가져오면 정답이 잘려 나갑니다.
-                //    행동 로그를 페이지 종류로 거를 때는 거른 뒤에도 정답이 남도록 넓게 회수합니다.
-                let recall_limit: usize = if analytic_pages.is_empty() && analytic_actions.is_empty() { 50 } else { 200 };
+                let recall_limit: usize = 50;
 
                 // 🌟 [비전 트랙] 루프 밖에서 1회 생성한 질의 벡터를 전 컨텍스트가 공유합니다.
                 //    (구버전은 여기서 매번 siglip2_model 을 들여다봤지만 로드 코드가 없어
@@ -3350,42 +3017,7 @@ async fn ai_search_complex(
                     final_results
                 };
 
-                let mut page_dropped = 0usize;
-                // 🌟 [ANALYTIC ACTION] 질의가 장바구니 담기 · 바로 구매 · 찜 · 쿠폰 받기 같은 버튼 행동을 물으면, 회수한 기록 중
-                //    누른 버튼 글자(data.action)가 그 행동인 것만 남깁니다 (바로 앞 페이지 거르기와 같은 자리). 하나도 안 남으면 거르지 않습니다.
-                let action_hits: usize = if analytic_actions.is_empty() {
-                    0
-                } else {
-                    final_results
-                        .iter()
-                        .filter(|(_, content, _)| {
-                            serde_json::from_str::<Value>(content)
-                                .ok()
-                                .map_or(false, |d| crate::analytic::doc_action_kinds(&d).iter().any(|k| analytic_actions.contains(k)))
-                        })
-                        .count()
-                };
-                let mut action_dropped = 0usize;
                 for (id, content, score) in final_results {
-                    if !analytic_pages.is_empty() {
-                        let kind = serde_json::from_str::<Value>(&content)
-                            .ok()
-                            .and_then(|d| crate::analytic::doc_page_kind(&d));
-                        if !kind.as_ref().map_or(false, |k| analytic_pages.contains(k)) {
-                            page_dropped += 1;
-                            continue;
-                        }
-                    }
-                    if action_hits > 0 {
-                        let acts = serde_json::from_str::<Value>(&content)
-                            .ok()
-                            .map(|d| crate::analytic::doc_action_kinds(&d))
-                            .unwrap_or_default();
-                        if !acts.iter().any(|k| analytic_actions.contains(k)) {
-                            action_dropped += 1;
-                            continue;
-                        }
-                    }
                     // 결과 배열 내 중복 방어
                     let is_dup = all_results.iter().any(|item: &serde_json::Value| item.get("id").and_then(|v| v.as_str()) == Some(&id));
                     if !is_dup {
@@ -3394,12 +3026,6 @@ async fn ai_search_complex(
 
                     // 백엔드(LanceDB)에서의 N:N 양방향 교차 검색(FTS) 로직을 제거하고,
                     // 프론트엔드(Dexie DB)로 역할을 위임합니다.
-                }
-                if page_dropped + action_dropped > 0 {
-                    emit_term(&format!(
-                        "[AI-SEARCH] 🧭 [ANALYTIC FILTER] 페이지 종류 {:?} 로 {}건, 행동 종류 {:?} 로 {}건을 걸렀습니다 (행동이 맞는 기록 {}건).",
-                        analytic_pages, page_dropped, analytic_actions, action_dropped, action_hits
-                    ));
                 }
 
                 // =====================================================================
@@ -3557,14 +3183,6 @@ async fn ai_search_complex(
                         println!("[AI-SEARCH] 🧩 [STAGE-4] item_chunks 코사인 매칭: {}개 item 후보 발견 (ctx_type='{}')", chunk_results.len(), ctx_type);
                     }
 
-                    // 🌟 [ANALYTIC FILTER · CHUNK] 청크로만 올라온 기록도 문서 트랙(STAGE-3)과 같은 페이지 · 행동 조건을 지나야 합니다.
-                    //    문서 트랙이 '누른 버튼이 그 행동이 아니다' 로 거른 기록이 청크 매칭으로 되돌아와 정답 자리를 차지했습니다
-                    //    (실측 A1 '장바구니에 담은 기록': 행동이 맞는 기록은 다 회수했는데 10위 안의 절반이 걸러졌던 기록의 청크 — R@10 0.5).
-                    //    청크 행에는 문서 본문이 없어(text = 청크 글) 문서를 id 로 읽어 같은 판정을 합니다. 문서를 못 읽으면 거르지 않습니다.
-                    let chunk_gate_on = search_mode == "analytic" && (!analytic_pages.is_empty() || action_hits > 0);
-                    let mut chunk_gate_seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-                    let mut chunk_gate_dropped = 0usize;
-
                     for (chunk_id, item_id, chunk_text, property, group_score, best_cos) in chunk_results {
                         // 🌟 [SCALE FIX] 트랙 가중치는 반드시 '코사인(0~1)' 에만 곱합니다.
                         //    기존에는 search_chunks 가 돌려준 '그룹 합산 점수' 를 코사인이라 가정하고 곱해
@@ -3706,28 +3324,6 @@ async fn ai_search_complex(
                                 existing_item.as_object_mut().unwrap().insert("alias_match".to_string(), json!(is_alias));
                             }
                         } else {
-                            if chunk_gate_on {
-                                let pass = match chunk_gate_seen.get(&item_id) {
-                                    Some(p) => *p,
-                                    None => {
-                                        let data = store
-                                            .get_item_by_id(target_table, &item_id)
-                                            .await
-                                            .ok()
-                                            .flatten()
-                                            .and_then(|d| serde_json::from_str::<Value>(&d.json_data).ok());
-                                        let p = data.as_ref().map_or(true, |d| {
-                                            crate::analytic::record_passes_filters(d, &analytic_pages, &analytic_actions, action_hits > 0)
-                                        });
-                                        chunk_gate_seen.insert(item_id.clone(), p);
-                                        p
-                                    }
-                                };
-                                if !pass {
-                                    chunk_gate_dropped += 1;
-                                    continue;
-                                }
-                            }
                             // 신규 결과 삽입
                             // chunk_id 가 아닌 item_id 를 기준으로 삽입하여
                             // 동일 item 의 여러 청크가 중복 결과로 나타나지 않도록 합니다.
@@ -3748,12 +3344,6 @@ async fn ai_search_complex(
                                 }));
                             }
                         }
-                    }
-                    if chunk_gate_dropped > 0 {
-                        emit_term(&format!(
-                            "[AI-SEARCH] 🧭 [ANALYTIC FILTER · CHUNK] 청크로만 올라온 기록 {}건이 페이지 종류 {:?} · 행동 종류 {:?} 조건에 맞지 않아 뺐습니다.",
-                            chunk_gate_dropped, analytic_pages, analytic_actions
-                        ));
                     }
                 }
                 // =====================================================================
@@ -3856,107 +3446,6 @@ async fn ai_search_complex(
                 }
             }
 
-            // ── 5-A2: [U-3] 시간 감쇠 융합 ──
-            //
-            //  ── 왜 정규화 '직전' 인가 ──
-            //   정규화 이후에 곱하면 최댓값이 1.0 을 유지하지 못해
-            //   프론트엔드의 상대 비교가 흔들립니다.
-            //   정규화 이전에 곱하면 감쇠가 반영된 채로 다시 0~1 에 맞춰지므로
-            //   '상대 순위만 바뀌고 스케일 계약은 유지' 됩니다.
-            //
-            //  ── 왜 analytic 에만 적용하는가 ──
-            //   무역 서식은 시간이 지나도 유효합니다. B/L 은 늙지 않습니다.
-            //   커머스 상품도 마찬가지입니다.
-            //   시의성이 관련성의 일부인 것은 행동 로그뿐입니다.
-            //
-            //  ── 왜 명시적 기간이 있으면 끄는가 ──
-            //   사용자가 '지난달' 을 지정했다면 SQL 이 이미 구간을 잘랐습니다.
-            //   그 안에서 다시 감쇠를 걸면 구간 앞부분이 부당하게 눌립니다.
-            if search_mode == "analytic" && !merged_map.is_empty() {
-                let explicit_period = structured_query
-                    .get("started_at")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0)
-                    > 0
-                    || structured_query
-                        .get("expired_at")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0)
-                        > 0;
-                if explicit_period {
-                    emit_term("[AI-SEARCH] ⏱️ [RECENCY] 질의에 명시적 기간이 있어 시간 감쇠를 적용하지 않습니다. (구간은 이미 SQL 이 잘랐고, 그 안에서 앞부분을 누르면 부당합니다)");
-                } else if let Some(store) = store_opt.as_ref() {
-                    let now_ms = crate::utils::time_guide::now_ms();
-                    // ① 회수 문서의 행동 시각을 모읍니다.
-                    //    report 문서는 U-1 이 남긴 episode_ended_at 이 실제 행동 시각이고,
-                    //    created_at 은 '합성 시각' 이라 시의성 판정에 쓰면 안 됩니다.
-                    let mut ages: Vec<(String, i64)> = Vec::new();
-                    for (id, _) in merged_map.iter() {
-                        if let Ok(Some(doc)) = store.get_item_by_id("items", id).await {
-                            let acted_at = serde_json::from_str::<Value>(&doc.json_data)
-                                .ok()
-                                .and_then(|d| {
-                                    d.get("episode_ended_at")
-                                        .and_then(|v| v.as_i64())
-                                        .or_else(|| d.get("created_at").and_then(|v| v.as_i64()))
-                                })
-                                .filter(|v| *v > 0)
-                                .unwrap_or(doc.created_at_ts);
-                            ages.push((id.clone(), (now_ms - acted_at).max(0)));
-                        }
-                    }
-                    let age_only: Vec<i64> = ages.iter().map(|(_, a)| *a).collect();
-                    match crate::analytic::derive_recency_half_life(&age_only) {
-                        Some(half_life) => {
-                            let hl_days = half_life / 86_400_000.0;
-                            emit_term(&format!(
-                                "[AI-SEARCH] ⏱️ [RECENCY DECAY] 회수 {}건의 경과 시간 중앙값에서 반감기를 유도했습니다: {:.2}일. (중앙값 시점에서 가중 0.5 → 절반은 증폭, 절반은 감쇠)",
-                                age_only.len(), hl_days
-                            ));
-                            crate::utils::score_dynamics::record_baseline(
-                                "analytic.recency_half_life_days",
-                                hl_days as f32,
-                            );
-                            let mut logged = 0usize;
-                            for (id, age) in ages.into_iter() {
-                                let w = crate::analytic::recency_weight(age, half_life);
-                                if let Some(item) = merged_map.get_mut(&id) {
-                                    let raw = item
-                                        .get("score")
-                                        .and_then(|v| v.as_f64())
-                                        .unwrap_or(0.0) as f32;
-                                    let decayed = raw * w;
-                                    item.as_object_mut()
-                                        .unwrap()
-                                        .insert("score".to_string(), json!(decayed));
-                                    item.as_object_mut()
-                                        .unwrap()
-                                        .insert("recency_weight".to_string(), json!(w));
-                                    item.as_object_mut().unwrap().insert(
-                                        "age_days".to_string(),
-                                        json!((age as f64 / 86_400_000.0 * 100.0).round() / 100.0),
-                                    );
-                                    if logged < 8 {
-                                        logged += 1;
-                                        emit_term(&format!(
-                                            "  ⏱️ [RECENCY] id={} | 경과 {:.2}일 | 가중 {:.4} | {:.4} → {:.4}",
-                                            id,
-                                            age as f64 / 86_400_000.0,
-                                            w,
-                                            raw,
-                                            decayed
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            emit_term("[AI-SEARCH] ⏱️ [RECENCY] 회수 건수가 부족하거나 전 기록이 사실상 동시각이라 반감기를 유도할 수 없습니다. 시간 감쇠를 적용하지 않습니다.");
-                        }
-                    }
-                }
-            }
-
             // ── 5-B: 점수 정규화 ──
             // 문서 매칭(primary)과 청크 매칭(chunk_match)의 점수 스케일이 다를 수 있으므로
             // 최대 점수 기준으로 0.0~1.0 에 정규화합니다.
@@ -3992,38 +3481,6 @@ async fn ai_search_complex(
                 let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
-
-            // ── 5-D1: 행동 로그는 질의가 묻는 유형(넓혀 회수했으면 추정 유형, 안전망 report 제외)의 기록을 앞으로
-            //          (점수는 정규화되어 1 이하이므로 +1 이 묶음 경계) ──
-            if !analytic_lift.is_empty() {
-                let mut lifted = 0usize;
-                for r in ranked_results.iter_mut() {
-                    let ty = r
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .and_then(|t| serde_json::from_str::<Value>(t).ok())
-                        .and_then(|d| d.get("type").and_then(|v| v.as_str()).map(|s| s.to_lowercase()))
-                        .unwrap_or_default();
-                    if analytic_lift.iter().any(|g| *g == ty) {
-                        if let Some(o) = r.as_object_mut() {
-                            let s = o.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            o.insert("score".to_string(), json!(s + 1.0));
-                        }
-                        lifted += 1;
-                    }
-                }
-                ranked_results.sort_by(|a, b| {
-                    let sa = a.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let sb = b.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                emit_term(&format!(
-                    "[AI-SEARCH] 🧭 [ANALYTIC TYPE ORDER] 질의가 묻는 유형 {:?} 의 기록 {}건을 앞에, 나머지(다른 유형 · 안전망 report) {}건을 뒤에 둡니다.",
-                    analytic_lift,
-                    lifted,
-                    ranked_results.len() - lifted
-                ));
-            }
 
             // ── 5-D2: 질의 전체 트랙과 합칩니다 (search_fusion 모듈 설명 참조) ──
             if search_mode == "commerce" {
@@ -4079,12 +3536,6 @@ async fn ai_search_complex(
                     crate::search_relation::relation_join(store, &model, &mut ranked_results, &mut dexie_plans, &query, &language, &cc, &emit_term).await;
                 } else if search_mode == "shipping" {
                     crate::search_relation::trade_relation_join(store, &mut ranked_results, &mut dexie_plans, &query, &language, &emit_term).await;
-                } else if search_mode == "analytic" {
-                    crate::search_relation::analytic_anchor_boost(store, &model, &mut ranked_results, &query, &cc, &emit_term).await;
-                    // 🌟 [ANALYTIC NEGATION] '결제하지 않은' 처럼 부정된 일이 일어난 방문의 기록을 뺍니다 (방문 단위 여집합).
-                    if !analytic_negation.is_empty() {
-                        crate::search_relation::analytic_visit_complement(store, &mut ranked_results, &analytic_negation, &cc, &emit_term).await;
-                    }
                 }
             }
 
@@ -4200,21 +3651,13 @@ async fn ai_search_complex(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 let brief: String = matched_text.chars().take(48).collect();
-                // 🌟 [U-3] 시간 감쇠가 적용된 항목은 그 사실을 랭킹 로그에 함께 남깁니다.
-                //    '왜 이 결과가 위에 있는가' 를 사후에 재구성할 수 있어야 합니다.
-                let rec = item.get("recency_weight").and_then(|v| v.as_f64());
-                let age_d = item.get("age_days").and_then(|v| v.as_f64());
-                let rec_note = match (rec, age_d) {
-                    (Some(w), Some(a)) => format!(" | recency={:.4}({:.1}일)", w, a),
-                    _ => String::new(),
-                };
-                println!("  [RANK {}] id={} | score={:.4} | type={} | match={} | property={} | matched='{}'{}",
+                println!("  [RANK {}] id={} | score={:.4} | type={} | match={} | property={} | matched='{}'",
                     rank + 1, id, score, ctx,
                     if is_chunk { if is_alias { "alias" } else { "chunk" } } else { "doc" },
-                    prop, brief, rec_note);
+                    prop, brief);
             }
 
-            if search_mode != "analytic" && !dexie_plans.is_empty() {
+            if !dexie_plans.is_empty() {
                 let has_hard = dexie_plans.iter().any(|p| {
                     p.get("conditions")
                         .and_then(|c| c.as_array())
@@ -4549,206 +3992,15 @@ async fn ai_search_complex(
         // 🌟 [STAGE-5 종료]
         // =====================================================================
 
-        // =====================================================================
-        // 🌟 [STAGE-6 / ANALYTIC REPORT] 회수한 시맨틱 기록으로 리포트를 작성합니다.
-        // ---------------------------------------------------------------------
-        //  ── 왜 여기서 만드는가 ──
-        //   프론트엔드는 LanceDB 원문(action / summary / relate)을 갖고 있지 않습니다.
-        //   결과 목록만 던지면 사용자는 로그 조각을 직접 읽어야 합니다.
-        //   Rust 가 원문을 다시 꺼내 Qwen3.5 2B 로 답변형 리포트를 합성해
-        //   채팅 말풍선 한 개로 전달합니다.
-        //  ── 근거 고정 ──
-        //   프롬프트는 "회수된 기록만 근거로 삼고, 없으면 없다고 말하라" 를 강제합니다.
-        // =====================================================================
-        let mut analytic_report = String::new();
-
-        if search_mode == "analytic" && !all_results.is_empty() {
-            if let Some(store) = store_opt.as_ref() {
-                let _ = app_handle.emit("extraction-progress", json!({
-                    "task_id": task_id,
-                    "category": "Report",
-                    "summary": "Writing behaviour report...",
-                    "spinner": "⠋"
-                }));
-
-                let mut records: Vec<Value> = Vec::new();
-
-                for item in all_results.iter().take(30) {
-                    if cancel_token.load(Ordering::Relaxed) { break; }
-                    let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                    if id.is_empty() { continue; }
-
-                    if let Ok(Some(doc)) = store.get_item_by_id("items", id).await {
-                        if let Ok(d) = serde_json::from_str::<Value>(&doc.json_data) {
-                            let action = d.get("action").and_then(|v| v.as_str()).unwrap_or("");
-                            let summary = d.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-                            let flow = d.get("cross_action_flow").and_then(|v| v.as_str()).unwrap_or("");
-                            let evo = d.get("intent_evolution").and_then(|v| v.as_str()).unwrap_or("");
-                            let pref = d.get("consistent_preferences").and_then(|v| v.as_str()).unwrap_or("");
-
-                            if action.is_empty() && summary.is_empty() && flow.is_empty() {
-                                continue;
-                            }
-
-                            let at = d.get("created_at").and_then(|v| v.as_i64()).unwrap_or(doc.created_at_ts);
-                            let at_iso = chrono::DateTime::from_timestamp_millis(at)
-                                .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
-                                .unwrap_or_default();
-
-                            // 🌟 [U-3] 경과 일수를 함께 실어 모델이 시의성을 판단할 수 있게 합니다.
-                            //
-                            //  ── 왜 ISO 시각만으로는 부족한가 ──
-                            //   2B 모델은 "2026-03-15" 와 "오늘" 사이의 간격을
-                            //   안정적으로 계산하지 못합니다. 시스템 시각이 프롬프트에 있어도
-                            //   뺄셈을 틀립니다. 계산된 일수를 직접 주는 편이 확실합니다.
-                            let age_days = {
-                                let now = crate::utils::time_guide::now_ms();
-                                ((now - at).max(0) as f64 / 86_400_000.0 * 10.0).round() / 10.0
-                            };
-                            records.push(json!({
-                                "user": doc.from,
-                                "type": doc.r#type,
-                                "at": at_iso,
-                                "days_ago": age_days,
-                                "link": d.get("link").and_then(|v| v.as_str()).unwrap_or(""),
-                                "action": action,
-                                "summary": summary,
-                                "relate": d.get("relate").cloned().unwrap_or(json!([])),
-                                "cross_action_flow": flow,
-                                "intent_evolution": evo,
-                                "consistent_preferences": pref
-                            }));
-                        }
-                    }
-                }
-
-                // 🌟 [U-3] 회수 기록을 최신순으로 정렬해 프롬프트에 넣습니다.
-                //
-                //  ── 왜 필요한가 ──
-                //   STAGE-5 는 점수순으로 정렬되어 있어 시간이 뒤섞입니다.
-                //   그 상태로 넣으면 모델이 "최근 흐름" 을 물어도
-                //   목록 앞쪽(=점수 높은) 오래된 기록부터 서술합니다.
-                //   시간 감쇠가 순위에 반영되었더라도, 프롬프트 안의 '읽는 순서' 는
-                //   별개의 신호이므로 함께 맞춰야 합니다.
-                //
-                //  ── 점수 순서를 버리지 않습니다 ──
-                //   records 는 이미 상위 30건으로 잘린 상태이므로,
-                //   그 안에서 시간순으로 재배열해도 '관련성 높은 집합' 이라는 사실은 유지됩니다.
-                records.sort_by(|a, b| {
-                    let ta = a.get("at").and_then(|v| v.as_str()).unwrap_or("");
-                    let tb = b.get("at").and_then(|v| v.as_str()).unwrap_or("");
-                    tb.cmp(ta)
-                });
-                if !records.is_empty() {
-                    let now_ms = crate::utils::time_guide::now_ms();
-                    let current_iso = chrono::DateTime::from_timestamp_millis(now_ms)
-                        .map(|dt| dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string())
-                        .unwrap_or_default();
-
-                    let started_at = structured_query.get("started_at").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let expired_at = structured_query.get("expired_at").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let time_intent = structured_query.get("time_intent").and_then(|v| v.as_str()).unwrap_or("");
-                    let season_intent = structured_query.get("season_intent").and_then(|v| v.as_str()).unwrap_or("");
-
-                    let period_str = if started_at > 0 || expired_at > 0 {
-                        let (period_clock, _) = crate::utils::time_guide::lang_clock(&language);
-                        let day = |ms: i64| -> String {
-                            if ms <= 0 {
-                                return String::new();
-                            }
-                            crate::utils::time_guide::date_of_ms(&period_clock, ms)
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default()
-                        };
-                        format!("{} ~ {}", day(started_at), day(expired_at))
-                    } else {
-                        "all time".to_string()
-                    };
-
-                    let scope = format!(
-                        "Period: {} (time_intent='{}', season_intent='{}')\nRecords retrieved: {}",
-                        period_str,
-                        if time_intent.is_empty() { "-" } else { time_intent },
-                        if season_intent.is_empty() { "-" } else { season_intent },
-                        records.len()
-                    );
-
-                    let time_context = format!(
-                        "- Current UTC time is \"{}\" (epoch ms {}).\n- The user locale language is \"{}\".",
-                        current_iso, now_ms, language
-                    );
-
-                    let records_json = serde_json::to_string_pretty(&records).unwrap_or_else(|_| "[]".to_string());
-
-                    let prompt = crate::prompts::analytic_report_answer_prompt(
-                        &query,
-                        &time_context,
-                        &scope,
-                        &records_json,
-                        &language
-                    );
-
-                    model.secure_vram_relay(
-                        crate::model::ModelSize::Qwen3_5,
-                        None,
-                        Some(cancel_token.clone()),
-                        false,
-                        None
-                    ).await.map_err(|e| e.to_string())?;
-
-                    let params = crate::openai_types::ChatCompletionParameters {
-                        messages: vec![
-                            crate::openai_types::ChatCompletionRequestMessage::User(
-                                crate::openai_types::ChatCompletionRequestUserMessage {
-                                    content: crate::openai_types::ChatCompletionRequestUserMessageContent::Text(prompt),
-                                    name: None,
-                                }
-                            )
-                        ],
-                        model: "qwen3.5".to_string(),
-                        max_tokens: Some(2048),
-                        temperature: Some(0.2),
-                        top_p: Some(0.95),
-                        ..Default::default()
-                    };
-
-                    if let Some(gen) = model.qwen3_5_generator.lock().await.as_mut() {
-                        if let Ok(res) = gen.generate(
-                            params,
-                            Some(cancel_token.clone()),
-                            Some(format!("{}_report", task_id)),
-                            None,
-                            None,
-                            None
-                        ).await {
-                            // 🌟 [REPORT NORMALIZE] 2B 모델이 지시를 어기고 JSON 을 반환해도
-                            //    말풍선에 원시 JSON 이 노출되지 않도록 코드에서 평탄화합니다.
-                            analytic_report = crate::analytic::normalize_report_output(&res);
-                        }
-                    }
-
-                    emit_term(&format!(
-                        "[ANALYTIC-REPORT] 📝 근거 기록 {}건으로 리포트를 작성했습니다. ({}자)",
-                        records.len(),
-                        analytic_report.chars().count()
-                    ));
-                } else {
-                    emit_term("[ANALYTIC-REPORT] ⚪ 회수된 문서에 구조화 문장이 없어 리포트를 생략합니다.");
-                }
-            }
-        }
-
-        // 🌟 [RESPONSE v4] 프론트엔드는 아래 4개를 받습니다.
+        // 🌟 [RESPONSE v4] 프론트엔드는 아래 3개를 받습니다.
         //    structured  : PLINKO 가 확정한 의미 구조 (기존과 동일)
         //    results     : LanceDB 리콜 후보 (조건 미적용, 넓게)
         //    dexie_plans : Dexie 가 실행할 정밀 필터 플랜 (조건 100% 보존)
-        //    report      : analytic 모드 전용. Qwen3.5 2B 가 쓴 답변형 리포트
         //  → main.ts 가 results 를 dexie_plans 로 걸러 최종 결과를 확정합니다.
         Ok(json!({
             "structured": structured_query,
             "results": all_results,
             "dexie_plans": dexie_plans,
-            "report": analytic_report,
             "mode": search_mode,
             "tracks": fusion_trace
         }))
@@ -4839,7 +4091,7 @@ async fn deep_research_command(
     }
 
     if model_guard.is_none() {
-        if let Ok(m) = LogisModel::new(app_handle.clone(), device_preference.as_deref()).await {
+        if let Ok(m) = LogisModel::new(crate::sink::tauri(&app_handle), device_preference.as_deref()).await {
             *model_guard = Some(m);
         } else {
             return Err("Failed to load model".to_string());
@@ -4891,7 +4143,7 @@ async fn deep_research_command(
     drop(store_guard);
 
     // 2. Run Deep Research (Reduce: 생성 한 번)
-    model.run_deep_research(query, &digest, top_documents, &app_handle, Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
+    model.run_deep_research(query, &digest, top_documents, &crate::sink::tauri(&app_handle), Some(state.cancellation_token.clone())).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -5057,7 +4309,7 @@ async fn connect_with_seed(_target_ip: String, _seed: u64) -> Result<(), String>
 
 #[tauri::command]
 async fn start_listener_command(app_handle: tauri::AppHandle, seed: u64) -> Result<(), String> {
-    crate::utils::network::start_signal_listener(app_handle, seed);
+    crate::utils::network::start_signal_listener(crate::sink::tauri(&app_handle), seed);
     println!("Signal Listener started on port 9999 with seed: {}", seed);
     Ok(())
 }
@@ -5281,7 +4533,7 @@ async fn get_active_tasks(state: State<'_, AppState>) -> Result<Vec<store::Task>
 
 #[tauri::command]
 async fn get_task_logs(app_handle: tauri::AppHandle, task_id: String) -> Result<Vec<Value>, String> {
-    let log_path = crate::utils::paths::get_task_log_file(Some(&app_handle), &task_id);
+    let log_path = crate::utils::paths::get_task_log_file(&task_id);
     
     
     // 메모리에 떠도는 최신 퍼센트를 강제로 끝에 끼워 넣으면 스텝 순서(stepMap)가 꼬입니다.
@@ -6003,35 +5255,22 @@ pub async fn eval_ai_search(
     .await
 }
 
-/// 🌟 [SYNTH EVAL / ANALYTIC] 행동 로그 원시 행을 프론트엔드 동기화(modes/analytic.ts)와 같은 명령 순서로 넣습니다.
-///   upsert_items(원시 행 저장, updated_at 0) → structure_pending_analytics(대상이 없을 때까지)
-///   → reindex_pending_embeddings(mode analytic, 대상이 없을 때까지).
-/// Cloudflare D1(console.logis.center) 대신 합성 행을 받는 연결점이라, 원시 행의 모양은 Worker 응답을
-/// fetchAnalyticsOrigin 이 바꾼 모양과 같아야 합니다 (data 는 풀린 JSON).
-pub async fn eval_analytic_ingest(app: &tauri::AppHandle, items: Vec<Value>, batch: usize) -> Result<Value, String> {
-    let saved = upsert_items(app.state::<AppState>(), items).await?;
-    let processed = |r: &Value| r.get("processed").and_then(|v| v.as_u64()).unwrap_or(0);
-    let (mut structured, mut rounds) = (0u64, 0u32);
-    loop {
-        let r = structure_pending_analytics(app.state::<AppState>(), app.clone(), Some(batch.max(1)), None).await?;
-        rounds += 1;
-        structured += processed(&r);
-        if processed(&r) == 0 || rounds >= 500 {
-            break;
-        }
-    }
-    let mut embedded = 0u64;
-    for _ in 0..500 {
-        let r = reindex_pending_embeddings(app.state::<AppState>(), app.clone(), Some(64), None, Some("analytic".to_string())).await?;
-        embedded += processed(&r);
-        if processed(&r) == 0 {
-            break;
-        }
-    }
-    Ok(json!({ "saved": saved, "structured": structured, "rounds": rounds, "embedded": embedded }))
+// 로컬 네트워크 도우미는 코어(utils::network)에 있고, Tauri 명령 껍데기만 여기 둡니다 (명령 이름 · 인자는 예전 그대로).
+#[tauri::command]
+fn get_local_network_prefix() -> String {
+    crate::utils::network::get_local_network_prefix()
+}
+
+#[tauri::command]
+fn get_my_full_ip() -> String {
+    crate::utils::network::get_my_full_ip()
 }
 
 pub fn run() {
+    // 모델이 띄우는 비동기 작업(KV 슬롯 반환 · 굽기 · 지연 해제)도 예전처럼 Tauri 전역 런타임에서 돕니다.
+    logis_llm::rt::set_spawner(|task| {
+        tauri::async_runtime::spawn(task);
+    });
     crate::model::lang_llm::register_loader(crate::models::qwen4_exp::registry::load_lang_runtime);
     let model = Arc::new(TokioMutex::new(None));
     let store = Arc::new(TokioMutex::new(None));
@@ -6068,7 +5307,7 @@ pub fn run() {
             }
 
             // [INIT] AppData/tmp 내부의 kv, logs, task_data 디렉토리를 초기화하여 이전 실행의 찌꺼기 완벽 삭제
-            crate::utils::paths::cleanup_temp_dirs(Some(app.handle()));
+            crate::utils::paths::cleanup_temp_dirs();
 
             // [INIT] KV Bake Worker (Immediate)
             crate::models::qwen::generate::init_bake_worker();
@@ -6136,7 +5375,7 @@ pub fn run() {
             let scheduler_store = app.state::<AppState>().store.clone();
             let scheduler_model = app.state::<AppState>().model.clone();
             let scheduler_cancel = app.state::<AppState>().cancellation_token.clone();
-            let scheduler_handle = app.handle().clone();
+            let scheduler_handle = crate::sink::tauri(app.handle());
             tauri::async_runtime::spawn(async move {
                 scheduler::start_background_worker(scheduler_store, scheduler_model, scheduler_cancel, scheduler_handle).await;
             });
@@ -6269,9 +5508,9 @@ pub fn run() {
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
             upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
-            save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
+            save_mobile_temp_file, get_local_network_prefix, get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
             get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb,
-            get_query_embedding, reindex_pending_embeddings, structure_pending_analytics,
+            get_query_embedding, reindex_pending_embeddings,
             translit_cache_respond, get_embedding_batch_for_translit,
             get_lang_llm_status
         ])

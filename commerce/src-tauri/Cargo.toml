@@ -15,78 +15,64 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
-csv = "1.4.0"
 tauri = { version = "2.10.1", features = [] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-# mistralrs = { path = "mistralrs/mistralrs", default-features = false, features = ["cuda"] }
-image = { version = "0.25", features = ["jpeg", "png"] }
-base64 = "0.22"
-anyhow = "1.0"
-calamine = "0.36.0"
-quick-xml = "0.41.0"
-pdf-extract = "0.12.0"
-zip = "8.6.0"
-regex = "1"
-encoding_rs = "0.8"
-flate2 = "1.0"
-futures = "0.3"
-uuid = { version = "1.4", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
+# 🌟 [APP CORE] 헤드리스 코어(commerce/app): 모델 상주 · LanceDB 저장소 · 스케줄러 · 검색 도우미. lib.rs 가 예전 모듈 이름으로
+#    재수출합니다. GPU 기능은 아래 [features] 가 이 crate 를 거쳐 모델 crate(logis-llm · logis-vision-doc)까지 켭니다.
+logis-app.workspace = true
+# 모델 엔진의 spawn 훅(logis_llm::rt::set_spawner)을 run() 이 Tauri 전역 런타임으로 등록합니다.
+logis-llm.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+# mistralrs = { path = "mistralrs/mistralrs", default-features = false, features = ["cuda"] }
+base64 = "0.22"
+anyhow = "1.0"
+regex = "1"
+futures = "0.3"
+uuid = { version = "1.4", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
-sysinfo = "0.30"
 mimalloc = { version = "*", features = ["v3"] }
-drag = "2.1.1"
-candle-core = "0.11.0"
-ahash = "0.8.11"
-candle-nn = "0.11.0"
-candle-transformers = "0.11.0"
-candle-flash-attn = { version = "0.11.0", optional = true, default-features = false }
-# 🌟 [FORK-GIT] candle-rocm-vulkan 포크는 Qntology 원격 master 를 따라갑니다(master 가 메인). 실제 커밋은 Cargo.lock 이 고정합니다.
-#    앱이 쓰는 API(attention_packed · fused_gdn_supported · forward_exact 등)가 원격 master 에 들어 있어야 빌드됩니다.
-#    원격에 아직 없는 로컬 포크로 빌드할 때만 아래 path 줄로 바꾸세요. (아래 [patch.crates-io] 3줄도 함께)
-candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master", optional = true }
-# candle-rocm = { path = "../../../candle-rocm-vulkan/candle-backend", optional = true }
-tokenizers = "0.22.1"
-num = "0.4.3"
-minijinja = "2.12.0"
-rayon = "1.10"
-dirs = "6.0.0"
 url = "2.5.7"
 fantoccini = "0.19"
 chromiumoxide = { version = "0.8.0", features = ["tokio-runtime"] }
 which = "6.0"
 once_cell = "1.18"
+# candle: 통합 시험(tests/it)이 직접 쓰고, 아래 GPU 기능이 이 이름으로도 켭니다.
+# 🌟 [FORK-GIT] candle-rocm-vulkan 포크 커밋(ebaf93d, premium-discount · raon-zena 와 같음)은 루트 Cargo.toml 한 곳에서 고정합니다:
+#    [patch.crates-io] 3줄(candle-core · candle-nn · candle-flash-attn)과 candle-rocm(crates/logis-llm 만 씀).
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+candle-flash-attn = { version = "0.11.0", optional = true, default-features = false }
+# 통합 시험(tests/it)이 직접 쓰는 crate
+image = { version = "0.25", features = ["jpeg", "png"] }
+tokenizers = "0.22.2"
 scraper = "0.25.0"
-lancedb = { version = "0.31.0", default-features = false }
+sysinfo = "0.30"
+dirs = "6.0.0"
 safetensors = "0.4"
-ethers-core = "2.0"
-ethers-signers = "2.0"
-arrow-array = "58.3.0"
-arrow-schema = "58.3.0"
-ego-tree = "0.10"
 nvml-wrapper = "0.9.0"
 half = "2.4"
 memmap2 = "0.9"
-webrtc = "0.10"
-rcgen = "0.13"
 rand = "0.8"
 rand_chacha = "0.3"
-windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_System_Memory"] }
-libc = "0.2"
-boa_engine = { path = "../crates/boa-engine/core/engine" }
-onnxruntime = { path = "../crates/onnxruntime" }
-# 🌟 [EMBED-CPU-PACKED] CPU 임베딩 패킹 GEMM (opt-in: LOGIS_EMBED_CPU_KERNEL=packed, models/embedding/cpu_packed.rs)
-embed-cpu-kernels = { path = "../crates/embed-cpu-kernels" }
-# 🌟 [PYRAMID-QUANT] 원본 가중치를 한 번 양자화하는 GGML 블록 인코더 (models/siglip2/quant.rs · model/lang_gguf.rs)
+# 🌟 [PYRAMID-QUANT] 원본 가중치를 한 번 양자화하는 GGML 블록 인코더 (시험이 씀, 코드는 logis-llm lang_gguf · logis-vision-doc quant)
 ggml-kquant = { path = "../crates/ggml-kquant" }
-ndarray = "0.15.1"
-whatlang = "0.18.0"
+# 셸 코드 · 시험이 직접 쓰지 않는 예전 의존성입니다 (코어 · 모델 crate 가 쓰거나 아무도 쓰지 않음). 빼면 의존성 그래프와 기능 통합이
+# 바뀌어 다시 빌드되므로 이 분리와 따로 정리합니다.
+drag = "2.1.1"
+ahash = "0.8.11"
+minijinja = "2.12.0"
+ego-tree = "0.10"
+webrtc = "0.10"
+libc = "0.2"
+# 🌟 [EMBED-CPU-PACKED] CPU 임베딩 패킹 GEMM (코드는 logis-llm models/embedding/cpu_packed.rs)
+embed-cpu-kernels = { path = "../crates/embed-cpu-kernels" }
 any_ascii = "0.3.3"
 
 [target.'cfg(windows)'.dependencies]
@@ -101,69 +87,19 @@ metal = "0.33.0"
 
 [features]
 default = ["cuda", "flash-attn", "turbo-quant"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "candle-flash-attn?/cuda"]
-rocm = ["dep:candle-rocm", "candle-core/rocm", "candle-nn/rocm", "candle-flash-attn?/rocm"]
-vulkan = ["candle-core/vulkan", "candle-nn/vulkan", "candle-flash-attn?/vulkan"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# 각 GPU · 가속 기능은 코어(logis-app)를 거쳐 crates/logis-llm · logis-vision-doc 의 같은 기능도 켭니다
+# (옮긴 모델 코드의 #[cfg(feature = …)] 는 그 crate 의 기능을 봄). 이 crate 의 #[cfg] 는 이제 통합 시험에만 있습니다.
+cuda = ["logis-app/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "candle-flash-attn?/cuda"]
+rocm = ["logis-app/rocm", "candle-core/rocm", "candle-nn/rocm", "candle-flash-attn?/rocm"]
+vulkan = ["logis-app/vulkan", "candle-core/vulkan", "candle-nn/vulkan", "candle-flash-attn?/vulkan"]
+metal = ["logis-app/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 # Fused FlashAttention (v1/v2/v3 tiers, picked per GPU) from the candle-rocm-vulkan fork.
-# Activates the `#[cfg(feature = "flash-attn")]` paths in models/common and models/qwen/common.
-flash-attn = ["dep:candle-flash-attn", "candle-flash-attn/flash-attn", "candle-core/flash-attn", "candle-nn/flash-attn"]
+# Activates the `#[cfg(feature = "flash-attn")]` paths in logis-llm models/common · models/qwen/common.
+flash-attn = ["logis-app/flash-attn", "dep:candle-flash-attn", "candle-flash-attn/flash-attn", "candle-core/flash-attn", "candle-nn/flash-attn"]
 # TurboQuant / NVFP4 / MXFP4 / MXFP8 / FP8 quantization kernels (candle_nn::turbo_quant).
-turbo-quant = ["candle-core/turbo-quant", "candle-nn/turbo-quant"]
+turbo-quant = ["logis-app/turbo-quant", "candle-core/turbo-quant", "candle-nn/turbo-quant"]
 # 디버그 빌드에서도 모든 언어 도메인 사전(full_bias.json)을 넣습니다. 릴리스 빌드는 이 기능 없이도 full_bias.json 입니다
-# (src/utils/bias_schema.rs BIAS_SOURCE). 개발 빌드 기본값은 한국어 · 영어만 담은 bias.json 입니다.
-full-bias = []
+# (crates/logis-bias/src/bias_schema.rs BIAS_SOURCE). 개발 빌드 기본값은 한국어 · 영어만 담은 bias.json 입니다.
+full-bias = ["logis-app/full-bias"]
 
-# candle-rocm-vulkan 포크는 Qntology 원격 master 브랜치를 따라갑니다(master 가 메인). 어느 커밋을 쓰는지는 Cargo.lock 이 고정하고,
-# 새 커밋을 받으려면 cargo update 로 포크 패키지(candle-core · candle-nn · candle-flash-attn · candle-rocm)를 갱신하세요.
-# 위 candle-rocm 의존성과 아래 3개 패치는 반드시 같은 git 주소·브랜치여야 candle-core 가 하나로 합쳐집니다.
-# 🌟 [FORK-GIT] 원격에 아직 없는 로컬 포크(../../../candle-rocm-vulkan)로 빌드하려면 git 3줄을 주석 처리하고 path 3줄의 주석을 푸세요.
-# ✅ [VERIFY-ROCM] AMD 실기기 검증(RX 6600 · gfx1032) 수정분은 Qntology master(PR #8) 에 들어가 git 줄로 돌아왔습니다.
-[patch.crates-io]
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", branch = "master" }
-# candle-core = { path = "../../../candle-rocm-vulkan/candle-core" }
-# candle-nn = { path = "../../../candle-rocm-vulkan/candle-nn" }
-# candle-flash-attn = { path = "../../../candle-rocm-vulkan/candle-flash-attn" }
-
-
-[profile.dev]
-opt-level = 0      # 기본값 0(최적화 없음)을 2로 올려서 실행 속도를 개선합니다.
-incremental = true # 변경된 부분만 빌드해서 시간을 아낍니다.
-
-[profile.dev.package.candle-core]
-opt-level = 3
-[profile.dev.package.candle-nn]
-opt-level = 3
-[profile.dev.package.candle-transformers]
-opt-level = 3
-[profile.dev.package.gemm]
-opt-level = 3
-[profile.dev.package.gemm-common]
-opt-level = 3
-[profile.dev.package.gemm-f16]
-opt-level = 3
-[profile.dev.package.gemm-f32]
-opt-level = 3
-[profile.dev.package.gemm-f64]
-opt-level = 3
-[profile.dev.package.embed-cpu-kernels]
-opt-level = 3
-[profile.dev.package.ggml-kquant]
-opt-level = 3
-[profile.dev.package.half]
-opt-level = 3
-[profile.dev.package.naga]
-opt-level = 3
-[profile.dev.package.rayon]
-opt-level = 3
-[profile.dev.package.rayon-core]
-opt-level = 3
-
-[profile.release]
-opt-level = 3   # 실행 속도 최대
-strip = true      # 모든 심볼 제거 (함수 이름 등 삭제)
-lto = true        # 전체 프로그램 최적화 (코드 분석을 훨씬 어렵게 함)
-panic = "abort"   # 에러 발생 시 정보를 남기지 않음
-codegen-units = 1 # 빌드 속도 개선
+# [patch.crates-io](candle 포크 커밋)와 [profile.*] 는 루트 Cargo.toml 에 있습니다. 작업 공간 멤버의 것은 무시됩니다.

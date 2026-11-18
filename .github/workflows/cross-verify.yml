@@ -116,7 +116,7 @@ jobs:
       - name: apply fork patch series + path dependencies (job only)
         run: |
           logis-center/.github/scripts/apply-fork-patches.sh
-          logis-center/.github/scripts/use-fork-path.sh logis-center/commerce/src-tauri/Cargo.toml
+          logis-center/.github/scripts/use-fork-path.sh logis-center/Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -129,7 +129,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             logis-center/commerce/src-tauri/target
-          key: cross-cpuv2-${{ matrix.name }}-${{ matrix.os }}-rust${{ env.RUST_VERSION }}${{ matrix.kind == 'cuda-check' && format('-cuda{0}-sm{1}', matrix.cuda || 'apt', matrix.cuda_cap || '80') || '' }}-${{ hashFiles('logis-center/commerce/src-tauri/Cargo.lock', 'logis-center/patches/candle-rocm-vulkan/*.patch') }}
+          key: cross-cpuv2-${{ matrix.name }}-${{ matrix.os }}-rust${{ env.RUST_VERSION }}${{ matrix.kind == 'cuda-check' && format('-cuda{0}-sm{1}', matrix.cuda || 'apt', matrix.cuda_cap || '80') || '' }}-${{ hashFiles('logis-center/Cargo.lock', 'logis-center/patches/candle-rocm-vulkan/*.patch') }}
           restore-keys: cross-cpuv2-${{ matrix.name }}-${{ matrix.os }}-rust${{ env.RUST_VERSION }}${{ matrix.kind == 'cuda-check' && format('-cuda{0}-sm{1}', matrix.cuda || 'apt', matrix.cuda_cap || '80') || '' }}-
       - name: error-annotation helper
         run: |
@@ -210,7 +210,7 @@ jobs:
         if: runner.os == 'macOS'
         run: echo "RUSTFLAGS=-C target-cpu=apple-m1" >> "$GITHUB_ENV"
 
-      # commerce/src-tauri/.cargo/config.toml builds with -C target-cpu=native. A cached target dir (proc-macro DLLs included)
+      # .cargo/config.toml (workspace root) builds with -C target-cpu=native. A cached target dir (proc-macro DLLs included)
       # built on one runner CPU is loaded by rustc on another runner: windows-cuda died with STATUS_ILLEGAL_INSTRUCTION
       # (0xc000001d) in `rustc boa_string`. The runner pool mixes CPU models, so x86 jobs build for a baseline every one has.
       - name: x86 — portable CPU target (a cache built on another runner CPU must stay loadable)
@@ -310,7 +310,7 @@ jobs:
             exit 1
           fi
           notice_lines "suite result" "$RUNNER_TEMP/suite.log" '^test result'
-      # The lib's own unit tests (src/**/mod tests) are not in `--test it`. These need no GPU or model files:
+      # The lib unit tests (src/**/mod tests of the app core commerce/app and crates/logis-llm) are not in `--test it`. These need no GPU or model files:
       # vocab trim (row choice, per-flow language scopes, trimmed head = original rows), stable search ranking, store.
       - name: "lib unit tests (vocab trim · stable search ranking · store)"
         if: matrix.name == 'linux-cpu' || matrix.name == 'windows-cpu'
@@ -318,9 +318,18 @@ jobs:
         run: |
           . "$RUNNER_TEMP/annot.sh"; set +e; ort_path
           f="${{ matrix.features }}"
-          cargo test --lib --no-default-features ${f:+--features $f} -- vocab_trim stable_rank store:: --test-threads 2 2>&1 | tee "$RUNNER_TEMP/lib.log" | tail -5
+          cargo test --lib -p logis-center -p logis-app -p logis-llm --no-default-features ${f:+--features $f} -- vocab_trim stable_rank store:: --test-threads 2 2>&1 | tee "$RUNNER_TEMP/lib.log" | tail -5
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/lib.log"; exit 1; }
           notice_lines "lib unit tests" "$RUNNER_TEMP/lib.log" '^test result'
+      # crates/logis-* : pure domain crates split out of the app (no Tauri, LanceDB, models or GPU).
+      - name: "domain crates (crates/logis-*)"
+        if: matrix.name == 'linux-cpu' || matrix.name == 'windows-cpu'
+        working-directory: logis-center
+        run: |
+          . "$RUNNER_TEMP/annot.sh"; set +e
+          cargo test -p logis-schema -p logis-bias -p logis-sds -p logis-pug -p logis-parsers -p logis-search 2>&1 | tee "$RUNNER_TEMP/crates.log" | tail -5
+          rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/crates.log"; exit 1; }
+          notice_lines "domain crates" "$RUNNER_TEMP/crates.log" '^test result'
       - name: "vision batch (ignored device tests — phrase encoding invariance on the device)"
         if: contains(fromJSON('["linux-vulkan","mac-metal","mac-vulkan"]'), matrix.name)
         working-directory: logis-center/commerce/src-tauri

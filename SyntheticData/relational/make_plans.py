@@ -4,8 +4,9 @@
 
   python make_plans.py <출력 폴더> [--langs ko,en,...] [--templates C1,R2,...]
 
-  plan_store.jsonl    검색 저장소: keys → 커머스 · 무역 seed2(연결 번호 포함) → 행동 로그 analytic → dump
-  plan_search.jsonl   queries.yaml 의 질의 (앱 언어 korean, 커머스는 그 쇼핑몰 사이트로 범위, 무역 · 행동 로그는 범위 없음)
+  plan_store.jsonl    검색 저장소: keys → 커머스 · 무역 seed2(연결 번호 포함) → dump
+                      (행동 로그 analytic 은 웹 분석이 premium-discount 로 옮겨 넣지 않습니다)
+  plan_search.jsonl   queries.yaml 의 질의 (앱 언어 korean, 커머스는 그 쇼핑몰 사이트로 범위, 무역은 범위 없음)
 
 seed2 레코드는 추출 경로가 남기는 모양을 따릅니다: 상태는 앱의 상태 이름(complete · progress · ...), 날짜는 ISO,
 연결 칸은 대상의 (유형, 번호)로 주고 하네스가 앱의 entity_key_index 로 번호를 셉니다.
@@ -150,7 +151,6 @@ def main() -> int:
         store += commerce_seeds(r)
     for r in recs:
         store += trade_seeds(r)
-    store.append({"id": "v2-weblog", "kind": "analytic", "events": str((HERE / "weblog" / "events.jsonl").resolve()), "batch": 20})
     store.append({"id": "v2-dump-store", "kind": "dump"})
     (out / "plan_store.jsonl").write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in store), encoding="utf-8")
 

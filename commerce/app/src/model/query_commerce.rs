@@ -1,0 +1,4664 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use serde_json::{json, Value};
+use crate::utils::GpuDeviceExt;
+
+impl crate::model::LogisModel {
+
+    pub async fn parse_commerce_query(&self, task_id: &str, app_handle: &crate::sink::Sink, query: String, language: &str, metrics_json: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
+
+        // 🌟 [신규] 터미널 로거 헬퍼 주입
+        let emit_term = |msg: &str| {
+            println!("{}", msg);
+            let _ = app_handle.emit("task-console-log", json!({"task_id": task_id, "text": format!("{}\n", msg)}));
+        };
+
+        emit_term("[ENGINE] 🚀 Starting Commerce Search Pipeline...");
+        crate::utils::score_dynamics::enter_scope(
+            "",
+            crate::utils::score_dynamics::Track::Search,
+            "all",
+            "",
+        );
+
+        // 🌟 [최초 초기화] VRAM 확보 및 불필요한 제너레이터 선제적 언로드 (캔슬 개입 포함)
+        emit_term("[ENGINE] 🧹 Pre-purging memory before loading embedding model...");
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
+        
+        // 🌟 [VRAM 누수 픽스] KV 캐시를 정상적으로 삭제하기 위해 None 덮어쓰기 로직을 제거하고, deep_purge_resources에 전부 일임합니다.
+        self.deep_purge_resources().await;
+        self.wait_for_vram_settle(1200, 5, Some(cancel_token.clone())).await.ok();
+
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
+        
+        // ----------------------------------------------------
+        // Stage 1: 세그먼트 분할 (Vector Cliff Detection) - Embedding 모델 사용
+        // ----------------------------------------------------
+        emit_term("[STAGE-1] Loading Models (Embedding & Qwen3) for Commerce Pipeline...");
+        let payload = json!({ "task_id": task_id, "category": "Stage 1", "summary": "Segmenting semantic intents...", "spinner": "⠋" });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
+
+        let route_lang = crate::utils::lang_utils::detect_document_language(&query);
+        // 🌟 [VOCAB TRIM] 텍스트 맥락: 질의 언어(현지 언어 + 영어)의 행만 출력 투영에 남깁니다.
+        let _vocab_scope = crate::models::common::vocab_trim::DocLangScope::text(&route_lang, &query);
+        let route_verdict = self.lang_route("search", "commerce_verify", &route_lang, &query).await;
+        emit_term(&format!("  {}", route_verdict.line));
+        let _query_route = crate::model::lang_llm::QueryRoute::open(route_verdict.code);
+        self.ensure_query_engine().await?;
+        self.ensure_embedding().await?;
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
+
+        // 🌟 [CRITICAL FIX] whatlang을 이용한 글로벌 언어 감지 로직 적용
+        // 감지된 언어가 신뢰할만하면 프로젝트 내부 ISO-639 코드 체계로 변환, 그 외의 경우 UI의 language로 폴백
+        let query_lang = whatlang::detect(&query)
+            .map(|info| match info.lang() {
+                whatlang::Lang::Kor => "ko".to_string(),
+                whatlang::Lang::Jpn => "ja".to_string(),
+                whatlang::Lang::Cmn => "zh-hans".to_string(),
+                whatlang::Lang::Rus => "ru".to_string(),
+                whatlang::Lang::Ara => "ar".to_string(),
+                whatlang::Lang::Tha => "th".to_string(),
+                whatlang::Lang::Ell => "el".to_string(),
+                whatlang::Lang::Heb => "he".to_string(),
+                whatlang::Lang::Hin => "hi".to_string(),
+                whatlang::Lang::Ben => "bn".to_string(),
+                whatlang::Lang::Tel => "te".to_string(),
+                whatlang::Lang::Khm => "km".to_string(),
+                whatlang::Lang::Eng => "en".to_string(),
+                whatlang::Lang::Fra => "fr".to_string(),
+                whatlang::Lang::Deu => "de".to_string(),
+                whatlang::Lang::Spa => "es".to_string(),
+                whatlang::Lang::Ita => "it".to_string(),
+                whatlang::Lang::Por => "pt".to_string(),
+                whatlang::Lang::Nld => "nl".to_string(),
+                whatlang::Lang::Ces => "cs".to_string(),
+                whatlang::Lang::Vie => "vi".to_string(),
+                _ => language.to_string(),
+            })
+            .unwrap_or_else(|| language.to_string());
+
+        let intent_anchors = vec![
+            ("order", "measure sales performance or direct transactions, conversion rate, sales volume, checkout, payment, cancellation, refund, purchase, buy"),
+            ("goods", "product catalog data, exposure, traffic metrics, page views, clicks, physical attributes, stock limits, unit prices, items, find, search clothes"),
+            ("tracking", "manage logistics and fulfillment, shipment status, dispatch, delivery duration, courier information, tracking number, parcel"),
+            ("review", "analyze the voice of the customer, feedback, ratings, reviews, CS messages, complaints, bad quality, good product"),
+            ("coupon", "manage specific discount vouchers, coupon codes, issuance limits, discount amounts applied via coupons, promotion code"),
+            ("event", "manage marketing campaigns, analyze broad operational trends, promotions, exhibitions, seasonal sales"),
+            ("ignore", "ignore, system prompt, stop, cancel, do nothing, irrelevant noise"),
+        ];
+
+        let categories = ["order", "goods", "tracking", "review", "coupon", "event", ""];
+        let mut layout_embs = std::collections::HashMap::new();
+        let mut anchor_embs = std::collections::HashMap::new();
+
+        let mut texts_to_embed = Vec::new();
+        let mut emb_mappings = Vec::new();
+
+        // 🌟 intent_anchors 임베딩 수집 추가
+        for (cat, text) in &intent_anchors {
+            texts_to_embed.push(text.to_string());
+            emb_mappings.push((cat.to_string(), "anchor".to_string()));
+        }
+
+        // 🌟 [변경] Stage 1 멀티패스 전용 함수인 get_multi_pass_contexts를 호출하여
+        // layout_list, layout_form 및 core_intent를 포함한 100% 모든 속성을 수집합니다.
+        for cat in &categories {
+            let contexts = crate::parsing::get_multi_pass_contexts(cat, &query_lang);
+            
+            for (key, bias, prejudice) in contexts {
+                texts_to_embed.push(bias);
+                emb_mappings.push((cat.to_string(), format!("{}_bias", key)));
+
+                let final_prej = if prejudice.trim().is_empty() { "random unrelated noise".to_string() } else { prejudice };
+                texts_to_embed.push(final_prej);
+                emb_mappings.push((cat.to_string(), format!("{}_prejudice", key)));
+            }
+        }
+
+        // 2. 단 한 번의 배치 호출로 모든 임베딩 벡터를 한 장바구니에 획득
+        let embedded_texts = self.get_embedding_batch_pinned(texts_to_embed).await.unwrap_or_else(|_| vec![vec![0.0; 384]; emb_mappings.len()]);
+
+        // 3. 획득한 벡터와 카테고리/키 값을 매칭하여 해시맵에 일괄 삽입
+        for (i, (cat, emb_type)) in emb_mappings.into_iter().enumerate() {
+            if emb_type == "anchor" {
+                anchor_embs.insert(cat, embedded_texts[i].clone());
+            } else {
+                layout_embs.insert(format!("{}_{}", cat, emb_type), embedded_texts[i].clone());
+            }
+        }
+
+        use crate::utils::ai_utils::cosine_similarity;
+
+        // 🌟 [추가] 서술어구(verb_expression) 타이브레이커 가이드 벡터 생성
+        let mut prefixed_verb_b_vals = Vec::new();
+        for lang in [query_lang.as_str(), "en"] {
+            let verb_val = crate::parsing::BIAS_DICT.get("verb").and_then(|v| v.get("bias")).and_then(|v| v.get(lang)).and_then(|v| v.as_str()).unwrap_or("verb, predicate");
+            let expr_val = crate::parsing::BIAS_DICT.get("expression").and_then(|v| v.get("bias")).and_then(|v| v.get(lang)).and_then(|v| v.as_str()).unwrap_or("idiom, phrase");
+            let combined_verb_expr = format!("{}, {}", verb_val, expr_val);
+            let prefixed = combined_verb_expr.split(',').map(|s| format!("{} {}", lang, s.trim())).collect::<Vec<_>>().join(", ");
+            prefixed_verb_b_vals.push(prefixed);
+        }
+        let combined_verb_b_val = prefixed_verb_b_vals.join(", ");
+        let verb_emb = self.get_embedding(combined_verb_b_val).await.unwrap_or_else(|_| vec![0.0; 384]);
+
+        // 🌟 [OPERATOR PHRASE BANK] 비교 대상도 구 단위로 맞춰야 공정한 비교가 됩니다.
+        //    (로그: '이하로' ActionSim 0.7700 > OpSim 0.5746 → 검색 명령어로 오인 →
+        //     '5000원' 과 분리되어 sale_price lte 5000 이 통째로 소멸)
+        let mut op_bank_texts: Vec<String> = Vec::new();
+        if let Some(ops) = crate::parsing::BIAS_DICT.get("operators").and_then(|v| v.as_object()) {
+            for (_, v) in ops {
+                for field in ["semantic", "bias"] {
+                    if let Some(b) = v.get(field).and_then(|val| val.as_str()) {
+                        for p in crate::utils::ai_utils::split_bias_phrases_full(b) {
+                            if !op_bank_texts.iter().any(|e| e == &p) { op_bank_texts.push(p); }
+                        }
+                    }
+                }
+            }
+        }
+        let operator_embs: Vec<Vec<f32>> = if op_bank_texts.is_empty() {
+            Vec::new()
+        } else {
+            self.get_embedding_batch_pinned(op_bank_texts.clone()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; op_bank_texts.len()])
+        };
+
+        // 🌟 [STANZA] 검색어 형태 분석 — stanza-onnx-export format 2 변환본 (12개 언어, PyTorch Stanza 와 원문 끝에서 끝 일치).
+        //    공백으로 낱말을 나누는 언어는 공백 어절이 단위입니다 (창 · NMS 좌표계가 공백 어절 기준). 어절 안의 Stanza 토큰 ·
+        //    MWT 낱말(du → de le, zum → zu dem, للعملاء → ل + العملاء) 중 첫 내용어의 품사 · 어간 · 관계를 어절에 붙입니다.
+        //    일본어 · 중국어는 공백이 없어 Stanza 토큰이 단위입니다 (이전에는 질의 전체가 한 낱말이었음).
+        //    기능어 품사(STANZA_DROP_TAGS) 어절은 Plinko 앞에서 빼고, 부정 · 하향 · 가격 경계 · 정렬 표시는 빼기 전 전체 어절로 잽니다.
+        let mut ext_words_string: Vec<String> = Vec::new();
+        let mut stanza_lemmas: Option<Vec<String>> = None;
+        let mut stanza_deprels: Option<Vec<String>> = None;
+        // 🌟 [POS TAG STORAGE] Stanza POS 태그 · 형태 자질을 ACTION VERB 판정에 씁니다.
+        let mut stanza_pos_tags: Option<Vec<String>> = None;
+        let mut stanza_feats: Option<Vec<String>> = None;
+        let mut stanza_negated: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stanza_downward: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stanza_order: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stanza_bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // 12개 언어 밖(키릴 · 태국 문자 …)이면 빈 코드 → analyze_query 가 건너뜀
+        let stanza_lang_code = crate::stanza::detect_query_lang(&query, language).unwrap_or("");
+        emit_term(&format!("[STANZA] 🧠 검색어 형태 분석 ('{}')...", stanza_lang_code));
+        let stanza_res = {
+            let q = query.clone();
+            let code = stanza_lang_code.to_string();
+            tokio::task::spawn_blocking(move || crate::stanza::analyze_query(&q, &code)).await
+        };
+        match stanza_res {
+            Ok(Ok(qa)) => {
+                emit_term(&format!(
+                    "  🧠 [STANZA-POS-LOG] 검색어 형태소 분석 결과 ({}, {} ms, 단위: {}): {:?}",
+                    qa.lang,
+                    qa.elapsed_ms,
+                    if qa.whitespace_units { "공백 어절" } else { "Stanza 토큰" },
+                    qa.describe()
+                ));
+                let surfaces = qa.surfaces();
+                {
+                    let marks = crate::utils::ai_utils::qualifier_marks(&surfaces, &|_: usize| false);
+                    let copy_marks = |idx: &std::collections::HashSet<usize>, set: &mut std::collections::HashSet<String>| {
+                        for j in idx.iter() {
+                            if let Some(t) = surfaces.get(*j) {
+                                set.insert(t.clone());
+                            }
+                        }
+                    };
+                    copy_marks(&marks.negated, &mut stanza_negated);
+                    copy_marks(&marks.downward, &mut stanza_downward);
+                    copy_marks(&marks.ordered, &mut stanza_order);
+                    copy_marks(&marks.price_bound, &mut stanza_bound);
+                }
+                let drop_tags = crate::utils::ai_utils::STANZA_DROP_TAGS;
+                let mut dropped_log = Vec::new();
+                let mut filtered_words = Vec::new();
+                let mut filtered_lemmas = Vec::new();
+                let mut filtered_deprels = Vec::new();
+                let mut filtered_pos_tags: Vec<String> = Vec::new();
+                let mut filtered_feats: Vec<String> = Vec::new();
+                for u in qa.units.iter() {
+                    // 내용어가 하나도 없는 단위만 뺍니다 (한국어 '따뜻하게' 는 UD 상 SCONJ 지만 실질 형태소가 있어 남김)
+                    if u.functional && drop_tags.contains(&u.upos.as_str()) {
+                        dropped_log.push(format!("{}({})", u.surface, u.upos));
+                        continue;
+                    }
+                    filtered_words.push(u.surface.clone());
+                    filtered_lemmas.push(u.stem.clone());
+                    filtered_deprels.push(u.deprel.clone());
+                    filtered_pos_tags.push(u.upos.clone());
+                    filtered_feats.push(u.feats.clone());
+                }
+                if !dropped_log.is_empty() {
+                    emit_term(&format!("  ✂️ [STANZA-SEARCH-POS] 검색어에서 기능어 품사 어절 제거: {:?}", dropped_log));
+                }
+                if filtered_words.is_empty() {
+                    // 🌟 전부 기능어로 나오면 단위를 그대로 씁니다 (과잉 삭제 방어)
+                    ext_words_string = surfaces;
+                } else {
+                    ext_words_string = filtered_words;
+                    stanza_lemmas = Some(filtered_lemmas);
+                    stanza_deprels = Some(filtered_deprels);
+                    stanza_pos_tags = Some(filtered_pos_tags);
+                    stanza_feats = Some(filtered_feats);
+                }
+            }
+            Ok(Err(e)) => {
+                emit_term(&format!("[STANZA] ⚠️ 형태 분석을 건너뜁니다 ('{}'): {:#}. 공백 분할로 진행합니다.", stanza_lang_code, e));
+            }
+            Err(e) => {
+                emit_term(&format!("[STANZA] ⚠️ 형태 분석 작업이 끝나지 않았습니다 ('{}'): {}. 공백 분할로 진행합니다.", stanza_lang_code, e));
+            }
+        }
+        // 🌟 [WORD-POS MAP] ext_words_string 의 각 단어에 대응하는 POS 태그를
+        //    HashMap 으로 구축합니다. PLINKO 루프의 words 는 current_text.split_whitespace()
+        //    이므로 ext_words_string 과 직접 인덱스 대응이 불가능합니다.
+        //    단어 문자열 자체를 키로 사용하여 O(1) 조회합니다.
+        //    Stanza 처리가 실패했거나 POS 태그가 없으면 빈 맵이 되어
+        //    ACTION VERB 판정이 코사인 폴백으로 동작합니다.
+        let word_pos_map: std::collections::HashMap<String, String> = {
+            let mut m = std::collections::HashMap::new();
+            if let Some(ref tags) = stanza_pos_tags {
+                for (i, w) in ext_words_string.iter().enumerate() {
+                    if let Some(tag) = tags.get(i) {
+                        m.insert(w.clone(), tag.clone());
+                    }
+                }
+            }
+            m
+        };
+
+        let word_feats_map: std::collections::HashMap<String, String> = {
+            let mut m = std::collections::HashMap::new();
+            if let Some(ref feats) = stanza_feats {
+                for (i, w) in ext_words_string.iter().enumerate() {
+                    if let Some(f) = feats.get(i) {
+                        m.insert(w.clone(), f.clone());
+                    }
+                }
+            }
+            m
+        };
+
+        if ext_words_string.is_empty() {
+            ext_words_string = query.split_whitespace().map(|s| s.to_string()).collect();
+        }
+        // 🌟 [TRACKING NUMBER DETECTION] 검색어에서 송장 번호 패턴(6자리 이상 순수 숫자 또는 숫자-하이픈 조합)을 감지합니다.
+        let mut detected_tracking_numbers: Vec<String> = Vec::new();
+        for word in &ext_words_string {
+            let digits_only: String = word.chars().filter(|c| c.is_ascii_digit()).collect();
+            if digits_only.len() >= 6 {
+                detected_tracking_numbers.push(digits_only.clone());
+                emit_term(&format!("  📦 [TRACKING DETECTED] Query contains potential tracking number: '{}'", digits_only));
+            }
+        }
+        let words: Vec<&str> = ext_words_string.iter().map(|s| s.as_str()).collect();
+        let mut context_arr = Vec::new();
+        // 🌟 [1차 패스] 최소 2단어 이상(2-gram)의 교차 윈도우 스팬 및 카테고리별 기본 점수 수집
+        struct SpanData {
+            start: usize,
+            end: usize,
+            text: String,
+            scores: std::collections::HashMap<String, f32>,
+        }
+        emit_term(&format!("  🔎 [INPUT WORDS] 분할된 단어 목록: {:?}", words));
+
+        let mut raw_spans = Vec::new();
+
+        // 🌟 [EMBED-PREFETCH] RAW-CHUNK 스팬(2~8단어 모든 창)은 루프 전에 이미 확정됩니다.
+        //    기존에는 n-gram 마다 get_embedding 을 1건씩(spawn_blocking + NVML + 배치 1 순전파)
+        //    불렀습니다(10단어 질의 = 42회). 한 번의 배치로 전부 임베딩합니다.
+        //    get_embedding_batch 는 get_embedding 과 같은 순전파·같은 캐시를 쓰므로 벡터가 같습니다.
+        let span_list = crate::utils::ai_utils::raw_chunk_spans(&words);
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
+        let span_embs: Vec<Vec<f32>> = if span_list.is_empty() {
+            Vec::new()
+        } else {
+            self.get_embedding_batch(span_list.iter().map(|(_, _, t)| t.clone()).collect()).await
+                .unwrap_or_else(|_| vec![vec![0.0; 384]; span_list.len()])
+        };
+
+        // 🌟 [STAGE1-CTX] get_multi_pass_contexts 를 n-gram × 카테고리마다 다시 만들지 않고
+        //    카테고리별 (bias, prejudice) 행 인덱스를 한 번만 만듭니다. (GAP BRIDGING 도 재사용)
+        //    점수 식은 기존과 같고, 결과는 비트 단위로 같습니다.
+        let mut layout_table = crate::utils::ai_utils::LayoutScoreTable::new();
+        for cat in &categories {
+            layout_table.ensure_cat(cat, crate::parsing::get_multi_pass_contexts(cat, &query_lang), &layout_embs, &anchor_embs);
+        }
+        let zero_emb = vec![0.0f32; 384];
+
+        for (si, (start, end, test_text)) in span_list.into_iter().enumerate() {
+            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                return Ok(json!({ "context": [], "cancelled": true }));
+            }
+            let test_emb: &[f32] = span_embs.get(si).map(|v| v.as_slice()).unwrap_or(&zero_emb);
+
+            // 🌟 Verb Penalty · 단어 길이 가중치 · 멀티패스 감쇠 합 · Intent Anchor 는
+            //    LayoutScoreTable::raw_chunk_scores 안에서 기존 식 그대로 계산합니다.
+            let word_count = end - start;
+            let mut scores = std::collections::HashMap::new();
+            for (cat, weighted_base_score) in layout_table.raw_chunk_scores(test_emb, &verb_emb, word_count) {
+                scores.insert(cat, weighted_base_score);
+            }
+            
+            // 🌟 [DEBUG LOG] 1차 슬라이딩 윈도우(기초 점수) 평가 결과 출력
+            let mut raw_score_log = String::new();
+            let mut sorted_raw: Vec<(&String, &f32)> = scores.iter().filter(|(k, _)| !k.is_empty()).collect();
+            sorted_raw.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            
+            for (cat, score) in sorted_raw.iter().take(3) {
+                raw_score_log.push_str(&format!("{}: {:.4} | ", cat, score));
+            }
+            emit_term(&format!("    🔍 [RAW-CHUNK] '{}' -> Top: {}", test_text, raw_score_log.trim_end_matches(" | ")));
+
+            raw_spans.push(SpanData { start, end, text: test_text, scores });
+        }
+
+        // 🌟 [신규: 서브 도메인 동적 승급 (Sub-Domain Dynamic Boost) 분석 및 개선]
+        // 각 서브 도메인(review, coupon, event)의 대표 키워드(layout_list, layout_form)를 결합하여 Bias로 삼고,
+        // '나머지 모든 카테고리'의 대표 키워드를 결합하여 Prejudice(차감 대상)로 삼아 쿼리와의 유사도를 검증합니다.
+        let query_emb = self.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 384]);
+        let mut sub_domain_boosts = std::collections::HashMap::new();
+        
+        // 1. 모든 카테고리에 대해 layout_list, layout_form의 bias 값 추출
+        let all_cats = ["order", "goods", "tracking", "review", "coupon", "event"];
+        let mut cat_core_texts = std::collections::HashMap::new();
+        for cat in &all_cats {
+            let contexts: Vec<(String, String, String)> = crate::parsing::get_multi_pass_contexts(cat, &query_lang);
+            let mut core_text = String::new();
+            for (key, bias, _prej) in contexts.into_iter() {
+                if key == "layout_list" || key == "layout_form" {
+                    core_text.push_str(&bias);
+                    core_text.push_str(", ");
+                }
+            }
+            cat_core_texts.insert(cat.to_string(), core_text);
+        }
+        // 2. review, coupon, event 카테고리에 대해 각각 bias와 (나머지 카테고리의 합인) prejudice를 계산
+        let target_cats = ["review", "coupon", "event"];
+        // 🌟 [EMBED-PREFETCH] 아래 루프의 bias/prejudice 텍스트(최대 6건)를 한 번의 배치로 미리 올립니다.
+        //    질의와 무관한 레이아웃 텍스트이므로 고정 계층에 둡니다. 루프의 get_embedding 은 전부 캐시 적중입니다.
+        {
+            let mut pre: Vec<String> = Vec::new();
+            for target_cat in &target_cats {
+                let core_bias = cat_core_texts.get(*target_cat).cloned().unwrap_or_default();
+                let mut core_prej = String::new();
+                for other_cat in &all_cats {
+                    if other_cat != target_cat {
+                        if let Some(other_text) = cat_core_texts.get(*other_cat) {
+                            core_prej.push_str(other_text);
+                        }
+                    }
+                }
+                if !core_bias.is_empty() && !core_prej.is_empty() {
+                    pre.push(core_bias);
+                    pre.push(core_prej);
+                }
+            }
+            self.prefetch_embeddings_pinned(pre).await;
+        }
+        for target_cat in &target_cats {
+            let core_bias = cat_core_texts.get(*target_cat).cloned().unwrap_or_default();
+            
+            let mut core_prej = String::new();
+            for other_cat in &all_cats {
+                if other_cat != target_cat {
+                    if let Some(other_text) = cat_core_texts.get(*other_cat) {
+                        core_prej.push_str(other_text);
+                    }
+                }
+            }
+
+            if !core_bias.is_empty() && !core_prej.is_empty() {
+                let cat_emb = self.get_embedding(core_bias).await.unwrap_or(vec![0.0; 384]);
+                let prej_emb = self.get_embedding(core_prej).await.unwrap_or(vec![0.0; 384]); // 🌟 타 도메인 전체를 prejudice로 사용
+                
+                let b_sim = cosine_similarity(&query_emb, &cat_emb);
+                let p_sim = cosine_similarity(&query_emb, &prej_emb);
+                let sim = b_sim - p_sim; // 🌟 bias 유사도에서 prejudice(타 도메인) 유사도 차감
+                
+                // 🌟 [CRITICAL FIX] 임계값을 0.55로 엄격하게 상향 설정하여 무관한 쿼리가 승급되지 않도록 완벽 차단합니다.
+                if sim > 0.55 { 
+                    sub_domain_boosts.insert(target_cat.to_string(), true);
+                    emit_term(&format!("  🚀 [SUB-DOMAIN BOOST] '{}' 핵심 키워드가 쿼리와 높은 유사도(Bias: {:.4} - Prej: {:.4} = Final: {:.4})를 보여 우선순위가 상향됩니다.", target_cat, b_sim, p_sim, sim));
+                }
+            }
+        }
+
+        // 🌟 [2차 패스] 앞뒤 교차 문장 점수 합산을 통한 최종 컨텍스트 점수 도출
+        // 🌟 [2차 패스] 앞뒤 교차 문장 점수 합산 및 임시 목록 저장
+        struct EvaluatedSpan {
+            start: usize,
+            end: usize,
+            text: String,
+            best_cat: String,
+            context_score: f32,
+            intersecting: Vec<String>,
+            base_score: f32,
+        }
+        let mut evaluated_spans = Vec::new();
+
+        for i in 0..raw_spans.len() {
+            let target = &raw_spans[i];
+            let mut contextual_scores: Vec<(String, f32)> = Vec::new();
+
+            for cat in &categories {
+                let base_score = *target.scores.get(*cat).unwrap_or(&0.0);
+                
+                let mut prev_bonus = 0.0;
+                let mut next_bonus = 0.0;
+                
+                for j in 0..raw_spans.len() {
+                    if i == j { continue; }
+                    let other = &raw_spans[j];
+                    let o_score = *other.scores.get(*cat).unwrap_or(&0.0);
+                    
+                    // 앞쪽 교차 문장: 시작점이 앞서면서 현재 문장과 겹침
+                    if other.start < target.start && other.end > target.start {
+                        if o_score > prev_bonus { prev_bonus = o_score; }
+                    }
+                    // 뒤쪽 교차 문장: 끝점이 뒤서면서 현재 문장과 겹침
+                    if other.end > target.end && other.start < target.end {
+                        if o_score > next_bonus { next_bonus = o_score; }
+                    }
+                }
+                
+                // 중심 점수에 앞뒤 교차 점수를 50% 가중치로 합산하여 자연스러운 의미 뭉치 우선순위 상향
+                let final_context_score = base_score + (prev_bonus * 0.5) + (next_bonus * 0.5);
+                contextual_scores.push((cat.to_string(), final_context_score));
+            }
+
+            // 최종 합산 점수 기준 내림차순 정렬
+            contextual_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut current_best_cat = contextual_scores[0].0.clone();
+            let current_max_contextual_score = contextual_scores[0].1;
+
+            // 🌟 [도메인 우선순위 정의 헬퍼]
+            let get_priority = |cat: &str| -> i32 {
+                if sub_domain_boosts.contains_key(cat) {
+                    return 1; // 🌟 쿼리 벡터 매칭 기반 동적 승급
+                }
+                match cat {
+                    "goods" | "order" | "tracking" => 1, // 상위(핵심) 도메인
+                    _ => 2, // review, coupon, event 등 부가 도메인
+                }
+            };
+
+            // 🌟 [계층적 도메인 승급 (Hierarchical Promotion)] 
+            // 1등이 부가 도메인(review 등)이더라도, 핵심 도메인(goods 등)이 유효 오차 범위 내에 있다면 우선권을 부여하여 강제 승급!
+            if get_priority(&current_best_cat) > 1 {
+                for (cat_name, c_score) in &contextual_scores {
+                    if get_priority(cat_name) == 1 && *c_score >= current_max_contextual_score - 0.20 && *c_score > 0.4 {
+                        current_best_cat = cat_name.clone();
+                        emit_term(&format!("    🚀 [HIERARCHY PROMOTION] 핵심 도메인 우선순위 발동! '{}' -> '{}' 로 승급 (Score: {:.4})", target.text, current_best_cat, c_score));
+                        break;
+                    }
+                }
+            }
+
+            // 🌟 [커트라인 완전 해제] 최소한의 유사도(0.0 초과)만 있다면 모두 후보군으로 올리고, 길이와 문맥이 반영된 NMS 배틀을 통해 최강자만 살아남게 합니다.
+            if current_max_contextual_score > 0.0 {
+                let mut intersecting_categories: Vec<String> = Vec::new();
+                let mut detailed_score_log = String::new();
+                
+                for (cat_name, c_score) in &contextual_scores {
+                    // 유의미한 점수가 있는 모든 도메인의 점수를 기록
+                    if *c_score > 0.0 {
+                        detailed_score_log.push_str(&format!("{}: {:.4} | ", cat_name, c_score));
+                    }
+                    // 🌟 [다중 허용 확장] 오차 범위를 넓혀 서브 도메인들도 다중 태그로 편입되도록 허용 (-0.30 오차)
+                    if *c_score >= current_max_contextual_score - 0.30 && *c_score > 0.10 {
+                        intersecting_categories.push(cat_name.clone());
+                    }
+                }
+                if intersecting_categories.is_empty() {
+                    intersecting_categories.push(current_best_cat.clone());
+                }
+
+                // 🌟 유효 텍스트 후보군 출력 (카테고리별 상세 점수 포함)
+                emit_term(&format!("  🟢 [CANDIDATE] '{}' -> Domain: {} (Context Score: {:.4})", target.text, current_best_cat, current_max_contextual_score));
+                emit_term(&format!("      📊 [SCORES] {}", detailed_score_log.trim_end_matches(" | ")));
+
+                evaluated_spans.push(EvaluatedSpan {
+                    start: target.start,
+                    end: target.end,
+                    text: target.text.clone(),
+                    best_cat: current_best_cat,
+                    context_score: current_max_contextual_score,
+                    intersecting: intersecting_categories,
+                    base_score: 0.0, // 구조체 호환성을 위해 0.0으로 고정
+                });
+            }
+        }
+
+        // 🌟 [3차 패스] 오버랩(교차) 충돌 해결 (계층적 도메인 우선순위 및 길이 가중치 점수 정렬)
+        let get_priority = |cat: &str| -> i32 {
+            if sub_domain_boosts.contains_key(cat) {
+                return 1; // 🌟 쿼리 벡터 매칭 기반 동적 승급
+            }
+            match cat {
+                "goods" | "order" | "tracking" => 1, // 상위(핵심) 도메인
+                _ => 2, // review, coupon, event 등 부가 도메인
+            }
+        };
+
+        evaluated_spans.sort_by(|a, b| {
+            let a_pri = get_priority(&a.best_cat);
+            let b_pri = get_priority(&b.best_cat);
+            
+            // 1. 계층적 우선순위 (상위 도메인 승리) -> 2. 점수 -> 3. 길이
+            a_pri.cmp(&b_pri)
+                .then(b.context_score.partial_cmp(&a.context_score).unwrap_or(std::cmp::Ordering::Equal))
+                .then(b.text.len().cmp(&a.text.len()))
+        });
+
+        let mut final_selected_spans: Vec<EvaluatedSpan> = Vec::new();
+
+        emit_term("\n  ⚔️ [NMS BATTLE] Resolving Overlaps with Hierarchical Absorption...");
+
+        for span in evaluated_spans {
+            let mut is_overlapped = false;
+            let mut winner_text = String::new();
+
+            // 이미 승리하여 선택된 상위 점수의 스팬들과 현재 스팬이 교차하는지 검사합니다.
+            for selected in &mut final_selected_spans {
+                let overlaps = span.start < selected.end && span.end > selected.start;
+                
+                if overlaps {
+                    is_overlapped = true;
+                    winner_text = selected.text.clone();
+                    
+                    // 🌟 [계층적 흡수 & 다중 허용] 패배한 조각의 후보 카테고리(intersecting) 및 best_cat을 승자에게 병합
+                    for cat in &span.intersecting {
+                        if !selected.intersecting.contains(cat) {
+                            selected.intersecting.push(cat.clone());
+                        }
+                    }
+                    if !selected.intersecting.contains(&span.best_cat) {
+                        selected.intersecting.push(span.best_cat.clone());
+                        emit_term(&format!("    ♻️ [ABSORBED] 패배한 '{}'의 '{}' 도메인이 승자 '{}'에게 다중 태그로 병합되었습니다.", span.text, span.best_cat, winner_text));
+                    }
+                    break;
+                }
+            }
+
+            if !is_overlapped {
+                emit_term(&format!("    👑 [WINNER] '{}' -> {} (Score: {:.4}) survives.", span.text, span.best_cat, span.context_score));
+                final_selected_spans.push(span);
+            } else {
+                emit_term(&format!("    💀 [DEFEAT] '{}' is absorbed by higher priority/score winner '{}'.", span.text, winner_text));
+            }
+        }
+
+        // 프론트엔드로 보내기 위해 최종 생존한 문맥들을 원래 문장의 단어 순서대로 재정렬합니다.
+        final_selected_spans.sort_by(|a, b| a.start.cmp(&b.start));
+
+        // 🌟 [4차 패스] Gap Bridging & Score Battle (고아 단어 구출 및 양방향 흡수 대결)
+        // NMS 배틀에서 탈락하여 붕 떠버린 단어(Gap)들을 양쪽 승자 문맥에 각각 붙여보고, 더 높은 멀티패스 점수를 내는 쪽이 흡수합니다.
+        if !final_selected_spans.is_empty() {
+            emit_term("\n  🌉 [GAP BRIDGING] Rescuing orphaned words via Score Battle...");
+            
+            let mut final_bounds: Vec<(usize, usize, String, f32, Vec<String>)> = final_selected_spans
+                .into_iter()
+                .map(|s| (s.start, s.end, s.best_cat, s.context_score, s.intersecting))
+                .collect();
+
+            // 1. 왼쪽 끝(Left Edge) 고아 단어 무조건 흡수 (예: 문장 맨 앞의 "여름")
+            if final_bounds[0].0 > 0 {
+                let gap_start = 0;
+                let gap_end = final_bounds[0].0;
+                let gap_text = words[gap_start..gap_end].join(" ");
+                emit_term(&format!("    🛠️ [LEFT EDGE] '{}' is absorbed by '{}'", gap_text, words[final_bounds[0].0..final_bounds[0].1].join(" ")));
+                final_bounds[0].0 = 0;
+            }
+
+            // 🌟 [EMBED-PREFETCH] 갭마다 왼쪽/오른쪽 흡수 텍스트를 1건씩 임베딩하던 것을 한 번의 배치로 미리 올립니다.
+            //    왼쪽 승자의 시작점은 직전 갭에서 오른쪽이 이기면 직전 갭 시작으로 바뀌므로,
+            //    두 경우를 모두(갭당 최대 3건) 추측해 넣습니다. 추측분은 캐시 엔트리만 늘릴 뿐 결과와 무관합니다.
+            //    추측분(직전 갭 시작 변형)은 배치 순전파일 때만 넣습니다(per-text 경로에서는 1건 = 순전파 1회).
+            {
+                let spec = self.embed_speculation_cheap();
+                let mut pre: Vec<String> = Vec::new();
+                for i in 0..(final_bounds.len() - 1) {
+                    let gap_start = final_bounds[i].1;
+                    let gap_end = final_bounds[i + 1].0;
+                    if gap_start >= gap_end { continue; }
+                    pre.push(words[final_bounds[i].0..gap_end].join(" "));
+                    if spec && i > 0 {
+                        let prev_gap_start = final_bounds[i - 1].1;
+                        if prev_gap_start < final_bounds[i].0 {
+                            pre.push(words[prev_gap_start..gap_end].join(" "));
+                        }
+                    }
+                    pre.push(words[gap_start..final_bounds[i + 1].1].join(" "));
+                }
+                self.prefetch_embeddings(pre).await;
+            }
+
+            // 2. 중간(Gap) 고아 단어 양방향 점수 대결 흡수 (예: "20%에", "속하지만")
+            for i in 0..(final_bounds.len() - 1) {
+                let gap_start = final_bounds[i].1;
+                let gap_end = final_bounds[i+1].0;
+
+                if gap_start < gap_end {
+                    let gap_text = words[gap_start..gap_end].join(" ");
+
+                    // 대결 A: 왼쪽 승자가 흡수했을 때의 멀티패스 점수 계산
+                    let left_cat = &final_bounds[i].2;
+                    let left_test_text = words[final_bounds[i].0..gap_end].join(" ");
+                    let left_emb = self.get_embedding(left_test_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                    // 🌟 [STAGE1-CTX] 카테고리별 (bias − prejudice) 상위 5개 감쇠 합 (기존 식 그대로, 채점표 재사용)
+                    if !layout_table.has_cat(left_cat) {
+                        layout_table.ensure_cat(left_cat, crate::parsing::get_multi_pass_contexts(left_cat, &query_lang), &layout_embs, &anchor_embs);
+                    }
+                    let left_score = layout_table.gap_score(&left_emb, left_cat).unwrap_or(0.0);
+
+                    // 대결 B: 오른쪽 승자가 흡수했을 때의 멀티패스 점수 계산
+                    let right_cat = &final_bounds[i+1].2;
+                    let right_test_text = words[gap_start..final_bounds[i+1].1].join(" ");
+                    let right_emb = self.get_embedding(right_test_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                    if !layout_table.has_cat(right_cat) {
+                        layout_table.ensure_cat(right_cat, crate::parsing::get_multi_pass_contexts(right_cat, &query_lang), &layout_embs, &anchor_embs);
+                    }
+                    let right_score = layout_table.gap_score(&right_emb, right_cat).unwrap_or(0.0);
+
+                    // ⚔️ 대결 결과 판정 및 최종 흡수
+                    if left_score >= right_score {
+                        emit_term(&format!("    ⚔️ [GAP BATTLE] Gap '{}' -> LEFT WINS! (Left: {:.4} > Right: {:.4})", gap_text, left_score, right_score));
+                        final_bounds[i].1 = gap_end; 
+                        final_bounds[i].3 = left_score; // 점수 갱신
+                        // 패자쪽(오른쪽)의 best_cat을 승자 쪽에 추가
+                        let right_cat = final_bounds[i+1].2.clone();
+                        if !final_bounds[i].4.contains(&right_cat) {
+                            final_bounds[i].4.push(right_cat);
+                        }
+                    } else {
+                        emit_term(&format!("    ⚔️ [GAP BATTLE] Gap '{}' -> RIGHT WINS! (Right: {:.4} > Left: {:.4})", gap_text, right_score, left_score));
+                        final_bounds[i+1].0 = gap_start; 
+                        final_bounds[i+1].3 = right_score; // 점수 갱신
+                        // 패자쪽(왼쪽)의 best_cat을 승자 쪽에 추가
+                        let left_cat = final_bounds[i].2.clone();
+                        if !final_bounds[i+1].4.contains(&left_cat) {
+                            final_bounds[i+1].4.push(left_cat);
+                        }
+                    }
+                }
+            }
+
+            // 3. 오른쪽 끝(Right Edge) 고아 단어 무조건 흡수 (예: 문장 맨 끝의 "시급해")
+            let last_idx = final_bounds.len() - 1;
+            if final_bounds[last_idx].1 < words.len() {
+                let gap_start = final_bounds[last_idx].1;
+                let gap_end = words.len();
+                let gap_text = words[gap_start..gap_end].join(" ");
+                emit_term(&format!("    🛠️ [RIGHT EDGE] '{}' is absorbed by '{}'", gap_text, words[final_bounds[last_idx].0..final_bounds[last_idx].1].join(" ")));
+                final_bounds[last_idx].1 = words.len();
+            }
+
+            // 4. 최종 조립된 결과를 배열에 삽입
+            let mut needs_category_llm = false;
+            for (_, _, _, _, intersecting) in &final_bounds {
+                if intersecting.len() > 1 {
+                    needs_category_llm = true;
+                    break;
+                }
+            }
+            
+            if needs_category_llm {
+                emit_term("    🧠 [QWEN3 VERIFICATION (STAGE-1)] Verifying domain categories...");
+                // 이미 최초에 로드되었으므로 생략
+            }
+
+            for (start, end, mut best_cat, context_score, mut intersecting) in final_bounds {
+                let final_text = words[start..end].join(" ");
+                
+                // 🌟 types 배열에 best_cat이 무조건 포함되도록 보장하고 중복 제거
+                if !intersecting.contains(&best_cat) {
+                    intersecting.push(best_cat.clone());
+                }
+                intersecting.sort();
+                intersecting.dedup();
+                
+                // 🌟 [추가] Qwen3를 이용한 카테고리(Type) 확정 로직
+                if intersecting.len() > 1 {
+                    let prompt = crate::prompts::verify_category_with_alternatives_prompt(
+                        &final_text, &best_cat, context_score, &intersecting
+                    );
+                    
+                    if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
+                        if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                            if let Some(suggested) = result.get("suggested_category").and_then(|v| v.as_str()) {
+                                let valid = intersecting.contains(&suggested.to_string());
+                                crate::model::lang_llm::record_query_value(valid);
+                                if valid && best_cat != suggested {
+                                    emit_term(&format!("      🔄 Category corrected/confirmed from [{}] to [{}] for '{}'", best_cat, suggested, final_text));
+                                    best_cat = suggested.to_string();
+                                } else if valid {
+                                    emit_term(&format!("      ✅ Category [{}] confirmed for '{}'", best_cat, final_text));
+                                } else {
+                                    emit_term(&format!(
+                                        "      🚫 [LLM REJECT] '{}' 의 카테고리 제안 [{}] 은 후보 {:?} 밖이라 폐기하고 [{}] 를 유지합니다. ({})",
+                                        final_text, suggested, intersecting, best_cat, crate::model::lang_llm::query_engine_label()
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                emit_term(&format!("  📈 [CROSS MATCH FINAL] Intersection: {:?} -> '{}' (Context Score: {:.4})", intersecting, final_text, context_score));
+
+                context_arr.push(json!({
+                    "type": best_cat,
+                    "types": intersecting,
+                    "text": final_text,
+                    "score": context_score
+                }));
+            }
+        }
+
+        let mut segments = json!({
+            "original_text": query.clone(),
+            "context": context_arr
+        });
+        
+        // Stage 1 완료 후 최종 분할된 맥락 트리 전체를 출력합니다.
+        emit_term("\n=======================================");
+        emit_term("[STAGE-1 RESULT] 🧩 Semantic Chunking Complete:");
+        emit_term(&serde_json::to_string_pretty(&segments).unwrap_or_default());
+        emit_term("=======================================\n");
+
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+            return Ok(json!({ "context": [], "cancelled": true }));
+        }
+
+        // ----------------------------------------------------
+        // Stage 2 & 3: Double Plinko Attribute/Operator Mapping & LLM Normalization
+        // ----------------------------------------------------
+        emit_term("[STAGE-2] Extracting attributes via Double Vector Plinko & LLM Normalization...");
+        
+        // 🌟 [SCOPE FIX] Stage-3 CROSS-VERB 에서 참조할 수 있도록 도메인 지시어 매핑을 외부 스코프에 선언합니다.
+        let mut domain_word_related: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        // 🌟 [ACTION WORD SET] 벡터 역검증을 통과해 '순수 검색 명령어'로 확정된 단어입니다.
+        //    STAGE-3 이 A/FULL 티어의 FTS 검색어에서 이 단어들만 제거합니다.
+        //    다국어 어휘 리터럴을 코드에 두지 않기 위해 런타임 확정 집합만 사용합니다.
+        let mut global_action_words: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
+            let total_segments = ctx_arr.len();
+
+            for (idx, seg) in ctx_arr.iter_mut().enumerate() {
+                if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                    emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                    return Ok(json!({ "context": [], "cancelled": true }));
+                }
+
+                let payload = json!({ "task_id": task_id, "category": format!("Stage 2 ({}/{})", idx+1, total_segments), "summary": "Mapping attributes...", "spinner": "⠋" });
+                let _ = app_handle.emit("extraction-progress", &payload);
+                crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
+
+                let current_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                
+                // 🌟 [2차 분기] 세부 속성 매칭: 해당 도메인 타입의 Schema Field(Property Bias/Prej) 로드
+                let fields = crate::parsing::get_detail_schema_fields(&seg_type, "", language);
+                
+                let mut prop_keys = Vec::new();
+                let mut bias_texts = Vec::new();
+                let mut prej_texts = Vec::new();
+                let mut prop_types = std::collections::HashMap::new(); // 🌟 스키마 타입 저장용 맵 추가
+                
+                for (key, desc, bias, prej) in fields {
+                    // 🌟 [추가] url, link 관련 속성은 추출 대상 및 Plinko 슬롯에서 완전히 배제
+                    let lower_key = key.to_lowercase();
+                    if lower_key.contains("url") || lower_key.contains("link") {
+                        continue;
+                    }
+
+                    prop_keys.push(key.clone());
+                    bias_texts.push(bias);
+                    prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
+                    
+                    // 🌟 [DB SCHEMA CHECK v2 / DELEGATED]
+                    //  ── 무엇이 바뀌었나 ──
+                    //   기존에는 ["price","amount","quantity","discount","fee","weight",
+                    //   "width","height","length","limit"] 완전 일치 목록을 여기와 DFS 루프
+                    //   두 곳에 각각 복제해 두었습니다. 커머스 전용 목록이라
+                    //   volume / package_count / local_charges / exchange_rate 같은
+                    //   무역 수치 축이 전부 String 으로 떨어졌고, 그 결과
+                    //     · 연산자가 contains 로 강제되어 수치 비교가 불가능
+                    //     · NUMERIC REROUTE 의 Numeric 후보 루프에서 제외
+                    //   가 동시에 발생했습니다.
+                    //   ai_utils::detect_field_format 이 이미 같은 판정을 하고 있으므로
+                    //   그쪽 한 곳으로 위임하여 구현이 갈라지는 원인을 없앱니다.
+                    //   Boolean 은 detect_field_format 에 없는 축이라 기존 규칙을 유지합니다.
+                    let parts: Vec<&str> = lower_key.split('_').collect();
+                    let is_boolean = parts.iter().any(|&p| ["only", "included"].contains(&p));
+                    let fmt_is_number = crate::utils::ai_utils::detect_field_format(&lower_key)
+                        == crate::utils::ai_utils::FieldFormat::Numeric;
+                    let type_str = if desc.contains("Number") { "Number" }
+                                   else if desc.contains("Boolean") || is_boolean { "Boolean" }
+                                   else if desc.contains("Array") { "Array" }
+                                   else if fmt_is_number { "Number" }
+                                   else { "String" };
+                    prop_types.insert(key, type_str);
+                }
+
+                // 🌟 [글로벌 속성 동적 확장] 뎁스(Depth)에 무관하게 bias.json 전체를 깊이 우선 탐색(Stack DFS)으로 순회하여 속성을 추출합니다.
+                let mut loaded_globals = Vec::new();
+                if let Some(root_obj) = crate::parsing::BIAS_DICT.as_object() {
+                    let mut stack: Vec<(String, &Value)> = Vec::new();
+                    
+                    let excluded_keys = [
+                        "ignore", "insight", "search_bridge", 
+                        "sq", "ar", "az", "bn", "bg", "ca", "zh", "hr", "cs", "da", 
+                        "nl", "en", "et", "fi", "fr", "ka", "de", "el", "he", "hi", 
+                        "hu", "is", "id", "it", "ja", "kk", "km", "ko", "lv", "lt", 
+                        "ms", "mr", "no", "fa", "pl", "pt", "ro", "ru", "sr", "sk", 
+                        "sl", "es", "sw", "sv", "tl", "te", "th", "tr", "uk", "ur", 
+                        "uz", "vi"
+                    ];
+
+                    // 1. 루트 레벨 객체들을 필터링하여 스택에 삽입
+                    for (g_key, g_val) in root_obj {
+                        if !excluded_keys.contains(&g_key.as_str()) {
+                            // emit_term(&format!("  root Property '{}' loaded for 1st Plinko.", g_key));
+                            stack.push((g_key.clone(), g_val));
+                        }
+                    }
+
+                    // 2. 스택 기반 뎁스 프리(Depth-Free) 무한 탐색 루프
+                    while let Some((node_key, node_val)) = stack.pop() {
+                        if let Some(obj) = node_val.as_object() {
+                            // 현재 객체가 속성 스키마의 필수 조건 3가지를 가졌다면 추출 (1단이든 2단이든 무조건 걸림)
+
+                            if obj.contains_key("semantic") && obj.contains_key("bias") && obj.contains_key("prejudice") {
+                                if !prop_keys.contains(&node_key) {
+                                    // emit_term(&format!("  child Property '{}' loaded for 1st Plinko.", node_key));
+
+                                    let desc = obj.get("semantic").and_then(|v| v.as_str()).unwrap_or("String").to_string();
+                                    let bias = obj.get("bias").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let prej = obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("random unrelated noise").to_string();
+                                    
+                                    prop_keys.push(node_key.clone());
+                                    bias_texts.push(bias);
+                                    prej_texts.push(if prej.trim().is_empty() { "random unrelated noise".to_string() } else { prej });
+                                    
+                                    // 🌟 [DB SCHEMA CHECK v2 / DELEGATED] 위 스키마 필드 루프와 동일 규칙입니다.
+                                    //    두 곳에 복제해 두었던 수치 키워드 목록을
+                                    //    ai_utils::detect_field_format 한 곳으로 위임합니다.
+                                    let node_key_lower = node_key.to_lowercase();
+                                    let parts: Vec<&str> = node_key_lower.split('_').collect();
+                                    let is_boolean = parts.iter().any(|&p| ["only", "included"].contains(&p));
+                                    let fmt_is_number = crate::utils::ai_utils::detect_field_format(&node_key_lower)
+                                        == crate::utils::ai_utils::FieldFormat::Numeric;
+                                    let type_str = if desc.contains("Number") { "Number" }
+                                                   else if desc.contains("Boolean") || is_boolean { "Boolean" }
+                                                   else if desc.contains("Array") { "Array" }
+                                                   else if fmt_is_number { "Number" }
+                                                   else { "String" };
+                                    prop_types.insert(node_key.clone(), type_str);
+                                    loaded_globals.push(node_key);
+                                }
+                            } else {
+                                // 필수 조건이 없는 일반 컨테이너 객체(예: metrics)라면 하위 객체들을 스택에 넣어 계속 파고듦
+                                for (sub_k, sub_v) in obj {
+                                    stack.push((sub_k.clone(), sub_v));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 🌟 [3차 분기] 동적 필터 카테고리 일괄 로드 (bias.json 구조 완전 동기화)
+                let filter_categories = vec![
+                    "operators", "metrics", "time_filters", "season_filters", 
+                    "status_filters", "substantial_filters", "find_filters", "option_filters"
+                ];
+
+                #[derive(Clone)]
+                struct DynamicFilterDef {
+                    category: String,
+                    key: String,
+                }
+                
+                let mut dynamic_filter_defs = Vec::new();
+                let mut dynamic_bias_texts = Vec::new();
+                let mut dynamic_prej_texts = Vec::new();
+
+                for cat in &filter_categories {
+                    if let Some(obj) = crate::parsing::BIAS_DICT.get(*cat).and_then(|v| v.as_object()) {
+                        for (k, v) in obj {
+                            let mut b_text = format!("{} context: {}", cat, k); 
+                            let mut p_text = format!("{} context: not {}", cat, k);
+                            
+                            if let Some(b) = v.get("bias").and_then(|val| val.as_str()) { 
+                                b_text = format!("{} context: {}", cat, b); 
+                            }
+                            if let Some(p) = v.get("prejudice").and_then(|val| val.as_str()) { 
+                                p_text = format!("{} context: {}", cat, p); 
+                            }
+                            
+                            dynamic_filter_defs.push(DynamicFilterDef { 
+                                category: cat.to_string(), 
+                                key: k.to_string() 
+                            });
+                            dynamic_bias_texts.push(b_text);
+                            dynamic_prej_texts.push(p_text);
+                        }
+                    }
+                }
+
+                // 🌟 [MULTILINGUAL VALUE ANCHOR — 정방향 편입]
+                //    bias.json 의 search_bridge.multilingual_value_anchor 에는
+                //    goods.title = "knit, cardigan, sweater, ..., 니트, 가디건, 스웨터, 코트, ニット, カーディガン, ..."
+                //    처럼 '그 속성의 값이 실제로 어떤 어휘로 등장하는가' 가 50개 언어로 등재되어 있습니다.
+                //    그런데 정방향은 이 축을 전혀 읽지 않아, 저장 벡터(역방향)에는 있는 축이
+                //    질의 벡터(정방향)에는 없는 비대칭이 발생했습니다.
+                //    (log 실측: '니트 가디건' -> 1st: [color] (0.5906), title 은 상위 2위에도 없음)
+                //    이 축을 편입하면 '니트'/'가디건' 이 title 뱅크의 동일 구와 코사인 1.0 이 되어
+                //    color 뱅크(603구 → BANK EQUALIZE 5구)의 우연 공명을 압도합니다.
+                //
+                //    구조 안전성: multilingual_value_anchor 는 filter_category_phrases() 도,
+                //    abstract_bridge_phrases() 도 읽지 않는 별도 노드이므로
+                //    SURPRISAL 게이트·필터 라우팅·연산자 뱅크를 전혀 오염시키지 않습니다.
+                //    오직 '스키마 속성 뱅크' 에만 들어갑니다.
+                let mut prop_phrase_texts: Vec<Vec<String>> = Vec::with_capacity(prop_keys.len());
+                let mut prop_raw_weights: Vec<Vec<f32>> = Vec::with_capacity(prop_keys.len());
+                let mut prop_prej_texts: Vec<Vec<String>> = Vec::with_capacity(prop_keys.len());
+                let mut mv_anchor_log: Vec<String> = Vec::new();
+                for (i, raw) in bias_texts.iter().enumerate() {
+                    let (mut ph, mut wt) = crate::utils::ai_utils::split_bias_phrases_weighted_full(raw);
+                    let anchor = crate::utils::ai_utils::semantic_anchor_text(&query_lang, &seg_type, &prop_keys[i]);
+                    for p in crate::utils::ai_utils::split_bias_phrases_full(&anchor) {
+                        if !ph.iter().any(|e| e == &p) {
+                            ph.push(p);
+                            wt.push(1.0);
+                        }
+                    }
+
+                    // 🌟 다국어 값 어휘 축 편입 (역방향 indexing_anchor_text 와 동일 노드)
+                    //    🌟 [DOMAIN SCOPE] bias.json 키는 "goods.title" / "review.title" / "tracking.title" 인데
+                    //       ai_utils 의 접미 매칭(rsplitn)이 세 도메인을 전부 병합했습니다.
+                    //       그 결과 review 검색의 title 뱅크에 의류 어휘 200여 구가 실려
+                    //       review.title 과 goods.title 이 벡터 공간에서 구분되지 않았습니다.
+                    //       seg_type 을 함께 넘겨 이 세그먼트의 도메인 축만 편입합니다.
+                    let mv = crate::utils::ai_utils::multilingual_value_anchor_phrases_scoped(&seg_type, &prop_keys[i]);
+                    if !mv.is_empty() {
+                        mv_anchor_log.push(format!("{}({}구)", prop_keys[i], mv.len()));
+                    }
+                    for p in mv {
+                        if !ph.iter().any(|e| e == &p) {
+                            ph.push(p);
+                            wt.push(1.0);
+                        }
+                    }
+
+                    prop_phrase_texts.push(ph);
+                    prop_raw_weights.push(wt);
+
+                    let prej_raw = prej_texts.get(i).cloned().unwrap_or_default();
+                    prop_prej_texts.push(crate::utils::ai_utils::split_bias_phrases_full(&prej_raw));
+                }
+                if !mv_anchor_log.is_empty() {
+                    emit_term(&format!(
+                        "    🌐 [MULTILINGUAL VALUE ANCHOR] 정방향 속성 뱅크에 다국어 값 어휘 축 편입: {:?}",
+                        mv_anchor_log
+                    ));
+                }
+
+                // 🌟 [AMBIGUITY MASK] bias.json 을 손대지 않고 무변별 구를 구조적으로 제거합니다.
+                let ambiguity_mask = crate::utils::ai_utils::cross_field_ambiguous_phrase_mask(&prop_phrase_texts, &prop_prej_texts);
+
+                let mut flat_phrases: Vec<String> = Vec::new();
+                let mut prop_phrase_weights: Vec<Vec<f32>> = Vec::with_capacity(prop_keys.len());
+                let mut prop_phrase_spans: Vec<(usize, usize)> = Vec::with_capacity(prop_keys.len());
+                for i in 0..prop_phrase_texts.len() {
+                    let start = flat_phrases.len();
+                    let mut w: Vec<f32> = Vec::new();
+                    let mut dropped: Vec<String> = Vec::new();
+                    for (pi, keep) in ambiguity_mask[i].iter().enumerate() {
+                        if *keep {
+                            flat_phrases.push(prop_phrase_texts[i][pi].clone());
+                            w.push(prop_raw_weights[i].get(pi).copied().unwrap_or(1.0));
+                        } else {
+                            dropped.push(prop_phrase_texts[i][pi].clone());
+                        }
+                    }
+                    if !dropped.is_empty() {
+                        emit_term(&format!(
+                            "    🧪 [AMBIGUOUS PHRASE DROP] '{}' 뱅크에서 타 필드와 동일하거나 자기 prejudice 와 충돌하는 무변별 구 {}개 제거: {:?}",
+                            prop_keys[i], dropped.len(), dropped.iter().take(6).collect::<Vec<_>>()
+                        ));
+                    }
+                    prop_phrase_spans.push((start, flat_phrases.len()));
+                    prop_phrase_weights.push(w);
+                }
+
+                emit_term(&format!("  🧱 [PROPERTY PHRASE BANK] 속성 {}개 / 변별 구 {}개 임베딩 개시...", prop_keys.len(), flat_phrases.len()));
+
+                let mut flat_embs: Vec<Vec<f32>> = Vec::with_capacity(flat_phrases.len());
+                for chunk in flat_phrases.chunks(200) {
+                    let part = self.get_embedding_batch_pinned(chunk.to_vec()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; chunk.len()]);
+                    flat_embs.extend(part);
+                }
+
+                let mut prop_phrase_embs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(prop_keys.len());
+                for (start, end) in &prop_phrase_spans {
+                    let mut bank = Vec::with_capacity(end.saturating_sub(*start));
+                    for idx in *start..*end {
+                        bank.push(flat_embs.get(idx).cloned().unwrap_or_else(|| vec![0.0; 384]));
+                    }
+                    prop_phrase_embs.push(bank);
+                }
+
+                // 🌟 [BANK SIZE EQUALIZATION] 거대 뱅크(color ~700구)가 Max-Pool 통계만으로
+                //    무관한 청크의 argmax 를 독식하는 '흡수 싱크' 를 구조적으로 해체합니다.
+                //    기존 1회 중앙값 컷은 603구 → 302구 로 절반만 줄여
+                //        √(2 ln 603)=3.58 → √(2 ln 302)=3.38  (이득 5.6% 감소)
+                //    에 그쳤고, title(11구, 2.19) 대비 여전히 1.54배 유리했습니다.
+                //    그래서 로그의 '팔린'(0.5780) '남긴'(0.6365) 이 계속 color 로 흡수되었습니다.
+                //    목표 규모는 '이 스키마의 유효 구 개수 중앙값' 이라는 실측값이므로 새 상수가 아닙니다.
+                {
+                    let seg_query_emb = self.get_embedding(current_text.clone()).await.unwrap_or(vec![0.0; 384]);
+
+                    let mut sizes: Vec<usize> = prop_phrase_embs.iter()
+                        .map(|b| b.iter().filter(|e| !e.iter().all(|&v| v == 0.0)).count())
+                        .filter(|&c| c > 0)
+                        .collect();
+                    sizes.sort_unstable();
+                    let target_size = if sizes.is_empty() {
+                        0
+                    } else if sizes.len() % 2 == 0 {
+                        (sizes[sizes.len() / 2 - 1] + sizes[sizes.len() / 2]) / 2
+                    } else {
+                        sizes[sizes.len() / 2]
+                    };
+                    if target_size > 0 {
+                        emit_term(&format!("    📐 [BANK EQUALIZE TARGET] 이 스키마의 유효 구 개수 중앙값 {}구를 목표 규모로 삼습니다.", target_size));
+                    }
+
+                    for pi in 0..prop_phrase_embs.len() {
+                        let before = prop_phrase_embs[pi].iter().filter(|e| !e.iter().all(|&v| v == 0.0)).count();
+                        let keep = crate::utils::ai_utils::bank_size_equalized_mask(&seg_query_emb, &prop_phrase_embs[pi], target_size);
+                        let mut dropped = 0usize;
+                        for (i, k) in keep.iter().enumerate() {
+                            if !*k {
+                                prop_phrase_embs[pi][i] = vec![0.0; 384];
+                                dropped += 1;
+                            }
+                        }
+                        if dropped > 0 {
+                            emit_term(&format!("    📉 [BANK EQUALIZE] '{}' 뱅크 {}구 → {}구 (Max-Pool 구조 이득 제거를 위해 {}개 비활성화)",
+                                prop_keys[pi], before, before.saturating_sub(dropped), dropped));
+                        }
+                    }
+                }
+
+                let prej_embs = self.get_embedding_batch_pinned(prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; prop_keys.len()]);
+                
+                let dynamic_bias_embs = self.get_embedding_batch_pinned(dynamic_bias_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
+                let dynamic_prej_embs = self.get_embedding_batch_pinned(dynamic_prej_texts).await.unwrap_or_else(|_| vec![vec![0.0; 384]; dynamic_filter_defs.len()]);
+
+                // ── 0) 전담 필터 카테고리가 이미 처리하는 키는 '속성' 후보가 아닙니다.
+                //       season_filters.summer / operators.gt / metrics.time 등이 루트 DFS 로
+                //       속성 목록에 이중 등록되어 있어, color 를 뺏긴 청크가 'summer(0.5129)' 같은
+                //       엉뚱한 슬롯으로 흘러갈 수 있었습니다.
+                //       단, 스키마 컬럼과 이름이 겹치는 키(goods.quantity ↔ metrics.quantity)는
+                //       루트 DFS 가 등록한 것이 아니므로(loaded_globals 에 없음) 그대로 보존합니다.
+                //       color 는 어떤 filter_category 에도 속하지 않으므로 반드시 살아남습니다.
+                let filter_owned_keys: std::collections::HashSet<String> =
+                    dynamic_filter_defs.iter().map(|d| d.key.clone()).collect();
+                let is_filter_owned = |name: &str| -> bool {
+                    loaded_globals.iter().any(|g| g == name) && filter_owned_keys.contains(name)
+                };
+
+                // 🌟 [FILTER-OWNED MASK] season_filters.summer / time_filters.this_year / operators.top 은
+                //    semantic+bias+prejudice 3종 세트를 갖고 있어 루트 DFS 가 '스키마 속성'으로 등록해 버립니다.
+                //    기존에는 행렬 구축 시점에만 걸러서, 채점 단계에서는 여전히 1순위를 독식했습니다.
+                //    (로그: '무거운' -> 1st: [summer] (0.5612))
+                //    채점 루프 진입 자체를 막습니다.
+                let prop_is_filter_owned: Vec<bool> = prop_keys.iter().map(|k| is_filter_owned(k)).collect();
+                {
+                    let owned: Vec<&String> = prop_keys.iter().enumerate()
+                        .filter(|(i, _)| prop_is_filter_owned[*i]).map(|(_, k)| k).collect();
+                    if !owned.is_empty() {
+                        emit_term(&format!("    🚧 [FILTER-OWNED EXCLUDE] 필터 카테고리 소유 키 {}개를 속성 후보에서 제외: {:?}",
+                            owned.len(), owned.iter().take(10).collect::<Vec<_>>()));
+                    }
+                }
+
+                // 🌟 [TEMPORAL PHRASE BANK PRE-BUILD]
+                //    기존 TEMPORAL PRE-GATE는 dynamic_bias_embs(센트로이드 1벡터)로 비교하여
+                //    한국어 2음절 단어("올해")가 영어 문장 센트로이드와 코사인이 낮아 실패했습니다.
+                //    여기서는 bias.json 의 time_filters / season_filters 각 키의
+                //    semantic + bias 를 구 단위로 쪼개 임베딩하고 Max-Pool 로 비교합니다.
+                //    '올해' 와 embed("current year") 의 코사인은 multilingual 모델에서 0.6+ 입니다.
+                //    이 뱅크는 세그먼트 루프 시작 시 1회만 구축합니다.
+                let temporal_phrases = crate::utils::ai_utils::temporal_semantic_phrases();
+                let temporal_phrase_texts: Vec<String> = temporal_phrases.iter().map(|(_, p)| p.clone()).collect();
+                let temporal_phrase_embs: Vec<Vec<f32>> = if temporal_phrase_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch_pinned(temporal_phrase_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; temporal_phrase_texts.len()])
+                };
+                // 🌟 [NUMERIC OPERATOR PHRASE BANK PRE-BUILD]
+                //    operators 카테고리 각 키의 bias 를 구 단위로 쪼개 임베딩합니다.
+                //    "이하로" 와 embed("less than or equal") / embed("under") / embed("no more than") 의
+                //    Max-Pool 코사인이 top/bottom 뱅크보다 높으면 비교 연산자로 확정합니다.
+                let mut op_phrase_texts: Vec<String> = Vec::new();
+                let mut op_phrase_is_rank: Vec<bool> = Vec::new();
+                if let Some(ops_node) = crate::parsing::BIAS_DICT.get("operators").and_then(|v| v.as_object()) {
+                    for (op_key, op_val) in ops_node {
+                        let is_rank = op_key == "top" || op_key == "bottom";
+                        if let Some(bias_str) = op_val.get("bias").and_then(|v| v.as_str()) {
+                            for phrase in crate::utils::ai_utils::split_bias_phrases_full(bias_str) {
+                                op_phrase_texts.push(phrase);
+                                op_phrase_is_rank.push(is_rank);
+                            }
+                        }
+                        if let Some(semantic_str) = op_val.get("semantic").and_then(|v| v.as_str()) {
+                            for phrase in crate::utils::ai_utils::split_bias_phrases_full(semantic_str) {
+                                op_phrase_texts.push(phrase);
+                                op_phrase_is_rank.push(is_rank);
+                            }
+                        }
+                    }
+                }
+                let op_phrase_embs: Vec<Vec<f32>> = if op_phrase_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch_pinned(op_phrase_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; op_phrase_texts.len()])
+                };
+                // 🌟 [METRICS FAMILY BANK] bias.json 의 metrics.* 를 (계열, 구) 로 펼쳐 임베딩합니다.
+                //    metrics.price.bias 에 "won" 이 이미 존재하므로 다국어 임베딩이 '원' ↔ 'won' 을
+                //    연결해 줍니다. 이 축이 있어야 "5000원 이하로" 의 수치 대상이
+                //    quantity 가 아니라 price 계열이라는 사실을 어휘 하드코딩 없이 확정할 수 있습니다.
+                let metric_family_defs = crate::utils::ai_utils::metrics_family_phrases();
+                let metric_family_texts: Vec<String> = metric_family_defs.iter().map(|(_, p)| p.clone()).collect();
+                let metric_family_raw: Vec<Vec<f32>> = if metric_family_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch_pinned(metric_family_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; metric_family_texts.len()])
+                };
+                let metric_family_bank: Vec<(String, Vec<f32>)> = metric_family_defs.iter()
+                    .zip(metric_family_raw.into_iter())
+                    .map(|((k, _), e)| (k.clone(), e))
+                    .collect();
+                if !metric_family_bank.is_empty() {
+                    emit_term(&format!("    📐 [METRICS FAMILY BANK] metrics 계열 구 {}개 준비 완료.", metric_family_bank.len()));
+                }
+                // 🌟 [ALL-FILTER PHRASE BANK PRE-BUILD]
+                //    substantial_filters / find_filters / status_filters / time_filters / season_filters
+                //    전 카테고리의 bias+semantic 구를 임베딩합니다.
+                //    (로그: '무거운'→unit, '많이'→condition, '팔린'→color 오배정의 공통 원인은
+                //     이 필터들이 2nd Plinko 에만 있어 1st 에서 스키마 속성이 먼저 선점하기 때문입니다)
+                //    bias.json 을 수정하지 않고 기존 bias/semantic 필드만 동적으로 읽어 구축합니다.
+                let all_filter_phrases = crate::utils::ai_utils::filter_category_phrases(&[
+                    "substantial_filters", "find_filters", "status_filters", "time_filters", "season_filters",
+                ]);
+                let all_filter_texts: Vec<String> = all_filter_phrases.iter().map(|(_, _, p)| p.clone()).collect();
+                let all_filter_raw_embs: Vec<Vec<f32>> = if all_filter_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch_pinned(all_filter_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; all_filter_texts.len()])
+                };
+                // (category, key, embedding) 트리플로 재조립
+                let mut all_filter_embs: Vec<(String, String, Vec<f32>)> = all_filter_phrases.iter()
+                    .zip(all_filter_raw_embs.into_iter())
+                    .map(|((cat, key, _), emb)| (cat.clone(), key.clone(), emb))
+                    .collect();
+
+                // 🌟 [ABSTRACT BRIDGE BANK]
+                //    bias.json 의 search_bridge.abstract_bridge 에서 영어 브릿지 구를 읽어 임베딩합니다.
+                //    substantial_filters / find_filters 의 원본 bias 는 영어 3~6구뿐이라
+                //    한국어 '무거운' 과의 코사인이 구조적으로 낮았습니다.
+                //    브릿지 구를 얹어 뱅크 밀도를 올리고, EVT 정규화로 크기 편향까지 제거합니다.
+                let bridge_defs = crate::utils::ai_utils::abstract_bridge_phrases();
+                let bridge_texts: Vec<String> = bridge_defs.iter().map(|(_, _, p)| p.clone()).collect();
+                let bridge_raw: Vec<Vec<f32>> = if bridge_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch_pinned(bridge_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; bridge_texts.len()])
+                };
+                let abstract_bridge_embs: Vec<(String, String, Vec<f32>)> = bridge_defs.iter()
+                    .zip(bridge_raw.into_iter())
+                    .map(|((c, k, _), e)| (c.clone(), k.clone(), e))
+                    .collect();
+                for t in &abstract_bridge_embs { all_filter_embs.push(t.clone()); }
+                if !abstract_bridge_embs.is_empty() {
+                    emit_term(&format!(
+                        "    🌉 [ABSTRACT BRIDGE BANK] 추상 수식어 브릿지 구 {}개 준비 완료. (substantial/find 다국어 매칭용)",
+                        abstract_bridge_embs.len()
+                    ));
+                }
+
+                // 🌟 [FILTER PREJUDICE BANK] bias.json 이 필터 키마다 이미 갖고 있는 편견 사전을
+                //    필터 라우팅 경로에서 처음으로 활용합니다.
+                //    status_filters.progress.prejudice = "draft, complete, error, stop, pause" 처럼
+                //    '이 필터가 절대 아닌 개념' 이 명시되어 있어 우연 공명을 직접 상쇄합니다.
+                let mut filter_prej_defs = crate::utils::ai_utils::filter_category_prejudice_phrases(&[
+                    "substantial_filters", "find_filters", "status_filters", "time_filters", "season_filters",
+                ]);
+                for t in crate::utils::ai_utils::abstract_bridge_prejudice_phrases() {
+                    if !filter_prej_defs.iter().any(|(c, k, p)| c == &t.0 && k == &t.1 && p == &t.2) {
+                        filter_prej_defs.push(t);
+                    }
+                }
+                let filter_prej_texts: Vec<String> = filter_prej_defs.iter().map(|(_, _, p)| p.clone()).collect();
+                let filter_prej_raw: Vec<Vec<f32>> = if filter_prej_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch_pinned(filter_prej_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; filter_prej_texts.len()])
+                };
+                let all_filter_prej_embs: Vec<(String, String, Vec<f32>)> = filter_prej_defs.iter()
+                    .zip(filter_prej_raw.into_iter())
+                    .map(|((c, k, _), e)| (c.clone(), k.clone(), e))
+                    .collect();
+                emit_term(&format!("    🛡️ [FILTER PREJUDICE BANK] 필터 편견 구 {}개 준비 완료.", all_filter_prej_embs.len()));
+
+                if !temporal_phrase_embs.is_empty() {
+                    emit_term(&format!("    📐 [TEMPORAL PHRASE BANK] time/season 구 {}개 준비 완료.", temporal_phrase_embs.len()));
+                }
+                if !op_phrase_embs.is_empty() {
+                    emit_term(&format!("    📐 [OPERATOR PHRASE BANK] operators 구 {}개 준비 완료.", op_phrase_embs.len()));
+                }
+                if !all_filter_embs.is_empty() {
+                    emit_term(&format!("    📐 [ALL-FILTER PHRASE BANK] substantial/find/status/time/season 구 {}개 준비 완료.", all_filter_embs.len()));
+                }
+
+                // 🌟 Plinko Game (1st Depth): Sliding Window Cliff Detection over words
+                struct PlinkoMatch {
+                    chunk: String,
+                    best_prop: String,
+                    best_score: f32,
+                    alternatives: Vec<(String, f32)>,
+                    // 🌟 [FULL SCORE VECTOR] 배타 배정 행렬을 만들려면 top-1 과 상위 5개가 아니라
+                    //    '이 청크가 모든 속성에 대해 받은 점수 전체'가 필요합니다.
+                    //    (베이지가 color 를 선점하면 가디건은 자기 점수표에서 다음 유효 속성을 찾아야 합니다)
+                    all_scores: Vec<(String, f32)>,
+                }
+                let mut plinko_matches: Vec<PlinkoMatch> = Vec::new();
+                let mut plinko_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                // 🌟 [N:N ALTERNATE AXIS] 확정 속성이 틀렸을 때를 대비한 '같은 값의 차순위 속성' 목록입니다.
+                //    STAGE-3 의 N:N 조합과 프론트엔드 Dexie 재질의가 이 목록을 소비합니다.
+                let mut plinko_alternates: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                // 🌟 [UNASSIGNED RESCUE] 속성 확정에 실패했거나 억지 배정으로 폐기된 청크입니다.
+                //    사용자가 실제로 입력한 단어이므로 조건이 되지 못하더라도 FTS 검색어로는 반드시 살아남아야 합니다.
+                //    (로그: review 세그먼트의 '메세지도' 가 B/NARROWED·C/RECALL 티어에서 통째로 사라졌습니다)
+                let mut unassigned_chunks: Vec<String> = Vec::new();
+                let words: Vec<&str> = current_text.split_whitespace().collect();
+                let (period_clock, period_southern) = crate::utils::time_guide::lang_clock(language);
+                let period_today = crate::utils::time_guide::today_in(&period_clock);
+                let validity_axes = {
+                    let fields: Vec<String> = crate::parsing::get_detail_schema_fields(&seg_type, "", language)
+                        .into_iter()
+                        .map(|(n, _, _, _)| n)
+                        .collect();
+                    fields.iter().any(|n| n == "started_at") && fields.iter().any(|n| n == "expired_at")
+                };
+                let period_words_owned: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+                let raw_exact_period = crate::utils::ai_utils::exact_absolute_period(&period_words_owned, period_today);
+                let exact_period = raw_exact_period
+                    .clone()
+                    .filter(|p| validity_axes || crate::utils::ai_utils::exact_period_tail_closed(&period_words_owned, p));
+                if exact_period.is_none() {
+                    if let Some(p) = raw_exact_period.as_ref() {
+                        emit_term(&format!(
+                            "  ⚪ [EXACT PERIOD OPEN TAIL] 토큰 {:?} 는 기간 모양이지만 '{}' 도메인에는 유효 기간 축이 없고 꼬리가 닫힌 어휘(조사·시간 연산자)가 아니어서 기간으로 확정하지 않고 속성 배정에 그대로 둡니다. (예: 연식·모델명)",
+                            p.tokens.iter().filter_map(|&i| period_words_owned.get(i).cloned()).collect::<Vec<_>>(),
+                            seg_type
+                        ));
+                    }
+                }
+                let period_words: std::collections::HashSet<String> = exact_period
+                    .as_ref()
+                    .map(|p| p.tokens.iter().filter_map(|&i| period_words_owned.get(i).cloned()).collect())
+                    .unwrap_or_default();
+                if let Some(p) = exact_period.as_ref() {
+                    let axis_note = if validity_axes {
+                        format!("기간은 LLM 이 아니라 결정론 시간 가이드가 '{}' 도메인의 유효 기간 축(started_at·expired_at)에 겁니다.", seg_type)
+                    } else {
+                        format!("'{}' 도메인에는 유효 기간 축이 없어 기간을 하드 조건으로 싣지 않습니다(DATE FIELD SCOPE 와 같은 규칙). 꼬리가 전부 닫힌 어휘라 기간 조각으로만 확정해 수치·문자 속성 배정에서 빼고 FTS 검색어로 남깁니다.", seg_type)
+                    };
+                    emit_term(&format!(
+                        "  📅 [EXACT PERIOD] {} ~ {} | op={} | 단위={} | 연도명시={} | 토큰={:?} | 근거={:?} — shipping 과 같은 12개 언어 닫힌 어휘 표(연·월·일 단위, 시간 연산자)로 확정했습니다. 이 토큰들은 속성 배정에서 빠지고, {}",
+                        p.start,
+                        p.end,
+                        p.operator,
+                        p.granularity,
+                        p.year_explicit,
+                        p.tokens.iter().filter_map(|&i| period_words_owned.get(i).cloned()).collect::<Vec<_>>(),
+                        p.evidence,
+                        axis_note
+                    ));
+                    crate::utils::score_dynamics::record_baseline(
+                        "search.exact_period_axisless",
+                        if validity_axes { 0.0 } else { 1.0 },
+                    );
+                }
+
+                let relay_intent: Option<(String, f32, f32, f32)> = if validity_axes {
+                    None
+                } else {
+                    let bridge = crate::parsing::BIAS_DICT
+                        .get("search_bridge")
+                        .and_then(|sb| sb.get("sales_to_order"));
+                    let bank = |k: &str| -> Vec<String> {
+                        bridge
+                            .and_then(|n| n.get(k))
+                            .and_then(|v| v.as_str())
+                            .map(|s| crate::utils::ai_utils::split_bias_phrases_full(s))
+                            .unwrap_or_default()
+                    };
+                    let bias_bank = bank("bias");
+                    let prej_bank = bank("prejudice");
+                    let mut cand_words: Vec<String> = Vec::new();
+                    for w in words.iter() {
+                        if period_words.contains(*w) || w.chars().any(|c| c.is_ascii_digit()) {
+                            continue;
+                        }
+                        cand_words.push(w.to_string());
+                    }
+                    if bias_bank.is_empty() || prej_bank.is_empty() || cand_words.is_empty() {
+                        None
+                    } else {
+                        let bias_embs = self.get_embedding_batch_pinned(bias_bank).await.unwrap_or_default();
+                        let prej_embs = self.get_embedding_batch_pinned(prej_bank).await.unwrap_or_default();
+                        let word_embs = self.get_embedding_batch(cand_words.clone()).await.unwrap_or_default();
+                        let mut best: Option<(String, f32, f32)> = None;
+                        let mut prej_max = 0.0f32;
+                        for (w, e) in cand_words.iter().zip(word_embs.iter()) {
+                            if e.iter().all(|&x| x == 0.0) {
+                                continue;
+                            }
+                            let b = crate::utils::ai_utils::max_pool_sim(e, &bias_embs);
+                            let p = crate::utils::ai_utils::max_pool_sim(e, &prej_embs);
+                            if p > prej_max {
+                                prej_max = p;
+                            }
+                            if best.as_ref().map_or(true, |(_, bb, bp)| b - p > *bb - *bp) {
+                                best = Some((w.clone(), b, p));
+                            }
+                        }
+                        best.map(|(w, b, p)| (w, b, p, prej_max))
+                    }
+                };
+
+                // 🌟 [DOMAIN TYPE WORD DETECTION]
+                //    "이벤트로", "주문에서" 같은 도메인 지시어는 속성 값이 아니라 테이블 타입 지표입니다.
+                //    로컬라이즈된 타입 이름(get_localized_page_type)과의 코사인 비교로 판정합니다.
+                //    bias.json 수정 없이 기존 함수를 재사용하며, 새 매직 상수 없이
+                //    '도메인 코사인 > 스키마 속성 Max-Pool 코사인' 상대 비교만 사용합니다.
+                let domain_type_names: Vec<(String, String)> = ["order", "goods", "tracking", "review", "coupon", "event"]
+                    .iter()
+                    .map(|cat| (cat.to_string(), crate::parsing::get_localized_page_type(cat, &query_lang)))
+                    .collect();
+                let domain_type_texts: Vec<String> = domain_type_names.iter().map(|(_, name)| name.clone()).collect();
+                let domain_type_embs: Vec<Vec<f32>> = if domain_type_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch_pinned(domain_type_texts.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; domain_type_texts.len()])
+                };
+                // 🌟 [EMBED-PREFETCH] 이 세그먼트가 1건씩 요청할 단어 임베딩(도메인 지시어 판정 ·
+                //    Plinko ACTION VERB 게이트)과 어간 후보(closed_tail_stems · shared_prefix_stems 상위 2개,
+                //    STEM SUBSTITUTION 과 같은 규칙)를 한 번의 배치로 미리 올립니다.
+                //    배치 순전파가 켜져 있으면(추측이 싸면) 연속 단어 창(2~8단어, PLINKO SLIDE 후보)도 함께 올립니다.
+                //    아래 루프는 그대로 get_embedding 을 1건씩 부르지만 전부 캐시 적중이라 판정이 같습니다.
+                //    어간은 루프의 게이트(ACTION VERB · FUNCTIONAL WORD DROP 등)를 통과한 단어에서만 쓰이므로
+                //    추측분입니다. per-text 경로(CPU · Vulkan · LOGIS_EMBED_BATCHED=0)에서는 추측분 1건이
+                //    순전파 1회라, 확실히 쓰는 단어만 올리고 어간·창은 배치 순전파일 때만 올립니다.
+                {
+                    let spec = self.embed_speculation_cheap();
+                    let mut pre: Vec<String> = Vec::new();
+                    for w in words.iter() {
+                        pre.push(w.to_string());
+                        if spec && !w.chars().any(|c| c.is_ascii_digit()) {
+                            for (stem, _) in crate::utils::ai_utils::closed_tail_stems(w) {
+                                pre.push(stem);
+                            }
+                            for st in crate::utils::ai_utils::shared_prefix_stems(w, &ext_words_string).into_iter().take(2) {
+                                pre.push(st);
+                            }
+                        }
+                    }
+                    if spec {
+                        pre.extend(crate::utils::ai_utils::contiguous_windows(&words, 2, 8));
+                    }
+                    let mut seen_pre: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    pre.retain(|t| !t.trim().is_empty() && seen_pre.insert(t.clone()));
+                    self.prefetch_embeddings(pre).await;
+                }
+                // 🌟 [EMB-BANK] 속성 구 뱅크의 노름·0벡터 표식을 한 번만 계산합니다(채점 결과는 비트 단위로 같음).
+                let prop_banks: Vec<crate::utils::ai_utils::NormBank> = prop_phrase_embs
+                    .iter()
+                    .map(|b| crate::utils::ai_utils::NormBank::new(b))
+                    .collect();
+
+                let mut domain_indicator_words: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for word in &words {
+                    if word.chars().any(|c| c.is_ascii_digit()) { continue; }
+                    let word_emb_d = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
+                    if word_emb_d.iter().all(|&v| v == 0.0) { continue; }
+                    let word_norm_d = crate::utils::ai_utils::l2_norm_exact(&word_emb_d);
+                    let mut best_schema_for_word = f32::MIN;
+                    for pi in 0..prop_phrase_embs.len() {
+                        let s = crate::utils::ai_utils::weighted_max_pool_sim_bank(&word_emb_d, word_norm_d, &prop_banks[pi], &prop_phrase_weights[pi]);
+                        if s > best_schema_for_word { best_schema_for_word = s; }
+                    }
+                    let word_key = crate::utils::ai_utils::lower_alnum(word);
+                    let exact_domain: Option<String> = domain_type_names
+                        .iter()
+                        .find(|(_, name)| {
+                            crate::utils::ai_utils::closed_class_exact(
+                                &word_key,
+                                &crate::utils::ai_utils::lower_alnum(name),
+                            )
+                        })
+                        .map(|(cat, _)| cat.clone());
+                    let mut best_domain_score = f32::MIN;
+                    let mut best_domain_cat = String::new();
+                    for (di, (cat, _name)) in domain_type_names.iter().enumerate() {
+                        if domain_type_embs[di].iter().all(|&v| v == 0.0) { continue; }
+                        let s = cosine_similarity(&word_emb_d, &domain_type_embs[di]);
+                        if s > best_domain_score {
+                            best_domain_score = s;
+                            best_domain_cat = cat.clone();
+                        }
+                    }
+                    if let Some(cat) = exact_domain.as_ref() {
+                        best_domain_cat = cat.clone();
+                    }
+                    if exact_domain.is_some() || (best_domain_score > best_schema_for_word && best_domain_score > 0.0) {
+                        domain_indicator_words.insert(word.to_string());
+                        emit_term(&format!(
+                            "      🏷️ [DOMAIN TYPE WORD] '{}' 는 '{}' 도메인 지시어로 판정{}. 속성 배정에서 제외하고 FTS 검색어로 보존합니다.",
+                            word,
+                            best_domain_cat,
+                            if exact_domain.is_some() {
+                                " (도메인 이름 뒤에 닫힌 조사·어미가 두 겹까지만 붙은 완전일치, shipping 서식 전문 대조와 같은 표)"
+                            } else {
+                                ""
+                            }
+                        ));
+                        // 🌟 [RELATED DOMAIN COLLECT] 이 단어와 코사인이 양수인 모든 도메인을 기록합니다.
+                        //    '판매된' → goods(최고) 이지만 order 와도 코사인 > 0 이면
+                        //    STAGE-3 에서 order CROSS-VERB 쿼리를 발행할 수 있습니다.
+                        let mut related: Vec<String> = Vec::new();
+                        for (di, (cat, _name)) in domain_type_names.iter().enumerate() {
+                            if domain_type_embs[di].iter().all(|&v| v == 0.0) { continue; }
+                            let s = cosine_similarity(&word_emb_d, &domain_type_embs[di]);
+                            if s > 0.0 {
+                                related.push(cat.clone());
+                            }
+                        }
+
+                        // 🌟 [SALES BRIDGE] bias.json 의 search_bridge.sales_to_order 를 읽어
+                        //    "판매/팔린/매출" 계열 단어가 감지되면 order 도메인을 related 에 강제 포함합니다.
+                        //    기존 코사인 > 0 조건만으로는 다국어 임베딩에서 order 앵커와
+                        //    "판매된" 간 코사인이 음수가 될 수 있어 브릿지가 필요합니다.
+                        {
+                            let sales_bridge_bias: Vec<String> = {
+                                let dict = &crate::parsing::BIAS_DICT;
+                                dict.get("search_bridge")
+                                    .and_then(|sb| sb.get("sales_to_order"))
+                                    .and_then(|n| n.get("bias"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| crate::utils::ai_utils::split_bias_phrases_full(s))
+                                    .unwrap_or_default()
+                            };
+                            if !sales_bridge_bias.is_empty() {
+                                let bridge_embs = self.get_embedding_batch_pinned(sales_bridge_bias.clone()).await
+                                    .unwrap_or_else(|_| vec![vec![0.0; 384]; sales_bridge_bias.len()]);
+                                let bridge_score = crate::utils::ai_utils::max_pool_sim(&word_emb_d, &bridge_embs);
+                                // 기존 최고 도메인 점수의 90% 이상이면 브릿지 발동
+                                if bridge_score > best_domain_score * 0.9 && bridge_score > 0.0 {
+                                    if !related.iter().any(|r| r == "order") {
+                                        related.push("order".to_string());
+                                    }
+                                    emit_term(&format!(
+                                        "  🌉 [SALES BRIDGE] '{}' 는 sales/order 브릿지 코사인 {:.4} 로 order 도메인 추가 포함",
+                                        word, bridge_score
+                                    ));
+                                }
+                            }
+                        }
+
+                        if !related.is_empty() {
+                            domain_word_related.insert(word.to_string(), related);
+                        }
+                    }
+                }
+                
+                let mut current_chunk: Vec<String> = Vec::new();
+                let mut prev_max_score = -1.0;
+                let mut best_prop_for_chunk = String::new();
+                let mut prev_alternatives: Vec<(String, f32)> = Vec::new();
+                let mut prev_all_scores: Vec<(String, f32)> = Vec::new();
+
+                // 🌟 [FORCED FILTER ROUTES] 속성이 아니라 필터로 확정된 단어들.
+                //    (word, category, key, evt_score)
+                //    기존에는 FILTER TERM DROP 이 단어만 버리고 '어느 필터였는지'를 기록하지 않아
+                //    substantial / find 가 끝까지 빈 값으로 남았습니다.
+                let mut forced_filter_routes: Vec<(String, String, String, f32)> = Vec::new();
+
+                emit_term(&format!("  🎯 [PLINKO GAME (1st)] Starting Sliding Window Cliff Detection for '{}'", current_text));
+
+                // 🌟 [개선] 다국어(52개국어)의 검색/요청 의미를 갖는 단어들을 모두 기준 벡터(Centroid)에 포함시켜 하드코딩 매칭 없이 벡터만으로 완벽한 시맨틱 필터링을 수행합니다.
+                let action_verbs = "find, search, query, get, question, request, 찾아, 알려줘, 보여줘, 조사, 결과, 답변, 대답, 말해, 검색, 해줘, 질문, 질의, 요청, 확인, 알아봐, 찾아봐, 가져와, 설명, 요약, 추천, 정보, gjej, kërko, pyet, merr, ابحث, بحث, استعلام, الحصول, tap, axtarış, sorğu, əldə et, খুঁজুন, অনুসন্ধান, প্রশ্ন, পান, намери, търси, заявка, получи, trobar, cercar, consulta, obtenir, 找, 搜索, 查询, 获取, 给我看, 告诉我, nađi, pretraži, upit, dobij, najít, hledat, dotaz, získat, søg, forespørgsel, hent, vind, zoek, zoekopdracht, krijg, leia, otsi, päring, saada, löydä, etsi, kysely, hae, trouver, chercher, requête, obtenir, montre-moi, dis-moi, იპოვე, ძებნა, მოთხოვნა, მიიღე, finden, suchen, abfrage, bekommen, zeig mir, sag mir, βρες, αναζήτηση, ερώτημα, πάρε, מצא, חפש, שאילתה, קבל, खोजें, खोज, क्वेरी, प्राप्त करें, talál, keres, lekérdezés, kap, finna, leita, fyrirspurn, fá, temukan, cari, kueri, dapatkan, trova, cerca, ottieni, mostrami, dimmi, 見つける, 検索, クエリ, 取得, 教えて, 見せて, табу, іздеу, сұрау, алу, ស្វែងរក, ស្រាវជ្រាវ, សំណួរ, ទទួលបាន, atrast, meklēt, vaicājums, iegūt, rasti, ieškoti, užklausa, gauti, carian, pertanyaan, शोधा, शोध, मिळवा, finn, søk, spørring, پیدا کردن, جستجو, پرس و جو, گرفتن, znajdź, szukaj, zapytanie, pobierz, encontrar, pesquisar, obter, mostre-me, diga-me, găsește, caută, interogare, obține, найти, поиск, запрос, получить, покажи, расскажи, нађи, претрага, упит, добиј, nájsť, hľadať, dopyt, získať, najdi, iskanji, poizvedba, dobi, buscar, obtener, muéstrame, dime, tafuta, utafutaji, swali, pata, hitta, sök, fråga, hämta, hanapin, maghanap, kunin, కనుగొనండి, శోధన, ప్రశ్న, పొందండి, ค้นหา, ค้น, คิวรี, รับ, bul, ara, sorgu, al, знайти, пошук, запит, отримати, تلاش, تلاش کریں, استفسار, حاصل کریں, topish, qidirish, so'rov, olish, tìm, tìm kiếm, truy vấn, lấy, cho tôi xem, nói cho tôi";
+                
+                // 🌟 [ACTION VERB PHRASE BANK] 500단어를 벡터 1개로 합치면 센트로이드가 되어
+                //    문자열에 '보여줘' 가 이미 있는데도 코사인 0.55 를 못 넘습니다.
+                //    필드 bias 에서 이미 폐기한 센트로이드 방식이 여기 남아 있었습니다.
+                //    구 단위로 쪼개면 자기 자신과의 코사인이 1.0 이라 확실히 잡힙니다.
+                let action_verb_phrases = crate::utils::ai_utils::split_bias_phrases_full(action_verbs);
+                let action_verb_embs: Vec<Vec<f32>> = if action_verb_phrases.is_empty() {
+                    Vec::new()
+                } else {
+                    self.get_embedding_batch_pinned(action_verb_phrases.clone()).await
+                        .unwrap_or_else(|_| vec![vec![0.0; 384]; action_verb_phrases.len()])
+                };
+
+                // 🌟 [EMB-BANK] Plinko 단어 루프가 단어마다 훑는 뱅크들의 노름·0벡터 표식을 한 번만 계산합니다.
+                let action_bank = crate::utils::ai_utils::NormBank::new(&action_verb_embs);
+                let operator_bank = crate::utils::ai_utils::NormBank::new(&operator_embs);
+                let op_phrase_bank = crate::utils::ai_utils::NormBank::new(&op_phrase_embs);
+                let temporal_bank = crate::utils::ai_utils::NormBank::new(&temporal_phrase_embs);
+                let prej_bank_rows = crate::utils::ai_utils::NormBank::new(&prej_embs);
+                let filter_tbank = crate::utils::ai_utils::TripleBank::new(&all_filter_embs);
+                let filter_prej_tbank = crate::utils::ai_utils::TripleBank::new(&all_filter_prej_embs);
+
+                let marks = crate::utils::ai_utils::qualifier_marks(&words, &|j: usize| period_words.contains(words[j]));
+                let negated_words: std::collections::HashSet<&str> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, w)| {
+                        (marks.negated.contains(&i) || stanza_negated.contains(*w))
+                            && !crate::utils::ai_utils::is_negation_marker(w)
+                    })
+                    .map(|(_, w)| *w)
+                    .collect();
+                let downward_words: std::collections::HashSet<&str> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, w)| marks.downward.contains(&i) || stanza_downward.contains(*w))
+                    .map(|(_, w)| *w)
+                    .collect();
+                let qualifier_bound: std::collections::HashSet<&str> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, w)| marks.price_bound.contains(&i) || stanza_bound.contains(*w))
+                    .map(|(_, w)| *w)
+                    .collect();
+                let qualifier_order: std::collections::HashSet<&str> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, w)| marks.ordered.contains(&i) || stanza_order.contains(*w))
+                    .map(|(_, w)| *w)
+                    .collect();
+                let qualifier_field: std::collections::HashMap<&str, String> = words
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, w)| {
+                        let mut near: Vec<String> = Vec::new();
+                        if i > 0 {
+                            near.push(words[i - 1].to_string());
+                            if i > 1 {
+                                near.push(format!("{} {}", words[i - 2], words[i - 1]));
+                            }
+                        }
+                        if i + 1 < words.len() {
+                            near.push(words[i + 1].to_string());
+                            if i + 2 < words.len() {
+                                near.push(format!("{} {}", words[i + 1], words[i + 2]));
+                            }
+                        }
+                        near.iter()
+                            .find_map(|n| {
+                                crate::utils::ai_utils::exact_match_filter_key_tailed("substantial_filters", n)
+                                    .filter(|k| k != "sale_price")
+                            })
+                            .map(|k| (*w, k))
+                    })
+                    .collect();
+                let mut qualifier_forced_find: Option<String> = None;
+                let mut qualifier_conflict = false;
+                let mut retained_words = Vec::new();
+
+                for word in words {
+                    // 🌟 [ORDER FIX] 1. DOMAIN TYPE WORD DROP 을 최우선으로 올립니다.
+                    //    사전 패스가 이미 '이벤트로'/'판매된'/'고객의' 를 도메인 지시어로 확정했는데
+                    //    본 루프의 ACTION VERB 가 그 판정을 덮어써 왔습니다.
+                    //    (log1.txt: DOMAIN TYPE WORD 로그 직후 동일 단어가 ACTION VERB IGNORED)
+                    //    ACTION VERB 로 소비되면 retained_words 에도 안 들어가 B/NARROWED 텍스트에서도 증발합니다.
+                    if domain_indicator_words.contains(word) {
+                        retained_words.push(word);
+                        if !unassigned_chunks.iter().any(|e| e == word) {
+                            unassigned_chunks.push(word.to_string());
+                        }
+                        continue;
+                    }
+
+                    // 2. FILTER TERM DROP
+                    if period_words.contains(word) {
+                        emit_term(&format!("      ✂️ [FILTER TERM DROP / EXACT PERIOD] '{}' 는 절대 기간의 조각이므로 속성 배정에서 제외합니다. 기간은 결정론 시간 가이드가 확정합니다. (FTS 검색어로는 보존)", word));
+                        retained_words.push(word);
+                        if !unassigned_chunks.iter().any(|e| e == word) {
+                            unassigned_chunks.push(word.to_string());
+                        }
+                        continue;
+                    }
+                    if let Some(k) = crate::utils::ai_utils::exact_match_filter_key_tailed("season_filters", word) {
+                        emit_term(&format!("      ✂️ [FILTER TERM DROP] '{}' 는 season_filters.{}.exact_match 확정어(닫힌 조사·어미가 붙은 형태 포함)이므로 속성 배정에서 제외합니다. (FTS 검색어로는 보존)", word, k));
+                        retained_words.push(word);
+                        if !unassigned_chunks.iter().any(|e| e == word) {
+                            unassigned_chunks.push(word.to_string());
+                        }
+                        continue;
+                    }
+                    if let Some(k) = crate::utils::ai_utils::exact_match_filter_key_tailed("time_filters", word) {
+                        emit_term(&format!("      ✂️ [FILTER TERM DROP] '{}' 는 time_filters.{}.exact_match 확정어(닫힌 조사·어미가 붙은 형태 포함)이므로 속성 배정에서 제외합니다. (FTS 검색어로는 보존)", word, k));
+                        retained_words.push(word);
+                        if !unassigned_chunks.iter().any(|e| e == word) {
+                            unassigned_chunks.push(word.to_string());
+                        }
+                        continue;
+                    }
+                    let sub_key = crate::utils::ai_utils::exact_match_filter_key_tailed("substantial_filters", word);
+                    let find_key = crate::utils::ai_utils::exact_match_filter_key_tailed("find_filters", word);
+                    if let (Some(sk), Some(fk)) = (sub_key, find_key) {
+                        let hold: Option<(&str, &str, &str)> = if negated_words.contains(word) {
+                            Some((
+                                "NEGATED",
+                                "search.qualifier_negated",
+                                "바로 앞이나 뒤 어절이 부정 표지(안·않은·없는·not·nicht·pas 등)입니다. '비싸지 않다' 는 '싸다' 와 같은 뜻이 아니므로 방향(상위·하위 20%)을 정하지 않습니다",
+                            ))
+                        } else if qualifier_order.contains(word) {
+                            Some((
+                                "ORDER",
+                                "search.qualifier_order",
+                                "바로 앞이나 뒤 어절이 정렬 요청('순으로'·'것부터'·sort·first)입니다. 정렬은 상위·하위 20% 필터와 다르므로 문서를 거르지 않습니다",
+                            ))
+                        } else if qualifier_bound.contains(word) {
+                            Some((
+                                "BOUND",
+                                "search.qualifier_bound",
+                                "앞뒤 두 어절 안에 가격 비교 수치(통화가 붙은 값, 또는 비교어·통화어 옆의 단위 없는 숫자)가 있습니다. 가격 조건은 그 수치가 만들고, 형용사로 상위·하위 20% 를 겹치면 결과가 지나치게 줄어듭니다",
+                            ))
+                        } else {
+                            None
+                        };
+                        if let Some((tag, axis, why)) = hold {
+                            crate::utils::score_dynamics::record_baseline(axis, 1.0);
+                            emit_term(&format!(
+                                "      🚫 [ABSTRACT QUALIFIER {}] '{}' (substantial_filters.{} + find_filters.{}) {}. 코사인 라우팅으로 넘기면 같은 방향으로 확정될 수 있으므로 속성 배정과 필터 라우팅에서 모두 뺍니다. (FTS 검색어로는 보존)",
+                                tag, word, sk, fk, why
+                            ));
+                            retained_words.push(word);
+                            if !unassigned_chunks.iter().any(|e| e == word) {
+                                unassigned_chunks.push(word.to_string());
+                            }
+                            continue;
+                        }
+                        let flipped = downward_words.contains(word);
+                        let fk = match (flipped, fk.as_str()) {
+                            (true, "much") => "little".to_string(),
+                            (true, "little") => "much".to_string(),
+                            _ => fk.clone(),
+                        };
+                        let field = qualifier_field.get(word).cloned();
+                        let sk = field.clone().unwrap_or(sk);
+                        if qualifier_conflict || qualifier_forced_find.as_ref().map_or(false, |prev| *prev != fk) {
+                            if !qualifier_conflict {
+                                forced_filter_routes.retain(|(_, c, _, s)| {
+                                    !((c == "substantial_filters" || c == "find_filters") && *s == f32::MAX)
+                                });
+                                crate::utils::score_dynamics::record_baseline("search.qualifier_conflict", 1.0);
+                                emit_term(&format!(
+                                    "      ⚖️ [ABSTRACT QUALIFIER CONFLICT] '{}' → find_filters.{} 가 앞서 확정한 find_filters.{} 와 반대 방향입니다. 한 질의에 싼 쪽과 비싼 쪽이 함께 적혀 있으면(비교·범위 요청) 어느 20% 도 맞지 않으므로 두 확정을 모두 취소합니다. (FTS 검색어로는 보존)",
+                                    word, fk, qualifier_forced_find.clone().unwrap_or_default()
+                                ));
+                            }
+                            qualifier_conflict = true;
+                        } else {
+                            qualifier_forced_find = Some(fk.clone());
+                            crate::utils::score_dynamics::record_baseline("search.qualifier_exact", 1.0);
+                            emit_term(&format!(
+                                "      🧲 [ABSTRACT QUALIFIER EXACT] '{}' → substantial_filters.{} + find_filters.{} | 두 필터의 exact_match 닫힌 어휘에 함께 있는 가격 방향 형용사이고, 곁에 부정 표지·정렬 요청·가격 비교 수치가 없어 추상 수식어입니다.{}{} 스키마 속성(통화·상태 등)과 코사인으로 겨루지 않고 확정합니다. (FTS 검색어로는 보존)",
+                                word,
+                                sk,
+                                fk,
+                                if flipped { " 앞 어절이 하향 표지(덜·less·least·moins·menos·weniger)라 방향을 뒤집었습니다." } else { "" },
+                                if field.is_some() { " 곁의 어절이 다른 금액 칸 이름(substantial_filters exact_match)이라 그 칸을 꾸밉니다." } else { "" }
+                            ));
+                            forced_filter_routes.push((word.to_string(), "substantial_filters".to_string(), sk, f32::MAX));
+                            forced_filter_routes.push((word.to_string(), "find_filters".to_string(), fk, f32::MAX));
+                        }
+                        retained_words.push(word);
+                        if !unassigned_chunks.iter().any(|e| e == word) {
+                            unassigned_chunks.push(word.to_string());
+                        }
+                        continue;
+                    }
+
+                    // 3. ACTION VERB IGNORED — 4중 역검증
+                    if !word.chars().any(|c| c.is_ascii_digit()) && !current_chunk.is_empty() {
+                        let n = current_chunk.len();
+                        let tail_numeric = current_chunk[n - 1].chars().any(|c| c.is_ascii_digit())
+                            || (n >= 2
+                                && current_chunk[n - 1].chars().count() <= 2
+                                && current_chunk[n - 2].chars().any(|c| c.is_ascii_digit()));
+                        if tail_numeric {
+                            if let Some(key) = crate::utils::ai_utils::comparator_exact_in_text(word) {
+                                emit_term(&format!(
+                                    "    🔗 [COMPARATOR GLUE] '{}' → [{}] 닫힌 비교 어휘 완전일치. 직전 수치 청크 '{}' 에 결합합니다. 비교 표현은 수치와 한 덩어리여야 하므로 ACTION VERB 판정과 절벽 판정을 거치지 않습니다.",
+                                    word, key, current_chunk.join(" ")
+                                ));
+                                current_chunk.push(word.to_string());
+                                retained_words.push(word);
+                                continue;
+                            }
+                        }
+                    }
+                    let word_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
+                    let word_norm = crate::utils::ai_utils::l2_norm_exact(&word_emb);
+                    let action_sim = crate::utils::ai_utils::max_pool_sim_bank(&word_emb, word_norm, &action_bank);
+                    let op_sim = crate::utils::ai_utils::max_pool_sim_bank(&word_emb, word_norm, &operator_bank);
+                    let word_has_digit = word.chars().any(|c| c.is_ascii_digit());
+
+                    // 🌟 [REVERSE VERIFICATION] action_verbs 는 ~500구 다국어 뱅크이고
+                    //    Max-Pool 은 그 중 최댓값을 취하므로, 한국어 2~3음절 단어는
+                    //    구조적으로 0.65~0.80 대역의 우연 공명이 반드시 발생합니다.
+                    //    (log2: '니트' 0.7400 / '가디건' 0.7429 — 둘 다 상품명)
+                    //    (log1: '제품' 0.6741 vs OpSim 0.6715 — 마진 0.0026)
+                    //    절대 임계치로는 이 잡음을 구분할 수 없으므로,
+                    //    '이 단어가 다른 어떤 뱅크보다 명령어 뱅크에 더 가까운가' 라는
+                    //    상대 우위로 판정합니다. 새 매직 상수를 도입하지 않습니다.
+                    //
+                    //    ① 속성 뱅크  : '니트'/'가디건'/'제품' 같은 값 명사를 구제
+                    //    ② 연산자 뱅크 : '이하로' 같은 비교 표현을 구제 (P0 — 가격 조건 복원)
+                    //    ③ 시간 뱅크  : '올해' 같은 시간 표현을 구제
+                    //    ④ 필터 뱅크  : '팔린'/'남긴' 같은 상태·수식 표현을 구제
+                    let mut max_prop_sim = 0.0f32;
+                    for pi in 0..prop_phrase_embs.len() {
+                        if prop_is_filter_owned[pi] { continue; }
+                        let s = crate::utils::ai_utils::weighted_max_pool_sim_bank(
+                            &word_emb, word_norm, &prop_banks[pi], &prop_phrase_weights[pi],
+                        );
+                        if s > max_prop_sim { max_prop_sim = s; }
+                    }
+                    let op_bank_sim = if op_phrase_embs.is_empty() {
+                        op_sim
+                    } else {
+                        crate::utils::ai_utils::max_pool_sim_bank(&word_emb, word_norm, &op_phrase_bank).max(op_sim)
+                    };
+                    let temporal_sim = if temporal_phrase_embs.is_empty() {
+                        0.0f32
+                    } else {
+                        crate::utils::ai_utils::max_pool_sim_bank(&word_emb, word_norm, &temporal_bank)
+                    };
+                    let filter_sim = filter_tbank.max_nonzero(&word_emb, word_norm);
+
+                    let rival_max = max_prop_sim
+                        .max(op_bank_sim)
+                        .max(temporal_sim)
+                        .max(filter_sim);
+                    // 🌟 [POS-FIRST ACTION VERB GATE]
+                    //    Stanza POS 태그를 1차 판정으로 사용하고, 코사인 경쟁은 폴백으로만 동작합니다.
+                    //
+                    //    판정 규칙:
+                    //    ① POS = AUX 또는 명령형(Mood=Imp) VERB
+                    //       → ACTION VERB 확정. 코사인 불필요.
+                    //       그 밖의 VERB 는 명령어 뱅크가 경쟁 뱅크를 이길 때만 (내용 동사는 값일 수 있음).
+                    //
+                    //    ② POS = NOUN / PROPN / ADJ / NUM
+                    //       → 원칙적으로 ACTION VERB 아님.
+                    //       단, action_sim 이 rival_max 대비 10% 이상 상대 우위이면
+                    //       Stanza 오분류 보정으로 ACTION VERB 확정.
+                    //       (log2: '찾아줘' Stanza=NOUN, action 0.8893 vs rival 0.6747 = 31.8% 우위 → 확정)
+                    //       (log2: '니트' Stanza=PROPN, action 0.7400 vs rival 0.7309 = 1.2% 우위 → 구제)
+                    //       10% 는 절대 임계치가 아니라 코사인 공간에서
+                    //       "사실상 동률" 과 "명확한 우위" 를 구분하는 구조적 비율입니다.
+                    //
+                    //    ③ POS 없음 / PUNCT / SYM / X / 불확실
+                    //       → 코사인 폴백 (기존 4중 역검증 결과 사용).
+                    //       이 경우에도 action_sim > rival_max 조건 유지.
+                    let word_pos = word_pos_map.get(word).map(|s| s.as_str()).unwrap_or("");
+                    let word_feats = word_feats_map.get(word).map(|s| s.as_str()).unwrap_or("");
+                    let is_action_verb = if word == "|" || word_has_digit {
+                        false
+                    } else {
+                        match word_pos {
+                            // 명령형 동사('find' · 'zeig' · 'busca' · 'trouve')는 검색 명령어입니다.
+                            "VERB" if word_feats.split('|').any(|f| f == "Mood=Imp") => true,
+                            "AUX" => true,
+                            // 품사가 맞게 나오면서 'cancelled' · 'expiring' · '식히는' 같은 내용 동사도 VERB 입니다. 상태 · 용도 값일 수 있어
+                            // 명령어 뱅크가 경쟁 뱅크를 이길 때만 명령어로 봅니다 ('찾아줘' 처럼 한국어 명령 어미는 자질이 없음).
+                            "VERB" => action_sim > rival_max,
+                            // 품사를 모를 때도 값 명사와 같은 기준을 씁니다. 동률에 가까운 '식히는' · '충전하는' 을 명령어로 지우면 안 됩니다.
+                            "NOUN" | "PROPN" | "ADJ" | "NUM" | "" => {
+                                action_sim > rival_max && action_sim > rival_max * 1.10
+                            },
+                            _ => {
+                                action_sim > rival_max
+                            },
+                        }
+                    };
+                    if is_action_verb {
+                        emit_term(&format!(
+                            "    🚫 [ACTION VERB IGNORED] '{}' | POS: {} | Action: {:.4} > Rival max {:.4} (Prop {:.4} / Op {:.4} / Time {:.4} / Filter {:.4}). Skipping Plinko mapping.",
+                            word, word_pos, action_sim, rival_max, max_prop_sim, op_bank_sim, temporal_sim, filter_sim
+                        ));
+
+                        // 🌟 [FTS 정화용 기록] 벡터로 확정된 순수 명령어만 STAGE-3 검색 텍스트에서 제거합니다.
+                        //    다국어 어휘 하드코딩 없이 이 목록만 소비합니다.
+                        if !global_action_words.contains(word) {
+                            global_action_words.insert(word.to_string());
+                        }
+
+                        // 이전에 쌓인 청크가 유효하다면 즉시 강제 Cliff(저장) 처리하여 슬롯에 안전하게 넣습니다.
+                        if !current_chunk.is_empty() && prev_max_score > 0.20 && !best_prop_for_chunk.is_empty() {
+                            emit_term(&format!("    📉 [FORCED CLIFF] Action verb intercepted. End of semantic chunk."));
+                            emit_term(&format!("      📥 [DROPPED INTO SLOT] '{}' belongs to property [{}]", current_chunk.join(" "), best_prop_for_chunk));
+                            plinko_matches.push(PlinkoMatch {
+                                chunk: current_chunk.join(" "),
+                                best_prop: best_prop_for_chunk.clone(),
+                                best_score: prev_max_score,
+                                alternatives: prev_alternatives.clone(),
+                                all_scores: prev_all_scores.clone(),
+                            });
+                        }
+
+                        // 윈도우 완전 초기화 (명령어 단어는 버림)
+                        current_chunk = Vec::new();
+                        prev_max_score = -1.0;
+                        best_prop_for_chunk = String::new();
+                        prev_alternatives = Vec::new();
+                        prev_all_scores = Vec::new();
+                        continue;
+                    } else if action_sim > rival_max - 0.05 {
+                        emit_term(&format!(
+                            "    🛡️ [ACTION VERB RESCUE] '{}' | POS: {} | Action: {:.4} <= Rival max {:.4} (Prop {:.4} / Op {:.4} / Time {:.4} / Filter {:.4}). 명령어가 아니라 값/연산자/시간 표현으로 판정하여 Plinko 로 보냅니다.",
+                            word, word_pos, action_sim, rival_max, max_prop_sim, op_bank_sim, temporal_sim, filter_sim
+                        ));
+                    }
+
+                    // 4. FUNCTIONAL WORD DROP
+                    if crate::utils::ai_utils::is_functional_word_chunk(
+                        word,
+                        &ext_words_string,
+                        stanza_lemmas.as_deref(),
+                        stanza_deprels.as_deref(),
+                    ) {
+                        emit_term(&format!("    ✂️ [FUNCTIONAL WORD DROP] '{}' 는 기능어/조사 구조라 속성 값이 될 수 없습니다. Plinko 진입 제외.", word));
+                        retained_words.push(word);
+                        continue;
+                    }
+
+                    let mut effective_word: String = word.to_string();
+                    if !word_has_digit {
+                        let tail_stems: Vec<String> = crate::utils::ai_utils::closed_tail_stems(word)
+                            .into_iter()
+                            .map(|(stem, _)| stem)
+                            .collect();
+                        let mut stems: Vec<String> = tail_stems.clone();
+                        for s in crate::utils::ai_utils::shared_prefix_stems(word, &ext_words_string).into_iter().take(2) {
+                            if !stems.contains(&s) { stems.push(s); }
+                        }
+                        if !stems.is_empty() {
+                            let base_emb = self.get_embedding(word.to_string()).await.unwrap_or(vec![0.0; 384]);
+                            let (_, base_schema) = crate::utils::ai_utils::surprisal_dual_scores_bank(
+                                &base_emb, &filter_tbank, &filter_prej_tbank,
+                                &prop_keys, &prop_banks, &prop_is_filter_owned,
+                            );
+                            let base_top = base_schema.first().map(|s| s.surprisal).unwrap_or(f32::MIN);
+
+                            let mut best_stem: Option<(String, f32)> = None;
+                            for stem in stems.iter() {
+                                let se = self.get_embedding(stem.clone()).await.unwrap_or(vec![0.0; 384]);
+                                if se.iter().all(|&v| v == 0.0) { continue; }
+                                let (_, stem_schema) = crate::utils::ai_utils::surprisal_dual_scores_bank(
+                                    &se, &filter_tbank, &filter_prej_tbank,
+                                    &prop_keys, &prop_banks, &prop_is_filter_owned,
+                                );
+                                let stem_top = stem_schema.first().map(|s| s.surprisal).unwrap_or(f32::MIN);
+                                if stem_top > base_top && best_stem.as_ref().map_or(true, |(_, b)| stem_top > *b) {
+                                    best_stem = Some((stem.clone(), stem_top));
+                                }
+                            }
+                            if let Some((stem, stem_top)) = best_stem {
+                                emit_term(&format!(
+                                    "      ✂️ [STEM SUBSTITUTION] '{}' → '{}' | SchemaSurprisal {:+.4} → {:+.4} (굴절 접미가 의미를 희석시켰습니다 · 어간 근거: {} · 후보 {}개 중 최고점)",
+                                    word, stem, base_top, stem_top,
+                                    if tail_stems.contains(&stem) {
+                                        "닫힌 조사·어미 표"
+                                    } else {
+                                        "같은 질의의 접두 공유"
+                                    },
+                                    stems.len()
+                                ));
+                                effective_word = stem;
+                            }
+                        }
+                    }
+
+                    // 🌟 [SURPRISAL ROUTE GATE]
+                    //    필터 뱅크와 스키마 뱅크를 '하나의 공통 기준선' 으로 동시 채점합니다.
+                    //        surprisal = (max - μ_global)/σ_global - √(2 ln N)
+                    //    surprisal > 0 = "N개를 무작위로 뽑은 기대치보다 실제로 더 가깝다"
+                    //    이 0 은 극값이론에서 유도된 값이므로 매직 상수가 아닙니다.
+                    //    무관한 단어는 전 뱅크에서 음수가 나와 라우팅 자체가 일어나지 않습니다.
+                    //
+                    //    🌟 숫자를 포함한 단어는 '정도' 가 아니라 '값' 이므로 게이트를 건너뜁니다.
+                    //    (word_has_digit 는 ACTION VERB 게이트 직전에 이미 선언되어 있습니다)
+                    if !word_has_digit && !all_filter_embs.is_empty() {
+                        let we = self.get_embedding(effective_word.clone()).await.unwrap_or(vec![0.0; 384]);
+                        if !we.iter().all(|&v| v == 0.0) {
+                            let (f_scores, s_scores) = crate::utils::ai_utils::surprisal_dual_scores_bank(
+                                &we,
+                                &filter_tbank,
+                                &filter_prej_tbank,
+                                &prop_keys,
+                                &prop_banks,
+                                &prop_is_filter_owned,
+                            );
+
+                            let schema_top = s_scores.first().map(|s| s.surprisal).unwrap_or(f32::MIN);
+                            let schema_name = s_scores.first().map(|s| s.key.clone()).unwrap_or_default();
+
+                            if let Some(top) = f_scores.first() {
+                                // 진단용: 상위 3개 필터와 스키마 1위를 항상 남깁니다.
+                                let brief: Vec<String> = f_scores.iter().take(3)
+                                    .map(|s| format!("{}.{}({:+.3}|cos {:.3}|N{})", s.category, s.key, s.surprisal, s.max_cos, s.n))
+                                    .collect();
+                                emit_term(&format!(
+                                    "      📐 [SURPRISAL] '{}' | Filters: {} | SchemaTop: {}({:+.3})",
+                                    effective_word, brief.join(" · "), schema_name, schema_top
+                                ));
+
+                                if top.surprisal > 0.0 && top.surprisal > schema_top {
+                                    let claim = ["substantial_filters", "find_filters"];
+                                    let is_abstract = claim.iter().any(|c| c == &top.category);
+
+                                    let abstract_hold: Option<(&str, &str)> = if !is_abstract {
+                                        None
+                                    } else if negated_words.contains(word) {
+                                        Some(("NEGATED", "search.qualifier_negated"))
+                                    } else if qualifier_order.contains(word) || crate::utils::ai_utils::is_ordering_marker(word) {
+                                        Some(("ORDER", "search.qualifier_order"))
+                                    } else if qualifier_bound.contains(word) {
+                                        Some(("BOUND", "search.qualifier_bound"))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((tag, axis)) = abstract_hold {
+                                        crate::utils::score_dynamics::record_baseline(axis, 1.0);
+                                        emit_term(&format!(
+                                            "      🚫 [ABSTRACT QUALIFIER {}] '{}' → {}.{} | Surprisal: {:+.4} > SchemaTop: {:+.4} 이지만 곁에 부정 표지·정렬 요청·가격 비교 수치 가운데 하나가 있어(닫힌 어휘 경로와 같은 판정) 방향(상위·하위 20%)을 정하지 않습니다. 추상 수식어로 라우팅하지 않고 속성 배정에서도 뺍니다. (FTS 검색어로는 보존)",
+                                            tag, effective_word, top.category, top.key, top.surprisal, schema_top
+                                        ));
+                                    } else if is_abstract {
+                                        let flipped = downward_words.contains(word);
+                                        for cat in claim.iter() {
+                                            if let Some(b) = f_scores.iter().find(|s| &s.category == cat) {
+                                                // 🌟 [QUALIFIER SURPRISAL] 축과 방향은 각자 기대치를 넘어야 합니다. 한쪽만 넘은 'on' · 'a' · '것' 이
+                                                //    '무게 하위 20%' 같은 순위 조건을 만들어 정답을 잘라냈습니다.
+                                                if b.surprisal <= 0.0 {
+                                                    continue;
+                                                }
+                                                let key = match (flipped && *cat == "find_filters", b.key.as_str()) {
+                                                    (true, "much") => "little".to_string(),
+                                                    (true, "little") => "much".to_string(),
+                                                    (true, "many") => "few".to_string(),
+                                                    (true, "few") => "many".to_string(),
+                                                    _ => b.key.clone(),
+                                                };
+                                                emit_term(&format!(
+                                                    "      🧲 [ABSTRACT QUALIFIER ROUTE] '{}' → {}.{} | Surprisal: {:+.4} (cos {:.4}, N={}) > SchemaTop: {:+.4}{}",
+                                                    effective_word, b.category, key, b.surprisal, b.max_cos, b.n, schema_top,
+                                                    if key != b.key { " | 앞 어절이 하향 표지(덜·less·moins·menos·weniger)라 방향을 뒤집었습니다" } else { "" }
+                                                ));
+                                                forced_filter_routes.push((word.to_string(), b.category.clone(), key, b.surprisal));
+                                            }
+                                        }
+                                    } else {
+                                        let temporal = top.category == "time_filters" || top.category == "season_filters";
+                                        let raw_top = f_scores
+                                            .iter()
+                                            .max_by(|a, b| a.max_cos.partial_cmp(&b.max_cos).unwrap_or(std::cmp::Ordering::Equal));
+                                        let anchored = !temporal || raw_top.map_or(true, |r| r.category == top.category);
+                                        if anchored {
+                                            emit_term(&format!(
+                                                "      ✂️ [FILTER TERM DROP] '{}' → {}.{} | Surprisal: {:+.4} (cos {:.4}, N={}) > SchemaTop: {:+.4}",
+                                                effective_word, top.category, top.key, top.surprisal, top.max_cos, top.n, schema_top
+                                            ));
+                                            forced_filter_routes.push((word.to_string(), top.category.clone(), top.key.clone(), top.surprisal));
+                                        } else {
+                                            let (rc, rk, rcos) = raw_top
+                                                .map(|r| (r.category.clone(), r.key.clone(), r.max_cos))
+                                                .unwrap_or_default();
+                                            crate::utils::score_dynamics::record_baseline("search.time_route_unanchored", 1.0);
+                                            crate::utils::score_dynamics::record_baseline("search.time_route_raw_gap", rcos - top.max_cos);
+                                            emit_term(&format!(
+                                                "      ✂️ [FILTER TERM DROP / TIME UNANCHORED] '{}' → {}.{} | Surprisal: {:+.4} (cos {:.4}, N={}) > SchemaTop: {:+.4} 이지만 원시 코사인 1위는 다른 필터 계열 {}.{} (cos {:.4}) 입니다. 구가 몇 개뿐인 시간 뱅크는 표준화 점수가 쉽게 양수가 되므로, 두 척도가 같은 계열을 가리키지 않으면 시간 의도(time_filters 시드)로 쓰지 않습니다. 속성 배정에서는 빼고 FTS 검색어로 남깁니다.",
+                                                effective_word, top.category, top.key, top.surprisal, top.max_cos, top.n, schema_top, rc, rk, rcos
+                                            ));
+                                        }
+                                    }
+
+                                    retained_words.push(word);
+                                    if !unassigned_chunks.iter().any(|e| e == word) {
+                                        unassigned_chunks.push(word.to_string());
+                                    }
+                                    continue;
+                                } else if top.surprisal <= 0.0 {
+                                    emit_term(&format!(
+                                        "      ⚪ [SURPRISAL GATE] '{}' | 최고 필터 {}.{} Surprisal {:+.4} <= 0. 무작위 기대치를 넘지 못해 필터 라우팅을 하지 않습니다.",
+                                        effective_word, top.category, top.key, top.surprisal
+                                    ));
+                                }
+                            }
+                        }
+                    }
+
+                    retained_words.push(word);
+
+                    // 7. Plinko Window Logic
+                    let mut test_chunk = current_chunk.clone();
+                    test_chunk.push(effective_word.clone());
+                    let test_text = test_chunk.join(" ");
+                    let test_emb = self.get_embedding(test_text.clone()).await.unwrap_or(vec![0.0; 384]);
+
+                    // 🌟 [추가] 1차 핀볼(속성 매칭)에도 동사 페널티(verb_penalty) 및 단어 길이 가중치 적용
+                    let word_count = test_chunk.len();
+                    let v_sim = cosine_similarity(&test_emb, &verb_emb);
+                    let beta = if word_count <= 2 { 0.05 } else { 0.10 };
+                    let verb_penalty = v_sim * beta;
+                    let penalty_weight = if word_count <= 2 { 0.3 } else { 0.7 };
+
+                    let mut candidates: Vec<(String, f32)> = Vec::new();
+                    let test_norm = crate::utils::ai_utils::l2_norm_exact(&test_emb);
+
+                    for i in 0..prop_keys.len() {
+                        if prop_is_filter_owned[i] { continue; }
+                        // 🌟 [PHRASE MAX-POOL] 센트로이드 대신 변별 구 단위 최대 유사도.
+                        //    이로써 'contains() 문자열 포함 시 +0.5' 라는 의미 판정 하드코딩과
+                        //    매직 상수 0.5 를 동시에 제거합니다.
+                        //    구가 원문과 동일하면 코사인이 1.0 이므로 보너스 없이 1순위가 확정됩니다.
+                        let b_score = crate::utils::ai_utils::weighted_max_pool_sim_bank(&test_emb, test_norm, &prop_banks[i], &prop_phrase_weights[i]);
+                        let p_score = prej_bank_rows.cos(i, &test_emb, test_norm);
+
+                        let score = b_score - (p_score * penalty_weight) - verb_penalty;
+
+                        candidates.push((prop_keys[i].clone(), score));
+                    }
+                    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    
+                    let current_best = candidates.first().map(|c| c.0.clone()).unwrap_or_default();
+                    let current_max = candidates.first().map(|c| c.1).unwrap_or(-1.0);
+                    let current_alternatives: Vec<(String, f32)> = candidates.iter().skip(1).take(5).cloned().collect();
+
+                    let mut global_scores_log = String::new();
+                    if !loaded_globals.is_empty() {
+                        let mut g_scores = Vec::new();
+                        for g_key in &loaded_globals {
+                            if let Some(c) = candidates.iter().find(|x| &x.0 == g_key) {
+                                g_scores.push(format!("{}: {:.4}", g_key, c.1));
+                            }
+                        }
+                        global_scores_log = format!(" | Globals: {}", g_scores.join(", "));
+                    }
+
+                    let sec_prop = current_alternatives.first().map(|c| c.0.clone()).unwrap_or_default();
+                    let sec_score = current_alternatives.first().map(|c| c.1).unwrap_or(-1.0);
+                    emit_term(&format!("    🔍 [PLINKO SLIDE] '{}' -> 1st: [{}] ({:.4}) | 2nd: [{}] ({:.4}){}", test_text, current_best, current_max, sec_prop, sec_score, global_scores_log));
+
+                    // Score Drop (Cliff) = Cut & Drop into Slot
+                    if current_max < prev_max_score && !current_chunk.is_empty() {
+                        emit_term(&format!("    📉 [CLIFF DETECTED] Score dropped ({:.4} -> {:.4}). End of semantic chunk.", prev_max_score, current_max));
+                        
+                        // 🌟 임계값을 0.20으로 상향 조정하여 무의미한 단어가 특정 속성으로 맵핑되는 현상 방지
+                        if prev_max_score > 0.20 && !best_prop_for_chunk.is_empty() {
+                            emit_term(&format!("      📥 [DROPPED INTO SLOT] '{}' belongs to property [{}]", current_chunk.join(" "), best_prop_for_chunk));
+                            plinko_matches.push(PlinkoMatch {
+                                chunk: current_chunk.join(" "),
+                                best_prop: best_prop_for_chunk.clone(),
+                                best_score: prev_max_score,
+                                alternatives: prev_alternatives.clone(),
+                                all_scores: prev_all_scores.clone(),
+                            });
+                        } else {
+                            emit_term(&format!("      🗑️ [SKIPPED] Score {:.4} is too low (Threshold: 0.20). Ignored.", prev_max_score));
+                        }
+                        
+                        // Reset Window
+                        current_chunk = vec![effective_word.clone()];
+                        let reset_emb = self.get_embedding(effective_word.clone()).await.unwrap_or(vec![0.0; 384]);
+                        
+                        // 🌟 [추가] 리셋 윈도우의 단일 단어에도 동사 페널티 일관되게 적용
+                        let r_v_sim = cosine_similarity(&reset_emb, &verb_emb);
+                        let r_verb_penalty = r_v_sim * 0.05;
+                        let r_penalty_weight = 0.3;
+
+                        let mut r_candidates: Vec<(String, f32)> = Vec::new();
+                        let reset_norm = crate::utils::ai_utils::l2_norm_exact(&reset_emb);
+                        for i in 0..prop_keys.len() {
+                            if prop_is_filter_owned[i] { continue; }
+                            // 🌟 [PHRASE MAX-POOL] 리셋 윈도우도 동일하게 구 단위 최대 유사도로 통일합니다.
+                            //    '가디건' 은 title 뱅크에 편입된 semantic 앵커 구('의류명')와 직접 경쟁하게 되어
+                            //    더 이상 tags/brand_name 으로 흘러가지 않습니다.
+                            let b_score = crate::utils::ai_utils::weighted_max_pool_sim_bank(&reset_emb, reset_norm, &prop_banks[i], &prop_phrase_weights[i]);
+                            let p_score = prej_bank_rows.cos(i, &reset_emb, reset_norm);
+
+                            let score = b_score - (p_score * r_penalty_weight) - r_verb_penalty;
+
+                            r_candidates.push((prop_keys[i].clone(), score));
+                        }
+                        r_candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                        
+                        let r_max = r_candidates.first().map(|c| c.1).unwrap_or(-1.0);
+                        let r_best = r_candidates.first().map(|c| c.0.clone()).unwrap_or_default();
+                        let r_alts: Vec<(String, f32)> = r_candidates.iter().skip(1).take(5).cloned().collect();
+                        let r_sec_prop = r_alts.first().map(|c| c.0.clone()).unwrap_or_default();
+                        let r_sec_score = r_alts.first().map(|c| c.1).unwrap_or(-1.0);
+
+                        let mut r_global_scores_log = String::new();
+                        if !loaded_globals.is_empty() {
+                            let mut r_g_scores = Vec::new();
+                            for g_key in &loaded_globals {
+                                if let Some(c) = r_candidates.iter().find(|x| &x.0 == g_key) {
+                                    r_g_scores.push(format!("{}: {:.4}", g_key, c.1));
+                                }
+                            }
+                            r_global_scores_log = format!(" | Globals: {}", r_g_scores.join(", "));
+                        }
+
+                        prev_max_score = r_max;
+                        best_prop_for_chunk = r_best.clone();
+                        prev_alternatives = r_alts;
+                        prev_all_scores = r_candidates;
+                        emit_term(&format!("    🔄 [WINDOW RESET] Started new chunk '{}' -> 1st: {} ({:.4}) | 2nd: {} ({:.4}){}", effective_word, r_best, r_max, r_sec_prop, r_sec_score, r_global_scores_log));
+                    } else {
+                        current_chunk.push(effective_word.clone());
+                        prev_max_score = current_max;
+                        best_prop_for_chunk = current_best;
+                        prev_alternatives = current_alternatives;
+                        prev_all_scores = candidates;
+                    }
+                }
+                if !current_chunk.is_empty() && prev_max_score > 0.20 && !best_prop_for_chunk.is_empty() {
+                    emit_term("    📉 [TAIL FLUSH] 입력 끝에 도달했습니다. 마지막 의미 청크를 슬롯에 넣습니다.");
+                    emit_term(&format!("      📥 [DROPPED INTO SLOT] '{}' belongs to property [{}]", current_chunk.join(" "), best_prop_for_chunk));
+                    plinko_matches.push(PlinkoMatch {
+                        chunk: current_chunk.join(" "),
+                        best_prop: best_prop_for_chunk.clone(),
+                        best_score: prev_max_score,
+                        alternatives: prev_alternatives.clone(),
+                        all_scores: prev_all_scores.clone(),
+                    });
+                }
+
+                // 🌟 [EXCLUSIVE PROPERTY ASSIGNMENT + QWEN3 VERIFICATION (1st)]
+                //    기존 구조는 HashMap<속성, Vec<청크>> 라서 한 속성에 청크가 무한히 쌓였고,
+                //    Double Plinko 가 v.join(" | ") 로 병합하는 순간 서로 다른 의미가 한 값이 되었습니다.
+                //    (로그: '베이지' 와 '가디건' 이 둘 다 color 로 들어가 value = "베이지 가디건")
+                //    이제 한 속성은 정확히 한 청크만, 한 청크는 정확히 한 속성만 가져갑니다.
+                if !plinko_matches.is_empty() {
+                    emit_term("    🧠 [EXCLUSIVE ASSIGN + QWEN3 VERIFICATION (1st)] Verifying property mappings...");
+
+                    // 🌟 [TEMPORAL / NUMERIC STRUCTURE PRE-GATE]
+                    //    형식 검증을 '배정 전' 에 제대로 수행하려면, 그 청크가
+                    //      ① 시간·계절 의도인가            → Date 필드 후보 자격 부여
+                    //      ② (숫자 + 비교 표현) 구조인가   → 문자열/열거형 필드 후보 자격 박탈
+                    //    를 먼저 결정론/코사인으로 확정해야 합니다.
+                    //    ① 은 이미 만들어 둔 dynamic_filter_defs(time_filters / season_filters / metrics / operators)
+                    //       벡터 뱅크를 그대로 재사용하므로 새 임베딩 자원도, 새 상수도 들지 않습니다.
+                    //    ② 는 split_numeric_and_comparator 라는 순수 문자열 구조 파싱 + operators 뱅크 코사인입니다.
+                    //    LLM 호출은 단 한 번도 추가되지 않으며, 오히려 후보 목록이 정화되어
+                    //    기존 Qwen3 검증 호출의 정확도가 올라갑니다.
+                    let mut temporal_chunks: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    let mut numeric_cmp_chunks: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+                    for pm in plinko_matches.iter() {
+                        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                            return Ok(json!({ "context": [], "cancelled": true }));
+                        }
+
+                        let c_emb = self.get_embedding(pm.chunk.clone()).await.unwrap_or(vec![0.0; 384]);
+
+                        // ① 시간성 판정 : 구 단위 Max-Pool 로 time/season 뱅크와 비교
+                        //    temporal_phrase_embs 중 time/season 소속 구와의 Max-Pool 이
+                        //    다른 필터 카테고리 센트로이드 최대보다 높으면 temporal 확정.
+                        //    절대 임계치 없이 'temporal Max-Pool > rival centroid max' 상대 비교만 사용.
+                        let mut temporal_pool = 0.0f32;
+                        if !temporal_phrase_embs.is_empty() {
+                            for te in &temporal_phrase_embs {
+                                if te.iter().all(|&v| v == 0.0) { continue; }
+                                let s = cosine_similarity(&c_emb, te);
+                                if s > temporal_pool { temporal_pool = s; }
+                            }
+                        }
+                        // 🌟 [RIVAL FIX] rival 비교도 구 뱅크 Max-Pool 로 통일합니다.
+                        //    기존 센트로이드(dynamic_bias_embs) 비교는 한국어 2음절 단어와
+                        //    영어 문장 센트로이드 간 코사인이 구조적으로 낮아
+                        //    temporal 이 우세해도 rival 가 과대평가되는 문제가 있었습니다.
+                        let mut rival_best = f32::MIN;
+                        if !all_filter_embs.is_empty() {
+                            for (cat, _key, emb) in &all_filter_embs {
+                                if cat == "time_filters" || cat == "season_filters" { continue; }
+                                if emb.iter().all(|&v| v == 0.0) { continue; }
+                                let s = cosine_similarity(&c_emb, emb);
+                                if s > rival_best { rival_best = s; }
+                            }
+                        }
+                        if rival_best == f32::MIN { rival_best = 0.0; }
+                        // 🌟 temporal Max-Pool 이 rival Max-Pool 보다 높으면 확정.
+                        if temporal_pool > rival_best && temporal_pool > 0.0 {
+                            temporal_chunks.insert(pm.chunk.trim().to_string());
+                            emit_term(&format!("      🕒 [TEMPORAL PRE-GATE] '{}' 는 시간/계절 의도가 우세합니다. (TemporalMaxPool {:.4} > RivalMaxPool {:+.4}) → Date 필드 후보 자격 부여", pm.chunk, temporal_pool, rival_best));
+                        }
+
+                        // ② 수치 비교 구조 판정 : 구 단위 Max-Pool 로 operators 뱅크와 비교
+                        //    "이하로" vs embed("less than or equal") / embed("under") / embed("no more than")
+                        //    의 Max-Pool 이 top/bottom 구 Max-Pool 보다 높으면 비교 연산자 확정.
+                        if let Some((_num, cmp_part)) = crate::utils::ai_utils::split_numeric_and_comparator(&pm.chunk) {
+                            if let Some(key) = crate::utils::ai_utils::numeric_comparator_exact(&pm.chunk) {
+                                numeric_cmp_chunks.insert(pm.chunk.trim().to_string());
+                                emit_term(&format!("      🔢 [NUMERIC PRE-GATE / EXACT] '{}' 는 (숫자 + 비교 표현 [{}]) 구조입니다. 닫힌 비교 어휘 완전일치 → 문자열/열거형 필드 후보 자격 박탈", pm.chunk, key));
+                            } else if !cmp_part.trim().is_empty() {
+                                let cmp_emb = self.get_embedding(cmp_part.clone()).await.unwrap_or(vec![0.0; 384]);
+                                let mut cmp_pool = 0.0f32;
+                                let mut rank_pool = 0.0f32;
+                                if !op_phrase_embs.is_empty() {
+                                    for (oi, oe) in op_phrase_embs.iter().enumerate() {
+                                        if oe.iter().all(|&v| v == 0.0) { continue; }
+                                        let s = cosine_similarity(&cmp_emb, oe);
+                                        if op_phrase_is_rank[oi] {
+                                            if s > rank_pool { rank_pool = s; }
+                                        } else {
+                                            if s > cmp_pool { cmp_pool = s; }
+                                        }
+                                    }
+                                }
+                                // 폴백: 구 뱅크가 비어 있으면 기존 센트로이드 경로 사용
+                                if op_phrase_embs.is_empty() {
+                                    for i in 0..dynamic_filter_defs.len() {
+                                        if dynamic_filter_defs[i].category != "operators" { continue; }
+                                        let b = cosine_similarity(&cmp_emb, &dynamic_bias_embs[i]);
+                                        let p = cosine_similarity(&cmp_emb, &dynamic_prej_embs[i]);
+                                        let s = b - p;
+                                        match dynamic_filter_defs[i].key.as_str() {
+                                            "top" | "bottom" => { if s > rank_pool { rank_pool = s; } },
+                                            _ => { if s > cmp_pool { cmp_pool = s; } },
+                                        }
+                                    }
+                                }
+                                if cmp_pool > rank_pool && cmp_pool > 0.0 {
+                                    numeric_cmp_chunks.insert(pm.chunk.clone());
+                                    emit_term(&format!("      🔢 [NUMERIC PRE-GATE] '{}' 는 (숫자 + 비교 표현) 구조입니다. (CmpMaxPool {:.4} > RankMaxPool {:.4}) → 문자열/열거형 필드 후보 자격 박탈", pm.chunk, cmp_pool, rank_pool));
+                                }
+                            }
+                        }
+                    }
+
+                    // ── 1) 형식 게이트 : 배정 전(행렬 구축 시점)에 값의 생김새부터 검증합니다.
+                    let chunk_count = plinko_matches.len();
+                    let mut matrix: Vec<Vec<f32>> = vec![vec![-1.0f32; chunk_count]; prop_keys.len()];
+                    let mut gate_dropped: Vec<String> = Vec::new();
+                    for (ci, pm) in plinko_matches.iter().enumerate() {
+                        // 🌟 [TRIM FIX] temporal_chunks 에 등록 시 trim 을 적용했으므로
+                        //    조회 시에도 동일하게 trim 하여 공백 차이로 인한 lookup 실패를 방지합니다.
+                        let chunk_trimmed = pm.chunk.trim().to_string();
+                        let t_hint = temporal_chunks.contains(&chunk_trimmed);
+                        let n_hint = numeric_cmp_chunks.contains(&chunk_trimmed);
+                        if t_hint {
+                            emit_term(&format!("      🕒 [TEMPORAL HINT ACTIVE] '{}' → Date 필드 후보 자격 부여 확인", chunk_trimmed));
+                        }
+                        if n_hint {
+                            emit_term(&format!("      🔢 [NUMERIC HINT ACTIVE] '{}' → 문자열/열거형 후보 자격 박탈 확인", chunk_trimmed));
+                        }
+                        for (name, sc) in &pm.all_scores {
+                            let pi = match prop_keys.iter().position(|p| p == name) { Some(v) => v, None => continue };
+                            if is_filter_owned(name) { continue; }
+                            if !crate::utils::ai_utils::query_chunk_matches_property_ext(name, &chunk_trimmed, t_hint, n_hint) {
+                                if gate_dropped.len() < 12 && *sc > 0.20 {
+                                    gate_dropped.push(format!("{}→{}({:.4})", chunk_trimmed, name, sc));
+                                }
+                                continue;
+                            }
+                            matrix[pi][ci] = *sc;
+                        }
+                    }
+                    if !gate_dropped.is_empty() {
+                        emit_term(&format!("      🚧 [FORMAT GATE] 값 생김새가 맞지 않아 배정 후보에서 제외: {:?}", gate_dropped));
+                    }
+
+                    // ── 2) 배타 배정 : 유효한 모든 (속성 × 청크) 주장을 절대 점수 순으로 그리디 배정합니다.
+                    //       기존 exclusive_assign_by_score(matrix, 0.0, 0.0) 는 rival 이
+                    //       '같은 청크에 대한 다른 속성의 최고 점수' 였기 때문에
+                    //       margin >= 0 이 곧 'own 이 그 청크의 argmax' 를 의미했고,
+                    //       그 결과 각 청크는 argmax 속성 하나에만 주장을 낼 수 있었습니다.
+                    //       그 속성을 더 높은 점수의 청크가 가져가면 차선책 없이 굶어 죽습니다.
+                    //       (로그: '가디건'/'무거운'/'제품중에서'/'제품으로'/'중에서'/'메세지도'/'보여줘' 전멸)
+                    //       greedy_exclusive_assign 은 margin 을 정렬이 아니라 보고 지표로만 쓰므로
+                    //       선점당한 청크가 즉시 자기 점수표의 다음 '형식 통과 + 미선점' 속성으로 이동합니다.
+                    let assign = crate::utils::ai_utils::greedy_exclusive_assign(&matrix);
+
+                    let mut chunk_owner: Vec<Option<(String, f32, f32)>> = vec![None; chunk_count];
+                    let mut claimed_props: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    for (pi, a) in assign.iter().enumerate() {
+                        if let Some((ci, own, margin)) = a {
+                            chunk_owner[*ci] = Some((prop_keys[pi].clone(), *own, *margin));
+                            claimed_props.insert(prop_keys[pi].clone());
+                        }
+                    }
+
+                    let covered = chunk_owner.iter().filter(|c| c.is_some()).count();
+                    emit_term(&format!("      📶 [ASSIGN COVERAGE] 청크 {}개 중 {}개 배정 확보 (그리디 최대 커버리지)", chunk_count, covered));
+
+                    // ── 3) Qwen3 재판정 : 후보 목록을 '형식 통과 + 미선점' 속성으로만 한정합니다.
+                    //       LLM 호출 수는 늘지 않고(청크당 최대 1회, 기존과 동일),
+                    //       대신 모델이 볼 수 있는 선택지 자체를 결정론으로 좁혀 오답 경로를 물리적으로 없앱니다.
+                    let mut validated_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                    let mut alt_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+
+                    for (ci, pm) in plinko_matches.iter().enumerate() {
+                        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                            emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                            return Ok(json!({ "context": [], "cancelled": true }));
+                        }
+
+                        let (mut owner_prop, owner_score, owner_margin) = match &chunk_owner[ci] {
+                            Some(v) => (v.0.clone(), v.1, v.2),
+                            None => {
+                                let sec = pm.alternatives.first()
+                                    .map(|c| format!("{} ({:.4})", c.0, c.1))
+                                    .unwrap_or_else(|| "-".to_string());
+                                emit_term(&format!("      ⚪ [UNASSIGNED CHUNK] '{}' 는 형식 통과 후보가 문서 스키마에 하나도 없어 조건에서 제외합니다. FTS 검색어로는 보존됩니다. (Plinko 1st: {} {:.4} / 2nd: {})", pm.chunk, pm.best_prop, pm.best_score, sec));
+                                unassigned_chunks.push(pm.chunk.clone());
+                                continue;
+                            }
+                        };
+
+                        // 🌟 [NEGATIVE MARGIN GUARD] margin 이 음수라는 것은
+                        //    '이 청크의 argmax 조차 아닌 필드에 억지로 배정되었다' 는 뜻입니다.
+                        //    그리디가 커버리지를 최대화하면서 의미 없는 청크까지 채워 넣은 부작용이며,
+                        //    로그의 '제품중에서'(-0.0091) '제품으로'(-0.0020) '보여줘'(-0.0344) 가 여기 해당합니다.
+                        //    조건으로 확정하는 대신 FTS 검색어로만 보존하는 것이 리콜에 유리합니다.
+                        //    (margin 은 같은 청크 내 1위-2위 차이이므로 새 임계치가 아니라 부호 판정입니다)
+                        if owner_margin < 0.0 {
+                            emit_term(&format!("      ⚖️ [NEGATIVE MARGIN DROP] '{}' → [{}] | Margin: {:+.4} < 0. 자기 argmax 가 아닌 억지 배정이므로 조건에서 제외하고 FTS 검색어로 보존합니다.", pm.chunk, owner_prop, owner_margin));
+                            claimed_props.remove(&owner_prop);
+                            unassigned_chunks.push(pm.chunk.clone());
+                            continue;
+                        }
+
+                        emit_term(&format!("      🔗 [EXCLUSIVE ASSIGN] '{}' → [{}] | Score: {:.4} | Margin: {:+.4}", pm.chunk, owner_prop, owner_score, owner_margin));
+
+                        // 🌟 [ALTERNATE AXIS] 이 청크가 갈 수 있었던 '형식 통과 + 미선점' 차순위 속성들.
+                        //    확정이 틀렸을 때 STAGE-3 이 이 목록으로 대안 컨텍스트를 발행합니다.
+                        let mut allowed: Vec<(String, f32)> = Vec::new();
+                        for (name, sc) in &pm.all_scores {
+                            if name == &owner_prop { continue; }
+                            if claimed_props.contains(name) { continue; }
+                            if is_filter_owned(name) { continue; }
+                            if !crate::utils::ai_utils::query_chunk_matches_property(name, &pm.chunk) { continue; }
+                            allowed.push((name.clone(), *sc));
+                            if allowed.len() >= 5 { break; }
+                        }
+
+                        // 🌟 [DETERMINISTIC BYPASS] 기존의 절대 임계치(0.70)는 매직 상수였고,
+                        //    다국어 임베딩의 짧은 한국어 청크는 0.5~0.7 대역에 촘촘히 뭉쳐 있어
+                        //    (로그 실측: 0.5265 ~ 0.6798) 사실상 거의 모든 청크가 LLM 을 거치며
+                        //    오히려 오판 기회를 늘렸습니다.
+                        //    '형식 게이트를 통과했고 아직 선점되지 않은 대안이 하나도 없다' 는 것은
+                        //    선택지가 물리적으로 하나뿐이라는 결정론적 사실이므로 LLM 에게 물을 이유가 없습니다.
+                        //    (LLM 호출 수는 늘지 않고 오히려 줄어들며, 임계치가 사라집니다)
+                        //
+                        //    🌟 [COLOR SINK GUARD] 단, color 로 배정된 청크가 '실제로 색상을 나타내는지'는
+                        //    대안이 없는 경우에도(is_empty) LLM 에게 한 번 물어서 확인합니다.
+                        //    '남긴', '팔린', '많이' 같은 비색상 단어가 color 5구 뱅크의 구조적 편향으로
+                        //    argmax 가 되는 것을 LLM 이 걸러냅니다. (호출 추가 없음, 기존 슬롯 활용)
+                        if allowed.is_empty() {
+                            if owner_prop != "color" {
+                                emit_term(&format!("      ⚡ [BYPASS] 형식 통과 대안이 존재하지 않아 [{}] 로 결정론 확정합니다. ('{}' | Score {:.4})", owner_prop, pm.chunk, owner_score));
+                                validated_map.insert(owner_prop.clone(), vec![pm.chunk.clone()]);
+                                alt_map.insert(owner_prop.clone(), Vec::new());
+                                continue;
+                            } else {
+                                emit_term(&format!("      🛡️ [COLOR SINK GUARD] '{}' 청크가 대안 없이 color 에 배정되었으나, 비색상 단어인지 확인하기 위해 Qwen3 검증을 거칩니다.", pm.chunk));
+                            }
+                        }
+
+                        // 🌟 [FILTER CONTEXT INJECTION] Qwen3 검증 프롬프트에 필터 카테고리 정보를 주입합니다.
+                        //    '팔린 제품' 같은 복합 청크에서 '팔린' 이 status 필터 의도임을
+                        //    Qwen3 가 인식할 수 있도록 컨텍스트를 제공합니다.
+                        //    LLM 호출 수는 늘지 않고(청크당 최대 1회, 기존과 동일),
+                        //    프롬프트 내용만 풍부해져 판정 정확도가 올라갑니다.
+                        //    bias.json 수정 없이 all_filter_embs 의 코사인 결과만 동적으로 전달합니다.
+                        let filter_context_hint = if !all_filter_embs.is_empty() {
+                            let chunk_emb_hint = self.get_embedding(pm.chunk.trim().to_string()).await.unwrap_or(vec![0.0; 384]);
+                            let mut hints: Vec<String> = Vec::new();
+                            for (cat, key, emb) in &all_filter_embs {
+                                if emb.iter().all(|&v| v == 0.0) { continue; }
+                                let s = cosine_similarity(&chunk_emb_hint, emb);
+                                if s > 0.45 {
+                                    hints.push(format!("{}.{}", cat, key));
+                                }
+                            }
+                            if hints.is_empty() { String::new() } else { format!("\n[POSSIBLE FILTER INTENTS] This chunk may also express filter intents: {}. If the chunk combines a filter intent with a property value, prioritize the property value and note the filter intent separately.", hints.join(", ")) }
+                        } else {
+                            String::new()
+                        };
+                        let prompt = format!("{}{}", crate::prompts::verify_property_with_alternatives_prompt(
+                            &pm.chunk, &owner_prop, owner_score, &allowed
+                        ), filter_context_hint);
+
+                        let mut picked: Option<String> = None;
+                        if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
+                            if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                                let mut cand_list: Vec<String> = Vec::new();
+                                if let Some(arr) = result.get("suggested_properties").and_then(|v| v.as_array()) {
+                                    for s in arr {
+                                        if let Some(t) = s.as_str() { cand_list.push(t.to_string()); }
+                                    }
+                                } else if let Some(s) = result.get("suggested_property").and_then(|v| v.as_str()) {
+                                    cand_list.push(s.to_string());
+                                }
+                                for c in cand_list {
+                                    if c == owner_prop { picked = Some(c); break; }
+                                    if allowed.iter().any(|(n, _)| n == &c) { picked = Some(c); break; }
+                                    emit_term(&format!("      🚫 [LLM REJECT] '{}' 에 대한 제안 [{}] 은 형식 불일치이거나 다른 청크가 이미 선점한 속성이라 폐기합니다.", pm.chunk, c));
+                                    crate::model::lang_llm::record_query_value(false);
+                                }
+                            }
+                        }
+
+                        if picked.is_none() && owner_margin < 0.05 {
+                            emit_term(&format!(
+                                "      ⚖️ [UNCONFIRMED ASSIGN DROP] '{}' → [{}] | 검증 응답이 이 배정도 형식이 맞는 대안도 확인해 주지 못했고, 벡터 마진 {:+.4} 도 0.05 미만입니다. 근소한 배정을 확인 없이 하드 조건으로 걸면 회수한 문서 전부를 막을 수 있어 조건에서 빼고 FTS 검색어로 보존합니다.",
+                                pm.chunk, owner_prop, owner_margin
+                            ));
+                            crate::utils::score_dynamics::record_baseline("search.verify_unconfirmed_drop", 1.0);
+                            claimed_props.remove(&owner_prop);
+                            unassigned_chunks.push(pm.chunk.clone());
+                            continue;
+                        }
+
+                        if let Some(new_prop) = picked {
+                            if new_prop != owner_prop {
+                                let chunk_emb_verify = self.get_embedding(pm.chunk.trim().to_string()).await.unwrap_or(vec![0.0; 384]);
+                                let old_pi = prop_keys.iter().position(|p| p == &owner_prop);
+                                let new_pi = prop_keys.iter().position(|p| p == &new_prop);
+                                let is_degraded = match (old_pi, new_pi) {
+                                    (Some(opi), Some(npi)) => {
+                                        crate::utils::ai_utils::correction_cosine_degraded(
+                                            &chunk_emb_verify,
+                                            &prop_phrase_embs[opi], &prop_phrase_weights[opi],
+                                            &prop_phrase_embs[npi], &prop_phrase_weights[npi],
+                                        )
+                                    },
+                                    _ => false,
+                                };
+                                if is_degraded {
+                                    emit_term(&format!("      🚫 [CORRECTION DEGRADED] '{}' 에 대한 {} 교정 [{}] → [{}] 은 코사인 열화로 폐기합니다. UNASSIGN 처리.", pm.chunk, crate::model::lang_llm::query_engine_label(), owner_prop, new_prop));
+                                    crate::model::lang_llm::record_query_value(false);
+                                    claimed_props.remove(&owner_prop);
+                                    unassigned_chunks.push(pm.chunk.clone());
+                                    continue;
+                                }
+                                crate::model::lang_llm::record_query_value(true);
+                                emit_term(&format!("      🔄 Property [{}] corrected as [{}] for '{}'", owner_prop, new_prop, pm.chunk));
+                                claimed_props.remove(&owner_prop);
+                                claimed_props.insert(new_prop.clone());
+                                // 확정에서 밀려난 기존 1순위는 그대로 대안 축의 선두가 됩니다.
+                                if !allowed.iter().any(|(n, _)| n == &owner_prop) {
+                                    allowed.insert(0, (owner_prop.clone(), owner_score));
+                                }
+                                allowed.retain(|(n, _)| n != &new_prop);
+                                owner_prop = new_prop;
+                            } else {
+                                crate::model::lang_llm::record_query_value(true);
+                                emit_term(&format!("      ✅ Property [{}] confirmed for '{}'", owner_prop, pm.chunk));
+                            }
+                        }
+
+                        validated_map.insert(owner_prop.clone(), vec![pm.chunk.clone()]);
+                        alt_map.insert(owner_prop.clone(), allowed.iter().map(|(n, _)| n.clone()).collect());
+                    }
+
+                    plinko_map = validated_map;
+                    plinko_alternates = alt_map;
+                }
+
+                // 🌟 [QUOTED NAME / PERIOD LEXICAL GATE] 따옴표로 묶은 이름('Bereit für den Sommerurlaub' · 「夏休み準備セール」)의
+                //    계절어는 기간이 아닙니다. 확정어는 따옴표 밖 낱말에서만 찾고, 벡터 후보는 따옴표 밖 질의에 그 키의 구 낱말이
+                //    있을 때만 LLM 에게 묻습니다 (utils::time_guide::period_lexical_support).
+                //    v2 질의: 영어 · 중국어 · 스페인어 · 이탈리아어 · 포르투갈어 · 체코어의 C7 이 이름 속 Sommer 로 여름 기간이 걸려
+                //    행사 기간 → 주문 → 상품 연결 대신 행사 4건만 보였습니다 (R@all 0).
+                //    동사 · 조동사로 쓰인 낱말(프랑스어 'a été expédiée' 의 été = être 의 과거분사, 영어 'prices fall' 의 fall)도
+                //    계절 · 시간 낱말이 아닙니다 (Stanza 품사 AUX · VERB). v2 질의 C2 fr 은 été 로 여름이 확정되었습니다.
+                let verbal = |w: &str| matches!(word_pos_map.get(w).map(|s| s.as_str()), Some("AUX") | Some("VERB"));
+                let unquoted_query: String = crate::stanza::strip_quoted(&query)
+                    .split_whitespace()
+                    .filter(|w| !verbal(w.trim_matches(|c: char| !c.is_alphanumeric())))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase();
+                let in_unquoted = |w: &str| -> bool {
+                    let t = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                    !t.is_empty() && !verbal(w.trim_matches(|c: char| !c.is_alphanumeric())) && unquoted_query.contains(&t)
+                };
+                let period_phrases = crate::utils::ai_utils::filter_category_phrases(&["time_filters", "season_filters"]);
+                // 기능어('that' ≈ 'thaw')는 기간의 글자 근거가 아닙니다 (utils::time_guide::period_function_words 설명).
+                let period_function_words =
+                    crate::utils::time_guide::period_function_words(word_pos_map.iter().map(|(w, t)| (w.as_str(), t.as_str())));
+                let period_text = crate::utils::time_guide::strip_period_function_words(&unquoted_query, &period_function_words);
+                let period_supported = |cat: &str, key: &str| -> bool {
+                    let phrases: Vec<&str> =
+                        period_phrases.iter().filter(|(c, k, _)| c == cat && k == key).map(|(_, _, p)| p.as_str()).collect();
+                    crate::utils::time_guide::period_lexical_support(&period_text, &phrases)
+                };
+                let mut exact_season_key = String::new();
+                let mut exact_time_key = String::new();
+                for w in current_text.split_whitespace() {
+                    if !in_unquoted(w) {
+                        continue;
+                    }
+                    if exact_season_key.is_empty() {
+                        if let Some(k) = crate::utils::ai_utils::exact_match_filter_key_tailed("season_filters", w) {
+                            emit_term(&format!("  🌤️ [SEASON EXACT MATCH] '{}' ∈ season_filters.{}.exact_match (닫힌 조사·어미 포함) → 코사인 경쟁 없이 확정합니다.", w, k));
+                            exact_season_key = k;
+                        }
+                    }
+                    if exact_time_key.is_empty() {
+                        if let Some(k) = crate::utils::ai_utils::exact_match_filter_key_tailed("time_filters", w) {
+                            emit_term(&format!("  🕒 [TIME EXACT MATCH] '{}' ∈ time_filters.{}.exact_match (닫힌 조사·어미 포함) → 코사인 경쟁 없이 확정합니다.", w, k));
+                            exact_time_key = k;
+                        }
+                    }
+                }
+
+                // 🌟 [IGNORE VECTOR CHECK] 현재 청크 전체가 명령어/분석 요청(ignore)에 해당하는지 검증
+                //    🌟 [DOMAIN GUARD] STAGE-1 이 이미 유효 도메인으로 확정한 세그먼트를
+                //    STAGE-2 가 뒤집는 것은 구조적 모순입니다.
+                //    (로그: '이벤트로 판매된' 은 STAGE-1 에서 event 확정 + Qwen3 가 coupon→event 교정까지 했는데
+                //     IGNORE 0.4526 으로 통째로 소멸했습니다. bias.json 의 ignore.bias 에 있는
+                //     'show me, display, list out, find out' 등이 '판매된' 과 우연히 공명한 결과입니다)
+                //    STAGE-1 이 ignore 가 아닌 도메인을 확정했다면 IGNORE 체크 자체를 건너뜁니다.
+                let stage1_confirmed = seg_type != "ignore" && !seg_type.is_empty();
+                let mut is_ignore_chunk = false;
+
+                if stage1_confirmed {
+                    emit_term(&format!("  🛡️ [IGNORE GUARD] STAGE-1 이 '{}' 도메인으로 확정한 세그먼트이므로 IGNORE 체크를 건너뜁니다.", seg_type));
+                } else {
+                    let chunk_full_emb = self.get_embedding(current_text.clone()).await.unwrap_or(vec![0.0; 384]);
+                    let chunk_word_count = current_text.split_whitespace().count();
+                    let v_sim = cosine_similarity(&chunk_full_emb, &verb_emb);
+                    let beta = if chunk_word_count <= 2 { 0.05 } else { 0.10 };
+                    let penalty_weight = if chunk_word_count <= 2 { 0.3 } else { 0.7 };
+                    let _ = (v_sim, beta);
+
+                    if let Some(ignore_obj) = crate::parsing::BIAS_DICT.get("ignore").and_then(|p| p.as_object()) {
+                        let s_bias = ignore_obj.get("bias").and_then(|v| v.as_str()).unwrap_or("");
+                        let s_prej = ignore_obj.get("prejudice").and_then(|v| v.as_str()).unwrap_or("");
+                        if !s_bias.is_empty() {
+                            let ignore_bias_emb = self.get_embedding(s_bias.to_string()).await.unwrap_or(vec![0.0; 384]);
+                            let ignore_prej_emb = self.get_embedding(s_prej.to_string()).await.unwrap_or(vec![0.0; 384]);
+
+                            let b_score = cosine_similarity(&chunk_full_emb, &ignore_bias_emb);
+                            let p_score = cosine_similarity(&chunk_full_emb, &ignore_prej_emb);
+                            let ignore_score = b_score - (p_score * penalty_weight);
+
+                            if ignore_score > 0.4 {
+                                emit_term(&format!("  🚫 [IGNORE VECTOR CHECK] Chunk '{}' identified as IGNORE (Score: {:.4}). Skipping LLM processing.", current_text, ignore_score));
+                                is_ignore_chunk = true;
+                            }
+                        }
+                    }
+                }
+
+                if is_ignore_chunk {
+                    if let Some(obj) = seg.as_object_mut() {
+                        obj.insert("type".to_string(), json!("ignore")); // 마스터 병합에서 빠지도록 타입 강제 변환
+                        obj.insert("condition".to_string(), json!({}));
+                    }
+                    continue;
+                }
+
+                // 🌟 Formatting Plinko Fragments & [2차 선택] Double Plinko for All Dynamic Filters
+                let mut fragments_text = String::new();
+                let mut prop_to_op: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                let mut exact_op_lock: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                let mut prop_to_exact_val: std::collections::HashMap<String, String> = std::collections::HashMap::new(); // 🌟 숫자 할루시네이션 방지용 원본 값 저장소
+
+                // 🌟 [FORCED ROUTE SEED] Plinko 진입 전에 필터로 확정된 단어들의 결과를
+                //    전역 필터 값의 초기값으로 삼습니다.
+                //    이 단어들은 plinko_map 에 들어가지 않으므로 2차 Plinko 가 볼 수 없고,
+                //    시딩이 없으면 substantial / find 가 영원히 빈 값으로 남습니다.
+                let pick_forced = |cat: &str| -> String {
+                    let mut best = f32::MIN;
+                    let mut key = String::new();
+                    for (_, c, k, s) in &forced_filter_routes {
+                        if c != cat { continue; }
+                        if *s > best { best = *s; key = k.clone(); }
+                    }
+                    key
+                };
+                let forced_status_key = pick_forced("status_filters");
+                let mut status_negated: Vec<String> = negated_words
+                    .iter()
+                    .filter(|w| {
+                        forced_filter_routes
+                            .iter()
+                            .any(|(fw, c, _, _)| c == "status_filters" && fw.as_str() == **w)
+                            || crate::utils::ai_utils::status_exact_key(w, &seg_type).is_some()
+                            || crate::utils::ai_utils::status_exact_key(crate::utils::ai_utils::negated_core(w), &seg_type).is_some()
+                    })
+                    .map(|w| w.to_string())
+                    .collect();
+                status_negated.sort();
+                let status_anchored: Vec<String> = forced_filter_routes
+                    .iter()
+                    .filter(|(w, c, _, _)| c == "status_filters" && !negated_words.contains(w.as_str()))
+                    .map(|(w, _, _, _)| w.clone())
+                    .collect();
+                let mut status_stopped: Vec<String> = Vec::new();
+                let status_exact_global: Option<(String, String, String, bool)> = if status_anchored.is_empty() {
+                    None
+                } else {
+                    let pivot = crate::utils::ai_utils::status_pivot_bank(self, &seg_type, &query_lang).await;
+                    let seg_words: Vec<&str> = current_text.split_whitespace().collect();
+                    let mut found: Vec<(String, String, String, bool)> = Vec::new();
+                    for w in status_anchored.iter() {
+                        let joinable = |x: &str| !negated_words.contains(x) && !crate::utils::ai_utils::is_negation_marker(x);
+                        let mut forms: Vec<String> = Vec::new();
+                        for (p, sw) in seg_words.iter().enumerate() {
+                            if *sw != w.as_str() {
+                                continue;
+                            }
+                            if p > 0 && joinable(seg_words[p - 1]) {
+                                forms.push(format!("{} {}", seg_words[p - 1], sw));
+                                forms.push(format!("{}{}", seg_words[p - 1], sw));
+                            }
+                            if let Some(nx) = seg_words.get(p + 1) {
+                                if joinable(nx) {
+                                    forms.push(format!("{} {}", sw, nx));
+                                    forms.push(format!("{}{}", sw, nx));
+                                }
+                            }
+                        }
+                        forms.push(w.clone());
+                        let mut hit: Option<(String, String, String, bool)> = None;
+                        for f in forms.iter() {
+                            if let Some((k, route)) = crate::utils::ai_utils::status_canonical_exact(f, &seg_type, pivot.as_ref()) {
+                                let curated = crate::utils::ai_utils::status_curated_key(f, &seg_type).as_deref() == Some(k.as_str());
+                                if hit.is_none() || (curated && !hit.as_ref().map_or(false, |h| h.3)) {
+                                    hit = Some((k, f.clone(), route, curated));
+                                }
+                                if curated {
+                                    break;
+                                }
+                            }
+                        }
+                        let stop_next = seg_words.iter().enumerate().any(|(p, sw)| {
+                            *sw == w.as_str()
+                                && seg_words.get(p + 1).map_or(false, |nx| crate::utils::ai_utils::is_status_stop_verb(nx))
+                        });
+                        if let Some(h) = hit {
+                            if h.1 == *w && stop_next {
+                                status_stopped.push(w.clone());
+                            } else if !found.iter().any(|(fk, _, _, _)| *fk == h.0) {
+                                found.push(h);
+                            }
+                        }
+                    }
+                    if found.len() == 1 { found.pop() } else { None }
+                };
+                status_negated.extend(status_stopped.iter().cloned());
+                let status_suppressed = !status_negated.is_empty();
+                if status_suppressed {
+                    crate::utils::score_dynamics::record_baseline("search.status_route_negated", status_negated.len() as f32);
+                    emit_term(&format!(
+                        "    🚫 [STATUS ROUTE / NEGATED] {:?} 는 곁의 어절이 부정 표지(안 된·안된·않은·제외·불가·not 등)이거나 바로 뒤에 중지·종료·해제 같은 멈춤 동사가 붙어 '그 상태가 아닌' 문서를 찾는 뜻입니다. 상태 필터는 '그 상태인' 문서를 거르는 조건이므로 그대로 확정하면 뜻이 뒤집힙니다. 이 단어로는 상태를 만들지 않고, 부정이 빠진 문장 조각으로 상태를 고를 수 있는 2차 Plinko 상태 후보와 상태 LLM 검증도 이 질의에서는 쓰지 않습니다. 부정되지 않은 다른 상태 어휘는 그대로 확인합니다. (단어는 FTS 검색어로 남습니다)",
+                        status_negated
+                    ));
+                }
+                let mut best_status_global = match status_exact_global.as_ref() {
+                    Some((k, w, route, curated)) => {
+                        crate::utils::score_dynamics::record_baseline("search.status_route_exact", 1.0);
+                        emit_term(&format!(
+                            "    🌉 [STATUS ROUTE / CLOSED VOCAB] '{}' → '{}' | {} | 목록 어휘={} | 상태 필터로 라우팅된 단어(붙어 있는 앞뒤 어절과 합친 형태 포함) 가운데 닫힌 상태 어휘로 확인된 것만 상태 축의 결정론 값이 됩니다. (Surprisal 1위 '{}')",
+                            w, k, route, curated, forced_status_key
+                        ));
+                        k.clone()
+                    }
+                    None => {
+                        let routed: Vec<String> = forced_filter_routes
+                            .iter()
+                            .filter(|(w, c, _, _)| {
+                                c == "status_filters" && !negated_words.contains(w.as_str()) && !status_negated.iter().any(|x| x == w)
+                            })
+                            .map(|(w, _, k, s)| format!("{}→{}({:+.3})", w, k, s))
+                            .collect();
+                        if !routed.is_empty() {
+                            crate::utils::score_dynamics::record_baseline("search.status_route_unanchored", routed.len() as f32);
+                            emit_term(&format!(
+                                "    ⚪ [STATUS ROUTE / UNANCHORED] 상태 필터로 라우팅된 {:?} 가 닫힌 상태 어휘(status_filters 의 영어 캐노니컬 구·exact_match, 문서 언어 ↔ en 상태 목록 대응)로 하나의 상태에 확인되지 않습니다. Surprisal 은 구 2~5개짜리 작은 상태 뱅크에서 기능어('발행된'·'연결된')도 쉽게 양수가 되므로, 이 라우팅은 상태 결정론 값과 LLM 힌트(Global Status Suggests)로 쓰지 않습니다. 다른 청크에서 나온 상태 후보는 기존 경로(2차 Plinko → LLM 검증)를 그대로 탑니다. (단어는 FTS 검색어로 남습니다)",
+                                routed
+                            ));
+                        }
+                        String::new()
+                    }
+                };
+                let mut best_sub_global    = pick_forced("substantial_filters");
+                let mut best_find_global   = pick_forced("find_filters");
+                let mut best_time_global   = pick_forced("time_filters");
+                let mut best_season_global = pick_forced("season_filters");
+                if !best_sub_global.is_empty() || !best_find_global.is_empty() {
+                    emit_term(&format!(
+                        "    🧲 [FORCED ROUTE SEED] substantial='{}' | find='{}' (추상 수식어 라우팅 결과 확정)",
+                        best_sub_global, best_find_global
+                    ));
+                }
+                let mut filter_candidates: std::collections::HashMap<String, Vec<(String, f32)>> = std::collections::HashMap::new();
+                // 🌟 [NUMERIC REROUTE PLAN] (원래속성, 대상Numeric속성, 연산자, 숫자값)
+                //    문자열로 잘못 굳은 수치 조건을 최종 조립 직전에 교체합니다.
+                let mut numeric_reroutes: Vec<(String, String, String, String)> = Vec::new();
+
+                emit_term("\n  🎯 [DOUBLE PLINKO (2nd)] Matching attributes and operators...");
+
+                for (k, v) in &plinko_map {
+                    let combined_chunk = v.join(" | ");
+                    
+                    let chunk_emb = self.get_embedding(combined_chunk.clone()).await.unwrap_or(vec![0.0; 384]);
+                    let cw_count = v.len();
+                    let v_sim_local = cosine_similarity(&chunk_emb, &verb_emb);
+                    let local_beta = if cw_count <= 2 { 0.05 } else { 0.10 };
+                    let local_vp = v_sim_local * local_beta;
+                    let local_pw = if cw_count <= 2 { 0.3 } else { 0.7 };
+
+                    // 🌟 [EXCLUSIVE CLAIM SCORE] 이 청크를 이미 선점한 '스키마 속성'의 코사인 점수입니다.
+                    //    status / substantial / find / time / season 은 청크 '자체'를 자기 값으로 가져가는
+                    //    경쟁 해석이므로, 속성 선점 점수를 넘지 못하면 후보 자격이 없습니다.
+                    //    (로그: '베이지' 는 color 0.8332 로 확정되었는데도 status_filters 가 'remove' 를 들고 올라와
+                    //     최종 SQL 에 status = 11 이 박히면서 검색 리콜이 통째로 무너졌습니다)
+                    //    이 비교가 절대 임계치 0.15 를 대체하므로 매직 상수를 제거합니다.
+                    let prop_claim_score = match prop_keys.iter().position(|p| p == k) {
+                        Some(pi) => {
+                            let own = crate::utils::ai_utils::weighted_max_pool_sim(&chunk_emb, &prop_phrase_embs[pi], &prop_phrase_weights[pi]);
+                            let pj = cosine_similarity(&chunk_emb, &prej_embs[pi]);
+                            own - (pj * local_pw) - local_vp
+                        },
+                        None => f32::MIN,
+                    };
+
+                    let mut local_filter_candidates: std::collections::HashMap<String, Vec<(String, f32)>> = std::collections::HashMap::new();
+
+                    // 🌟 Part 1에서 준비된 통합 벡터(dynamic_filter_defs) 순회
+                    for i in 0..dynamic_filter_defs.len() {
+                        let def = &dynamic_filter_defs[i];
+                        let b_score = cosine_similarity(&chunk_emb, &dynamic_bias_embs[i]);
+                        let p_score = cosine_similarity(&chunk_emb, &dynamic_prej_embs[i]);
+                        let score = b_score - (p_score * local_pw) - local_vp;
+
+                        // 🌟 [CLAIM CATEGORY] 청크 자체를 값으로 가져가는 카테고리는 속성과 배타 경쟁합니다.
+                        //    operators / metrics / option_filters 는 '이미 확정된 속성을 어떻게 비교할지'를
+                        //    서술하는 수식어이므로 경쟁 대상이 아니며 게이트를 적용하지 않습니다.
+                        let is_claim_category = matches!(
+                            def.category.as_str(),
+                            "status_filters" | "substantial_filters" | "find_filters" | "time_filters" | "season_filters"
+                        );
+
+                        if is_claim_category && score <= prop_claim_score {
+                            continue;
+                        }
+
+                        local_filter_candidates.entry(def.category.clone()).or_insert_with(Vec::new).push((def.key.clone(), score));
+                    }
+
+                    for (_, cands) in local_filter_candidates.iter_mut() {
+                        cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    }
+
+                    let cos_op = local_filter_candidates.get("operators").and_then(|c| c.first()).map(|c| c.0.clone()).unwrap_or_else(|| "eq".to_string());
+                    let exact_cmp = crate::utils::ai_utils::numeric_comparator_exact(&combined_chunk);
+                    let best_op = match exact_cmp {
+                        Some(key) => {
+                            emit_term(&format!(
+                                "    ⚖️ [OPERATOR / EXACT] \"{}\" → [{}] 닫힌 비교 어휘 완전일치 (코사인 1위 [{}])",
+                                combined_chunk, key, cos_op
+                            ));
+                            key.to_string()
+                        },
+                        None => cos_op,
+                    };
+                    let best_metric = local_filter_candidates.get("metrics").and_then(|c| c.first()).map(|c| c.0.clone()).unwrap_or_else(|| "string".to_string());
+                    
+                    if let Some(cands) = local_filter_candidates.get("status_filters").filter(|_| !status_suppressed) {
+                        if let Some(c) = cands.first() { if best_status_global.is_empty() { best_status_global = c.0.clone(); } }
+                        filter_candidates.insert("status_filters".to_string(), cands.clone());
+                    }
+                    if let Some(cands) = local_filter_candidates.get("substantial_filters") {
+                        if let Some(c) = cands.first() {
+                            if best_sub_global.is_empty() {
+                                best_sub_global = c.0.clone();
+                                emit_term(&format!("    📏 [SUBSTANTIAL MATCH] '{}' → substantial_filters.{} (Score: {:+.4})", combined_chunk, c.0, c.1));
+                            }
+                        }
+                        filter_candidates.insert("substantial_filters".to_string(), cands.clone());
+                    }
+                    if let Some(cands) = local_filter_candidates.get("find_filters") {
+                        if let Some(c) = cands.first() {
+                            if best_find_global.is_empty() {
+                                best_find_global = c.0.clone();
+                                emit_term(&format!("    🔍 [FIND MATCH] '{}' → find_filters.{} (Score: {:+.4})", combined_chunk, c.0, c.1));
+                            }
+                        }
+                        filter_candidates.insert("find_filters".to_string(), cands.clone());
+                    }
+                    if let Some(cands) = local_filter_candidates.get("time_filters") {
+                        if let Some(c) = cands.first() { if best_time_global.is_empty() { best_time_global = c.0.clone(); } }
+                        filter_candidates.insert("time_filters".to_string(), cands.clone());
+                    }
+                    if let Some(cands) = local_filter_candidates.get("season_filters") {
+                        if let Some(c) = cands.first() { if best_season_global.is_empty() { best_season_global = c.0.clone(); } }
+                        filter_candidates.insert("season_filters".to_string(), cands.clone());
+                    }
+
+                    // 🌟 [SCHEMA OVERRIDE] Vector 모델의 예측을 실제 DB 스키마 검증으로 덮어씁니다.
+                    let actual_db_type = prop_types.get(k).copied().unwrap_or("String");
+                    
+                    let mut final_op = best_op.clone();
+                    let mut final_metric = best_metric.clone();
+
+                    // DB 스키마가 숫자나 날짜가 아닌 일반 문자열(String)인 경우
+                    // 아예 통째로 스킵(continue)하지 않고, 연산자를 'contains'(부분 일치/FTS) 및 'string'으로 강제 고정하여 문맥에 포함시킵니다.
+                    if actual_db_type != "Number" {
+                        let is_date_field = k.contains("date") || k.contains("time") || k.ends_with("_at");
+                        if !is_date_field {
+                            // 🌟 [FTS FIX] 상품명, 카테고리 등 텍스트 검색은 'eq'가 아닌 'contains'로 처리해야 정상적인 Full Text Search 결과가 나옵니다.
+                            emit_term(&format!("    ⏭️ [SCHEMA ADJUST] Property [{}] is strictly defined as '{}'. Adjusting operator to 'contains' (FTS).", k, actual_db_type));
+                            final_op = "contains".to_string();
+                            final_metric = "string".to_string();
+                        }
+                        // 🌟 [DETERMINISTIC VALUE BIND] 문자열/날짜 계열도 값은 '벡터가 짚어준 원문 청크' 그 자체입니다.
+                        //    기존 코드는 Number 일 때만 prop_to_exact_val 에 등록했기 때문에
+                        //    문자열 속성은 복구 경로가 통째로 죽어 있었습니다.
+                        //    (로그: color 조건에 value 키가 없고, brand_name 조건은 아예 소멸)
+                        let literal_val = crate::utils::ai_utils::deterministic_condition_value(v, false);
+                        if !literal_val.is_empty() {
+                            prop_to_exact_val.insert(k.clone(), literal_val);
+                        }
+                    } else {
+                        // 🌟 [CRITICAL FIX] 숫자인 경우, 텍스트에서 실제 숫자를 미리 추출하여 LLM 환각을 방지합니다.
+                        // 연산자(Operator)는 하드코딩 문자열 매칭 대신, 위에서 Double Plinko 연산을 통해 도출된 best_op 벡터 결과를 순수하게 신뢰합니다.
+                        final_op = best_op.clone();
+                        if let Some(key) = exact_cmp {
+                            exact_op_lock.insert(k.clone(), key.to_string());
+                        }
+
+                        // 숫자 값 100% 원본 추출 (소수점 포함)
+                        let final_numeric = crate::utils::ai_utils::deterministic_condition_value(v, true);
+
+                        if !final_numeric.is_empty() {
+                            prop_to_exact_val.insert(k.clone(), final_numeric);
+                        }
+                    }
+
+                    // 🌟 [NUMERIC COMPARISON REROUTE — 최후 안전망]
+                    //    수치 비교 구조는 이제 배정 '전' 의 NUMERIC PRE-GATE 에서
+                    //    문자열/열거형 필드의 후보 자격 자체를 박탈하므로 정상 경로에서는 여기까지 오지 않습니다.
+                    //    다만 PRE-GATE 를 통과한 Numeric 필드가 전부 다른 청크에 선점되어
+                    //    그리디 배정이 이 청크를 문자열 필드로 흘려보내는 경우가 남습니다.
+                    //
+                    //    🌟 [FIX] 기존 항등식 오타 `best_num_score > best_cmp_score - best_cmp_score` (≡ > 0.0) 를
+                    //    '현재 확정된 문자열 속성 [k] 의 동일 기준 코사인 점수' 와의 비교로 교정합니다.
+                    //    추가로, 비교 연산자 확정도 구 단위 Max-Pool(op_phrase_embs)을 우선 사용합니다.
+                    //
+                    //    🌟 [NUMBER→NUMBER 허용] 기존 `actual_db_type != "Number"` 가드는
+                    //    '5000원 이하로' 가 quantity(Number)로 굳었을 때 METRICS FAMILY GATE 를
+                    //    아예 실행하지 않았습니다. quantity 는 convert_conditions_to_sql 의
+                    //    valid_cols 에 없어 SQL 에서 통째로 폐기되므로 가격 조건이 소멸합니다.
+                    //    (log1.txt: '5000원' → quantity(0.5464) → Qwen3 교정 열화 → UNASSIGN)
+                    //    metrics.price.bias 에 "won" 이 있어 '원' ↔ 'won' 다국어 공명이 성립하므로,
+                    //    Numeric 필드끼리도 계열 판정으로 재라우팅합니다.
+                    //    자기 자신으로의 재라우팅은 best_num_score == cur_prop_score 가 되어 자연 차단됩니다.
+                    {
+                        if let Some((num_part, cmp_part)) = crate::utils::ai_utils::split_numeric_and_comparator(&combined_chunk) {
+                            if !cmp_part.is_empty() {
+                                // ① 비교 표현이 어떤 연산자인지 확정합니다.
+                                //    구 단위 Max-Pool 이 있으면 그것을, 없으면 센트로이드를 사용합니다.
+                                let cmp_emb = self.get_embedding(cmp_part.clone()).await.unwrap_or(vec![0.0; 384]);
+                                let mut best_cmp_op = String::new();
+                                let mut best_cmp_score = f32::MIN;
+                                // 구 단위 Max-Pool 경로
+                                let mut cmp_pool_score = 0.0f32;
+                                let cmp_pool_key = String::new();
+                                if !op_phrase_embs.is_empty() {
+                                    let mut rank_pool = 0.0f32;
+                                    for (oi, oe) in op_phrase_embs.iter().enumerate() {
+                                        if oe.iter().all(|&v| v == 0.0) { continue; }
+                                        let s = cosine_similarity(&cmp_emb, oe);
+                                        if op_phrase_is_rank[oi] {
+                                            if s > rank_pool { rank_pool = s; }
+                                        } else {
+                                            if s > cmp_pool_score {
+                                                cmp_pool_score = s;
+                                                // 이 구가 속한 연산자 키를 역추적
+                                                // op_phrase_texts[oi]가 속한 키를 찾기 위해 bias.json 재탐색
+                                                // 단순화: 가장 높은 비교 연산자 구의 인덱스로 키 확정
+                                            }
+                                        }
+                                    }
+                                    if cmp_pool_score > rank_pool && cmp_pool_score > 0.0 {
+                                        // 구 뱅크에서 best 비교 연산자 확정
+                                        for i in 0..dynamic_filter_defs.len() {
+                                            if dynamic_filter_defs[i].category != "operators" { continue; }
+                                            if dynamic_filter_defs[i].key == "top" || dynamic_filter_defs[i].key == "bottom" { continue; }
+                                            let b = cosine_similarity(&cmp_emb, &dynamic_bias_embs[i]);
+                                            let p = cosine_similarity(&cmp_emb, &dynamic_prej_embs[i]);
+                                            let s = b - p;
+                                            if s > best_cmp_score { best_cmp_score = s; best_cmp_op = dynamic_filter_defs[i].key.clone(); }
+                                        }
+                                    }
+                                } else {
+                                    // 센트로이드 폴백
+                                    for i in 0..dynamic_filter_defs.len() {
+                                        if dynamic_filter_defs[i].category != "operators" { continue; }
+                                        let b = cosine_similarity(&cmp_emb, &dynamic_bias_embs[i]);
+                                        let p = cosine_similarity(&cmp_emb, &dynamic_prej_embs[i]);
+                                        let s = b - p;
+                                        if s > best_cmp_score { best_cmp_score = s; best_cmp_op = dynamic_filter_defs[i].key.clone(); }
+                                    }
+                                }
+                                // ② 이 청크가 어떤 Numeric 스키마 필드의 값인지 확정합니다.
+                                if let Some(key) = exact_cmp {
+                                    best_cmp_op = key.to_string();
+                                    best_cmp_score = 1.0;
+                                }
+                                let chunk_emb_local = self.get_embedding(combined_chunk.clone()).await.unwrap_or(vec![0.0; 384]);
+
+                                // 🌟 [METRICS FAMILY GATE] 먼저 "이 청크가 어떤 계량 계열인가" 를 판정합니다.
+                                //    "5000원 이하로" → metrics.price ("won" 구와 공명)
+                                //    그런 다음 후보 Numeric 필드도 자기 구 뱅크로 계열을 판정하여
+                                //    계열이 일치하는 필드만 경쟁시킵니다.
+                                //    이 게이트가 없으면 quantity 가 미세한 점수 차로 sale_price 를 이깁니다.
+                                let (chunk_metric_family, chunk_metric_score) = if metric_family_bank.is_empty() {
+                                    (String::new(), 0.0f32)
+                                } else {
+                                    crate::utils::ai_utils::metrics_family_argmax(&chunk_emb_local, &metric_family_bank)
+                                };
+                                if !chunk_metric_family.is_empty() {
+                                    emit_term(&format!("      📐 [METRICS FAMILY] \"{}\" → metrics.{} (MaxPool {:.4})", combined_chunk, chunk_metric_family, chunk_metric_score));
+                                }
+
+                                let mut best_num_prop = String::new();
+                                let mut best_num_score = f32::MIN;
+                                let mut family_filtered = 0usize;
+                                for (pi, pname) in prop_keys.iter().enumerate() {
+                                    if prop_types.get(pname).copied().unwrap_or("String") != "Number" { continue; }
+                                    if is_filter_owned(pname) { continue; }
+
+                                    if !chunk_metric_family.is_empty() && !metric_family_bank.is_empty() {
+                                        let field_family = crate::utils::ai_utils::metrics_family_of_bank(
+                                            &prop_phrase_embs[pi], &metric_family_bank,
+                                        );
+                                        if !field_family.is_empty() && field_family != chunk_metric_family {
+                                            family_filtered += 1;
+                                            continue;
+                                        }
+                                    }
+
+                                    let own = crate::utils::ai_utils::weighted_max_pool_sim(&chunk_emb_local, &prop_phrase_embs[pi], &prop_phrase_weights[pi]);
+                                    let pj = cosine_similarity(&chunk_emb_local, &prej_embs[pi]);
+                                    let s = own - pj;
+                                    if s > best_num_score { best_num_score = s; best_num_prop = pname.clone(); }
+                                }
+                                if family_filtered > 0 {
+                                    emit_term(&format!("      🚧 [METRICS FAMILY GATE] 계열 불일치 Numeric 필드 {}개를 재라우팅 후보에서 제외했습니다.", family_filtered));
+                                }
+                                // ③ 현재 확정된 문자열 속성 [k] 의 점수를 '같은 기준' 으로 산출해 비교합니다.
+                                let mut cur_prop_score = f32::MIN;
+                                if let Some(pi) = prop_keys.iter().position(|p| p == k) {
+                                    let own = crate::utils::ai_utils::weighted_max_pool_sim(&chunk_emb_local, &prop_phrase_embs[pi], &prop_phrase_weights[pi]);
+                                    let pj = cosine_similarity(&chunk_emb_local, &prej_embs[pi]);
+                                    cur_prop_score = own - pj;
+                                }
+                                // ④ 두 축이 모두 확정되고, 그 연산자가 실제 비교 연산자일 때만 재라우팅합니다.
+                                //    🌟 [FIX] 기존 `best_num_score > best_cmp_score - best_cmp_score` (항상 > 0.0) 을
+                                //    `best_num_score > cur_prop_score` 로 교정.
+                                //    Numeric 필드의 own-prej 가 현재 문자열 필드의 own-prej 보다 높아야 교체합니다.
+                                let is_comparison = matches!(best_cmp_op.as_str(), "lte" | "lt" | "gte" | "gt" | "eq");
+                                if is_comparison && !best_num_prop.is_empty() && best_num_score > cur_prop_score {
+                                    emit_term(&format!("    🔁 [NUMERIC REROUTE] \"{}\" → Property [{}] Operator [{}] Value [{}] | 문자열 속성 [{}] 대신 수치 비교로 재라우팅합니다. (CmpOp {:+.4} | NumProp {:+.4} > CurProp {:+.4})",
+                                        combined_chunk, best_num_prop, best_cmp_op, num_part, k, best_cmp_score, best_num_score, cur_prop_score));
+                                    numeric_reroutes.push((k.clone(), best_num_prop.clone(), best_cmp_op.clone(), num_part.clone()));
+                                }
+                            }
+                        }
+                    }
+
+                    prop_to_op.insert(k.clone(), final_op.clone());
+
+                    let mut op_alts = String::new();
+                    if final_op != "contains" && !exact_op_lock.contains_key(k) { 
+                        if let Some(cands) = local_filter_candidates.get("operators") {
+                            let alts: Vec<String> = cands.iter().skip(1).take(2).map(|c| format!("{} ({:.2})", c.0, c.1)).collect();
+                            // 🌟 [CRITICAL FIX] LLM 프롬프트 가이드 문자열에서 Operator 대괄호([]) 안에 불필요한 Alts 정보가 중첩되어 들어가면 LLM이 5000을 500으로 헷갈리는 환각 증세가 발생합니다. 대괄호 밖으로 완전히 분리합니다.
+                            if !alts.is_empty() { op_alts = format!(" (Alts: {})", alts.join(", ")); }
+                        }
+                    }
+
+                    // 🌟 [CRITICAL FIX] 숫자가 포함된 청크("5000원")를 LLM이 "500"으로 환각 파싱하는 것을 방지하기 위해, Rust에서 원본 숫자를 추출하여 명시적으로 가이드에 꽂아 넣습니다.
+                    //    문자열 속성도 동일하게 확정 값을 명시합니다. 0.6B 모델이 value 키를 통째로 빠뜨리는 것을
+                    //    막고, 어차피 뒤에서 Rust 가 결정론적으로 덮어쓰므로 프롬프트와 최종 값이 100% 일치합니다.
+                    let exact_value_guide = match prop_to_exact_val.get(k) {
+                        Some(exact) if !exact.is_empty() => format!(", Exact Value [{}]", exact),
+                        _ => String::new(),
+                    };
+
+                    let guide_log = format!("Target Text: \"{}\" -> Vector Suggests: Property [{}], Operator [{}]{}, Metric Type [{}]{}", combined_chunk, k, final_op, op_alts, final_metric, exact_value_guide);
+                    emit_term(&format!("    🧲 {}", guide_log));
+                    fragments_text.push_str(&format!("{}\n", guide_log));
+                }
+
+                // Qwen3로 2차 매핑 검증
+                if !prop_to_op.is_empty() {
+                     emit_term("    🧠 [QWEN3 VERIFICATION (2nd)] Verifying operators...");
+                     self.ensure_query_engine().await?;
+                    
+                     // 속성별 operator 검증
+                     let mut validated_prop_to_op = prop_to_op.clone();
+                     for (prop, op) in &prop_to_op {
+                         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
+                             return Ok(json!({ "context": [], "cancelled": true }));
+                         }
+
+                         // 🌟 [CRITICAL FIX] 문자열 검색(FTS)용 연산자인 'contains'는 LLM이 문맥을 오해하여 'eq'로 바꾸지 못하도록 검증을 우회합니다.
+                         if op == "contains" {
+                             emit_term(&format!("      ⚡ [BYPASS] Operator [{}] is FTS. Bypassing verification for [{}]", op, prop));
+                             continue;
+                         }
+                         if exact_op_lock.get(prop).map_or(false, |l| l == op) {
+                             emit_term(&format!("      ⚡ [BYPASS] Operator [{}] for [{}] is an exact comparator match. Bypassing verification.", op, prop));
+                             continue;
+                         }
+                        
+                         let prompt = crate::prompts::verify_operator_mapping_prompt(&current_text, prop, op);
+                        
+                         if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
+                             if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                                 if let Some(suggested) = result.get("suggested_operator").and_then(|v| v.as_str()) {
+                                     if suggested != op {
+                                         emit_term(&format!("      🔄 Operator for [{}] corrected from [{}] to [{}]", prop, op, suggested));
+                                         validated_prop_to_op.insert(prop.clone(), suggested.to_string());
+                                     } else {
+                                         emit_term(&format!("      ✅ Operator [{}] confirmed for [{}]", op, prop));
+                                     }
+                                 } else {
+                                     emit_term(&format!("      ✅ Operator [{}] confirmed for [{}]", op, prop));
+                                 }
+                             }
+                         }
+                     }
+                    
+                     prop_to_op = validated_prop_to_op;
+                }
+                
+                // 🌟 [DEDUP] 동일한 Global Suggests 3줄이 두 번 append 되고 [FINAL VECTOR GUIDE] 가 두 번 출력되던
+                //    죽은 중복 블록을 통째로 제거합니다.
+                //    같은 힌트를 두 번 주입하면 0.6B 모델이 '반드시 채워야 하는 값' 으로 오인해
+                //    근거 없는 status / find 를 창작합니다. (로그: status "show", find "many")
+                //    또한 여기서 계산되던 get_deterministic_time_guide 결과는 바로 아래에서 재선언(shadow)되어
+                //    한 번도 사용되지 않는 죽은 호출이었습니다.
+                if !best_status_global.is_empty() { fragments_text.push_str(&format!("Global Status Suggests [{}]\n", best_status_global)); }
+                if !best_sub_global.is_empty() { fragments_text.push_str(&format!("Global Substantial Suggests [{}]\n", best_sub_global)); }
+                if !best_find_global.is_empty() { fragments_text.push_str(&format!("Global Find Suggests [{}]\n", best_find_global)); }
+
+                emit_term(&format!("\n  🎯 [FINAL VECTOR GUIDE FOR LLM] \n{}", fragments_text.trim()));
+
+                // 🌟 [VRAM 최적화 수정] 루프 안에서 임베딩 모델을 언로드하면 다음 세그먼트에서 다시 로드하는 Ping-Pong이 발생하므로 삭제합니다.
+                // 파이프라인이 모두 종료된 후 마지막에 일괄적으로 deep_purge_resources를 통해 해제합니다.
+
+                let mut llm_temporal_guide = String::new();
+                let now = crate::utils::time_guide::now_local();
+                let time_context = format!("Current Time: {}\nTimezone: {}\nLanguage: {}", now.format("%Y-%m-%dT%H:%M:%S"), now.format("%z"), language);
+                let temporal_cands = |cat: &str| -> Vec<(String, f32)> {
+                    let mut out: Vec<(String, f32)> = filter_candidates.get(cat).cloned().unwrap_or_default();
+                    if out.is_empty() {
+                        for (_, c, k, s) in forced_filter_routes.iter() {
+                            if c != cat { continue; }
+                            if let Some(pos) = out.iter().position(|(ok, _)| ok == k) {
+                                if *s > out[pos].1 { out[pos].1 = *s; }
+                            } else {
+                                out.push((k.clone(), *s));
+                            }
+                        }
+                        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    }
+                    out
+                };
+                let verified_time: String = {
+
+                    // 이미 최초에 Qwen3를 로드했으므로 ensure_qwen3() 호출 생략
+
+                    // 🌟 [QWEN3 VERIFICATION: TIME & SEASON] Plinko에서 대충 잡힌 시간/시즌을 LLM으로 2차 검증하여 환각을 원천 차단합니다.
+                    let mut verified_time = String::new();
+                    if exact_period.is_some() {
+                        emit_term("  🕒 [TIME / EXACT PERIOD] 절대 기간이 확정되어 상대 시간 의도는 LLM 에게 묻지 않습니다.");
+                    } else if !exact_time_key.is_empty() {
+                        verified_time = exact_time_key.clone();
+                        emit_term(&format!("  🕒 [TIME EXACT MATCH] Time Intent 를 bias.json exact_match 로 '{}' 확정합니다 (LLM 에게 되묻지 않습니다). 계절과 같은 규칙입니다. 지금까지는 이 확정이 결정론 시간 가이드에 전달되지 않아 '오늘'·'지난달' 이 속성 배정에서만 빠지고 기간 조건은 만들어지지 않았습니다.", verified_time));
+                    } else {
+                        let (time_cands, unsupported): (Vec<(String, f32)>, Vec<(String, f32)>) =
+                            temporal_cands("time_filters").into_iter().partition(|(k, _)| period_supported("time_filters", k));
+                        if !unsupported.is_empty() {
+                            emit_term(&format!("  🧷 [PERIOD LEXICAL GATE] 따옴표 밖 질의에 시간 구 낱말이 없어 묻지 않는 후보: {:?}", unsupported.iter().map(|(k, _)| k).collect::<Vec<_>>()));
+                        }
+                        if !time_cands.is_empty() {
+                            let first_choice = &time_cands[0].0;
+                            let first_score = time_cands[0].1;
+                            let alternatives: Vec<(String, f32)> = time_cands.iter().skip(1).take(3).cloned().collect();
+                            let prompt_time = crate::parsing::extract_time_intent_prompt(&current_text, &time_context, first_choice, first_score, &alternatives);
+                            if let Ok(res_time) = self.call_qwen3_verification_model(&prompt_time, Some(cancel_token.clone())).await {
+                                let final_time_json = crate::parsing::parse_json_from_llm(&res_time);
+                                if let Some(t) = final_time_json.get("time_intent").and_then(|v| v.as_str()) {
+                                    if !t.is_empty() {
+                                        verified_time = t.to_string();
+                                        emit_term(&format!("  🕒 [LLM-VERIFIED TIME] Time Intent explicitly confirmed as: '{}'", verified_time));
+                                    } else {
+                                        emit_term("  🕒 [LLM-VERIFIED TIME] Time Intent rejected (Empty).");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    verified_time
+                };
+                let verified_season: String = {
+                    let mut verified_season = String::new();
+
+                    // 🌟 [SEASON EXACT MATCH PRIORITY] bias.json 의 exact_match 로 이미 확정된 계절은
+                    //    LLM 에게 되묻지 않습니다. 되물으면 로그처럼 '여름' → 'autumn' 환각이 발생하고
+                    //    started_at/expired_at 에 엉뚱한 범위가 주입되어 검색이 통째로 0건이 됩니다.
+                    //    LLM 호출도 1회 줄어듭니다.
+                    if !exact_season_key.is_empty() {
+                        verified_season = exact_season_key.clone();
+                        emit_term(&format!("  🌤️ [SEASON EXACT MATCH] Season Intent 를 bias.json exact_match 로 '{}' 확정 (LLM 호출 생략).", verified_season));
+                    } else {
+                        let (season_cands, unsupported): (Vec<(String, f32)>, Vec<(String, f32)>) =
+                            temporal_cands("season_filters").into_iter().partition(|(k, _)| period_supported("season_filters", k));
+                        if !unsupported.is_empty() {
+                            emit_term(&format!("  🧷 [PERIOD LEXICAL GATE] 따옴표 밖 질의에 계절 구 낱말이 없어 묻지 않는 후보: {:?}", unsupported.iter().map(|(k, _)| k).collect::<Vec<_>>()));
+                        }
+                        if !season_cands.is_empty() {
+                            let first_choice = &season_cands[0].0;
+                            let first_score = season_cands[0].1;
+                            let alternatives: Vec<(String, f32)> = season_cands.iter().skip(1).take(3).cloned().collect();
+                            let prompt_season = crate::parsing::extract_season_intent_prompt(&current_text, first_choice, first_score, &alternatives);
+                            if let Ok(res_season) = self.call_qwen3_verification_model(&prompt_season, Some(cancel_token.clone())).await {
+                                let final_season_json = crate::parsing::parse_json_from_llm(&res_season);
+                                if let Some(s) = final_season_json.get("season_intent").and_then(|v| v.as_str()) {
+                                    if !s.is_empty() {
+                                        verified_season = s.to_string();
+                                        emit_term(&format!("  🌤️ [LLM-VERIFIED SEASON] Season Intent explicitly confirmed as: '{}'", verified_season));
+                                    } else {
+                                        emit_term("  🌤️ [LLM-VERIFIED SEASON] Season Intent rejected (Empty).");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    verified_season
+                };
+
+                if !verified_time.is_empty() { llm_temporal_guide.push_str(&format!("Time Intent [{}] ", verified_time)); }
+                if !verified_season.is_empty() { llm_temporal_guide.push_str(&format!("Season Intent [{}]", verified_season)); }
+
+                let resolved: Option<(chrono::NaiveDate, chrono::NaiveDate, &'static str, String)> = match exact_period.as_ref() {
+                    Some(p) => {
+                        let (start, end) = crate::utils::time_guide::anchor_exact_period(p.start, p.end, p.year_explicit, &exact_time_key, period_today, false);
+                        let (cond_start, cond_end, _) = crate::utils::time_guide::exact_with_season(start, end, p.granularity, &verified_season, period_southern);
+                        llm_temporal_guide = if validity_axes {
+                            format!(
+                                "- [DETERMINISTIC OVERRIDE] Exact period {} ~ {} detected. DO NOT extract date properties (like started_at, expired_at, date). The system will auto-inject them.",
+                                cond_start, cond_end
+                            )
+                        } else {
+                            format!(
+                                "- [DETERMINISTIC OVERRIDE] Exact period {} ~ {} detected. DO NOT extract date properties (like started_at, expired_at, date). This domain has no validity period axis, so the period stays a search keyword and no date condition is added.",
+                                cond_start, cond_end
+                            )
+                        };
+                        Some((
+                            cond_start,
+                            cond_end,
+                            p.operator,
+                            if cond_start == start && cond_end == end {
+                                format!("Exact period {} ~ {} (op={}, 연도명시={})", start, end, p.operator, p.year_explicit)
+                            } else {
+                                format!(
+                                    "Exact period {} ~ {} (op={}, 연도명시={}, 계절 '{}' 적용 · 원래 {} ~ {})",
+                                    cond_start, cond_end, p.operator, p.year_explicit, verified_season, start, end
+                                )
+                            },
+                        ))
+                    }
+                    None => crate::utils::time_guide::resolve_intent(
+                        &verified_time,
+                        &verified_season,
+                        language,
+                        crate::utils::time_guide::SeasonAnchor::Current,
+                    )
+                    .map(|ip| (ip.start, ip.end, "between", ip.label)),
+                };
+                let relay_period: Option<Value> = match resolved.as_ref() {
+                    Some((start, end, op, label)) if !validity_axes => {
+                        let target_domain = crate::parsing::BIAS_DICT
+                            .get("search_bridge")
+                            .and_then(|sb| sb.get("sales_to_order"))
+                            .and_then(|n| n.get("target_domain"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("order")
+                            .to_string();
+                        let via = match relay_intent.as_ref() {
+                            Some((_, b, p, pmax)) if b > p && *b >= *pmax => Some(target_domain.clone()),
+                            _ => None,
+                        };
+                        let (iw, ib, ip, ipmax) = relay_intent
+                            .clone()
+                            .unwrap_or_else(|| (String::new(), 0.0, 0.0, 0.0));
+                        let start_v = if *op == "lte" { Value::Null } else { json!(format!("{}T00:00:00", start)) };
+                        let end_v = if *op == "gte" { Value::Null } else { json!(format!("{}T23:59:59", end)) };
+                        crate::utils::score_dynamics::record_baseline("search.time.relay_carry", 1.0);
+                        crate::utils::score_dynamics::record_baseline("search.relay_intent_margin", ib - ip);
+                        emit_term(&format!(
+                            "  🔗 [RELAY PERIOD CARRY] {} ({} ~ {}) 는 '{}' 에 하드 조건으로 싣지 않지만 relay_period 로 운반합니다. 판매 관계 근거: '{}' 판매 브릿지 {:.4} · 등록/노출 편견 {:.4} (질의 안 편견 최고 {:.4}) → {}",
+                            label,
+                            start,
+                            end,
+                            seg_type,
+                            iw,
+                            ib,
+                            ip,
+                            ipmax,
+                            match via.as_ref() {
+                                Some(v) => format!("판매·거래 관계로 확정했습니다. 검색 단계가 기간을 '{}' 의 날짜 축으로 옮깁니다.", v),
+                                None => "관계 근거가 약해 검색 단계는 기간을 옮기지 않고 표시만 합니다.".to_string(),
+                            }
+                        ));
+                        Some(json!({
+                            "start": start_v,
+                            "end": end_v,
+                            "op": op,
+                            "label": label,
+                            "via": via,
+                            "intent_word": iw,
+                            "intent_bias": ib,
+                            "intent_prejudice": ip
+                        }))
+                    }
+                    _ => None,
+                };
+                let deterministic_json: Option<Value> = match resolved {
+                    None => None,
+                    Some((start, end, op, label)) => {
+                        crate::utils::score_dynamics::record_baseline(
+                            "search.time.axis_drop",
+                            if validity_axes { 0.0 } else { 1.0 },
+                        );
+                        if validity_axes {
+                            let cond = crate::utils::time_guide::validity_condition(start, end, op);
+                            let shape = match op {
+                                "gte" => "시작 이후에 걸친 유효 기간 (expired_at ≥ 시작)",
+                                "lte" => "끝 이전에 걸친 유효 기간 (started_at ≤ 끝)",
+                                _ => "기간과 겹치는 유효 기간 (started_at ≤ 끝 · expired_at ≥ 시작)",
+                            };
+                            emit_term(&format!(
+                                "  ⏳ [DETERMINISTIC TIME GUIDE] {} → {} ~ {} (오늘 {}, 언어 달력) | {} | 조건 {} — epoch 는 저장 규약 canonical::iso_to_epoch_ms 와 같은 UTC 벽시계로 만듭니다. 저장된 날짜 문자열이 그 규칙으로 epoch 가 되었으므로, 언어 오프셋으로 만들면 기간 경계 앞뒤 오프셋 시간만큼의 이벤트가 반대편으로 넘어갑니다.",
+                                label,
+                                start,
+                                end,
+                                period_today,
+                                shape,
+                                serde_json::to_string(&cond).unwrap_or_default()
+                            ));
+                            Some(Value::Object(cond))
+                        } else {
+                            emit_term(&format!(
+                                "  🎯 [DATE FIELD SCOPE] {} ({} ~ {}) 를 '{}' 도메인에 하드 조건으로 싣지 않습니다. 이 도메인 스키마에는 유효 기간 축(started_at·expired_at)이 없습니다. shipping 의 DATE FIELD SCOPE·D2 FIELD SCOPE 와 같은 규칙입니다. 기간 단어는 FTS 검색어로 남고, LLM 이 계산한 날짜 조건도 싣지 않습니다.",
+                                label,
+                                start,
+                                end,
+                                seg_type
+                            ));
+                            Some(Value::Object(serde_json::Map::new()))
+                        }
+                    }
+                };
+
+                if !fragments_text.is_empty() {
+
+                    // 🌟 [명시적 타입 선언] 추출될 속성(Property)의 스키마 타입에 따라 Number 인지 String 인지 정확하게 결정합니다.
+                    let mut matched_types = Vec::new();
+                    for k in prop_to_op.keys() {
+                        let t = prop_types.get(k).copied().unwrap_or("String");
+                        matched_types.push(t);
+                    }
+                    matched_types.sort();
+                    matched_types.dedup();
+                    
+                    // 🌟 [CRITICAL FIX] String 타입일 경우 JSON 값이 큰따옴표에 제대로 감싸지도록 프롬프트 가이드를 "\"String\"" 형태로 교정합니다.
+                    let value_type_str = if matched_types.is_empty() {
+                        "\"String\"".to_string()
+                    } else if matched_types.len() == 1 {
+                        if matched_types[0] == "String" { "\"String\"".to_string() } else { "Number".to_string() }
+                    } else {
+                        let mut type_conditions = Vec::new();
+                        for k in prop_to_op.keys() {
+                            let t = prop_types.get(k).copied().unwrap_or("String");
+                            let t_quoted = if t == "String" { "\"String\"" } else { "Number" };
+                            type_conditions.push(format!("{} (if property is '{}')", t_quoted, k));
+                        }
+                        type_conditions.join(", ")
+                    };
+
+                    // 🌟 [CRITICAL FIX] 벡터 매칭 가이드와 LLM 시간 가이드를 병합하여 최종 조건 추출 프롬프트 호출
+                    let combined_guide = format!("{}\n{}", fragments_text.trim(), llm_temporal_guide);
+                    
+                    let prompt_numeric = crate::parsing::extract_numeric_conditions(&current_text, &seg_type, metrics_json, &combined_guide, &time_context, language, &value_type_str);
+
+                    self.ensure_query_engine().await?;
+
+                    // call_qwen3_verification_model을 통해 순차적으로 LLM Normalization 수행
+                    let res_numeric = self.call_qwen3_verification_model(&prompt_numeric, Some(cancel_token.clone())).await?;
+
+                    // 🌟 [EVIDENCE GATE] 배타 게이트를 통과한 벡터 후보가 하나도 없다는 것은
+                    //    '질의에 그 의도의 근거가 존재하지 않는다' 는 결정론적 사실입니다.
+                    //    근거가 없는 상태에서 0.6B 에게 물으면 반드시 아무 값이나 채워 넣습니다.
+                    //    Qwen3 는 '근거가 있을 때 어떤 값인지 고르는' 판정에만 사용합니다.
+                    let res_status = if !best_status_global.is_empty()
+                        && (status_exact_global.as_ref().map_or(false, |x| x.3)
+                            || filter_candidates.get("status_filters").map_or(true, |c| c.is_empty()))
+                    {
+                        emit_term(&format!("  ⚡ [STATUS DETERMINISTIC] 라우팅으로 '{}' 확정. LLM 호출 생략.", best_status_global));
+                        format!("{{ \"status\": \"{}\" }}", best_status_global)
+                    } else {
+                        let mut cands: Vec<(String, f32)> = filter_candidates.get("status_filters").cloned().unwrap_or_default();
+                        if let Some((k, _, _, _)) = status_exact_global.as_ref() {
+                            let s = cands.first().map_or(0.0, |c| c.1);
+                            cands.retain(|(ck, _)| ck != k);
+                            cands.insert(0, (k.clone(), s));
+                        }
+                        if cands.is_empty() {
+                            emit_term("  ⛔ [STATUS EVIDENCE GATE] 후보 없음. LLM 호출 없이 빈 값 확정.");
+                            "{ \"status\": \"\" }".to_string()
+                        } else {
+                            let alternatives: Vec<(String, f32)> = cands.iter().skip(1).take(3).cloned().collect();
+                            let p = crate::parsing::extract_status_intent_prompt(&current_text, &seg_type, &cands[0].0, cands[0].1, &alternatives);
+                            self.call_qwen3_verification_model(&p, Some(cancel_token.clone())).await?
+                        }
+                    };
+
+                    let res_substantial = if !best_sub_global.is_empty() {
+                        emit_term(&format!("  ⚡ [SUBSTANTIAL DETERMINISTIC] 추상 수식어 라우팅으로 '{}' 확정. LLM 호출 생략.", best_sub_global));
+                        format!("{{ \"substantial\": \"{}\" }}", best_sub_global)
+                    } else {
+                        match filter_candidates.get("substantial_filters").filter(|c| !c.is_empty()) {
+                            Some(cands) => {
+                                let alternatives: Vec<(String, f32)> = cands.iter().skip(1).take(3).cloned().collect();
+                                let p = crate::parsing::extract_substantial_intent_prompt(&current_text, &cands[0].0, cands[0].1, &alternatives);
+                                self.call_qwen3_verification_model(&p, Some(cancel_token.clone())).await?
+                            },
+                            None => {
+                                emit_term("  ⛔ [SUBSTANTIAL EVIDENCE GATE] 후보 없음. LLM 호출 없이 빈 값 확정.");
+                                "{ \"substantial\": \"\" }".to_string()
+                            }
+                        }
+                    };
+
+                    let res_find = if !best_find_global.is_empty() {
+                        emit_term(&format!("  ⚡ [FIND DETERMINISTIC] 추상 수식어 라우팅으로 '{}' 확정. LLM 호출 생략.", best_find_global));
+                        format!("{{ \"find\": \"{}\" }}", best_find_global)
+                    } else {
+                        match filter_candidates.get("find_filters").filter(|c| !c.is_empty()) {
+                            Some(cands) => {
+                                let alternatives: Vec<(String, f32)> = cands.iter().skip(1).take(3).cloned().collect();
+                                let p = crate::parsing::extract_find_intent_prompt(&current_text, &cands[0].0, cands[0].1, &alternatives);
+                                self.call_qwen3_verification_model(&p, Some(cancel_token.clone())).await?
+                            },
+                            None => {
+                                emit_term("  ⛔ [FIND EVIDENCE GATE] 후보 없음. LLM 호출 없이 빈 값 확정.");
+                                "{ \"find\": \"\" }".to_string()
+                            }
+                        }
+                    };
+
+                    emit_term(&format!("  🤖 [LLM RAW RESPONSE - NUMERIC]\n{}", res_numeric.trim()));
+                    emit_term(&format!("  🤖 [LLM RAW RESPONSE - STATUS]\n{}", res_status.trim()));
+                    emit_term(&format!("  🤖 [LLM RAW RESPONSE - SUBSTANTIAL]\n{}", res_substantial.trim()));
+                    emit_term(&format!("  🤖 [LLM RAW RESPONSE - FIND]\n{}", res_find.trim()));
+                    
+                    let final_numeric_json = crate::parsing::parse_json_from_llm(&res_numeric);
+                    let final_status_json = crate::parsing::parse_json_from_llm(&res_status);
+                    let final_substantial_json = crate::parsing::parse_json_from_llm(&res_substantial);
+                    let final_find_json = crate::parsing::parse_json_from_llm(&res_find);
+                    
+                    emit_term(&format!("  ✅ [EXTRACTED DATA (NUMERIC RAW)]\n{}", serde_json::to_string_pretty(&final_numeric_json).unwrap_or_default()));
+                    
+                    if let Some(obj) = seg.as_object_mut() {
+                        if let Some(status_val) = final_status_json.get("status") {
+                            obj.insert("status".to_string(), status_val.clone());
+                        }
+                        if let Some(sub_val) = final_substantial_json.get("substantial") {
+                            obj.insert("substantial".to_string(), sub_val.clone());
+                        }
+                        if let Some(find_val) = final_find_json.get("find") {
+                            obj.insert("find".to_string(), find_val.clone());
+                        }
+                        
+                        // 🌟 LLM이 뽑아준 "값"과 Rust 메모리에 저장해둔 "연산자(operator)"를 여기서 최종 조립합니다.
+                        let mut structured_cond = serde_json::Map::new();
+                        
+                        // 🌟 [CRITICAL FIX] LLM이 배열이 아닌 단일 객체로 반환했을 때 필터가 망가지는 현상을 막기 위해 파싱을 배열 폼으로 통일합니다.
+                        let condition_json = final_numeric_json.get("condition");
+                        if condition_json.is_none() {
+                            let got_keys: Vec<String> = final_numeric_json
+                                .as_object()
+                                .map(|o| o.keys().cloned().collect())
+                                .unwrap_or_default();
+                            emit_term(&format!(
+                                "      🧾 [NUMERIC FORMAT MISS] {} 의 수치 조건 응답에 'condition' 키가 없습니다 (응답 키 {:?}). 형식을 지키지 못한 응답도 검증 실패로 세어야 엔진별 일관성 비교가 한쪽으로 기울지 않습니다.",
+                                crate::model::lang_llm::query_engine_label(),
+                                got_keys
+                            ));
+                            crate::model::lang_llm::record_query_value(false);
+                        }
+                        let mut cond_items = Vec::new();
+
+                        if let Some(arr) = condition_json.and_then(|v| v.as_array()) {
+                            cond_items = arr.clone();
+                        } else if let Some(obj) = condition_json.and_then(|v| v.as_object()) {
+                            // LLM이 { "property": "...", "operator": "...", "value": "..." } 포맷을 단일 객체로 뱉었을 경우 배열로 감싸서 넘깁니다.
+                            if obj.contains_key("property") || obj.contains_key("property_name") {
+                                cond_items.push(json!(obj));
+                            } else {
+                                // { "price": { "operator": "lt", "value": 5000 } } 맵 포맷일 경우
+                                for (k, v) in obj {
+                                    if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
+                                        continue;
+                                    }
+                                    if v.is_object() {
+                                        let mut final_val_obj = v.clone();
+                                        if let Some(v_obj) = final_val_obj.as_object_mut() {
+                                            if !v_obj.contains_key("operator") {
+                                                let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                                v_obj.insert("operator".to_string(), json!(op));
+                                            }
+                                            // 🌟 [CRITICAL FIX] Rust 원본 숫자값을 덮어씌움
+                                            if let Some(exact_val) = prop_to_exact_val.get(k) {
+                                                v_obj.insert("value".to_string(), json!(exact_val));
+                                            }
+                                        }
+                                        structured_cond.insert(k.clone(), final_val_obj);
+                                    } else {
+                                        let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                        let final_value = prop_to_exact_val.get(k).map(|v| json!(v)).unwrap_or_else(|| v.clone());
+                                        structured_cond.insert(k.clone(), json!({
+                                            "operator": op,
+                                            "value": final_value
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+
+                        // 단일화된 배열(cond_items) 처리
+                        for item in cond_items {
+                            if let Some(item_obj) = item.as_object() {
+                                let mut prop_val_opt = None;
+                                for (ik, iv) in item_obj {
+                                    if ik.trim() == "property" || ik.trim() == "property_name" {
+                                        prop_val_opt = iv.as_str();
+                                        break;
+                                    }
+                                }
+
+                                if let Some(prop_val) = prop_val_opt {
+                                    let k = prop_val.trim().to_string();
+                                    
+                                    if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
+                                        continue;
+                                    }
+
+                                    if !prop_to_op.contains_key(&k) {
+                                        emit_term(&format!(
+                                            "      ⚠️ [DISCARD] 수치 조건 응답의 속성 [{}] 은 이번 질의의 벡터 가이드(확정된 청크 속성)에 없어 버립니다. 스키마에 있는 속성이어도 가이드 밖이면 이 단계의 답이 아니며, 같은 축은 추상 수식어 라우팅이 따로 물질화할 수 있습니다.",
+                                            k
+                                        ));
+                                        crate::model::lang_llm::record_query_value(false);
+                                        continue;
+                                    }
+                                    crate::model::lang_llm::record_query_value(true);
+
+                                    let mut op = item_obj.get("operator").and_then(|v| v.as_str())
+                                        .unwrap_or_else(|| prop_to_op.get(&k).map(|s| s.as_str()).unwrap_or("eq")).to_string();
+                                    
+                                    let mut final_val_obj = serde_json::Map::new();
+                                    for (ik, iv) in item_obj {
+                                        let ik_trimmed = ik.trim();
+                                        if ik_trimmed != "property" && ik_trimmed != "property_name" && ik_trimmed != "operator" {
+                                            // 🌟 [CRITICAL FIX] Rust 원본 숫자값을 덮어씌움
+                                            if ik_trimmed == "value" {
+                                                if let Some(exact_val) = prop_to_exact_val.get(&k) {
+                                                    final_val_obj.insert(ik_trimmed.to_string(), json!(exact_val));
+                                                    continue;
+                                                }
+                                            }
+                                            final_val_obj.insert(ik_trimmed.to_string(), iv.clone());
+                                        }
+                                    }
+
+                                    // 🌟 [CRITICAL FIX] 숫자가 없어서 value가 빈 값인데 연산자가 부등호일 경우 퍼지(Fuzzy) 표현으로 간주하여 강제 교정
+                                    let actual_db_type = prop_types.get(&k).copied().unwrap_or("String");
+                                    if actual_db_type == "Number" {
+                                        let val_is_empty = final_val_obj.get("value").and_then(|v| v.as_str()).map_or(false, |s| s.trim().is_empty());
+                                        if val_is_empty && !prop_to_exact_val.contains_key(&k) {
+                                            if op == "gt" || op == "gte" {
+                                                op = "top".to_string();
+                                                final_val_obj.insert("percent_total".to_string(), json!("20.0"));
+                                                final_val_obj.insert("is_percent".to_string(), json!(true));
+                                            } else if op == "lt" || op == "lte" {
+                                                op = "bottom".to_string();
+                                                final_val_obj.insert("percent_total".to_string(), json!("20.0"));
+                                                final_val_obj.insert("is_percent".to_string(), json!(true));
+                                            }
+                                        }
+                                    }
+                                    
+                                    final_val_obj.insert("operator".to_string(), json!(op));
+                                    
+                                    if !final_val_obj.contains_key("value") {
+                                        if let Some(exact_val) = prop_to_exact_val.get(&k) {
+                                            final_val_obj.insert("value".to_string(), json!(exact_val));
+                                        }
+                                    }
+                                    
+                                    structured_cond.insert(k, json!(final_val_obj));
+                                } else {
+                                    for (k, val) in item_obj {
+                                        let k_trimmed = k.trim();
+                                        if deterministic_json.is_some() && (k_trimmed == "started_at" || k_trimmed == "expired_at" || k_trimmed == "registration_date" || k_trimmed == "date") {
+                                            continue;
+                                        }
+
+                                        let mut op = prop_to_op.get(k_trimmed).map(|s| s.as_str()).unwrap_or("eq").to_string();
+                                        let mut final_val_obj = val.clone();
+
+                                        if let Some(v_obj) = final_val_obj.as_object_mut() {
+                                            if !v_obj.contains_key("operator") {
+                                                v_obj.insert("operator".to_string(), json!(op));
+                                            } else {
+                                                op = v_obj.get("operator").and_then(|v| v.as_str()).unwrap_or(&op).to_string();
+                                            }
+
+                                            // 🌟 [CRITICAL FIX] Rust 원본 숫자값을 덮어씌움
+                                            if let Some(exact_val) = prop_to_exact_val.get(k_trimmed) {
+                                                v_obj.insert("value".to_string(), json!(exact_val));
+                                            }
+                                        } else {
+                                            let final_value = prop_to_exact_val.get(k_trimmed).map(|v| json!(v)).unwrap_or_else(|| val.clone());
+                                            final_val_obj = json!({
+                                                "operator": op,
+                                                "value": final_value
+                                            });
+                                        }
+
+                                        // 퍼지 변환 동일 적용
+                                        if let Some(v_obj) = final_val_obj.as_object_mut() {
+                                            let actual_db_type = prop_types.get(k_trimmed).copied().unwrap_or("String");
+                                            if actual_db_type == "Number" {
+                                                let val_is_empty = v_obj.get("value").and_then(|v| v.as_str()).map_or(false, |s| s.trim().is_empty());
+                                                if val_is_empty && !prop_to_exact_val.contains_key(k_trimmed) {
+                                                    if op == "gt" || op == "gte" {
+                                                        v_obj.insert("operator".to_string(), json!("top"));
+                                                        v_obj.insert("percent_total".to_string(), json!("20.0"));
+                                                        v_obj.insert("is_percent".to_string(), json!(true));
+                                                    } else if op == "lt" || op == "lte" {
+                                                        v_obj.insert("operator".to_string(), json!("bottom"));
+                                                        v_obj.insert("percent_total".to_string(), json!("20.0"));
+                                                        v_obj.insert("is_percent".to_string(), json!(true));
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        structured_cond.insert(k_trimmed.to_string(), final_val_obj);
+                                    }
+                                }
+                            }
+                        }
+
+                        // 🌟 [CRITICAL RECOVERY] LLM이 배열에서 특정 키를 통째로 누락(환각)시켰을 경우를 대비해, 
+                        // Rust에서 명시적으로 찾아둔 값(prop_to_exact_val)을 강제로 쑤셔 넣습니다.
+                        // 🌟 [VALUE BIND] 키는 돌려줬지만 value 키 자체를 누락한 경우(로그의 color)도 여기서 봉합합니다.
+                        for (k, exact_val) in &prop_to_exact_val {
+                            if !structured_cond.contains_key(k) {
+                                let op = prop_to_op.get(k).map(|s| s.as_str()).unwrap_or("eq");
+                                structured_cond.insert(k.clone(), json!({
+                                    "operator": op,
+                                    "value": exact_val
+                                }));
+                                emit_term(&format!("      ⚠️ [RECOVERY] LLM missed property [{}]. Forcefully recovered with exact value [{}].", k, exact_val));
+                                continue;
+                            }
+
+                            if let Some(existing) = structured_cond.get_mut(k) {
+                                if let Some(obj) = existing.as_object_mut() {
+                                    let needs_fill = match obj.get("value") {
+                                        None => true,
+                                        Some(serde_json::Value::Null) => true,
+                                        Some(serde_json::Value::String(s)) => s.trim().is_empty() || s == "null",
+                                        _ => false,
+                                    };
+                                    if needs_fill {
+                                        obj.insert("value".to_string(), json!(exact_val));
+                                        emit_term(&format!("      🩹 [VALUE BIND] LLM returned [{}] without a usable value. Deterministically bound to [{}].", k, exact_val));
+                                    }
+                                }
+                            }
+                        }
+
+                        // 🌟 [PERCENT RESIDUE SWEEP] 0.6B 모델은 값이 없을 때 percent_total 을 창작합니다.
+                        //    (로그: { "operator":"lt", "percent_total":"0.38", "value":"" })
+                        //    percent_total 은 top/bottom 연산자에서만 의미를 갖는 필드이므로,
+                        //    그 외 연산자이거나 is_percent 가 거짓이면 잔재를 완전히 제거합니다.
+                        //    프론트엔드 Dexie 재질의가 이 키를 읽고 오동작하는 경로를 원천 차단합니다.
+                        {
+                            let mut swept: Vec<String> = Vec::new();
+                            for (k, v) in structured_cond.iter_mut() {
+                                let obj = match v.as_object_mut() { Some(o) => o, None => continue };
+                                let op = obj.get("operator").and_then(|o| o.as_str()).unwrap_or("").to_string();
+                                let is_rank = op == "top" || op == "bottom";
+                                let is_percent = obj.get("is_percent").and_then(|b| b.as_bool()).unwrap_or(false);
+                                if is_rank && is_percent { continue; }
+                                let had_percent = obj.remove("percent_total").is_some();
+                                let had_flag = obj.remove("is_percent").is_some();
+                                if had_percent || had_flag { swept.push(k.clone()); }
+                            }
+                            if !swept.is_empty() {
+                                emit_term(&format!("      🧽 [PERCENT RESIDUE SWEEP] top/bottom 이 아닌 조건 {:?} 에서 percent_total/is_percent 환각 잔재를 제거했습니다.", swept));
+                            }
+                        }
+
+                        // 🌟 [ABSTRACT QUALIFIER MATERIALIZE]
+                        //    substantial_filters 키(weight / sale_price / shipping_fee ...)는
+                        //    실제 스키마 필드명과 동일하므로, find_filters 방향을 연산자로 환산해
+                        //    '조건' 으로 물질화합니다.
+                        //      heavy / many / much  → top    (상위 구간)
+                        //      light / few / little → bottom (하위 구간)
+                        //    방향은 문자열 판정이 아니라 위에서 코사인으로 확정한 캐노니컬 키를 그대로 씁니다.
+                        //    percent_total 은 기존 퍼지(Fuzzy) 변환이 쓰는 값과 동일하게 유지합니다.
+                        // 🌟 [DEAD BRANCH FIX] 기존 구조는 CROSS-DOMAIN 분기를
+                        //    `prop_keys.iter().any(|p| p == &best_sub_global)` 안에 중첩시켰습니다.
+                        //    그런데 CROSS-DOMAIN 은 정확히 '이 필드가 현재 스키마에 없을 때'를 위한 것이라
+                        //    논리적으로 절대 도달할 수 없는 죽은 코드였습니다.
+                        //    (log1.txt: '무거운' → substantial_filters.weight 확정에도 MATERIALIZE 로그 0건.
+                        //     goods 스키마에 weight 가 없고 tracking 에만 있기 때문)
+                        //    현재 스키마 보유 여부로 분기를 완전히 분리합니다.
+                        if !best_sub_global.is_empty()
+                            && !structured_cond.contains_key(&best_sub_global)
+                        {
+                            let dir_op = match best_find_global.as_str() {
+                                "heavy" | "many" | "much"   => "top",
+                                "light" | "few"  | "little" => "bottom",
+                                _ => "",
+                            };
+                            let owned_here = prop_keys.iter().any(|p| p == &best_sub_global);
+
+                            if owned_here && !dir_op.is_empty() {
+                                structured_cond.insert(best_sub_global.clone(), json!({
+                                    "operator": dir_op,
+                                    "percent_total": "20.0",
+                                    "is_percent": true
+                                }));
+                                emit_term(&format!(
+                                    "      🧲 [ABSTRACT MATERIALIZE] substantial='{}' + find='{}' → 조건 '{} {} 20%' 물질화",
+                                    best_sub_global, best_find_global, best_sub_global, dir_op
+                                ));
+                            } else {
+                                // 🌟 [CROSS-DOMAIN MATERIALIZE] 현재 도메인 스키마에 그 필드가 없으면
+                                //    다른 도메인 스키마를 뒤져 보유 도메인을 찾아 메타데이터로 남깁니다.
+                                //    STAGE-3 이 이 값을 읽어 해당 도메인 컨텍스트를 추가 발행합니다.
+                                //    (예: goods 질의의 '무거운' → weight 는 tracking 스키마에 있음)
+                                let mut host_domain = String::new();
+                                for cand in ["tracking", "goods", "order", "event", "coupon", "review"] {
+                                    if cand == seg_type { continue; }
+                                    let cand_fields = crate::parsing::get_detail_schema_fields(cand, "", &query_lang);
+                                    if cand_fields.iter().any(|(n, _, _, _)| n == &best_sub_global) {
+                                        host_domain = cand.to_string();
+                                        break;
+                                    }
+                                }
+                                if !host_domain.is_empty() {
+                                    emit_term(&format!(
+                                        "      🔀 [CROSS-DOMAIN MATERIALIZE] '{}' 는 '{}' 스키마에 없고 '{}' 스키마에 존재합니다. 교차 도메인 컨텍스트를 발행합니다. (find='{}')",
+                                        best_sub_global, seg_type, host_domain, best_find_global
+                                    ));
+                                    obj.insert("substantial_host".to_string(), json!(host_domain));
+                                } else {
+                                    emit_term(&format!(
+                                        "      ⚪ [ABSTRACT MATERIALIZE SKIP] substantial='{}' 을 보유한 도메인 스키마가 없어 메타데이터로만 전달합니다. (find='{}')",
+                                        best_sub_global, best_find_global
+                                    ));
+                                }
+                            }
+                        }
+
+                        // 🌟 [NUMERIC REROUTE APPLY] 문자열로 굳었던 수치 조건을 실제 Numeric 필드로 교체합니다.
+                        //    이 교체가 있어야 convert_conditions_to_sql 이 `amount <= 5000` 을 생성합니다.
+                        for (from_prop, to_prop, op, num_val) in &numeric_reroutes {
+                            if !structured_cond.contains_key(from_prop) { continue; }
+                            if structured_cond.contains_key(to_prop) { continue; }
+                            structured_cond.remove(from_prop);
+                            structured_cond.insert(to_prop.clone(), json!({
+                                "operator": op,
+                                "value": num_val
+                            }));
+                            emit_term(&format!("      🔁 [NUMERIC REROUTE APPLY] '{}' 조건을 '{} {} {}' 로 교체했습니다.", from_prop, to_prop, op, num_val));
+                        }
+                        let mut relocked: Vec<String> = Vec::new();
+                        for (k, lock_op) in &exact_op_lock {
+                            let obj = match structured_cond.get_mut(k).and_then(|v| v.as_object_mut()) {
+                                Some(o) => o,
+                                None => continue,
+                            };
+                            let has_value = match obj.get("value") {
+                                None | Some(serde_json::Value::Null) => false,
+                                Some(serde_json::Value::String(s)) => !s.trim().is_empty() && s != "null",
+                                _ => true,
+                            };
+                            if !has_value { continue; }
+                            let cur = obj.get("operator").and_then(|o| o.as_str()).unwrap_or("").to_string();
+                            if cur == *lock_op { continue; }
+                            obj.insert("operator".to_string(), json!(lock_op));
+                            obj.remove("percent_total");
+                            obj.remove("is_percent");
+                            relocked.push(format!("{}: {} → {}", k, cur, lock_op));
+                        }
+                        if !relocked.is_empty() {
+                            emit_term(&format!("      🔒 [EXACT OPERATOR LOCK] 닫힌 비교 어휘로 확정한 연산자를 LLM 출력 위에 다시 고정했습니다: {:?}", relocked));
+                        }
+
+                        {
+                            let cur_raw: Option<(String, String)> = structured_cond.get("currency").map(|c| (
+                                c.get("operator").and_then(|o| o.as_str()).unwrap_or("").trim().to_lowercase(),
+                                match c.get("value") {
+                                    Some(Value::String(s)) => s.trim().to_string(),
+                                    Some(Value::Number(n)) => n.to_string(),
+                                    _ => String::new(),
+                                },
+                            ));
+                            if let Some((cur_op, v)) = cur_raw.filter(|(_, v)| !v.is_empty() && v != "null") {
+                                let negated = cur_op.starts_with("not") || cur_op.starts_with("neq");
+                                match crate::utils::ai_utils::currency_code_of(&v) {
+                                    Some(code) => {
+                                        let new_op = if negated { "neq" } else { "eq" };
+                                        if let Some(o) = structured_cond.get_mut("currency").and_then(|c| c.as_object_mut()) {
+                                            o.insert("operator".to_string(), json!(new_op));
+                                            o.insert("value".to_string(), json!(code));
+                                        }
+                                        emit_term(&format!("      💱 [CLOSED VOCAB / CURRENCY] '{}' ({}) → ISO '{}' ({}) — 통화 코드·통화명·기호 닫힌 표 일치", v, cur_op, code, new_op));
+                                    }
+                                    None => {
+                                        structured_cond.remove("currency");
+                                        if !unassigned_chunks.iter().any(|e| e == &v) { unassigned_chunks.push(v.clone()); }
+                                        crate::utils::score_dynamics::record_baseline("search.closed_vocab_drop", 1.0);
+                                        emit_term(&format!("      🗑️ [CLOSED VOCAB DROP] currency='{}' 는 통화 코드·통화명·기호 어느 것과도 닫힌 일치가 없어 조건에서 제외하고 FTS 검색어로만 남깁니다.", v));
+                                    }
+                                }
+                            }
+                            let st_raw: Option<(String, String)> = structured_cond.get("status").map(|c| (
+                                c.get("operator").and_then(|o| o.as_str()).unwrap_or("").trim().to_lowercase(),
+                                match c.get("value") {
+                                    Some(Value::String(s)) => s.trim().to_string(),
+                                    Some(Value::Number(n)) => n.to_string(),
+                                    _ => String::new(),
+                                },
+                            ));
+                            if let Some((st_op, v)) = st_raw.filter(|(_, v)| !v.is_empty() && v != "null") {
+                                let mut key = v.to_lowercase();
+                                let numeric_code = key.parse::<i32>().ok().filter(|n| (1..=12).contains(n));
+                                if numeric_code.is_none() && crate::logic::parse_status(&key) == 0 {
+                                    let pivot = crate::utils::ai_utils::status_pivot_bank(self, &seg_type, &query_lang).await;
+                                    if let Some((canon, route)) = crate::utils::ai_utils::status_canonical_exact(&v, &seg_type, pivot.as_ref()) {
+                                        emit_term(&format!("      🌉 [CLOSED VOCAB / STATUS PIVOT] status '{}' → '{}' | {}", v, canon, route));
+                                        crate::utils::score_dynamics::record_baseline("search.status_pivot_hit", 1.0);
+                                        key = canon;
+                                    }
+                                }
+                                let code = numeric_code.unwrap_or_else(|| crate::logic::parse_status(&key));
+                                let negated = st_op.starts_with("not") || st_op.starts_with("neq");
+                                if code != 0 && (negated || numeric_code.is_some()) {
+                                    let keep_op = if negated { "neq" } else { "eq" };
+                                    structured_cond.insert("status".to_string(), json!({ "operator": keep_op, "value": code }));
+                                    if negated {
+                                        let axis_code = obj
+                                            .get("status")
+                                            .and_then(|s| s.as_str())
+                                            .map(|s| crate::logic::parse_status(s.trim()))
+                                            .unwrap_or(0);
+                                        if axis_code == code {
+                                            obj.insert("status".to_string(), json!(""));
+                                            emit_term(&format!("      🔁 [CLOSED VOCAB / STATUS] 상태 축 값이 부정 조건과 같은 코드 {} 라 모순을 피하려고 축을 비웁니다.", code));
+                                        }
+                                    }
+                                    emit_term(&format!("      🔁 [CLOSED VOCAB / STATUS] status {} '{}' → 저장 규약 코드 {} 로 {} 수치 조건을 유지합니다.", st_op, key, code, keep_op));
+                                } else if code != 0 {
+                                    structured_cond.remove("status");
+                                    let axis_empty = obj
+                                        .get("status")
+                                        .and_then(|s| s.as_str())
+                                        .map_or(true, |s| {
+                                            let t = s.trim();
+                                            t.is_empty() || t == "null" || crate::logic::parse_status(t) == 0
+                                        });
+                                    if axis_empty {
+                                        obj.insert("status".to_string(), json!(key.clone()));
+                                    }
+                                    emit_term(&format!("      🔁 [CLOSED VOCAB / STATUS] status='{}' 는 캐노니컬 상태 키라 속성 조건 대신 상태 축(status)으로 옮깁니다. (상태 축 {})", key, if axis_empty { "비어 있어 채움" } else { "이미 확정되어 유지" }));
+                                } else {
+                                    structured_cond.remove("status");
+                                    if !unassigned_chunks.iter().any(|e| e == &v) { unassigned_chunks.push(v.clone()); }
+                                    crate::utils::score_dynamics::record_baseline("search.closed_vocab_drop", 1.0);
+                                    emit_term(&format!("      🗑️ [CLOSED VOCAB DROP] status='{}' 는 캐노니컬 상태 키가 아니어서 조건에서 제외합니다. 저장된 status 는 정수 코드라 문자열 조건은 어떤 문서와도 맞지 않고, 상태 의도는 상태 필터 축이 따로 판정합니다. (FTS 검색어로는 보존)", v));
+                                }
+                            }
+                        }
+
+                        // 🌟 [EMPTY CONDITION SWEEP] 끝내 값을 확보하지 못한 조건은 필터가 아니라 노이즈입니다.
+                        //    (top / bottom 은 percent_total 로 동작하므로 값이 없어도 유효)
+                        let empty_keys: Vec<String> = structured_cond.iter().filter(|(_, v)| {
+                            let op = v.get("operator").and_then(|o| o.as_str()).unwrap_or("");
+                            if op == "top" || op == "bottom" { return false; }
+                            match v.get("value") {
+                                None => true,
+                                Some(serde_json::Value::Null) => true,
+                                Some(serde_json::Value::String(s)) => s.trim().is_empty() || s == "null",
+                                _ => false,
+                            }
+                        }).map(|(k, _)| k.clone()).collect();
+                        for k in empty_keys {
+                            structured_cond.remove(&k);
+                            emit_term(&format!("      🗑️ [EMPTY CONDITION DROP] '{}' 는 끝내 값을 확보하지 못해 조건에서 제외합니다.", k));
+                        }
+
+                        // 🌟 [CRITICAL FIX] Deterministic JSON(확정된 기간)이 있다면 여기서 강력하게 덮어씌워서 LLM 환각을 원천 차단합니다!
+                        if let Some(det_json) = &deterministic_json {
+                            if let Some(det_obj) = det_json.as_object() {
+                                for (k, v) in det_obj {
+                                    structured_cond.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        
+                        obj.insert("condition".to_string(), json!(structured_cond.clone()));
+
+                        let mut alt_payload = serde_json::Map::new();
+                        for (prop, alts) in &plinko_alternates {
+                            if !structured_cond.contains_key(prop) { continue; }
+                            if alts.is_empty() { continue; }
+                            alt_payload.insert(prop.clone(), json!(alts.clone()));
+                        }
+                        for prop in crate::utils::canonical::RELAY_LINK_KEYS.iter() {
+                            let text_valued = structured_cond
+                                .get(*prop)
+                                .and_then(|c| c.get("value"))
+                                .and_then(|v| v.as_str())
+                                .map_or(false, crate::utils::canonical::relay_text_is_content);
+                            if !text_valued { continue; }
+                            let companion = format!("{}_title", prop);
+                            let entry = alt_payload.entry(prop.to_string()).or_insert_with(|| json!([]));
+                            if let Some(arr) = entry.as_array_mut() {
+                                if !arr.iter().any(|x| x.as_str() == Some(companion.as_str())) {
+                                    arr.push(json!(companion));
+                                }
+                            }
+                        }
+                        if !alt_payload.is_empty() {
+                            emit_term(&format!("  🔀 [ALTERNATE AXIS]\n{}", serde_json::to_string_pretty(&alt_payload).unwrap_or_default()));
+                        }
+                        obj.insert("alternates".to_string(), Value::Object(alt_payload));
+
+                        if !unassigned_chunks.is_empty() {
+                            emit_term(&format!("  🧷 [UNASSIGNED RESCUE] 조건 미확정 청크 {:?} 를 FTS 검색어로 보존합니다.", unassigned_chunks));
+                        }
+                        obj.insert("unassigned".to_string(), json!(unassigned_chunks.clone()));
+                        if let Some(rp) = relay_period.as_ref() {
+                            obj.insert("relay_period".to_string(), rp.clone());
+                        }
+
+                        if !exact_season_key.is_empty() {
+                            obj.insert("exact_season".to_string(), json!(exact_season_key.clone()));
+                        }
+                        if !exact_time_key.is_empty() {
+                            obj.insert("exact_time".to_string(), json!(exact_time_key.clone()));
+                        }
+
+                        // 🌟 [추가] 벡터 매칭(연산자)과 LLM(추출 값) + 확정 날짜가 최종 병합된 결과 로그 출력
+                        emit_term(&format!("  🚀 [FINAL MERGED CONDITION]\n{}", serde_json::to_string_pretty(&structured_cond).unwrap_or_default()));
+                    }
+                } else {
+                    if let Some(obj) = seg.as_object_mut() {
+                        let mut cond = serde_json::Map::new();
+                        if let Some(det_obj) = deterministic_json.as_ref().and_then(|v| v.as_object()) {
+                            for (k, v) in det_obj {
+                                cond.insert(k.clone(), v.clone());
+                            }
+                        }
+                        if !cond.is_empty() {
+                            emit_term(&format!(
+                                "  🗓️ [DETERMINISTIC PERIOD ONLY] 속성 조각이 없어 LLM 정규화는 건너뛰지만, 결정론으로 확정한 기간 조건 {:?} 는 싣습니다. 기간 확정은 속성 조각의 유무와 무관한 근거인데, 지금까지는 조각이 없으면 조건 전체를 비워 기간이 사라졌습니다.",
+                                cond.keys().collect::<Vec<_>>()
+                            ));
+                        }
+                        obj.insert("condition".to_string(), json!(cond));
+                        obj.insert("unassigned".to_string(), json!(unassigned_chunks.clone()));
+                        if let Some(rp) = relay_period.as_ref() {
+                            obj.insert("relay_period".to_string(), rp.clone());
+                        }
+                        if !exact_season_key.is_empty() {
+                            obj.insert("exact_season".to_string(), json!(exact_season_key.clone()));
+                        }
+                        if !exact_time_key.is_empty() {
+                            obj.insert("exact_time".to_string(), json!(exact_time_key.clone()));
+                        }
+                    }
+                }
+
+                crate::models::qwen::generate::wait_for_global_io().await;
+                
+                if !self.is_cpu_mode {
+                    let dev = self.device_config.device.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if dev.is_cuda_or_rocm() { let _ = dev.synchronize(); }
+                    }).await;
+                }
+
+                crate::utils::legacy_working_set_trim(); // 🌟 [RAM-SAWTOOTH] 기본은 작업 집합을 내쫓지 않습니다 (LOGIS_MEM_TRIM=legacy)
+            }
+        }
+
+        // =====================================================================
+        // 🌟 [STAGE-3 v4 / SINGLE CONTEXT PER DOMAIN]
+        // ---------------------------------------------------------------------
+        //  v3 는 도메인마다 A/FULL · B/NARROWED · C/RECALL · D/ALTERNATE ·
+        //  E/TABLE-FALLBACK 5개 티어를 발행했습니다. 그 이유는 전부 '보험' 이었습니다.
+        //
+        //    A vs B : convert_conditions_to_sql 이 조건을 버릴까 봐 완화본을 하나 더
+        //    C      : SQL 문법 에러로 0건이 날까 봐 조건 없는 본을 하나 더
+        //    D      : 속성 확정이 틀렸을까 봐 교체본을 하나 더
+        //    E      : 저장 테이블과 조회 테이블이 어긋날까 봐 items 미러본을 하나 더
+        //
+        //  v4 에서 이 네 가지 위험이 전부 구조적으로 사라졌습니다.
+        //    - build_dexie_plan 이 조건을 하나도 버리지 않음        → A/B 통합
+        //    - build_scope_filter 가 봉투 컬럼만 씀 (문법 에러 불가) → C 불필요
+        //    - alternates 를 dexie_plan 에 실어 프론트가 재질의      → D 불필요
+        //    - 물리 테이블이 items 하나                              → E 불필요
+        //
+        //  → 도메인당 컨텍스트 1개 + 후보 도메인 목록(types) 으로 접습니다.
+        //    LanceDB 왕복이 24회 → 3~4회로 줄고, 임베딩 호출도 같은 비율로 감소합니다.
+        //    리콜은 lib.rs 의 RECALL_LIMIT(50) + Dexie 의 후보 밖 구출 경로가 보증합니다.
+        // =====================================================================
+        if let Some(ctx_arr) = segments.get_mut("context").and_then(|v| v.as_array_mut()) {
+            if !ctx_arr.is_empty() {
+                emit_term("[STAGE-3] Generating single context per domain (v4)...");
+
+                struct DomainGroup {
+                    /// ACTION WORD 를 제거한 정화 텍스트 (FTS 정밀도용)
+                    text_words: Vec<String>,
+                    /// 정화 이전 세그먼트 원문 (게이트 오탐 시 복구용)
+                    raw_words: Vec<String>,
+                    /// 조건 값 + 미배정 청크 (FTS 리콜용)
+                    value_words: Vec<String>,
+                    condition: serde_json::Map<String, Value>,
+                    alternates: serde_json::Map<String, Value>,
+                    /// 이 도메인과 교차 가능한 후보 도메인 (STAGE-1 types + 브릿지)
+                    candidates: Vec<String>,
+                    status: Value,
+                    substantial: Value,
+                    find: Value,
+                    /// substantial 필드를 보유한 타 도메인 (교차 조회 대상)
+                    substantial_host: String,
+                }
+
+                // 🌟 [WORD ORDER PRESERVE] value_words 는 condition 맵(키 알파벳순) 순회로 수집되어
+                //    원문 어순이 파괴됩니다. FTS 는 어순에 민감하므로 원문 순서로 복원합니다.
+                fn reorder_by_source(words: &Vec<String>, source: &Vec<String>) -> Vec<String> {
+                    let mut out: Vec<String> = Vec::with_capacity(words.len());
+                    for s in source {
+                        if words.iter().any(|w| w == s) && !out.iter().any(|o| o == s) {
+                            out.push(s.clone());
+                        }
+                    }
+                    for w in words {
+                        if !out.iter().any(|o| o == w) { out.push(w.clone()); }
+                    }
+                    out
+                }
+
+                let mut final_contexts: Vec<Value> = Vec::new();
+                let mut groups: std::collections::HashMap<String, DomainGroup> = std::collections::HashMap::new();
+                let mut group_order: Vec<String> = Vec::new();
+                let mut global_candidates: Vec<String> = Vec::new();
+                let mut relay_periods: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+
+                // ── 1) 도메인 축 : 세그먼트를 '확정 타입'별로 그룹핑합니다. 절대 서로 섞지 않습니다.
+                for seg in ctx_arr.iter() {
+                    let seg_type = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                    // "ignore"는 상거래 검색 조건이 아니므로 병합하지 않고 원형 그대로 보존합니다.
+                    if seg_type == "ignore" {
+                        final_contexts.push(seg.clone());
+                        continue;
+                    }
+                    if seg_type.is_empty() { continue; }
+
+                    if !group_order.iter().any(|g| g == &seg_type) { group_order.push(seg_type.clone()); }
+                    let g = groups.entry(seg_type.clone()).or_insert_with(|| DomainGroup {
+                        text_words: Vec::new(),
+                        raw_words: Vec::new(),
+                        value_words: Vec::new(),
+                        condition: serde_json::Map::new(),
+                        alternates: serde_json::Map::new(),
+                        candidates: Vec::new(),
+                        status: json!(""),
+                        substantial: json!(""),
+                        find: json!(""),
+                        substantial_host: String::new(),
+                    });
+
+                    // 🌟 [CANDIDATES] STAGE-1 이 남긴 교차 후보를 '컨텍스트를 늘리는 대신'
+                    //    types 배열로 컨텍스트 안에 담습니다.
+                    //    lib.rs 는 이 배열을 보고 스코프 SQL 의 type 조건을 IN 절로 넓힙니다.
+                    //    → C/CANDIDATE, C/CROSS-VERB 티어가 통째로 불필요해집니다.
+                    if let Some(types) = seg.get("types").and_then(|v| v.as_array()) {
+                        for t in types {
+                            if let Some(ts) = t.as_str() {
+                                if ts.is_empty() || ts == "ignore" { continue; }
+                                if !g.candidates.iter().any(|d| d == ts) { g.candidates.push(ts.to_string()); }
+                                if !global_candidates.iter().any(|d| d == ts) { global_candidates.push(ts.to_string()); }
+                            }
+                        }
+                    }
+
+                    // 🌟 [CROSS-DOMAIN] substantial 필드를 보유한 타 도메인도 후보에 넣습니다.
+                    //    v3 는 D/CROSS-DOMAIN + E/CROSS-DOMAIN-FALLBACK 2개 컨텍스트를 더 만들었지만,
+                    //    v4 는 types 에 host 를 추가하는 것으로 동일한 리콜을 얻습니다.
+                    if let Some(host) = seg.get("substantial_host").and_then(|v| v.as_str()) {
+                        if !host.is_empty() {
+                            if !g.candidates.iter().any(|d| d == host) { g.candidates.push(host.to_string()); }
+                            if !global_candidates.iter().any(|d| d == host) { global_candidates.push(host.to_string()); }
+                            if g.substantial_host.is_empty() {
+                                g.substantial_host = host.to_string();
+                            }
+                        }
+                    }
+
+                    if let Some(text) = seg.get("text").and_then(|v| v.as_str()) {
+                        for w in text.split_whitespace() {
+                            if w == "|" { continue; }
+                            // 🌟 [RAW AXIS] 정화 여부와 무관하게 원문은 항상 보존합니다.
+                            //    ACTION VERB 게이트가 전 단어를 오탐해도 복구할 수 있습니다.
+                            if !g.raw_words.iter().any(|e| e == w) { g.raw_words.push(w.to_string()); }
+
+                            // 🌟 [ACTION WORD PURGE] 벡터로 확정된 순수 명령어는 FTS 노이즈입니다.
+                            //    '찾아줘'/'보여줘' 가 ngram 검색어에 남으면 무관한 문서를 끌어옵니다.
+                            //    역검증을 통과한 값/연산자/시간 표현은 이 집합에 없으므로 그대로 보존됩니다.
+                            if global_action_words.contains(w) { continue; }
+                            if !g.text_words.iter().any(|e| e == w) { g.text_words.push(w.to_string()); }
+                        }
+                    }
+
+                    if let Some(status) = seg.get("status") {
+                        let s_str = status.as_str().unwrap_or("");
+                        if !s_str.is_empty() && s_str != "null" && g.status.as_str().unwrap_or("").is_empty() {
+                            g.status = status.clone();
+                        }
+                    }
+                    if let Some(sub) = seg.get("substantial") {
+                        let s_str = sub.as_str().unwrap_or("");
+                        if !s_str.is_empty() && s_str != "null" && g.substantial.as_str().unwrap_or("").is_empty() {
+                            g.substantial = sub.clone();
+                        }
+                    }
+                    if let Some(find) = seg.get("find") {
+                        let s_str = find.as_str().unwrap_or("");
+                        if !s_str.is_empty() && s_str != "null" && g.find.as_str().unwrap_or("").is_empty() {
+                            g.find = find.clone();
+                        }
+                    }
+
+                    if let Some(alts) = seg.get("alternates").and_then(|v| v.as_object()) {
+                        for (k, v) in alts {
+                            if !g.alternates.contains_key(k) { g.alternates.insert(k.clone(), v.clone()); }
+                        }
+                    }
+
+                    // 🌟 [UNASSIGNED RESCUE] 조건이 되지 못한 청크도 사용자가 실제로 입력한 단어이므로
+                    //    완화 티어의 FTS 검색어에 반드시 포함시킵니다.
+                    //    (로그: review 세그먼트의 '메세지도' 가 B/NARROWED·C/RECALL 에서 사라졌습니다)
+                    //    🌟 [FILTER TERM 포함] FILTER TERM DROP 으로 속성 배정에서 제외된 단어
+                    //    ('올해', '여름', '무거운', '많이' 등)도 이 경로로 FTS 검색어에 보존됩니다.
+                    if let Some(un) = seg.get("unassigned").and_then(|v| v.as_array()) {
+                        for u in un {
+                            if let Some(us) = u.as_str() {
+                                for w in us.split_whitespace() {
+                                    if !g.value_words.iter().any(|e| e == w) { g.value_words.push(w.to_string()); }
+                                }
+                            }
+                        }
+                    }
+                    // 🌟 [EXACT SEASON/TIME FTS 보존] exact_season / exact_time 으로 확정된 단어도
+                    //    FTS 검색어에 포함되어야 합니다. (기존 FILTER TERM RESCUE 와 동일한 맥락)
+                    if let Some(es) = seg.get("exact_season").and_then(|v| v.as_str()) {
+                        if !es.is_empty() {
+                            for w in es.split_whitespace() {
+                                if !g.value_words.iter().any(|e| e == w) { g.value_words.push(w.to_string()); }
+                            }
+                        }
+                    }
+                    if let Some(et) = seg.get("exact_time").and_then(|v| v.as_str()) {
+                        if !et.is_empty() {
+                            for w in et.split_whitespace() {
+                                if !g.value_words.iter().any(|e| e == w) { g.value_words.push(w.to_string()); }
+                            }
+                        }
+                    }
+                    if let Some(rp) = seg.get("relay_period").filter(|v| v.is_object()) {
+                        relay_periods.entry(seg_type.clone()).or_insert_with(|| rp.clone());
+                    }
+
+                    if let Some(cond) = seg.get("condition").and_then(|v| v.as_object()) {
+                        for (k, v) in cond {
+                            // 값(value)이 비어있는 쓰레기 데이터는 무시하고, 유효한 값만 병합
+                            // 🌟 value 키 자체가 없는 경우(None)도 반드시 '비어있음' 으로 판정해야
+                            //    { "color": { "operator": "contains", "percent_total": "0.5" } } 같은
+                            //    값 없는 조건이 최종 컨텍스트로 새어 나가지 않습니다.
+                            let mut is_empty = match v.get("value") {
+                                None => true,
+                                Some(serde_json::Value::String(s)) => s.trim().is_empty() || s == "null",
+                                Some(serde_json::Value::Null) => true,
+                                Some(serde_json::Value::Object(o)) => {
+                                    o.get("value").and_then(|val| val.as_str()).map_or(false, |s| s.trim().is_empty() || s == "null")
+                                },
+                                _ => false,
+                            };
+
+                            // 🌟 top, bottom 연산자는 percent_total 로 동작하므로 value 가 없어도 유효합니다.
+                            if let Some(op) = v.get("operator").and_then(|o| o.as_str()) {
+                                if op == "top" || op == "bottom" {
+                                    is_empty = false;
+                                }
+                            }
+
+                            if is_empty { continue; }
+
+                            // 🌟 [COLLISION GUARD] 같은 도메인 안에서 동일 키가 충돌하면 먼저 확정된 값을 지킵니다.
+                            //    기존 무조건 덮어쓰기가 review 의 title="고객의" 로 goods 의 title="제품" 을 지운 원인입니다.
+                            if g.condition.contains_key(k) {
+                                emit_term(&format!("    ⚠️ [CONDITION COLLISION] 도메인 '{}' 의 '{}' 조건이 중복되어 먼저 확정된 값을 유지합니다. (폐기: {})", seg_type, k, v));
+                            } else {
+                                g.condition.insert(k.clone(), v.clone());
+                            }
+
+                            if let Some(val_str) = v.get("value").and_then(|x| x.as_str()) {
+                                for w in val_str.split_whitespace() {
+                                    if w == "|" { continue; }
+                                    if !g.value_words.iter().any(|e| e == w) { g.value_words.push(w.to_string()); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── 2) [TRACKING NUMBER INJECTION] 감지된 송장 번호는 전용 tracking 도메인 그룹으로 독립시킵니다.
+                //       기존처럼 마스터 타입을 tracking 으로 '승급' 시키면 goods 조회가 통째로 사라집니다.
+                if !detected_tracking_numbers.is_empty() {
+                    if !group_order.iter().any(|g| g == "tracking") { group_order.push("tracking".to_string()); }
+                    let g = groups.entry("tracking".to_string()).or_insert_with(|| DomainGroup {
+                        text_words: Vec::new(),
+                        raw_words: Vec::new(),
+                        value_words: Vec::new(),
+                        condition: serde_json::Map::new(),
+                        alternates: serde_json::Map::new(),
+                        candidates: Vec::new(),
+                        status: json!(""),
+                        substantial: json!(""),
+                        find: json!(""),
+                        substantial_host: String::new(),
+                    });
+                    for tn in &detected_tracking_numbers {
+                        // 🌟 v4 : contains 대신 eq 를 씁니다.
+                        //    canonicalize 가 tracking_number 를 String 으로 확정했고,
+                        //    Dexie 의 data.tracking_number 인덱스가 eq 를 O(log n) 으로 처리합니다.
+                        //    contains 는 풀스캔이라 같은 결과를 훨씬 느리게 얻습니다.
+                        g.condition.insert("tracking_number".to_string(), json!({
+                            "operator": "eq",
+                            "value": tn
+                        }));
+                        if !g.value_words.iter().any(|e| e == tn) { g.value_words.push(tn.clone()); }
+                        if !g.text_words.iter().any(|e| e == tn) { g.text_words.push(tn.clone()); }
+                        if !g.raw_words.iter().any(|e| e == tn) { g.raw_words.push(tn.clone()); }
+                        // 🌟 order 도 송장번호를 갖고 있을 수 있으므로 후보에 넣습니다.
+                        for cand in ["order", "goods"] {
+                            if !g.candidates.iter().any(|d| d == cand) { g.candidates.push(cand.to_string()); }
+                        }
+                        emit_term(&format!("  📦 [TRACKING INJECT] tracking_number eq '{}' → tracking 도메인 컨텍스트 (candidates: order, goods)", tn));
+                    }
+                }
+
+                // 🌟 [DOMAIN AFFINITY v4] bias.json 의 search_bridge.domain_affinity 를 읽어
+                //    확정 도메인의 친화 도메인을 '해당 그룹의 candidates 배열' 에 주입합니다.
+                //    v3 는 여기서 별도 C/CANDIDATE 컨텍스트를 만들어 쿼리를 늘렸지만,
+                //    v4 는 기존 컨텍스트의 types 를 넓히는 것으로 동일한 리콜을 얻습니다.
+                {
+                    let domain_affinity: std::collections::HashMap<String, Vec<String>> = {
+                        let dict = &crate::parsing::BIAS_DICT;
+                        let mut map = std::collections::HashMap::new();
+                        if let Some(aff_obj) = dict.get("search_bridge")
+                            .and_then(|sb| sb.get("domain_affinity"))
+                            .and_then(|v| v.as_object())
+                        {
+                            for (dom, targets) in aff_obj {
+                                if let Some(arr) = targets.as_array() {
+                                    let t: Vec<String> = arr.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect();
+                                    if !t.is_empty() {
+                                        map.insert(dom.clone(), t);
+                                    }
+                                }
+                            }
+                        }
+                        map
+                    };
+
+                    let doms: Vec<String> = group_order.clone();
+                    for dom in &doms {
+                        let affiliated = match domain_affinity.get(dom) {
+                            Some(a) => a.clone(),
+                            None => continue,
+                        };
+                        if let Some(g) = groups.get_mut(dom) {
+                            for aff in affiliated {
+                                if g.candidates.iter().any(|d| d == &aff) { continue; }
+                                g.candidates.push(aff.clone());
+                                emit_term(&format!(
+                                    "  🔗 [DOMAIN AFFINITY] '{}' 확정 → 친화 도메인 '{}' 를 candidates 에 추가",
+                                    dom, aff
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // ── 3) 도메인마다 컨텍스트를 정확히 1개씩 발행합니다.
+                //
+                //    v3 의 A/FULL · B/NARROWED · C/RECALL · D/ALTERNATE · E/TABLE-FALLBACK 을
+                //    다음과 같이 흡수합니다.
+                //
+                //      A/B  → conditions 전량을 그대로 실어 보냄 (build_dexie_plan 이 안 버림)
+                //      C    → text 는 '정화본 + 원문' 합집합. 게이트 오탐이 있어도 원문이 남음
+                //      D    → alternates 를 컨텍스트에 동봉 (Dexie 가 재질의)
+                //      E    → 물리 테이블이 items 하나라 불필요
+                //      후보 → types 배열로 동봉 (lib.rs 가 type IN (...) 으로 확장)
+                let ordered_domains = group_order.clone();
+                for dom in &ordered_domains {
+                    let g = match groups.get(dom) { Some(v) => v, None => continue };
+
+                    let raw = g.raw_words.join(" ");
+                    let purged = if g.text_words.is_empty() { raw.clone() } else { g.text_words.join(" ") };
+
+                    if g.text_words.is_empty() && !raw.trim().is_empty() {
+                        emit_term(&format!(
+                            "  🛟 [PURGE COLLAPSE GUARD] type={} | ACTION WORD 정화로 텍스트가 비어 원문으로 복구합니다.",
+                            dom
+                        ));
+                    }
+
+                    // 🌟 [UNION TEXT] 정화본 · 값 · 원문을 원문 어순으로 합칩니다.
+                    //    v3 는 세 축을 각각 다른 티어로 나눠 3번 쿼리했는데,
+                    //    FTS 는 어차피 ngram 부분 일치라 합쳐서 한 번에 던져도 리콜이 같습니다.
+                    //    오히려 어순이 보존되어 매칭 품질이 올라갑니다.
+                    let union_text = {
+                        let mut w: Vec<String> = Vec::new();
+                        for x in purged.split_whitespace() {
+                            if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                        }
+                        for x in g.value_words.iter() {
+                            if !w.iter().any(|e| e == x) { w.push(x.clone()); }
+                        }
+                        for x in raw.split_whitespace() {
+                            if !w.iter().any(|e| e == x) { w.push(x.to_string()); }
+                        }
+                        reorder_by_source(&w, &g.raw_words).join(" ")
+                    };
+
+                    if union_text.trim().is_empty() && g.condition.is_empty() { continue; }
+
+                    // 🌟 [TYPES] 확정 도메인 + 후보 도메인. lib.rs 가 IN 절로 펼칩니다.
+                    let mut types: Vec<String> = vec![dom.clone()];
+                    for c in &g.candidates {
+                        if c.is_empty() || c == "ignore" { continue; }
+                        if !types.iter().any(|t| t == c) { types.push(c.clone()); }
+                    }
+
+                    let mut ctx = serde_json::Map::new();
+                    ctx.insert("type".to_string(), json!(dom.clone()));
+                    ctx.insert("types".to_string(), json!(types.clone()));
+                    ctx.insert("text".to_string(), json!(union_text.clone()));
+                    ctx.insert("status".to_string(), g.status.clone());
+                    ctx.insert("substantial".to_string(), g.substantial.clone());
+                    ctx.insert("find".to_string(), g.find.clone());
+                    ctx.insert("condition".to_string(), Value::Object(g.condition.clone()));
+                    ctx.insert("alternates".to_string(), Value::Object(g.alternates.clone()));
+                    ctx.insert("unassigned".to_string(), json!(g.value_words.clone()));
+                    if let Some(rp) = relay_periods.get(dom) {
+                        ctx.insert("relay_period".to_string(), rp.clone());
+                    }
+                    if !g.substantial_host.is_empty() {
+                        ctx.insert("substantial_host".to_string(), json!(g.substantial_host.clone()));
+                    }
+                    ctx.insert("tier".to_string(), json!("UNIFIED"));
+
+                    emit_term(&format!(
+                        "  📦 [CONTEXT] type={} | types={:?} | conditions={} | alternates={} | text=\"{}\"",
+                        dom, types, g.condition.len(), g.alternates.len(), union_text
+                    ));
+
+                    final_contexts.push(Value::Object(ctx));
+                }
+
+                // ── 4) [SUBSTANTIAL HOST] 추상 수식어가 지목한 필드를 보유한 타 도메인.
+                //       v3 는 D/CROSS-DOMAIN + E/CROSS-DOMAIN-FALLBACK 2개 컨텍스트를 더 만들었지만,
+                //       v4 는 이미 candidates(types) 에 host 가 들어가 있으므로
+                //       '조건만' 해당 그룹에 물질화하면 됩니다.
+                //
+                //       (예: goods 질의의 '무거운' → weight 는 tracking 스키마에 존재
+                //            → goods 컨텍스트의 types 에 tracking 이 이미 포함되어 있고,
+                //              conditions 에 weight top 20% 를 넣으면 Dexie 가 두 타입 모두에서 필터링)
+                for dom in &ordered_domains {
+                    let (host, sub_field, find_key) = match groups.get(dom) {
+                        Some(g) => (
+                            g.substantial_host.clone(),
+                            g.substantial.as_str().unwrap_or("").to_string(),
+                            g.find.as_str().unwrap_or("").to_string(),
+                        ),
+                        None => continue,
+                    };
+                    if host.is_empty() || sub_field.is_empty() { continue; }
+
+                    let dir_op = match find_key.as_str() {
+                        "heavy" | "many" | "much"   => "top",
+                        "light" | "few"  | "little" => "bottom",
+                        _ => "",
+                    };
+                    if dir_op.is_empty() { continue; }
+
+                    // 🌟 이미 발행한 컨텍스트의 condition 에 직접 주입합니다.
+                    for c in final_contexts.iter_mut() {
+                        if c.get("type").and_then(|v| v.as_str()) != Some(dom.as_str()) { continue; }
+                        if let Some(cond_obj) = c.get_mut("condition").and_then(|v| v.as_object_mut()) {
+                            if cond_obj.contains_key(&sub_field) { break; }
+                            cond_obj.insert(sub_field.clone(), json!({
+                                "operator": dir_op,
+                                "percent_total": "20.0",
+                                "is_percent": true
+                            }));
+                            emit_term(&format!(
+                                "  🧲 [SUBSTANTIAL MATERIALIZE] type={} | '{} {} 20%' 조건을 주입했습니다. (host 도메인 '{}' 은 이미 types 에 포함)",
+                                dom, sub_field, dir_op, host
+                            ));
+                        }
+                        break;
+                    }
+                }
+
+                // ── 5) [FALLBACK] 확정 도메인이 하나도 없으면 goods 순수 FTS 라도 발행합니다.
+                let has_real_ctx = final_contexts.iter()
+                    .any(|c| c.get("type").and_then(|v| v.as_str()).unwrap_or("") != "ignore");
+
+                if !has_real_ctx {
+                    let fallback_text = if global_candidates.is_empty() {
+                        query.clone()
+                    } else {
+                        query.clone()
+                    };
+
+                    let mut types: Vec<String> = vec!["goods".to_string()];
+                    for c in &global_candidates {
+                        if c.is_empty() || c == "ignore" { continue; }
+                        if !types.iter().any(|t| t == c) { types.push(c.clone()); }
+                    }
+
+                    let mut ctx = serde_json::Map::new();
+                    ctx.insert("type".to_string(), json!("goods"));
+                    ctx.insert("types".to_string(), json!(types.clone()));
+                    ctx.insert("text".to_string(), json!(fallback_text.clone()));
+                    ctx.insert("status".to_string(), json!(""));
+                    ctx.insert("substantial".to_string(), json!(""));
+                    ctx.insert("find".to_string(), json!(""));
+                    ctx.insert("condition".to_string(), json!({}));
+                    ctx.insert("alternates".to_string(), json!({}));
+                    ctx.insert("unassigned".to_string(), json!([]));
+                    ctx.insert("tier".to_string(), json!("FALLBACK"));
+
+                    final_contexts.push(Value::Object(ctx));
+                    emit_term(&format!("  🛟 [FALLBACK] 확정 도메인이 없어 goods 순수 FTS 컨텍스트를 발행합니다. types={:?}", types));
+                }
+                // 🌟 [CROSS-VERB v4] STAGE-1 교차 범위에 들지 못한 도메인을 코사인으로 구출합니다.
+                //    v3 는 구출된 도메인마다 별도 컨텍스트를 만들어 쿼리를 늘렸습니다.
+                //    v4 는 '그 세그먼트가 속한 도메인 그룹의 candidates' 에 추가만 합니다.
+                //    → lib.rs 가 type IN (...) 으로 한 번에 조회하므로 왕복이 늘지 않습니다.
+                //
+                //    또한 v3 는 도메인 6개 × 세그먼트 N개 만큼 앵커 임베딩을 매번 계산했습니다.
+                //    앵커는 질의와 무관하므로 루프 밖에서 1회만 계산합니다. (임베딩 호출 대폭 감소)
+                {
+                    let all_doms = ["order", "goods", "tracking", "review", "coupon", "event"];
+
+                    // 🌟 [ANCHOR CACHE] 도메인 앵커 임베딩을 1회만 계산합니다.
+                    let mut anchor_cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+                    for dom in &all_doms {
+                        let anchor_text = crate::parsing::get_page_type_classification_bias(dom, &query_lang);
+                        let e = self.get_embedding(anchor_text).await.unwrap_or(vec![0.0; 384]);
+                        anchor_cache.insert(dom.to_string(), e);
+                    }
+
+                    // 🌟 [WORD EMB CACHE] 같은 단어를 여러 도메인에 대해 반복 임베딩하지 않습니다.
+                    let mut word_emb_cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+
+                    for seg in ctx_arr.iter() {
+                        let seg_text = seg.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        if seg_text.trim().is_empty() { continue; }
+                        let seg_type_val = seg.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if seg_type_val.is_empty() || seg_type_val == "ignore" { continue; }
+
+                        let seg_emb = self.get_embedding(seg_text.to_string()).await.unwrap_or(vec![0.0; 384]);
+                        if seg_emb.iter().all(|&v| v == 0.0) { continue; }
+
+                        let mut rescued: Vec<(String, f32, String, bool)> = Vec::new();
+
+                        for dom in &all_doms {
+                            if seg_type_val == *dom { continue; }
+
+                            let anchor_emb = match anchor_cache.get(*dom) {
+                                Some(e) if !e.iter().all(|&v| v == 0.0) => e,
+                                _ => continue,
+                            };
+
+                            let seg_cross_sim = cosine_similarity(&seg_emb, anchor_emb);
+
+                            let mut word_cross_sim = 0.0f32;
+                            let mut matched_word = String::new();
+                            let mut bridge_forced = false;
+
+                            for w in seg_text.split_whitespace() {
+                                let related = match domain_word_related.get(w) {
+                                    Some(r) => r,
+                                    None => continue,
+                                };
+                                if !related.iter().any(|r| r == dom) { continue; }
+
+                                let w_emb = match word_emb_cache.get(w) {
+                                    Some(e) => e.clone(),
+                                    None => {
+                                        let e = self.get_embedding(w.to_string()).await.unwrap_or(vec![0.0; 384]);
+                                        word_emb_cache.insert(w.to_string(), e.clone());
+                                        e
+                                    }
+                                };
+                                if w_emb.iter().all(|&v| v == 0.0) { continue; }
+
+                                let ws = cosine_similarity(&w_emb, anchor_emb);
+                                if ws > word_cross_sim {
+                                    word_cross_sim = ws;
+                                    matched_word = w.to_string();
+                                }
+                                // 🌟 [SALES BRIDGE FORCE] STAGE-2 가 이미 코사인 검증을 통과시킨
+                                //    관계이므로, 앵커 코사인이 음수여도 후보로 인정합니다.
+                                if ws <= 0.0 {
+                                    bridge_forced = true;
+                                    if matched_word.is_empty() {
+                                        matched_word = w.to_string();
+                                        word_cross_sim = 0.01;
+                                    }
+                                }
+                            }
+
+                            let final_cross = seg_cross_sim.max(word_cross_sim);
+                            if final_cross > 0.0 || bridge_forced {
+                                rescued.push((dom.to_string(), final_cross, matched_word, bridge_forced));
+                            }
+                        }
+
+                        if rescued.is_empty() { continue; }
+
+                        if let Some(g) = groups.get_mut(&seg_type_val) {
+                            for (dom, sim, word, forced) in rescued {
+                                if g.candidates.iter().any(|d| d == &dom) { continue; }
+                                g.candidates.push(dom.clone());
+                                if forced {
+                                    emit_term(&format!("  🔀 [CROSS-VERB] '{}' → candidates 에 '{}' 추가 (SALES BRIDGE, 지시어 '{}')", seg_type_val, dom, word));
+                                } else if !word.is_empty() {
+                                    emit_term(&format!("  🔀 [CROSS-VERB] '{}' → candidates 에 '{}' 추가 (지시어 '{}' 코사인 {:+.4})", seg_type_val, dom, word, sim));
+                                } else {
+                                    emit_term(&format!("  🔀 [CROSS-VERB] '{}' → candidates 에 '{}' 추가 (세그먼트 코사인 {:+.4})", seg_type_val, dom, sim));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                *ctx_arr = final_contexts;
+
+                if crate::utils::canonical::has_superlative_marker(&query)
+                    && !query.contains('%')
+                    && !query.contains('％')
+                {
+                    let mut tagged: Vec<String> = Vec::new();
+                    for c in ctx_arr.iter_mut() {
+                        let cond_obj = match c.get_mut("condition").and_then(|v| v.as_object_mut()) {
+                            Some(o) => o,
+                            None => continue,
+                        };
+                        for (k, v) in cond_obj.iter_mut() {
+                            let o = match v.as_object_mut() {
+                                Some(o) => o,
+                                None => continue,
+                            };
+                            let op = o.get("operator").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                            if op != "top" && op != "bottom" {
+                                continue;
+                            }
+                            o.insert("extreme".to_string(), json!(true));
+                            tagged.push(format!("{} {}", k, op));
+                        }
+                    }
+                    if !tagged.is_empty() {
+                        crate::utils::score_dynamics::record_baseline("search.superlative_extreme", tagged.len() as f32);
+                        emit_term(&format!(
+                            "  🏁 [SUPERLATIVE EXTREME] 질의에 최상급 표지가 있어 순위 조건 {:?} 를 백분위 구간 대신 극값(동률 포함)으로 좁힙니다. '가장 저렴한 제품' 은 하위 20% 가 아니라 최저가 상품입니다.",
+                            tagged
+                        ));
+                    }
+                }
+
+                let query_count = ctx_arr.iter().filter(|c| c.get("type").and_then(|v| v.as_str()).unwrap_or("") != "ignore").count();
+                let total_types: usize = ctx_arr.iter()
+                    .filter_map(|c| c.get("types").and_then(|v| v.as_array()).map(|a| a.len()))
+                    .sum();
+
+                emit_term(&format!(
+                    "  ✅ [UNIFIED CONTEXTS v4] 발행 쿼리 {}건 (커버 타입 {}종)\n{}",
+                    query_count, total_types,
+                    serde_json::to_string_pretty(&ctx_arr).unwrap_or_default()
+                ));
+            }
+        }
+
+        let payload = json!({ "task_id": task_id, "category": "Done", "summary": "Analysis complete.", "spinner": "✅" });
+        let _ = app_handle.emit("extraction-progress", &payload);
+        crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
+
+        // 🌟 [VRAM 초기화 반영] 파이프라인 종료 직후 Embedding 및 Qwen3 모델을 메모리에서 완벽히 해제하여 VRAM을 0으로 떨어뜨립니다.
+        emit_term("[ENGINE] 🧹 Purging models from memory to free VRAM...");
+        
+        // 🌟 [VRAM 누수 픽스] KV 캐시를 정상적으로 삭제하기 위해 None 덮어쓰기 로직을 제거하고, deep_purge_resources에 전부 일임합니다.
+        self.deep_purge_resources().await;
+
+        // 🌟 [강화된 VRAM 초기화] CUDA 메모리 캐시 강제 비우기 (컴파일 에러 해결 적용)
+        if !self.is_cpu_mode {
+            if self.device_config.device.is_cuda_or_rocm() {
+                let _ = self.device_config.device.synchronize();
+            }
+            // 새 컨텍스트를 할당하여 기존 메모리 풀을 OS로 반환시킵니다.
+            crate::utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
+        }
+
+        // 🌟 [CRITICAL FIX] scheduler.rs의 함수 대신 model.rs에 내장된 강력한 VRAM 스마트 폴링 모니터(self.wait_for_vram_settle)를 호출합니다.
+        // 내부에서 OS 메모리 강제 반환을 폭격하여 VRAM을 0으로 만듭니다.
+        self.wait_for_vram_settle(1200, 10, Some(cancel_token.clone())).await.ok();
+
+        Ok(segments)
+    }
+
+}

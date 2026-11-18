@@ -62,7 +62,7 @@ esac
 case "$PHASE" in
 build)
   git -C ../../../candle-rocm-vulkan log --oneline -n 1 > "$OUT/fork-head.txt" 2>/dev/null || true
-  grep -n "candle-rocm-vulkan" Cargo.toml > "$OUT/cargo-fork-lines.txt" || true
+  grep -n "candle-rocm-vulkan" Cargo.toml ../../Cargo.toml > "$OUT/cargo-fork-lines.txt" || true
   run build cargo test --test it "${FEAT[@]}" --no-run
   ;;
 suite)

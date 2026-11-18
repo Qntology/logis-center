@@ -12,7 +12,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
     rt,
-    decodeAnalyticBlob,
+    decodeBlob,
     updateSyncBackoff,
     getSyncIntervalMs
 } from "./runtime";
@@ -80,7 +80,7 @@ export async function pullTradingData(): Promise<number> {
     for (const row of res.results) {
         if (!row || !row.id) continue;
         if (tombs.has(String(row.id))) { tombBlocked++; continue; }
-        const parsed: any = decodeAnalyticBlob(row.data) || {};
+        const parsed: any = decodeBlob(row.data) || {};
         // 서버 봉투가 진실의 원천입니다. data 안의 값보다 우선합니다.
         parsed.id = row.id;
         parsed.type = row.type;

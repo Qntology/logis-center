@@ -386,6 +386,8 @@ def build(records: list, events: list) -> list:
     out = []
     for i, tmpl in enumerate(sorted(T, key=lambda t: (t[0] != "C", t[0] != "R", int(t[1:])))):
         dom = DOMAIN[tmpl]
+        if dom == "analytic":
+            continue  # 웹 분석(행동 로그)은 premium-discount 로 옮겨 logis 평가에서 뺍니다 (틀 정의는 남김)
         n = int(tmpl[1:])
         if dom in ("commerce", "analytic"):
             picks = [shops[n % 4], shops[(n + 2) % 4]]

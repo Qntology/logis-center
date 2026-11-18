@@ -5,8 +5,8 @@
 use serde_json::{Map, Value};
 use tauri_app_lib::utils::bias_schema::{lang_code_of, BIAS_SOURCE};
 
-const DEV: &str = include_str!("../../src/utils/bias.json");
-const FULL: &str = include_str!("../../src/utils/full_bias.json");
+const DEV: &str = include_str!("../../../../crates/logis-bias/src/bias.json");
+const FULL: &str = include_str!("../../../../crates/logis-bias/src/full_bias.json");
 
 fn sections(text: &str) -> Map<String, Value> {
     serde_json::from_str::<Value>(text).expect("JSON").as_object().expect("최상위 객체").clone()

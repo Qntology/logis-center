@@ -1,8 +1,8 @@
 // Global test setup, executed before every test file (vitest.config.ts -> setupFiles).
 //
-// index.html loads ethers / pako as classic <script> globals, and src/lib/utils.ts and
-// src/modes/oauth.ts capture `window.ethers` / `window.pako` at *import* time, so the real
-// vendored bundles must be on the global object before any test imports those modules.
+// index.html loads ethers / pako as classic <script> globals, and src/lib/utils.ts captures
+// `window.ethers` / `window.pako` at *import* time, so the real vendored bundles must be on
+// the global object before any test imports those modules.
 import { beforeEach, vi } from "vitest";
 // Vite `?raw` imports return the file contents as a string (works in vitest's DOM/web transform mode).
 import ethersSource from "../ethers.umd.min.js?raw"; // ethers v6.6.2

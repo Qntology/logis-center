@@ -225,3 +225,6 @@ build/
 
 # Turbo output
 .turbo/
+
+# Cargo (root workspace; build output goes to commerce/src-tauri/target via .cargo/config.toml)
+/target/

@@ -1,0 +1,15 @@
+[package]
+name = "logis-sds"
+description = "logis-center SDS(점수 동역학) 원장: 스코프별 기준선 · 감쇠 형상 · 필드 거절 · 혼동 통계와 실행 파일 · 원장(recipe sds-v3). 통계 레코드는 premium-discount-sds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+logis-schema.workspace = true
+once_cell.workspace = true
+premium-discount-sds.workspace = true
+serde.workspace = true
+serde_json.workspace = true

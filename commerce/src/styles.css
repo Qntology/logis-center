@@ -111,7 +111,6 @@ body {
 #search-mode-tabs button:hover{font-style: italic;}
 #search-mode-tabs button[data-mode="shipping"]{width: 55px;}
 #search-mode-tabs button[data-mode="commerce"]{width: 77px;}
-#search-mode-tabs button[data-mode="analytic"]{width: 49px;}
 
 /* Search Container & Chips */
 .search-container {

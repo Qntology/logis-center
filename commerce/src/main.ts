@@ -27,17 +27,6 @@ import {
     syncCommerceData,
     syncCommerceInBackground
 } from "./modes/commerce";
-import {
-    syncAnalyticsData,
-    syncAnalyticsInBackground,
-    runAnalyticLocalTick,
-    resetAnalyticThrottle
-} from "./modes/analytic";
-import {
-    fetchOAuthRegisteredSites,
-    renderOAuthSitesUI,
-    renderOAuthRegistrationForm
-} from "./modes/oauth";
 
 
 type CanonKind = 'id' | 'num' | 'bool' | 'tags' | 'free';
@@ -330,7 +319,7 @@ async function runLocalEmbeddingSync() {
         let totalProcessed = 0;
         try {
             const trackOrder = [currentSearchMode,
-                ...["commerce", "shipping", "analytic"].filter(m => m !== currentSearchMode)];
+                ...["commerce", "shipping"].filter(m => m !== currentSearchMode)];
 
             for (const track of trackOrder) {
                 if (isSearching || isExtracting || GlobalTaskManager.isBusy) break;
@@ -1084,8 +1073,6 @@ class GlobalTaskManager {
                 "search_mode",
                 "hidden_pages",
                 "my_sync_seed",
-                "oauth_registered_sites",
-                "oauth_client_address",
                 "item_tombstones",
                 "schema_v4_notified",
                 "force_cpu_mode"
@@ -1298,53 +1285,6 @@ if (chatForm) {
                 content: query 
             }));
             console.log("[CHAT] Message sent via WebRTC");
-        }
-        if (currentSearchMode === "analytic") {
-            const taskId = `search_${Date.now()}`;
-            const startTime = Date.now();
-
-            // 사용자 질문 말풍선 즉시 렌더링
-            await renderMessage({
-                id: `${taskId}_query`,
-                role: "user",
-                text: query,
-                status: 9,
-                created_at: startTime,
-                updated_at: startTime
-            });
-
-            try {
-                const devicePref = getDevicePref();
-
-                // 로컬 검색 큐에 등록 (ai_search_complex 가 mode="analytic" 으로 동작)
-                await GlobalTaskManager.addToQueue(taskId, "ai_search", {
-                    taskId: taskId,
-                    query: query,
-                    language: "korean",
-                    devicePreference: devicePref,
-                    searchMode: "analytic",
-                    cc: activeContext.cc || "",
-                    bcc: activeContext.bcc || "",
-                    refId: activeContext.ref || ""
-                });
-            } catch (e) {
-                console.error("[ANALYTIC-LOCAL] Search queue failed:", e);
-            }
-
-            setTimeout(() => {
-                const scrollEl = document.getElementById("chat-scroll");
-                const container = document.querySelector(".chat-container") as HTMLElement;
-
-                if (scrollEl && container) {
-                    const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
-                    currentY = maxScroll;
-                    scrollEl.style.transition = "transform 0.3s ease-out";
-                    updateTransform();
-                    setTimeout(() => { scrollEl.style.transition = ""; }, 300);
-                }
-            }, 100);
-
-            return;
         }
         const localTalkId = `talk_${now}_${Math.random().toString(36).slice(2, 8)}`;
         {
@@ -2231,32 +2171,8 @@ async function renderNavigation() {
         
         const navSection = pageList.closest('.nav-section') as HTMLElement;
         const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
-        if (navSection) {
-            const existingBtn = navSection.querySelector("#btn-oauth-register");
-            if (existingBtn) existingBtn.remove();
-            if (currentSearchMode === "analytic" && !isSettingsOpen && currentSession.email) {
-                const h3 = navSection.querySelector("h3");
-                const registerBtn = document.createElement("button");
-                registerBtn.id = "btn-oauth-register";
-                registerBtn.style.cssText = "position: absolute; left: 5em; top: 13px; border: 0px; padding: 0px; font-size: 0.8rem; cursor: pointer; text-align: center; text-decoration: underline; background: none;";
-                registerBtn.textContent = "+ 사이트 등록 (Analytic)";
-                registerBtn.addEventListener("click", (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    renderOAuthRegistrationForm();
-                });
-                if (h3 && h3.nextSibling) {
-                    navSection.insertBefore(registerBtn, h3.nextSibling);
-                } else if (h3) {
-                    navSection.appendChild(registerBtn);
-                } else {
-                    navSection.insertBefore(registerBtn, pageList);
-                }
-            }
-        }
 
         if (_pages.length === 0) {
-            pageList.querySelectorAll(".oauth-site-item").forEach((el: Element) => el.remove());
             pageList.innerHTML = `<div class="empty">No shared pages found for this domain.</div>`;
             if (navSection) navSection.style.display = (isSettingsOpen || currentSearchMode === "shipping") ? "none" : "block";
         } else {
@@ -2359,7 +2275,6 @@ async function renderNavigation() {
             }
 
             // 3. Render
-            pageList.querySelectorAll(".oauth-site-item").forEach((el: Element) => el.remove());
             pageList.innerHTML = await renderAccordion(tree);
             pageList.querySelectorAll(".btn-toggle-visibility").forEach((btn: any) => {
                 btn.onclick = async (e: Event) => {
@@ -2439,7 +2354,6 @@ async function renderNavigation() {
                 };
             });
         }
-        await renderOAuthSitesUI(pageList);
         const localUserList = document.getElementById("nav-list-local-users");
         const usersRaw = await Select["users"]({});
         const users = usersRaw.map(u => {
@@ -2679,29 +2593,12 @@ function showInviteQr(hook: string, email: string) {
     }
 }
 async function syncData() {
-    // 🌟 [ANALYTICS TRACK] analytic 모드는 console.logis.center Client Worker 와 동기화합니다.
-    if (currentSearchMode === "analytic") {
-        await syncAnalyticsData();
-        if (currentSession.hash && currentSession.email) {
-            syncCommerceInBackground();
-        }
-        if (currentSession.hash) {
-            syncTradingInBackground();
-        }
-        return;
-    }
     if (currentSearchMode === "shipping") {
         await syncTradingData();
-        if (currentSession.hash) {
-            syncAnalyticsInBackground();
-        }
         if (currentSession.hash && currentSession.email) {
             syncCommerceInBackground();
         }
         return;
-    }
-    if (currentSession.hash) {
-        syncAnalyticsInBackground();
     }
     if (currentSession.hash) {
         syncTradingInBackground();
@@ -2741,45 +2638,6 @@ function applySearchModeUI() {
             pagesSection.style.display = "block"; // 🌟 명시적으로 block 처리하여 노출 보장
         }
     }
-
-    const existingOAuthBtn = document.getElementById("btn-oauth-register");
-    if (existingOAuthBtn && currentSearchMode !== "analytic") {
-        existingOAuthBtn.remove();
-    }
-
-    if (currentSearchMode !== "analytic") {
-        const pageListEl = document.getElementById("nav-list-pages");
-        if (pageListEl) {
-            pageListEl.querySelectorAll(".oauth-site-item").forEach((el: Element) => el.remove());
-        }
-    }
-
-    if (currentSearchMode === "analytic" && !document.getElementById("btn-oauth-register") && !isSettingsOpen && currentSession.email) {
-        if (pagesSection) {
-            const h3 = pagesSection.querySelector("h3");
-            const pageListEl = document.getElementById("nav-list-pages");
-            const registerBtn = document.createElement("button");
-            registerBtn.id = "btn-oauth-register";
-            registerBtn.style.cssText = "position: absolute; left: 5em; top: 13px; border: 0px; padding: 0px; font-size: 0.8rem; cursor: pointer; text-align: center; text-decoration: underline; background: none;";
-            registerBtn.textContent = "+ 사이트 등록 (Analytic)";
-            registerBtn.addEventListener("click", (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                renderOAuthRegistrationForm();
-            });
-            if (h3 && h3.nextSibling) {
-                pagesSection.insertBefore(registerBtn, h3.nextSibling);
-            } else if (h3) {
-                pagesSection.appendChild(registerBtn);
-            } else if (pageListEl) {
-                pagesSection.insertBefore(registerBtn, pageListEl);
-            }
-        }
-    }
-    const logoSection = document.querySelector('.logo-section') as HTMLElement;
-    if (logoSection) {
-        logoSection.style.display = currentSearchMode === "analytic" ? "none" : "";
-    }
 }
 
 // DOM 로드 후 이벤트 리스너 추가
@@ -2801,18 +2659,9 @@ document.querySelectorAll('.mode-tab').forEach(btn => {
         await refreshList();
         await refreshList();
 
-        if (currentSearchMode === "analytic" && currentSession.hash) {
-            resetAnalyticThrottle(); // 🌟 [MODE SPLIT] 구 `lastAnalyticsSyncAt = 0;` 스로틀 해제
-            syncAnalyticsData();
-        }
         if (currentSearchMode === "shipping" && currentSession.hash) {
             resetTradingThrottle(); // 🌟 [MODE SPLIT] 구 `lastTradingSyncAt = 0;` 스로틀 해제
             syncTradingData();
-        }
-
-        const _isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
-        if (currentSearchMode === "analytic" && currentSession.email && !_isSettingsOpen) {
-            await renderNavigation();
         }
 
         if (dataChannel && dataChannel.readyState === "open") {
@@ -3229,7 +3078,7 @@ btnExtract?.addEventListener("click", async () => {
                         device_preference: getDevicePref(), search_mode: currentSearchMode
                     });
                 } else {
-                    console.log("[WIDGET] Queuing LOCAL HTML/ANALYTIC task...");
+                    console.log("[WIDGET] Queuing LOCAL HTML task...");
                     const html = await invoke<string>("extract_html_from_current_tab");
                     
                     let validUrl = currentDetectedUrl;
@@ -3250,7 +3099,7 @@ btnExtract?.addEventListener("click", async () => {
                     const teamId = currentSession.team || "";
                     const hashedRefId = await hashId(teamId + cc + rawPath.toLowerCase());
                     
-                    const extractType = currentSearchMode === "analytic" ? "analytic_extraction" : "html_extraction";
+                    const extractType = "html_extraction";
                     
                     // 🚀 큐에 등록
                     await GlobalTaskManager.addToQueue(taskId, extractType, { 
@@ -3404,113 +3253,6 @@ listen("extraction-progress", async (event: any) => {
 
         if (payload.task_id.startsWith("search_") && payload.category === "Done" && payload.data) {
             const response = payload.data;
-            if (currentSearchMode === "analytic") {
-                const resultCount = response.results ? response.results.length : 0;
-
-                // ① 요약 말풍선 (질의 · 기간 · 회수 건수)
-                let summaryText = `Analytic 검색 완료: ${resultCount}건`;
-                if (response.structured && response.structured.original_text) {
-                    summaryText = `${response.structured.original_text} → ${resultCount}건`;
-                }
-                if (response.structured && Number(response.structured.started_at) > 0) {
-                    const fmt = (ms: number) => {
-                        const d = new Date(Number(ms));
-                        const p = (n: number) => String(n).padStart(2, "0");
-                        return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
-                    };
-                    const s = fmt(response.structured.started_at);
-                    const e = Number(response.structured.expired_at) > 0
-                        ? fmt(response.structured.expired_at)
-                        : s;
-                    const ti = response.structured.time_intent || "";
-                    const si = response.structured.season_intent || "";
-                    const tag = [ti, si].filter(Boolean).join(" / ");
-                    summaryText += `\n기간: ${s} ~ ${e}${tag ? ` (${tag})` : ""}`;
-                }
-                await renderMessage({
-                    id: `${payload.task_id}_answer`,
-                    role: "system",
-                    text: summaryText,
-                    status: 9,
-                    created_at: Date.now(),
-                    updated_at: Date.now()
-                });
-
-                if (response.report && String(response.report).trim().length > 0) {
-                    await renderMessage({
-                        id: `${payload.task_id}_report`,
-                        role: "system",
-                        text: String(response.report).trim(),
-                        status: 9,
-                        created_at: Date.now() + 1,
-                        updated_at: Date.now() + 1
-                    });
-                }
-
-                // ② Dexie Plan 실행 → 상세 결과 말풍선
-                if (response.dexie_plans && Array.isArray(response.dexie_plans) && response.dexie_plans.length > 0) {
-                    const candidateIds = (response.results || []).map((r: any) => r.id).filter(Boolean);
-                    for (const plan of response.dexie_plans) {
-                        const condCount = plan.conditions ? plan.conditions.length : 0;
-                        if (condCount === 0) continue;
-                        try {
-                            const passed = await executeDexiePlan(plan, { candidateIds, limit: 20 });
-                            for (const p of passed) {
-                                const d = p.data || {};
-                                const actionText = d.action || "";
-                                const summaryDoc = d.summary || "";
-                                const crossFlow = d.cross_action_flow || "";
-                                const text = d.text || "";
-                                const displayText = actionText || summaryDoc || crossFlow || text;
-                                if (displayText) {
-                                    await renderMessage({
-                                        id: `analytic_res_${p.id}`,
-                                        role: "system",
-                                        text: displayText,
-                                        status: 9,
-                                        created_at: Date.now(),
-                                        updated_at: Date.now()
-                                    });
-                                }
-                            }
-                        } catch (e) {
-                            console.warn("[ANALYTIC-LOCAL] Dexie plan execution failed:", e);
-                        }
-                    }
-                }
-
-                // ③ 결과 없음 안내
-                if (resultCount === 0) {
-                    await renderMessage({
-                        id: `${payload.task_id}_empty`,
-                        role: "system",
-                        text: "해당 조건에 맞는 행동 로그를 찾지 못했습니다.",
-                        status: 9,
-                        created_at: Date.now(),
-                        updated_at: Date.now()
-                    });
-                }
-
-                // ④ 상태 정리
-                isSearching = false;
-                stopSpinner();
-                updateExtractButtonVisibility();
-
-                // ⑤ 채팅 스크롤 맨 아래로
-                setTimeout(() => {
-                    const scrollEl = document.getElementById("chat-scroll");
-                    const container = document.querySelector(".chat-container") as HTMLElement;
-                    if (scrollEl && container) {
-                        const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
-                        currentY = maxScroll;
-                        scrollEl.style.transition = "transform 0.3s ease-out";
-                        updateTransform();
-                        setTimeout(() => { scrollEl.style.transition = ""; }, 300);
-                    }
-                }, 100);
-                return;
-            }
-
             openWidget("list");
             if (listView) listView.style.display = "block";
             if (detailView) detailView.style.display = "none";
@@ -5900,7 +5642,6 @@ async function checkAuthStatus() {
             console.log('currentSession',currentSession);
             if (currentSession.email) {
                 await invoke("initialize_hub", { address: currentSession.address, email: currentSession.email, flag: session.flag || "kr" });
-                await fetchOAuthRegisteredSites();
                 updateAuthUI(); fetchChatHistory(); syncData();
             }
         }
@@ -6049,17 +5790,6 @@ function startPolling() {
             } catch (e) {
                 console.error("[POLLING] Error during poll:", e);
             }
-        } else {
-            try {
-                if (currentSession.hash) {
-                    await syncAnalyticsInBackground();
-                } else {
-                    // 🌟 [LOCAL-ONLY] 세션이 없어도(오프라인 · 로그인 전) 로컬에 쌓인 행동 로그는 구조화합니다. 서버에는 접속하지 않습니다.
-                    await runAnalyticLocalTick();
-                }
-            } catch (e) {
-                console.error("[POLLING] Analytics background sync error:", e);
-            }
         }
         const nextInterval = computeSyncInterval();
         if (isFocus) {
@@ -6125,8 +5855,9 @@ async function initSession() {
         console.warn("[GC] translit_cache cleanup failed:", e);
     }
     // 🌟 search_mode 도 여기서 비동기로 불러와 초기화합니다.
+    //    남은 트랙은 commerce / shipping 둘뿐이므로, 이전 버전이 저장한 'analytic' 같은 값은 무시하고 기본값(commerce)을 씁니다.
     const savedSearchMode = await kvGet("search_mode");
-    if (savedSearchMode) {
+    if (savedSearchMode === "commerce" || savedSearchMode === "shipping") {
         currentSearchMode = savedSearchMode;
         applySearchModeUI(); // UI에 즉시 반영
     }
@@ -7787,8 +7518,6 @@ bindModeRuntime({
     getDetectedUrl: () => currentDetectedUrl,
     getActiveTags: () => activeTags as any,
     getCurrentTab: () => currentTab,
-    isBusy: () => isSearching || isExtracting || GlobalTaskManager.isBusy,
-    getDevicePref: () => getDevicePref(),
     getCloudPendingTasks: () => cloudPendingTasks as any,
 
     // ── UI 콜백 ──

@@ -57,7 +57,7 @@ export function decodeCommerceRows(rows: any[]): void {
                 } catch (err) {}
             }
         } else if (typeof item.data === 'string' && item.data.length > 50) {
-            // 🌟 [BASE64 GZIP PATH] syncAnalyticsData 와 동일한 처리.
+            // 🌟 [BASE64 GZIP PATH] base64(gzip) · base64(JSON) 문자열을 풉니다.
             try {
                 const rawBytes = Uint8Array.from(atob(item.data), c => c.charCodeAt(0));
                 const gzip = rawBytes[0] === 0x1f && rawBytes[1] === 0x8b;
@@ -157,7 +157,7 @@ export async function syncCommerceInBackground() {
         });
         if (response.results && Array.isArray(response.results)) {
             decodeCommerceRows(response.results);
-            // 🌟 [TOMBSTONE GUARD] analytic 탭에서도 commerce D1 을 백그라운드로 긁으므로
+            // 🌟 [TOMBSTONE GUARD] shipping 탭에서도 commerce D1 을 백그라운드로 긁으므로
             //    syncCommerceData 와 동일한 부활 경로가 열려 있습니다. 같은 게이트를 적용합니다.
             const bgTombstones = await R.loadTalkTombstones();
             const bgItemTombs = await R.loadItemTombstones();
@@ -231,7 +231,7 @@ export async function syncCommerceInBackground() {
 /**
  * 🌟 [COMMERCE FOREGROUND] 구 main.ts syncData() 의 commerce 본문입니다.
  *  ── 라우팅 계약 ──
- *   main.ts 의 syncData() 가 analytic / shipping 분기를 먼저 처리하고,
+ *   main.ts 의 syncData() 가 shipping 분기를 먼저 처리하고,
  *   commerce 트랙일 때만 이 함수를 await 합니다.
  *   따라서 이 함수는 진입 시점에 hash / email 이 확정되어 있습니다.
  */
