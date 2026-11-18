@@ -21,7 +21,8 @@ const NO_OFFSET = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
 const asUtc = (a) => (typeof a === "string" && NO_OFFSET.test(a.trim()) ? a.trim() + "Z" : a);
 class UTCDate extends RealDate {
   constructor(...args) {
-    if (args.length === 0) super();
+    // 인자 없는 new Date() 도 가상 시계를 따른다 (aws4fetch 의 x-amz-date 등이 두 실행에서 같게)
+    if (args.length === 0) super(t);
     else if (args.length === 1) super(asUtc(args[0]));
     else super(RealDate.UTC(...args));
   }

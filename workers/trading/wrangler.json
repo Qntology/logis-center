@@ -1,0 +1,26 @@
+{
+  "compatibility_date": "2025-12-01",
+  "main": "build/index.js",
+  "build": {
+    "command": "cargo install -q worker-build@0.8.7 --locked && worker-build --release"
+  },
+  "name": "trading-logis-center",
+  "upload_source_maps": true,
+  "routes": [
+    {
+      "pattern": "trading.logis.center",
+      "custom_domain": true
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "trading_logis_center",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}

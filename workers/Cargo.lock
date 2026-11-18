@@ -846,10 +846,13 @@ dependencies = [
 name = "logis-worker-trading"
 version = "0.1.0"
 dependencies = [
+ "flate2",
+ "js-sys",
  "logis-worker-common",
  "regex",
  "url",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "worker",
 ]
 

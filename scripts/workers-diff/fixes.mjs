@@ -70,7 +70,9 @@ export async function patchOriginal(worker, source) {
   let s = source;
   const applied = [];
   for (const fix of [...FIXES, ...(await moreFixes())]) {
-    if (fix.worker !== worker && fix.worker !== "both") continue;
+    // "both" 는 apac · proxy 둘. commerce · trading 은 이름으로만 (배열이면 그 안의 워커들)
+    const targets = Array.isArray(fix.worker) ? fix.worker : fix.worker === "both" ? ["apac", "proxy"] : [fix.worker];
+    if (!targets.includes(worker)) continue;
     const re = fix.find instanceof RegExp ? fix.find : loose(fix.find);
     const n = (s.match(re) || []).length;
     const want = fix.count ?? 1;

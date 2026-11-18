@@ -13,7 +13,11 @@ crate-type = ["cdylib", "rlib"]
 logis-worker-common.workspace = true
 url = "2"
 regex.workspace = true
+# pako 2.2 ungzip (gzip · zlib 자동 감지 · 여러 멤버) 을 원본과 같은 성공/실패로
+flate2.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 worker.workspace = true
 wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
