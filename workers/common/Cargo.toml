@@ -1,6 +1,6 @@
 [package]
 name = "logis-worker-common"
-description = "logis-center Workers 공용: JS 값 모형(V, 참조 공유 · undefined/null · JS 키 순서 · JSON.stringify/parse), D1 · Workers AI · Vectorize 를 JS 그대로 부르는 얇은 층, gzip(pako), Gemini · DeepInfra 호출, 지역 · 언어 표"
+description = "logis-center Workers 공용: JS 값 모형(V, 참조 공유 · undefined/null · JS 키 순서 · JSON.stringify/parse), D1 · Workers AI · Vectorize 를 JS 그대로 부르는 얇은 층, gzip(pako), Gemini · DeepInfra 호출, 지역 · 언어 표, aws4fetch(S3 SigV4) · ethers 주소"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,12 @@ flate2.workspace = true
 regex.workspace = true
 fancy-regex.workspace = true
 logis-schema.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+k256.workspace = true
+tiny-keccak.workspace = true
+getrandom.workspace = true
+url.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 worker.workspace = true

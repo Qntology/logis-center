@@ -28,6 +28,13 @@ flate2 = "1"
 regex = "1"
 fancy-regex = "0.18"
 scraper = "0.25"
+# aws4fetch(S3 SigV4) · ethers 주소 — 순수 Rust (wasm 에서도 그대로). 판은 premium-discount-identity 가 잠근 것과 같다
+hmac = "0.12"
+sha2 = "0.10"
+k256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa"] }
+tiny-keccak = { version = "2", features = ["keccak"] }
+getrandom = "0.3"
+url = "2"
 # 앱과 같은 엔터티 해시 (ethers.computeAddress(ethers.hashMessage(text)) 와 같음)
 logis-schema = { path = "../crates/logis-schema" }
 logis-worker-common = { path = "common" }
