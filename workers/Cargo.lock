@@ -793,6 +793,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "logis-worker-commerce"
+version = "0.1.0"
+dependencies = [
+ "logis-worker-common",
+ "regex",
+ "url",
+ "wasm-bindgen",
+ "worker",
+]
+
+[[package]]
 name = "logis-worker-common"
 version = "0.1.0"
 dependencies = [
@@ -821,6 +832,17 @@ dependencies = [
  "scraper",
  "selectors",
  "serde_json",
+ "url",
+ "wasm-bindgen",
+ "worker",
+]
+
+[[package]]
+name = "logis-worker-trading"
+version = "0.1.0"
+dependencies = [
+ "logis-worker-common",
+ "regex",
  "url",
  "wasm-bindgen",
  "worker",

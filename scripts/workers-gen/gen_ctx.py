@@ -1,16 +1,18 @@
-"""원본 fetch 처리기(2354~6487 줄)의 `var` 를 모두 모아 Ctx 구조체로. usage: python gen_ctx.py <index.ts> <out ctx.rs>"""
+"""원본 fetch 처리기의 `var` 를 모두 모아 Ctx 구조체로. usage: python gen_ctx.py <index.ts> <out ctx.rs> [시작 줄 끝 줄] (기본: proxy 2354 6487)"""
 import re
 import sys
 
 src = open(sys.argv[1], encoding='utf-8').read().split('\n')
-body = '\n'.join(src[2353:6487])
+start, end = (int(sys.argv[3]), int(sys.argv[4])) if len(sys.argv) > 4 else (2354, 6487)
+body = '\n'.join(src[start - 1:end])
 names = set(re.findall(r'\bvar\s+([A-Za-z_$][\w$]*)', body))
 for m in re.finditer(r'\bvar\s*\{([^}]*)\}', body):
-    for p in m.group(1).split(','):
+    # 구조 분해 안의 주석(// … · /* … */)은 걷어 낸다
+    for p in re.sub(r'//[^\n]*|/\*.*?\*/', '', m.group(1), flags=re.S).split(','):
         p = p.strip()
         if ':' in p:
             p = p.split(':')[1].strip()
-        if p:
+        if re.fullmatch(r'[A-Za-z_$][\w$]*', p):
             names.add(p)
 
 KEYWORDS = {'type', 'match', 'ref', 'in', 'fn', 'loop', 'move', 'use', 'where', 'self', 'mod', 'impl', 'let', 'mut', 'pub', 'static', 'struct', 'trait', 'enum', 'const', 'crate', 'super', 'as', 'break', 'continue', 'else', 'extern', 'false', 'true', 'for', 'if', 'return', 'unsafe', 'while', 'async', 'await', 'dyn', 'abstract', 'become', 'box', 'do', 'final', 'macro', 'override', 'priv', 'typeof', 'unsized', 'virtual', 'yield', 'try'}

@@ -256,3 +256,54 @@ pub async fn response_json(res: &JsValue) -> R<V> {
     let r = V::ext(Js(res.clone()));
     call_async(&r, "json", &[]).await
 }
+
+/// worker::Request → [`crate::web::Req`] (`request.cf` 는 JS 값 그대로)
+pub async fn req_from(mut req: worker::Request) -> crate::web::Req {
+    let method = req.method().to_string().to_uppercase();
+    let url = req.url().map(|u| u.to_string()).unwrap_or_default();
+    let headers: Vec<(String, String)> = req.headers().entries().map(|(k, v)| (k.to_ascii_lowercase(), v)).collect();
+    let cf = Reflect::get(req.inner(), &JsValue::from_str("cf")).map(|v| to_v(&v)).unwrap_or(V::Undef);
+    let body = req.bytes().await.unwrap_or_default();
+    crate::web::Req { method, url, headers, cf, body }
+}
+
+/// [`crate::web::Resp`] → worker::Response (같은 이름의 머리글은 append 로 여럿)
+pub fn resp_into(resp: crate::web::Resp) -> worker::Result<worker::Response> {
+    let headers = worker::Headers::new();
+    for (k, v) in &resp.headers {
+        headers.append(k, v)?;
+    }
+    let base = match resp.body {
+        crate::web::Body::Text(t) => worker::Response::ok(t)?,
+        crate::web::Body::Bytes(b) => worker::Response::from_bytes(b)?,
+        crate::web::Body::Empty => worker::Response::empty()?,
+    };
+    Ok(base.with_status(resp.status).with_headers(headers))
+}
+
+/// `response.headers.get(name)` (없으면 null)
+pub fn response_header(res: &JsValue, name: &str) -> R<V> {
+    let headers = Reflect::get(res, &"headers".into()).map_err(to_throw)?;
+    let h = V::ext(Js(headers));
+    Ok(to_v(&call(&h, "get", &[JsValue::from_str(name)])?))
+}
+
+/// `response.headers.forEach((value, key) => …)` 의 순서 (이름 소문자 · 정렬 — Fetch Headers 의 반복 순서)
+pub fn response_headers(res: &JsValue) -> R<Vec<(String, String)>> {
+    let headers = Reflect::get(res, &"headers".into()).map_err(to_throw)?;
+    let h = V::ext(Js(headers));
+    let entries = call(&h, "entries", &[])?;
+    let arr = js_sys::Array::from(&entries);
+    Ok(arr
+        .iter()
+        .filter_map(|pair| {
+            let p: &Array = pair.unchecked_ref();
+            Some((p.get(0).as_string()?, p.get(1).as_string()?))
+        })
+        .collect())
+}
+
+/// `response.status`
+pub fn response_status(res: &JsValue) -> f64 {
+    Reflect::get(res, &"status".into()).ok().and_then(|v| v.as_f64()).unwrap_or(0.0)
+}
