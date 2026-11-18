@@ -231,7 +231,7 @@ jobs:
       - name: mock granite model (seeded, identical on every platform)
         run: |
           pip install -q numpy
-          python -I logis-center/commerce/src-tauri/tests/fixtures/granite_mock/gen_granite_mock.py "$RUNNER_TEMP/mock-models"
+          python -I logis-center/commerce/app/tests/fixtures/granite_mock/gen_granite_mock.py "$RUNNER_TEMP/mock-models"
       - name: MoltenVK
         if: matrix.backend == 'vulkan'
         run: |

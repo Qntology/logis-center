@@ -130,7 +130,7 @@ pub fn build_scope_filter(ctx: &Value, search_mode: &str) -> Option<String> {
     // ── 시간 범위 : created_at / updated_at 은 봉투 물리 컬럼이므로 SQL 로 좁히는 게 이득 ──
     //    (전체 문서에서 기간 밖 데이터를 미리 걷어내면 벡터 검색 후보가 줄어 리콜 품질이 올라갑니다)
     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
-        for (key, val_obj) in cond {
+        for (key, val_obj) in logis_schema::json_order::sorted_iter(cond) {
             let envelope_col = match key.as_str() {
                 "created_at" => "created_at",
                 "updated_at" => "updated_at",
@@ -286,7 +286,7 @@ pub fn build_dexie_plan(ctx: &Value, search_mode: &str) -> Value {
         .and_then(|v| v.as_str())
         .map_or(false, |t| crate::utils::canonical::decimal_comma_lang(&crate::utils::lang_utils::detect_document_language(t)));
     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
-        for (key, val_obj) in cond {
+        for (key, val_obj) in logis_schema::json_order::sorted_iter(cond) {
             // created_at / updated_at 은 build_scope_filter 가 이미 SQL 로 처리했으므로 중복 제외
             if key == "created_at" || key == "updated_at" { continue; }
 
@@ -454,7 +454,7 @@ pub fn dexie_value_passes(op: &str, kind: &str, have: &Value, want: &Value) -> b
     let as_text = |v: &Value| -> String {
         match v {
             Value::String(s) => s.trim().to_lowercase(),
-            other => other.to_string().trim_matches('"').to_lowercase(),
+            other => logis_schema::json_order::to_string_sorted(&other).trim_matches('"').to_lowercase(),
         }
     };
     if kind == "number" {
@@ -594,7 +594,7 @@ pub fn evaluate_dexie_hints(plan: &Value, docs: &[Value]) -> Vec<(String, usize,
         None => return Vec::new(),
     };
     let mut out: Vec<(String, usize, usize, usize)> = Vec::new();
-    for (field, spec) in hints.iter() {
+    for (field, spec) in logis_schema::json_order::sorted_iter(&hints) {
         let op = spec.get("operator").and_then(|v| v.as_str()).unwrap_or("contains");
         let want = spec.get("value").cloned().unwrap_or(Value::Null);
         if want.is_null() { continue; }
@@ -668,7 +668,7 @@ pub fn doc_axis_values<'a>(doc: &'a Value, field: &str) -> Vec<&'a Value> {
             _ => {}
         }
     }
-    for node in obj.values() {
+    for node in logis_schema::json_order::sorted_values(obj) {
         match node {
             Value::Object(o) => {
                 if let Some(v) = o.get(field).filter(|v| scalar(v)) {
@@ -696,7 +696,7 @@ pub fn collect_storage_axes(docs: &[Value]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for d in docs.iter() {
         if let Some(obj) = d.as_object() {
-            for (k, v) in obj.iter() {
+            for (k, v) in logis_schema::json_order::sorted_iter(obj) {
                 if v.is_null() { continue; }
                 if let Some(s) = v.as_str() {
                     if s.trim().is_empty() { continue; }
@@ -1178,7 +1178,7 @@ pub async fn ground_conditions<E: Fn(&str)>(store: &VectorStore, structured: &mu
             .map(|a| a.iter().filter_map(|t| t.as_str().map(|s| s.strip_suffix("_items").unwrap_or(s).to_string())).collect())
             .unwrap_or_default();
         let mut demoted: Vec<(String, Value)> = Vec::new();
-        for (key, spec) in cond.iter() {
+        for (key, spec) in logis_schema::json_order::sorted_iter(&cond) {
             let field = crate::utils::bias_schema::canonical_field_name(key).to_string();
             let format = crate::utils::ai_utils::detect_field_format(&field);
             // 상태는 코드로, 날짜는 시각으로 저장되어 글자로 대조할 수 없습니다.
@@ -1191,7 +1191,7 @@ pub async fn ground_conditions<E: Fn(&str)>(store: &VectorStore, structured: &mu
                 // 순위 조건은 맥락의 유형에 그 칸이 있어야 뜻이 있습니다. 상품에는 무게가 없는데 'Lightweight' 가 무게 하위 20% 를 만들었습니다.
                 if sample.is_none() {
                     let rows = store.rows_mentioning(&scope, "", SAMPLE_ROWS).await.unwrap_or_default();
-                    sample = Some(rows.iter().filter_map(|r| serde_json::from_str::<Value>(r).ok()).collect());
+                    sample = Some(rows.iter().filter_map(|r| serde_json::from_str::<Value>(r).map(logis_schema::json_order::sorted).ok()).collect());
                 }
                 sample.as_deref().unwrap_or_default().iter().any(|r| {
                     r.get("type").and_then(|t| t.as_str()) == Some(ctx_type.as_str()) && r.get(field.as_str()).and_then(number_of).is_some()
@@ -1200,7 +1200,7 @@ pub async fn ground_conditions<E: Fn(&str)>(store: &VectorStore, structured: &mu
                 let Some(target) = spec.get("value").and_then(number_of) else { continue };
                 if sample.is_none() {
                     let rows = store.rows_mentioning(&scope, "", SAMPLE_ROWS).await.unwrap_or_default();
-                    sample = Some(rows.iter().filter_map(|r| serde_json::from_str::<Value>(r).ok()).collect());
+                    sample = Some(rows.iter().filter_map(|r| serde_json::from_str::<Value>(r).map(logis_schema::json_order::sorted).ok()).collect());
                 }
                 let rows = sample.as_deref().unwrap_or_default();
                 let known = rows.iter().filter(|r| in_types(r, &types)).filter_map(|r| r.get(field.as_str()).and_then(number_of));
@@ -1222,7 +1222,7 @@ pub async fn ground_conditions<E: Fn(&str)>(store: &VectorStore, structured: &mu
                 if format == FieldFormat::Numeric && value.chars().all(|c| c.is_ascii_digit() || c == '.') { continue; }
                 match store.rows_mentioning(&scope, value, LITERAL_ROWS).await {
                     Ok(rows) => rows.iter().any(|r| {
-                        serde_json::from_str::<Value>(r)
+                        serde_json::from_str::<Value>(r).map(logis_schema::json_order::sorted)
                             .map_or(false, |d| in_types(&d, &types) && crate::search_fusion::field_contains(&d, &field, value))
                     }),
                     Err(_) => true,
@@ -1258,7 +1258,7 @@ pub async fn ground_conditions<E: Fn(&str)>(store: &VectorStore, structured: &mu
         }
         emit(&format!(
             "[AI-SEARCH] ⚓ [CONDITION GROUNDING] 저장 데이터로 통과시킬 수 없어 힌트로 내립니다: {:?}",
-            demoted.iter().map(|(k, s)| format!("{} {} {}", k, s.get("operator").unwrap_or(&Value::Null), s.get("value").unwrap_or(&Value::Null))).collect::<Vec<_>>()
+            demoted.iter().map(|(k, s)| format!("{} {} {}", k, logis_schema::json_order::Sorted(s.get("operator").unwrap_or(&Value::Null)), logis_schema::json_order::Sorted(s.get("value").unwrap_or(&Value::Null)))).collect::<Vec<_>>()
         ));
     }
 }
@@ -1388,7 +1388,7 @@ pub fn ground_trade_conditions<E: Fn(&str)>(structured: &mut Value, query: &str,
         emit(&format!(
             "[AI-SEARCH] ⚓ [TRADE GROUNDING] 질의에 근거가 없는 서식 조건을 버리고 {:?}, 글자 값 조건은 힌트로 내립니다 {:?}",
             dropped,
-            hinted.iter().map(|(k, s)| format!("{} = {}", k, s.get("value").unwrap_or(&Value::Null))).collect::<Vec<_>>()
+            hinted.iter().map(|(k, s)| format!("{} = {}", k, logis_schema::json_order::Sorted(s.get("value").unwrap_or(&Value::Null)))).collect::<Vec<_>>()
         ));
     }
 }
@@ -1475,7 +1475,7 @@ pub async fn fuse_whole_query<E: Fn(&str)>(
         .filter(|id| {
             data_of
                 .get(*id)
-                .and_then(|d| serde_json::from_str::<Value>(d).ok())
+                .and_then(|d| serde_json::from_str::<Value>(d).map(logis_schema::json_order::sorted).ok())
                 .and_then(|d| d.get("type").and_then(|t| t.as_str()).map(|t| domains.iter().any(|x| x == t)))
                 .unwrap_or(false)
         })
@@ -1505,7 +1505,7 @@ pub async fn fuse_whole_query<E: Fn(&str)>(
             Some(r) => r,
             None => {
                 let data = data_of.get(id).cloned().unwrap_or_default();
-                let doc_type = serde_json::from_str::<Value>(&data)
+                let doc_type = serde_json::from_str::<Value>(&data).map(logis_schema::json_order::sorted)
                     .ok()
                     .and_then(|d| d.get("type").and_then(|t| t.as_str()).map(str::to_string))
                     .unwrap_or_default();
@@ -1590,7 +1590,7 @@ pub async fn ai_search_complex(
             from: "user".to_string(),
             to: "system".to_string(),
             cc: cc.clone(), bcc: bcc.clone(), r#ref: ref_id.clone(), 
-            data_json: json!({"query": query.clone(), "mode": search_mode.clone()}).to_string(),
+            data_json: logis_schema::json_order::to_string_sorted(&json!({"query": query.clone(), "mode": search_mode.clone()})),
             created_at: now + 1, updated_at: now + 1,
             status: 10, 
         };
@@ -1720,9 +1720,9 @@ pub async fn ai_search_complex(
         
         if let Some(store) = store_opt.as_ref() {
             if let Ok(Some(doc)) = store.get_item_by_id("users", &team_id).await {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&doc.json_data) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&doc.json_data).map(logis_schema::json_order::sorted) {
                     if let Some(base) = val.get("base") {
-                        metrics_json_str = base.to_string();
+                        metrics_json_str = logis_schema::json_order::to_string_sorted(&base);
                     }
                 }
             }
@@ -1923,7 +1923,7 @@ pub async fn ai_search_complex(
                 } else {
                     let mut parts: Vec<String> = Vec::new();
                     if let Some(cond) = ctx.get("condition").and_then(|v| v.as_object()) {
-                        for (_, v) in cond {
+                        for (_, v) in logis_schema::json_order::sorted_iter(cond) {
                             if let Some(s) = v.get("value").and_then(|x| x.as_str()) {
                                 let t = s.trim();
                                 if !t.is_empty() && !parts.iter().any(|p| p == t) {
@@ -2095,7 +2095,7 @@ pub async fn ai_search_complex(
                     let mut hint_props: Vec<String> = Vec::new();
                     let mut condition_props: Vec<String> = hard_props.clone();
                     if let Some(hint_obj) = ctx.get("hint").and_then(|v| v.as_object()) {
-                        for k in hint_obj.keys() {
+                        for k in logis_schema::json_order::sorted_keys(hint_obj) {
                             if hard_props.iter().any(|p| p == k) { continue; }
                             if !hint_props.iter().any(|p| p == k) { hint_props.push(k.clone()); }
                             if !condition_props.iter().any(|p| p == k) {
@@ -2599,7 +2599,7 @@ pub async fn ai_search_complex(
                             for axis in projection_axes.iter() {
                                 let hit = data.get(axis.as_str()).cloned().or_else(|| {
                                     data.as_object().and_then(|o| {
-                                        o.values()
+                                        logis_schema::json_order::sorted_values(o)
                                             .filter_map(|v| v.as_object())
                                             .find_map(|inner| inner.get(axis.as_str()).cloned())
                                     })
@@ -2675,7 +2675,7 @@ pub async fn ai_search_complex(
                 let mut unresolved = 0usize;
                 for r in ranked_results.iter() {
                     let inline = match r.get("text") {
-                        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+                        Some(Value::String(s)) => serde_json::from_str::<Value>(s).map(logis_schema::json_order::sorted).ok(),
                         Some(v) if v.is_object() => Some(v.clone()),
                         _ => None,
                     };
@@ -2693,7 +2693,7 @@ pub async fn ai_search_complex(
                         Some(store) => store.get_item_by_id("items", id).await.ok().flatten(),
                         None => None,
                     };
-                    match fetched.and_then(|d| serde_json::from_str::<Value>(&d.json_data).ok()) {
+                    match fetched.and_then(|d| serde_json::from_str::<Value>(&d.json_data).map(logis_schema::json_order::sorted).ok()) {
                         Some(d) => {
                             docs.push(d);
                             hydrated += 1;

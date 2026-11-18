@@ -303,7 +303,7 @@ pub async fn find_referrers(
     };
     docs.into_iter()
         .filter_map(|d| {
-            let v: Value = serde_json::from_str(&d.json_data).ok()?;
+            let v: Value = serde_json::from_str(&d.json_data).map(logis_schema::json_order::sorted).ok()?;
             if is_relay_placeholder(&v) {
                 return None;
             }
@@ -323,7 +323,7 @@ async fn find_tracking_by_number(store: &VectorStore, tn: &str, self_id: &str) -
         if d.id == self_id {
             return None;
         }
-        let v: Value = serde_json::from_str(&d.json_data).ok()?;
+        let v: Value = serde_json::from_str(&d.json_data).map(logis_schema::json_order::sorted).ok()?;
         let idx = relay_ref_index(v.get("index"))?;
         Some((d.id, idx))
     })
@@ -331,7 +331,7 @@ async fn find_tracking_by_number(store: &VectorStore, tn: &str, self_id: &str) -
 
 async fn load_doc(store: &VectorStore, id: &str) -> (Option<TradeDocument>, Option<Value>) {
     let doc = store.get_item_by_id("items", id).await.ok().flatten();
-    let json_val = doc.as_ref().and_then(|d| serde_json::from_str::<Value>(&d.json_data).ok());
+    let json_val = doc.as_ref().and_then(|d| serde_json::from_str::<Value>(&d.json_data).map(logis_schema::json_order::sorted).ok());
     (doc, json_val)
 }
 
@@ -607,7 +607,7 @@ impl RelayJoinReport {
 fn result_doc(r: &Value) -> Option<Value> {
     match r.get("text") {
         Some(Value::Object(_)) => r.get("text").cloned(),
-        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok().filter(|v| v.is_object()),
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).map(logis_schema::json_order::sorted).ok().filter(|v| v.is_object()),
         _ => None,
     }
 }
@@ -671,7 +671,7 @@ fn date_axis(doc: &Value) -> Option<(String, String)> {
         }
     }
     let obj = doc.as_object()?;
-    for (k, v) in obj.iter() {
+    for (k, v) in logis_schema::json_order::sorted_iter(obj) {
         if matches!(k.as_str(), "created_at" | "updated_at") {
             continue;
         }
@@ -933,7 +933,7 @@ pub async fn relay_join(
                     if partners.iter().any(|(id, _)| *id == d.id) {
                         continue;
                     }
-                    if let Ok(v) = serde_json::from_str::<Value>(&d.json_data) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&d.json_data).map(logis_schema::json_order::sorted) {
                         if !is_relay_placeholder(&v) {
                             partners.push((d.id, v));
                         }
@@ -1175,7 +1175,7 @@ pub async fn relay_join(
         emit(&format!(
             "[AI-SEARCH] 🔗 [RELAY PERIOD JOIN] '{}' 질의의 기간은 판매·거래 관계의 시점이라 기간 {:?} ~ {:?} 을 연결 타입 {:?} 의 날짜 축 {:?} 로 옮겼습니다. 기간 안 연결 문서 {}건(취소·환불·반품 {}건 포함)이 '{}' 로 가리키는 {} {}건을 결과 집합으로 확정합니다 (재회수 {}건 · 기간 밖/미연결 제외 {}건 · 취소 건만 가리켜진 제외 {}건). 판매 수량 합 {}개 (취소·환불·반품 {}개를 뺀 값 · 빼기 전 {}개){}",
             primary, start, end, partner_types, date_fields, in_period_ids.len(), void_partners, key, primary, hits.len(), rescued_ids.len(), dropped, void_only.len(),
-            unit_json(units_net_total), unit_json(void_units_total), unit_json(units_total),
+            logis_schema::json_order::Sorted(&unit_json(units_net_total)), logis_schema::json_order::Sorted(&unit_json(void_units_total)), logis_schema::json_order::Sorted(&unit_json(units_total)),
             if units_exact { " — 연결 문서의 quantity 를 그대로 더했습니다." } else { " — quantity 가 없거나 한 문서가 여러 상대를 가리키는 경우는 1개로 셌습니다(relay_period_units_exact=false)." }
         ));
         crate::utils::score_dynamics::restore_scope(caller_scope.clone());

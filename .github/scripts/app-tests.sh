@@ -24,6 +24,10 @@ case "$BACKEND" in
   *) echo "unknown backend $BACKEND"; exit 2 ;;
 esac
 
+# The it suite is commerce/app/tests/it (package logis-app, no Tauri in the test binary). -p logis-center only makes the
+# build use the desktop app's feature set (same dependency artifacts as the shell build).
+IT=(-p logis-center -p logis-app --test it)
+
 # tauri::generate_context! needs ../dist; bundle.resources "dlls/*" needs one file.
 [ -f dist/index.html ] || { mkdir -p dist; echo '<html></html>' > dist/index.html; }
 mkdir -p src-tauri/dlls; [ -n "$(ls -A src-tauri/dlls)" ] || touch src-tauri/dlls/.gitkeep
@@ -40,7 +44,7 @@ embed() {
   local tests=(app_embed::gpu_embed_many_matches_per_text_and_is_faster)
   [ "$kind" = main ] && [ "${EMBED_COMPARE:-1}" != speed ] && tests+=(app_embed::embed_many_decisions_match_per_text)
   run "$label" env LOGIS_TEST_MODELS=1 LOGIS_REQUIRE_MODELS=1 LOGIS_MODELS_DIR="$root" "$@" \
-    cargo test --test it "${FEAT[@]}" -- "${tests[@]}" --ignored --nocapture --test-threads 1
+    cargo test "${IT[@]}" "${FEAT[@]}" -- "${tests[@]}" --ignored --nocapture --test-threads 1
   require_measured "$label" "\\[EMBED-SUMMARY\\]"
 }
 CPU_ENV=(); [ "$BACKEND" = cpu ] && CPU_ENV=(LOGIS_TEST_EMBED_DEVICE=cpu)
@@ -63,15 +67,15 @@ case "$PHASE" in
 build)
   git -C ../../../candle-rocm-vulkan log --oneline -n 1 > "$OUT/fork-head.txt" 2>/dev/null || true
   grep -n "candle-rocm-vulkan" Cargo.toml ../../Cargo.toml > "$OUT/cargo-fork-lines.txt" || true
-  run build cargo test --test it "${FEAT[@]}" --no-run
+  run build cargo test "${IT[@]}" "${FEAT[@]}" --no-run
   ;;
 suite)
   # regression: the non-ignored suite (CPU paths; GPU modules for metal/vulkan builds)
-  run suite cargo test --test it "${FEAT[@]}" -- --test-threads 2
+  run suite cargo test "${IT[@]}" "${FEAT[@]}" -- --test-threads 2
   if [ "$BACKEND" = cpu ]; then
-    run suite-packed env LOGIS_EMBED_CPU_KERNEL=packed cargo test --test it "${FEAT[@]}" -- --test-threads 2
+    run suite-packed env LOGIS_EMBED_CPU_KERNEL=packed cargo test "${IT[@]}" "${FEAT[@]}" -- --test-threads 2
   else
-    run qwen4-exp-gpu env LOGIS_REQUIRE_GPU=0 cargo test --test it "${FEAT[@]}" -- qwen4_exp_tiny_gpu_matches_hf --nocapture
+    run qwen4-exp-gpu env LOGIS_REQUIRE_GPU=0 cargo test "${IT[@]}" "${FEAT[@]}" -- qwen4_exp_tiny_gpu_matches_hf --nocapture
     require_measured qwen4-exp-gpu "QWEN4-EXP\\] +variant_a on (Metal|Vulkan)"
   fi
   ;;
@@ -93,7 +97,7 @@ bench)
   [ "$BACKEND" = cpu ] || { echo "bench phase: cpu only"; exit 0; }
   sysctl -a 2>/dev/null | grep -E 'hw\.(perflevel|l1|l2|l3|cachelinesize|ncpu)' > "$OUT/cpu-caches.txt" || lscpu > "$OUT/cpu-caches.txt" || true
   # [MAC-SSD-IO] KV block SSD offload: parallel pread/pwrite + F_NOCACHE vs std::fs
-  run kv-io-bench env LOGIS_IO_BENCH_MB=512 cargo test --test it "${FEAT[@]}" -- direct_loader::kv_block_io_bench --ignored --nocapture --test-threads 1
+  run kv-io-bench env LOGIS_IO_BENCH_MB=512 cargo test "${IT[@]}" "${FEAT[@]}" -- direct_loader::kv_block_io_bench --ignored --nocapture --test-threads 1
   require_measured kv-io-bench "\\[KV-IO\\] best"
   # 3-2: packed-kernel contract + CPU profile / custom kernels (mock weights)
   run cpu-kernel-contract cargo test --release --manifest-path ../crates/embed-cpu-kernels/Cargo.toml
@@ -122,24 +126,24 @@ accel)
   # state (GDN override, accel config) or measures device-wide memory, so each runs alone (--test-threads 1).
   want() { case ",${ACCEL_TESTS:-gdn,gpu-mem,kv35,vk-auto,fa}," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
   if want qwen4; then
-    run qwen4-exp-gpu env LOGIS_REQUIRE_GPU=0 cargo test --test it "${FEAT[@]}" -- qwen4_exp_tiny_gpu_matches_hf --nocapture
+    run qwen4-exp-gpu env LOGIS_REQUIRE_GPU=0 cargo test "${IT[@]}" "${FEAT[@]}" -- qwen4_exp_tiny_gpu_matches_hf --nocapture
     require_measured qwen4-exp-gpu "QWEN4-EXP\\] +variant_a on (Metal|Vulkan)"
   fi
   # Fused GDN (CPU kernel) vs the tensor path on CPU and on this build's GPU: numbers + time.
-  want gdn && run gdn-path cargo test --test it "${FEAT[@]}" -- qwen4_exp::gdn_fused --ignored --nocapture --test-threads 1
+  want gdn && run gdn-path cargo test "${IT[@]}" "${FEAT[@]}" -- qwen4_exp::gdn_fused --ignored --nocapture --test-threads 1
   want gdn && require_measured gdn-path "\\[GDN-PATH\\] (Metal|Vulkan)"
   # Device memory reported / returned (Metal: fork patch 0003), KV-PLAN inputs, KV tiers on the GPU.
   if want gpu-mem; then
-    run gpu-mem cargo test --test it "${FEAT[@]}" -- gpu_memory:: --ignored --nocapture --test-threads 1
+    run gpu-mem cargo test "${IT[@]}" "${FEAT[@]}" -- gpu_memory:: --ignored --nocapture --test-threads 1
     require_measured gpu-mem "\\[GPU-MEM\\] .*total"
   fi
   if want vision; then
-    run vision-batch cargo test --test it "${FEAT[@]}" -- vision_batch --ignored --nocapture --test-threads 1
+    run vision-batch cargo test "${IT[@]}" "${FEAT[@]}" -- vision_batch --ignored --nocapture --test-threads 1
     require_measured vision-batch "\\[VISION-BATCH\\] 구 인코딩"
   fi
   if want kv35; then
     # Qwen3.5 KV plan v2 on a mock Qwen3.5 (GGUF): Vram / Ram / Ssd tiers, GDN state on the device, kv_exact.
-    run qwen35-kv cargo test --test it "${FEAT[@]}" -- qwen35_kv::qwen35_kv_tiers qwen35_kv::qwen35_kv_ssd --ignored --nocapture --test-threads 1
+    run qwen35-kv cargo test "${IT[@]}" "${FEAT[@]}" -- qwen35_kv::qwen35_kv_tiers qwen35_kv::qwen35_kv_ssd --ignored --nocapture --test-threads 1
     require_measured qwen35-kv "\\[QWEN35-KV\\] 목업 Qwen3.5 · (Metal|Vulkan)"
   fi
   if [ "$BACKEND" = vulkan ] && want vk-auto; then
@@ -151,15 +155,15 @@ accel)
   # Compressed (TurboQuant) KV blocks exist on Vulkan only (no Metal kernels); they need the FA/TQ build too.
   kv35_tq=false; [ "$BACKEND" = vulkan ] && want kv35 && kv35_tq=true
   if want fa || $kv35_tq; then
-    run accel-build cargo test --test it "${ACCEL_FEAT[@]}" --no-run
+    run accel-build cargo test "${IT[@]}" "${ACCEL_FEAT[@]}" --no-run
   fi
   if want fa; then
-    run accel-acc cargo test --test it "${ACCEL_FEAT[@]}" -- accel_accuracy --ignored --nocapture --test-threads 1
+    run accel-acc cargo test "${IT[@]}" "${ACCEL_FEAT[@]}" -- accel_accuracy --ignored --nocapture --test-threads 1
     require_measured accel-acc "\\[ACCEL-ACC\\]"
   fi
   if $kv35_tq; then
     # LOGIS_KV_PRECISION is read once per process, so its own run.
-    run qwen35-kv-compressed env LOGIS_KV_PRECISION=compressed cargo test --test it "${ACCEL_FEAT[@]}" -- qwen35_kv::qwen35_kv_compressed --ignored --nocapture --test-threads 1
+    run qwen35-kv-compressed env LOGIS_KV_PRECISION=compressed cargo test "${IT[@]}" "${ACCEL_FEAT[@]}" -- qwen35_kv::qwen35_kv_compressed --ignored --nocapture --test-threads 1
     require_measured qwen35-kv-compressed "\\[QWEN35-KV\\] 압축 KV"
   fi
   ;;

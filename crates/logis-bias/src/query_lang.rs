@@ -66,7 +66,7 @@ pub fn collect_vocab(v: &Value, out: &mut HashSet<String>) {
     match v {
         Value::String(s) => out.extend(vocab_words(s)),
         Value::Array(a) => a.iter().for_each(|x| collect_vocab(x, out)),
-        Value::Object(o) => o.values().for_each(|x| collect_vocab(x, out)),
+        Value::Object(o) => logis_schema::json_order::sorted_values(o).for_each(|x| collect_vocab(x, out)),
         _ => {}
     }
 }

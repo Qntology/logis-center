@@ -587,7 +587,7 @@ pub async fn process_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    let mut task_data: Value = serde_json::from_str(&task.data_json).map(logis_schema::json_order::sorted).unwrap_or(json!({}));
     
     
     let search_mode = task_data.get("search_mode").and_then(|s| s.as_str()).unwrap_or("commerce").to_string();
@@ -983,7 +983,7 @@ pub async fn process_task(
             let mut final_cache = None;
 
             for page_doc in potential_caches {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&page_doc.json_data) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&page_doc.json_data).map(logis_schema::json_order::sorted) {
                     let cached_detail = val.get("detail").and_then(|v| v.as_bool()).unwrap_or(false);
                     let node_sel = val.get("node").or_else(|| val.get("parent")).and_then(|v| v.as_str()).unwrap_or("");
                     let item_sel = val.get("item").or_else(|| val.get("itemSelector")).and_then(|v| v.as_str()).unwrap_or("");
@@ -1396,7 +1396,7 @@ pub async fn process_task(
                     nodes_json.push(serde_json::json!(serde_json::Value::Null));
                 }
             }
-            serde_json::to_string(&nodes_json).unwrap_or_default()
+            serde_json::to_string(&logis_schema::json_order::SortedSlice(&nodes_json)).unwrap_or_default()
         };
 
         {
@@ -3354,7 +3354,7 @@ pub async fn process_task(
                         }
                     }
                     
-                    let nodes_str = serde_json::to_string(&nodes_json)?;
+                    let nodes_str = serde_json::to_string(&logis_schema::json_order::SortedSlice(&nodes_json))?;
                     let titles_str = serde_json::to_string(&titles)?;
 
                     let js_template = get_boa_js_template();
@@ -3537,7 +3537,7 @@ pub async fn process_task(
                                         for x in a { harvest_selector_strings(x, out); }
                                     }
                                     serde_json::Value::Object(o) => {
-                                        for (_, x) in o { harvest_selector_strings(x, out); }
+                                        for (_, x) in logis_schema::json_order::sorted_iter(o) { harvest_selector_strings(x, out); }
                                     }
                                     _ => {}
                                 }
@@ -4753,7 +4753,7 @@ pub async fn process_task(
                         }
                     }
                 }
-                let filtered_full_item_pug = serde_json::to_string_pretty(&json_contexts).unwrap_or_default();
+                let filtered_full_item_pug = serde_json::to_string_pretty(&logis_schema::json_order::SortedSlice(&json_contexts)).unwrap_or_default();
 
                 let mut item_val = json!({});
                 let mut global_ignore_list: Vec<String> = Vec::new();
@@ -5026,7 +5026,7 @@ pub async fn process_task(
                         if let Some(o) = c.as_object_mut() { o.remove("line_rank"); }
                         c
                     }).collect();
-                    serde_json::to_string_pretty(&clean_hints).unwrap_or_default()
+                    serde_json::to_string_pretty(&logis_schema::json_order::SortedSlice(&clean_hints)).unwrap_or_default()
                 } else {
                     String::new()
                 };
@@ -5968,7 +5968,7 @@ pub async fn process_task(
 
                                 
                                 if let Some(obj) = parsed_val.as_object_mut() {
-                                    let ks: Vec<String> = obj.keys().cloned().collect();
+                                    let ks: Vec<String> = logis_schema::json_order::sorted_keys(obj).cloned().collect();
                                     for k in ks {
                                         let cleaned = match obj.get(&k) {
                                             Some(serde_json::Value::String(s)) => Some(strip_markup_prefix(s)),
@@ -6241,7 +6241,7 @@ pub async fn process_task(
                                 for k in &keys {
                                     if let Some(val) = parsed_val.get(*k) {
                                         item_val.as_object_mut().unwrap().insert(k.to_string(), val.clone());
-                                        extracted_results.push(format!("\"{}\": {}", k, val));
+                                        extracted_results.push(format!("\"{}\": {}", k, logis_schema::json_order::Sorted(&val)));
                                         
                                         let val_str = if val.is_string() { val.as_str().unwrap().trim().to_string() }
                                                       else if val.is_number() { val.to_string() }
@@ -6285,8 +6285,8 @@ pub async fn process_task(
                 }
 
 
-                let mut temp_id = item_val.get("id").and_then(|v| if v.is_string() { v.as_str().map(|s| s.to_string()) } else { Some(v.to_string()) }).unwrap_or_default();
-                let mut temp_code = item_val.get("code").and_then(|v| if v.is_string() { v.as_str().map(|s| s.to_string()) } else { Some(v.to_string()) }).unwrap_or_default();
+                let mut temp_id = item_val.get("id").and_then(|v| if v.is_string() { v.as_str().map(|s| s.to_string()) } else { Some(logis_schema::json_order::to_string_sorted(&v)) }).unwrap_or_default();
+                let mut temp_code = item_val.get("code").and_then(|v| if v.is_string() { v.as_str().map(|s| s.to_string()) } else { Some(logis_schema::json_order::to_string_sorted(&v)) }).unwrap_or_default();
                 
 
                 if !temp_id.is_empty() || !temp_code.is_empty() {
@@ -6353,7 +6353,7 @@ pub async fn process_task(
                         }
                     }
                     
-                    emit_term(&format!("  ✅ Successfully Merged Extracted Item {}/{}: {}", idx + 1, total_items, serde_json::to_string(&item_val).unwrap_or_default()));
+                    emit_term(&format!("  ✅ Successfully Merged Extracted Item {}/{}: {}", idx + 1, total_items, serde_json::to_string(&logis_schema::json_order::Sorted(&item_val)).unwrap_or_default()));
                     synthesis_item_pos.insert(idx, all_extracted_items.len());
                     all_extracted_items.push(item_val);
                     
@@ -6880,7 +6880,7 @@ pub async fn process_task(
                         nodes_json.push(serde_json::json!(serde_json::Value::Null));
                     }
                 }
-                serde_json::to_string(&nodes_json).unwrap_or_default()
+                serde_json::to_string(&logis_schema::json_order::SortedSlice(&nodes_json)).unwrap_or_default()
             };
             
             let js_template_detail = get_boa_block_extractor_template();
@@ -7952,7 +7952,7 @@ pub async fn process_task(
                             "role": g.role_phrase,
                             "options": g.options
                         })).collect();
-                        let cat_str = serde_json::to_string_pretty(&catalogue).unwrap_or_default();
+                        let cat_str = serde_json::to_string_pretty(&logis_schema::json_order::SortedSlice(&catalogue)).unwrap_or_default();
                         let sel_prompt = crate::parsing::extract_status_selector_prompt(&page_type, &doc_lang, &cat_str);
 
                         let params = ChatCompletionParameters {
@@ -8057,7 +8057,7 @@ pub async fn process_task(
             }
 
             let pre_mapped_context = if !pre_mapped_hints.is_empty() {
-                serde_json::to_string_pretty(&pre_mapped_hints).unwrap_or_default()
+                serde_json::to_string_pretty(&logis_schema::json_order::SortedSlice(&pre_mapped_hints)).unwrap_or_default()
             } else {
                 String::new()
             };
@@ -8720,7 +8720,7 @@ pub async fn process_task(
                         }));
                     }
                 }
-                let targeted_json_context = serde_json::to_string_pretty(&json_contexts).unwrap_or_default();
+                let targeted_json_context = serde_json::to_string_pretty(&logis_schema::json_order::SortedSlice(&json_contexts)).unwrap_or_default();
                 
                 emit_term(&format!("  🎯 [MATCHED CONTEXT] Field: '{}' ({:?}) | RawSim: {:.4} | Contrast: {:+.4} | Margin: {:+.4}\n{}", field_name, field_format, best_raw, best_contrast, best_margin, targeted_json_context));
 
@@ -8903,7 +8903,7 @@ pub async fn process_task(
                             
                             
                             if let Some(obj) = item_val.as_object_mut() {
-                                let ks: Vec<String> = obj.keys().cloned().collect();
+                                let ks: Vec<String> = logis_schema::json_order::sorted_keys(obj).cloned().collect();
                                 for k in ks {
                                     let cleaned = match obj.get(&k) {
                                         Some(serde_json::Value::String(s)) => Some(strip_markup_prefix(s)),
@@ -8951,7 +8951,7 @@ pub async fn process_task(
                                             let answer_key = extracted_str.trim().trim_matches(|c: char| c == '.' || c == '"' || c == '\'').trim().to_lowercase();
                                             let bare_value = !answer_key.chars().any(|c| c.is_alphanumeric())
                                                 || extracted_data.as_object().map_or(false, |o| {
-                                                    o.iter().any(|(ok, ov)| ok.as_str() != *k && ov.as_str().map_or(false, |s| s.trim().to_lowercase() == answer_key))
+                                                    logis_schema::json_order::sorted_iter(o).any(|(ok, ov)| ok.as_str() != *k && ov.as_str().map_or(false, |s| s.trim().to_lowercase() == answer_key))
                                                 })
                                                 || targeted_pug.lines().any(|l| l.split_once('|').map_or(false, |(_, v)| v.trim().to_lowercase() == answer_key));
                                             if bare_value {
@@ -9135,7 +9135,7 @@ pub async fn process_task(
                             for k in &keys {
                                 if let Some(val) = item_val.get(*k) {
                                     extracted_data.as_object_mut().unwrap().insert(k.to_string(), val.clone());
-                                    extracted_results.push(format!("\"{}\": {}", k, val));
+                                    extracted_results.push(format!("\"{}\": {}", k, logis_schema::json_order::Sorted(&val)));
                                     
 
                                     let val_str = if val.is_string() { val.as_str().unwrap().trim().to_string() }
@@ -9299,7 +9299,7 @@ pub async fn process_task(
 
             let decimal_comma = crate::utils::canonical::decimal_comma_lang(&doc_lang_str)
                 && !crate::utils::canonical::point_decimal_currency(&currency_norm);
-            let numeric_keys: Vec<String> = obj.keys().cloned().collect();
+            let numeric_keys: Vec<String> = logis_schema::json_order::sorted_keys(obj).cloned().collect();
             for k in numeric_keys {
                 let lk = k.to_lowercase();
                 if lk.ends_with("_at") || lk.ends_with("_date") || crate::utils::canonical::is_structural_key(&lk) {
@@ -9696,7 +9696,7 @@ pub async fn process_task(
                             .await
                             .ok()
                             .flatten()
-                            .and_then(|d| serde_json::from_str::<serde_json::Value>(&d.json_data).ok())
+                            .and_then(|d| serde_json::from_str::<serde_json::Value>(&d.json_data).map(logis_schema::json_order::sorted).ok())
                             .as_ref(),
                     );
                     relay_ledger::add_delta(&mut stats_diff, "tracking", crate::utils::canonical::ledger_delta(tracking_prior, true));
@@ -9737,7 +9737,7 @@ pub async fn process_task(
         let mut existing_json_found: Option<serde_json::Value> = None;
 
         if let Ok(Some(existing_item)) = store.get_item_by_id(&target_table, &target_id).await {
-            if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data) {
+            if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing_item.json_data).map(logis_schema::json_order::sorted) {
                 prior_vector = Some(existing_item.vector);
                 extracted_data = merge_node(&existing_json, &extracted_data);
                 existing_json_found = Some(existing_json);
@@ -10147,7 +10147,7 @@ pub async fn process_task(
                         .get("text")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
-                        .unwrap_or_else(|| serde_json::to_string(&single_item).unwrap_or_default());
+                        .unwrap_or_else(|| serde_json::to_string(&logis_schema::json_order::Sorted(&single_item)).unwrap_or_default());
                     let auto = format!("AUTO-{}-{}", page_type, crate::utils::hash::digest(&seed));
                     emit_term(&format!(
                         "  ⚠️ [ITEM ID FALLBACK] 식별자가 비어 내용 기반 결정론 키 '{}' 를 사용합니다. (UUID 를 쓰면 재스캔마다 중복 행이 생깁니다)",
@@ -10173,7 +10173,7 @@ pub async fn process_task(
                 let existing_item = store.get_item_by_id(&target_table, &hashed_item_id).await.ok().flatten();
                 let existing_json: Option<serde_json::Value> = existing_item
                     .as_ref()
-                    .and_then(|d| serde_json::from_str::<serde_json::Value>(&d.json_data).ok());
+                    .and_then(|d| serde_json::from_str::<serde_json::Value>(&d.json_data).map(logis_schema::json_order::sorted).ok());
                 let self_prior = crate::utils::canonical::ledger_prior(existing_json.as_ref());
                 let origin_ok = relay_ledger::placeholder_origin_establishes(&page_type, existing_json.as_ref());
                 if let Some(ej) = existing_json.as_ref() {

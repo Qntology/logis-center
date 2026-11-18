@@ -640,7 +640,7 @@ pub fn translit_demand(item: &Value, doc_lang: &str) -> usize {
     fn walk(v: &Value, doc_lang: &str, out: &mut usize) {
         match v {
             Value::Object(m) => {
-                for (k, x) in m.iter() {
+                for (k, x) in logis_schema::json_order::sorted_iter(m) {
                     if skip_key(k) {
                         continue;
                     }
@@ -1888,7 +1888,7 @@ fn key_tolerance(expected: &str) -> usize {
 fn repair_keys_into(v: &mut Value, expected: &[String], fixed: &mut Vec<(String, String)>) {
     match v {
         Value::Object(map) => {
-            let keys: Vec<String> = map.keys().cloned().collect();
+            let keys: Vec<String> = logis_schema::json_order::sorted_keys(map).cloned().collect();
             for k in keys {
                 if expected.iter().any(|e| e == &k) {
                     continue;
@@ -1919,7 +1919,7 @@ fn repair_keys_into(v: &mut Value, expected: &[String], fixed: &mut Vec<(String,
                     }
                 }
             }
-            for (_, child) in map.iter_mut() {
+            for (_, child) in logis_schema::json_order::sorted_iter_mut(map) {
                 repair_keys_into(child, expected, fixed);
             }
         }
@@ -1967,7 +1967,7 @@ pub fn normalize_lang_json(raw: &str, expected: &[String]) -> (String, Vec<(Stri
         return (raw.to_string(), Vec::new());
     }
     let fixed = if expected.is_empty() { Vec::new() } else { repair_json_keys(&mut v, expected) };
-    let text = serde_json::to_string(&v).unwrap_or_else(|_| raw.to_string());
+    let text = serde_json::to_string(&logis_schema::json_order::Sorted(&v)).unwrap_or_else(|_| raw.to_string());
     (text, fixed)
 }
 

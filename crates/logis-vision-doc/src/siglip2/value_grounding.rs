@@ -343,7 +343,7 @@ pub fn strip_name_residue(
                 hits += 1;
             }
         }
-        for node in data.values_mut() {
+        for node in logis_schema::json_order::sorted_values_mut(data) {
             hits += fix(node, &c.field, &old, &cut);
         }
         logis_sds::record_baseline("vision.name_residue", 1.0);
@@ -594,7 +594,7 @@ pub fn retain_merged_claims(
             return true;
         }
         let kept = data.get(&c.field).map(|x| hit(x, v)).unwrap_or(false)
-            || data.values().any(|node| holds(node, &c.field, v));
+            || logis_schema::json_order::sorted_values(data).any(|node| holds(node, &c.field, v));
         if !kept {
             dropped.push(c.clone());
         }

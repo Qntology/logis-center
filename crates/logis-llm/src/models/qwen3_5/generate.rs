@@ -163,7 +163,7 @@ impl Qwen3_5GenerateModel {
         
         let config_path = std::path::Path::new(model_dir).join("config.json");
         let max_pos = if config_path.exists() {
-            let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path)?)?;
+            let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(config_path)?).map(logis_schema::json_order::sorted)?;
             cfg.get("max_position_embeddings").or_else(|| cfg.get("text_config").and_then(|t| t.get("max_position_embeddings"))).and_then(|v| v.as_u64()).unwrap_or(262144) as usize
         } else {
             

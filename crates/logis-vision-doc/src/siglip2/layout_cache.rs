@@ -386,7 +386,7 @@ fn count_filled(v: &Value) -> usize {
         Value::Bool(_) | Value::Number(_) => 1,
         Value::String(s) => usize::from(!s.trim().is_empty()),
         Value::Array(a) => a.iter().map(count_filled).sum(),
-        Value::Object(o) => o.values().map(count_filled).sum(),
+        Value::Object(o) => logis_schema::json_order::sorted_values(o).map(count_filled).sum(),
     }
 }
 

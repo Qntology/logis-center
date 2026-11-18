@@ -172,7 +172,7 @@ pub fn drop_unnamed_drafts(
         return 0;
     }
     let before = combined.len();
-    combined.retain(|_, (txt, _)| match serde_json::from_str::<Value>(txt.as_str()) {
+    combined.retain(|_, (txt, _)| match serde_json::from_str::<Value>(txt.as_str()).map(logis_schema::json_order::sorted) {
         Ok(doc) => !is_relay_draft(&doc) || draft_named_by_query(&doc, query_text),
         Err(_) => true,
     });
@@ -915,7 +915,7 @@ impl VectorStore {
             .collect();
         let stored = std::fs::read_to_string(&marker)
             .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|s| serde_json::from_str::<Value>(&s).map(logis_schema::json_order::sorted).ok())
             .and_then(|v| v.get("space").and_then(|x| x.as_str()).map(|x| x.to_string()));
         let stored = match stored {
             Some(s) => s,
@@ -982,7 +982,7 @@ impl VectorStore {
             Some(o) => o,
             None => return json!({}),
         };
-        let existing: Vec<String> = obj.keys().cloned().collect();
+        let existing: Vec<String> = logis_schema::json_order::sorted_keys(obj).cloned().collect();
         for k in existing {
             let kind = kind_of(&k);
             if kind == CanonKind::Free { continue; }
@@ -1060,7 +1060,7 @@ impl VectorStore {
                             } else if let Some(s) = t.as_str() {
                                 json!(s)
                             } else {
-                                json!(t.to_string().trim_matches('"'))
+                                json!(logis_schema::json_order::to_string_sorted(&t).trim_matches('"'))
                             }
                         }).filter(|t| t.as_str().map_or(false, |s| !s.is_empty())).collect(),
                         Some(Value::String(s)) if !s.is_empty() => vec![json!(s.clone())],
@@ -1148,7 +1148,7 @@ impl VectorStore {
 
     fn collect_filled_fields(v: &Value, depth: usize, out: &mut Vec<String>) {
         let obj = match v.as_object() { Some(o) => o, None => return };
-        for (k, val) in obj.iter() {
+        for (k, val) in logis_schema::json_order::sorted_iter(obj) {
             if Self::STORE_STAMPED_KEYS.iter().any(|s| *s == k.as_str()) { continue; }
             let filled = match val {
                 Value::Null => false,
@@ -1243,7 +1243,7 @@ impl VectorStore {
                 && doc.updated_at_ts >= new_updated_at
                 && !new_digest.is_empty()
             {
-                let old_json = serde_json::from_str::<Value>(&doc.json_data).ok();
+                let old_json = serde_json::from_str::<Value>(&doc.json_data).map(logis_schema::json_order::sorted).ok();
                 let old_digest = old_json
                     .as_ref()
                     .and_then(|v| v.get("digest").and_then(|d| d.as_str()).map(|s| s.to_string()))
@@ -1315,7 +1315,7 @@ impl VectorStore {
                     final_id
                 );
             }
-            let old_data = serde_json::from_str::<Value>(&doc.json_data).ok();
+            let old_data = serde_json::from_str::<Value>(&doc.json_data).map(logis_schema::json_order::sorted).ok();
             let old_embedded = old_data.as_ref()
                 .and_then(|v| v.get("embed"))
                 .map(|v| v.as_i64().unwrap_or(0) == 1 || v.as_bool().unwrap_or(false))
@@ -1351,7 +1351,7 @@ impl VectorStore {
                     if let Ok(decompressed) = crate::utils::compression::decompress_to_value(&decoded) {
                         if let Some(base_obj) = final_data.as_object_mut() {
                             if let Some(inner_obj) = decompressed.as_object() {
-                                for (k, v) in inner_obj {
+                                for (k, v) in logis_schema::json_order::sorted_iter(inner_obj) {
                                     // 봉투 필드는 덮어쓰지 않습니다.
                                     if !base_obj.contains_key(k) || k == "action" || k == "summary" || k == "relate" || k == "text" || k == "masked_text" || k == "embed" || k == "href" || k == "link" || k == "origin" {
                                         base_obj.insert(k.clone(), v.clone());
@@ -1433,7 +1433,7 @@ impl VectorStore {
         let seed_defaults = needs_domain_seed(target, type_);
         let final_data = Self::canonicalize_data(final_data, seed_defaults);
 
-        let json_str = final_data.to_string();
+        let json_str = logis_schema::json_order::to_string_sorted(&final_data);
         let text_content = final_data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
         let masked_text_content = final_data.get("masked_text").and_then(|s| s.as_str()).unwrap_or(&text_content).to_string();
         let flag_str = final_data.get("flag").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -1496,7 +1496,7 @@ impl VectorStore {
         let mut base = json!({"pages": {}, "goods": {"draft": 0, "count": 0}, "order": {"draft": 0, "count": 0}, "event": {"draft": 0, "count": 0}, "coupon": {"draft": 0, "count": 0}, "tracking": {"draft": 0, "count": 0}, "search": {"draft": 0, "count": 0}, "review": {"draft": 0, "count": 0}, "member": {"draft": 0, "count": 0}});
         let properties = vec!["price", "quantity", "width", "height", "length", "weight", "shipping_fee", "shipping_duration", "sale_price", "supply_price", "low_stock_threshold", "discount", "min_order_amount", "max_discount_amount", "usage_limit", "usage_per", "started_at", "expired_at"];
         if let Some(base_obj) = base.as_object_mut() {
-            for (table_name, table_val) in base_obj.iter_mut() {
+            for (table_name, table_val) in logis_schema::json_order::sorted_iter_mut(base_obj) {
                 if table_name != "pages" {
                     if let Some(table_obj) = table_val.as_object_mut() {
                         for prop in &properties { table_obj.insert(prop.to_string(), json!({"max": 0, "min": 0})); }
@@ -1545,7 +1545,7 @@ impl VectorStore {
             let filter = format!("`to` = '{}'", old_to);
             let docs = self.get_all_items(table, 5000, 0, Some(filter)).await.unwrap_or_default();
             for doc in docs {
-                let mut data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
+                let mut data: Value = serde_json::from_str(&doc.json_data).map(logis_schema::json_order::sorted).unwrap_or(json!({}));
                 if let Some(obj) = data.as_object_mut() {
                     obj.insert("to".to_string(), json!(new_to));
                     obj.insert("from".to_string(), json!(new_from));
@@ -1624,7 +1624,7 @@ impl VectorStore {
             let mode_wrong = doc.mode != "shipping";
             let type_wrong = doc.r#type != canon_type;
             if !mode_wrong && !type_wrong { continue; }
-            let mut data: Value = serde_json::from_str(&doc.json_data).unwrap_or(json!({}));
+            let mut data: Value = serde_json::from_str(&doc.json_data).map(logis_schema::json_order::sorted).unwrap_or(json!({}));
             if let Some(obj) = data.as_object_mut() {
                 obj.insert("mode".to_string(), json!("shipping"));
                 obj.insert("type".to_string(), json!(canon_type.clone()));
@@ -1894,13 +1894,13 @@ impl VectorStore {
                  "total_found": final_list.len(),
                  "returned": result_slice.len(),
                  "results": result_slice.iter().map(|(id, text, score)| {
-                     let parsed_text: serde_json::Value = serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!(text));
+                     let parsed_text: serde_json::Value = serde_json::from_str(text).map(logis_schema::json_order::sorted).unwrap_or_else(|_| serde_json::json!(text));
                      serde_json::json!({ "id": id, "text": parsed_text, "score": score })
                  }).collect::<Vec<_>>()
              });
              println!("\n=======================================");
              println!("[STORE] 🔎 2-Track Recall Search (FTS + Vector) — precision filtering delegated to Dexie:");
-             println!("{}", serde_json::to_string_pretty(&json_log).unwrap_or_default());
+             println!("{}", serde_json::to_string_pretty(&logis_schema::json_order::Sorted(&json_log)).unwrap_or_default());
              println!("=======================================\n");
          }
 
@@ -1961,7 +1961,7 @@ impl VectorStore {
     fn named_rows(batches: &[RecordBatch], order: &[(usize, usize)], query_text: &str) -> Vec<(String, String)> {
         Self::ordered_id_data(batches, order)
             .into_iter()
-            .filter(|(_, tx)| match serde_json::from_str::<Value>(tx) {
+            .filter(|(_, tx)| match serde_json::from_str::<Value>(tx).map(logis_schema::json_order::sorted) {
                 Ok(doc) => !is_relay_draft(&doc) || draft_named_by_query(&doc, query_text),
                 Err(_) => true,
             })
@@ -2007,7 +2007,7 @@ impl VectorStore {
             Value::String(s) => s.clone(),
             Value::Number(n) => n.to_string(),
             Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
-            _ => value.to_string().trim_matches('"').to_string(),
+            _ => logis_schema::json_order::to_string_sorted(&value).trim_matches('"').to_string(),
         };
         if target_str.is_empty() { return Ok(None); }
         use crate::utils::canonical::{kind_of, CanonKind};
@@ -2037,13 +2037,13 @@ impl VectorStore {
             let ids = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
             let datas = batch.column(9).as_any().downcast_ref::<StringArray>().unwrap();
             for i in 0..batch.num_rows() {
-                if let Ok(data) = serde_json::from_str::<Value>(datas.value(i)) {
+                if let Ok(data) = serde_json::from_str::<Value>(datas.value(i)).map(logis_schema::json_order::sorted) {
                     if let Some(f_val) = data.get(property) {
                         let f_val_str = match f_val {
                             Value::String(s) => s.clone(),
                             Value::Number(n) => n.to_string(),
                             Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
-                            _ => f_val.to_string().trim_matches('"').to_string(),
+                            _ => logis_schema::json_order::to_string_sorted(&f_val).trim_matches('"').to_string(),
                         };
                         if f_val_str == target_str {
                             return Ok(Some((ids.value(i).to_string(), data)));
@@ -2403,7 +2403,7 @@ pub fn json_property_needle(property: &str, value: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
-        _ => value.to_string().trim_matches('"').to_string(),
+        _ => logis_schema::json_order::to_string_sorted(&value).trim_matches('"').to_string(),
     };
     let ep = property.replace('\'', "''");
     let ev = raw.replace('\'', "''");
@@ -2528,7 +2528,7 @@ mod embed_space_tests {
 
     async fn embed_flag(store: &VectorStore, id: &str) -> Option<i64> {
         let doc = store.get_item_by_id("items", id).await.unwrap()?;
-        let v: Value = serde_json::from_str(&doc.json_data).unwrap();
+        let v: Value = serde_json::from_str(&doc.json_data).map(logis_schema::json_order::sorted).unwrap();
         v.get("embed").and_then(|e| e.as_i64().or_else(|| e.as_bool().map(|b| b as i64)))
     }
 
@@ -2591,10 +2591,10 @@ mod embed_space_tests {
         assert_eq!(embed_flag(&store, "a1").await, Some(0));
         assert_eq!(embed_flag(&store, "a2").await, Some(0));
         assert_eq!(embed_flag(&store, "a3").await, Some(0));
-        let a1: Value = serde_json::from_str(&store.get_item_by_id("items", "a1").await.unwrap().unwrap().json_data).unwrap();
+        let a1: Value = serde_json::from_str(&store.get_item_by_id("items", "a1").await.unwrap().unwrap().json_data).map(logis_schema::json_order::sorted).unwrap();
         assert_eq!(a1["title"], "title a1", "표식 말고는 그대로입니다");
         assert_eq!(store.count_chunks_by_item("a1").await.unwrap(), 0, "청크는 재색인이 새 공간으로 다시 만듭니다");
-        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).map(logis_schema::json_order::sorted).unwrap();
         assert_eq!(saved["space"], current);
         assert_eq!(store.migrate_embedding_space().await.unwrap(), None, "한 번 옮기면 다시 옮기지 않습니다");
 

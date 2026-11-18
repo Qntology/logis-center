@@ -226,7 +226,7 @@ impl VisionEmbedCache {
             "embed_dims": dims,
             "deepstack_count": deepstacks.len(),
         });
-        std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec_pretty(&logis_schema::json_order::Sorted(&meta))?)?;
 
         let byte_size = Self::dir_size(&dir);
         {

@@ -92,7 +92,7 @@ if defined BUILD_FAILED (
 echo [VERIFY] %time% test: app GPU tests (app_embed, mem_lifecycle)...
 cd /d "%ROOT%src-tauri"
 set "LOGIS_TEST_MODELS=1"
-cargo test --test it --no-default-features --features %FEATS% --no-fail-fast -- app_embed mem_lifecycle --include-ignored --nocapture --test-threads=1 > "%LOGDIR%\05_app_tests.log" 2>&1
+cargo test -p logis-center -p logis-app --test it --no-default-features --features %FEATS% --no-fail-fast -- app_embed mem_lifecycle --include-ignored --nocapture --test-threads=1 > "%LOGDIR%\05_app_tests.log" 2>&1
 set "RC=%errorlevel%"
 set "LOGIS_TEST_MODELS="
 call :record app_tests %RC% 05_app_tests.log

@@ -193,7 +193,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                 match eval_result {
                     Ok(Ok(res)) => {
                         if let Some(val_str) = res.into_value::<String>().ok() {
-                            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
+                            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str).map(logis_app::json_order::sorted) {
                                 let tab_id = json_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                 let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
                                 let has_focus = json_val.get("focus").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -245,7 +245,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                         "#;
                         if let Ok(Ok(res)) = tokio::time::timeout(Duration::from_millis(300), page.evaluate(script)).await {
                             if let Some(val_str) = res.into_value::<String>().ok() {
-                                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str) {
+                                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&val_str).map(logis_app::json_order::sorted) {
                                     let tab_url = json_val.get("url").and_then(|v| v.as_str()).unwrap_or("");
                                     
                                     
@@ -306,8 +306,8 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
             
             // URL 변경 시 즉시 알림 및 3회 루프마다 생존 신호(Heartbeat) 발송
             if active_url != last_detected_url || current_is_shop != last_is_shop {
-                let _ = app_handle.emit("browser-match-found", &payload);
-                let _ = app_handle.emit("browser-status", &payload);
+                let _ = app_handle.emit("browser-match-found", &logis_app::json_order::Sorted(&payload));
+                let _ = app_handle.emit("browser-status", &logis_app::json_order::Sorted(&payload));
                 
                 last_detected_url = active_url;
                 last_is_shop = current_is_shop;
@@ -323,13 +323,13 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
                         "session_id": "",
                         "kv_path": crate::utils::paths::get_kv_dir().to_string_lossy().into_owned()
                     });
-                    if let Ok(json_str) = serde_json::to_string(&shared_data) {
+                    if let Ok(json_str) = serde_json::to_string(&logis_app::json_order::Sorted(&shared_data)) {
                         let _ = std::fs::write(tmp_root.join("index.json"), json_str);
                     }
                 }
             } else {
                 // 변경이 없더라도 브라우저가 실행 중임을 UI에 주기적으로 알려 플리커링 방지
-                let _ = app_handle.emit("browser-status", &payload);
+                let _ = app_handle.emit("browser-status", &logis_app::json_order::Sorted(&payload));
             }
             tokio::time::sleep(Duration::from_millis(800)).await; 
         }
@@ -337,7 +337,7 @@ fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
         let mut global = GLOBAL_BROWSER.lock().await;
         *global = None;
         
-        let _ = app_handle.emit("browser-match-found", json!({ "url": "", "is_client": false, "is_admin": false }));
+        let _ = app_handle.emit("browser-match-found", logis_app::json_order::sorted(json!({ "url": "", "is_client": false, "is_admin": false })));
         println!("[AUTO] Browser monitor exited cleanly.");
     });
 }
@@ -526,7 +526,7 @@ async fn run_driver_automation(browser: &str, url: &str, script: &str) -> anyhow
     let res = async {
         client.goto(url).await?;
         let result = client.execute(script, vec![]).await?;
-        Ok(format!("Driver Success ({}). Result: {}", browser, serde_json::to_string_pretty(&result).unwrap_or_default()))
+        Ok(format!("Driver Success ({}). Result: {}", browser, serde_json::to_string_pretty(&logis_app::json_order::Sorted(&result)).unwrap_or_default()))
     }.await;
 
     let _ = child.kill();

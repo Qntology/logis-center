@@ -35,6 +35,8 @@ pub mod sink;
 pub mod browser_state;
 // 🌟 [QUERY] 자연어 검색 (예전 셸 lib.rs 의 ai_search_complex 본문과 도우미)
 pub mod query;
+// 🌟 [COMMANDS] 화면 명령의 본문 (예전 셸 lib.rs 의 #[tauri::command] 함수들, 셸은 같은 이름의 껍데기)
+pub mod commands;
 
 pub use utils::parsing;
 pub use utils::bias_schema;
@@ -47,6 +49,8 @@ pub use utils::time_guide;
 pub use utils::score_dynamics;
 // 🌟 [LOGIS-LLM] 텍스트 · VL 생성 모델 · 토크나이저 · 채팅 템플릿 · 위치 임베딩 · 장치 도우미는 crates/logis-llm 에 있습니다.
 pub use logis_llm::{chat_template, openai_types, position_embed, tokenizer};
+// JSON 객체 키 순서를 예전(키 정렬)과 같게 지키는 도우미 (셸도 이 경로로 씀)
+pub use logis_schema::json_order;
 
 // ── 코어가 읽고 셸(명령)도 읽는 전역 상태 (예전 lib.rs) ──
 /// 지금 처리 중인 작업의 문맥 (스케줄러가 채우고 UI 명령이 읽음)
@@ -64,4 +68,11 @@ pub struct AppState {
     pub model: Arc<TokioMutex<Option<LogisModel>>>,
     pub store: Arc<TokioMutex<Option<VectorStore>>>,
     pub cancellation_token: Arc<AtomicBool>,
+}
+
+/// Tauri 없이 코어를 쓸 때(통합 시험 · 합성 평가 · CLI) 엔진을 초기화합니다: 언어 엔진 런타임 로더 등록, KV 굽기 작업자 시작.
+/// Tauri 앱은 `run()` 이 같은 두 가지를 합니다(로더는 시작할 때, 굽기 작업자는 setup 에서).
+pub fn init_headless() {
+    crate::model::lang_llm::register_loader(crate::models::qwen4_exp::registry::load_lang_runtime);
+    crate::models::qwen::generate::init_bake_worker();
 }

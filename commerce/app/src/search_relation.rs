@@ -33,7 +33,7 @@ pub async fn trade_relation_join(
     };
     let mut docs: Vec<(String, Value)> = Vec::new();
     for r in rows.into_iter() {
-        if let Ok(v) = serde_json::from_str::<Value>(&r.json_data) {
+        if let Ok(v) = serde_json::from_str::<Value>(&r.json_data).map(logis_schema::json_order::sorted) {
             if !is_relay_placeholder(&v) {
                 docs.push((r.id, v));
             }
@@ -210,7 +210,7 @@ pub async fn trade_relation_join(
                 }
             }
             None => {
-                results.push(json!({ "id": id, "text": d.to_string(), "score": score, "context_type": code_of(d), "doc_type": code_of(d), "relation": "relation_target" }));
+                results.push(json!({ "id": id, "text": logis_schema::json_order::to_string_sorted(&d), "score": score, "context_type": code_of(d), "doc_type": code_of(d), "relation": "relation_target" }));
                 rescued += 1;
             }
         }
@@ -312,7 +312,7 @@ pub async fn relation_join(
     };
     let mut docs: Vec<(String, Value)> = Vec::new();
     for r in rows.into_iter() {
-        if let Ok(v) = serde_json::from_str::<Value>(&r.json_data) {
+        if let Ok(v) = serde_json::from_str::<Value>(&r.json_data).map(logis_schema::json_order::sorted) {
             if !is_relay_placeholder(&v) {
                 docs.push((r.id, v));
             }
@@ -576,7 +576,7 @@ pub async fn relation_join(
             None => {
                 results.push(json!({
                     "id": id,
-                    "text": d.to_string(),
+                    "text": logis_schema::json_order::to_string_sorted(&d),
                     "score": score,
                     "context_type": text_of(d.get("type")),
                     "doc_type": text_of(d.get("type")),
@@ -627,7 +627,7 @@ pub async fn relation_join(
                     || value.as_str().map_or(false, |s| anchor_texts.contains(&norm_text(s)) || name_fragment(&path, s))
                     || (path == "data.status" && value.as_i64().map_or(false, |v| anchor_status.contains(&v)));
                 if explained {
-                    consumed.push(format!("{} {} {}", path, c.get("op").and_then(|v| v.as_str()).unwrap_or(""), value));
+                    consumed.push(format!("{} {} {}", path, c.get("op").and_then(|v| v.as_str()).unwrap_or(""), logis_schema::json_order::Sorted(&value)));
                 }
                 !explained
             });

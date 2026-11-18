@@ -109,7 +109,7 @@ pub fn bias_label_texts(dict: &Value, limit: usize) -> Vec<String> {
                 }
             }
             Value::Array(items) => items.iter().for_each(|x| walk(x, out)),
-            Value::Object(map) => map.values().for_each(|x| walk(x, out)),
+            Value::Object(map) => logis_schema::json_order::sorted_values(map).for_each(|x| walk(x, out)),
             _ => {}
         }
     }

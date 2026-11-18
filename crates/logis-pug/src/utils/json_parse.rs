@@ -280,9 +280,9 @@ fn salvage_partial_json(src: &str) -> Option<serde_json::Value> {
         let mut dropped: Vec<String> = Vec::new();
         for s in segs.iter() {
             let candidate = format!("{{{}}}", s.trim());
-            match serde_json::from_str::<serde_json::Value>(&candidate) {
+            match serde_json::from_str::<serde_json::Value>(&candidate).map(logis_schema::json_order::sorted) {
                 Ok(serde_json::Value::Object(o)) => {
-                    for (k, v) in o {
+                    for (k, v) in logis_schema::json_order::into_sorted(o) {
                         map.insert(k, v);
                     }
                 }
@@ -308,7 +308,7 @@ fn salvage_partial_json(src: &str) -> Option<serde_json::Value> {
     let mut arr: Vec<serde_json::Value> = Vec::new();
     let mut dropped = 0usize;
     for s in segs.iter() {
-        match serde_json::from_str::<serde_json::Value>(s.trim()) {
+        match serde_json::from_str::<serde_json::Value>(s.trim()).map(logis_schema::json_order::sorted) {
             Ok(v) => arr.push(v),
             Err(_) => dropped += 1,
         }

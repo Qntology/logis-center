@@ -14,6 +14,9 @@ pub fn decompress_to_value(binary_data: &[u8]) -> Result<Value> {
 
 pub fn compress_value(value: &Value) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(value.to_string().as_bytes())?;
+    let mut sorted = value.clone();
+    // JSON 객체 키 순서를 예전(키 정렬)과 같게: serde_json preserve_order 가 켜져도 같은 바이트 (logis_schema::json_order 와 같은 규칙)
+    sorted.sort_all_objects();
+    encoder.write_all(sorted.to_string().as_bytes())?;
     Ok(encoder.finish()?)
 }

@@ -50,12 +50,12 @@ pub fn value_text(data_json: &str) -> String {
                 out.push('\n');
             }
             Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
-            Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+            Value::Object(o) => logis_schema::json_order::sorted_values(o).for_each(|x| walk(x, out)),
             _ => {}
         }
     }
     let mut out = String::new();
-    if let Ok(v) = serde_json::from_str::<Value>(data_json) {
+    if let Ok(v) = serde_json::from_str::<Value>(data_json).map(logis_schema::json_order::sorted) {
         walk(&v, &mut out);
     }
     out

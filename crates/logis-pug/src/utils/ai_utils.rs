@@ -353,7 +353,7 @@ pub fn semantic_anchor_text(doc_lang: &str, page_type: &str, field_name: &str) -
                     if !s.trim().is_empty() { return s.to_string(); }
                 }
             }
-            for (_, v) in obj {
+            for (_, v) in logis_schema::json_order::sorted_iter(obj) {
                 if v.is_object() { stack.push(v); }
             }
         }
@@ -375,7 +375,7 @@ pub fn abstract_bridge_field_phrases(field_name: &str) -> Vec<String> {
         .and_then(|v| v.as_object())
     { Some(n) => n, None => return out };
 
-    for (target, val) in node {
+    for (target, val) in logis_schema::json_order::sorted_iter(node) {
         let key = match target.rsplitn(2, '.').next() { Some(k) => k, None => continue };
         if key != field_name { continue; }
         for field in ["semantic", "bias"] {
@@ -518,7 +518,7 @@ pub fn multilingual_value_anchor_phrases_scoped(page_type: &str, field_name: &st
 
     // ② 폴백 : 이 필드에 도메인 항목이 아예 없을 때만 접미 일치로 전 도메인 수집.
     //    (page_type 이 비어 오는 호출부의 기존 동작을 그대로 보존합니다)
-    for (target, val) in node {
+    for (target, val) in logis_schema::json_order::sorted_iter(node) {
         let key = match target.rsplitn(2, '.').next() { Some(k) => k, None => continue };
         if key != field_name { continue; }
         for field in ["semantic", "bias"] {
@@ -544,7 +544,7 @@ pub fn multilingual_value_anchor_phrases(field_name: &str) -> Vec<String> {
 pub fn metrics_family_phrases() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     if let Some(node) = crate::parsing::BIAS_DICT.get("metrics").and_then(|v| v.as_object()) {
-        for (key, val) in node {
+        for (key, val) in logis_schema::json_order::sorted_iter(node) {
             for field in ["semantic", "bias"] {
                 if let Some(s) = val.get(field).and_then(|v| v.as_str()) {
                     for p in split_bias_phrases_full(s) {
@@ -804,7 +804,7 @@ pub fn temporal_semantic_phrases() -> Vec<(String, String)> {
     let dict: &serde_json::Value = &crate::parsing::BIAS_DICT;
     for cat in ["time_filters", "season_filters"] {
         if let Some(node) = dict.get(cat).and_then(|v| v.as_object()) {
-            for (key, val) in node {
+            for (key, val) in logis_schema::json_order::sorted_iter(node) {
                 if let Some(semantic) = val.get("semantic").and_then(|v| v.as_str()) {
                     for phrase in split_bias_phrases_full(semantic) {
                         out.push((format!("{}.{}", cat, key), phrase));
@@ -844,7 +844,7 @@ pub fn filter_category_phrases(categories: &[&str]) -> Vec<(String, String, Stri
     let mut out: Vec<(String, String, String)> = Vec::new();
     for cat in categories {
         if let Some(node) = crate::parsing::BIAS_DICT.get(cat).and_then(|v| v.as_object()) {
-            for (key, val) in node {
+            for (key, val) in logis_schema::json_order::sorted_iter(node) {
                 if let Some(bias) = val.get("bias").and_then(|v| v.as_str()) {
                     for phrase in split_bias_phrases_full(bias) {
                         out.push((cat.to_string(), key.clone(), phrase));
@@ -1420,7 +1420,7 @@ pub fn filter_category_prejudice_phrases(categories: &[&str]) -> Vec<(String, St
     let mut out: Vec<(String, String, String)> = Vec::new();
     for cat in categories {
         if let Some(node) = crate::parsing::BIAS_DICT.get(cat).and_then(|v| v.as_object()) {
-            for (key, val) in node {
+            for (key, val) in logis_schema::json_order::sorted_iter(node) {
                 if let Some(p) = val.get("prejudice").and_then(|v| v.as_str()) {
                     for phrase in split_bias_phrases_full(p) {
                         if out.iter().any(|(c, k, e)| c == cat && k == key && e == &phrase) { continue; }
@@ -1442,7 +1442,7 @@ pub fn abstract_bridge_prejudice_phrases() -> Vec<(String, String, String)> {
         .and_then(|v| v.as_object())
     { Some(n) => n, None => return out };
 
-    for (target, val) in node {
+    for (target, val) in logis_schema::json_order::sorted_iter(node) {
         let mut it = target.splitn(2, '.');
         let cat = match it.next() { Some(c) if !c.is_empty() => c.to_string(), _ => continue };
         let key = match it.next() { Some(k) if !k.is_empty() => k.to_string(), _ => continue };
@@ -1492,7 +1492,7 @@ pub fn abstract_bridge_phrases() -> Vec<(String, String, String)> {
         None => return out,
     };
 
-    for (target, val) in node {
+    for (target, val) in logis_schema::json_order::sorted_iter(node) {
         let mut it = target.splitn(2, '.');
         let cat = match it.next() { Some(c) if !c.is_empty() => c.to_string(), _ => continue };
         let key = match it.next() { Some(k) if !k.is_empty() => k.to_string(), _ => continue };
@@ -1755,7 +1755,7 @@ pub fn exact_match_filter_keys(category: &str, chunk: &str) -> Vec<String> {
         None => return Vec::new(),
     };
     let mut keys: Vec<String> = Vec::new();
-    for (key, val) in node {
+    for (key, val) in logis_schema::json_order::sorted_iter(node) {
         let arr = match val.get("exact_match").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
         let hit = arr
             .iter()
@@ -1797,7 +1797,7 @@ pub fn prefix_match_filter_stem(category: &str, chunk: &str) -> Option<(String, 
     let mut best_stem = String::new();
     let mut tied = false;
 
-    for (key, val) in node {
+    for (key, val) in logis_schema::json_order::sorted_iter(node) {
         let arr = match val.get("exact_match").and_then(|v| v.as_array()) { Some(a) => a, None => continue };
         for item in arr {
             let s = match item.as_str() { Some(x) => x.trim(), None => continue };
@@ -6798,7 +6798,7 @@ pub fn synthesis_value_sheet(item: &serde_json::Value, page_type: &str, doc_lang
             || l.contains("insight") || l.contains("summary") || l.contains("analysis")
     };
     let mut lines: Vec<String> = Vec::new();
-    for (k, v) in obj.iter() {
+    for (k, v) in logis_schema::json_order::sorted_iter(obj) {
         if skip(k) { continue; }
         if crate::utils::canonical::is_relay_index_key(k) && !crate::utils::canonical::relay_value_is_content(v) {
             continue;

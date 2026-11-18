@@ -384,7 +384,7 @@ impl KVRegistry {
                     }));
                 }
             }
-            if let Ok(json) = serde_json::to_string_pretty(&layer_data) {
+            if let Ok(json) = serde_json::to_string_pretty(&layer_data.iter().map(logis_schema::json_order::Sorted).collect::<Vec<_>>()) {
                 // [DIRECT-IO] Use OS-accelerated write for metadata
                 let _ = crate::utils::direct_loader::save_kv_block(&path.join(format!("layer{}_meta.json", l_idx)), json.as_bytes());
             }

@@ -204,7 +204,7 @@ impl Qwen4ExpTextConfig {
 
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
         let raw = std::fs::read(path).map_err(|e| anyhow!("[QWEN4-EXP] {:?} 를 읽을 수 없습니다: {e}", path))?;
-        let v: Value = serde_json::from_slice(&raw)?;
+        let v: Value = serde_json::from_slice(&raw).map(logis_schema::json_order::sorted)?;
         Self::from_value(&v)
     }
 

@@ -156,7 +156,7 @@ impl crate::model::LogisModel {
         //     '5000원' 과 분리되어 sale_price lte 5000 이 통째로 소멸)
         let mut op_bank_texts: Vec<String> = Vec::new();
         if let Some(ops) = crate::parsing::BIAS_DICT.get("operators").and_then(|v| v.as_object()) {
-            for (_, v) in ops {
+            for (_, v) in logis_schema::json_order::sorted_iter(ops) {
                 for field in ["semantic", "bias"] {
                     if let Some(b) = v.get(field).and_then(|val| val.as_str()) {
                         for p in crate::utils::ai_utils::split_bias_phrases_full(b) {
@@ -742,7 +742,7 @@ impl crate::model::LogisModel {
                     );
                     
                     if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
-                        if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                        if let Ok(result) = serde_json::from_str::<Value>(&response).map(logis_schema::json_order::sorted) {
                             if let Some(suggested) = result.get("suggested_category").and_then(|v| v.as_str()) {
                                 let valid = intersecting.contains(&suggested.to_string());
                                 crate::model::lang_llm::record_query_value(valid);
@@ -781,7 +781,7 @@ impl crate::model::LogisModel {
         // Stage 1 완료 후 최종 분할된 맥락 트리 전체를 출력합니다.
         emit_term("\n=======================================");
         emit_term("[STAGE-1 RESULT] 🧩 Semantic Chunking Complete:");
-        emit_term(&serde_json::to_string_pretty(&segments).unwrap_or_default());
+        emit_term(&serde_json::to_string_pretty(&logis_schema::json_order::Sorted(&segments)).unwrap_or_default());
         emit_term("=======================================\n");
 
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
@@ -877,7 +877,7 @@ impl crate::model::LogisModel {
                     ];
 
                     // 1. 루트 레벨 객체들을 필터링하여 스택에 삽입
-                    for (g_key, g_val) in root_obj {
+                    for (g_key, g_val) in logis_schema::json_order::sorted_iter(root_obj) {
                         if !excluded_keys.contains(&g_key.as_str()) {
                             // emit_term(&format!("  root Property '{}' loaded for 1st Plinko.", g_key));
                             stack.push((g_key.clone(), g_val));
@@ -919,7 +919,7 @@ impl crate::model::LogisModel {
                                 }
                             } else {
                                 // 필수 조건이 없는 일반 컨테이너 객체(예: metrics)라면 하위 객체들을 스택에 넣어 계속 파고듦
-                                for (sub_k, sub_v) in obj {
+                                for (sub_k, sub_v) in logis_schema::json_order::sorted_iter(obj) {
                                     stack.push((sub_k.clone(), sub_v));
                                 }
                             }
@@ -945,7 +945,7 @@ impl crate::model::LogisModel {
 
                 for cat in &filter_categories {
                     if let Some(obj) = crate::parsing::BIAS_DICT.get(*cat).and_then(|v| v.as_object()) {
-                        for (k, v) in obj {
+                        for (k, v) in logis_schema::json_order::sorted_iter(obj) {
                             let mut b_text = format!("{} context: {}", cat, k); 
                             let mut p_text = format!("{} context: not {}", cat, k);
                             
@@ -1168,7 +1168,7 @@ impl crate::model::LogisModel {
                 let mut op_phrase_texts: Vec<String> = Vec::new();
                 let mut op_phrase_is_rank: Vec<bool> = Vec::new();
                 if let Some(ops_node) = crate::parsing::BIAS_DICT.get("operators").and_then(|v| v.as_object()) {
-                    for (op_key, op_val) in ops_node {
+                    for (op_key, op_val) in logis_schema::json_order::sorted_iter(ops_node) {
                         let is_rank = op_key == "top" || op_key == "bottom";
                         if let Some(bias_str) = op_val.get("bias").and_then(|v| v.as_str()) {
                             for phrase in crate::utils::ai_utils::split_bias_phrases_full(bias_str) {
@@ -2482,7 +2482,7 @@ impl crate::model::LogisModel {
 
                         let mut picked: Option<String> = None;
                         if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
-                            if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                            if let Ok(result) = serde_json::from_str::<Value>(&response).map(logis_schema::json_order::sorted) {
                                 let mut cand_list: Vec<String> = Vec::new();
                                 if let Some(arr) = result.get("suggested_properties").and_then(|v| v.as_array()) {
                                     for s in arr {
@@ -3115,7 +3115,7 @@ impl crate::model::LogisModel {
                          let prompt = crate::prompts::verify_operator_mapping_prompt(&current_text, prop, op);
                         
                          if let Ok(response) = self.call_qwen3_verification_model(&prompt, Some(cancel_token.clone())).await {
-                             if let Ok(result) = serde_json::from_str::<Value>(&response) {
+                             if let Ok(result) = serde_json::from_str::<Value>(&response).map(logis_schema::json_order::sorted) {
                                  if let Some(suggested) = result.get("suggested_operator").and_then(|v| v.as_str()) {
                                      if suggested != op {
                                          emit_term(&format!("      🔄 Operator for [{}] corrected from [{}] to [{}]", prop, op, suggested));
@@ -3349,7 +3349,7 @@ impl crate::model::LogisModel {
                                 end,
                                 period_today,
                                 shape,
-                                serde_json::to_string(&cond).unwrap_or_default()
+                                serde_json::to_string(&logis_schema::json_order::SortedMap(&cond)).unwrap_or_default()
                             ));
                             Some(Value::Object(cond))
                         } else {
@@ -3472,7 +3472,7 @@ impl crate::model::LogisModel {
                     let final_substantial_json = crate::parsing::parse_json_from_llm(&res_substantial);
                     let final_find_json = crate::parsing::parse_json_from_llm(&res_find);
                     
-                    emit_term(&format!("  ✅ [EXTRACTED DATA (NUMERIC RAW)]\n{}", serde_json::to_string_pretty(&final_numeric_json).unwrap_or_default()));
+                    emit_term(&format!("  ✅ [EXTRACTED DATA (NUMERIC RAW)]\n{}", serde_json::to_string_pretty(&logis_schema::json_order::Sorted(&final_numeric_json)).unwrap_or_default()));
                     
                     if let Some(obj) = seg.as_object_mut() {
                         if let Some(status_val) = final_status_json.get("status") {
@@ -3512,7 +3512,7 @@ impl crate::model::LogisModel {
                                 cond_items.push(json!(obj));
                             } else {
                                 // { "price": { "operator": "lt", "value": 5000 } } 맵 포맷일 경우
-                                for (k, v) in obj {
+                                for (k, v) in logis_schema::json_order::sorted_iter(obj) {
                                     if deterministic_json.is_some() && (k == "started_at" || k == "expired_at" || k == "registration_date" || k == "date") {
                                         continue;
                                     }
@@ -3545,7 +3545,7 @@ impl crate::model::LogisModel {
                         for item in cond_items {
                             if let Some(item_obj) = item.as_object() {
                                 let mut prop_val_opt = None;
-                                for (ik, iv) in item_obj {
+                                for (ik, iv) in logis_schema::json_order::sorted_iter(item_obj) {
                                     if ik.trim() == "property" || ik.trim() == "property_name" {
                                         prop_val_opt = iv.as_str();
                                         break;
@@ -3573,7 +3573,7 @@ impl crate::model::LogisModel {
                                         .unwrap_or_else(|| prop_to_op.get(&k).map(|s| s.as_str()).unwrap_or("eq")).to_string();
                                     
                                     let mut final_val_obj = serde_json::Map::new();
-                                    for (ik, iv) in item_obj {
+                                    for (ik, iv) in logis_schema::json_order::sorted_iter(item_obj) {
                                         let ik_trimmed = ik.trim();
                                         if ik_trimmed != "property" && ik_trimmed != "property_name" && ik_trimmed != "operator" {
                                             // 🌟 [CRITICAL FIX] Rust 원본 숫자값을 덮어씌움
@@ -3614,7 +3614,7 @@ impl crate::model::LogisModel {
                                     
                                     structured_cond.insert(k, json!(final_val_obj));
                                 } else {
-                                    for (k, val) in item_obj {
+                                    for (k, val) in logis_schema::json_order::sorted_iter(item_obj) {
                                         let k_trimmed = k.trim();
                                         if deterministic_json.is_some() && (k_trimmed == "started_at" || k_trimmed == "expired_at" || k_trimmed == "registration_date" || k_trimmed == "date") {
                                             continue;
@@ -3704,7 +3704,7 @@ impl crate::model::LogisModel {
                         //    프론트엔드 Dexie 재질의가 이 키를 읽고 오동작하는 경로를 원천 차단합니다.
                         {
                             let mut swept: Vec<String> = Vec::new();
-                            for (k, v) in structured_cond.iter_mut() {
+                            for (k, v) in logis_schema::json_order::sorted_iter_mut(&mut structured_cond) {
                                 let obj = match v.as_object_mut() { Some(o) => o, None => continue };
                                 let op = obj.get("operator").and_then(|o| o.as_str()).unwrap_or("").to_string();
                                 let is_rank = op == "top" || op == "bottom";
@@ -3906,7 +3906,7 @@ impl crate::model::LogisModel {
 
                         // 🌟 [EMPTY CONDITION SWEEP] 끝내 값을 확보하지 못한 조건은 필터가 아니라 노이즈입니다.
                         //    (top / bottom 은 percent_total 로 동작하므로 값이 없어도 유효)
-                        let empty_keys: Vec<String> = structured_cond.iter().filter(|(_, v)| {
+                        let empty_keys: Vec<String> = logis_schema::json_order::sorted_iter(&structured_cond).filter(|(_, v)| {
                             let op = v.get("operator").and_then(|o| o.as_str()).unwrap_or("");
                             if op == "top" || op == "bottom" { return false; }
                             match v.get("value") {
@@ -3924,7 +3924,7 @@ impl crate::model::LogisModel {
                         // 🌟 [CRITICAL FIX] Deterministic JSON(확정된 기간)이 있다면 여기서 강력하게 덮어씌워서 LLM 환각을 원천 차단합니다!
                         if let Some(det_json) = &deterministic_json {
                             if let Some(det_obj) = det_json.as_object() {
-                                for (k, v) in det_obj {
+                                for (k, v) in logis_schema::json_order::sorted_iter(det_obj) {
                                     structured_cond.insert(k.clone(), v.clone());
                                 }
                             }
@@ -3954,7 +3954,7 @@ impl crate::model::LogisModel {
                             }
                         }
                         if !alt_payload.is_empty() {
-                            emit_term(&format!("  🔀 [ALTERNATE AXIS]\n{}", serde_json::to_string_pretty(&alt_payload).unwrap_or_default()));
+                            emit_term(&format!("  🔀 [ALTERNATE AXIS]\n{}", serde_json::to_string_pretty(&logis_schema::json_order::SortedMap(&alt_payload)).unwrap_or_default()));
                         }
                         obj.insert("alternates".to_string(), Value::Object(alt_payload));
 
@@ -3974,20 +3974,20 @@ impl crate::model::LogisModel {
                         }
 
                         // 🌟 [추가] 벡터 매칭(연산자)과 LLM(추출 값) + 확정 날짜가 최종 병합된 결과 로그 출력
-                        emit_term(&format!("  🚀 [FINAL MERGED CONDITION]\n{}", serde_json::to_string_pretty(&structured_cond).unwrap_or_default()));
+                        emit_term(&format!("  🚀 [FINAL MERGED CONDITION]\n{}", serde_json::to_string_pretty(&logis_schema::json_order::SortedMap(&structured_cond)).unwrap_or_default()));
                     }
                 } else {
                     if let Some(obj) = seg.as_object_mut() {
                         let mut cond = serde_json::Map::new();
                         if let Some(det_obj) = deterministic_json.as_ref().and_then(|v| v.as_object()) {
-                            for (k, v) in det_obj {
+                            for (k, v) in logis_schema::json_order::sorted_iter(det_obj) {
                                 cond.insert(k.clone(), v.clone());
                             }
                         }
                         if !cond.is_empty() {
                             emit_term(&format!(
                                 "  🗓️ [DETERMINISTIC PERIOD ONLY] 속성 조각이 없어 LLM 정규화는 건너뛰지만, 결정론으로 확정한 기간 조건 {:?} 는 싣습니다. 기간 확정은 속성 조각의 유무와 무관한 근거인데, 지금까지는 조각이 없으면 조건 전체를 비워 기간이 사라졌습니다.",
-                                cond.keys().collect::<Vec<_>>()
+                                logis_schema::json_order::sorted_keys(&cond).collect::<Vec<_>>()
                             ));
                         }
                         obj.insert("condition".to_string(), json!(cond));
@@ -4168,7 +4168,7 @@ impl crate::model::LogisModel {
                     }
 
                     if let Some(alts) = seg.get("alternates").and_then(|v| v.as_object()) {
-                        for (k, v) in alts {
+                        for (k, v) in logis_schema::json_order::sorted_iter(alts) {
                             if !g.alternates.contains_key(k) { g.alternates.insert(k.clone(), v.clone()); }
                         }
                     }
@@ -4208,7 +4208,7 @@ impl crate::model::LogisModel {
                     }
 
                     if let Some(cond) = seg.get("condition").and_then(|v| v.as_object()) {
-                        for (k, v) in cond {
+                        for (k, v) in logis_schema::json_order::sorted_iter(cond) {
                             // 값(value)이 비어있는 쓰레기 데이터는 무시하고, 유효한 값만 병합
                             // 🌟 value 키 자체가 없는 경우(None)도 반드시 '비어있음' 으로 판정해야
                             //    { "color": { "operator": "contains", "percent_total": "0.5" } } 같은
@@ -4235,7 +4235,7 @@ impl crate::model::LogisModel {
                             // 🌟 [COLLISION GUARD] 같은 도메인 안에서 동일 키가 충돌하면 먼저 확정된 값을 지킵니다.
                             //    기존 무조건 덮어쓰기가 review 의 title="고객의" 로 goods 의 title="제품" 을 지운 원인입니다.
                             if g.condition.contains_key(k) {
-                                emit_term(&format!("    ⚠️ [CONDITION COLLISION] 도메인 '{}' 의 '{}' 조건이 중복되어 먼저 확정된 값을 유지합니다. (폐기: {})", seg_type, k, v));
+                                emit_term(&format!("    ⚠️ [CONDITION COLLISION] 도메인 '{}' 의 '{}' 조건이 중복되어 먼저 확정된 값을 유지합니다. (폐기: {})", seg_type, k, logis_schema::json_order::Sorted(&v)));
                             } else {
                                 g.condition.insert(k.clone(), v.clone());
                             }
@@ -4298,7 +4298,7 @@ impl crate::model::LogisModel {
                             .and_then(|sb| sb.get("domain_affinity"))
                             .and_then(|v| v.as_object())
                         {
-                            for (dom, targets) in aff_obj {
+                            for (dom, targets) in logis_schema::json_order::sorted_iter(aff_obj) {
                                 if let Some(arr) = targets.as_array() {
                                     let t: Vec<String> = arr.iter()
                                         .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -4600,7 +4600,7 @@ impl crate::model::LogisModel {
                             Some(o) => o,
                             None => continue,
                         };
-                        for (k, v) in cond_obj.iter_mut() {
+                        for (k, v) in logis_schema::json_order::sorted_iter_mut(cond_obj) {
                             let o = match v.as_object_mut() {
                                 Some(o) => o,
                                 None => continue,
@@ -4630,7 +4630,7 @@ impl crate::model::LogisModel {
                 emit_term(&format!(
                     "  ✅ [UNIFIED CONTEXTS v4] 발행 쿼리 {}건 (커버 타입 {}종)\n{}",
                     query_count, total_types,
-                    serde_json::to_string_pretty(&ctx_arr).unwrap_or_default()
+                    serde_json::to_string_pretty(&logis_schema::json_order::SortedSlice(&ctx_arr)).unwrap_or_default()
                 ));
             }
         }
