@@ -1,0 +1,38 @@
+# Cloudflare Workers (workers-rs, wasm32-unknown-unknown). 루트 작업 공간(데스크톱 앱)과 따로 빌드한다:
+# 표적이 wasm 이고, 앱의 rustflags(target-cpu=native) · candle 패치를 받으면 안 된다.
+#
+#   common   JS 값 모형(V) · D1 · Workers AI · Vectorize · gzip · LLM 호출 · 공용 표 — 두 워커가 같이 쓴다
+#   proxy    proxy-commerce-logis-center (fetch): 작업 하나를 받아 추출 · 저장 · 검색
+#   apac     commerce-apac-logis-center (cron): tasks 대기열을 돌며 proxy 를 부른다
+#
+# 원본 TypeScript 와 같은 동작이 목표다(같은 SQL · 같은 프롬프트 · 같은 JSON 출력). 차이는 docs/workers-rs.md 에 적는다.
+[workspace]
+resolver = "2"
+members = ["common", "proxy", "apac"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Qntology/logis-center"
+
+[workspace.dependencies]
+worker = { version = "=0.8.7", features = ["d1"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = "2"
+ryu-js = "1"
+flate2 = "1"
+regex = "1"
+fancy-regex = "0.18"
+scraper = "0.25"
+# 앱과 같은 엔터티 해시 (ethers.computeAddress(ethers.hashMessage(text)) 와 같음)
+logis-schema = { path = "../crates/logis-schema" }
+logis-worker-common = { path = "common" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

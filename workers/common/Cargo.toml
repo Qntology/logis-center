@@ -1,0 +1,24 @@
+[package]
+name = "logis-worker-common"
+description = "logis-center Workers 공용: JS 값 모형(V, 참조 공유 · undefined/null · JS 키 순서 · JSON.stringify/parse), D1 · Workers AI · Vectorize 를 JS 그대로 부르는 얇은 층, gzip(pako), Gemini · DeepInfra 호출, 지역 · 언어 표"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+indexmap.workspace = true
+ryu-js.workspace = true
+flate2.workspace = true
+regex.workspace = true
+fancy-regex.workspace = true
+logis-schema.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+# getrandom_backend="wasm_js" (.cargo/config.toml) 와 짝
+getrandom = { version = "0.3", features = ["wasm_js"] }

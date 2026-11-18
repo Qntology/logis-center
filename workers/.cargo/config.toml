@@ -1,0 +1,8 @@
+# 루트 .cargo/config.toml(데스크톱 앱: target-cpu=native, 산출물 ../target)을 덮는다.
+# target.<triple>.rustflags 가 있으면 build.rustflags 는 쓰이지 않는다 — wasm 에 target-cpu=native 가 붙지 않게.
+[build]
+target-dir = "target"
+
+[target.wasm32-unknown-unknown]
+# premium-discount-identity(logis-schema 의 hash_id)가 getrandom 0.3 을 쓴다: wasm 은 JS crypto 백엔드
+rustflags = ["--cfg", 'getrandom_backend="wasm_js"']

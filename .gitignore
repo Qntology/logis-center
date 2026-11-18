@@ -228,3 +228,4 @@ build/
 
 # Cargo (root workspace; build output goes to target/ via .cargo/config.toml)
 /target/
+workers/target/
