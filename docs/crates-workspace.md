@@ -105,6 +105,7 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 - 1단계만: release ROCm `cargo build`(lib + bin) 통과 (51분 56초 — ethers 를 빼며 호스트 syn 기능이 바뀌어 거의 전체 재빌드).
 - 1~4단계 합친 상태:
   - debug `cargo check --no-default-features --features rocm --lib --bins --test it` 통과.
+  - release ROCm `cargo build`(lib + bin) 통과 (28분 50초).
   - CI(windows-cpu)와 같은 조건(debug · CPU · `CARGO_PROFILE_DEV_DEBUG=0`): `cargo test --test it` 286 통과 · 0 실패 · 65 무시,
     lib 단위 시험(`vocab_trim stable_rank store::`) 8 통과. 시험 수는 388 → 375 로, 지운 분석 시험 13개(analytic_page 10 · search_relation 3)만큼.
   - crate 단위 시험(`-p logis-schema … -p logis-search`) 통과, 프런트엔드 tsc 0 오류 · vitest 217 통과(지운 분석 · OAuth 시험 74개 제외).
