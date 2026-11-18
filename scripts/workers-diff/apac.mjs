@@ -5,6 +5,8 @@ import * as esbuild from "esbuild";
 import { gzipSync, gunzipSync } from "node:zlib";
 import fs from "node:fs";
 import path from "node:path";
+// 운영 Workers 의 시간대는 UTC 다: workerd(Miniflare)가 PC 시간대(KST)로 날짜를 읽지 않게
+process.env.TZ = "UTC";
 import { execFileSync } from "node:child_process";
 import { patchOriginal } from "./fixes.mjs";
 // 원본 TypeScript 는 저장소 이력에서 꺼낸다 (workers-rs 로 바꾸기 직전 커밋)

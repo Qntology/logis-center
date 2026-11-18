@@ -1,6 +1,6 @@
 // 원본 TS(801b0ce0)에 버그 수정을 덧대 "고친 원본"을 만든다. Rust 판의 같은 수정과 1:1 로 견주기 위해서다.
 // 각 수정은 { id, worker: "apac" | "proxy" | "both", find, replace } — find 의 공백(탭 · 줄바꿈 수)은 무시하고 맞추며,
-// 정확히 한 번 맞아야 한다(worker 가 both 면 각 파일에서 한 번). 설명은 docs/workers-rs.md 의 "고친 버그" 표와 같은 id 를 쓴다.
+// 정확히 한 번(count 를 주면 그 수만큼) 맞아야 한다(worker 가 both 면 각 파일에서 한 번). 설명은 docs/workers-rs.md 의 "고친 버그" 표와 같은 id 를 쓴다.
 // D1 의 undefined 바인딩(fix-bind-undefined)은 글 패치가 아니라 진입 모듈의 env 래퍼가 맡는다(mocks: wrapD1).
 import fs from "node:fs";
 import path from "node:path";
@@ -73,7 +73,8 @@ export async function patchOriginal(worker, source) {
     if (fix.worker !== worker && fix.worker !== "both") continue;
     const re = fix.find instanceof RegExp ? fix.find : loose(fix.find);
     const n = (s.match(re) || []).length;
-    if (n !== 1) throw new Error(`fix ${fix.id}: ${n} matches in ${worker}`);
+    const want = fix.count ?? 1;
+    if (n !== want) throw new Error(`fix ${fix.id}: ${n} matches in ${worker} (want ${want})`);
     s = s.replace(re, () => fix.replace);
     applied.push(fix.id);
   }

@@ -133,21 +133,55 @@ fn generate_pug_lines(doc: &Document, nodes: &[NodeId]) -> R<Vec<String>> {
     Ok(lines)
 }
 
-/// `parseBody(body, page)` — 원본에서 부르는 곳은 없다. 원본 그대로 옮긴다:
-/// - `var body = ''` 가 인자를 가려 늘 빈 문서를 읽는다
-/// - 반복 안의 `selectors.hasOwnProperty(s)` 는 정의되지 않은 전역 `selectors` 를 읽어, `page.selectors` 에 열거되는 키가
-///   하나라도 있으면 첫 바퀴에서 ReferenceError 를 던진다. 그래서 그 뒤(querySelector · type/checked/selected/value 분기)는
-///   닿지 않고, 던지지 않을 때의 결과는 늘 `[]` 다
-pub fn parse_body(_body: &V, page: &V) -> R<V> {
-    // 원본 그대로: var body = ''
-    let body = "";
-    let _document = Document::parse(&format!("<html><body>{body}</body></html>"));
+/// `parseBody(body, page)` — 원본에서 부르는 곳은 없다.
+/// 고침: 원본은 `var body = ''` 가 인자를 가려 늘 빈 문서를 읽었고, 반복 안의 `selectors` 가 범위에 없어(ReferenceError)
+/// 키가 하나라도 있으면 던졌다. 이제 인자 `body` 와 `page.selectors` 를 쓴다.
+/// `$item.value` 는 linkedom 처럼 input 은 value 속성, textarea 는 글, 그 밖은 undefined 로 본다.
+pub fn parse_body(body: &V, page: &V) -> R<V> {
+    let body = if body.truthy() { body.to_str() } else { String::new() };
+    let document = Document::parse(&format!("<html><body>{body}</body></html>"));
     let results = V::new_arr();
     // for (const s in page.selectors) — page 가 undefined · null 이면 TypeError, selectors 가 undefined · null 이면 반복 없음
     let selectors = page.g("selectors")?;
-    if !selectors.keys().is_empty() {
-        // 원본 그대로: selectors 는 parseBody 의 범위에 없다
-        return Err(Throw { name: "ReferenceError", message: "selectors is not defined".into() });
+    for s in selectors.keys() {
+        if !selectors.has(&s) {
+            continue;
+        }
+        let selector = match selectors.g(&s)? {
+            V::Str(x) => x,
+            V::Undef | V::Null => {
+                return Err(Throw::type_error(format!("Cannot read properties of {} (reading 'includes')", selectors.g(&s)?.to_str())))
+            }
+            _ => return Err(Throw::type_error("selectors.includes is not a function")),
+        };
+        let item = V::new_obj();
+        if let Some(id) = document.query_selector(&selector)? {
+            let attr = |name: &str| document.get_attribute(id, name).filter(|v| !v.is_empty());
+            let text = document.text_content(id);
+            if attr("type").is_some() {
+                let tag = document.tag_name(id).map(|t| to_lower(&t)).unwrap_or_default();
+                let value = match tag.as_str() {
+                    "input" => attr("value"),
+                    "textarea" => Some(text.clone()).filter(|v| !v.is_empty()),
+                    _ => None,
+                };
+                let v = if let Some(checked) = attr("checked") {
+                    V::Bool(checked == "true")
+                } else if let Some(selected) = attr("selected") {
+                    V::from(selected)
+                } else if let Some(value) = value {
+                    V::from(value)
+                } else if !text.is_empty() {
+                    V::from(text)
+                } else {
+                    V::Null
+                };
+                item.put(&s, v);
+            } else {
+                item.put(&s, if text.is_empty() { V::Null } else { V::from(text) });
+            }
+        }
+        results.push(item)?;
     }
     Ok(results)
 }
@@ -165,11 +199,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_body_quirks() {
+    fn parse_body_reads_selectors() {
         assert_eq!(parse_body(&V::from("<p>x</p>"), &obj! { "selectors" => obj! {} }).unwrap().len(), 0);
         assert_eq!(parse_body(&V::Undef, &obj! {}).unwrap().len(), 0);
-        let err = parse_body(&V::Undef, &obj! { "selectors" => obj! { "title" => "h1" } }).unwrap_err();
-        assert_eq!(err.name, "ReferenceError");
+        let html = V::from(r#"<h1>제목</h1><input type="text" value="7"><input type="checkbox" checked="true"><p></p>"#);
+        let page = obj! { "selectors" => obj! { "title" => "h1", "qty" => "input[type=text]", "on" => "input[type=checkbox]", "empty" => "p", "none" => "h2" } };
+        let out = parse_body(&html, &page).unwrap();
+        assert_eq!(logis_worker_common::stringify_str(&out), r#"[{"title":"제목"},{"qty":"7"},{"on":true},{"empty":null},{}]"#);
         assert_eq!(parse_body(&V::Undef, &V::Undef).unwrap_err().name, "TypeError");
     }
 }

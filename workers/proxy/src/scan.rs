@@ -14,7 +14,7 @@ use logis_worker_common::{arr, console_log, obj, stringify_str, R, V};
 use crate::ctx::Ctx;
 use crate::dom::Document;
 use crate::flow::Flow;
-use crate::handler::{dec, select};
+use crate::handler::dec;
 use crate::rules::{item2json, list2json};
 use crate::templates::*;
 
@@ -71,6 +71,15 @@ fn qsa(doc: &Document, sel: &V) -> R<usize> {
 /// `document.querySelector(sel)` 가 있는지
 fn qs(doc: &Document, sel: &V) -> R<bool> {
     Ok(doc.query_selector(&selector_text(sel)?)?.is_some())
+}
+
+/// 3084 · 3104 · 3150 · 3346 의 `SELECT * FROM pages WHERE "id" = '${id}' AND "created_at" < ${created_at} LIMIT 1`.
+/// 고침: 값을 SQL 글에 잇지 않고 묶는다 (작은따옴표가 든 값이 쿼리를 깨뜨리지 않게)
+const SQL_PAGE: &str = "SELECT * FROM pages WHERE \"id\" = ?1 AND \"created_at\" < ?2 LIMIT 1";
+
+/// pages 에서 id 하나 (`results`)
+async fn select_page(env: &Env, id: V, created_at: &V) -> R<V> {
+    js::query_bound(env, CENTER_REGION, SQL_PAGE, &[id, created_at.clone()]).await
 }
 
 /// `statements[key].push(env[db].prepare(sql).bind(...args))` — 칸이 비면 prepare 전에 던진다(원본의 평가 순서)
@@ -186,7 +195,8 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
 async fn body(ctx: &mut Ctx, env: &Env) -> R<Flow> {
     let task = ctx.task.clone();
 
-    // 원본 그대로: `var page` 에 초기값이 없어 앞 작업(회차)의 page 가 남는다 — 3201 · 3246 의 `!page` 가 그 값을 본다
+    // 고침: `var page` 는 작업마다 undefined 에서 시작한다 (원본은 앞 작업의 page 가 남아 3201 · 3246 의 `!page` 가 그 값을 봤다)
+    ctx.page = V::Undef;
     ctx.pageType = V::from("");
     ctx.pageLength = V::Num(0.0);
 
@@ -202,8 +212,7 @@ async fn body(ctx: &mut Ctx, env: &Env) -> R<Flow> {
 
     console_log!("pageId", ctx.pageId.clone());
 
-    let sql = tpl(T3084, &[ctx.pageId.clone(), ctx.created_at.clone()]);
-    ctx.results = select(env, CENTER_REGION, &sql).await?;
+    ctx.results = select_page(env, ctx.pageId.clone(), &ctx.created_at).await?;
 
     ctx.pages = ctx.results.clone();
 
@@ -223,8 +232,7 @@ async fn body(ctx: &mut Ctx, env: &Env) -> R<Flow> {
                 ctx.pageType = ctx._page.g("type")?;
             } else if loose_eq(&task.g("ref")?, &ctx.pageId) {
                 let id = hash_id(&add(&task.g("cc")?, &upper(&pathname)?))?;
-                let sql = tpl(T3104, &[V::from(id), ctx.created_at.clone()]);
-                ctx.results = select(env, CENTER_REGION, &sql).await?;
+                ctx.results = select_page(env, V::from(id), &ctx.created_at).await?;
 
                 if ctx.results.length()?.truthy() {
                     ctx._page = ctx.results.gi(0)?;
@@ -239,12 +247,12 @@ async fn body(ctx: &mut Ctx, env: &Env) -> R<Flow> {
                         ctx.pageType = ctx._page.g("type")?;
                     }
 
-                    let page = ctx._page.clone();
+                    let (page, node_selectors) = (ctx._page.clone(), ctx._selectors.clone());
                     let r: R<()> = (|| {
                         let document = Document::parse(&tpl(T3120, &[task.g("body")?]));
 
-                        // 원본 그대로: _page.data 는 풀지 않은 BLOB(숫자 배열)이라 .node 는 undefined → linkedom 이 던진다
-                        if qsa(&document, &page.g("data")?.g("node")?)? > 0 {
+                        // 고침: 풀어 읽은 _selectors.node 를 쓴다 (원본의 _page.data 는 풀지 않은 BLOB 이라 .node 가 undefined → 늘 던졌다)
+                        if qsa(&document, &node_selectors.g("node")?)? > 0 {
                             task.s_("page", page.clone())?;
                         }
                         Ok(())
@@ -272,8 +280,7 @@ async fn body(ctx: &mut Ctx, env: &Env) -> R<Flow> {
     }
 
     if !ctx.isDetail.truthy() && task.g("referrer")?.truthy() {
-        let sql = tpl(T3150, &[task.g("referrer")?, ctx.created_at.clone()]);
-        ctx.results = select(env, CENTER_REGION, &sql).await?;
+        ctx.results = select_page(env, task.g("referrer")?, &ctx.created_at).await?;
 
         if ctx.results.length()?.truthy() {
             ctx._page = ctx.results.gi(0)?;
@@ -404,7 +411,8 @@ async fn body(ctx: &mut Ctx, env: &Env) -> R<Flow> {
 
     console_log!("isDetail2", stringify_str(&ctx.isDetail));
 
-    // 원본 그대로: `var before` 에 초기값이 없어 앞 작업의 before 가 남는다 — 3451 이 그 값을 본다
+    // 고침: `var before` 는 작업마다 undefined 에서 시작한다 (원본은 앞 작업의 before 가 남아 3451 이 그 값을 봤다)
+    ctx.before = V::Undef;
 
     if ctx.isDetail.truthy() {
         ctx.selectors.s_("detail", V::Bool(true))?;
@@ -417,10 +425,11 @@ async fn body(ctx: &mut Ctx, env: &Env) -> R<Flow> {
 
         console_log!("pageId", ctx.pageId.clone());
 
-        let sql = tpl(T3346, &[ctx.pageId.clone(), ctx.created_at.clone()]);
-        ctx.results = select(env, CENTER_REGION, &sql).await?;
+        ctx.results = select_page(env, ctx.pageId.clone(), &ctx.created_at).await?;
 
-        // 원본 그대로: `var _page` 에 초기값이 없어 3089 · 3107 · 3153 (또는 앞 작업)의 _page 가 남는다 → 3409 가 그 값을 본다
+        // 고침: `var _page` 는 여기서 undefined 에서 시작한다 (원본은 3089 · 3107 · 3153 의 _page 가 남아 3409 가 그 값을 봤다 —
+        // 그 행의 data 가 NULL 이면 `_page.data.item` 에서 던져 작업이 통째로 버려졌다)
+        ctx._page = V::Undef;
         if ctx.results.length()?.truthy() {
             ctx._page = ctx.results.gi(0)?;
 
@@ -456,8 +465,8 @@ async fn body(ctx: &mut Ctx, env: &Env) -> R<Flow> {
                     ctx.option = prop.gk(&ctx.i)?;
                     let option = ctx.option.clone();
 
-                    // 원본 그대로: typeof null == "object" 라 null 원소면 Object.keys(null) 이 던진다
-                    if option.type_of() == "object" && !option.keys_checked()?.is_empty() {
+                    // 고침: null 원소는 건너뛴다 (typeof null == "object" 라 원본은 Object.keys(null) 에서 던졌다)
+                    if option.truthy() && option.type_of() == "object" && !option.keys_checked()?.is_empty() {
                         for n in option.keys() {
                             ctx.n = V::from(n.clone());
                             if !option.has(&n) {
@@ -470,7 +479,7 @@ async fn body(ctx: &mut Ctx, env: &Env) -> R<Flow> {
                                 ctx.selectors.s_(&tpl(T3382, &[V::from(p.clone())]), option.g("selector")?)?;
 
                                 item.g(&p)?.sk(&ctx.i, option.g("value")?)?;
-                            } else if opt.type_of() == "object" && !opt.keys_checked()?.is_empty() {
+                            } else if opt.truthy() && opt.type_of() == "object" && !opt.keys_checked()?.is_empty() {
                                 for o in opt.keys() {
                                     ctx.o = V::from(o.clone());
                                     if !opt.has(&o) {

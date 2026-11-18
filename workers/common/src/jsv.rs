@@ -39,11 +39,19 @@ impl Throw {
     pub fn error(message: impl Into<String>) -> Throw {
         Throw { name: "Error", message: message.into() }
     }
+    /// Error 객체가 아닌 값을 던진 것 (`throw "buffer error"` — pako 가 이렇게 던진다). `String(err)` 는 글 그대로
+    pub fn value(message: impl Into<String>) -> Throw {
+        Throw { name: "", message: message.into() }
+    }
 }
 
 impl fmt::Display for Throw {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.name, self.message)
+        if self.name.is_empty() {
+            write!(f, "{}", self.message)
+        } else {
+            write!(f, "{}: {}", self.name, self.message)
+        }
     }
 }
 

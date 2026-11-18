@@ -258,11 +258,7 @@ pub fn paragraph2propertys(task: &V, team: &V, paragraph: &V) -> R<V> {
             } else {
                 condition.s_("date", operators(&V::from("date")))?;
             }
-            const PROPERTYS: &[&str] = &[
-                "price", "quantity", "width", "height", "length", "weight", "shipping_fee", "shipping_duration", "sale_price", "supply_price",
-                "low_stock_threshold", "discount", "min_order_amount", "max_discount_amount", "usage_limit", "usage_per", "started_at", "expired_at",
-            ];
-            for property in PROPERTYS {
+            for property in CONDITION_PROPERTYS {
                 let condition = paragraph.g("condition")?;
                 if !condition.g(property)?.truthy() {
                     condition.s_(property, V::new_obj())?;
@@ -295,6 +291,10 @@ pub fn paragraph2propertys(task: &V, team: &V, paragraph: &V) -> R<V> {
 }
 
 /// `parseCondition(obj, col, condition)`
+///
+/// 고침: 값과 열 이름을 SQL 글에 그대로 이어 붙였다(LLM 이 낸 값 · 키로 쿼리를 바꿀 수 있었음). 이제 글에 들어가는 값은
+/// `Number()`(날짜는 `new Date().getTime()`) 뒤 유한한 수뿐이고(아니면 그 경계는 건너뜀), 열은 [`condition_column`] 의
+/// 알려진 이름뿐이다(아니면 조건 없음 — 원본의 "모두 NaN" 갈래처럼 빈 글).
 pub fn parse_condition(obj: &V, col: &V, condition: &V) -> R<V> {
     let is_date = is(col, "date");
     let val = |v: V| -> V {
@@ -308,22 +308,83 @@ pub fn parse_condition(obj: &V, col: &V, condition: &V) -> R<V> {
     let lte = val(obj.g("lte")?);
     let eq = val(obj.g("eq")?);
     let column = if is_date { V::from("created_at") } else { col.clone() };
+    if !condition_column(&column.to_str()) {
+        return Ok(V::from(""));
+    }
+    // 글에 넣을 경계: 원본처럼 참인 값만, 그리고 수로 바꿔 유한할 때만
+    let bound = |raw: V| -> Option<V> {
+        if !raw.truthy() {
+            return None;
+        }
+        let n = val(raw).to_num();
+        n.is_finite().then_some(V::Num(n))
+    };
     let mut condition = condition.clone();
     if !gte.to_num().is_nan() || !lte.to_num().is_nan() || !eq.to_num().is_nan() {
         let add = |c: &V, s: String| logis_worker_common::add(c, &V::from(s));
-        if obj.g("gte")?.truthy() && obj.g("lte")?.truthy() {
-            condition = add(&condition, tpl(T981, &[column.clone(), val(obj.g("gte")?), column.clone(), val(obj.g("lte")?)]));
-        } else if obj.g("gte")?.truthy() {
-            condition = add(&condition, tpl(T983, &[column.clone(), val(obj.g("gte")?)]));
-        } else if obj.g("lte")?.truthy() {
-            condition = add(&condition, tpl(T985, &[column.clone(), val(obj.g("lte")?)]));
-        } else if obj.g("eq")?.truthy() {
-            condition = add(&condition, tpl(T987, &[column, val(obj.g("eq")?)]));
+        let (g, l, e) = (bound(obj.g("gte")?), bound(obj.g("lte")?), bound(obj.g("eq")?));
+        if let (Some(g), Some(l)) = (&g, &l) {
+            condition = add(&condition, tpl(T981, &[column.clone(), g.clone(), column.clone(), l.clone()]));
+        } else if let Some(g) = g {
+            condition = add(&condition, tpl(T983, &[column.clone(), g]));
+        } else if let Some(l) = l {
+            condition = add(&condition, tpl(T985, &[column.clone(), l]));
+        } else if let Some(e) = e {
+            condition = add(&condition, tpl(T987, &[column, e]));
         }
     } else {
         condition = V::from("");
     }
     Ok(condition)
+}
+
+/// 검색이 SQL 을 만드는 표의 열 (migrations/0001 의 스키마)
+const TABLE_COLUMNS: &[(&str, &[&str])] = &[
+    ("items", &["id", "type", "from", "to", "cc", "bcc", "ref", "digest", "data", "created_at", "updated_at"]),
+    (
+        "sales",
+        &[
+            "id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "views", "goods",
+            "status", "width", "height", "length", "weight", "size", "currency", "supply_price", "sale_price", "discount", "quantity", "tracking",
+            "number", "carrier", "shipping_fee", "shipping_method", "shipping_duration", "fulfillment_service", "stock_keeping_unit",
+            "bundle_shipping", "used", "lease", "rental", "refurbish", "tax_included", "release_date",
+        ],
+    ),
+    (
+        "event",
+        &[
+            "id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "started_at", "expired_at", "index", "event", "phone", "address",
+            "status", "code", "discount", "quantity", "usage_per", "usage_limit", "min_order_amount", "max_order_amount", "max_discount_amount",
+            "new_customer_only", "first_purchase_only", "region_restrictions",
+        ],
+    ),
+    (
+        "tracking",
+        &[
+            "id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "index", "event", "goods", "order", "status", "no",
+            "sender_address", "sender_phone", "recipient_address", "recipient_phone", "width", "height", "length", "weight", "carrier",
+            "shipping_fee", "shipping_method", "shipping_duration", "shipping_date", "delivery_date", "order_date", "payment_date",
+            "payment_method", "payment_origin", "payment_number", "bundle_shipping",
+        ],
+    ),
+    ("talks", &["id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at"]),
+];
+
+/// `paragraph2propertys` 가 조건에 넣는 속성 (원본의 propertys 순서 그대로 — 표에 열이 없는 것도 있다: price 등)
+const CONDITION_PROPERTYS: &[&str] = &[
+    "price", "quantity", "width", "height", "length", "weight", "shipping_fee", "shipping_duration", "sale_price", "supply_price",
+    "low_stock_threshold", "discount", "min_order_amount", "max_discount_amount", "usage_limit", "usage_per", "started_at", "expired_at",
+];
+
+/// 표 `table` 의 열 목록 (검색이 쓰는 표가 아니면 None)
+pub fn table_columns(table: &str) -> Option<&'static [&'static str]> {
+    TABLE_COLUMNS.iter().find(|(t, _)| *t == table).map(|(_, c)| *c)
+}
+
+/// 조건 글에 넣어도 되는 열 이름: 검색 표의 열이거나 `paragraph2propertys` 의 속성.
+/// 이름은 따옴표 안에 들어가므로 이 목록 밖(LLM 이 지어낸 키)은 받지 않는다
+pub fn condition_column(column: &str) -> bool {
+    CONDITION_PROPERTYS.contains(&column) || TABLE_COLUMNS.iter().any(|(_, cols)| cols.contains(&column))
 }
 
 /// `randomKey()` — `parseInt(Math.random().toString().replace("0.",""))`

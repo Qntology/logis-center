@@ -24,11 +24,32 @@ pub fn gzip(data: &[u8]) -> Vec<u8> {
 /// `input.subarray is not a function` 으로 던져 그 작업을 통째로 버렸다([`pako_array_throws`] 가 그 자리를 안다). 이제 바이트로 바꿔 푼다
 /// (원본에서는 `ungzip(new Uint8Array(row.data))`).
 pub fn ungzip(v: &V) -> R<Vec<u8>> {
-    let bytes = v.to_bytes().ok_or_else(|| Throw::error("invalid input"))?;
+    // `new Uint8Array(d)`: 배열 · 바이트는 그 내용, 수는 그만큼의 0, 그 밖(null · 객체 · 문자열 등)은 ToIndex 길이의 0
+    let bytes = match v {
+        V::Bytes(_) | V::Arr(_) => v.to_bytes().unwrap_or_default(),
+        other => {
+            let n = other.to_num();
+            vec![0u8; if n.is_finite() && n > 0.0 { n.trunc() as usize } else { 0 }]
+        }
+    };
+    // pako 가 던지는 글과 같게 (Error 가 아니라 글을 던진다)
+    if bytes.len() < 2 {
+        return Err(Throw::value("buffer error"));
+    }
+    if bytes[0] != 0x1f || bytes[1] != 0x8b {
+        return Err(Throw::value("incorrect header check"));
+    }
+    if bytes.len() < 10 {
+        return Err(Throw::value("buffer error"));
+    }
+    if bytes[2] != 8 {
+        return Err(Throw::value("unknown compression method"));
+    }
     let mut out = Vec::new();
-    GzDecoder::new(&bytes[..])
-        .read_to_end(&mut out)
-        .map_err(|e| Throw::error(format!("{e}")))?;
+    GzDecoder::new(&bytes[..]).read_to_end(&mut out).map_err(|e| match e.kind() {
+        std::io::ErrorKind::UnexpectedEof => Throw::value("buffer error"),
+        _ => Throw::value(format!("{e}")),
+    })?;
     Ok(out)
 }
 

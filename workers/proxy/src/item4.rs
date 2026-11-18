@@ -10,7 +10,7 @@ use logis_worker_common::{console_log, obj, R, V};
 use crate::ctx::Ctx;
 use crate::flow::Flow;
 use crate::handler::dec;
-use crate::item3::{event_params, mark_embed_pending, pick, push_bound, sales_params, tirm, tracking_params, CLIENT_EMBEDDING};
+use crate::item3::{event_params, event_sql, map_vectors, mark_embed_pending, pick, push_bound, sales_params, tracking_params, trim_of, CLIENT_EMBEDDING};
 use crate::templates::*;
 
 /// 5170~5516
@@ -35,7 +35,8 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
             }
             console_log!("[EMBED-PENDING] item delegated to Client App:", item.g("id")?);
         } else {
-            // `var embeddings` 는 값을 지우지 않는다
+            // 고침: `var embeddings` 가 앞 아이템의 값을 남겼다 — 아이템마다 비운다
+            ctx.embeddings = V::Undef;
             if ctx.models.g("cloudflare")?.truthy() {
                 let out = env.ai_run("@cf/google/embeddinggemma-300m", &obj! { "text" => vec![item.g("semantic")?] }).await?;
                 ctx.embeddings = out.g("data")?;
@@ -47,7 +48,19 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
                 ctx.models.s_("cloudflare", dec(&ctx.models.g("cloudflare")?))?;
             }
             if !ctx.embeddings.truthy() && ctx.models.g("deepinfra")?.truthy() {
-                return Err(tirm(&item.g("semantic")?, "item.semantic"));
+                // 고침(fix-tirm): item.semantic.tirm() → item.semantic.trim()
+                let content = trim_of(&item.g("semantic")?, "item.semantic")?;
+                ctx.embeddings = crate::llm::deepinfra(
+                    &ctx.deepinfra,
+                    &V::from("google/embeddinggemma-300m"),
+                    &V::from(""),
+                    &content,
+                    &V::Undef,
+                    &V::Undef,
+                )
+                .await?;
+                ctx.s_VectorizeVector = map_vectors(&ctx.embeddings, &item.g("id")?, &ctx.metadata)?;
+                ctx.models.s_("deepinfra", dec(&ctx.models.g("deepinfra")?))?;
             }
             console_log!("typeof embeddings", ctx.embeddings.type_of());
             if !ctx.embeddings.truthy() {
@@ -106,7 +119,7 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
         })?;
     } else if loose_eq(&ctx.itemType, &V::from("event")) {
         let db = tpl(T5453, &[zone.clone()]);
-        push_bound(&ctx.statements, &tpl(T5452, &[zone]), env, &db, T5453_1[0], || {
+        push_bound(&ctx.statements, &tpl(T5452, &[zone]), env, &db, &event_sql(T5453_1[0]), || {
             Ok(event_params(&item, item.get("type"), &item, item.get("status")))
         })?;
     }

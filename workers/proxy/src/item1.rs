@@ -4,14 +4,14 @@
 //! 이 구역과 [`crate::item2`] 가 같이 쓰는 작은 도우미도 여기 둔다.
 
 use logis_worker_common::gzip::{decode_utf8, gzip_json, ungzip};
-use logis_worker_common::js::Env;
+use logis_worker_common::js::{self, Env};
 use logis_worker_common::jsv::{js_trim, less_than, parse_float, parse_int, stringify_checked, to_lower, to_upper, tpl, Throw};
 use logis_worker_common::util::{clean_number, crc32, digest, hash_id, merge_node, normalize_numeric_homoglyphs};
 use logis_worker_common::{add, arr, console_log, date, loose_eq, obj, parse, stringify_str, R, V};
 
 use crate::ctx::Ctx;
 use crate::flow::Flow;
-use crate::handler::{dec, prepare_bind, select};
+use crate::handler::{dec, prepare_bind};
 use crate::llm::{deepinfra, gemini};
 use crate::rules::{parse_status, semantic_prompt_system};
 use crate::templates::*;
@@ -133,6 +133,26 @@ fn mark_embed_pending(o: &V) {
     }
 }
 
+/// SQL 에 이어 붙여도 되는 표 이름 (값처럼 묶을 수 없다)
+const KNOWN_TABLES: &[&str] = &["items", "sales", "event", "talks", "tracking", "pages", "users", "tasks"];
+
+/// 고침: 유형 변수로 만든 표 이름은 아는 표일 때만 SQL 에 넣는다
+pub(crate) fn table_name(v: &V) -> R<String> {
+    match v {
+        V::Str(s) if KNOWN_TABLES.contains(&s.as_str()) => Ok(s.clone()),
+        _ => Err(Throw::type_error(format!("unknown table: {}", v.to_str()))),
+    }
+}
+
+/// `semantic.trim()` — 문자열이 아니면 원본처럼 TypeError
+fn trim_text(v: &V, name: &str) -> R<V> {
+    match v {
+        V::Str(s) => Ok(V::from(js_trim(s).to_string())),
+        V::Undef | V::Null => Err(Throw::type_error(format!("Cannot read properties of {} (reading 'trim')", v.to_str()))),
+        _ => Err(Throw::type_error(format!("{name}.trim is not a function"))),
+    }
+}
+
 /// `parseFloat(t[k] ? t[k] : 0)`
 fn pf(t: &V, k: &str) -> R<V> {
     let v = or(t.g(k)?, 0);
@@ -219,14 +239,16 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
         item.s_("digest", V::from(digest(&item.g("title")?)?))?;
     }
 
+    // 고침: 3741 · 3744 의 값은 SQL 글에 잇지 않고 묶는다 (표 이름은 아는 표만)
     let db = tpl(T3741, &[zone.clone(), ctx.itemType.clone()]);
-    let sql = tpl(T3741_1, &[ctx.itemType.clone(), item.g("id")?, item.g("index")?, task.g("to")?, task.g("cc")?, now.clone()]);
-    ctx.results = select(env, &db, &sql).await?;
+    let table = table_name(&ctx.itemType)?;
+    let sql = format!("SELECT * FROM {table} WHERE \"id\" = ?1 AND \"index\" = ?2 AND \"to\" = ?3 AND \"cc\" = ?4 AND \"created_at\" < ?5 LIMIT 1");
+    ctx.results = js::query_bound(env, &db, &sql, &[item.g("id")?, item.g("index")?, task.g("to")?, task.g("cc")?, now.clone()]).await?;
 
     if loose_eq(&ctx.results.length()?, &V::Num(0.0)) {
         let db = tpl(T3744, &[zone.clone(), ctx.itemType.clone()]);
-        let sql = tpl(T3744_1, &[ctx.itemType.clone(), task.g("to")?, task.g("cc")?, item.g("ref")?, now.clone()]);
-        ctx.results = select(env, &db, &sql).await?;
+        let sql = format!("SELECT * FROM {table} WHERE \"to\" = ?1 AND \"cc\" = ?2 AND \"ref\" = ?3 AND \"created_at\" < ?4 LIMIT 1");
+        ctx.results = js::query_bound(env, &db, &sql, &[task.g("to")?, task.g("cc")?, item.g("ref")?, now.clone()]).await?;
     }
 
     console_log!("add results.length", item.g("type")?, ctx.results.length()?);
@@ -249,12 +271,14 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
             ctx._item.del("status")?;
         }
 
-        // 원본 그대로: 새 객체로 바뀌어 items[i] 와는 갈라진다
         ctx.item = merge_node(&ctx._item, &ctx.item);
+        // 고침: mergeNode 는 새 객체를 만드니 items[i] 에도 다시 넣는다 (원본은 items[i] 가 옛 객체로 남았다)
+        ctx.items.sk(&ctx.i, ctx.item.clone())?;
 
+        // 고침: 값은 묶는다
         let db = tpl(T3793, &[zone.clone()]);
-        let sql = tpl(T3793_1, &[ctx._item.g("id")?, task.g("to")?, task.g("cc")?, now.clone()]);
-        ctx.results = select(env, &db, &sql).await?;
+        let sql = "SELECT * FROM items WHERE \"id\" = ?1 AND \"to\" = ?2 AND \"cc\" = ?3 AND \"created_at\" < ?4 LIMIT 1";
+        ctx.results = js::query_bound(env, &db, sql, &[ctx._item.g("id")?, task.g("to")?, task.g("cc")?, now.clone()]).await?;
 
         if ctx.results.length()?.truthy() {
             ctx._item = ctx.results.gi(0)?;
@@ -285,21 +309,14 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
     ctx.goods = if goods.truthy() { goods.deep_clone() } else { V::new_arr() };
     item.del("goods")?;
 
-    // try 3826~3834: 배열이면 앞에 {} 하나 (문자열 · length 있는 객체는 unshift 가 없어 TypeError → 기록만)
-    let r: R<()> = if !ctx.goods.get("length").is_undef() {
-        match &ctx.goods {
-            V::Arr(a) => {
-                a.borrow_mut().insert(0, V::new_obj());
-                Ok(())
-            }
-            _ => Err(Throw::type_error("goods.unshift is not a function")),
-        }
-    } else {
-        ctx.goods = V::new_arr();
-        Ok(())
-    };
-    if let Err(err) = r {
-        console_log!("goods err", err);
+    // try 3826~3834: 앞에 {} 하나 (주문 자체의 tracking 행).
+    // 고침: 배열이 아니면 먼저 배열로 감싼다(비었으면 빈 배열) — 원본은 문자열이면 unshift 가 없어 던지고(기록만) 그 글자마다
+    // tracking 행을 만들었고, length 없는 객체 하나는 [] 로 버렸다
+    if !ctx.goods.is_arr() {
+        ctx.goods = if ctx.goods.truthy() { arr![ctx.goods.clone()] } else { V::new_arr() };
+    }
+    if let V::Arr(a) = &ctx.goods {
+        a.borrow_mut().insert(0, V::new_obj());
     }
 
     let currency = item.g("currency")?;
@@ -341,8 +358,8 @@ fn link_and_detail(ctx: &mut Ctx, task: &V) -> R<()> {
         relink(ctx, &href)?;
     }
 
-    if ctx.isDetail.truthy() {
-        // 원본 그대로: 상세면 앞(3342)에서 detail = null 이라 여기서 던지고 삼켜진다
+    // 고침: detail 이 객체일 때만 (상세면 앞(3342)에서 detail = null 이라 원본은 여기서 던지고 삼켰다)
+    if ctx.isDetail.truthy() && ctx.detail.truthy() && ctx.detail.type_of() == "object" {
         if !ctx.detail.g("page")?.truthy() {
             let pathname = ctx._url.ext_ref::<url::Url>().map_or(V::Undef, |u| V::from(u.path()));
             let id = hid(&cat(&[ctx.item.g("type")?, upper(&task.g("cc")?)?, pathname]))?;
@@ -378,8 +395,9 @@ fn absorb_stored(ctx: &mut Ctx, task: &V, team: &V) -> R<()> {
     item.s_("index", crc_hid(&cat(&[item.g("type")?, team.g("id")?, item.g("no")?]))?)?;
     item.s_("id", hid(&cat(&[team.g("id")?, item.g("index")?]))?)?;
 
-    // 원본 그대로: 방금 만든 item.data 에는 item 이 없어 늘 거짓
-    if item.g("data")?.g("item")?.truthy() && !stored.g("data")?.g("item")?.truthy() {
+    // 고침: 새 아이템에 선택자(item · node)가 없으면 저장된 것을 쓴다 (원본의 `item.data.item && !_item.data.item` 은
+    // 방금 만든 item.data 에 item 이 없어 늘 거짓이었다)
+    if !item.g("data")?.g("item")?.truthy() && stored.g("data")?.g("item")?.truthy() {
         item.g("data")?.s_("item", stored.g("data")?.g("item")?)?;
         item.g("data")?.s_("node", stored.g("data")?.g("node")?)?;
     }
@@ -430,9 +448,10 @@ async fn tracking_row(ctx: &mut Ctx, env: &Env) -> R<()> {
         good.s_("no", ctx.no.clone())?;
         good.s_("index", crc_hid(&cat(&[V::from("goods"), team.g("id")?, good.g("no")?]))?)?;
 
+        // 고침: 값은 묶는다
         let db = tpl(T3896, &[zone.clone()]);
-        let sql = tpl(T3896_1, &[task.g("to")?, task.g("cc")?, now.clone()]);
-        ctx.results = select(env, &db, &sql).await?;
+        let sql = "SELECT * FROM sales WHERE \"type\" = 'goods' AND \"to\" = ?1 AND \"cc\" = ?2 AND \"created_at\" < ?3 LIMIT 1";
+        ctx.results = js::query_bound(env, &db, sql, &[task.g("to")?, task.g("cc")?, now.clone()]).await?;
         if ctx.results.length()?.truthy() {
             tracking.s_("event", ctx.results.gi(0)?.g("event")?)?;
         }
@@ -469,9 +488,10 @@ async fn tracking_row(ctx: &mut Ctx, env: &Env) -> R<()> {
         team.g("data")?.g("base")?.g("pages")?.gk(&task.g("cc")?)?.sk(&type_, obj! { "draft" => 0, "count" => 0 })?;
     }
 
+    // 고침: 값은 묶는다
     let db = tpl(T3950, &[zone.clone()]);
-    let sql = tpl(T3950_1, &[tracking.g("index")?, task.g("to")?, now.clone()]);
-    ctx.results = select(env, &db, &sql).await?;
+    let sql = "SELECT * FROM tracking WHERE \"index\" = ?1 AND \"to\" = ?2 AND \"created_at\" < ?3 LIMIT 1";
+    ctx.results = js::query_bound(env, &db, sql, &[tracking.g("index")?, task.g("to")?, now.clone()]).await?;
 
     if ctx.results.length()?.truthy() {
         ctx._tracking = ctx.results.gi(0)?.deep_clone();
@@ -504,7 +524,8 @@ async fn tracking_row(ctx: &mut Ctx, env: &Env) -> R<()> {
         };
         ctx.content = V::from(stringify_checked(&content)?.unwrap_or_default());
 
-        // 원본 그대로: `var semantic` 은 다시 선언해도 지워지지 않아 앞 상품의 값이 남는다
+        // 고침: `var semantic` 은 상품마다 undefined 에서 시작한다 (원본은 앞 상품의 값이 남아 `!semantic` 이 Gemini 대체를 건너뛰었다)
+        ctx.semantic = V::Undef;
         ctx.system = V::from(js_trim(&semantic_prompt_system(&ctx.language).to_str()).to_string());
 
         if ctx.models.g("deepinfra")?.truthy() {
@@ -544,7 +565,8 @@ async fn tracking_row(ctx: &mut Ctx, env: &Env) -> R<()> {
 
             console_log!("[EMBED-PENDING] tracking relay delegated to Client App:", ctx.tracking.g("id")?);
         } else {
-            // 원본 그대로: `var embeddings` 도 지워지지 않는다
+            // 고침: `var embeddings` 도 상품마다 undefined 에서 시작한다
+            ctx.embeddings = V::Undef;
             if ctx.models.g("cloudflare")?.truthy() {
                 let r = env.ai_run("@cf/google/embeddinggemma-300m", &obj! { "text" => arr![ctx.semantic.clone()] }).await?;
                 ctx.embeddings = r.g("data")?;
@@ -557,8 +579,23 @@ async fn tracking_row(ctx: &mut Ctx, env: &Env) -> R<()> {
             }
 
             if !ctx.embeddings.truthy() && ctx.models.g("deepinfra")?.truthy() {
-                // 원본 그대로: semantic.tirm() (오타) — 인자를 셀 때 TypeError 라 Deepinfra 는 불리지 않는다
-                return Err(Throw::type_error("semantic.tirm is not a function"));
+                // 고침: semantic.trim() (원본은 .tirm() 오타라 인자를 셀 때 TypeError 였다)
+                let text = trim_text(&ctx.semantic, "semantic")?;
+                ctx.embeddings = deepinfra(&ctx.deepinfra, &V::from("google/embeddinggemma-300m"), &V::from(""), &text, &V::Undef, &V::Undef).await?;
+                // embeddings.map((values, i) => ({ id: item.id, values, metadata }))
+                let list = match &ctx.embeddings {
+                    V::Arr(a) => a.borrow().clone(),
+                    V::Undef | V::Null => {
+                        return Err(Throw::type_error(format!("Cannot read properties of {} (reading 'map')", ctx.embeddings.to_str())));
+                    }
+                    _ => return Err(Throw::type_error("embeddings.map is not a function")),
+                };
+                let mut vectors = Vec::with_capacity(list.len());
+                for values in list {
+                    vectors.push(obj! { "id" => item.g("id")?, "values" => values, "metadata" => ctx.metadata.clone() });
+                }
+                ctx.s_VectorizeVector = V::from(vectors);
+                dec_key(&ctx.models, &V::from("deepinfra"))?;
             }
 
             if !ctx.embeddings.truthy() {

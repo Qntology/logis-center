@@ -9,8 +9,8 @@ use logis_worker_common::{console_log, loose_eq, obj, R, V};
 
 use crate::ctx::Ctx;
 use crate::flow::Flow;
-use crate::handler::{prepare_bind, select};
-use crate::item1::{cat, err_str, ge, le, lt};
+use crate::handler::prepare_bind;
+use crate::item1::{cat, err_str, ge, le, lt, table_name};
 use crate::rules::{related, relay};
 use crate::templates::*;
 
@@ -56,7 +56,9 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
     let zone = ctx.zoneRegion.clone();
 
     let item = ctx.item.clone();
-    if item.g("condition")?.truthy() {
+    // 고침: 글 · 배열일 때만 (원본은 수 · 객체 condition 이면 indexOf 가 없어 던져 작업을 통째로 버렸다)
+    let condition = item.g("condition")?;
+    if condition.truthy() && matches!(condition, V::Str(_) | V::Arr(_)) {
         if index_of_v(&item.g("condition")?, "used")? > -1.0 {
             item.s_("used", V::Num(1.0))?;
         }
@@ -71,16 +73,18 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
         }
     }
 
+    // 고침: 4218 · 4235 의 값은 SQL 글에 잇지 않고 묶는다 (표 이름은 아는 표만)
     let db = tpl(T4218, &[zone.clone(), ctx.itemType.clone()]);
-    let sql = tpl(T4218_1, &[ctx.itemType.clone(), item.g("id")?, task.g("to")?, now.clone()]);
-    ctx.results = select(env, &db, &sql).await?;
+    let table = table_name(&ctx.itemType)?;
+    let sql = format!("SELECT * FROM {table} WHERE \"id\" = ?1 AND \"to\" = ?2 AND \"created_at\" < ?3 LIMIT 1");
+    ctx.results = js::query_bound(env, &db, &sql, &[item.g("id")?, task.g("to")?, now.clone()]).await?;
 
     if ctx.results.length()?.truthy() {
         absorb(ctx)?;
     } else {
         let db = tpl(T4235, &[zone.clone(), ctx.itemType.clone()]);
-        let sql = tpl(T4235_1, &[ctx.itemType.clone(), item.g("index")?, task.g("to")?, task.g("cc")?, now.clone()]);
-        ctx.results = select(env, &db, &sql).await?;
+        let sql = format!("SELECT * FROM {table} WHERE \"index\" = ?1 AND \"to\" = ?2 AND \"cc\" = ?3 AND \"created_at\" < ?4 LIMIT 1");
+        ctx.results = js::query_bound(env, &db, &sql, &[item.g("index")?, task.g("to")?, task.g("cc")?, now.clone()]).await?;
 
         if ctx.results.length()?.truthy() {
             absorb(ctx)?;
@@ -104,10 +108,12 @@ pub async fn run(ctx: &mut Ctx, env: &Env) -> R<Flow> {
             ctx.merge = relay_out.g("merge")?;
 
             if ctx.query.truthy() && ctx.merge.truthy() {
+                // 고침: 오류 글의 유형은 이 회차의 관계 유형 — try 앞에서 related[r] 로 두고, query[0].type 을 읽으면 그 값
+                // (원본은 try 가 그 전에 던지면 앞 회차의 type 을 썼다)
+                let mut relate_type = ctx.related.gk(&ctx.r)?;
                 // try 4481~4546
-                if let Err(err) = relate(ctx, env).await {
-                    // 원본 그대로: type 은 앞에서 던졌으면 이전 회차의 값
-                    let log = cat(&[V::from("tracking inner err"), ctx.type_.clone(), V::from(err_str(&err))]);
+                if let Err(err) = relate(ctx, env, &mut relate_type).await {
+                    let log = cat(&[V::from("tracking inner err"), relate_type, V::from(err_str(&err))]);
                     let stmt = prepare_bind(env, CENTER_REGION, T4534[0], &[V::from(hash_id(&V::Undef)?), task.g("bcc")?, log, now.clone()])?;
                     js::run(&stmt).await?;
                 }
@@ -131,8 +137,9 @@ fn absorb(ctx: &mut Ctx) -> R<()> {
         ctx._item.del("status")?;
     }
 
-    // 원본 그대로: 새 객체로 바뀌어 items[i] 와는 갈라진다
     ctx.item = merge_node(&ctx._item, &ctx.item);
+    // 고침: mergeNode 는 새 객체를 만드니 items[i] 에도 다시 넣는다 (원본은 items[i] 가 옛 객체로 남았다)
+    ctx.items.sk(&ctx.i, ctx.item.clone())?;
     Ok(())
 }
 
@@ -154,19 +161,26 @@ fn widen_range(ctx: &mut Ctx) -> R<()> {
 }
 
 /// try 4481~4546 의 몸통: Relay 질의의 첫 줄로 관련 행을 찾아 relates[type] 에 둔다
-async fn relate(ctx: &mut Ctx, env: &Env) -> R<()> {
+async fn relate(ctx: &mut Ctx, env: &Env, relate_type: &mut V) -> R<()> {
     if !ctx.query.g("length")?.truthy() {
         return Ok(());
     }
 
     ctx.table = ctx.query.gi(0)?.g("table")?;
     ctx.type_ = ctx.query.gi(0)?.g("type")?;
+    *relate_type = ctx.type_.clone();
     ctx.column = ctx.query.gi(0)?.g("column")?;
     ctx.column_value = ctx.query.gi(0)?.g("value")?;
     ctx.status = ctx.query.gi(0)?.g("status")?;
 
+    // 고침: 표 · 열 이름은 묶을 수 없으니 아는 표 · 이름 꼴일 때만 SQL 에 넣는다 (값은 원본부터 묶었다)
     let db = tpl(T4503, &[ctx.zoneRegion.clone(), ctx.table.clone()]);
-    let stmt = env.prepare(&db, &tpl(T4504, &[ctx.table.clone(), ctx.column.clone()]))?;
+    let table = table_name(&ctx.table)?;
+    let column = match &ctx.column {
+        V::Str(c) if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') => c.clone(),
+        other => return Err(Throw::type_error(format!("unknown column: {}", other.to_str()))),
+    };
+    let stmt = env.prepare(&db, &tpl(T4504, &[V::from(table), V::from(column)]))?;
     let stmt = js::bind(&stmt, &[ctx.type_.clone(), ctx.column_value.clone(), ctx.team.g("id")?, ctx.item.g("cc")?, ctx.now.clone()])?;
     ctx.results = js::all(&stmt).await?.g("results")?;
 

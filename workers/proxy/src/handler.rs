@@ -6,7 +6,7 @@
 
 use logis_worker_common::gzip::{gzip_json, ungzip_json};
 use logis_worker_common::js::{self, Env};
-use logis_worker_common::jsv::{add, index_of, num_to_string, tpl, Throw};
+use logis_worker_common::jsv::{add, index_of, num_to_string, Throw};
 use logis_worker_common::tables::{lookup, CENTER_REGION, LANGUAGE_CODE, LOGIS_REGION, TABLES};
 use logis_worker_common::util::is_diff;
 use logis_worker_common::{console_log, date, obj, stringify_str, R, V};
@@ -29,6 +29,23 @@ pub fn prepare_bind(env: &Env, db: &str, sql: &str, params: &[V]) -> R<V> {
 /// `(await env[db].prepare(sql).all()).results`
 pub async fn select(env: &Env, db: &str, sql: &str) -> R<V> {
     js::query(env, db, sql).await
+}
+
+/// `(await env[db].prepare(sql).bind(...params).all()).results` — 값은 SQL 글에 넣지 않고 묶는다
+pub async fn select_bound(env: &Env, db: &str, sql: &str, params: &[V]) -> R<V> {
+    js::query_bound(env, db, sql, params).await
+}
+
+/// 원본 2419 의 작업 찾기 — 값은 묶는다 (`id` = json.id, `ref` = json.ref, `created_at` < created_at)
+const SQL_TASK: &str = "SELECT * FROM tasks WHERE \"id\" = ?1 AND \"ref\" = ?2 AND \"created_at\" < ?3 AND \"updated_at\" = 0 ORDER BY created_at ASC LIMIT 1";
+/// 원본 2485 의 팀 찾기 — 값은 묶는다 (`id` = task.to, `created_at` < now)
+const SQL_TEAM: &str = "SELECT * FROM users WHERE \"type\" = 'team' AND \"id\" = ?1 AND \"created_at\" < ?2 LIMIT 1";
+/// 원본 2510 의 소유자 찾기 — 값은 묶는다 (`id` = team.from, `created_at` < now)
+const SQL_OWNER: &str = "SELECT * FROM users WHERE \"type\" = 'user' AND \"id\" = ?1 AND \"created_at\" < ?2 LIMIT 1";
+
+/// 따옴표 안에 이어 붙이던 값 — 원본이 글에 넣던 그대로(`${x}`)의 글로 묶는다
+pub fn text(v: &V) -> V {
+    V::from(v.to_str())
 }
 
 /// `x -= 1`
@@ -105,8 +122,9 @@ async fn outer(buffer: &[u8], env: &Env, ctx: &mut Ctx) -> R<Option<String>> {
 /// 2418~6442 (안쪽 try): 작업 행 읽기 · 작업마다 처리 · 꼬리 문장
 async fn tasks(env: &Env, ctx: &mut Ctx) -> R<()> {
     let json = ctx.json.clone();
-    let sql = tpl(T2419, &[json.g("id")?, json.g("ref")?, ctx.created_at.clone()]);
-    ctx.results = select(env, &ctx.region.to_key(), &sql).await?;
+    // 고침: 값을 SQL 글에 이어 붙였다(작은따옴표가 든 값은 쿼리를 깨뜨림) — 묶는다
+    let params = [text(&json.g("id")?), text(&json.g("ref")?), ctx.created_at.clone()];
+    ctx.results = select_bound(env, &ctx.region.to_key(), SQL_TASK, &params).await?;
     console_log!("results.length", ctx.results.length()?);
     ctx.crons = ctx.results.deep_clone();
 
@@ -180,8 +198,9 @@ async fn task(env: &Env, ctx: &mut Ctx) -> R<Flow> {
         ctx.limits.sk(&from, task.g("rpm")?)?;
     }
 
-    let sql = tpl(T2485, &[task.g("to")?, ctx.now.clone()]);
-    ctx.results = select(env, &ctx.logisRegion.to_key(), &sql).await?;
+    // 고침: 값을 묶는다 (위와 같음)
+    let params = [text(&task.g("to")?), ctx.now.clone()];
+    ctx.results = select_bound(env, &ctx.logisRegion.to_key(), SQL_TEAM, &params).await?;
     ctx.team = ctx.results.gi(0)?;
     if ctx.team.g("data")?.truthy() {
         let data = ungzip_json(&ctx.team.g("data")?)?;
@@ -201,8 +220,9 @@ async fn task(env: &Env, ctx: &mut Ctx) -> R<Flow> {
 
     console_log!("team.data.base.pages", stringify_str(&ctx.team.g("data")?.g("base")?.g("pages")?));
 
-    let sql = tpl(T2510, &[ctx.team.g("from")?, ctx.now.clone()]);
-    ctx.results = select(env, &ctx.logisRegion.to_key(), &sql).await?;
+    // 고침: 값을 묶는다 (위와 같음)
+    let params = [text(&ctx.team.g("from")?), ctx.now.clone()];
+    ctx.results = select_bound(env, &ctx.logisRegion.to_key(), SQL_OWNER, &params).await?;
     ctx.owner = ctx.results.gi(0)?;
     let owner_data = ungzip_json(&ctx.owner.g("data")?)?;
     ctx.owner.s_("data", owner_data)?;
