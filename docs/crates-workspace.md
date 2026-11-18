@@ -112,8 +112,13 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   없음" 오류가 났습니다(폴더를 비우고 다시 빌드하면 사라짐). debug 정보를 켠 채 `it` 시험 exe 를 링크하면 PDB 가 1.7 GB 를 넘어 LNK1318(LIMIT 12) —
   CI 처럼 `CARGO_PROFILE_DEV_DEBUG=0` 을 씁니다.
 - 2026-11-18 08:00 쯤부터 `github.com/microsoft/onnxruntime` 저장소가 404 라(07:20 엔 받아졌음) onnxruntime-sys 빌드 스크립트의 내려받기가
-  실패합니다. 새 빌드 폴더에는 이미 받은 zip 을 OUT_DIR 에 두거나 `ORT_STRATEGY=system` + `ORT_LIB_LOCATION` 을 씁니다. 캐시 없는 CI 도 같은 이유로
-  실패할 수 있습니다(이 브랜치는 루트 작업 공간 때문에 path 패키지 해시가 바뀌어 CI 도 다시 받으려 함).
+  실패했습니다(첫 CI 실행 44203533916 의 빌드 단계 실패가 모두 이것). 그래서 `commerce/crates/onnxruntime-sys/build.rs` 에 예비 경로를 더했습니다:
+  GitHub 배포판을 받지 못하면 같은 판을 NuGet `Microsoft.ML.OnnxRuntime` 에서 꺼내 배포판과 같은 `include/` · `lib/` 로 둡니다(CPU 판만,
+  win-x64 헤더 · DLL · LIB 가 배포판과 바이트 단위로 같음, 리눅스 SONAME `libonnxruntime.so.1` · 맥 `libonnxruntime.1.dylib` 이름도 둠).
+  지금 상태에서 새 빌드 폴더로 빌드 → 링크 → 실행해 `ONNX Runtime 1.28.0` 을 확인했습니다.
+- 덧붙여: Windows 11 은 `System32\onnxruntime.dll`(1.17.1)을 갖고 있고, 암시적으로 링크한 DLL 은 PATH 보다 System32 를 먼저 찾으므로 이 앱 판(빌드 때
+  링크)은 DLL 이 실행 파일 옆에 없으면 그 옛 판을 불러옵니다(시험 exe 에서 1.17.1 로 확인). premium-discount 의 `runtime-load` 가 전체 경로로만
+  여는 이유가 이것입니다.
 
 ## 빌드 · 시험
 
