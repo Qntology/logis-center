@@ -146,6 +146,12 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   컴파일되지 않습니다. 모델이 KV 배치(`utils::resources` 82곳) · KV 블록 암호화(`crypto`) · 어휘 판정 도우미(`misc_utils`) · Qwen3.5 GGUF
   변환(`model/lang_gguf.rs`)을 쓰므로 함께 옮겼습니다. `vocab_trim.rs` 는 이미 premium-discount-quant 규칙 위의 얇은 층이라 그대로 옮겼습니다.
 - Analytic 의 이관처는 `premium-discount-nav` · `-nms` 가 아니라 `premium-discount-analytic` 입니다(앞 작업에서 만듦).
+- "lancedb 0.41 로 통일"은 저장소 코드만의 일이 아닙니다. lancedb 0.41 의 매니페스트가 `serde_json = { features = ["preserve_order"] }` 를
+  요구하고(0.31 은 없음), Cargo 기능은 합쳐지므로 앱 전체의 `serde_json::Map` 이 정렬 순서(BTreeMap)에서 삽입 순서(IndexMap)로 바뀝니다.
+  0.41 로 올려 보니 store.rs 는 고치지 않고 컴파일됐지만(디버그 9분) `it` 에서 키 순서에 기대는 시험 4개가 실패했습니다:
+  JSON → 자연어 문장 순서(`utils_schema::json_to_natural_language_and_chunk_split`), 스키마 카테고리 · 필드 순서(`schema_field_counts_per_page_type` ·
+  `trade_schema_triples_load_base_plus_overlay`), 자리 표시자 복원 경로 순서(`utils_text::placeholder_drop_and_informative_restore`).
+  시험만의 문제가 아니라 색인 문장(임베딩 입력 · 텍스트 캐시 키)과 프롬프트의 필드 순서가 바뀌는 동작 변경이라 0.31 로 되돌렸습니다.
 - Stanza · granite 순전파를 `premium-discount-nlp` 로, 스팬 NMS 를 `premium-discount-nms` 로 바꾸는 것은 하지 않았습니다. 두 저장소가 따로 갖던
   `onnxruntime(-sys)` 사본은 이 저장소 판(`commerce/crates`, ORT 1.28.0)을 기준으로 premium-discount 쪽을 다시 맞췄습니다(premium-discount
   0d83b8d: 이 판 그대로 + 기본 꺼진 `runtime-load` 기능 — 링크 대신 실행할 때 불러옴, premium-discount-nlp 의 stanza 가 켬). 남은 일은 두
@@ -160,7 +166,10 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   부를 수 있으니, `build_headless_app` 대신 그쪽으로 바꾸면 기획서 5단계("Tauri 모킹 없이 합성 데이터 검색 시험")가 됩니다.
 - **셸 의존성 정리**: 매니페스트에 표시한 쓰지 않는 의존성(webrtc 등)을 빼고 다시 빌드 · 시험합니다.
 - **SigLIP2 타워 · 임베딩 · Stanza · NMS 를 premium-discount 로**: 실제 모델 출력 대조 뒤.
-- **LanceDB 0.41**: premium-discount 앱이 옮긴 API 변경(테이블 add · 질의 실행)을 store.rs 에 적용합니다. 이 작업 공간은 아직 0.31 입니다.
+- **LanceDB 0.41 (결정 필요)**: API 는 그대로 맞지만 `serde_json/preserve_order` 가 앱 전체에 켜집니다(위 "기획서와 다른 점"). 올리려면
+  ① 삽입 순서를 받아들여 순서 시험 4개를 고치고, 직렬화한 JSON 을 해시 · ID · 캐시 키로 쓰는 곳이 없는지 확인하고, 기존 색인 문장과 새 문장이
+  달라지는 것(다시 색인 또는 감수)을 정하거나, ② 순서가 드러나는 곳에서 키를 직접 정렬해 0.31 과 같은 출력을 지키는 방법이 있습니다.
+  0.31(lance 8)이 쓴 테이블을 0.41(lance 14)이 그대로 읽고 이어 쓰는 것은 premium-discount 앱에서 확인했습니다. 지금은 0.31 입니다.
 
 ## 검증 (2026-11-18, 이 PC: Windows · RAM 16 GB)
 
