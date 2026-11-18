@@ -114,22 +114,95 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 
 - `commerce/src-tauri/src` 의 46개 파일(model · store · scheduler · stanza · search_fusion · search_relation · logic · prompts · js_templates · parsers ·
   models · utils · sink)을 `git mv` 로 `commerce/app/src` 에 옮겼습니다. 셸에는 lib.rs(명령 49개 · `run()`), automation.rs(브라우저
-  자동화), main.rs, sink.rs(`TauriSink`)만 남았고, lib.rs 가 코어 모듈을 예전 이름으로 재수출해(`pub use logis_app::{model, store, …}`) 명령과
-  통합 시험(`tauri_app_lib::…`)의 경로가 그대로입니다. 코어의 의존성 그래프에는 tauri 가 없습니다(`cargo tree -p logis-app -i tauri` → 없음).
+  자동화), main.rs, sink.rs(`TauriSink`)만 남았고, lib.rs 가 코어 모듈을 예전 이름으로 재수출해(`pub use logis_app::{model, store, …}`) 명령의
+  경로가 그대로입니다(통합 시험은 5단계에서 commerce/app 으로 옮김). 코어의 의존성 그래프에는 tauri 가 없습니다(`cargo tree -p logis-app -i tauri` → 없음).
 - 코어가 셸에 기대던 곳: lib.rs 전역 `ACTIVE_TASK_MEM` · `LATEST_PROGRESS_PAYLOAD`(정의를 코어 루트로, 셸은 재수출), automation.rs 의
   `LAST_DETECTED_STATE`(코어 `browser_state`, URL 도우미가 읽음), utils/network.rs 의 `#[tauri::command]`(코어는 평범한 함수, 등록된 두 명령
   `get_local_network_prefix` · `get_my_full_ip` 는 셸 lib.rs 의 같은 이름 · 인자 껍데기 — 등록되지 않던 `get_deterministic_cert` 는 함수만).
 - 코어 코드는 `#[cfg(feature = …)]` 를 보지 않습니다. 셸의 GPU · 가속 기능과 `full-bias` 는 `logis-app/…` 을 켜고, 코어가 다시 logis-llm ·
   logis-vision-doc · logis-bias 의 같은 기능을 켭니다(헤드리스로 `-p logis-app --features rocm` 도 같은 경로).
 - 셸 매니페스트에서는 코어만 쓰는 의존성(lancedb · arrow · boa_engine · onnxruntime · whatlang · rcgen · ndarray · num · encoding_rs · windows-sys ·
-  logis-* · premium-discount-*)을 뺐습니다. 셸 코드 · 시험이 쓰지 않는 예전 의존성(webrtc · drag · ahash · minijinja · ego-tree · libc · any_ascii ·
-  embed-cpu-kernels, windows · direct-storage · metal)은 빼면 기능 통합이 바뀌어 다시 빌드되므로 이번에는 남기고 매니페스트에 표시했습니다.
+  logis-* · premium-discount-*)을 뺐습니다. 셸 코드 · 시험이 쓰지 않던 예전 의존성(webrtc 등)은 5단계에서 뺐습니다.
 - 자연어 검색(`ai_search_complex` 1,538줄)과 그 도우미 29개(범위 필터 · dexie 계획/평가 · 저장 축 맞추기 · 조건 그라운딩 · 무역 질의 탐침 ·
   질의 융합, 정적 캐시 2개)는 코어 `query` 모듈로 옮겼습니다(셸 lib.rs 5,557 → 2,517줄). 본문의 `tauri::AppHandle` 은 진행 이벤트를 보내는 데만
   쓰였으므로 같은 이름의 `Sink` 매개변수가 되었고(`use tauri::Emitter` 1곳 삭제, `sink::tauri(&app_handle)` 4곳 → `app_handle.clone()`),
   `State<AppState>` 는 `&AppState` 입니다. 셸의 `#[tauri::command] ai_search_complex` 는 같은 이름 · 인자로 코어를 부르는 껍데기이고,
   `AppState` · `IS_SEARCHING` 은 코어 루트에 있습니다(셸 재수출, 통합 시험 경로 `tauri_app_lib::AppState` · `ground_trade_conditions` 그대로).
-- 아직 셸에 있는 것: `upsert_items` · `reindex_pending_embeddings` · `download_model` 등 나머지 명령 본문(각각 수백 줄)과 문서 조회 · 삭제 명령.
+- 나머지 명령 본문(`upsert_items` · `reindex_pending_embeddings` · `download_model` 등)은 5단계에서 코어 `commands` 로 옮겼습니다.
+
+## 5단계: LanceDB 0.41 (키 직접 정렬) · 명령 본문 · 통합 시험 commerce/app · 셸 의존성
+
+### LanceDB 0.41 — 키를 직접 정렬해 예전 출력 그대로
+
+- 결정: 삽입 순서를 받아들여 다시 색인하는 대신, 맵 순서가 바깥으로 드러나는 곳에서 키를 정렬해 0.31 때(serde_json 맵 = BTreeMap)와 같은
+  출력을 지킵니다. 코어는 `lancedb = "0.41"`(lance 14.0.2 · datafusion 54.1.0)입니다. preserve_order 에서 `Map` 은 IndexMap(넣은 순서 · 문서
+  순서)이고 `Map::remove` 가 swap_remove 라 지운 뒤의 순서도 바뀝니다.
+- 도우미 `crates/logis-schema/src/json_order.rs`(코어는 `logis_app::json_order` 로 재수출): 순회 `sorted_iter` · `sorted_keys` · `sorted_values` ·
+  `sorted_iter_mut` · `into_sorted`, 직렬화 `Sorted(&Value)` · `SortedMap` · `SortedSlice`(Serialize · Display) · `to_string_sorted`, 값 정렬
+  `sorted` · `sort_all`. 순서는 BTreeMap 과 같고(키 바이트 순), preserve_order 가 꺼진 빌드에서도 결과가 같습니다(단위 시험 2개).
+- 고친 곳(48개 파일):
+  - 순회 156곳: 맵을 돌며 문장 · 청크 · 프롬프트 · 간선 · 스키마 목록을 만드는 곳(`nl_convert`, 프롬프트 필드, 스키마 카테고리 · 필드, 자리 표시자
+    복원 경로 …).
+  - 직렬화 63곳: 맵이 든 Value 를 `to_string` · `{}` · `serde_json::to_string` 으로 쓰는 곳(색인 문장 · 텍스트 캐시 키 · 프롬프트 속 JSON ·
+    저장소 data 열 · 원장 · 로그). 타입이 정해진 구조체 · `Vec<String>` · HashMap 은 serde_json 맵이 아니라 그대로입니다.
+  - 원천: 파싱한 값(`from_str::<Value>` → `.map(json_order::sorted)`), 서식 사전 `BIAS_DICT`(파싱 · 오버레이 직후 `sort_all`), gzip 저장
+    (`logis-parsers` `compression.rs`, `sort_all_objects`).
+  - 화면 경계: 셸 명령 껍데기가 Value 인자는 들어올 때, Value 결과는 나갈 때 정렬하고 `TauriSink::emit_json` · 셸의 직접 `emit` 도 정렬합니다
+    (웹뷰 · HTTP 본문의 키 순서도 예전과 같음).
+- 빠뜨리지 않게 찾은 방법:
+  - Display 감사: serde_json 사본에서 `impl Display for Value` 를 끄고(`#[cfg(any())]`) 별도 작업 트리 · 산출물 폴더에서
+    `cargo check --workspace --lib --bins` 를 돌리면 Value 를 `{}` · `.to_string()` 으로 쓰는 곳이 모두 컴파일 오류로 드러납니다. 코어 25곳과 명령을
+    옮긴 뒤 4곳을 고쳤고, 숫자 · 한 키짜리처럼 순서가 없는 곳은 두었습니다.
+  - 순회: 스캐너로 `.iter()` · `.keys()` · `.values()` · `for (k, v) in` 후보를 찾아 바꾼 뒤, 맵이 아니었던 것(Vec · HashMap · 슬라이스)은 컴파일
+    오류로 가려 되돌렸습니다.
+  - 골든 덤프(임시 시험, 커밋 안 함): 키 순서에 흔들릴 수 있는 순수 함수 약 45종(자연어 변환 · 청크 · 자리 표시자 · 병합 · LLM 응답 파싱 · 관계
+    간선 · 프롬프트 9종 · 스키마 삼중 · 검색 계획)을 입력마다 키 삽입 순서 3변형(정렬 · 역순 · 섞음)으로 돌려 7,303줄을 씁니다. 기준은 바꾸기 전
+    0.31 빌드의 덤프입니다.
+- 결과: 0.31 + 정렬은 기준과 0줄 차이이고, 0.41 + 정렬은 세 변형이 모두 같으며 기준과도 같습니다(다른 12줄은 하네스가 검색 계획을 정렬 없이
+  찍은 `plan_order_*` 줄로, 앱에서는 명령 껍데기가 나갈 때 정렬). 색인 문장(임베딩 입력) · 텍스트 캐시 키 · 프롬프트가 예전과 같으므로 다시 색인하지
+  않고 기존 벡터 · 해시를 그대로 씁니다. 0.41 에서 실패하던 순서 시험 4개를 포함해 `it` 286 통과.
+- 앞으로: preserve_order 가 켜져 있으므로 새 코드가 `serde_json::Map` 을 돌거나 Value 를 문자열로 만들 때는 `json_order` 를 씁니다(그냥 쓰면
+  넣은 순서가 나옴).
+
+### 명령 본문 → `logis_app::commands`
+
+- 셸 lib.rs 에 남아 있던 명령 본문 32개(`upsert_items` · `reindex_pending_embeddings` · `download_model` · 문서 조회 · 삭제 · `proxy_fetch` …)와
+  `ActiveTaskQuery` 를 `commerce/app/src/commands.rs` 로 옮겼습니다. 본문은 그대로이고 시그니처만 바뀝니다: `State<AppState>` → `&AppState`,
+  `tauri::AppHandle` → 같은 이름의 `Sink`, `sink::tauri(&app_handle)` → `app_handle.clone()`.
+- 셸 lib.rs(2,517 → 901줄)에는 같은 이름 · 인자의 `#[tauri::command]` 껍데기(`&state` 와 `sink::tauri(&app_handle)` 을 넘김), 창(크기 · 위치 ·
+  끌기 · 커서 통과) · 브라우저 실행 · 상태 명령, `run()` 만 남았습니다. 통합 시험용 헤드리스 Tauri 앱(`build_headless_app` · `eval_ai_search`)은 지웠습니다.
+- `logis_app::init_headless()`: 앱 `run()` 이 하는 엔진 초기화(언어 엔진 로더 등록 · KV 굽기 작업자)를 Tauri 없이 할 때(시험 · 합성 평가 · CLI) 부릅니다.
+
+### 통합 시험 · 합성 평가 → commerce/app (기획서 5단계)
+
+- `commerce/src-tauri/tests/{it,fixtures}` → `commerce/app/tests/`(git mv), `tauri_app_lib::` → `logis_app::`(314곳). 시험 exe 는 logis-app 만
+  링크합니다(tauri 없음). 그래서 시험 exe 에 comctl32 v6 매니페스트를 넣던 셸 build.rs 의 `rustc-link-arg-tests` 도 뺐습니다(시험 대상이 없는
+  패키지가 그 지시를 내면 cargo 가 빌드를 멈춤).
+- 합성 평가(`synthetic_eval.rs`): 헤드리스 Tauri 앱과 `listen` 두 개 대신 시험용 `EventSink`(`EvalSink`: `translit-cache-query` 에 빈 응답,
+  `LOGIS_SYNTH_STOP_ON` 문구가 든 `task-console-log` 에서 취소)와 `init_headless()`, `logis_app::query::ai_search_complex(&state, sink, …)` 를 직접 부릅니다.
+- 실행: `cargo test -p logis-center -p logis-app --test it`(작업 폴더 무관). 시험 대상은 logis-app 에만 있고, `-p logis-center` 는 데스크톱 앱과
+  같은 기능 집합으로 빌드해 셸 빌드와 의존성 산출물을 같이 쓰게 할 뿐입니다. CI(`cross-verify.yml` · `app-tests.sh` · 픽스처 경로)와
+  `commerce/test_cargo*.bat` · `_verify_rocm.bat` · `test_linux.sh` 를 이렇게 바꿨습니다. 시험 exe 자리(`target/debug/deps/it-*.exe`)는 그대로라
+  `SyntheticData/eval/run_eval.bat` 은 고칠 것이 없습니다.
+- 시험이 쓰는 crate(candle-nn · candle-transformers · dirs · ggml-kquant · memmap2 · mimalloc · nvml-wrapper · safetensors · sysinfo, 리눅스
+  io-uring)는 logis-app 의 `[dev-dependencies]` 입니다.
+
+### 셸 의존성 정리
+
+- 셸 코드(lib.rs · automation.rs · sink.rs · main.rs)가 직접 쓰는 것만 남겼습니다: tauri 와 플러그인 3개(dialog · fs · shell), logis-app ·
+  logis-llm, serde · serde_json · tokio · anyhow · regex · futures · uuid · chrono · reqwest · mimalloc · once_cell, 브라우저 자동화 fantoccini ·
+  chromiumoxide · which.
+- 뺀 것: webrtc · drag · ahash · minijinja · ego-tree · libc · any_ascii · embed-cpu-kernels · base64 · url, candle-core · candle-nn ·
+  candle-transformers · candle-flash-attn(GPU 기능은 logis-app → logis-llm 이 켜므로 셸 기능은 이제 `logis-app/…` 만), 시험 전용 image ·
+  tokenizers · scraper · sysinfo · dirs · safetensors · nvml-wrapper · half · memmap2 · rand · rand_chacha · ggml-kquant, 플랫폼별 windows ·
+  direct-storage(Windows) · io-uring(리눅스) · metal(맥), 그리고 한 번도 등록하지 않은 템플릿 잔재 tauri-plugin-opener(capabilities 의
+  `opener:default` 도 뺌. 프런트엔드 package.json 의 `@tauri-apps/plugin-opener` 는 import 하는 곳이 없지만 npm 쪽이라 두었음). ethers-* 는
+  1단계에서 이미 뺐습니다. Cargo.lock 의 패키지는 1,202 → 1,109 개입니다.
+- 남는 crate 의 동작이 바뀌지 않는지: `cargo tree -e normal,build -f "{p}|{f}"` 를 Windows(CPU · ROCm · 기본 기능) · 리눅스(Vulkan · ROCm) ·
+  맥(Metal) 대상으로 앞뒤 비교했습니다. 기능이 줄어든 것은 webrtc 가 켜던 암호 crate(der · ecdsa · elliptic-curve · sec1 · signature · hmac ·
+  subtle · zeroize · crypto-common …의 `std` · `alloc` · `pem`), Windows · 맥 바인딩 기능, syn 1 처럼 컴파일 시점 API 뿐이고, image · tokenizers ·
+  scraper · minijinja · rand · half · candle 등 동작에 닿는 crate 의 기능은 그대로입니다. 암호 crate 를 쓰는 premium-discount-identity(k256,
+  `hash_id`)는 통합 시험의 ethers 벡터 시험(`utils_identity`)이 확인합니다.
 
 ## 기획서와 다른 점 (코드 · 저장소로 확인)
 
@@ -151,25 +224,20 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   0.41 로 올려 보니 store.rs 는 고치지 않고 컴파일됐지만(디버그 9분) `it` 에서 키 순서에 기대는 시험 4개가 실패했습니다:
   JSON → 자연어 문장 순서(`utils_schema::json_to_natural_language_and_chunk_split`), 스키마 카테고리 · 필드 순서(`schema_field_counts_per_page_type` ·
   `trade_schema_triples_load_base_plus_overlay`), 자리 표시자 복원 경로 순서(`utils_text::placeholder_drop_and_informative_restore`).
-  시험만의 문제가 아니라 색인 문장(임베딩 입력 · 텍스트 캐시 키)과 프롬프트의 필드 순서가 바뀌는 동작 변경이라 0.31 로 되돌렸습니다.
+  시험만의 문제가 아니라 색인 문장(임베딩 입력 · 텍스트 캐시 키)과 프롬프트의 필드 순서가 바뀌는 동작 변경이라 처음에는 0.31 로 되돌렸고,
+  5단계에서 순서가 드러나는 곳의 키를 직접 정렬해 0.31 과 같은 출력을 지키며 0.41 로 올렸습니다.
 - Stanza · granite 순전파를 `premium-discount-nlp` 로, 스팬 NMS 를 `premium-discount-nms` 로 바꾸는 것은 하지 않았습니다. 두 저장소가 따로 갖던
   `onnxruntime(-sys)` 사본은 이 저장소 판(`commerce/crates`, ORT 1.28.0)을 기준으로 premium-discount 쪽을 다시 맞췄습니다(premium-discount
   0d83b8d: 이 판 그대로 + 기본 꺼진 `runtime-load` 기능 — 링크 대신 실행할 때 불러옴, premium-discount-nlp 의 stanza 가 켬). 남은 일은 두
   Stanza 파이프라인 · NMS 의 출력을 실제 모델로 대조한 뒤 이 앱을 그 crate 로 바꾸는 것입니다.
 
-## 남은 단계 (3 · 4)
+## 남은 단계
 
 - **logis-search 의 나머지**: 기획서가 이 crate 에 넣은 `model/merge.rs`(병합 · 그라운딩, SigLIP2 결과를 씀)와 `model/research.rs` 의 집계는
   모델 · 저장소 호출과 섞여 있어 순수 부분을 먼저 떼어야 합니다 (`merge_rules` 로 두 규칙만 옮김).
-- **나머지 명령 본문 → 코어**: `upsert_items` · `reindex_pending_embeddings` · `download_model` 등도 `ai_search_complex` 처럼 `Sink` · `&AppState`
-  를 받는 코어 함수와 셸 껍데기로 나눕니다. 합성 평가(`tests/it/synthetic_eval.rs`)는 이제 `logis_app::query::ai_search_complex` 를 Tauri 앱 없이
-  부를 수 있으니, `build_headless_app` 대신 그쪽으로 바꾸면 기획서 5단계("Tauri 모킹 없이 합성 데이터 검색 시험")가 됩니다.
-- **셸 의존성 정리**: 매니페스트에 표시한 쓰지 않는 의존성(webrtc 등)을 빼고 다시 빌드 · 시험합니다.
 - **SigLIP2 타워 · 임베딩 · Stanza · NMS 를 premium-discount 로**: 실제 모델 출력 대조 뒤.
-- **LanceDB 0.41 (결정 필요)**: API 는 그대로 맞지만 `serde_json/preserve_order` 가 앱 전체에 켜집니다(위 "기획서와 다른 점"). 올리려면
-  ① 삽입 순서를 받아들여 순서 시험 4개를 고치고, 직렬화한 JSON 을 해시 · ID · 캐시 키로 쓰는 곳이 없는지 확인하고, 기존 색인 문장과 새 문장이
-  달라지는 것(다시 색인 또는 감수)을 정하거나, ② 순서가 드러나는 곳에서 키를 직접 정렬해 0.31 과 같은 출력을 지키는 방법이 있습니다.
-  0.31(lance 8)이 쓴 테이블을 0.41(lance 14)이 그대로 읽고 이어 쓰는 것은 premium-discount 앱에서 확인했습니다. 지금은 0.31 입니다.
+- **LanceDB 0.41 의 기존 테이블**: 0.31(lance 8)이 쓴 테이블을 0.41(lance 14)이 그대로 읽고 이어 쓰는 것은 premium-discount 앱에서 확인했습니다.
+  이 앱의 실제 데이터 폴더로는 아직 열어 보지 않았습니다(시험은 새 임시 폴더를 씀).
 
 ## 검증 (2026-11-18, 이 PC: Windows · RAM 16 GB)
 
@@ -194,6 +262,14 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 - 세 단계(logis-llm · logis-vision-doc · commerce/app)를 합친 상태의 release ROCm `cargo build`(lib + bin) 통과 (27분 12초).
 - 검색 본문을 코어 `query` 로 옮긴 뒤 (CI 와 같은 조건): `it` 286 통과 · 0 실패 · 65 무시, lib 단위 8 통과, crate 시험 통과. 첫 빌드에 그대로
   컴파일됐고(코어 · 셸 모두 `#[cfg(feature)]` 가 없어 CPU 빌드가 모든 경로를 봄), 옮기며 남은 쓰지 않는 import 4개만 지웠습니다.
+- 5단계 (CI 와 같은 조건):
+  - 키 정렬을 넣은 0.31: `it` 286 통과 · 0 실패 · 65 무시, 골든 덤프가 기준과 0줄 차이.
+  - lancedb 0.41: `it` 286 통과 · 0 실패 · 65 무시(0.41 에서 실패하던 순서 시험 4개 포함). 골든은 세 변형이 같고 기준과는 `plan_order_*` 12줄만
+    다름(위). Display 감사(`cargo check --workspace --lib --bins`, Display 를 끈 serde_json 사본) 통과.
+  - 명령 · 시험을 옮긴 뒤: `cargo test -p logis-center -p logis-app --test it` 286 통과 · 0 실패 · 65 무시(시험 exe 에 tauri 없음), lib 단위 8 통과.
+  - 셸 의존성 정리 뒤: `it` 286 통과 · 0 실패 · 65 무시, lib 단위 8 통과(코어 3 · logis-llm 5), logis-llm · logis-vision-doc 단독 21 통과 · 3 무시,
+    crate 시험 통과, 골든 덤프가 0.41 때와 바이트 단위로 같음. 암호 crate 기능이 바뀌어 digest 를 쓰는 lance · datafusion 까지 다시 빌드됐습니다
+    (debug 7분 30초).
 - 함정: 같은 `target/debug` 에 `cargo check`(ROCm, 메타데이터만)와 CPU 빌드를 섞으면 boa 의 타입이 엉뚱하게 읽혀 `str` 크기 오류 · "rlib 형식이
   없음" 오류가 났습니다(폴더를 비우고 다시 빌드하면 사라짐). debug 정보를 켠 채 `it` 시험 exe 를 링크하면 PDB 가 1.7 GB 를 넘어 LNK1318(LIMIT 12) —
   CI 처럼 `CARGO_PROFILE_DEV_DEBUG=0` 을 씁니다.
@@ -209,5 +285,8 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 ## 빌드 · 시험
 
 - 앱: 예전처럼 `commerce/*.bat` (작업 폴더 `commerce/src-tauri`). 이 PC(RAM 16 GB)는 마지막 LTO 링크 두 개(lib · bin, 시험 exe)가 겹치면
-  os error 1455 가 나므로, `cargo build --release … -j 3` 으로 lib → bin 을 만든 뒤 `cargo test --release --no-run --test it … -j 3` 을 돌리면 겹치지 않습니다.
+  os error 1455 가 나므로, `cargo build --release … -j 3` 으로 lib → bin 을 만든 뒤
+  `cargo test --release --no-run -p logis-center -p logis-app --test it … -j 3` 을 돌리면 겹치지 않습니다.
+- 통합 시험: 어디서든 `cargo test -p logis-center -p logis-app --test it --no-default-features [--features rocm|vulkan|metal]`
+  (`commerce/test_cargo*.bat` 가 이것). Windows debug 는 `CARGO_PROFILE_DEV_DEBUG=0`(PDB 한도, 위 함정).
 - crate: 루트에서 `cargo test -p logis-schema -p logis-bias -p logis-sds -p logis-pug -p logis-parsers -p logis-search`.
