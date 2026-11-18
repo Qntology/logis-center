@@ -4,7 +4,7 @@
 
 앱의 이미지(SigLIP2) 경로에서 '읽은 값을 받을지 · 어느 축으로 보낼지' 를 가르는 게이트를 실제 함수로 재기 위한 결정론적 데이터입니다.
 전체 추출(크롭마다 LLM 판독)은 쪽당 5~25분이라, 게이트의 입력을 직접 만들어 게이트만 돌립니다
-(commerce/src-tauri/tests/it/synthetic_eval.rs 의 vision_gates · label_gates).
+(apps/core/tests/it/synthetic_eval.rs 의 vision_gates · label_gates).
 
   python make_vision_cases.py <영어 페이지 폴더> <ml 페이지 폴더> <출력 폴더>
 
@@ -45,7 +45,7 @@ from truth import ROOT, TRADING_ML, trading_docs
 sys.path.insert(0, str(TRADING_ML))
 from packs import PACKS  # noqa: E402
 
-BIAS = ROOT.parent / "commerce" / "src-tauri" / "src" / "utils" / "bias.json"
+BIAS = ROOT.parent / "crates" / "logis-bias" / "src" / "bias.json"
 KINDS = ["clean", "light", "smudge", "stamp", "blot", "sign"]
 # SDS 기준선은 서식 코드 스코프에 쌓입니다. ml 은 언어마다 같은 서식 5종이라 앞 언어들의 깨끗한 쪽을 그 코드의 기준선(calib)으로,
 # 뒤 언어들을 평가로 씁니다. 영어는 문서마다 코드가 달라(45종) 평가 쪽 코드에 기준선이 없습니다 — 표본 없음 경로를 잽니다.

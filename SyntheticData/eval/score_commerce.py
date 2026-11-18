@@ -22,7 +22,7 @@ import yaml
 from normalize import contains_value, same_value
 from truth import ROOT, commerce_pages
 
-BIAS = ROOT.parent / "commerce" / "src-tauri" / "src" / "utils" / "bias.json"
+BIAS = ROOT.parent / "crates" / "logis-bias" / "src" / "bias.json"
 STATUS_WORDS = ROOT / "commerce" / "status_words.yaml"
 STATUS_CODE = {
     "progress": 1, "stop": 2, "cancel": 3, "refund": 4, "return": 5, "error": 6, "expire": 7,

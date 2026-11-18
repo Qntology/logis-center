@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # logis-center app build + tests for one backend, one phase per workflow step (each step has its own
 # timeout and publishes its own annotations, so a slow later phase cannot lose the earlier results).
-# Run inside logis-center/commerce.
+# Run from the logis-center repository root.
 #   app-tests.sh cpu|metal|vulkan <out-dir> build|suite|embed|bench|real|accel
 # Env: MOCK_MODELS (gen_granite_mock.py output root), REAL_MODELS (Hugging Face download root, optional),
 #      EMBED_BACKENDS (backends whose embed / real phases run, default all), EMBED_COMPARE (0: default policy only; speed: default policy, speed / bit-identity test only — no decision test),
@@ -24,16 +24,16 @@ case "$BACKEND" in
   *) echo "unknown backend $BACKEND"; exit 2 ;;
 esac
 
-# The it suite is commerce/app/tests/it (package logis-app, no Tauri in the test binary). -p logis-center only makes the
+# The it suite is apps/core/tests/it (package logis-app, no Tauri in the test binary). -p logis-center only makes the
 # build use the desktop app's feature set (same dependency artifacts as the shell build).
 IT=(-p logis-center -p logis-app --test it)
 
-# tauri::generate_context! needs ../dist; bundle.resources "dlls/*" needs one file.
-[ -f dist/index.html ] || { mkdir -p dist; echo '<html></html>' > dist/index.html; }
-mkdir -p src-tauri/dlls; [ -n "$(ls -A src-tauri/dlls)" ] || touch src-tauri/dlls/.gitkeep
+# tauri::generate_context! needs frontendDist (web/desktop/dist); bundle.resources "dlls/*" needs one file.
+[ -f web/desktop/dist/index.html ] || { mkdir -p web/desktop/dist; echo '<html></html>' > web/desktop/dist/index.html; }
+mkdir -p apps/desktop/dlls; [ -n "$(ls -A apps/desktop/dlls)" ] || touch apps/desktop/dlls/.gitkeep
 # Keep the app data dir of the runner clean.
 XDG_DATA_HOME="$(mktemp -d)"; export XDG_DATA_HOME
-cd src-tauri
+cd apps/desktop
 
 # embed <label> <models-root> main|compare [extra env...]
 #   main    : the device's default policy — bit-identity / invariance / speed test + decision-level test
@@ -100,8 +100,8 @@ bench)
   run kv-io-bench env LOGIS_IO_BENCH_MB=512 cargo test "${IT[@]}" "${FEAT[@]}" -- direct_loader::kv_block_io_bench --ignored --nocapture --test-threads 1
   require_measured kv-io-bench "\\[KV-IO\\] best"
   # 3-2: packed-kernel contract + CPU profile / custom kernels (mock weights)
-  run cpu-kernel-contract cargo test --release --manifest-path ../crates/embed-cpu-kernels/Cargo.toml
-  run cpu-kernel-bench cargo run --release --manifest-path ../tools/cpu-embed-bench/Cargo.toml -- \
+  run cpu-kernel-contract cargo test --release --manifest-path ../../crates/embed-cpu-kernels/Cargo.toml
+  run cpu-kernel-bench cargo run --release --manifest-path ../../tools/cpu-embed-bench/Cargo.toml -- \
     "$MOCK_MODELS/granite-embedding-97m-multilingual-r2" --quick
   ;;
 real)

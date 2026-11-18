@@ -25,7 +25,7 @@ How to drive GitHub Actions from this session:
 4. Waiting for CI: a single shell command times out after 2 minutes by default, up to 10 minutes on request. The VM pauses after a few minutes of inactivity, and background commands are lost when it resumes. Do NOT run one long blocking wait (for example `gh run watch` for 40 minutes, or a `sleep` loop). Poll instead: call `gh run view <id> --json status,conclusion` every few minutes. In between, do useful work such as the Linux CPU experiments.
 5. Two repositories: logis-center is the repository attached to this session (started with `claude --cloud` from my logis-center checkout). The fork is a second repository you clone yourself:
    - Setup at the start: `git clone https://github.com/sungu-che/candle-rocm-vulkan ../candle-rocm-vulkan` (sibling of the logis-center checkout; the fork is public, so cloning works). Create a working branch there too, for example `claude/mac-verify`.
-   - Local builds in this VM: point the app at the sibling fork with path dependencies. Use the commented `path = "../../../candle-rocm-vulkan/..."` lines in `commerce/src-tauri/Cargo.toml`: the `candle-rocm` dependency plus the three `[patch.crates-io]` lines. Do not commit that path switch.
+   - Local builds in this VM: point the app at the sibling fork with path dependencies. Use the commented `path = "../../../candle-rocm-vulkan/..."` lines in `apps/desktop/Cargo.toml`: the `candle-rocm` dependency plus the three `[patch.crates-io]` lines. Do not commit that path switch.
    - Pushing fork changes: try `git push` of the fork working branch once. A terminal-started cloud session attaches only one repository, so the proxy may refuse it with "not in this session's authorized repository set". Pick mode A or B below by the result, and say which one you use.
    - Mode A (the fork push works): push fork changes to the fork working branch. On the app working branch, point the four Cargo.toml lines at `git = "https://github.com/sungu-che/candle-rocm-vulkan", branch = "<fork working branch>"` (or `rev = "<fork sha>"`). Push the fork branch first, so the app CI builds exactly that commit. Fork test suites can also run from a fork-side `.github/workflows/mac-verify.yml`.
    - Mode B (the fork push is refused): this is the expected case. Do not stop. Do everything from logis-center:
@@ -68,12 +68,12 @@ GitHub Actions(macOS 러너)와 이 리눅스 클라우드 세션에서 Mac 검�
 - https://github.com/sungu-che/logis-center (앱, main). Cargo.toml 은 포크를 git = https://github.com/Qntology/candle-rocm-vulkan (master) 로 참조한다. 포크를 고치면 sungu-che 에 push 한 뒤, 앱 검증은 [patch] 를 sungu-che git(또는 rev)로 잠시 돌려서 하고, 결과를 보고해줘(Qntology 반영은 내가 PR 머지로 한다).
 
 [이미 Windows 에서 끝난 것 — 이 구조를 그대로 따르고 같은 기준으로 비교]
-- logis-center/commerce/src-tauri/src/models/embedding.rs: batched_enabled() 는 CUDA/ROCm/CPU/Vulkan 기본 ON, Metal 만 OFF.
+- logis-center/apps/desktop/src/models/embedding.rs: batched_enabled() 는 CUDA/ROCm/CPU/Vulkan 기본 ON, Metal 만 OFF.
 - models/embedding/batched.rs: BatchOpts::for_device(). CUDA/ROCm = 고정 모양(fixed_shape=true, 모자란 행은 더미). CPU/Vulkan = 동적 모드(fixed_shape=false, exact_len_max=512: 같은 길이끼리만 묶고 패딩 없음).
   - 근거: CPU 는 연산량이 곧 시간이라 고정 모양이 오히려 0.4배로 느렸다. CPU gemm 은 행 결과가 행 수(M ≥ 2)·행 위치와 무관해 동적 모드에서도 구성 무관 비트 동일. 단, M = 1 은 다른 경로를 타서 비트가 달라짐(Vulkan 고정 모드는 1행을 2행으로 복제해 처리).
 - 포크 candle-core/src/vulkan_backend/shaders.rs: scoped_exec_mode(ExecMode::{Auto,Host,Gpu}). Vulkan 백엔드는 연산마다 GPU/CPU 를 크기·가중치 사용 횟수로 골라(CANDLE_VULKAN_MIRROR_AFTER=2, GEMV/GEMM 전환, 실패 시 조용한 CPU 폴백) 같은 텍스트도 비트가 달라졌다. 배치 구간은 Gpu 모드(가중치 행렬곱은 항상 GPU GEMM, 나머지 CPU)로 묶는다. 테스트: candle-core/tests/vulkan_tests.rs 의 fixed_exec_modes_are_batch_invariant.
 - 캐시 공간 태그: text_cache.rs 의 FORWARD_TAG_BATCHED(고정 모양) / FORWARD_TAG_BATCHED_DYN(동적). 캐시는 RAM 전용.
-- 검증 테스트: commerce/src-tauri/tests/it/app_embed.rs 의 gpu_embed_many_matches_per_text_and_is_faster (LOGIS_TEST_MODELS=1, --ignored). LOGIS_TEST_EMBED_DEVICE=cpu 면 CPU 로 돈다. 출력: 속도(per-text vs embed_many, 짧은 구, 단건 호출), 최소 코사인, 비트 동일 수, 구성 무관성(단건 · 표본 · 역순 절반), 재현성, F32 기준 코사인, 판정 일치(질의 150 × 뱅크 170 1위).
+- 검증 테스트: apps/core/tests/it/app_embed.rs 의 gpu_embed_many_matches_per_text_and_is_faster (LOGIS_TEST_MODELS=1, --ignored). LOGIS_TEST_EMBED_DEVICE=cpu 면 CPU 로 돈다. 출력: 속도(per-text vs embed_many, 짧은 구, 단건 호출), 최소 코사인, 비트 동일 수, 구성 무관성(단건 · 표본 · 역순 절반), 재현성, F32 기준 코사인, 판정 일치(질의 150 × 뱅크 170 1위).
 - Windows 기준 수치(비교용): CPU(Ryzen 5600X) 전체 1.6배 · 짧은 구 2.8배 · 단건 같은 비용 · per-text 와 320/320 비트 동일. Vulkan(RX 6600) 1.7배 · 3.7배 · 구성 무관 비트 동일. ROCm 1.8배.
 - 임베딩 판정 기준(확정): per-text 대비 최소 코사인 0.9999 는 쓰지 않는다. 'embed_many 의 F32 기준 평균 코사인 ≥ per-text 평균 − 2e-4'(테스트가 이미 단언) + 구성 무관 비트 동일 + 판정 일치.
 

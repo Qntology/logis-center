@@ -1,6 +1,6 @@
 # 합성 데이터 평가
 
-합성 데이터를 실제 파이프라인에 태워 정답과 비교하고, 앱이 AppData 에 남긴 SDS 실행 파일과 교차 확인합니다. 브라우저 · 프론트엔드 · 창 없이 앱과 같은 `process_task` / `ai_search_complex` 를 부릅니다 (`commerce/src-tauri/tests/it/synthetic_eval.rs`).
+합성 데이터를 실제 파이프라인에 태워 정답과 비교하고, 앱이 AppData 에 남긴 SDS 실행 파일과 교차 확인합니다. 브라우저 · 프론트엔드 · 창 없이 앱과 같은 `process_task` / `ai_search_complex` 를 부릅니다 (`apps/core/tests/it/synthetic_eval.rs`).
 
 ## 파일
 
@@ -23,7 +23,7 @@
 
 ## 돌리는 법
 
-ROCm 빌드만 씁니다. 빌드는 `commerce\test_cargo_rocm.bat --no-run` 입니다.
+ROCm 빌드만 씁니다. 빌드는 `scripts\test_cargo_rocm.bat --no-run` 입니다.
 
 ```bat
 python make_plan.py commerce --split dev --out plan.jsonl

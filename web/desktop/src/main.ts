@@ -1,0 +1,7782 @@
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { open, ask } from '@tauri-apps/plugin-dialog';
+import { listen, emit } from '@tauri-apps/api/event';
+import { readFile } from '@tauri-apps/plugin-fs';
+import { item2html, selector, isAlmostEqual } from "./lib/render";
+import { Select, Upsert } from "./lib/db";
+import { hashId, time2text } from "./lib/utils";
+import {
+    modeOfType,
+    TYPE_SETS,
+    modeLabel
+} from "./modes/types";
+import {
+    bindModeRuntime,
+    computeSyncInterval,
+    resetSyncBackoff,
+    getRootDomain,
+    ENVELOPE_ROOT_KEYS
+} from "./modes/runtime";
+import {
+    syncTradingData,
+    syncTradingInBackground,
+    resetTradingThrottle
+} from "./modes/trading";
+import {
+    COMMERCE_API_HOST as API_HOST,
+    syncCommerceData,
+    syncCommerceInBackground
+} from "./modes/commerce";
+
+
+type CanonKind = 'id' | 'num' | 'bool' | 'tags' | 'free';
+
+const FORCE_ID = new Set(['id', 'no', 'digest']);
+const FORCE_NUM = new Set(['status', 'views', 'created_at', 'updated_at', 'index', 'goods', 'order', 'tracking']);
+const FORCE_BOOL = new Set(['detail', 'node', 'embed']);
+const ID_SUFFIX = ['_no', '_code', '_number', '_id', '_sku', '_barcode', '_gtin', '_mpn'];
+const ID_CONTAINS = ['code', 'barcode', 'gtin', 'mpn', 'sku', 'reference_', 'container', 'seal'];
+const NUM_SUFFIX = [
+    '_price', '_amount', '_fee', '_rate', '_count', '_qty', '_at',
+    '_weight', '_volume', '_duration', '_limit', '_threshold', '_charges',
+    '_kg', '_cbm', '_m3', '_usd', '_krw', '_eur', '_jpy', '_cny', '_gbp'
+];
+const NUM_CONTAINS = [
+    'price', 'amount', 'quantity', 'discount', 'weight', 'volume',
+    'shipping_fee', 'usage_', 'threshold', 'exchange_rate', 'package_count',
+    'local_charges', 'number_of_',
+    'packages', 'pieces',
+    'measurement', 'premium', 'duty_', 'dutiable', 'balance', 'flash_point',
+    'tare_weight', 'chargeable'
+];
+const NUM_EXACT = new Set([
+    'width', 'height', 'length',
+    'premium', 'rate', 'debit', 'credit', 'dosage'
+]);
+const BOOL_PREFIX = ['is_', 'has_', 'allow_', 'use_'];
+const NUM_PREFIX = ['rel_'];
+const BOOL_SUFFIX = ['_only', '_included', '_allowed', '_match'];
+
+function kindOf(key: string): CanonKind {
+    const k = key.toLowerCase();
+
+    if (k === 'tags') return 'tags';
+
+    if (FORCE_ID.has(k)) return 'id';
+    if (FORCE_NUM.has(k)) return 'num';
+    if (FORCE_BOOL.has(k)) return 'bool';
+
+    if (NUM_PREFIX.some(p => k.startsWith(p))) return 'num';
+
+    if (BOOL_PREFIX.some(p => k.startsWith(p))) return 'bool';
+    if (BOOL_SUFFIX.some(s => k.endsWith(s))) return 'bool';
+
+    if (NUM_EXACT.has(k)) return 'num';
+    if (NUM_SUFFIX.some(s => k.endsWith(s))) return 'num';
+
+    if (ID_SUFFIX.some(s => k.endsWith(s))) return 'id';
+    if (ID_CONTAINS.some(c => k.includes(c))) return 'id';
+
+    if (NUM_CONTAINS.some(c => k.includes(c))) return 'num';
+
+    return 'free';
+}
+
+const SEED_KEYS: Array<[string, CanonKind]> = [
+    ['id', 'id'], ['no', 'id'], ['code', 'id'],
+    ['tracking_number', 'id'], ['stock_keeping_unit', 'id'], ['barcode', 'id'], ['digest', 'id'],
+    ['index', 'num'], ['goods', 'num'], ['order', 'num'], ['tracking', 'num'],
+    ['status', 'num'], ['created_at', 'num'], ['updated_at', 'num'],
+    ['embed', 'bool'],
+    ['tags', 'tags']
+];
+
+const STATUS_CODE: Record<string, number> = {
+    progress: 1, stop: 2, cancel: 3, refund: 4, return: 5,
+    error: 6, expire: 7, exchange: 8, complete: 9,
+    draft: 10, show: 11, hide: 12
+};
+
+const NON_SEED_TYPES = new Set([
+    'team', 'user', 'member', 'users', 'pages', 'page',
+    'click', 'hover', 'change', 'report', 'question', 'answer'
+]);
+
+function isoToEpochMs(t: string): number | null {
+    if (!/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?/.test(t)) return null;
+    let ms: number;
+    if (t.length === 10) {
+        ms = Date.parse(t); // "2024-01-01" 은 명세상 UTC 로 해석됩니다.
+    } else {
+        const hasTz = /[Zz]$|[+\-]\d{2}:?\d{2}$/.test(t);
+        const norm = t.includes('T') ? t : t.replace(' ', 'T');
+
+        ms = Date.parse(hasTz ? norm : norm + 'Z');
+    }
+    return isNaN(ms) ? null : ms;
+}
+
+function canonicalizeData(parsed: any, seedDefaults: boolean = true): any {
+    if (!parsed || typeof parsed !== 'object') return {};
+    const out: any = { ...parsed };
+
+    for (const k of Object.keys(out)) {
+        const kind = kindOf(k);
+        if (kind === 'free') continue;
+
+        const v = out[k];
+
+        if (kind === 'id') {
+            if (v === undefined || v === null) continue;
+            // 배열/객체는 식별자가 될 수 없으므로 건드리지 않습니다.
+            if (typeof v === 'object') continue;
+            out[k] = String(v);
+            continue;
+        }
+
+        if (kind === 'num') {
+            if (v === undefined || v === null || v === "") continue;
+            if (typeof v === 'object') continue;
+            if (typeof v === 'number') { out[k] = v; continue; }
+            if (typeof v === 'boolean') { out[k] = v ? 1 : 0; continue; }
+            const s = String(v).trim();
+            if (s === "null" || s === "N/A") continue;
+            if (k === 'status') {
+                const mapped = STATUS_CODE[s.toLowerCase()];
+                if (mapped !== undefined) { out[k] = mapped; continue; }
+            }
+            const ms = isoToEpochMs(s);
+            if (ms !== null) { out[k] = ms; continue; }
+            const cleaned = s.replace(/[^\d.\-]/g, '');
+            if (cleaned === "" || cleaned === "-" || cleaned === ".") continue;
+            const n = Number(cleaned);
+            if (isNaN(n)) continue;
+            out[k] = n;
+            continue;
+        }
+
+        if (kind === 'bool') {
+            if (v === undefined || v === null) continue;
+            if (typeof v === 'object') continue;
+            if (typeof v === 'boolean') { out[k] = v ? 1 : 0; continue; }
+            if (typeof v === 'number') { out[k] = v !== 0 ? 1 : 0; continue; }
+            const t = String(v).trim();
+            if (t === "") continue;
+            out[k] = (t === "1" || t.toLowerCase() === "true") ? 1 : 0;
+            continue;
+        }
+
+        if (kind === 'tags') {
+            if (v === undefined || v === null) continue;
+            if (!Array.isArray(v)) {
+                out[k] = [String(v)].filter(Boolean);
+            } else {
+                out[k] = v
+                    .map((t: any) => (typeof t === 'object' && t !== null ? (t.tag ?? "") : String(t)))
+                    .filter(Boolean);
+            }
+            continue;
+        }
+    }
+    if (seedDefaults) {
+        for (const [k, kind] of SEED_KEYS) {
+            if (out[k] !== undefined && out[k] !== null) continue;
+            out[k] = kind === 'id' ? "" : kind === 'tags' ? [] : 0;
+        }
+    }
+
+    return out;
+}
+const normalizeEnvelope = (docs: any[]) => docs.map(d => {
+    let parsed: any = {};
+    if (typeof d.json_data === 'string') {
+        try { parsed = JSON.parse(d.json_data) || {}; } catch (e) { parsed = {}; }
+    } else if (d.data && typeof d.data === 'object') {
+        parsed = d.data;
+    } else if (typeof d.data === 'string') {
+        try { parsed = JSON.parse(d.data) || {}; } catch (e) { parsed = {}; }
+    } else {
+        parsed = {};
+    }
+
+    for (const k in d) {
+        if (!Object.prototype.hasOwnProperty.call(d, k)) continue;
+        if (ENVELOPE_ROOT_KEYS.has(k)) continue;
+        const v = d[k];
+        if (v === undefined || v === null) continue;
+        // 함수/DOM 등 직렬화 불가 값은 IndexedDB structured clone 에서 터지므로 제외합니다.
+        if (typeof v === 'function') continue;
+        if (parsed[k] === undefined || parsed[k] === null || parsed[k] === "") {
+            parsed[k] = v;
+        }
+    }
+
+    // 검색/표시용 텍스트도 data 안으로 통일합니다.
+    if (parsed.text === undefined) parsed.text = d.text ?? "";
+    if (parsed.masked_text === undefined) parsed.masked_text = d.masked_text ?? parsed.text ?? "";
+
+    const inferredType = String(d.type ?? d.doc_type ?? parsed.type ?? "");
+    if (parsed.mode === undefined) parsed.mode = d.mode ?? modeOfType(inferredType);
+    if (parsed.digest === undefined) parsed.digest = d.digest ?? "";
+    const created = d.created_at_ts ?? d.created_at ?? parsed.created_at ?? 0;
+
+    const updatedRaw = d.updated_at_ts ?? d.updated_at ?? parsed.updated_at;
+    const updated = updatedRaw !== undefined && updatedRaw !== null ? updatedRaw : 0;
+    parsed.created_at = Number(created) || 0;
+    parsed.updated_at = Number(updated) || 0;
+    // 🌟 [PAGE CACHE DETECT] store.rs 의 target == "pages" 와 등가인 판정입니다.
+    const isPageCacheRow = d.table === 'pages' || d.table === 'page'
+        || !!parsed.node || !!parsed.item;
+    const seedDefaults = !isPageCacheRow
+        && !NON_SEED_TYPES.has(inferredType);
+    return {
+        // ── 봉투 12개. 이 목록은 앞으로 절대 늘어나지 않습니다 ──
+        id: String(d.id ?? d.uuid ?? parsed.id ?? ""),
+        type: String(d.type ?? d.doc_type ?? parsed.type ?? "unknown"),
+        flag: String(d.flag ?? parsed.flag ?? ""),
+        from: String(d.from ?? parsed.from ?? ""),
+        to: String(d.to ?? parsed.to ?? ""),
+        cc: String(d.cc ?? parsed.cc ?? ""),
+        bcc: String(d.bcc ?? parsed.bcc ?? ""),
+        ref: String(d.ref ?? d.ref_val ?? parsed.ref ?? ""),
+        mode: String(d.mode ?? parsed.mode ?? modeOfType(inferredType)),
+        created_at: Number(created) || 0,
+        updated_at: Number(updated) || 0,
+        data: canonicalizeData(parsed, seedDefaults)
+    };
+});
+const enrichForIndex = normalizeEnvelope;
+const ethers = (window as any).ethers;
+const blockies = (window as any).blockies;
+const WIDGET_WIDTH = 380;
+const COLLAPSED_HEIGHT = 80;
+const EXPANDED_HEIGHT = 600;
+interface ChatSession {
+    hash: string;
+    token?: string;
+    email?: string;
+    team?: string;
+    address?: string;
+    name?: string;
+    cc?: string;
+    sender?: string;
+    flag?: string;
+}
+let currentSession: ChatSession = { hash: "", cc: "logis.center" };
+let isExpanded = false;
+let currentTab = "list";
+let currentImage: string | null = null;
+let currentDetectedUrl = "";
+let isCurrentShop = false; 
+let searchDebounceTimer: number | null = null;
+let chatPollInterval: number | null = null;
+let isSearching = false;
+let isExtracting = false;
+let modelStatus: Record<string, boolean> = {};
+const TARGET_MODELS = [
+    'Qwen3', 'Qwen3.5', 'Embedding', 'Granite', 'SigLIP2',
+    // stanza-onnx-export 변환본(format 2)이 있는 12개 언어 (apps/core/src/stanza.rs UI_LANGS 와 같음)
+    'stanza_korean', 'stanza_english', 'stanza_japanese', 'stanza_chinese',
+    'stanza_french', 'stanza_german', 'stanza_spanish', 'stanza_italian',
+    'stanza_portuguese', 'stanza_dutch', 'stanza_arabic', 'stanza_czech'
+];
+export let lastSearchedQuery = "";
+
+let isBrowserRunning = false;
+let isAutoLaunchLocked = false; // 🌟 런처 클릭 후 stopped 시그널 전까지 버튼 강제 숨김 락
+
+interface CloudPendingMeta {
+    serverId: string;
+    kind: "extract" | "search";
+    createdAt: number;
+}
+let cloudPendingTasks = new Map<string, CloudPendingMeta>();
+let isReindexing = false;
+
+
+// 🌟 [EMBED DEBOUNCE] runLocalEmbeddingSync 중복 호출 방지를 위한 스케줄링 변수
+let reindexScheduled = false;
+let reindexDebounceTimer: number | null = null;
+// 🌟 [EMBED DRAIN] 한 회차는 트랙마다 20건씩만 임베딩합니다. 그 회차에 실제로 임베딩한 문서가 있으면
+//    대기열이 남았을 수 있으므로 곧바로 다음 회차를 예약합니다. 임베딩 공간이 바뀐 뒤(store.rs
+//    migrate_embedding_space) 전량 재임베딩이 다음 동기화 이벤트를 기다리지 않고 끝나게 하려는 것이고,
+//    연속 회차에는 상한을 두어 처리되지 않는 문서가 남아도 무한히 돌지 않습니다.
+let embedDrainRounds = 0;
+const EMBED_DRAIN_MAX_ROUNDS = 200;
+
+async function runLocalEmbeddingSync() {
+    if (isReindexing || reindexScheduled) return;
+    if (isSearching || isExtracting || GlobalTaskManager.isBusy) return;
+    // 🌟 [DEBOUNCE] 2초 내 재호출 시 타이머를 리셋하여 마지막 호출만 실행
+    reindexScheduled = true;
+    if (reindexDebounceTimer) clearTimeout(reindexDebounceTimer);
+    reindexDebounceTimer = window.setTimeout(async () => {
+        reindexScheduled = false;
+        reindexDebounceTimer = null;
+        
+        if (isReindexing || isSearching || isExtracting || GlobalTaskManager.isBusy) return;
+        isReindexing = true;
+        let totalProcessed = 0;
+        try {
+            const trackOrder = [currentSearchMode,
+                ...["commerce", "shipping"].filter(m => m !== currentSearchMode)];
+
+            for (const track of trackOrder) {
+                if (isSearching || isExtracting || GlobalTaskManager.isBusy) break;
+
+                const res = await invoke<any>("reindex_pending_embeddings", {
+                    limit: 20,
+                    devicePreference: getDevicePref(),
+                    mode: track
+                });
+
+                if (res && res.processed && res.processed > 0) {
+                    totalProcessed += res.processed;
+                    console.log(`[EMBED] Locally embedded ${res.processed} item(s). (mode: ${res.mode || track})`);
+                } else if (res && res.skipped) {
+                    console.log(`[EMBED] 트랙 '${track}' 임베딩 스킵: 사유=${res.skipped}`);
+                }
+            }
+
+            if (totalProcessed > 0) {
+                await renderNavigation();
+                if (currentTab === "list") {
+                    await loadMoreDocs(false, true);
+                }
+            }
+        } catch (e) {
+            console.warn("[EMBED] reindex_pending_embeddings failed:", e);
+        } finally {
+            isReindexing = false;
+        }
+        if (totalProcessed > 0 && embedDrainRounds < EMBED_DRAIN_MAX_ROUNDS) {
+            embedDrainRounds += 1;
+            runLocalEmbeddingSync();
+        } else {
+            embedDrainRounds = 0;
+        }
+    }, 2000);
+}
+if (!(window as any).Dexie) {
+    console.error("🚨 [ERROR] Dexie library is missing! public 폴더 안의 파일들은 반드시 절대경로(/)로 불러와야 합니다.");
+}
+const DexieLocal = (window as any).Dexie;
+
+const appDb = new DexieLocal("LogisAppDB");
+
+const ITEMS_SCHEMA = [
+    'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
+    'created_at', 'updated_at',
+    '[cc+type]', '[mode+type]', '[ref+created_at]', '[mode+updated_at]',
+    'data.index', 'data.no', 'data.code', 'data.tracking_number',
+    'data.goods', 'data.order', 'data.tracking',
+    'data.stock_keeping_unit', 'data.barcode',
+    'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
+    'data.quantity', 'data.weight', 'data.discount',
+    'data.carrier', 'data.shipping_method',
+    'data.started_at', 'data.expired_at',
+    'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
+    'data.embed', 'data.digest',
+    '*data.tags',
+    'data.doc_type', 'data.doc_number', 'data.issue_date',
+    'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
+    'data.etd', 'data.eta',
+    'data.incoterms', 'data.payment_terms', 'data.currency',
+    '*data.container_number', '*data.seal_number',
+    'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
+    'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+    'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+    'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+    'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+    'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+    'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+    'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+    'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+    'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+    'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+    'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
+    'data.reference_bl', 'data.reference_po', 'data.reference_contract',
+    'data.reference_master_bl', 'data.reference_sr', 'data.reference_number',
+    'data.expiry_date', 'data.place_receipt', 'data.place_delivery',
+    'data.flight_number', 'data.departure_date', 'data.arrival_date',
+    'data.transport_mode', 'data.freight_payment_term',
+    'data.amount_subtotal', 'data.amount_tax', 'data.freight_amount',
+    'data.due_date', 'data.payment_status',
+    'data.package_unit', '*data.type_size', '*data.hs_code',
+    '*data.item_code', '*data.charge_code',
+    'data.rel_phyto', 'data.rel_msds', 'data.rel_poa',
+    'data.rel_biz_lic', 'data.rel_ben_cert',
+    '[type+created_at]'
+].join(', ');
+appDb.version(15).stores({
+    items: ITEMS_SCHEMA,
+    kv_store: 'key',
+    ts_queue: 'taskId, type',
+    talks: 'id, type, role, from, to, cc, bcc, ref, task_id, status, created_at, updated_at',
+    users: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.is_device, data.email, data.origin',
+    pages: 'id, type, flag, from, to, cc, bcc, ref, mode, created_at, updated_at, data.type, data.detail, data.origin',
+    translit_cache: '++id, source_word, doc_lang, [source_word+doc_lang], created_at',
+    talk_tombstones: 'id, deleted_at, ref'
+});
+
+(window as any).appDb = appDb;
+
+async function kvGet(key: string): Promise<any> {
+    try {
+        const record = await appDb.table("kv_store").get(key);
+        return record ? record.value : null;
+    } catch (e) {
+        console.warn(`[KV] get('${key}') failed:`, e);
+        return null;
+    }
+}
+async function kvSet(key: string, value: any) {
+    try {
+        await appDb.table("kv_store").put({ key, value });
+    } catch (e) {
+        console.warn(`[KV] set('${key}') failed:`, e);
+    }
+}
+async function kvRemove(key: string) {
+    try {
+        await appDb.table("kv_store").delete(key);
+    } catch (e) {
+        console.warn(`[KV] remove('${key}') failed:`, e);
+    }
+}
+
+let talkTombstoneCache: Set<string> | null = null;
+let itemTombstoneCache: Set<string> | null = null;
+
+async function loadItemTombstones(): Promise<Set<string>> {
+    if (itemTombstoneCache) return itemTombstoneCache;
+    const s = new Set<string>();
+    try {
+        // kv_store 에 'item_tombstones' 키 하나로 JSON 배열 저장
+        const raw = await kvGet("item_tombstones");
+        if (Array.isArray(raw)) {
+            for (const id of raw) s.add(String(id));
+        }
+    } catch (e) {
+        console.warn("[ITEM-TOMBSTONE] load failed:", e);
+    }
+    itemTombstoneCache = s;
+    return s;
+}
+
+async function addItemTombstone(id: string) {
+    if (!id) return;
+    const cache = await loadItemTombstones();
+    cache.add(String(id));
+    try {
+        await kvSet("item_tombstones", Array.from(cache));
+    } catch (e) {
+        console.warn(`[ITEM-TOMBSTONE] save('${id}') failed:`, e);
+    }
+}
+
+/** 묘비 목록을 메모리에 적재합니다. 최초 1회만 Dexie 를 읽습니다. */
+async function loadTalkTombstones(): Promise<Set<string>> {
+    if (talkTombstoneCache) return talkTombstoneCache;
+    const s = new Set<string>();
+    try {
+        const rows = await appDb.table("talk_tombstones").toArray();
+        for (const r of rows) {
+            if (r && r.id) s.add(String(r.id));
+        }
+        if (s.size > 0) {
+            console.log(`[TOMBSTONE] 삭제 묘비 ${s.size}건 적재 완료. 해당 메시지는 서버 폴링으로 부활하지 않습니다.`);
+        }
+    } catch (e) {
+        console.warn("[TOMBSTONE] load failed:", e);
+    }
+    talkTombstoneCache = s;
+    return s;
+}
+
+/** 동기 조회용. loadTalkTombstones() 가 선행되어야 정확합니다. */
+function isTalkTombstoned(id: string): boolean {
+    if (!id) return false;
+    return talkTombstoneCache ? talkTombstoneCache.has(String(id)) : false;
+}
+
+/** 묘비를 세웁니다. 메모리 캐시와 Dexie 를 동시에 갱신합니다. */
+async function addTalkTombstone(id: string, refVal: string = "") {
+    if (!id) return;
+    const cache = await loadTalkTombstones();
+    cache.add(String(id));
+    try {
+        await appDb.table("talk_tombstones").put({
+            id: String(id),
+            ref: refVal || "",
+            deleted_at: Date.now()
+        });
+    } catch (e) {
+        console.warn(`[TOMBSTONE] put('${id}') failed:`, e);
+    }
+}
+
+async function deleteChatMessage(msgId: string, opts: { skipConfirm?: boolean } = {}): Promise<boolean> {
+    if (!msgId) return false;
+
+    if (!opts.skipConfirm) {
+        const confirmed = await ask(
+            "이 메시지를 삭제하시겠습니까?\n\n" +
+            "· 내 기기에서 완전히 사라지며 다시 나타나지 않습니다.\n" +
+            "· 이미 메시지를 받아간 다른 팀원의 화면에는 그대로 남습니다.",
+            { title: "Delete Message", kind: "warning" }
+        );
+        if (!confirmed) return false;
+    }
+
+    const el = document.getElementById(msgId) as HTMLElement | null;
+    const refVal = el?.dataset.ref || activeContext.ref || "";
+
+    // ① 묘비 (가장 먼저)
+    await addTalkTombstone(msgId, refVal);
+
+    try {
+        await invoke("delete_message", { taskId: msgId });
+    } catch (e) {
+        console.warn(`[CHAT] LanceDB delete_message('${msgId}') failed:`, e);
+    }
+
+    // ③ Dexie talks 캐시
+    try {
+        if (appDb) await appDb.table("talks").delete(msgId);
+    } catch (e) { /* 캐시에 없을 수 있으므로 무시 */ }
+
+    // ④ DOM
+    if (el) el.remove();
+
+    // 마지막 한 건을 지웠다면 안내 문구를 복원합니다.
+    if (chatTalks && chatTalks.querySelectorAll('.chat-talk').length === 0) {
+        if (!chatTalks.querySelector('.no-msg')) {
+            chatTalks.insertAdjacentHTML(
+                'beforeend',
+                "<div class='no-msg' data-created-at=\"0\" style='text-align:center; padding:20px; color:#999; font-size:0.8rem;'>No messages yet.</div>"
+            );
+        }
+    }
+
+    console.log(`[CHAT] 🗑️ [DELETED] '${msgId}' 를 내 기기에서 삭제했습니다. (서버 행 및 타 사용자 로컬 원장은 유지)`);
+    return true;
+}
+(window as any).normalizeEnvelope = normalizeEnvelope;
+(window as any).canonicalizeData = canonicalizeData;
+const DEXIE_INDEXED_PATHS = new Set<string>([
+    // ── 봉투 ──
+    'id', 'type', 'flag', 'from', 'to', 'cc', 'bcc', 'ref', 'mode',
+    'created_at', 'updated_at',
+    // ── commerce 축 ──
+    'data.index', 'data.no', 'data.code', 'data.tracking_number',
+    'data.goods', 'data.order', 'data.tracking',
+    'data.stock_keeping_unit', 'data.barcode',
+    'data.status', 'data.amount', 'data.sale_price', 'data.supply_price',
+    'data.quantity', 'data.weight', 'data.discount',
+    'data.carrier', 'data.shipping_method',
+    'data.started_at', 'data.expired_at',
+    'data.title', 'data.name', 'data.sender_name', 'data.recipient_name',
+    'data.embed', 'data.digest',
+    'data.doc_type', 'data.doc_number', 'data.issue_date',
+    'data.vessel', 'data.voyage_number', 'data.pol', 'data.pod',
+    'data.etd', 'data.eta',
+    'data.incoterms', 'data.payment_terms', 'data.currency',
+    'data.container_number', 'data.seal_number',
+    'data.package_count', 'data.weight_gross', 'data.weight_net', 'data.volume',
+    'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+    'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+    'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+    'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+    'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+    'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+    'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+    'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+    'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+    'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+    'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+    'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
+    'data.rel_phyto', 'data.rel_msds', 'data.rel_poa',
+    'data.rel_biz_lic', 'data.rel_ben_cert',
+    'data.item_code', 'data.charge_code',
+    'data.reference_bl', 'data.reference_po', 'data.reference_contract',
+    'data.reference_master_bl', 'data.reference_sr', 'data.reference_number',
+    'data.expiry_date', 'data.place_receipt', 'data.place_delivery',
+    'data.flight_number', 'data.departure_date', 'data.arrival_date',
+    'data.transport_mode', 'data.freight_payment_term',
+    'data.amount_subtotal', 'data.amount_tax', 'data.freight_amount',
+    'data.due_date', 'data.payment_status',
+    'data.package_unit', 'data.type_size', 'data.hs_code'
+]);
+
+interface DexieCondition {
+    path: string;
+    op: string;
+    value?: any;
+    percent?: number;
+    kind?: string;
+    extreme?: boolean;
+}
+
+interface DexiePlan {
+    type?: string;
+    /** 🌟 v4 : 확정 도메인 + 교차 후보 도메인. LanceDB 의 IN 절과 동일한 집합입니다. */
+    types?: string[];
+    mode?: string;
+    /** 🌟 [PLAN TENANT SCOPE] 이 사이트의 문서만 통과시킵니다. 조건 리콜은 표 전체를 훑습니다. */
+    cc?: string;
+    conditions?: DexieCondition[];
+    keywords?: string[];
+    alternates?: Record<string, string[]>;
+    substantial?: string;
+    find?: string;
+    relay?: RelayPlanInfo;
+}
+
+interface RelayPlanInfo {
+    applied?: boolean;
+    key?: string;
+    partner_types?: string[];
+    target_ids?: string[];
+    void_only?: string[];
+    partner_ids?: string[];
+    void_partner_ids?: string[];
+}
+
+// 🌟 중첩 경로('data.sale_price')를 안전하게 읽습니다.
+function readPath(row: any, path: string): any {
+    if (!row) return undefined;
+    if (path.indexOf('.') === -1) return row[path];
+    let cur: any = row;
+    for (const seg of path.split('.')) {
+        if (cur === null || cur === undefined) return undefined;
+        cur = cur[seg];
+    }
+    return cur;
+}
+function relayFamily(t: string): string {
+    const k = String(t || "").trim().toLowerCase();
+    if (k === "receiving" || k === "shipping" || k === "tracking") return "tracking";
+    if (k === "sales" || k === "order") return "order";
+    if (k === "coupon" || k === "event") return "event";
+    return k;
+}
+function relayPeriodBadge(res: any): string {
+    if (!res || res.relay_period_hits === undefined || res.relay_period_hits === null) return "";
+    const net = Number(res.relay_period_units_net ?? res.relay_period_units ?? res.relay_period_hits);
+    const voidUnits = Number(res.relay_period_void_units ?? 0);
+    const exact = res.relay_period_units_exact !== false;
+    const shown = isNaN(net) ? String(res.relay_period_hits) : String(net);
+    const head = `🔗 기간 내 판매·거래 ${shown}개${exact ? "" : " (수량 없는 연결은 1개로 셈)"}`;
+    return voidUnits > 0 ? `${head} · 취소·환불·반품 ${voidUnits}개 제외` : head;
+}
+function matchCondition(row: any, cond: DexieCondition): boolean {
+    // top / bottom 은 개별 행으로 판정 불가. 정렬 단계에서 처리합니다.
+    if (cond.op === 'top' || cond.op === 'bottom') return true;
+
+    const raw = readPath(row, cond.path);
+
+    if (cond.kind === 'number') {
+        const target = typeof cond.value === 'number' ? cond.value : Number(cond.value);
+        if (isNaN(target)) return true; // 비교 불가 → 조건 무시(리콜 우선)
+        const isMissing = (raw === undefined || raw === null || raw === "");
+        if (isMissing) return cond.op === 'neq';
+
+        const actual = typeof raw === 'number'
+            ? raw
+            : Number(String(raw).replace(/[^\d.\-]/g, ''));
+        if (isNaN(actual)) return false;
+
+        switch (cond.op) {
+            case 'gt':  return actual >  target;
+            case 'gte': return actual >= target;
+            case 'lt':  return actual <  target;
+            case 'lte': return actual <= target;
+            case 'neq': return actual !== target;
+            default:    return actual === target;
+        }
+    }
+    if (Array.isArray(raw)) {
+        const t0 = (cond.value === null || cond.value === undefined) ? '' : String(cond.value).toLowerCase();
+        if (!t0) return true;
+        const hit = raw.some(el => {
+            const s = (el === null || el === undefined) ? '' : String(el).toLowerCase();
+            return cond.op === 'contains' ? s.includes(t0) : s === t0;
+        });
+        if (cond.op === 'not_contains' || cond.op === 'neq') return !hit;
+        return hit;
+    }
+    // 문자열 계열
+    const actualStr = (raw === null || raw === undefined) ? '' : String(raw);
+    const targetStr = (cond.value === null || cond.value === undefined) ? '' : String(cond.value);
+    if (!targetStr) return true; // 빈 조건은 무시
+
+    const a = actualStr.toLowerCase();
+    const t = targetStr.toLowerCase();
+
+    switch (cond.op) {
+        case 'contains':     return a.includes(t);
+        case 'not_contains': return !a.includes(t);
+        case 'neq':          return a !== t;
+        case 'gt':           return a >  t;
+        case 'gte':          return a >= t;
+        case 'lt':           return a <  t;
+        case 'lte':          return a <= t;
+        default:             return a === t;
+    }
+}
+function pickDriverCondition(conds: DexieCondition[]): DexieCondition | null {
+    const HIGH_SELECTIVITY = [
+        // ── commerce 식별자 ──
+        'data.tracking_number', 'data.no', 'data.code', 'data.index',
+        'data.barcode', 'data.stock_keeping_unit', 'data.digest',
+        'data.doc_number', 'data.container_number', 'data.seal_number',
+        'data.reference_invoice', 'data.reference_lc', 'data.reference_booking',
+        'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+        'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+        'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+        'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+        'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+        'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+        'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+        'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+        'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+        'data.rel_be', 'data.rel_ins', 'data.rel_dgd',
+        'data.reference_bl', 'data.reference_po', 'data.reference_contract',
+        'data.reference_master_bl', 'data.reference_sr'
+    ];
+
+    let best: DexieCondition | null = null;
+    let bestScore = -1;
+
+    for (const c of conds) {
+        if (!DEXIE_INDEXED_PATHS.has(c.path)) continue;
+        if (c.op === 'top' || c.op === 'bottom') continue;
+        if (c.op === 'contains' || c.op === 'not_contains' || c.op === 'neq') continue;
+
+        let score = 0;
+        if (c.op === 'eq') score += 10;
+        else score += 4; // 범위 연산자
+        if (HIGH_SELECTIVITY.includes(c.path)) score += 20;
+
+        if (score > bestScore) { bestScore = score; best = c; }
+    }
+    return best;
+}
+// 🌟 [ALTERNATES] 조건의 필드가 비었거나 맞지 않으면 plan.alternates 의 대체 필드로도 봅니다.
+//    lib.rs 의 dexie_condition_passes 와 같은 규칙입니다. 예전에는 alternates 를 읽지 않아, 무역 허브 번호 조건
+//    (data.hub_reference, 대체 필드 doc_number · reference_*)이 그 필드를 가진 문서가 없어 모든 행을 걸러 냈습니다.
+function conditionAlternates(plan: DexiePlan, cond: DexieCondition): string[] {
+    const field = cond.path.startsWith('data.') ? cond.path.slice(5) : cond.path;
+    const alts = plan.alternates && plan.alternates[field];
+    return Array.isArray(alts) ? alts : [];
+}
+function matchConditionWithAlternates(row: any, cond: DexieCondition, plan: DexiePlan): boolean {
+    if (matchCondition(row, cond)) return true;
+    return conditionAlternates(plan, cond).some(a => matchCondition(row, { ...cond, path: `data.${a}` }));
+}
+async function executeDexiePlan(
+    plan: DexiePlan,
+    opts: { candidateIds?: string[]; limit?: number; offset?: number } = {}
+): Promise<any[]> {
+    if (!appDb) return [];
+
+    const conds: DexieCondition[] = Array.isArray(plan.conditions) ? plan.conditions : [];
+    const limit = opts.limit ?? 200;
+    const offset = opts.offset ?? 0;
+
+    let rows: any[] = [];
+    if (opts.candidateIds && opts.candidateIds.length > 0) {
+        rows = await appDb.table('items').where('id').anyOf(opts.candidateIds).toArray();
+        console.log(`[DEXIE-PLAN] 후보 ${opts.candidateIds.length}건 → Dexie 적재 ${rows.length}건`);
+    } else {
+        // 대체 필드가 있는 조건은 인덱스 드라이버로 쓰지 않습니다(그 필드에만 값이 있는 행을 놓칩니다).
+        const driver = pickDriverCondition(conds.filter(c => conditionAlternates(plan, c).length === 0));
+        if (driver) {
+            try {
+                const coll = appDb.table('items').where(driver.path);
+                if (driver.op === 'eq') {
+                    rows = await coll.equals(driver.value).toArray();
+                } else if (driver.op === 'gt') {
+                    rows = await coll.above(driver.value).toArray();
+                } else if (driver.op === 'gte') {
+                    rows = await coll.aboveOrEqual(driver.value).toArray();
+                } else if (driver.op === 'lt') {
+                    rows = await coll.below(driver.value).toArray();
+                } else if (driver.op === 'lte') {
+                    rows = await coll.belowOrEqual(driver.value).toArray();
+                } else {
+                    rows = await appDb.table('items').toArray();
+                }
+                console.log(`[DEXIE-PLAN] 드라이버 인덱스 '${driver.path} ${driver.op} ${driver.value}' → ${rows.length}건 적재`);
+            } catch (e) {
+                console.warn(`[DEXIE-PLAN] ⚠️ 드라이버 인덱스 '${driver.path}' 조회 실패. 전량 적재로 폴백합니다.`, e);
+                rows = await appDb.table('items').toArray();
+            }
+        } else if (plan.types && plan.types.length > 0) {
+            // 🌟 types 인덱스(anyOf)로 좁힙니다. mode 보다 선택도가 높습니다.
+            rows = await appDb.table('items').where('type').anyOf(plan.types).toArray();
+            console.log(`[DEXIE-PLAN] 드라이버 없음. type anyOf [${plan.types.join(', ')}] 로 ${rows.length}건 적재`);
+        } else if (plan.mode) {
+            rows = await appDb.table('items').where('mode').equals(plan.mode).toArray();
+            console.log(`[DEXIE-PLAN] 드라이버 없음. mode='${plan.mode}' 로 ${rows.length}건 적재`);
+        } else {
+            rows = await appDb.table('items').toArray();
+            console.log(`[DEXIE-PLAN] 전체 적재 ${rows.length}건`);
+        }
+    }
+    const allowedTypes: string[] = (plan.types && plan.types.length > 0)
+        ? plan.types
+        : (plan.type ? [plan.type] : []);
+
+    if (allowedTypes.length > 0) {
+        const before = rows.length;
+        rows = rows.filter(r => allowedTypes.includes(r.type || ''));
+        if (before !== rows.length) {
+            console.log(`[DEXIE-PLAN] types 필터 [${allowedTypes.join(', ')}]: ${before} → ${rows.length}건`);
+        }
+    }
+    if (plan.mode) {
+        rows = rows.filter(r => (r.mode || 'commerce') === plan.mode);
+    }
+    if (plan.cc) {
+        rows = rows.filter(r => r.cc === plan.cc);
+    }
+
+    // ── 정밀 조건 전량 적용 ──
+    const rankConds = conds.filter(c => c.op === 'top' || c.op === 'bottom');
+    const plainConds = conds.filter(c => c.op !== 'top' && c.op !== 'bottom');
+
+    if (plainConds.length > 0) {
+        const before = rows.length;
+        rows = rows.filter(r => plainConds.every(c => matchConditionWithAlternates(r, c, plan)));
+        console.log(`[DEXIE-PLAN] 정밀 조건 ${plainConds.length}개 적용: ${before} → ${rows.length}건`);
+        for (const c of plainConds) {
+            const viaIndex = DEXIE_INDEXED_PATHS.has(c.path) ? 'index' : 'scan';
+            console.log(`  ↳ ${c.path} ${c.op} ${JSON.stringify(c.value)} (${c.kind}, ${viaIndex})`);
+        }
+    }
+
+    // ── top / bottom 백분위 : 정렬 후 슬라이스 ──
+    for (const rc of rankConds) {
+        if (rows.length === 0) break;
+        const ranked = rows.filter(r => {
+            const v = readPath(r, rc.path);
+            if (v === undefined || v === null || v === "") return false;
+            return !isNaN(Number(v));
+        });
+        const skipped = rows.length - ranked.length;
+        if (ranked.length === 0) {
+            console.log(`[DEXIE-PLAN] ${rc.op} ${rc.path}: 값을 가진 문서가 0건이라 랭킹을 건너뜁니다.`);
+            continue;
+        }
+
+        const pct = Math.max(1, Math.min(100, rc.percent ?? 20));
+        const take = Math.max(1, Math.ceil(ranked.length * (pct / 100)));
+
+        const sorted = [...ranked].sort((a, b) => {
+            const av = Number(readPath(a, rc.path));
+            const bv = Number(readPath(b, rc.path));
+            return rc.op === 'top' ? bv - av : av - bv;
+        });
+        if (rc.extreme) {
+            const edge = Number(readPath(sorted[0], rc.path));
+            rows = sorted.filter(r => Number(readPath(r, rc.path)) === edge);
+            console.log(`[DEXIE-PLAN] ${rc.op} extreme on ${rc.path} = ${edge} → ${rows.length}건 (동률 포함, 값 결손 ${skipped}건 제외)`);
+        } else {
+            rows = sorted.slice(0, take);
+            console.log(`[DEXIE-PLAN] ${rc.op} ${pct}% on ${rc.path} → ${rows.length}건 (값 결손 ${skipped}건 제외)`);
+        }
+    }
+    if (plan.keywords && plan.keywords.length > 0) {
+        for (const r of rows) {
+            const hay = `${r.data?.text ?? ''} ${r.data?.title ?? ''} ${r.data?.masked_text ?? ''}`.toLowerCase();
+            let hit = 0;
+            for (const k of plan.keywords) {
+                if (k && hay.includes(k.toLowerCase())) hit++;
+            }
+            r.__kw_score = hit;
+        }
+        rows.sort((a, b) => (b.__kw_score || 0) - (a.__kw_score || 0));
+    }
+
+    const start = Math.min(offset, rows.length);
+    const end = Math.min(start + limit, rows.length);
+    return rows.slice(start, end);
+}
+class GlobalTaskManager {
+    static isBusy: boolean = false;
+    static currentTaskId: string | null = null;
+    static currentTaskPayload: any = null; 
+    static activeRefs: Set<string> = new Set();
+    static queue: Array<{taskId: string, type: string, payload: any}> = [];
+    static backendQueued: any[] = []; // 🌟 [CRITICAL FIX] 백엔드가 이미 관리 중인 대기열 추적용 배열 추가
+    static cancelledTasks: Set<string> = new Set(); // 🌟 [CRITICAL FIX] 취소된 작업 ID 블랙리스트 추가
+    static async saveQueue() {
+        await appDb.table("ts_queue").clear();
+        if (this.queue.length > 0) {
+            await appDb.table("ts_queue").bulkAdd(this.queue);
+        }
+    }
+    static async loadQueue() {
+        if (!sessionStorage.getItem("app_running_session")) {
+            sessionStorage.setItem("app_running_session", "true");
+            try {
+                const leftoverTasks = await appDb.table("ts_queue").toArray();
+                if (leftoverTasks && leftoverTasks.length > 0) {
+                    const errorItems = leftoverTasks.map((task: any) => {
+                        const now = Date.now();
+                        let taskRef = "Queued Task";
+                        if (task.payload) {
+                            taskRef = task.payload.query || task.payload.link || task.payload.image_path || "Queued Task";
+                        }
+                        
+                        const textMsg = `[Cancelled] ${taskRef} (App closed unexpectedly)`;
+
+                        return {
+                            id: task.taskId,
+                            type: "talk",
+                            role: "system_task",
+                            from: "system",
+                            to: "user",
+                            cc: task.payload?.cc || "",
+                            bcc: task.payload?.bcc || "",
+                            ref: task.payload?.refId || task.payload?.ref || "",
+                            status: 6, // 6: Error 상태 코드로 UI에 붉게 표기됨
+                            created_at: now,
+                            updated_at: now,
+                            data: {
+                                text: textMsg,
+                                link: "",
+                                origin: "https://commerce.logis.center"
+                            }
+                        };
+                    });
+                    await invoke("upsert_items", { items: errorItems });
+                    console.log(`[QUEUE] Recorded ${errorItems.length} leftover tasks as ERROR in LanceDB.`);
+                }
+            } catch (e) {
+                console.error("[QUEUE] Failed to log leftover tasks to LanceDB:", e);
+            }
+            try {
+                await appDb.table("ts_queue").clear();
+                console.log("[QUEUE] App restarted. Cleared persistent Dexie queue to mark as STOPPED.");
+            } catch (e) {
+                console.warn("[QUEUE] ts_queue clear failed (table may be missing):", e);
+            }
+            this.queue = [];
+            return;
+        }
+
+        try {
+            const q = await appDb.table("ts_queue").toArray();
+            if (q && q.length > 0) {
+                this.queue = q;
+                this.queue.forEach((task: any) => this.activeRefs.add(task.taskId));
+                console.log(`[QUEUE] Restored ${this.queue.length} pending tasks from Dexie.`);
+            } else {
+                this.queue = [];
+            }
+        } catch(e) {
+            console.error("[QUEUE] Failed to load queue from Dexie", e);
+            this.queue = [];
+        }
+    }
+
+    static async addToQueue(taskId: string, type: string, payload: any) {
+        if (this.activeRefs.has(taskId)) return;
+        this.queue.push({ taskId, type, payload });
+        this.activeRefs.add(taskId);
+        await this.saveQueue(); // 🌟 즉시 저장 (Dexie)
+        const startTime = parseInt(taskId.split('_')[1]) || Date.now();
+        if (payload.query) {
+            await renderMessage({
+                id: `${taskId}_query`,
+                role: "user",
+                text: payload.query,
+                status: 9,
+                created_at: startTime - 100,
+                updated_at: startTime - 100
+            });
+        }
+        await renderMessage({
+            id: taskId,
+            task_id: taskId,
+            role: "system_task",
+            text: payload.link || payload.image_path || "Waiting in queue...",
+            status: 10, // Pending
+            created_at: startTime,
+            updated_at: startTime
+        });
+
+        console.log(`[QUEUE] Task ${taskId} (${type}) added. Current queue length: ${this.queue.length}`);
+        await this.processNext();
+    }
+
+    // 다음 작업 실행 판단 로직
+    static async processNext() {
+        if (this.isBusy || this.queue.length === 0) return;
+
+        this.isBusy = true;
+        const task = this.queue.shift()!;
+        await this.saveQueue(); // 🌟 큐에서 항목이 나갔으므로 갱신 (Dexie)
+        
+        this.currentTaskId = task.taskId;
+        this.currentTaskPayload = task.payload; // 🌟 추가: 실행중인 페이로드 동시 기록
+        await kvSet("sys_lock", task.taskId);
+
+        console.log(`[QUEUE] Starting Task: ${task.taskId}`);
+        
+        // 🌟 [CRITICAL FIX] await로 인한 프론트엔드 프리징 및 큐 막힘 현상 원천 차단 (Fire-and-Forget)
+        if (task.type === "ai_search") {
+            invoke("ai_search_complex", task.payload).catch(async e => {
+                console.error(`[QUEUE] Task execution failed:`, e);
+                await this.release(task.taskId, task.taskId);
+            });
+        } else {
+            emit("new-task-from-browser", task.payload).catch(async e => {
+                console.error(`[QUEUE] Task execution failed:`, e);
+                await this.release(task.taskId, task.taskId);
+            });
+        }
+    }
+
+    static async release(taskId: string, refOrQuery: string) {
+        if (this.currentTaskId === taskId) {
+            this.isBusy = false;
+            this.currentTaskId = null;
+            this.currentTaskPayload = null; 
+        }
+        this.activeRefs.delete(taskId);
+        this.backendQueued = this.backendQueued.filter(p => p.id !== taskId && p.taskId !== taskId); // 🌟 종료된 작업은 가림막에서 제거
+        
+        if (await kvGet("sys_lock") === taskId) {
+            await kvRemove("sys_lock");
+        }
+        await this.saveQueue(); // 🌟 참조 목록(activeRefs)이 변했으므로 갱신 (Dexie)
+        await this.processNext();
+    }
+
+    static async forceReset() {
+        this.isBusy = false;
+        this.currentTaskId = null;
+        this.currentTaskPayload = null;
+        this.activeRefs.clear();
+        this.queue = [];
+        this.backendQueued = []; // 🌟 전체 초기화 반영
+        try {
+            await appDb.table("ts_queue").clear();
+            const PRESERVE_KEYS = new Set([
+                "chat_session",
+                "search_mode",
+                "hidden_pages",
+                "my_sync_seed",
+                "item_tombstones",
+                "schema_v4_notified",
+                "force_cpu_mode"
+            ]);
+            const allKeys = await appDb.table("kv_store").toCollection().primaryKeys();
+            for (const key of allKeys) {
+                if (typeof key === "string" && !PRESERVE_KEYS.has(key)) {
+                    await appDb.table("kv_store").delete(key);
+                }
+            }
+            console.log("[QUEUE] Dexie DB tables cleared (session keys preserved).");
+        } catch (e) {
+            console.error("[QUEUE] Dexie DB clear error:", e);
+        }
+        try {
+            await invoke("reset_lancedb");
+            console.log("[QUEUE] LanceDB fully reset.");
+        } catch (e) {
+            console.error("[QUEUE] LanceDB reset error:", e);
+        }
+    }
+}
+
+// [TAG SYSTEM] Hashtag-style search state
+interface SearchTag {
+    id: string;
+    label: string;
+    type: 'domain' | 'type' | 'mode' | 'path';
+    value: string;
+}
+let activeTags: SearchTag[] = [];
+
+// List State
+let cachedDocs: any[] = [];
+let currentPage = 0;
+const pageSize = 10;
+let isLoading = false;
+let hasMore = true;
+
+// Chat Pagination State
+let chatPage = 0;
+let chatHasMore = true;
+let isChatLoading = false;
+
+// [NEW] Track first-load status for UI loaders
+let isFirstNavRender = true;
+let isFirstChatLoad = true;
+
+// [NEW] Window Focus State (백그라운드 리소스 최적화용)
+let isFocus = true;
+
+// 🌟 [CRITICAL FIX] 새로고침 시 스텝 순서 꼬임 방지용 대기열
+let isFetchingLogs = false;
+let pendingLiveEvents: any[] = [];
+const livePayloads = new Map<string, any>(); // 🌟 [CRITICAL FIX] 퍼센트(%) 지연 노출을 막기 위한 프론트엔드 초고속 캐시 메모리
+
+// ==========================================
+// [PARITY] Cloud front.js Core Utilities
+// ==========================================
+function isDiff(obj1: any, obj2: any): boolean {
+    if (!obj1 && !obj2) return false;
+    if (!obj1 || !obj2) return true;
+    const keys1 = Object.keys(obj1);
+    const keys2 = Object.keys(obj2);
+    if (keys1.length !== keys2.length) return true;
+    
+    for (const key of keys1) {
+        if (typeof obj1[key] === 'object' && typeof obj2[key] === 'object') {
+            if (isDiff(obj1[key], obj2[key])) return true;
+        } else if (obj1[key] !== obj2[key]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function safeClone(obj: any) {
+    const seen = new WeakMap();
+    function clone(value: any) {
+        if (typeof value !== "object" || value === null) return value;
+        if (seen.has(value)) return null; 
+        const copy: any = Array.isArray(value) ? [] : {};
+        seen.set(value, copy);
+        for (const key in value) {
+            copy[key] = clone(value[key]);
+        }
+        return copy;
+    }
+    return clone(obj);
+}
+
+function mergeNode(obj1: any, obj2: any) {
+    const isEmpty = (value: any) => value === null || value === undefined || value === '' || value === 0;
+    const merged = { ...obj1 };
+    for (const key in obj2) {
+        if (obj2.hasOwnProperty(key)) {
+            const value2 = obj2[key];
+            if (!isEmpty(value2)) {
+                merged[key] = value2;
+            }
+        }
+    }
+    return merged;
+}
+
+const taskSteps = new Map<string, Map<string, number>>();
+const taskTotalSteps = new Map<string, number>(); // 🌟 [CRITICAL FIX] 작업별 총 스텝 수를 기억하는 장부 추가
+
+let selectedUuids = new Set<string>();
+let currentDetailUuid: string | null = null;
+let activeTaskId: string | null = null; 
+// [DEPRECATED] 흩어져 있던 개별 락 변수들은 GlobalTaskManager로 대체되었습니다.
+let spinnerInterval: number | null = null;
+let qrSpinnerIndex = 0; 
+let systemLogCount = 0;
+
+function stepQrSpinner() {
+    const el = document.getElementById("qr-auth-spinner");
+    if (el) {
+        qrSpinnerIndex = (qrSpinnerIndex + 1) % spinnerFrames.length;
+        el.innerText = spinnerFrames[qrSpinnerIndex];
+    }
+}
+// [NEW] Active navigation context for related logs/chat
+let activeContext = {
+    cc: "",
+    bcc: "",
+    ref: ""
+};
+
+// --- UI Elements ---
+const contentPanel = document.getElementById("content-panel") as HTMLElement;
+const searchInput = document.getElementById("global-search") as HTMLInputElement;
+const btnSubmit = document.getElementById("btn-submit") as HTMLButtonElement; 
+const btnExtract = document.getElementById("btn-extract") as HTMLButtonElement; 
+const btnAutoLaunch = document.getElementById("btn-auto-launch") as HTMLButtonElement;
+const settingsBtn = document.getElementById("btn-settings") as HTMLButtonElement;
+const tabContents = document.querySelectorAll<HTMLElement>(".tab-content");
+
+const navPreviewContainer = document.getElementById("nav-preview-container") as HTMLElement;
+const navImgThumbnail = document.getElementById("nav-img-thumbnail") as HTMLImageElement;
+const navImgClear = document.getElementById("nav-img-clear") as HTMLButtonElement;
+const navUploadBtn = document.getElementById("nav-upload-btn");
+
+const listView = document.getElementById("list-view") as HTMLElement;
+const detailView = document.getElementById("detail-view") as HTMLElement;
+const detailTitle = document.getElementById("detail-title") as HTMLElement;
+const detailContent = document.getElementById("detail-content") as HTMLElement;
+const btnDetailBack = document.getElementById("btn-detail-back") as HTMLButtonElement;
+const btnListBack = document.getElementById("btn-list-back") as HTMLButtonElement;
+const btnDetailDelete = document.getElementById("btn-detail-delete") as HTMLButtonElement;
+const btnStopTask = document.getElementById("btn-stop-task") as HTMLButtonElement; 
+
+// [CHANGED] Replaced table body with generic list container
+const docListContainer = document.getElementById("doc-list") as HTMLElement;
+
+const listRefreshBtn = document.getElementById("list-refresh-btn") as HTMLButtonElement;
+const btnDeleteSelected = document.getElementById("btn-delete-selected") as HTMLButtonElement;
+const btnSyncQr = document.getElementById("btn-sync-qr") as HTMLButtonElement;
+const listScrollContainer = document.getElementById("list-scroll-container") as HTMLElement;
+const headerLoading = document.getElementById("header-loading") as HTMLElement;
+const listTitle = document.querySelector("#list-view .header-row h2") as HTMLElement;
+
+const aiResultsArea = document.getElementById("ai-search-results") as HTMLElement;
+const aiResultsTitle = document.getElementById("ai-results-title") as HTMLElement;
+const aiResultsContent = document.getElementById("ai-results-content") as HTMLElement;
+
+const chatTalks = document.querySelector('.chat-talks') as HTMLElement;
+const chatForm = document.querySelector('form[name="chat-form"]') as HTMLFormElement;
+
+// 🌟 채팅폼(submit) 이벤트 (chrome.js 방식 적용)
+if (chatForm) {
+    chatForm.addEventListener("submit", async (e) => {
+        e.preventDefault(); // 폼 기본 동작인 새로고침 방지
+
+        const input = chatForm.querySelector('input[name="talk"]') as HTMLInputElement;
+        if (!input) return;
+
+        const query = input.value.trim();
+        if (!query) return;
+
+        input.value = ""; // 하단 채팅창 비우기
+
+        const now = Date.now();
+
+        let effectiveCc = activeContext.cc;
+        let effectiveBcc = activeContext.bcc;
+        let effectiveRef = activeContext.ref;
+
+        const isDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
+
+        if (!effectiveCc || (!isDefaultForced && activeTags.length === 0)) {
+            let targetUrlStr = currentDetectedUrl || "https://commerce.logis.center/tracking";
+            if (targetUrlStr.includes("localhost") || targetUrlStr.includes("127.0.0.1") || targetUrlStr === "about:blank") {
+                targetUrlStr = "https://commerce.logis.center/tracking";
+            }
+            try {
+                const urlObj = new URL(targetUrlStr.toLowerCase());
+                const rootDomain = getRootDomain(urlObj.hostname);
+                effectiveCc = await hashId(rootDomain);
+                const link = (urlObj.pathname + urlObj.search).toLowerCase();
+                effectiveRef = await hashId((currentSession.team || "") + effectiveCc + link);
+            } catch (err) {}
+        }
+
+        // 1. WebRTC (모바일 기기 등) P2P 연결이 되어있다면 상대방 기기로 전송
+        if (dataChannel && dataChannel.readyState === "open") {
+            dataChannel.send(JSON.stringify({ 
+                type: "chat_message", 
+                content: query 
+            }));
+            console.log("[CHAT] Message sent via WebRTC");
+        }
+        const localTalkId = `talk_${now}_${Math.random().toString(36).slice(2, 8)}`;
+        {
+            let localLink = "/tracking";
+            let localOrigin = "https://commerce.logis.center";
+            try {
+                let hrefForLink = currentDetectedUrl || "https://commerce.logis.center/tracking";
+                if (hrefForLink.includes("localhost") || hrefForLink.includes("127.0.0.1") || hrefForLink === "about:blank") {
+                    hrefForLink = "https://commerce.logis.center/tracking";
+                }
+                const u = new URL(hrefForLink.toLowerCase());
+                localLink = (u.pathname + u.search).toLowerCase();
+                localOrigin = u.origin;
+            } catch (e) {}
+
+            try {
+                await invoke("upsert_items", {
+                    items: [{
+                        id: localTalkId,
+                        table: "talks",
+                        type: "talk",
+                        from: currentSession.address || "",
+                        to: currentSession.team || "",
+                        cc: effectiveCc || "",
+                        bcc: effectiveBcc || "",
+                        ref: effectiveRef || "",
+                        status: 9,
+                        created_at: now,
+                        updated_at: now,
+                        data: {
+                            text: query,
+                            link: localLink,
+                            origin: localOrigin
+                        }
+                    }]
+                });
+                console.log(`[CHAT] Optimistically stored local talk '${localTalkId}' (ref: ${effectiveRef})`);
+            } catch (e) {
+                console.warn("[CHAT] Local optimistic write failed:", e);
+            }
+
+            // 로컬 저장 직후 즉시 말풍선 렌더링 (서버 왕복을 기다리지 않습니다)
+            await renderMessage({
+                id: localTalkId,
+                role: "user",
+                text: query,
+                status: 9,
+                created_at: now,
+                updated_at: now
+            });
+        }
+
+        // 2. 클라우드플레어 Workers (서버)로 PUT 요청 전송 및 정식 응답 처리 (chrome.js 방식)
+        try {
+            const origin = "https://commerce.logis.center";
+            const tzOffset = new Date().getTimezoneOffset() * 60 * 1000;
+            const createdAt = now - tzOffset;
+            
+            let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+            if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+                targetHref = "https://commerce.logis.center/tracking";
+            }
+            const talkSender = currentSession.email || currentSession.name || "";
+
+            const params = new URLSearchParams({
+                origin: origin,
+                created_at: createdAt.toString(),
+                hash: currentSession.hash,
+                token: currentSession.token || "",
+                href: targetHref,
+                type: "talk",
+                sender: talkSender,
+                from: currentSession.address || "",
+                to: currentSession.team || currentSession.address || "",
+                text: encodeURIComponent(query)
+            });
+            
+            const url = `${API_HOST}/?${params.toString()}`;
+            
+            const response = await invoke<any>("proxy_fetch", {
+                url: url,
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                session_params: { hash: currentSession.hash, token: currentSession.token }
+            });
+            if (response && response.results && response.results.length > 0) {
+                await invoke("upsert_items", { items: response.results });
+                for (const item of response.results) {
+                    if (item.table === "talks" || item.type === "talk") {
+                        await appDb.table("talks").put(item);
+                    }
+                }
+                console.log(`[CHAT] Server accepted talk. rows=${response.results.length}`);
+            } else {
+                console.warn(
+                    "[CHAT] ⚠️ Server returned no talk rows. " +
+                    "Check that `sender` reached the worker (cookies.sender gate) — " +
+                    `sent sender='${talkSender}', from='${currentSession.address}', to='${currentSession.team}'`
+                );
+            }
+
+            // 3. 서버 동기화 후 최신 메시지 렌더링
+            await fetchChatHistory(false, true);
+
+            console.log("[CHAT] Message sent to Cloudflare worker and synced");
+        } catch (err) {
+            console.error("[CHAT] Failed to send to Cloudflare worker:", err);
+        }
+
+        // 4. 스크롤을 맨 아래로 부드럽게 이동
+        setTimeout(() => {
+            const scrollEl = document.getElementById("chat-scroll");
+            const container = document.querySelector(".chat-container") as HTMLElement;
+            if (scrollEl && container) {
+                const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                currentY = maxScroll;
+                scrollEl.style.transition = "transform 0.3s ease-out";
+                updateTransform();
+                setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+            }
+        }, 100);
+    });
+}
+if (chatTalks) {
+    chatTalks.addEventListener("click", async (e) => {
+        const target = e.target as HTMLElement;
+        const btn = target.closest('.btn-delete-talk') as HTMLElement | null;
+        if (!btn) return;
+
+        // 🌟 태스크 말풍선의 handleTaskClick 이 함께 발화하지 않도록 반드시 차단합니다.
+        e.preventDefault();
+        e.stopPropagation();
+
+        const talkId = btn.dataset.talkId;
+        if (!talkId) return;
+
+        btn.style.pointerEvents = "none";
+        btn.style.opacity = "0.15";
+
+        const ok = await deleteChatMessage(talkId);
+
+        if (!ok) {
+            // 사용자가 취소했으면 버튼을 원상복구합니다.
+            btn.style.pointerEvents = "";
+            btn.style.opacity = "0.35";
+        }
+    });
+}
+
+// --- Settings Toggle Logic ---
+const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+const settingsPanel = document.getElementById("settings-panel") as HTMLElement;
+const docList = document.getElementById("doc-list") as HTMLElement;
+// 🌟 nav-section은 여러 개이므로 querySelectorAll로 잡습니다.
+const navSections = document.querySelectorAll(".nav-section"); 
+
+settingsToggle?.addEventListener("change", (e) => {
+    const isChecked = (e.target as HTMLInputElement).checked;
+    const label = document.querySelector('label[for="settings-toggle"]') as HTMLElement;
+    const listRefreshBtn = document.getElementById("list-refresh-btn"); // 🌟 버튼 참조 추가
+    
+    if (isChecked) {
+        if (settingsPanel) settingsPanel.style.display = "block";
+        if (docList) docList.style.display = "none";
+        if (listRefreshBtn) listRefreshBtn.style.display = "none"; // 🌟 새로고침 버튼 숨김
+        navSections.forEach(el => (el as HTMLElement).style.display = "none");
+        
+        if (label) {
+            label.classList.add("on")
+        }
+    } else {
+        if (settingsPanel) settingsPanel.style.display = "none";
+        if (docList) docList.style.display = ""; 
+        if (listRefreshBtn) listRefreshBtn.style.display = "flex"; // 🌟 새로고침 버튼 다시 표시
+        navSections.forEach(el => (el as HTMLElement).style.display = "");
+        
+        if (label) {
+            label.classList.remove("on");
+        }
+
+        applySearchModeUI(); 
+    }
+});
+
+// --- Spinner Logic ---
+const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function startSpinner() {
+    if (spinnerInterval) clearInterval(spinnerInterval);
+    
+    if (settingsBtn) {
+        settingsBtn.classList.add("active-spinner-mode");
+        if (isSearching && btnSubmit) btnSubmit.style.display = "none";
+    }
+    
+    let i = 0;
+    spinnerInterval = window.setInterval(() => {
+        const char = spinnerFrames[i % spinnerFrames.length];
+        if (settingsBtn) settingsBtn.innerText = char;
+        
+        document.querySelectorAll('.spinner, .active-spinner').forEach(el => {
+            (el as HTMLElement).innerText = char;
+        });
+        i++;
+    }, 80);
+}
+
+function stopSpinner() {
+    if (isExtracting || isSearching) return;
+
+    if (spinnerInterval) {
+        clearInterval(spinnerInterval);
+        spinnerInterval = null;
+    }
+    
+    if (settingsBtn) {
+        settingsBtn.classList.remove("active-spinner-mode");
+        settingsBtn.innerText = settingsBtn.classList.contains('active') ? "💬" : "🗨️";
+    }
+    
+    document.querySelectorAll('.spinner, .active-spinner').forEach(el => {
+        if (!el.closest('#extraction-log')) {
+            el.classList.remove('active-spinner');
+            (el as HTMLElement).innerText = "";
+        }
+    });
+    restoreSubmitButton();
+    updateExtractButtonVisibility();
+}
+function restoreSubmitButton() {
+    if (!btnSubmit) return;
+    const currentVal = searchInput?.value.trim() || "";
+    if (currentVal !== "" && !isQueryActive(currentVal)) {
+        btnSubmit.style.display = "flex";
+    } else {
+        btnSubmit.style.display = "none";
+    }
+}
+
+// --- Layout & Window Logic ---
+async function setWindowSize(expanded: boolean) {
+    const height = expanded ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT;
+    await invoke("resize_window", { width: WIDGET_WIDTH, height: height });
+}
+
+function switchTab(tabName: string) {
+    tabContents.forEach(c => {
+        if (c.id === `tab-${tabName}`) c.classList.add("active");
+        else c.classList.remove("active");
+    });
+    currentTab = tabName;
+    
+    if (tabName === "settings") {
+        settingsBtn?.classList.add("active-emoji", "active");
+        if (!currentSession.email) {
+            checkAuthStatus();
+        }
+        if (!isSearching && !isExtracting) {
+            fetchChatHistory();
+        } else {
+            if (chatTalks && chatTalks.children.length < 10 && chatHasMore) {
+                loadMoreChat(true, true);
+            } else {
+                loadMoreChat(false, true);
+            }
+        }
+        startPolling();
+    } else {
+        settingsBtn?.classList.remove("active-emoji", "active");
+    }
+    if (tabName === "list") {
+        const resultH3 = document.querySelector('.nav-section.search h3');
+        const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
+        if (isShowingSearchResult && !isSearching) {
+            if (searchInput) searchInput.value = "";
+            if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
+            refreshList(); 
+        }
+    }
+    if (tabName === "automation") initBrowserDropdown();
+}
+
+function openWidget(tabName: string = "list") {
+    if (!isExpanded) {
+        isExpanded = true;
+        contentPanel.classList.add("open");
+        settingsBtn.innerText = "💬";
+        setWindowSize(true);
+    }
+    switchTab(tabName);
+}
+
+function collapseWidget() {
+    isExpanded = false;
+    contentPanel.classList.remove("open");
+    setWindowSize(false);
+    settingsBtn?.classList.remove("active-emoji", "active");
+    settingsBtn.innerText = "🗨️";
+}
+
+// --- Mouse Passthrough Logic ---
+const interactiveElements = ['.pill-nav', '#content-panel'];
+
+function setupMousePassthrough() {
+    invoke('set_ignore_cursor_events', { ignore: false }).catch(console.error);
+
+    interactiveElements.forEach(selector => {
+        const el = document.querySelector(selector);
+        if (el) {
+            el.addEventListener('mouseenter', () => {
+                invoke('set_ignore_cursor_events', { ignore: false }).catch(console.error);
+            });
+        }
+    });
+}
+
+// Drag Logic
+const pillNav = document.querySelector('.pill-nav') as HTMLElement;
+if (pillNav) {
+    setupMousePassthrough(); // Initialize passthrough with the nav
+    let isMouseDown = false;
+    let startX = 0, startY = 0;
+    const DRAG_THRESHOLD = 5;
+
+    pillNav.addEventListener('mousedown', (e) => {
+        const target = e.target as HTMLElement;
+        if (!target.closest('button, input') && e.button === 0) {
+             isMouseDown = true; startX = e.clientX; startY = e.clientY;
+        }
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        if (!isMouseDown) return;
+        if (Math.abs(e.clientX - startX) > DRAG_THRESHOLD || Math.abs(e.clientY - startY) > DRAG_THRESHOLD) {
+            isMouseDown = false; invoke('start_drag').catch(console.error);
+        }
+    });
+    window.addEventListener('mouseup', () => isMouseDown = false);
+    pillNav.addEventListener('dblclick', (e) => {
+        const target = e.target as HTMLElement;
+        if (!target.closest('button, input')) invoke("move_to_top_center").catch(console.error);
+    });
+}
+
+let extractClickLock = false; 
+
+async function updateExtractButtonVisibility() {
+    if (!btnExtract || !btnAutoLaunch) return;
+    if (!isBrowserRunning && !isAutoLaunchLocked && !currentImage) {
+        btnAutoLaunch.style.display = "flex";
+        btnAutoLaunch.classList.remove("hidden");
+        btnExtract.style.display = "none";
+        return;
+    }
+
+    btnAutoLaunch.style.display = "none";
+    btnAutoLaunch.classList.add("hidden");
+
+    // 2. URL 유효성 및 이미지 업로드 즉시 검사
+    const isInvalidUrl = !currentDetectedUrl || 
+                         currentDetectedUrl === "" || 
+                         currentDetectedUrl === "about:blank" || 
+                         currentDetectedUrl.startsWith("chrome://") || 
+                         currentDetectedUrl.startsWith("edge://");
+
+    if (!currentImage && isInvalidUrl) {
+        btnExtract.style.display = "none";
+        btnExtract.classList.add("hidden");
+        return;
+    }
+
+    // 3. 도메인 허용 여부 판별 (DB 조회 없이 DOM 캐시 활용)
+    let isAllowedDomain = isCurrentShop;
+
+    if (!isAllowedDomain && currentDetectedUrl) {
+        try {
+            const currentHostname = new URL(currentDetectedUrl.toLowerCase()).hostname;
+            const pageList = document.getElementById("nav-list-pages");
+            if (pageList) {
+                const labels = Array.from(pageList.querySelectorAll(".logis-label")) as HTMLElement[];
+                isAllowedDomain = labels.some(label => {
+                    const domain = label.dataset.domain;
+                    return domain && (currentHostname === domain || currentHostname.endsWith("." + domain));
+                });
+            }
+        } catch (e) { isAllowedDomain = false; }
+    }
+
+    // 4. 도메인 및 이미지 업로드 여부로 1차 필터링
+    if (!isAllowedDomain && !currentImage) {
+        btnExtract.style.display = "none";
+        btnExtract.classList.add("hidden");
+        return; 
+    }
+
+    if (extractClickLock) {
+        btnExtract.style.display = "none";
+        return;
+    }
+
+    // 고아 락 해제용 로직 (버튼 가시성에는 영향 주지 않음)
+    const currentLock = await kvGet("sys_lock");
+    if (currentLock) {
+        const lockEl = document.getElementById(currentLock);
+        if (!lockEl) {
+            const isFrontendActive = GlobalTaskManager.currentTaskId === currentLock || GlobalTaskManager.queue.some(q => q.taskId === currentLock);
+            const isBackendActive = GlobalTaskManager.backendQueued.some(p => p.id === currentLock || p.taskId === currentLock);
+            
+            if (!isFrontendActive && !isBackendActive) {
+                console.log(`[LOCK] Zombie lock detected without active queue: ${currentLock}. Releasing immediately.`);
+                await kvRemove("sys_lock");
+            }
+        }
+    }
+
+    let shouldHide = false;
+    try {
+        if (currentImage) {
+            const imageRefHash = await hashId(currentImage); 
+            const isActive = await invoke<boolean>("check_active_task", { payload: { cc: activeContext.cc || "", ref: imageRefHash } });
+            // 🌟 프론트엔드 대기 큐 및 백엔드 대기 큐(backendQueued) 동시 확인
+            const isQueued = GlobalTaskManager.queue.some(q => q.payload && q.payload.ref === imageRefHash) ||
+                             GlobalTaskManager.backendQueued.some(p => p.ref === imageRefHash);
+            
+            const isCurrentExecuting = GlobalTaskManager.currentTaskId && GlobalTaskManager.currentTaskPayload && 
+                GlobalTaskManager.currentTaskPayload.ref === imageRefHash;
+
+            if (isActive || isQueued || isCurrentExecuting) shouldHide = true;
+        } else if (currentDetectedUrl) {
+            const urlObj = new URL(currentDetectedUrl.toLowerCase());
+            const link = (urlObj.pathname + urlObj.search).toLowerCase();
+            const rootDomain = getRootDomain(urlObj.hostname);
+            const ccHash = await hashId(rootDomain);
+            const hashedRefId = await hashId((currentSession.team || "") + ccHash + link);
+            const currentRefToCheck = hashedRefId;
+            let isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: currentRefToCheck } });
+            if (!isActive && activeContext.ref && activeContext.ref !== currentRefToCheck) {
+                isActive = await invoke<boolean>("check_active_task", { payload: { cc: ccHash, ref: activeContext.ref } });
+            }
+            if (!isActive && !activeContext.ref) {
+                try {
+                    const activeCtx = await invoke<any>("get_active_task_context");
+                    if (activeCtx && activeCtx.id && (activeCtx.status === 1 || activeCtx.status === 10)) {
+                        const activeLink = (activeCtx.link || "").toLowerCase();
+                        if (activeLink && activeLink === link) {
+                            isActive = true;
+                        }
+                    }
+                } catch (_e2) { /* 무시 */ }
+            }
+            const isQueued = GlobalTaskManager.queue.some(q => q.payload && (q.payload.ref === currentRefToCheck || q.payload.link === link)) ||
+                GlobalTaskManager.backendQueued.some(p => p.ref === currentRefToCheck || p.link === link);
+            const isCurrentExecuting = GlobalTaskManager.currentTaskId && GlobalTaskManager.currentTaskPayload &&
+                (GlobalTaskManager.currentTaskPayload.ref === currentRefToCheck || GlobalTaskManager.currentTaskPayload.link === link);
+            if (isActive || isQueued || isCurrentExecuting) shouldHide = true;
+        }
+    } catch (e) {
+        // 통신 에러 발생 시 노출 유지
+    }
+
+    if (shouldHide) {
+        btnExtract.style.display = "none";
+        btnExtract.classList.add("hidden");
+    } else {
+        btnExtract.style.display = "flex";
+        btnExtract.innerHTML = "⚡";
+        btnExtract.classList.remove("hidden");
+    }
+}
+
+listen("browser-match-found", async (event: any) => {
+    const payload = event.payload;
+    if (payload.status === "running" || (payload.url && payload.url !== "")) {
+        isBrowserRunning = true;
+    } else if (payload.status === "stopped") {
+        isBrowserRunning = false;
+        isAutoLaunchLocked = false;
+    }
+    currentDetectedUrl = payload.url || "";
+    isCurrentShop = payload.is_client || payload.is_admin || false;
+    activeContext.ref = "";
+    await renderNavigation();
+    await updateExtractButtonVisibility();
+});
+
+listen("browser-status", async (event: any) => {
+    const payload = event.payload; 
+    const statusStr = typeof payload === "object" ? payload.status : payload;
+    
+    if (typeof payload === "object" && payload.url !== undefined) {
+        const prevUrl = currentDetectedUrl;
+        currentDetectedUrl = payload.url || "";
+        isCurrentShop = payload.is_client || payload.is_admin || false;
+        if (prevUrl !== currentDetectedUrl) {
+            await updateExtractButtonVisibility();
+        }
+    }
+
+    if (statusStr === "running") {
+        isBrowserRunning = true;
+        isAutoLaunchLocked = true; // 실행 중엔 런처 버튼 잠금
+    } else if (statusStr === "stopped") {
+        isBrowserRunning = false;
+        isAutoLaunchLocked = false;
+        currentDetectedUrl = "";
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "flex";
+            btnAutoLaunch.classList.remove("hidden");
+        }
+        if (btnExtract) {
+            btnExtract.style.display = "none";
+            btnExtract.classList.add("hidden");
+        }
+        await updateExtractButtonVisibility();
+    }
+});
+
+const handleSearchInteraction = () => {
+    const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+    if (settingsToggle && settingsToggle.checked) {
+        settingsToggle.checked = false;
+        settingsToggle.dispatchEvent(new Event("change")); // UI 원상복구 이벤트 트리거
+    }
+
+    const resultH3 = document.querySelector('.nav-section.search h3');
+    const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
+    if (isExpanded && currentTab === "list") {
+        if (isShowingSearchResult && !isSearching) {
+            if (searchInput) searchInput.value = "";
+            if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
+            refreshList();
+        }
+        return;
+    }
+
+    openWidget("list");
+    const navOverlay = document.getElementById("nav-categories");
+    if (navOverlay) {
+        navOverlay.classList.remove("hidden");
+        navOverlay.classList.add("visible");
+        renderNavigation();
+        if (listScrollContainer) listScrollContainer.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+    if (!isSearching && (!searchInput.value || isShowingSearchResult)) {
+        if (searchInput) searchInput.value = "";
+        if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
+        if (docListContainer) docListContainer.innerHTML = "";
+        cachedDocs = [];
+        currentPage = 0;
+        hasMore = true;
+        loadMoreDocs(true);
+    }
+};
+
+searchInput?.addEventListener("focus", handleSearchInteraction);
+searchInput?.addEventListener("click", handleSearchInteraction);
+
+function hideNavigation() {
+    const navOverlay = document.getElementById("nav-categories");
+    if (navOverlay) {
+        navOverlay.classList.add("hidden");
+        navOverlay.classList.remove("visible");
+    }
+}
+
+function addSearchTag(label: string, type: 'domain' | 'type' | 'mode' | 'path', value: string) {
+    const id = `${type}:${value}`;
+    if (activeTags.find(t => t.id === id)) return;
+    activeTags.push({ id, label, type, value });
+    updateTagsUI();
+    if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = window.setTimeout(() => loadMoreDocs(true), 300);
+}
+
+function removeSearchTag(id: string) {
+    const tagToRemove = activeTags.find(t => t.id === id);
+    if (tagToRemove) {
+        if (tagToRemove.type === 'domain') activeContext.cc = "";
+        if (tagToRemove.type === 'type') activeContext.ref = "";
+        if (tagToRemove.type === 'path') activeContext.ref = "";
+    }
+    activeTags = activeTags.filter(t => t.id !== id);
+    if (activeTags.length === 0) {
+        activeContext = { cc: "", bcc: "", ref: "" };
+    }
+    updateTagsUI();
+    loadMoreDocs(true);
+    fetchChatHistory(true);
+}
+
+function updateTagsUI() {
+    const container = document.getElementById("search-tags-container");
+    if (!container) return;
+    container.innerHTML = "";
+    activeTags.forEach(tag => {
+        const chip = document.createElement("div");
+        chip.className = `search-chip ${tag.type}`;
+        chip.innerHTML = `<span>${tag.label}</span><span class="remove-btn" onclick="document.dispatchEvent(new CustomEvent('remove-tag', {detail: '${tag.id}'}))">✕</span>`;
+        container.appendChild(chip);
+    });
+}
+document.addEventListener('remove-tag', (e: any) => removeSearchTag(e.detail));
+let navTmp: Record<string, boolean> = {};
+
+async function renderAccordion(nodes: any[], level = 1): Promise<string> {
+    let html = `<ul class="logis-branch">`;
+
+    for (var n = 0; n < nodes.length; n++) {
+        var node = nodes[n];
+        var nodeId = node.id || node.uuid || `node-${level}-${n}`;
+        var active = '';
+        var host = '';
+        var type = 'page';
+        var content = '';
+        var name = '';
+        var desc: string[] = [];
+        var _url: URL | null = null;
+        if (!navTmp[nodeId]) {
+            navTmp[nodeId] = true;
+
+            if (node.name) {
+                type = node.type || "team";
+                name = node.name;
+                if (node.type === "team") {
+                    var teamName = node.name;
+                    if (node.from === currentSession.address && nodeId === node.to) {
+                        teamName = "Members";
+                    }
+                    host = `<strong>${teamName}</strong>`;
+                } else {
+                    let cancelBtn = "";
+                    if (node.id === currentSession.address) {
+                        desc.push("(owner)");
+                    } else {
+                        desc.push("(member)");
+                        cancelBtn = `<button class="btn-cancel-member" data-id="${nodeId}" data-name="${name}" style="background:none; border:none; color:#ef4444; font-size:0.85rem; cursor:pointer; padding:0 5px; margin-left:auto; display:flex; align-items:center; justify-content:center;" title="Remove / Cancel Invite">✕</button>`;
+                    }
+                    content = `<div style="display:flex; align-items:center; width:100%; gap:8px;">
+                        <span>${name}${desc.length ? `<i>${desc.toString()}</i>` : ''}</span>
+                        ${cancelBtn}
+                    </div>`;
+                }
+                if (nodeId === activeContext.ref) active = "active";
+            } else if (node.data || node.type) {
+                type = 'page';
+                const data = node.data || {};
+                const nodeType = data.type || node.type || 'unknown';
+                console.log("[DEBUG] renderAccordion Page Node:", { id: nodeId, type: nodeType, domain: node.domain, origin: data.origin, link: data.link });
+
+                if (data.origin) {
+                    _url = new URL(data.origin);
+                    const domain = node.domain || _url.hostname;
+                    if (!navTmp[domain] && data.item) {
+                        host = `<strong>${domain}</strong>`;
+                        if (API_HOST.includes(domain)) {
+                            host += `<label for="membership">Edit</label>`;
+                        }
+                        navTmp[domain] = true;
+                    }
+                    let isActive = nodeId === activeContext.ref;
+
+                    if (!isActive && currentDetectedUrl && data.link) {
+                        try {
+                            const currentUrl = new URL(currentDetectedUrl.toLowerCase());
+                            const targetUrl = new URL((data.origin + data.link).toLowerCase());
+
+                            if (currentUrl.pathname === targetUrl.pathname) {
+                                const currentParams = Object.fromEntries(currentUrl.searchParams.entries());
+                                const targetParams = Object.fromEntries(targetUrl.searchParams.entries());
+                                const currentKeys = Object.keys(currentParams);
+                                const targetKeys = Object.keys(targetParams);
+
+                                const isDetailMode = Object.values(currentParams).some(val => 
+                                    val === "form" || val === "view" || val === "detail" || val === "update" || val === "edit" || val === "read"
+                                ) || (currentKeys.length > targetKeys.length);
+
+                                if (data.detail) {
+                                    if (isDetailMode) isActive = true;
+                                } else {
+                                    if (!isDetailMode) {
+                                        let isExactMatch = true;
+                                        for (const key of targetKeys) {
+                                            if (currentParams[key] !== targetParams[key]) {
+                                                isExactMatch = false; break;
+                                            }
+                                        }
+                                        if (isExactMatch) isActive = true;
+                                    }
+                                }
+                            }
+                        } catch(e) {}
+                    }
+
+                    if (isActive) {
+                        active = "active";
+                    }
+                }
+                var total = { draft: 0, count: 0 };
+                const cc = node.cc || data.cc;
+                if (
+                    nodeType !== 'team' &&
+                    nodeType !== 'user' &&
+                    nodeType !== 'member' &&
+                    nodeType !== 'pages' &&
+                    nodeType !== 'page' &&
+                    cc &&
+                    appDb
+                ) {
+                    try {
+                        const rows = await appDb.table('items')
+                            .where('[cc+type]')
+                            .equals([cc, nodeType])
+                            .toArray();
+                        for (const r of rows) {
+                            const rootUp = Number(r.updated_at ?? 0);
+                            const dataUp = Number(r.data?.updated_at ?? rootUp);
+                            const up = dataUp;
+
+                            if (up > 0) total.count++;
+                            else total.draft++;
+                        }
+
+                        console.log(`[NAV-COUNT] cc=${cc} type=${nodeType} | 총 ${rows.length}건 → draft ${total.draft} / count ${total.count}`);
+
+                        if (rows.length > 0 && total.draft === 0 && total.count === rows.length) {
+                            console.warn(`[NAV-COUNT] ⚠️ 전 건이 count 로 분류되었습니다. store.rs 의 updated_at=0 보존 수정이 반영되었는지 확인하세요.`);
+                        }
+                    } catch (e) {
+                        console.warn(`[NAV-COUNT] Dexie count failed for ${nodeType}:`, e);
+                    }
+                }
+
+                var recent = '';
+                try {
+                    const bcc = node.bcc || data.bcc;
+                    if (bcc) {
+                        const _items = await invoke<any[]>("get_all_documents", { limit: 1, offset: 0, filter: `bcc = '${bcc}'` });
+                        if (_items.length && _items[0].created_at) {
+                            const timeStr = time2text(Number(_items[0].created_at));
+                            const author = _items[0].from ? _items[0].from.substring(0,6) : "system";
+                            recent = `<strong>${timeStr} - ${author}</strong>`;
+                        }
+                    }
+                } catch (err) {}
+                name = `<span>${nodeType}</span>`;
+                
+                var count = '';
+                if (data.item) {
+                    count = `<span style="font-size: 0.9em; margin-left: 4px;"> Draft <u>(${total.draft || 0})</u></span>`;
+                } else {
+                    count = `<u>(${total.count || 0})</u>`;
+                }
+                const isHidden = hiddenPages.includes(nodeId);
+                const visibilityIcon = isHidden ? "show" : "hide";
+                const visibilityBtn = `<button class="btn-toggle-visibility" data-id="${nodeId}" style="position: absolute; right: 10px; top: 1px; background: none; border: none; cursor: pointer; font-size: 10px; text-decoration: underline; color: #888; z-index: 10;">${visibilityIcon}</button>`;
+                const opacityStyle = isHidden ? 'opacity: 0.3;' : 'opacity: 1;';
+                content = `<span style="${opacityStyle}">${name}\n${count}\n</span>\n${recent}\n${visibilityBtn}`;
+            }
+
+            var hasChildren = node.children && node.children.length > 0;
+            const inputId = `${type}-${nodeId}`;
+
+            html += `
+                <input type="checkbox" name="${type}" id="${inputId}" ${hasChildren ? 'checked' : ''} style="display:none;" />
+                <li class="logis-parent ${hasChildren ? 'has-children' : ''}" ${type}-id="${nodeId}">
+                    ${host}
+                    <label for="${inputId}" class="logis-label ${inputId} ${active}" 
+                           data-id="${nodeId}" 
+                           data-cc="${node.cc || (node.data && node.data.cc) || ''}" 
+                           data-bcc="${node.bcc || (node.data && node.data.bcc) || ''}" 
+                           data-ref="${node.ref || node.ref_val || (node.data && node.data.ref) || ''}"
+                           data-domain="${node.domain || (_url ? _url.hostname : '')}" 
+                           data-type="${node.type || (node.data && node.data.type) || ''}">${content}</label>
+            `;
+
+            if (hasChildren) {
+                html += `<div class="logis-child ${inputId}">`;
+                html += await renderAccordion(node.children, level + 1);
+                html += `</div>`;
+            }
+
+            html += `</li>`;
+        }
+    }
+
+    html += `</ul>`;
+    return html;
+}
+
+async function renderNavigation() {
+    const pageList = document.getElementById("nav-list-pages");
+    const userList = document.getElementById("nav-list-users");
+    const profileName = document.getElementById("nav-profile-name");
+    const profileFavicon = document.getElementById("nav-profile-favicon");
+    const btnSignin = document.getElementById("nav-signin");
+    const btnSignout = document.getElementById("nav-signout");
+
+    if (!pageList || !userList) return;
+    if (isFirstNavRender) {
+        startSpinner();
+    }
+
+    // Profile UI
+    if (currentSession.email) {
+        if (profileName) profileName.innerText = currentSession.email.split('@')[0];
+        if (btnSignin) btnSignin.classList.add("hidden");
+        if (btnSignout) btnSignout.classList.remove("hidden");
+        if (profileFavicon && blockies) {
+            const icon = blockies.create({ seed: currentSession.email, size: 8, scale: 4 });
+            profileFavicon.innerHTML = ""; profileFavicon.appendChild(icon);
+        }
+    }
+
+    try {
+        navTmp = {}; // Reset for fresh render
+        let _pagesRaw = await Select["pages"]({});
+        let _pages = _pagesRaw.map(p => {
+            if (!p.data && p.json_data && typeof p.json_data === "string") {
+                try { p.data = JSON.parse(p.json_data); } catch(e) {}
+            }
+            return p;
+        });
+        let currentDomain = "";
+        console.log(`[DEBUG-NAV] 브라우저 현재 감지된 URL(currentDetectedUrl):`, currentDetectedUrl);
+        
+        if (currentDetectedUrl) {
+            try {
+                const footprint = new URL(currentDetectedUrl.toLowerCase());
+                currentDomain = footprint.hostname;
+                console.log(`[DEBUG-NAV] 파싱된 현재 도메인(currentDomain):`, currentDomain);
+                if (!activeContext.ref) {
+                    console.log(`[DEBUG-NAV] 활성 컨텍스트(activeContext.ref)가 비어있어 URL 기반 자동 복구를 시도합니다.`);
+                    const currentParams = Object.fromEntries(footprint.searchParams.entries());
+                    const isDetailMode = Object.values(currentParams).some(val => 
+                        val === "form" || val === "view" || val === "detail" || val === "update" || val === "edit" || val === "read"
+                    );
+
+                    let matchedPage = null;
+                    
+                    const localPages = await Select["pages"]({});
+                    for (const p of localPages) {
+                        const d = p.data || p;
+                        if (d.origin && d.link) {
+                            try {
+                                const targetUrl = new URL((d.origin + d.link).toLowerCase());
+                                if (currentDomain === targetUrl.hostname && footprint.pathname === targetUrl.pathname) {
+                                    if (isDetailMode && d.detail) {
+                                        matchedPage = p;
+                                        break;
+                                    } else if (!isDetailMode && !d.detail) {
+                                        const targetParams = Object.fromEntries(targetUrl.searchParams.entries());
+                                        let isExactMatch = true;
+                                        for (const key of Object.keys(targetParams)) {
+                                            if (currentParams[key] !== targetParams[key]) {
+                                                isExactMatch = false;
+                                                break;
+                                            }
+                                        }
+                                        if (isExactMatch) {
+                                            matchedPage = p;
+                                        }
+                                    }
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                    
+                    if (matchedPage) {
+                        activeContext.cc = matchedPage.cc || "";
+                        activeContext.bcc = matchedPage.bcc || "";
+                        activeContext.ref = matchedPage.id || "";
+                        console.log("[NAV] Restored activeContext from exact URL match:", activeContext);
+                    }
+                }
+            } catch(e) {}
+        }
+
+        if (currentDomain) {
+            _pages = _pages.filter(p => {
+                const data = p.data || p;
+                return data.origin && data.origin.toLowerCase().includes(currentDomain);
+            });
+        }
+        
+        const navSection = pageList.closest('.nav-section') as HTMLElement;
+        const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
+
+        if (_pages.length === 0) {
+            pageList.innerHTML = `<div class="empty">No shared pages found for this domain.</div>`;
+            if (navSection) navSection.style.display = (isSettingsOpen || currentSearchMode === "shipping") ? "none" : "block";
+        } else {
+            if (navSection) navSection.style.display = (isSettingsOpen || currentSearchMode === "shipping") ? "none" : "block";
+            const branchs: Record<string, any> = {};
+            for (let p = 0; p < _pages.length; p++) {
+                let _page = _pages[p];
+                const data = _page.data || _page;
+                if (!data.origin) continue;
+
+                const domain = new URL(data.origin).hostname;
+                _page.domain = domain;
+                _page.id = _page.id || _page.uuid;
+
+                if (data.item) {
+                    branchs[`${data.origin}#${_page.type}`] = { ..._page, children: [] };
+                }
+                branchs[_page.id] = { ..._page, children: [] };
+            }
+
+            const temp: Record<string, any> = {};
+            for (let key in branchs) {
+                if (branchs.hasOwnProperty(key)) {
+                    let _page = safeClone(branchs[key]);
+                    const data = _page.data || _page;
+
+                    if (!temp[_page.id]) {
+                        temp[_page.id] = true;
+                        let parent = branchs[`${data.origin}#${_page.type}`];
+                        if (parent) {
+                            if (data.item) {
+                                let children = safeClone(parent.children);
+                                branchs[`${data.origin}#${_page.type}`] = {
+                                    ..._page,
+                                    children: children
+                                };
+                            } else {
+                                branchs[`${data.origin}#${_page.type}`].children.push(_page);
+                            }
+                        } else {
+                            if (data.item) {
+                                if (!branchs[`${data.origin}#${_page.type}`]) {
+                                    branchs[`${data.origin}#${_page.type}`] = {
+                                        ..._page,
+                                        children: []
+                                    };
+                                }
+                            } else {
+                                if (!branchs[`${data.origin}#${_page.type}`]) {
+                                    branchs[`${data.origin}#${_page.type}`] = { children: [] };
+                                }
+                                branchs[`${data.origin}#${_page.type}`].children.push(_page);
+                            }
+                        }
+                    }
+                }
+            }
+
+            const tree: any[] = [];
+            for (let key in branchs) {
+                if (branchs.hasOwnProperty(key)) {
+                    if (key.includes('#')) {
+                        tree.push(branchs[key]);
+                    }
+                }
+            }
+            try {
+                const _usersForStats = await Select["users"]({});
+                const teamDoc = _usersForStats.find(u => u.type === "team" || (u.data && u.data.type === "team"));
+                if (teamDoc) {
+                    let teamData: any = teamDoc;
+                    while (teamData && teamData.json_data && typeof teamData.json_data === "string") {
+                        try {
+                            const parsed = JSON.parse(teamData.json_data);
+                            if (parsed && typeof parsed === "object") {
+                                teamData = parsed;
+                            } else {
+                                break;
+                            }
+                        } catch(e) {
+                            break;
+                        }
+                    }
+                    
+                    if (teamData && !teamData.base && teamData.data) {
+                        teamData = typeof teamData.data === "string" ? JSON.parse(teamData.data) : teamData.data;
+                    }
+                    teamData = teamData || teamDoc;
+                    console.log("\n=====================================");
+                    console.log("[DEBUG-UI] Dexie에서 로드된 Team 데이터:", teamDoc);
+                    console.log("[DEBUG-UI] 화면에 렌더링될 Base 통계:", JSON.stringify(teamData.base, null, 2));
+                    console.log("=====================================\n");
+
+                    if (teamData.base && teamData.base.pages) {
+                        (currentSession as any).pages = teamData.base.pages;
+                    }
+                }
+            } catch(e) { 
+                console.warn("[Navigation] Failed to load local stats:", e); 
+            }
+
+            // 3. Render
+            pageList.innerHTML = await renderAccordion(tree);
+            pageList.querySelectorAll(".btn-toggle-visibility").forEach((btn: any) => {
+                btn.onclick = async (e: Event) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const targetId = btn.dataset.id;
+                    if (!targetId) return;
+
+                    if (hiddenPages.includes(targetId)) {
+                        hiddenPages = hiddenPages.filter(id => id !== targetId);
+                    } else {
+                        hiddenPages.push(targetId);
+                    }
+                    await kvSet("hidden_pages", JSON.stringify(hiddenPages));
+                    await renderNavigation(); // UI 즉시 갱신
+                };
+            });
+
+            pageList.querySelectorAll(".logis-label").forEach((label: any) => {
+                const id = label.dataset.id;
+                const domain = label.dataset.domain;
+                if (hiddenPages.includes(id)) {
+                    const hostShowBtn = pageList.querySelector(`.btn-show-domain-hidden[data-domain="${domain}"]`) as HTMLElement;
+                    if (hostShowBtn) hostShowBtn.style.display = "inline";
+                }
+            });
+
+            pageList.querySelectorAll(".btn-show-domain-hidden").forEach((btn: any) => {
+                btn.onclick = async (e: Event) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    const domain = btn.dataset.domain;
+                    pageList.querySelectorAll(`.logis-label[data-domain="${domain}"]`).forEach((label: any) => {
+                        const id = label.dataset.id;
+                        if (hiddenPages.includes(id)) {
+                            hiddenPages = hiddenPages.filter(hId => hId !== id);
+                        }
+                    });
+                    
+                    await kvSet("hidden_pages", JSON.stringify(hiddenPages));
+                    await renderNavigation(); // UI 즉시 갱신하여 숨겨졌던 모든 항목을 표시
+                };
+            });
+
+            // 4. Bind Clicks manually to labels
+            pageList.querySelectorAll(".logis-label").forEach((label: any) => {
+                label.onclick = async (e: Event) => {
+                    const ds = label.dataset;
+                    if (!ds.id) return;
+                    const inviteContainer = document.getElementById("nav-cloud-invite-container");
+                    const isInviteMode = inviteContainer && !inviteContainer.classList.contains("hidden");
+
+                    if (isInviteMode) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        label.classList.toggle("selected");
+                        console.log(`[INVITE-MODE] Page ${ds.id} selection toggled:`, label.classList.contains("selected"));
+                        return; // 필터링 로직 실행 방지
+                    }
+                    activeContext.cc = ds.cc || "";
+                    activeContext.bcc = ds.bcc || "";
+                    activeContext.ref = ds.ref || "";
+                    
+                    activeTags = activeTags.filter(t => t.type !== 'type' && t.type !== 'domain' && t.type !== 'path');
+                    
+                    // 2. 검색 태그 추가
+                    addSearchTag(`@${ds.domain}`, 'domain', ds.domain);
+                    addSearchTag(`#${ds.type}`, 'type', ds.type);
+                    updateTagsUI();
+                    
+                    // 3. 버튼(#btn-extract) 강제 업데이트 호출
+                    await updateExtractButtonVisibility();
+
+                    // 4. UI 갱신 및 닫기
+                    fetchChatHistory(true);
+                    hideNavigation();
+                };
+            });
+        }
+        const localUserList = document.getElementById("nav-list-local-users");
+        const usersRaw = await Select["users"]({});
+        const users = usersRaw.map(u => {
+            if (!u.data && u.json_data && typeof u.json_data === "string") {
+                try { u.data = JSON.parse(u.json_data); } catch(e) {}
+            }
+            return u;
+        });
+        
+        if (userList) userList.innerHTML = "";
+        if (localUserList) localUserList.innerHTML = `<div class="empty">No local Members/Devices</div>`;
+
+        if (users.length > 0) {
+            const isDevice = (u: any) => {
+                const v = u?.data?.is_device;
+                return v === 1 || v === true || v === "1" || v === "true";
+            };
+            const localUsers = users.filter(u => isDevice(u));
+            const cloudUsers = users.filter(u => !isDevice(u));
+            if (cloudUsers.length > 0 && userList) {
+                const tempUsers: Record<string, any> = {};
+                const treeUsers: any[] = [];
+
+                for (let u = 0; u < cloudUsers.length; u++) {
+                    let user = cloudUsers[u];
+                    tempUsers[user.id] = { ...user, children: [] };
+                }
+
+                for (let key in tempUsers) {
+                    if (tempUsers.hasOwnProperty(key)) {
+                        let user = tempUsers[key];
+                        let parentId = user.to;
+                        if (user.type === "user" || user.type === "member") { 
+                            if (tempUsers[parentId]) {
+                                tempUsers[parentId].children.push(tempUsers[key]);
+                            } else {
+                                treeUsers.push(tempUsers[key]);
+                            }
+                        } else if (user.type === "team") {
+                            treeUsers.push(tempUsers[key]);
+                        }
+                    }
+                }
+                userList.innerHTML = await renderAccordion(treeUsers);
+                const myTeam = cloudUsers.find(u => u.type === "team" && u.from === currentSession.address && u.id === u.to);
+                const btnCloudInvite = document.getElementById("btn-cloud-invite-toggle");
+                
+                if (myTeam) {
+                    if (btnCloudInvite) btnCloudInvite.style.display = "inline-block";
+                } else {
+                    if (btnCloudInvite) btnCloudInvite.style.display = "none";
+                }
+                userList.onclick = async (e: Event) => {
+                    const target = e.target as HTMLElement;
+                    const cancelBtn = target.closest('.btn-cancel-member') as HTMLElement;
+                    if (!cancelBtn) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+
+                    const targetId = cancelBtn.dataset.id;
+                    const targetName = cancelBtn.dataset.name;
+
+                    // Tauri 네이브 ask 팝업으로 확인
+                    const confirmed = await ask(`정말 '${targetName}' 멤버를 삭제하거나 초대를 취소하시겠습니까?`, { 
+                        title: "멤버 삭제 확인", 
+                        kind: "warning" 
+                    });
+
+                    if (confirmed && targetId) {
+                        try {
+                            // 로컬 및 클라우드(동기화 시)에서 데이터 삭제
+                            await invoke("delete_document", { uuid: targetId });
+                            console.log(`[AUTH] Member/Invite removed: ${targetId}`);
+                            
+                            // UI 즉시 새로고침
+                            await renderNavigation();
+                        } catch (err) {
+                            console.error("Failed to remove member:", err);
+                        }
+                    }
+                };
+            }
+
+            // 3. Local Devices 렌더링 (단일 리스트 구조)
+            if (localUsers.length > 0 && localUserList) {
+                // 로컬 기기는 자식(children)이 없는 플랫한 노드로 렌더링합니다.
+                const localNodes = localUsers.map(u => ({ ...u, children: [] }));
+                localUserList.innerHTML = await renderAccordion(localNodes);
+            }
+        }
+
+    } catch (e) { 
+        console.error("Nav render error:", e); 
+    } finally {
+        if (isFirstNavRender) {
+            isFirstNavRender = false;
+            stopSpinner();
+        }
+        if (activeContext.ref) {
+            await updateExtractButtonVisibility();
+        }
+    }
+}
+
+// --- Invite Logic ---
+async function handleTeamInvite() {
+    const emailInput = document.getElementById("invite-email-input") as HTMLInputElement;
+    const email = emailInput?.value.trim();
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+
+    if (!email || !emailRegex.test(email)) {
+        alert("Please enter a valid email address (e.g., user@example.com).");
+        if (emailInput) {
+            emailInput.focus();
+            emailInput.style.outline = "2px solid #ef4444";
+        }
+        return;
+    }
+    if (emailInput) emailInput.style.outline = "none";
+
+    const btn = document.getElementById("btn-send-invite") as HTMLButtonElement;
+    const originalText = btn.innerText;
+    btn.innerText = "Wait...";
+    btn.disabled = true;
+
+    try {
+        const origin = "https://commerce.logis.center";
+        const now = Date.now();
+        const createdAt = now - timezoneOffset;
+        const selectedPages: string[] = [];
+        const pageList = document.getElementById("nav-list-pages");
+        if (pageList) {
+            pageList.querySelectorAll(".logis-label.selected").forEach((label: any) => {
+                if (label.dataset.id) selectedPages.push(label.dataset.id);
+            });
+        }
+        
+        let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+            targetHref = "https://commerce.logis.center/tracking";
+        }
+
+        const params = new URLSearchParams({
+            origin: origin,
+            created_at: createdAt.toString(),
+            hash: currentSession.hash,
+            token: currentSession.token || "",
+            href: targetHref,
+            from: currentSession.team || "",
+            to: currentSession.address || "",
+            email: email,
+            ref: JSON.stringify(selectedPages)
+        });
+        
+        const url = `${API_HOST}/?${params.toString()}`;
+        const response = await invoke<any>("proxy_fetch", {
+            url: url,
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            session_params: { hash: currentSession.hash, token: currentSession.token }
+        });
+        let hookUrl = `${currentSession.hash}.logis.center@oauth.email`;
+        if (response.results && response.results.length > 0) {
+            const invite = response.results[0];
+            if (invite.hook) hookUrl = invite.hook;
+        }
+
+        showInviteQr(hookUrl, email);
+        emailInput.value = "";
+        try {
+            const pendingMember = {
+                id: `pending_invite_${Date.now()}`,
+                type: "user", // users 테이블로 분류되어 아코디언 메뉴에 들어갑니다.
+                name: `${email.split('@')[0]} (Pending ⏳)`,
+                from: currentSession.address || "0x0000000000000000000000000000000000000000",
+                to: currentSession.team || "0x0000000000000000000000000000000000000000",
+                cc: currentSession.team || "",
+                data: { origin: "cloud", is_pending: true, email: email }
+            };
+            
+            await invoke("upsert_items", { items: [pendingMember] });
+            await renderNavigation(); // UI 즉시 갱신
+        } catch (err) {
+            console.warn("[INVITE] Failed to add pending member to UI:", err);
+        }
+
+    } catch (e) {
+        console.error("[INVITE] Failed:", e);
+        alert("Error sending invite.");
+    } finally {
+        btn.innerText = originalText;
+        btn.disabled = false;
+    }
+}
+
+function showInviteQr(hook: string, email: string) {
+    if (!chatTalks) return;
+    hideNavigation();
+    openWidget("settings");
+
+    const existing = document.getElementById("msg-invite-qr");
+    if (existing) existing.remove();
+    
+    const mailtoLink = `mailto:${encodeURIComponent(hook)}`;
+
+    const html = `
+        <div class="chat-talk system" id="msg-invite-qr" data-created-at="9999999999999">
+            <div class="chat-message" style="padding:15px; background: #fff; color: #000; border:0; border-radius: 8px; text-align: center;">
+                <div style="font-size:0.8rem; font-weight: bold; margin-bottom: 10px; color: #333;">
+                    Invite <span style="color:var(--primary);">${email}</span>
+                </div>
+                <div style="font-size:0.65rem; color: #666; margin-bottom: 15px; line-height: 1.4;">
+                    Scan this QR code with mobile camera<br>to send an invitation email.
+                </div>
+                <div id="invite-qr-target" style="display: inline-block; background: #fff; padding: 10px; border-radius: 8px; border: 1px solid #eee;"></div>
+                <div style="margin-top: 15px;">
+                    <a href="${mailtoLink}" style="display: inline-block; padding: 8px 16px; background: var(--primary); color: #000; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 0.7rem;">Open Mail App</a>
+                </div>
+            </div>
+        </div>`;
+        
+    chatTalks.insertAdjacentHTML('beforeend', html);
+    
+    const qrTarget = document.getElementById("invite-qr-target");
+    if (qrTarget) {
+        qrTarget.innerHTML = "";
+        new (window as any).QRCode(qrTarget, { 
+            text: mailtoLink, 
+            width: 300, 
+            height: 300, 
+            colorDark: "#000000", 
+            colorLight: "#ffffff", 
+            correctLevel: (window as any).QRCode.CorrectLevel.M 
+        });
+        const scroll = document.getElementById("chat-scroll");
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    }
+}
+async function syncData() {
+    if (currentSearchMode === "shipping") {
+        await syncTradingData();
+        if (currentSession.hash && currentSession.email) {
+            syncCommerceInBackground();
+        }
+        return;
+    }
+    if (currentSession.hash) {
+        syncTradingInBackground();
+    }
+    if (!currentSession.hash || !currentSession.email) return;
+    await syncCommerceData();
+}
+
+// --- 기존 State 영역 어딘가에 추가 ---
+let currentSearchMode = "commerce";
+
+// 🌟 앱 시작 시 탭 UI 초기화 함수
+function applySearchModeUI() {
+    document.querySelectorAll('.mode-tab').forEach(btn => {
+        const el = btn as HTMLElement;
+        if (el.dataset.mode === currentSearchMode) {
+            el.style.color = "#000";
+            el.style.fontWeight = "bold";
+            el.classList.add('active');
+        } else {
+            el.style.color = "#999";
+            el.style.fontWeight = "bold";
+            el.classList.remove('active');
+        }
+    });
+
+    if (searchInput) {
+        searchInput.placeholder = `${modeLabel(currentSearchMode)} Search or Ask`;
+    }
+    // 🌟 [추가] Shipping 모드일 때 Pages 섹션 통째로 숨기기
+    const pagesSection = document.getElementById("nav-list-pages")?.closest(".nav-section") as HTMLElement;
+    const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
+    if (pagesSection) {
+        if (currentSearchMode === "shipping" || isSettingsOpen) {
+            pagesSection.style.display = "none"; // Shipping이거나 세팅 패널이 열려있으면 숨김
+        } else {
+            pagesSection.style.display = "block"; // 🌟 명시적으로 block 처리하여 노출 보장
+        }
+    }
+}
+
+// DOM 로드 후 이벤트 리스너 추가
+document.querySelectorAll('.mode-tab').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+        const target = e.target as HTMLElement;
+        const prevMode = currentSearchMode;
+        currentSearchMode = target.dataset.mode || "commerce";
+        if (prevMode !== currentSearchMode) {
+            activeContext = { cc: "", bcc: "", ref: "" };
+            activeTags = [];
+            updateTagsUI();
+        }
+        await kvSet("search_mode", currentSearchMode);
+        applySearchModeUI();
+
+        console.log(`[UI] Search mode changed to: ${currentSearchMode}. Refreshing list...`);
+        resetSyncBackoff();
+        await refreshList();
+        await refreshList();
+
+        if (currentSearchMode === "shipping" && currentSession.hash) {
+            resetTradingThrottle(); // 🌟 [MODE SPLIT] 구 `lastTradingSyncAt = 0;` 스로틀 해제
+            syncTradingData();
+        }
+
+        if (dataChannel && dataChannel.readyState === "open") {
+            dataChannel.send(JSON.stringify({
+                type: "sync_mode",
+                mode: currentSearchMode
+            }));
+        }
+    });
+});
+
+// 파일이 로드될 때 즉시 UI 적용
+applySearchModeUI();
+
+
+// [NEW] Global Navigation Link Handler (from item2html)
+document.addEventListener('nav-link', async (e: any) => {
+    const targetLink = e.detail;
+    console.log("[NAV] Internal Link Clicked:", targetLink);
+    addSearchTag(targetLink, 'path', targetLink);
+    openWidget("list");
+    listView.style.display = "block";
+    detailView.style.display = "none";
+});
+
+function isQueryActive(text: string): boolean {
+    const query = text.trim();
+    // 1. 프론트엔드 큐 배열 검사 (아직 UI에 안 그려진 찰나의 순간 방어)
+    if (GlobalTaskManager.queue.some(q => q.type === "ai_search" && q.payload && q.payload.query === query)) return true;
+
+    // 2. DOM 상태 검사 (현재 실행 중인 작업 및 대기열 포함)
+    let active = false;
+    const bubbles = document.querySelectorAll('.task-bubble');
+    for (let i = 0; i < bubbles.length; i++) {
+        const el = bubbles[i] as HTMLElement;
+        const status = parseInt(el.dataset.status || "0");
+        const taskId = el.id;
+        if (GlobalTaskManager.cancelledTasks.has(taskId)) {
+            continue;
+        }
+
+        // 🌟 상태가 1(Processing)이거나 10(Queued)일 때만 활성 상태로 간주
+        if ((status === 1 || status === 10) && taskId.startsWith("search_")) {
+            const queryEl = document.getElementById(`${taskId}_query`);
+            if (queryEl) {
+                const qText = queryEl.querySelector('.content')?.textContent || "";
+                if (qText.trim() === query) {
+                    active = true;
+                    break;
+                }
+            }
+        }
+    }
+    return active;
+}
+
+searchInput?.addEventListener("input", () => {
+    // 🌟 [CRITICAL FIX] 입력값이 비어있지 않고, 현재 진행/대기 중인 검색어와 '다를 때만' 버튼을 노출합니다.
+    if (btnSubmit) {
+        const currentVal = searchInput.value.trim();
+        if (currentVal !== "" && !isQueryActive(currentVal)) {
+            btnSubmit.style.display = "flex";
+        } else {
+            btnSubmit.style.display = "none";
+        }
+    }
+
+    // 🌟 [CRITICAL FIX] 추출 중(isExtracting)이거나 큐가 바쁠 때(GlobalTaskManager.isBusy)
+    // 타이핑만으로 백그라운드 임베딩 로직이 몰래 실행되는 것을 원천 차단합니다!
+    if (isSearching || isExtracting || GlobalTaskManager.isBusy) return; 
+    if(searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = window.setTimeout(async () => {
+        if (isSearching || isExtracting || GlobalTaskManager.isBusy) return; 
+        await loadMoreDocs(true);
+    }, 800);
+});
+
+// [신규] 검색창에서 엔터 키를 누르면 AI 검색(돋보기 버튼)을 강제로 실행하도록 연결
+searchInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+        e.preventDefault(); 
+        // 🌟 [CRITICAL FIX] isExtracting 검사를 삭제하여, 전처리 중에도 검색을 대기열에 넣을 수 있게 허용합니다!
+        if (!isSearching) { 
+            btnSubmit?.click(); 
+        }
+    }
+});
+
+// --- main.ts 소스 ---
+
+btnSubmit?.addEventListener("click", async () => {
+    const query = searchInput.value.trim();
+    if (!query) return;
+    if (isQueryActive(query)) {
+        console.warn("[SEARCH] The exact same query is already in progress or queued.");
+        return; 
+    }
+
+    if (searchDebounceTimer) {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = null;
+    }
+
+    searchInput.value = "";
+    if (btnSubmit) btnSubmit.style.display = "none";
+    isSearching = true;
+
+    const taskId = `search_${Date.now()}`;
+    const startTime = Date.now();
+    const resultH3 = document.querySelector('.nav-section.search h3');
+    if (resultH3) {
+        resultH3.innerHTML = `searching<strong class="count" style="cursor:pointer; margin-left:10px; color:#ef4444;" id="cancel-search-btn">Cancel</strong>`;
+        const cancelBtn = document.getElementById("cancel-search-btn");
+        if (cancelBtn) {
+            cancelBtn.addEventListener("click", async () => {
+                const confirmed = await ask("정말 검색을 취소하시겠습니까?", { title: "Cancel Search", kind: "warning" });
+                if (confirmed) {
+                    const targetTaskId = activeTaskId || taskId;
+                    if (targetTaskId) {
+                        GlobalTaskManager.cancelledTasks.add(targetTaskId);
+                        const el = document.getElementById(targetTaskId);
+                        if (el) {
+                            el.dataset.status = "2";
+                            const statusBar = el.querySelector('.status-bar');
+                            if (statusBar) statusBar.innerHTML = `<span style="color:#ef4444;">❌ STOPPED</span>`;
+                        }
+                        const queryEl = document.getElementById(`${targetTaskId}_query`);
+                        if (queryEl) queryEl.dataset.status = "2";
+                        await kvRemove(`term_${targetTaskId}`);
+                    }
+                    activeTaskId = null;
+                    GlobalTaskManager.isBusy = false;
+                    GlobalTaskManager.currentTaskId = null;
+                    GlobalTaskManager.currentTaskPayload = null;
+
+                    isSearching = false; 
+                    stopSpinner();
+                    
+                    if (btnSubmit) btnSubmit.style.display = "flex";
+                    
+                    try {
+                        await invoke<string>("stop_current_extraction", { taskId: targetTaskId });
+                        await GlobalTaskManager.release(targetTaskId, targetTaskId);
+                    } catch (e) { 
+                        console.error("Stop failed:", e); 
+                    }
+                    
+                    if (resultH3) {
+                        const count = document.querySelectorAll('#doc-list .logis-result').length;
+                        resultH3.innerHTML = `Result <strong class="count">${count > 0 ? `(${count})` : ""}</strong>`;
+                    }
+
+                    // 🌟 [추가] 검색 취소 후 텅 빈 화면에 원래 리스트(기본값)를 다시 렌더링합니다.
+                    refreshList();
+                }
+            });
+        }
+    }
+
+    if (docListContainer) docListContainer.innerHTML = "";
+    openWidget("settings");
+
+    // 3. 사용자 질문 말풍선 즉시 렌더링
+    await renderMessage({
+        id: `${taskId}_query`,
+        role: "user", 
+        text: query,
+        status: 9, 
+        created_at: startTime,
+        updated_at: startTime
+    });
+
+    try {
+        const devicePref = getDevicePref();
+        const isCloudMode = (document.getElementById("cloud-mode-toggle") as HTMLInputElement)?.checked;
+
+        if (isCloudMode && currentSession.hash && currentSession.email) {
+            renderProgressToUI({ task_id: taskId, category: "Cloud Sync", summary: "Embedding query locally...", spinner: "⠋" });
+
+            let queryVector: number[] = [];
+            try {
+                queryVector = await invoke<number[]>("get_query_embedding", {
+                    text: query,
+                    devicePreference: devicePref
+                });
+                console.log(`[CLOUD SEARCH] Local query vector generated. dim = ${queryVector.length}`);
+            } catch (err) {
+                console.warn("[CLOUD SEARCH] Local embedding failed. Server will fall back.", err);
+            }
+
+            const origin = "https://commerce.logis.center";
+            let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+            if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+                targetHref = "https://commerce.logis.center/tracking";
+            }
+
+            const urlObj = new URL(API_HOST);
+            urlObj.searchParams.append("origin", origin);
+            urlObj.searchParams.append("created_at", (Date.now() - timezoneOffset).toString());
+            urlObj.searchParams.append("hash", currentSession.hash);
+            urlObj.searchParams.append("token", currentSession.token || "");
+            urlObj.searchParams.append("href", targetHref);
+            urlObj.searchParams.append("from", currentSession.address || "");
+            urlObj.searchParams.append("to", currentSession.team || "");
+
+            const response = await invoke<any>("proxy_fetch", {
+                url: urlObj.toString(),
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Content-Encoding": "gzip"
+                },
+                body: { query: query, vector: queryVector },
+                session_params: { hash: currentSession.hash, token: currentSession.token }
+            });
+
+            let serverTaskId = "";
+            if (response && response.results && response.results.length > 0) {
+                serverTaskId = response.results[0].id || "";
+            }
+
+            cloudPendingTasks.set(taskId, {
+                serverId: serverTaskId,
+                kind: "search",
+                createdAt: Date.now()
+            });
+
+            renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Query queued on Logis Center. Processing remotely.", spinner: "☁️" });
+
+            isSearching = false;
+            stopSpinner();
+            if (btnSubmit) btnSubmit.style.display = "flex";
+        } else {
+            await GlobalTaskManager.addToQueue(taskId, "ai_search", { 
+                taskId: taskId, 
+                query: query, 
+                language: "korean",
+                devicePreference: devicePref,
+                searchMode: currentSearchMode,
+                cc: activeContext.cc || "",
+                bcc: activeContext.bcc || "",
+                refId: activeContext.ref || ""
+            });
+        }
+
+        updateExtractButtonVisibility();
+        setTimeout(() => {
+            const taskEl = document.getElementById(`${taskId}_query`) || document.getElementById(taskId);
+            const scrollEl = document.getElementById("chat-scroll");
+            const container = document.querySelector(".chat-container") as HTMLElement;
+            
+            if (taskEl && scrollEl && container) {
+                const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                let targetY = taskEl.offsetTop - (container.clientHeight / 2) + (taskEl.clientHeight / 2);
+                
+                if (targetY < 0) targetY = 0;
+                if (targetY > maxScroll) targetY = maxScroll;
+                
+                currentY = targetY;
+                scrollEl.style.transition = "transform 0.3s ease-out";
+                updateTransform();
+                
+                setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+            }
+        }, 100);
+    } catch(e) { 
+        console.error("[SEARCH-ERROR]", e);
+        if (aiResultsContent) aiResultsContent.innerHTML = "<div style='color:#ef4444;'>Error: " + e + "</div>"; 
+        isSearching = false; 
+        if (btnSubmit) btnSubmit.style.display = "flex";
+        stopSpinner(); 
+        updateExtractButtonVisibility();
+    }
+});
+
+document.addEventListener('show-doc', (e: any) => showDetail(e.detail));
+document.addEventListener('view-task-log', () => { openWidget("list"); listView.style.display = "none"; detailView.style.display = "flex"; });
+
+btnExtract?.addEventListener("click", async () => {
+    if (extractClickLock) {
+        console.warn("[LOCK] Click locked to prevent double submission.");
+        if (btnExtract) btnExtract.style.display = "none";
+        return; 
+    }
+    
+    // 2. 버튼 숨김 (isExtracting = true 는 백엔드 작업이 실제 픽업될 때 켜지도록 제외)
+    extractClickLock = true;
+    if (btnExtract) btnExtract.style.display = "none";
+
+    console.log("[DEBUG] btnExtract clicked. currentDetectedUrl:", currentDetectedUrl, "currentImage:", currentImage);
+    
+    try {
+        if (currentDetectedUrl || currentImage) {
+            const logArea = document.getElementById("extraction-log");
+            if (logArea) logArea.innerHTML = "";
+            
+            // 🌟 [CRITICAL FIX] 추출(Extract) 시 채팅창(settings) 탭으로 자동 이동합니다.
+            openWidget("settings"); 
+
+            const taskId = `task_${Date.now()}`;
+            
+            // 🌟 수동 renderMessage 및 startSpinner 제거: addToQueue가 대기열 UI(10번)를 예쁘게 그려줍니다.
+            
+            const isCloudMode = (document.getElementById("cloud-mode-toggle") as HTMLInputElement)?.checked;
+
+            if (isCloudMode && currentSession.hash) {
+                // ==========================================
+                // ☁️ [SERVER MODE]
+                // ==========================================
+                console.log("[WIDGET] Routing task to Cloud Server...");
+                let payloadBody = "";
+                let format = "";
+
+                if (currentImage) {
+                    const ext = currentImage.split('.').pop()?.toLowerCase() || '';
+                    const isDocument = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'hwpx', 'txt', 'csv'].includes(ext);
+
+                    const contents = await readFile(currentImage);
+                    const blob = new Blob([contents]);
+                    const base64Data = await new Promise<string>((resolve) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => { resolve(reader.result as string); };
+                        reader.readAsDataURL(blob);
+                    });
+                    
+                    payloadBody = base64Data;
+                    if (isDocument) {
+                        format = `application/${ext}`; // 서버에서 확장자 기반 파싱을 위해 전달
+                    } else {
+                        format = "image/png"; 
+                    }
+                } else {
+                    payloadBody = await invoke<string>("extract_html_from_current_tab");
+                    format = "text/html";
+                }
+
+                let extractionType = "html_extraction";
+                if (currentImage) {
+                    const ext = currentImage.split('.').pop()?.toLowerCase() || '';
+                    const isDocument = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'hwpx', 'txt', 'csv'].includes(ext);
+                    extractionType = isDocument ? "document_extraction" : "image_extraction";
+                }
+
+                const requestData = {
+                    id: taskId,
+                    from: currentSession.address,
+                    to: currentSession.team,
+                    cc: activeContext.cc || "",
+                    bcc: activeContext.bcc || "",
+                    ref: activeContext.ref || "",
+                    body: payloadBody,
+                    link: currentDetectedUrl || "local",
+                    type: extractionType
+                };
+
+                const urlObj = new URL(API_HOST);
+                urlObj.searchParams.append("from", currentSession.address || "");
+                urlObj.searchParams.append("to", currentSession.team || "");
+                if (format.includes("image")) {
+                    urlObj.searchParams.append("format", encodeURIComponent(format));
+                }
+
+                renderProgressToUI({ task_id: taskId, category: "Cloud Sync", summary: "Sending data to Logis Center...", spinner: "⠋" });
+
+                const response = await invoke<any>("proxy_fetch", {
+                    url: urlObj.toString(),
+                    method: "POST",
+                    headers: { 
+                        "Content-Type": "application/json",
+                        "Content-Encoding": "gzip" 
+                    },
+                    body: requestData,
+                    session_params: { hash: currentSession.hash, token: currentSession.token }
+                });
+
+                console.log("[SERVER MODE] Task accepted by server:", response);
+
+                // 🌟 [CLOUD TASK LIFECYCLE] 서버가 만든 task.id 를 기억해 두고 syncData 에서 완료를 판정합니다.
+                let serverTaskId = "";
+                if (response && response.results && response.results.length > 0) {
+                    serverTaskId = response.results[0].id || "";
+                }
+
+                cloudPendingTasks.set(taskId, {
+                    serverId: serverTaskId,
+                    kind: "extract",
+                    createdAt: Date.now()
+                });
+
+                renderProgressToUI({ task_id: taskId, category: "Cloud Queue", summary: "Task queued on server. Processing remotely.", spinner: "☁️" });
+
+                isExtracting = false;
+                stopSpinner();
+                await GlobalTaskManager.release(taskId, taskId);
+                await updateExtractButtonVisibility();
+                
+            } else {
+                if (currentImage) {
+                    const ext = currentImage.split('.').pop()?.toLowerCase() || '';
+                    const isDocument = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'hwpx', 'txt', 'csv'].includes(ext);
+                    const taskTypeStr = isDocument ? "document_extraction" : "image_extraction";
+                    const logPrefix = isDocument ? "DOCUMENT" : "IMAGE";
+
+                    console.log(`[WIDGET] Queuing LOCAL ${logPrefix} task...`);
+                    const imageRefHash = await hashId(currentImage);
+
+                    // 🚀 큐에 등록
+                    await GlobalTaskManager.addToQueue(taskId, taskTypeStr, { 
+                        id: taskId, type: taskTypeStr, image_path: currentImage, document_ext: ext,
+                        ref: imageRefHash, 
+                        cc: activeContext.cc || "",
+                        bcc: activeContext.bcc || "",
+                        link: `Local ${logPrefix}`,
+                        device_preference: getDevicePref(), search_mode: currentSearchMode
+                    });
+                } else {
+                    console.log("[WIDGET] Queuing LOCAL HTML task...");
+                    const html = await invoke<string>("extract_html_from_current_tab");
+                    
+                    let validUrl = currentDetectedUrl;
+                    if (!validUrl || validUrl === "" || validUrl === "about:blank") {
+                        const pageList = document.getElementById("nav-list-pages");
+                        const activeLabel = pageList?.querySelector(".logis-label.active") as HTMLElement;
+                        if (activeLabel && activeLabel.dataset.domain) {
+                            validUrl = `https://${activeLabel.dataset.domain}`;
+                        } else {
+                            validUrl = "https://commerce.logis.center"; // 최후의 수단
+                        }
+                    }
+
+                    const urlObj = new URL(validUrl.toLowerCase());
+                    const rootDomain = getRootDomain(urlObj.hostname);
+                    const cc = await hashId(rootDomain);
+                    const rawPath = urlObj.pathname + urlObj.search;
+                    const teamId = currentSession.team || "";
+                    const hashedRefId = await hashId(teamId + cc + rawPath.toLowerCase());
+                    
+                    const extractType = "html_extraction";
+                    
+                    // 🚀 큐에 등록
+                    await GlobalTaskManager.addToQueue(taskId, extractType, { 
+                        id: taskId, type: extractType, html: html, link: rawPath, 
+                        origin: urlObj.origin,
+                        cc: activeContext.cc || cc, 
+                        ref: activeContext.ref || hashedRefId, 
+                        bcc: activeContext.bcc || "", 
+                        from: currentSession.address, to: currentSession.team,
+                        flag: String((currentSession as any).flag || ""),
+                        device_preference: getDevicePref(), search_mode: currentSearchMode
+                    });
+                }
+            }
+            
+            if (currentImage) {
+                currentImage = null;
+                if (navPreviewContainer) navPreviewContainer.classList.add("hidden");
+                if (navUploadBtn) navUploadBtn.classList.remove("active-emoji");
+                if (searchInput) {
+                    searchInput.disabled = false;
+                    if (btnSubmit) {
+                        const currentVal = searchInput.value.trim();
+                        if (currentVal !== "" && !isQueryActive(currentVal)) {
+                            btnSubmit.style.display = "flex";
+                        } else {
+                            btnSubmit.style.display = "none";
+                        }
+                    }
+                }
+            }
+            console.log("[WIDGET] Task safely added to backend queue:", taskId);
+
+            // 🌟 [CRITICAL FIX] 생성된 테스크 말풍선 위치로 부드럽게 스크롤 이동
+            setTimeout(() => {
+                const taskEl = document.getElementById(taskId);
+                const scrollEl = document.getElementById("chat-scroll");
+                const container = document.querySelector(".chat-container") as HTMLElement;
+                
+                if (taskEl && scrollEl && container) {
+                    const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                    // 엘리먼트를 화면 중앙쯤에 오도록 Y값 계산
+                    let targetY = taskEl.offsetTop - (container.clientHeight / 2) + (taskEl.clientHeight / 2);
+                    
+                    if (targetY < 0) targetY = 0;
+                    if (targetY > maxScroll) targetY = maxScroll;
+                    
+                    currentY = targetY;
+                    // 부드러운 스크롤 효과를 위해 transition 임시 적용
+                    scrollEl.style.transition = "transform 0.3s ease-out";
+                    updateTransform();
+                    
+                    // 이동 후 transition 제거 (원래 드래그를 위해 없는 상태 유지)
+                    setTimeout(() => {
+                        scrollEl.style.transition = "";
+                    }, 300);
+                }
+            }, 100);
+        }
+    } catch (e) {
+        console.error("[WIDGET] Extraction failed:", e);
+        extractClickLock = false;
+        updateExtractButtonVisibility();
+    } finally {
+        setTimeout(async () => {
+            extractClickLock = false;
+            await updateExtractButtonVisibility();
+        }, 1500);
+    }
+});
+
+// 🌟 [추가] Rust 백엔드에 성공적으로 등록되었을 때 가상 렌더링 내용을 실제 데이터로 덮어씌웁니다.
+listen("task-db-registered", async (event: any) => {
+    const p = event.payload;
+    console.log(`[WIDGET] Task ${p.task_id} successfully registered in Backend DB.`);
+    
+    await renderMessage({
+        id: p.task_id,
+        task_id: p.task_id,
+        role: "system_task",
+        text: p.text,
+        status: p.status,
+        created_at: p.created_at,
+        updated_at: Date.now()
+    });
+});
+
+listen("extraction-progress", async (event: any) => { 
+    const payload = event.payload;
+
+    // 🌟 [CRITICAL FIX] 취소된 작업의 이벤트가 뒤늦게 도착하면 DOM을 파괴/재생성하지 못하도록 가장 먼저 폐기합니다.
+    if (payload.task_id && GlobalTaskManager.cancelledTasks.has(payload.task_id)) {
+        return;
+    }
+
+    if (payload.task_id) livePayloads.set(payload.task_id, payload);
+
+    const summary = (payload.summary || "").toLowerCase();
+    const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
+    
+    if (isTerminal && payload.task_id) {
+        console.log(`[QUEUE] Terminal state reached for ${payload.task_id}. Releasing and checking next.`);
+        if (payload.task_id.startsWith("task_") || payload.task_id.startsWith("img_")) {
+            isExtracting = false;
+        } 
+
+        // 🌟 큐 매니저 릴리즈 (비동기로 Dexie 업데이트 후 processNext 호출됨)
+        await GlobalTaskManager.release(payload.task_id, payload.task_id);
+        
+        // 🌟 버튼 UI 즉시 갱신 및 스피너 중단 (검색 모드가 아닐 때만 선반영)
+        if (!isSearching) {
+            stopSpinner();
+            updateExtractButtonVisibility();
+        }
+        // 🌟 [NEW] 추출 태스크 완료 시 네비게이션 카운트 및 리스트 최신화
+        if ((payload.task_id.startsWith("task_") || payload.task_id.startsWith("img_")) && payload.category === "Done") {
+            try {
+                const freshDocs = await invoke<any[]>("get_all_documents", {
+                    limit: pageSize,
+                    offset: 0,
+                    filter: `mode = '${currentSearchMode}'`
+                });
+                if (freshDocs.length > 0 && appDb) {
+                    const normalized = normalizeEnvelope(freshDocs);
+                    await appDb.table("items").bulkPut(normalized).catch(() => null);
+                    await renderNavigation();
+                    if (currentTab === "list") {
+                        upsertListItems(normalized, 'prepend');
+                    }
+                }
+            } catch (e) {
+                console.warn("[SYNC] Post-extraction refresh failed:", e);
+                // 폴백: 위 방식 실패 시 완전 새로고침
+                if (currentTab === "list") {
+                    await loadMoreDocs(true);
+                }
+            }
+        }
+        // 🌟 [추가] 에러이거나 취소된 경우 H3 복원
+        if (payload.task_id.startsWith("search_") && payload.category !== "Done") {
+             const resultH3 = document.querySelector('.nav-section.search h3');
+             if (resultH3 && resultH3.textContent?.includes("searching")) {
+                 const count = document.querySelectorAll('#doc-list .logis-result').length;
+                 resultH3.innerHTML = `Result <strong class="count">${count > 0 ? `(${count})` : ""}</strong>`;
+             }
+             // 에러나 취소 시에는 여기서 락을 해제합니다.
+             isSearching = false;
+             stopSpinner();
+             updateExtractButtonVisibility();
+        }
+
+        if (payload.task_id.startsWith("search_") && payload.category === "Done" && payload.data) {
+            const response = payload.data;
+            openWidget("list");
+            if (listView) listView.style.display = "block";
+            if (detailView) detailView.style.display = "none";
+            const resultH3 = document.querySelector('.nav-section.search h3');
+            if (resultH3) {
+                const applied: string[] = [];
+                const coveredTypes = new Set<string>();
+
+                if (response.dexie_plans && Array.isArray(response.dexie_plans)) {
+                    for (const plan of response.dexie_plans) {
+                        // 🌟 v4 : 어떤 도메인을 훑었는지도 함께 보여줍니다.
+                        const t = (plan.types && plan.types.length > 0) ? plan.types : (plan.type ? [plan.type] : []);
+                        for (const x of t) coveredTypes.add(x);
+
+                        if (!plan.conditions) continue;
+                        for (const c of plan.conditions) {
+                            const label = c.path.replace('data.', '');
+                            if (c.op === 'top' || c.op === 'bottom') {
+                                applied.push(`${label} ${c.op} ${c.percent ?? 20}%`);
+                            } else {
+                                const opSym: Record<string, string> = {
+                                    eq: '=', neq: '≠', gt: '>', gte: '≥', lt: '<', lte: '≤',
+                                    contains: '⊇', not_contains: '⊉'
+                                };
+                                applied.push(`${label} ${opSym[c.op] || c.op} ${c.value}`);
+                            }
+                        }
+                    }
+                }
+
+                console.log(`[SEARCH-DEBUG] 커버 도메인: [${Array.from(coveredTypes).join(', ')}]`);
+
+                let queryText = "";
+                if (response.structured && response.structured.original_text) {
+                    queryText = response.structured.original_text;
+                }
+                if (!queryText) {
+                    const queryEl = document.getElementById(`${payload.task_id}_query`);
+                    if (queryEl) queryText = queryEl.querySelector('.content')?.textContent?.trim() || "";
+                }
+
+                // 🌟 [MODE LABEL] 파일 상단 modeLabel() 단일 정의를 사용합니다.
+                //    (v1 에서는 여기만 'Goods' 로 되어 있어 검색창 라벨과 어긋났습니다)
+                let displayMode = modeLabel(currentSearchMode);
+
+                // 🌟 카운트는 '렌더링될 문서 수' 로 확정해야 하므로 아래 updateResultCount 가 다시 갱신합니다.
+                //    여기서는 조건 요약만 먼저 노출합니다.
+                const condStr = applied.length > 0
+                    ? ` <span style="font-size:0.85em; opacity:0.7;">[${applied.slice(0, 3).join(' · ')}${applied.length > 3 ? ` +${applied.length - 3}` : ''}]</span>`
+                    : "";
+
+                resultH3.innerHTML = `Search ${displayMode}: "${queryText}"${condStr} <strong class="count"></strong>`;
+            }
+
+            console.log(`[SEARCH-DEBUG] 백엔드에서 수신한 리콜 후보 수: ${response.results ? response.results.length : 0}`);
+            console.log(`[SEARCH-DEBUG] 수신한 Dexie 플랜 수: ${response.dexie_plans ? response.dexie_plans.length : 0}`);
+
+            let planFilteredIds: Set<string> | null = null;
+            const planBadges = new Map<string, string>();
+
+            if (response.dexie_plans && Array.isArray(response.dexie_plans) && response.dexie_plans.length > 0) {
+                const candidateIds = (response.results || []).map((r: any) => r.id).filter(Boolean);
+                const accepted = new Set<string>();
+
+                for (const plan of response.dexie_plans) {
+                    const condCount = plan.conditions ? plan.conditions.length : 0;
+                    const relay: RelayPlanInfo | undefined = plan.relay;
+                    const relayLocked = !!relay && relay.applied === true;
+                    const relayTargets: string[] = (relayLocked && relay && Array.isArray(relay.target_ids)) ? relay.target_ids : [];
+                    const relayVoid = new Set<string>((relay && Array.isArray(relay.void_only)) ? relay.void_only : []);
+
+                    if (condCount === 0) {
+                        for (const id of candidateIds) {
+                            if (!relayVoid.has(id)) accepted.add(id);
+                        }
+                        console.log(`[DEXIE-PLAN] type='${plan.type}' 조건 0개 → 후보 전량 통과`);
+                        continue;
+                    }
+
+                    try {
+                        const passed = await executeDexiePlan(plan, { candidateIds, limit: 500 });
+                        for (const p of passed) {
+                            if (relayVoid.has(p.id)) continue;
+                            accepted.add(p.id);
+                            const first = plan.conditions[0];
+                            if (first) {
+                                planBadges.set(p.id, `🎯 ${first.path.replace('data.', '')} ${first.op}`);
+                            }
+                        }
+                        console.log(`[DEXIE-PLAN] type='${plan.type}' 조건 ${condCount}개 → ${passed.length}건 통과`);
+
+                        {
+                            const rescued = relayLocked
+                                ? (relayTargets.length > 0 ? await executeDexiePlan(plan, { candidateIds: relayTargets, limit: 200 }) : [])
+                                : await executeDexiePlan(plan, { limit: 200 });
+                            let added = 0;
+                            for (const p of rescued) {
+                                if (accepted.has(p.id) || relayVoid.has(p.id)) continue;
+                                accepted.add(p.id);
+                                planBadges.set(p.id, `🛟 recall`);
+                                added++;
+                            }
+                            if (relayLocked) {
+                                console.log(`[DEXIE-PLAN] 🔗 기간 연결이 확정한 대상 ${relayTargets.length}건 안에서만 조건 리콜을 수행했습니다 (추가 ${added}건). 기간 밖·미연결·취소 전용 문서는 전체 테이블 리콜로 되살리지 않습니다.`);
+                            } else if (added > 0) {
+                                console.log(`[DEXIE-PLAN] 🛟 후보 밖에서 ${added}건 추가 확보 (전송 상한과 무관한 조건 리콜)`);
+                            }
+                        }
+                    } catch (e) {
+                        console.error(`[DEXIE-PLAN] 실행 실패 (type='${plan.type}'):`, e);
+                        for (const id of candidateIds) {
+                            if (!relayVoid.has(id)) accepted.add(id);
+                        }
+                    }
+                }
+
+                planFilteredIds = accepted;
+                console.log(`[DEXIE-PLAN] 최종 통과 문서 ${accepted.size}건`);
+            }
+
+            // 🌟 2. 실제 검색 결과 문서(Card)를 #doc-list 영역에 렌더링하고 카운트 갱신
+            if (response.results && response.results.length > 0) {
+                if (docListContainer) docListContainer.innerHTML = ""; // 기존 목록 비우기
+
+                let docs: any[] = [];
+                const seenIds = new Set<string>();
+
+                for (const res of response.results) {
+                    try {
+                        // 🌟 [PLAN GATE] 플랜이 존재하면 통과한 문서만 렌더링합니다.
+                        if (planFilteredIds && !planFilteredIds.has(res.id)) continue;
+
+                        // 🌟 백엔드가 data 컬럼(JSON 문자열)을 res.text 로 보냅니다.
+                        //    get_document 를 건건이 재호출하는 N+1 쿼리를 원천 차단합니다.
+                        let parsedData: any = {};
+                        try { parsedData = JSON.parse(res.text); } catch(e) {}
+
+                        let fullDoc: any = {
+                            id: res.id,
+                            uuid: res.id,
+                            type: parsedData.type || res.context_type || "unknown",
+                            mode: parsedData.mode || currentSearchMode,
+                            data: parsedData,
+                            text: parsedData.text || "",
+                            created_at: parsedData.created_at || 0,
+                            updated_at: parsedData.updated_at || 0
+                        };
+
+                        if (fullDoc.data) {
+                            fullDoc.data.search_score = res.score;
+                            fullDoc.data.search_context = res.context_type;
+                            const badge = [planBadges.get(res.id), relayPeriodBadge(res)].filter(Boolean).join(' · ');
+                            if (badge) fullDoc.data.search_badge = badge;
+                        }
+
+                        seenIds.add(res.id);
+                        docs.push(fullDoc);
+                    } catch (e) {
+                        console.error("Failed to process search result:", e);
+                    }
+                }
+
+                // 🌟 [RESCUED MERGE] LanceDB 후보에는 없었지만 플랜이 건져 올린 문서를 합칩니다.
+                if (planFilteredIds) {
+                    const rescuedIds = Array.from(planFilteredIds).filter(id => !seenIds.has(id));
+                    if (rescuedIds.length > 0 && appDb) {
+                        const rescuedRows = await appDb.table('items').where('id').anyOf(rescuedIds).toArray();
+                        for (const row of rescuedRows) {
+                            docs.push({
+                                id: row.id,
+                                uuid: row.id,
+                                type: row.type || "unknown",
+                                mode: row.mode || currentSearchMode,
+                                data: { ...(row.data || {}), search_badge: planBadges.get(row.id) || "🛟 recall" },
+                                text: row.data?.text || "",
+                                created_at: row.created_at || 0,
+                                updated_at: row.updated_at || 0
+                            });
+                            seenIds.add(row.id);
+                        }
+                        console.log(`[SEARCH-DEBUG] 플랜 구출 문서 ${rescuedRows.length}건 병합 완료`);
+                    }
+                }
+
+                console.log(`[SEARCH-DEBUG] 1차 파싱 완료. 기본 문서 수: ${docs.length}`);
+                if (appDb && docs.length > 0) {
+                    console.log(`[SEARCH-DEBUG] Dexie 연관 교차 검색(Relay v4) 시작...`);
+                    const relayDocs = new Map<string, any>();
+                    const existingIds = new Set(docs.map(d => d.id));
+                    const LINK_PATHS = [
+                        'data.index', 'data.no', 'data.code', 'data.tracking_number',
+                        'data.goods', 'data.order', 'data.tracking',
+                        'data.stock_keeping_unit', 'data.barcode',
+                        'data.doc_number', 'data.reference_invoice',
+                        'data.reference_lc', 'data.reference_booking',
+                        'data.container_number', 'data.seal_number',
+                        'data.rel_bl', 'data.rel_hbl', 'data.rel_swb', 'data.rel_awb',
+                        'data.rel_ci', 'data.rel_cinv', 'data.rel_csi', 'data.rel_pi', 'data.rel_pl',
+                        'data.rel_po', 'data.rel_sc', 'data.rel_lc', 'data.rel_llc', 'data.rel_co',
+                        'data.rel_bc', 'data.rel_bk', 'data.rel_sr', 'data.rel_do', 'data.rel_an',
+                        'data.rel_sa', 'data.rel_fcr', 'data.rel_pod', 'data.rel_cm', 'data.rel_fi',
+                        'data.rel_wr', 'data.rel_ed', 'data.rel_id', 'data.rel_ccc', 'data.rel_cnm',
+                        'data.rel_el', 'data.rel_ic', 'data.rel_wc', 'data.rel_ca', 'data.rel_coa',
+                        'data.rel_pc', 'data.rel_fc', 'data.rel_hc', 'data.rel_cdr',
+                        'data.rel_ip', 'data.rel_icf', 'data.rel_lg', 'data.rel_tr',
+                        'data.rel_soa', 'data.rel_dn', 'data.rel_cn', 'data.rel_ti', 'data.rel_cp',
+                        'data.rel_be', 'data.rel_ins', 'data.rel_dgd'
+                    ];
+
+                    // 🌟 하나의 값으로 모든 연관 축을 한 번에 훑는 헬퍼
+                    const findLinked = async (value: string | number): Promise<any[]> => {
+                        if (value === "" || value === 0 || value == null) return [];
+                        let coll = appDb.table("items").where(LINK_PATHS[0]).equals(value);
+                        for (let i = 1; i < LINK_PATHS.length; i++) {
+                            coll = coll.or(LINK_PATHS[i]).equals(value);
+                        }
+                        return await coll.toArray();
+                    };
+
+                    const periodFamilies = new Set<string>();
+                    const periodPartners = new Set<string>();
+                    const periodVoid = new Set<string>();
+                    for (const p of (response.dexie_plans || [])) {
+                        const r: RelayPlanInfo | undefined = p && p.relay;
+                        if (!r || r.applied !== true) continue;
+                        for (const t of (r.partner_types || [])) periodFamilies.add(relayFamily(t));
+                        for (const id of (r.partner_ids || [])) periodPartners.add(id);
+                        for (const id of (r.void_partner_ids || [])) periodVoid.add(id);
+                        for (const id of (r.void_only || [])) periodVoid.add(id);
+                    }
+                    const periodAdmits = (match: any): boolean => {
+                        if (periodFamilies.size === 0) return true;
+                        if (periodVoid.has(match.id)) return false;
+                        if (!periodFamilies.has(relayFamily(match.type || match.data?.type || ""))) return true;
+                        return periodPartners.has(match.id);
+                    };
+
+                    const absorb = (match: any, relation: string) => {
+                        if (!match || !match.id) return false;
+                        if (existingIds.has(match.id) || relayDocs.has(match.id)) return false;
+                        if (!periodAdmits(match)) return false;
+                        const dData = { ...(match.data || {}) };
+                        dData.search_context = match.type;
+                        dData.relation = relation;
+                        relayDocs.set(match.id, { ...match, data: dData });
+                        return true;
+                    };
+
+                    for (const doc of docs) {
+                        const parsedData = doc.data || {};
+
+                        // 1) 정방향 : 내 index 를 참조하는 문서들
+                        const selfIndex = parsedData.index != null ? Number(parsedData.index) : 0;
+                        if (selfIndex) {
+                            for (const match of await findLinked(selfIndex)) {
+                                if (match.id === doc.id) continue;
+                                absorb(match, "forward");
+                            }
+                        }
+
+                        // 2) 역방향 : 내가 참조하는 외래키로 부모 찾기
+                        const refKeys = ["tracking_number", "no", "code", "goods", "order", "tracking", "stock_keeping_unit", "barcode"];
+                        for (const key of refKeys) {
+                            const rawRef = parsedData[key];
+                            if (rawRef === undefined || rawRef === null || rawRef === "") continue;
+                            const refVal: string | number = (key === "goods" || key === "order" || key === "tracking")
+                                ? Number(rawRef)
+                                : String(rawRef);
+                            for (const match of await findLinked(refVal)) {
+                                if (match.id === doc.id) continue;
+                                if (!absorb(match, "backward")) continue;
+
+                                // 3) 2-Depth 체이닝 : 부모의 index 로 다시 자식 찾기
+                                //    연결 칸(data.goods · order · tracking · index)은 숫자로 저장되어 있어, 예전처럼
+                                //    String(index) 로 찾으면 Dexie 키 비교(숫자 ≠ 문자열)에서 한 건도 맞지 않았습니다.
+                                const bIndex = match.data?.index ? Number(match.data.index) : 0;
+                                if (!bIndex) continue;
+                                for (const d2 of await findLinked(bIndex)) {
+                                    if (d2.id === match.id || d2.id === doc.id) continue;
+                                    absorb(d2, "backward_chained");
+                                }
+                            }
+                        }
+                    }
+
+                    console.log(`[SEARCH-DEBUG] 연관 교차 검색으로 추가된 문서 수: ${relayDocs.size}`);
+                    docs.push(...Array.from(relayDocs.values()));
+                }
+                
+                console.log(`[SEARCH-DEBUG] 화면에 렌더링될 최종 문서 수(docs.length): ${docs.length}`);
+                totalResultCount = docs.length;
+
+                if (docs.length > 0) {
+                    upsertListItems(docs, 'append', true);
+                    hasMore = false; // 🌟 [CRITICAL FIX] AI 검색 결과는 단발성 고정 셋이므로 스크롤을 통한 전체 리스트 더 불러오기를 원천 차단합니다!
+                } else {
+                    if (docListContainer) docListContainer.innerHTML = `<div class="empty">No detailed documents found.</div>`;
+                    hasMore = false;
+                }
+            } else {
+                if (docListContainer) docListContainer.innerHTML = `<div class="empty">No matching data found.</div>`;
+                totalResultCount = 0;
+                hasMore = false; // 🌟 결과가 없을 때도 추가 불러오기 방지
+            }
+            
+            console.log(`[SEARCH-DEBUG] 렌더링 직후 H3 DOM 카운트 동기화 시도 (updateResultCount)`);
+            updateResultCount(); // 🌟 카운트 갱신 반영
+            
+            // 🌟 [CRITICAL FIX] 검색 결과 DOM 렌더링이 완벽하게 끝난 이 시점에 드디어 락을 해제합니다!
+            isSearching = false;
+            stopSpinner();
+            updateExtractButtonVisibility();
+            console.log(`[SEARCH-DEBUG] 글로벌 락 해제 완료 (isSearching = false)`);
+        }
+    }
+
+    if (isFetchingLogs && payload.task_id === activeTaskId) {
+        pendingLiveEvents.push(payload);
+        return;
+    }
+    renderProgressToUI(payload); 
+});
+
+document.addEventListener('render-progress', (e: any) => { renderProgressToUI(e.detail); });
+
+async function renderProgressToUI(payload: any, isRecovery: boolean = false) {
+    payload.task_id = payload.task_id || activeTaskId || (document.getElementById("extraction-log")?.dataset.activeTaskId);
+    const tId = payload.task_id;
+    if (!tId) return;
+    if (GlobalTaskManager.cancelledTasks.has(tId)) return;
+    const summary = (payload.summary || "").toLowerCase();
+    const isTerminal = payload.category === "Done" || payload.category === "Error" || summary.includes("cancelled") || summary.includes("stopped");
+    const isNotification = payload.category === "Warning" || payload.category === "Info";
+    const isPayloadRunning = payload.category && !["Pending", "Cloud Sync", "Cloud Queue"].includes(payload.category);
+
+    if (!isRecovery && !isTerminal && isPayloadRunning) {
+        if (activeTaskId !== payload.task_id || !GlobalTaskManager.isBusy) {
+            console.log("[WIDGET] Adopting/Confirming running background task:", payload.task_id);
+            
+            activeTaskId = payload.task_id;
+            await kvSet("sys_lock", activeTaskId!);
+            GlobalTaskManager.isBusy = true;
+            GlobalTaskManager.currentTaskId = activeTaskId;
+            
+            if (payload.task_id && payload.task_id.startsWith("search_")) {
+                isSearching = true;
+                if (btnSubmit) btnSubmit.style.display = "none";
+            } else {
+                isExtracting = true;
+            }
+            startSpinner();
+        } else if (!spinnerInterval) {
+            startSpinner();
+        }
+    }
+
+    const baseCategory = payload.category ? payload.category.replace(/\s*\(.*?\)/g, "") : "general";
+    const catId = baseCategory.replace(/[^a-zA-Z0-9]/g, "");
+    const elementId = `progress-${catId}`;
+    let displaySummary = payload.summary || "";
+    if (tId) {
+        const existingEl = document.getElementById(tId) as HTMLElement;
+        if (!displaySummary && existingEl) {
+            displaySummary = existingEl.querySelector('.content')?.textContent || "";
+        }
+    }
+    
+    if (!taskSteps.has(tId)) {
+        taskSteps.set(tId, new Map());
+    }
+    const stepMap = taskSteps.get(tId)!;
+    if (!isTerminal && !isNotification) {
+        let rawSummary = payload.summary || "";
+        const pctMatch = rawSummary.match(/\(\d+%\)/);
+        const hasDots = rawSummary.endsWith("...");
+        
+        if (hasDots) rawSummary = rawSummary.slice(0, -3).trim();
+        if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
+
+        let fractionStr = "";
+        if (payload.category && payload.category.includes("List Extraction")) {
+            const match = payload.category.match(/\((\d+)\/(\d+)\)/);
+            if (match) {
+                fractionStr = ` [${match[1]}/${match[2]}]`; // 백엔드가 준 정확한 숫자만 사용
+            }
+        }
+        
+        displaySummary = `${rawSummary}${fractionStr}${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+    } else if (isNotification) {
+        displaySummary = payload.summary || "";
+    }
+    let statusCode = 1; 
+        
+    if (isTerminal) {
+        if (payload.category === "Done") statusCode = 9;
+        else if (payload.category === "Error") statusCode = 6;
+        else statusCode = 3;
+    } else if (summary.includes("cancelled") || summary.includes("stopped")) {
+        statusCode = 3;
+    } else {
+        if (payload.category === "Pending" || payload.category === "Cloud Sync" || payload.category === "Cloud Queue") {
+            statusCode = 10;
+        } else {
+            statusCode = 1;
+        }
+    }
+    
+    if (payload.task_id) {
+        const existingEl = document.getElementById(payload.task_id) as HTMLElement;
+        let originalCreatedAt = Date.now();
+        if (existingEl) {
+            originalCreatedAt = parseInt(existingEl.dataset.createdAt || "0");
+        } else {
+            const match = payload.task_id.match(/_(\d+)$/);
+            if (match) originalCreatedAt = parseInt(match[1]);
+        }
+
+        await renderMessage({ 
+            id: payload.task_id, 
+            role: "system_task", 
+            text: displaySummary, 
+            status: statusCode, 
+            created_at: originalCreatedAt, 
+            updated_at: Date.now(),
+            task_id: payload.task_id
+        });
+    }
+    if (isTerminal) {
+        if (tId === activeTaskId || !activeTaskId) {
+            const currentLock = await kvGet("sys_lock");
+            if (currentLock === tId || !currentLock) {
+                await kvRemove("sys_lock");
+            }
+            
+            isExtracting = false;
+            isSearching = false;
+            stopSpinner();
+            
+            if (btnExtract) { btnExtract.classList.remove("active-spinner"); btnExtract.innerText = "⚡"; }
+            if (currentImage) {
+                currentImage = null; 
+                if (navPreviewContainer) navPreviewContainer.classList.add("hidden"); 
+                if (navUploadBtn) navUploadBtn.classList.remove("active-emoji"); 
+                if (searchInput) searchInput.disabled = false; 
+                if (btnSubmit) btnSubmit.style.display = "flex"; 
+            }
+            if (!isBrowserRunning) {
+                isAutoLaunchLocked = false;
+            }
+            updateExtractButtonVisibility(); 
+        }
+        if (payload.category === "Done") {
+            Promise.all([
+                invoke<any[]>("get_known_users"),
+                invoke<any[]>("get_known_pages") 
+            ]).then(async ([users, pages]) => {
+                console.log("\n[TRACKING-1] Rust(LanceDB)에서 가져온 get_known_users 목록 수:", users ? users.length : 0);
+                if (users && users.length > 0) {
+                    const teamDocs = users.filter(u => u.type === "team" || (u.data && u.data.type === "team"));
+                    console.log("[TRACKING-2] 그 중 'team' 타입 문서 파악:", teamDocs);
+                    if (teamDocs.length > 0) {
+                        // 🌟 [CRITICAL FIX] 로그 출력을 위해 json_data 문자열을 객체로 안전하게 파싱합니다.
+                        let tData: any = null;
+                        if (teamDocs[0].json_data && typeof teamDocs[0].json_data === "string") {
+                            try { tData = JSON.parse(teamDocs[0].json_data); } catch(e) {}
+                        }
+                        if (!tData && teamDocs[0].data) {
+                            tData = typeof teamDocs[0].data === "string" ? JSON.parse(teamDocs[0].data) : teamDocs[0].data;
+                        }
+                        tData = tData || teamDocs[0];
+                        
+                        console.log("[TRACKING-3] 화면에 반영될 최신 Base 통계:", JSON.stringify(tData.base?.pages, null, 2));
+                    } else {
+                        console.warn("[TRACKING-WARN] get_known_users에 'team' 문서가 포함되지 않았습니다! (Limit 제한 의심)");
+                    }
+                }
+                await renderNavigation();
+                if (currentTab === "list") {
+                    if (!(payload.task_id && payload.task_id.startsWith("search_"))) {
+                        refreshList();
+                    }
+                }
+                if (currentSession.email) {
+                    syncData(); 
+                }
+            });
+        }
+    }
+    const extractionLog = document.getElementById("extraction-log");
+    const targetContainer = document.getElementById("progress-container") || extractionLog;
+
+    if (extractionLog && detailView.style.display !== "none") {
+        if (extractionLog.dataset.activeTaskId !== tId) {
+            return;
+        }
+
+        if (payload.category === "Processing" && stepMap.size > 0) {
+            stepMap.clear();
+            if (targetContainer) targetContainer.innerHTML = "";
+            await kvRemove(`term_${tId}`);
+            const termArea = document.getElementById("terminal-logs");
+            if (termArea) { termArea.innerHTML = ""; termArea.style.display = "none"; }
+        }
+
+        if (!stepMap.has(elementId)) {
+            stepMap.set(elementId, stepMap.size + 1);
+        }
+
+        if (isTerminal) {
+            if (targetContainer) {
+                 const existingSpinners = targetContainer.querySelectorAll('.active-spinner');
+                 existingSpinners.forEach(s => {
+                     s.classList.remove('active-spinner');
+                     s.innerHTML = payload.category === "Error" ? "❌" : "✅";
+                     (s as HTMLElement).style.color = payload.category === "Error" ? "#ef4444" : "#4ade80";
+                 });
+            }
+            if (btnStopTask) btnStopTask.style.display = "none";
+            if (btnDetailDelete) btnDetailDelete.style.display = "flex";
+        }
+
+        let p = document.getElementById(elementId);
+        if (!p) {
+            if (targetContainer && !isNotification) {
+                const existingSpinners = targetContainer.querySelectorAll('.active-spinner');
+                existingSpinners.forEach(s => {
+                    s.classList.remove('active-spinner');
+                    s.innerHTML = "✅";
+                    (s as HTMLElement).style.color = "#4ade80";
+                });
+            }
+
+            p = document.createElement("div"); p.id = elementId;
+            p.className = "progress-item";
+            p.style.borderBottom = "1px solid #eee"; p.style.padding = "6px 0"; p.style.fontSize = "0.8rem";
+            p.style.display = "flex"; p.style.flexDirection = "column"; 
+            const row = document.createElement("div"); row.className = "progress-row"; row.style.display = "flex"; row.style.alignItems = "center";
+            
+            const spinnerIcon = `<span class="active-spinner" style="color:var(--primary); margin-right:8px; font-family:monospace; min-width:15px;">⠋</span>`;
+            row.innerHTML = `${spinnerIcon}<span class="summary-text">${displaySummary}</span>`;
+            p.appendChild(row);
+            const results = document.createElement("div"); results.className = "results-container"; p.appendChild(results);
+            
+            if (targetContainer) targetContainer.appendChild(p);
+        }
+        
+        const summaryEl = p.querySelector(".summary-text") as HTMLElement;
+        const spinnerEl = p.querySelector(".active-spinner") as HTMLElement;
+
+        if (summaryEl && summaryEl.textContent !== displaySummary) {
+            summaryEl.textContent = displaySummary;
+        }
+
+        if (payload.category === "Done") {
+            const row = p.querySelector(".progress-row");
+            if (row) {
+                const s = row.querySelector(".active-spinner") as HTMLElement;
+                if (s) { s.classList.remove("active-spinner"); s.innerHTML = "✅"; s.style.color = "#4ade80"; }
+            }
+        } else if (payload.category === "Error") {
+            const row = p.querySelector(".progress-row");
+            if (row) { 
+                const s = row.querySelector(".active-spinner") as HTMLElement;
+                if (s) { s.classList.remove("active-spinner"); s.innerHTML = "❌"; s.style.color = "#ef4444"; }
+                (row as HTMLElement).style.color = "#ef4444"; 
+            }
+        } else if (isNotification) {
+            if (spinnerEl) {
+                spinnerEl.classList.remove("active-spinner");
+                spinnerEl.innerHTML = payload.spinner || "⚠️";
+                spinnerEl.style.color = "#fbbf24"; 
+            }
+        } else {
+            if (spinnerEl && spinnerEl.innerHTML !== "✅" && spinnerEl.innerHTML !== "❌" && spinnerEl.innerHTML !== "⚠️") {
+                const newIcon = payload.spinner || "⠋";
+                if (spinnerEl.innerText !== newIcon) { spinnerEl.innerText = newIcon; }
+                if (newIcon === "✅" || newIcon === "✔") {
+                    spinnerEl.classList.remove("active-spinner"); spinnerEl.style.color = "#4ade80";
+                } else if (newIcon === "❌") {
+                    spinnerEl.classList.remove("active-spinner"); spinnerEl.style.color = "#ef4444";
+                } else {
+                    spinnerEl.classList.add("active-spinner");
+                }
+            }
+        }
+    }
+}
+
+btnStopTask?.addEventListener("click", async () => {
+    if (await ask("Stop the current extraction/search? (The record will be deleted)", { title: "Stop Task", kind: "warning" })) {
+        const targetTaskId = activeTaskId; // 지우려는 대상 고정
+        
+        if (targetTaskId) {
+            GlobalTaskManager.cancelledTasks.add(targetTaskId); // 🌟 [CRITICAL FIX] 취소 블랙리스트에 등록하여 지연 도착하는 이벤트를 완벽 차단
+        }
+        activeTaskId = null;
+        GlobalTaskManager.isBusy = false;
+        GlobalTaskManager.currentTaskId = null;
+        GlobalTaskManager.currentTaskPayload = null;
+
+        isExtracting = false; 
+        isSearching = false; 
+        stopSpinner();
+        
+        if (btnExtract) {
+            btnExtract.classList.remove("active-spinner");
+            btnExtract.innerText = "⚡";
+            btnExtract.style.display = "flex";
+        }
+        if (btnStopTask) btnStopTask.style.display = "none";
+
+        try {
+            console.log("[WIDGET] Stopping task:", targetTaskId);
+            // 1. 백엔드 작업 중단
+            await invoke<string>("stop_current_extraction", { taskId: targetTaskId });
+            
+            if (targetTaskId) {
+                await kvRemove(`term_${targetTaskId}`);
+                const el = document.getElementById(targetTaskId);
+                if (el) el.remove();
+
+                // 2. 큐 매니저에서 식별자 제거 및 다음 대기열 진행
+                await GlobalTaskManager.release(targetTaskId, targetTaskId);
+            }
+
+            detailTitle.innerText = "Cancelled";
+            detailContent.innerHTML = "<div style='color:#ef4444; padding:20px;'>Extraction stopped and deleted by user.</div>";
+            
+            await updateExtractButtonVisibility();
+        } catch (e) { 
+            console.error("Stop failed:", e); 
+        }
+    }
+});
+
+// --- Browser Auto ---
+btnAutoLaunch?.addEventListener("click", async () => { 
+    if (isBrowserRunning || isAutoLaunchLocked) return;
+
+    try { 
+        isAutoLaunchLocked = true; // 🌟 런칭 락 활성화 (무식하게 전부 무시 시작)
+        isBrowserRunning = true; 
+        
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "none";
+            btnAutoLaunch.classList.add("hidden");
+        }
+        
+        console.log(`[WIDGET] UI LOCKED: Chrome Launching...`);
+        await invoke("launch_best_browser", { url: "about:blank" }); 
+        console.log(`[WIDGET] UI LOCKED: Waiting for Rust signal...`);
+    } catch (e) { 
+        console.error("Launch failed:", e); 
+        isAutoLaunchLocked = false; // 🌟 에러 시에만 락 해제
+        isBrowserRunning = false;
+        syncBrowserStatus();
+    } 
+});
+const autoBrowser = document.getElementById("auto-browser") as HTMLSelectElement;
+const autoUrl = document.getElementById("auto-url") as HTMLInputElement;
+const autoBtn = document.getElementById("auto-btn") as HTMLButtonElement;
+
+async function initBrowserDropdown() {
+    if (!autoBrowser) return;
+    try {
+        const browsers = await invoke<any[]>("check_available_browsers");
+        autoBrowser.innerHTML = "";
+        browsers.forEach(b => {
+            const opt = document.createElement("option");
+            opt.value = b.name; opt.text = b.name + (b.needs_driver ? " (No Driver)" : "");
+            autoBrowser.appendChild(opt);
+        });
+    } catch (e) { console.error("Dropdown error:", e); }
+}
+
+autoBtn?.addEventListener("click", async () => {
+    if (!autoBrowser || !autoUrl) return;
+    try { await invoke("launch_browser", { browser: autoBrowser.value, url: autoUrl.value, script: "" }); } catch (e) { console.error("Manual launch error:", e); }
+});
+
+listen("browser-status", async (event: any) => {
+    const payload = event.payload; 
+    const statusStr = typeof payload === "object" ? payload.status : payload;
+    
+    if (statusStr === "running") {
+        isBrowserRunning = true;
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "none";
+            btnAutoLaunch.classList.add("hidden");
+        }
+    } else {
+        console.log("[WIDGET] Browser stopped. Resetting UI.");
+        isBrowserRunning = false;
+        isAutoLaunchLocked = false;
+        if (btnAutoLaunch) {
+            btnAutoLaunch.style.display = "flex";
+            btnAutoLaunch.classList.remove("hidden");
+        }
+        currentDetectedUrl = "";
+    }
+    await updateExtractButtonVisibility();
+});
+
+// --- List Logic (Updated for Cards) ---
+listRefreshBtn?.addEventListener("click", refreshList);
+
+btnDeleteSelected?.addEventListener("click", async () => {
+    if (selectedUuids.size === 0) return;
+    if (await ask(`Delete ${selectedUuids.size} documents?`, { title: "Confirm Delete", kind: "warning" })) {
+        try {
+            const uuids = Array.from(selectedUuids);
+            await invoke("delete_documents", { uuids });
+            if (appDb && uuids.length > 0) {
+                try {
+                    await appDb.table("items").bulkDelete(uuids);
+                    await appDb.table("users").bulkDelete(uuids);
+                    await appDb.table("pages").bulkDelete(uuids);
+                    console.log(`[WIDGET] Dexie cache cleared for ${uuids.length} item(s)`);
+                } catch (dexieErr) {
+                    console.warn("[WIDGET] Dexie bulk delete failed (non-critical):", dexieErr);
+                }
+            }
+            await refreshList();
+            updateResultCount();
+        } catch (e) { console.error(e); }
+    }
+});
+
+btnSyncQr?.addEventListener("click", async () => {
+    const qrContainer = document.getElementById("nav-qr-container");
+    const navOverlay = document.getElementById("nav-categories");
+
+    if (!qrContainer || !navOverlay) return;
+
+    if (navOverlay.classList.contains("hidden")) {
+        handleSearchInteraction();
+    }
+
+    const isHidden = qrContainer.classList.contains("hidden");
+    if (isHidden) {
+        qrContainer.classList.remove("hidden");
+        if (btnSyncQr) btnSyncQr.innerText = "CLOSE"; // 🌟 [추가] 패널이 열리면 CLOSE로 변경
+        await initSyncUI(); // [NEW] Initialize IP/Seed view
+        listCurrentY = 0;
+        updateListTransform(true);
+    } else {
+        qrContainer.classList.add("hidden");
+        if (btnSyncQr) btnSyncQr.innerText = "ADD"; // 🌟 [추가] 패널이 닫히면 ADD로 원상복구
+    }
+});
+
+// 🌟 [추가] Cloud Member 초대 패널 토글 로직 (Local Member와 동일한 구조)
+document.getElementById("btn-cloud-invite-toggle")?.addEventListener("click", () => {
+    const inviteContainer = document.getElementById("nav-cloud-invite-container");
+    const btn = document.getElementById("btn-cloud-invite-toggle");
+    const pageList = document.getElementById("nav-list-pages");
+    
+    if (!inviteContainer || !btn) return;
+
+    if (inviteContainer.classList.contains("hidden")) {
+        inviteContainer.classList.remove("hidden");
+        btn.innerText = "CLOSE";
+        listCurrentY = 0;
+        updateListTransform(true);
+    } else {
+        inviteContainer.classList.add("hidden");
+        btn.innerText = "ADD";
+        // 🌟 [추가] 패널 닫을 때 선택된 클래스 일괄 제거 (기획 의도에 따라 생략 가능)
+        if (pageList) {
+            pageList.querySelectorAll(".logis-label.selected").forEach(el => el.classList.remove("selected"));
+        }
+    }
+});
+
+// 🌟 [추가] Cloud Member 초대 전송 이벤트 등록
+document.getElementById("btn-send-invite")?.addEventListener("click", async () => {
+    await handleTeamInvite();
+});
+
+// [NEW] Manual Connect Handler
+document.getElementById("btn-manual-connect")?.addEventListener("click", async () => {
+    const tSeed = (document.getElementById("target-seed") as HTMLInputElement).value;
+    const btn = document.getElementById("btn-manual-connect") as HTMLButtonElement;
+    
+    if (!tSeed) {
+        alert("Please enter target seed!");
+        return;
+    }
+
+    // 1. 현재 PC의 전체 IP를 가져옵니다 (예: 192.168.45.115)
+    const myFullIp = await invoke<string>("get_my_full_ip"); 
+    const ipParts = myFullIp.split('.');
+    
+    if (ipParts.length !== 4) {
+        alert("Could not determine local network subnet.");
+        return;
+    }
+
+    // 2. 앞의 3자리만 잘라서 서브넷 베이스를 만듭니다 (예: 192.168.45)
+    const baseIp = `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}`; 
+    const seed = parseInt(tSeed);
+
+    console.log(`[SYNC] Auto-Scanning subnet ${baseIp}.1~254 with seed ${seed}...`);
+    btn.innerText = "SCANNING...";
+    btn.disabled = true;
+
+    try {
+        await startWebRtcOfferer(baseIp, seed);
+    } catch (e) {
+        alert("Connection failed. Device not found on this Wi-Fi network.");
+    } finally {
+        btn.innerText = "AUTO CONNECT";
+        btn.disabled = false;
+    }
+});
+
+// 🌟 [수정] 병렬 스캔 WebRTC 연결 함수 (이전 답변과 동일, 혹시 몰라 전체 첨부)
+async function startWebRtcOfferer(baseIp: string, seed: number) {
+    peerConn = new RTCPeerConnection({ iceServers: [] });
+    dataChannel = peerConn.createDataChannel("logis-sync");
+    setupDataChannel(dataChannel);
+    
+    const offer = await peerConn.createOffer();
+    await peerConn.setLocalDescription(offer);
+    
+    // Wait for ICE gathering
+    await new Promise<void>(resolve => {
+        if (peerConn?.iceGatheringState === 'complete') resolve();
+        else {
+            const check = () => { if (peerConn?.iceGatheringState === 'complete') { peerConn?.removeEventListener('icegatheringstatechange', check); resolve(); } };
+            peerConn?.addEventListener('icegatheringstatechange', check);
+            setTimeout(resolve, 2000);
+        }
+    });
+
+    const sdp = peerConn.localDescription?.sdp || "";
+    
+    // 🌟 병렬 연결 시도 (1.1부터 1.254까지 전부 핑을 날려서 가장 먼저 받는 놈과 연결)
+    const scanPromises = [];
+    for (let i = 1; i <= 254; i++) {
+        const targetIp = `${baseIp}.${i}`;
+        scanPromises.push(
+            invoke<string>("send_signal_offer", { targetIp, seed, sdp })
+                .then(answerSdp => ({ targetIp, answerSdp }))
+        );
+    }
+
+    try {
+        const result = await (Promise as any).any(scanPromises);
+        await peerConn.setRemoteDescription({ type: 'answer', sdp: result.answerSdp });
+        console.log(`[SYNC] Connected to ${result.targetIp} successfully via Auto Scan!`);
+    } catch (e) {
+        peerConn.close();
+        throw new Error("Scan failed");
+    }
+}
+
+listen("webrtc-offer", async (event) => {
+    const [offerSdp, fromIp] = event.payload as [string, string];
+    console.log(`[SYNC] Incoming offer from ${fromIp}`);
+    
+    peerConn = new RTCPeerConnection({ iceServers: [] });
+    peerConn.ondatachannel = (e) => setupDataChannel(e.channel);
+
+    await peerConn.setRemoteDescription({ type: 'offer', sdp: offerSdp });
+    const answer = await peerConn.createAnswer();
+    await peerConn.setLocalDescription(answer);
+
+    // [FIXED] Send Answer back via TCP stream through the backend
+    try {
+        await invoke("submit_signal_answer", { targetIp: fromIp, sdp: answer.sdp });
+        console.log(`[SYNC] Answer submitted for ${fromIp}`);
+    } catch (e) {
+        console.error("[SYNC] Failed to submit answer:", e);
+    }
+});
+
+let mySyncSeed = 0; 
+let isListenerStarted = false; // 🌟 [추가] 리스너 중복 실행 방지용 플래그
+
+async function initSyncUI() {
+    if (mySyncSeed === 0) {
+        const savedSeed = await kvGet("my_sync_seed");
+        if (savedSeed) {
+            mySyncSeed = parseInt(savedSeed);
+        } else {
+            // 🌟 [수정] 4자리 난수(1000~9999) 대신 2자리 난수(10~99)를 생성합니다.
+            mySyncSeed = Math.floor(10 + Math.random() * 90);
+            await kvSet("my_sync_seed", mySyncSeed.toString());
+        }
+    }
+
+    const mySyncSeedEl = document.getElementById("my-sync-seed");
+    const ipPrefixEl = document.getElementById("ip-prefix");
+
+    if (mySyncSeedEl) {
+        mySyncSeedEl.innerText = mySyncSeed.toString();
+    }
+    if (ipPrefixEl) {
+        const prefix = await invoke("get_local_network_prefix") as string;
+        ipPrefixEl.innerText = prefix + ".";
+    }
+    
+    try {
+        // 🌟 [CRITICAL FIX] 아직 리스너가 열리지 않았을 때만 딱 한 번 실행하도록 차단합니다.
+        if (!isListenerStarted) {
+            await invoke("start_listener_command", { seed: mySyncSeed });
+            isListenerStarted = true;
+        }
+    } catch (e) { console.error(e); }
+}
+
+let peerConn: RTCPeerConnection | null = null;
+let dataChannel: RTCDataChannel | null = null;
+let desktopStream: MediaStream | null = null;
+let qrRotationInterval: number | null = null;
+let isWebRtcFinalized = false;
+function finalizeWebRtcConnection(guestSession: any) {
+    if (isWebRtcFinalized) {
+        console.log("[WebRTC] Already finalized. Skipping duplicate device registration.");
+        return;
+    }
+    isWebRtcFinalized = true;
+    const profileName = document.getElementById("nav-profile-name");
+    if (profileName) {
+        profileName.textContent = "✅ Mobile Linked (P2P)";
+        profileName.style.color = "#4ade80";
+    }
+    document.getElementById("nav-qr-container")?.classList.add("hidden");
+    try {
+        const guestName = (guestSession && guestSession.email) ? guestSession.email.split('@')[0] : "📱 Linked Device";
+        const guestAddr = (guestSession && guestSession.address) ? guestSession.address : "0x0000000000000000000000000000000000000000";
+
+        const mobileUser = {
+            id: `mobile_${Date.now()}`,
+            type: "user",
+            name: guestName,
+            from: guestAddr, 
+            to: currentSession.team || "0x0000000000000000000000000000000000000000",
+            data: { origin: "local", is_device: 1 } 
+        };
+        
+        invoke("upsert_items", { items: [mobileUser] }).then(() => renderNavigation());
+    } catch (e) {
+        console.error("[WebRTC] Failed to add device to members:", e);
+    }
+}
+
+function setupDataChannel(channel: RTCDataChannel) {
+    channel.onopen = async () => {
+        console.log("[WebRTC] Channel OPEN! Starting Zero-Trust Auth Handshake...");
+        channel.send(JSON.stringify({ 
+            type: "auth_request", 
+            session: currentSession 
+        }));
+    };
+    channel.onclose = () => {
+        console.log("[WebRTC] Channel CLOSED. Resetting pairing state.");
+        isWebRtcFinalized = false;
+        const profileName = document.getElementById("nav-profile-name");
+        if (profileName && profileName.textContent === "✅ Mobile Linked (P2P)") {
+            profileName.textContent = currentSession.email ? currentSession.email.split('@')[0] : "";
+            profileName.style.color = "";
+        }
+    };
+
+    channel.onmessage = async (e) => {
+        try {
+            const msg = JSON.parse(e.data);
+            console.log("[WebRTC] Received from Peer:", msg.type);
+            
+            // 🌟 [핵심 2] 상대방이 인증을 요청해옴 (내가 Host/수신자 역할일 때)
+            if (msg.type === "auth_request") {
+                const guest = msg.session;
+                
+                // a. 이미 클라우드 팀원인지 내 로컬 DB(LanceDB, 클라우드 동기화됨)에서 조회
+                const users = await Select["users"]({});
+                const isCloudMember = users.some(u => 
+                    (u.id === guest.address || u.from === guest.address) &&
+                    (u.to === currentSession.team || u.cc === currentSession.team)
+                );
+
+                if (isCloudMember) {
+                    console.log("[WebRTC] Guest is an authorized Cloud Member. Auto-approving.");
+                    channel.send(JSON.stringify({ type: "auth_success" }));
+                    finalizeWebRtcConnection(guest);
+                } else {
+                    if (guest.team && currentSession.team && guest.team !== currentSession.team) {
+                        const myTeamMembers = users.filter(u => u.to === currentSession.team || u.cc === currentSession.team);
+                        
+                        // 내 팀에 나 혼자(1명 이하)밖에 없다면(초대한 멤버가 없다면) 내가 양보하고 시드를 바꿉니다.
+                        if (myTeamMembers.length <= 1) {
+                            console.warn("[WebRTC] Seed collision detected! I have no members. Auto-regenerating my seed...");
+                            channel.send(JSON.stringify({ type: "auth_reject", reason: "Seed collision. Auto-yielding." }));
+                            peerConn?.close();
+                            
+                            // 시드 강제 재생성 및 로컬 DB 영구 저장
+                            // 🌟 [수정] 충돌 시 새로 부여받는 시드도 2자리 난수(10~99)로 통일합니다.
+                            mySyncSeed = Math.floor(10 + Math.random() * 90);
+                            await kvSet("my_sync_seed", mySyncSeed.toString());
+                            
+                            const mySyncSeedEl = document.getElementById("my-sync-seed");
+                            if (mySyncSeedEl) mySyncSeedEl.innerText = mySyncSeed.toString();
+                            
+                            // 🌟 Rust 바인딩된 리스너의 시드만 초고속으로 업데이트 (10048 에러 없음!)
+                            await invoke("start_listener_command", { seed: mySyncSeed });
+                            
+                            alert(`[Network] 동일한 와이파이 내에 시드 번호 충돌이 감지되었습니다.\n멤버가 없는 현재 PC의 시드가 새 번호(${mySyncSeed})로 자동 변경 및 양보되었습니다.`);
+                            return;
+                        } else {
+                            // 내 팀에 멤버가 있다면, 상대방이 양보하도록 거절만 날려줍니다.
+                            console.warn("[WebRTC] Seed collision detected, but I have members. Rejecting guest.");
+                            channel.send(JSON.stringify({ type: "auth_reject", reason: "Wrong team. Please regenerate your seed." }));
+                            peerConn?.close();
+                            return;
+                        }
+                    }
+
+                    // b. 충돌이 아니라 정상적인 외부 기기 연결이라면 화면에 팝업을 띄워 수동 승인 진행
+                    const displayId = guest.email || guest.address || "Unknown Local Device";
+                    const approved = await ask(`Incoming connection from '${displayId}'.\nAre you sure you want to approve this device and share local data?`, { title: "Peer Approval Required", kind: "warning" });
+                    
+                    if (approved) {
+                        console.log("[WebRTC] Connection manually approved by peer.");
+                        channel.send(JSON.stringify({ type: "auth_success" }));
+                        finalizeWebRtcConnection(guest);
+                        // [Option] 필요시 여기서 proxy_fetch를 날려 클라우드 DB에도 guest.address를 강제로 등록(PUT)시킬 수 있습니다.
+                    } else {
+                        console.log("[WebRTC] Connection rejected by peer.");
+                        channel.send(JSON.stringify({ type: "auth_reject", reason: "Rejected by Team Member" }));
+                        peerConn?.close();
+                    }
+                }
+            } 
+            // 🌟 [핵심 3] 상대방이 내 접속을 승인함 (내가 Guest/발신자 역할일 때)
+            else if (msg.type === "auth_success") {
+                console.log("[WebRTC] Auth Approved by Host Peer!");
+                finalizeWebRtcConnection(null);
+            }
+            // 🌟 [핵심 4] 상대방이 내 접속을 거절함
+            else if (msg.type === "auth_reject") {
+                alert(`WebRTC Connection blocked: ${msg.reason}`);
+                peerConn?.close();
+            // --- 기존 통신 로직 유지 ---
+            } else if (msg.type === "get_detail") {
+                const doc = await invoke<any>("get_document", { uuid: msg.uuid });
+                if (doc && dataChannel?.readyState === "open") {
+                    let parsed: any = {};
+                    try { parsed = JSON.parse(doc.json_data || "{}"); } catch (e) { parsed = {}; }
+                    const titleType = parsed.doc_type || doc.type || "Detail";
+                    const titleNo = parsed.doc_number || parsed.no || parsed.title || parsed.tracking_number || "";
+                    const esc = (s: any) => String(s ?? "")
+                        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                    let pretty = "";
+                    try { pretty = JSON.stringify(parsed, null, 2); } catch (e) { pretty = String(doc.json_data || ""); }
+                    if (pretty.length > 60_000) pretty = pretty.slice(0, 60_000) + "\n… (truncated)";
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_detail",
+                        title: `${titleType} ${titleNo}`.trim(),
+                        content:
+                            `<div style="margin-bottom:15px; font-size:0.85rem; color:#333;">` +
+                            `<strong>Summary</strong><br>${esc(doc.text)}</div>` +
+                            `<hr>` +
+                            `<pre>${esc(pretty)}</pre>`
+                    }));
+                }
+            } else if (msg.type === "get_session") {
+                // Send current desktop session info to mobile
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({ 
+                        type: "sync_session", 
+                        data: currentSession 
+                    }));
+                }
+            } else if (msg.type === "get_mode") {
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_mode",
+                        mode: currentSearchMode
+                    }));
+                }
+            } else if (msg.type === "get_navigation") {
+                const pages = await Select["pages"]({});
+                const users = await Select["users"]({});
+                const slimPages = (pages || []).slice(0, 200).map((p: any) => ({
+                    id: p.id,
+                    uuid: p.id,
+                    type: p.type,
+                    mode: p.mode,
+                    ref: p.ref,
+                    cc: p.cc,
+                    title: p.title || p.data?.title || "",
+                    data: {
+                        type: p.data?.type || p.type || "",
+                        title: p.data?.title || p.title || "",
+                        link: p.data?.link || "",
+                        origin: p.data?.origin || "",
+                        detail: p.data?.detail ?? false
+                    }
+                }));
+                const slimUsers = (users || []).slice(0, 200).map((u: any) => ({
+                    id: u.id,
+                    uuid: u.id,
+                    type: u.type,
+                    from: u.from,
+                    to: u.to,
+                    cc: u.cc,
+                    data: {
+                        type: u.data?.type || u.type || "",
+                        name: u.data?.name || "",
+                        title: u.data?.title || "",
+                        flag: u.data?.flag || "",
+                        page_count: u.data?.page_count ?? 0
+                    }
+                }));
+                if (dataChannel?.readyState === "open") {
+                    const navPayload = JSON.stringify({
+                        type: "sync_navigation",
+                        pages: slimPages,
+                        users: slimUsers
+                    });
+                    if (navPayload.length > 240_000) {
+                        console.warn(`[WebRTC] sync_navigation 페이로드 ${navPayload.length}바이트. slice 상한을 낮추세요.`);
+                    }
+                    dataChannel.send(navPayload);
+                }
+            } else if (msg.type === "get_chat_history") {
+                const chatFilterParts: string[] = [];
+                if (activeContext.ref) chatFilterParts.push(`\`ref\` = '${activeContext.ref}'`);
+                else if (activeContext.cc) chatFilterParts.push(`cc = '${activeContext.cc}'`);
+                const chatFilter = chatFilterParts.length > 0 ? chatFilterParts.join(" AND ") : null;
+                const messages = await invoke<any[]>("get_chat_messages", {
+                    limit: 30,
+                    offset: 0,
+                    filter: chatFilter
+                });
+                const ordered = (messages || []).slice().sort(
+                    (a: any, b: any) => (Number(a?.created_at) || 0) - (Number(b?.created_at) || 0)
+                );
+                const slimMessages = ordered.map((m: any) => ({
+                    id: m.id,
+                    role: m.role,
+                    text: typeof m.text === "string" && m.text.length > 2000 ? m.text.slice(0, 2000) : m.text,
+                    status: m.status,
+                    task_id: m.task_id,
+                    created_at: m.created_at,
+                    updated_at: m.updated_at
+                }));
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_chat_history",
+                        messages: slimMessages
+                    }));
+                }
+            } else if (msg.type === "get_queue_status") {
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_queue_status",
+                        busy: GlobalTaskManager.isBusy,
+                        currentTaskId: GlobalTaskManager.currentTaskId,
+                        pending: GlobalTaskManager.queue.length + GlobalTaskManager.backendQueued.length
+                    }));
+                }
+            } else if (msg.type === "cancel_task") {
+                // 🌟 [REMOTE CANCEL] 모바일에서 진행 중인 작업을 취소합니다.
+                const targetTaskId = msg.taskId || GlobalTaskManager.currentTaskId;
+                if (targetTaskId) {
+                    console.log(`[WebRTC] Remote cancel requested: ${targetTaskId}`);
+                    GlobalTaskManager.cancelledTasks.add(targetTaskId);
+                    try {
+                        await invoke<string>("stop_current_extraction", { taskId: targetTaskId });
+                        await GlobalTaskManager.release(targetTaskId, targetTaskId);
+                    } catch (e) {
+                        console.error("[WebRTC] Remote cancel failed:", e);
+                    }
+                    isSearching = false;
+                    isExtracting = false;
+                    stopSpinner();
+                    await updateExtractButtonVisibility();
+                }
+                if (dataChannel?.readyState === "open") {
+                    dataChannel.send(JSON.stringify({
+                        type: "sync_queue_status",
+                        busy: GlobalTaskManager.isBusy,
+                        currentTaskId: GlobalTaskManager.currentTaskId,
+                        pending: GlobalTaskManager.queue.length + GlobalTaskManager.backendQueued.length
+                    }));
+                }
+            } else if (msg.type === "search") {
+                const remoteMode = msg.mode || currentSearchMode;
+                const remoteLimit = Number(msg.limit || 20);
+                const remoteOffset = Number(msg.offset || 0);
+                const remoteQuery = String(msg.query || "").trim();
+                console.log(`[WebRTC] Remote list: mode=${remoteMode} q='${remoteQuery}' offset=${remoteOffset}`);
+                const allowedTypes = TYPE_SETS[remoteMode] || TYPE_SETS.commerce;
+                const scopeUsable = (remoteMode === currentSearchMode);
+                const scopeRef = scopeUsable ? activeContext.ref : "";
+                const scopeCc = scopeUsable ? activeContext.cc : "";
+                if (!scopeUsable && (activeContext.ref || activeContext.cc)) {
+                    console.log(`[WebRTC] 모드 불일치(desktop='${currentSearchMode}' / mobile='${remoteMode}')로 activeContext 스코프를 무시합니다.`);
+                }
+                let rows: any[] = [];
+                try {
+                    if (appDb) {
+                        if (scopeRef) {
+                            rows = await appDb.table('items').where('ref').equals(scopeRef).toArray();
+                            rows = rows.filter((r: any) => (r.mode || 'commerce') === remoteMode);
+                            rows = rows.filter((r: any) => allowedTypes.includes(r.type));
+                        } else if (scopeCc) {
+                            rows = await appDb.table('items').where('cc').equals(scopeCc).toArray();
+                            rows = rows.filter((r: any) => (r.mode || 'commerce') === remoteMode);
+                            rows = rows.filter((r: any) => allowedTypes.includes(r.type));
+                        } else {
+                            // 🌟 '[mode+type]' 복합 인덱스를 anyOf 로 펼칩니다. (loadMoreDocs 와 동일)
+                            const pairs = allowedTypes.map(t => [remoteMode, t]);
+                            rows = await appDb.table('items').where('[mode+type]').anyOf(pairs).toArray();
+                        }
+                        // 🌟 텍스트 질의가 있으면 인메모리 부분일치로 좁힙니다.
+                        //    (AI 검색은 별도 ai_search 경로가 담당합니다)
+                        if (remoteQuery) {
+                            const q = remoteQuery.toLowerCase();
+                            rows = rows.filter((r: any) => {
+                                const d = r.data ?? {};
+                                const hay = [
+                                    d.text, d.title, d.name, d.no, d.code,
+                                    d.tracking_number, d.doc_number, d.doc_type,
+                                    d.vessel, d.container_number, d.seal_number,
+                                    d.sender_name, d.recipient_name,
+                                    d.pol, d.pod, d.hs_code,
+                                    d.action, d.summary
+                                ].filter(Boolean).join(' ').toLowerCase();
+                                return hay.includes(q);
+                            });
+                        }
+                        rows.sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
+                    }
+                } catch (e) {
+                    console.warn("[WebRTC] Remote list query failed:", e);
+                }
+                const total = rows.length;
+                const page = rows.slice(remoteOffset, remoteOffset + remoteLimit);
+                const REMOTE_CARD_KEYS = [
+                    'id', 'no', 'code', 'index', 'title', 'name', 'text', 'summary',
+                    'status', 'type', 'mode', 'link', 'origin', 'image', 'thumbnail',
+                    'created_at', 'updated_at', 'search_badge', 'relation',
+                    'goods', 'event', 'tracking', 'views',
+                    'currency', 'amount', 'sale_price', 'price', 'supply_price',
+                    'discount', 'quantity', 'stock_keeping_unit', 'tax_included',
+                    'shipping_fee', 'shipping_method', 'shipping_duration', 'release_date',
+                    'carrier', 'tracking_number',
+                    'sender_name', 'sender_address', 'recipient_name', 'recipient_address',
+                    'notify_party_name',
+                    'doc_type', 'doc_number', 'vessel', 'voyage_number', 'pol', 'pod',
+                    'place_receipt', 'place_delivery', 'etd', 'eta', 'transport_mode',
+                    'incoterms', 'payment_terms', 'freight_payment_term',
+                    'freight_amount', 'insurance_amount',
+                    'container_number', 'seal_number', 'package_count', 'package_unit',
+                    'weight_gross', 'weight_net', 'volume', 'hs_code',
+                    'reference_invoice', 'reference_lc', 'reference_booking',
+                    'issue_date', 'expiry_date',
+                    'action', 'cross_action_flow', 'intent_evolution',
+                    'consistent_preferences', 'href',
+                    'usage_per', 'usage_limit', 'min_order_amount', 'max_discount_amount',
+                    'started_at', 'expired_at'
+                ];
+                const slim = page.map((r: any) => {
+                    const d: any = {};
+                    for (const k of REMOTE_CARD_KEYS) {
+                        const v = r.data ? r.data[k] : undefined;
+                        if (v === undefined || v === null || v === "") continue;
+                        // 긴 본문은 카드에서 어차피 잘리므로 500자에서 절단합니다.
+                        d[k] = (typeof v === 'string' && v.length > 500) ? v.slice(0, 500) : v;
+                    }
+                    return {
+                        id: r.id,
+                        uuid: r.id,
+                        type: r.type,
+                        mode: r.mode,
+                        cc: r.cc,
+                        ref: r.ref,
+                        created_at: r.created_at,
+                        updated_at: r.updated_at,
+                        data: d
+                    };
+                });
+                if (dataChannel?.readyState === "open") {
+                    const payload = JSON.stringify({
+                        type: "sync_list",
+                        data: slim,
+                        total: total,
+                        reset: !!msg.reset
+                    });
+                    if (payload.length > 240_000) {
+                        console.warn(`[WebRTC] ⚠️ sync_list 페이로드가 ${payload.length}바이트로 SCTP 한계에 근접합니다. REMOTE_CARD_KEYS 를 더 줄이거나 limit 을 낮추세요.`);
+                    }
+                    dataChannel.send(payload);
+                }
+            } else if (msg.type === "ai_search") {
+                const remoteQ = String(msg.query || "").trim();
+                if (remoteQ) {
+                    const taskId = `search_${Date.now()}`;
+                    console.log(`[WebRTC] Remote AI search queued: '${remoteQ}' (${taskId})`);
+                    openWidget("settings");
+                    await GlobalTaskManager.addToQueue(taskId, "ai_search", {
+                        taskId: taskId,
+                        query: remoteQ,
+                        language: "korean",
+                        devicePreference: getDevicePref(),
+                        searchMode: msg.mode || currentSearchMode,
+                        cc: activeContext.cc || "",
+                        bcc: activeContext.bcc || "",
+                        refId: activeContext.ref || ""
+                    });
+                    if (dataChannel?.readyState === "open") {
+                        dataChannel.send(JSON.stringify({
+                            type: "task_queued",
+                            taskId: taskId,
+                            summary: `AI Search: ${remoteQ}`
+                        }));
+                    }
+                }
+            } else if (msg.type === "chat_message") {
+                const remoteText = String(msg.content || "").trim();
+                if (remoteText) {
+                    const now = Date.now();
+                    const localTalkId = `talk_${now}_${Math.random().toString(36).slice(2, 8)}`;
+                    let localLink = "/tracking";
+                    let localOrigin = "https://commerce.logis.center";
+                    let hrefForLink = currentDetectedUrl || "https://commerce.logis.center/tracking";
+                    if (hrefForLink.includes("localhost") || hrefForLink.includes("127.0.0.1") || hrefForLink === "about:blank") {
+                        hrefForLink = "https://commerce.logis.center/tracking";
+                    }
+                    try {
+                        const u = new URL(hrefForLink.toLowerCase());
+                        localLink = (u.pathname + u.search).toLowerCase();
+                        localOrigin = u.origin;
+                    } catch (e) {}
+                    let chatCc = activeContext.cc;
+                    let chatBcc = activeContext.bcc;
+                    let chatRef = activeContext.ref;
+                    const chatDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
+                    if (!chatCc || (!chatDefaultForced && activeTags.length === 0)) {
+                        try {
+                            const urlObj = new URL(hrefForLink.toLowerCase());
+                            const rootDomain = getRootDomain(urlObj.hostname);
+                            chatCc = await hashId(rootDomain);
+                            const link = (urlObj.pathname + urlObj.search).toLowerCase();
+                            chatRef = await hashId((currentSession.team || "") + chatCc + link);
+                        } catch (err) {}
+                    }
+                    try {
+                        await invoke("upsert_items", {
+                            items: [{
+                                id: localTalkId,
+                                table: "talks",
+                                type: "talk",
+                                from: currentSession.address || "",
+                                to: currentSession.team || "",
+                                cc: chatCc || "",
+                                bcc: chatBcc || "",
+                                ref: chatRef || "",
+                                status: 9,
+                                created_at: now,
+                                updated_at: now,
+                                data: {
+                                    text: remoteText,
+                                    link: localLink,
+                                    origin: localOrigin
+                                }
+                            }]
+                        });
+                        console.log(`[WebRTC] Remote chat stored locally '${localTalkId}' (cc=${chatCc}, ref=${chatRef})`);
+                    } catch (e) {
+                        console.warn("[WebRTC] Remote chat local write failed:", e);
+                    }
+                    await renderMessage({
+                        id: localTalkId,
+                        role: "user",
+                        text: remoteText,
+                        status: 9,
+                        created_at: now,
+                        updated_at: now
+                    });
+                }
+            } else if (msg.type === "mobile_upload") {
+                console.log("[WebRTC] Receiving file from mobile:", msg.name);
+                try {
+                    const binaryString = atob(msg.data);
+                    const bytes = new Uint8Array(binaryString.length);
+                    for (let i = 0; i < binaryString.length; i++) {
+                        bytes[i] = binaryString.charCodeAt(i);
+                    }
+                    const tempPath = `mobile_upload_${Date.now()}_${msg.name}`;
+                    const fullPath = await invoke<string>("save_mobile_temp_file", { 
+                        filename: tempPath, 
+                        data: Array.from(bytes) 
+                    });
+                    console.log("[WebRTC] Saved mobile upload to:", fullPath);
+                    const taskId = `task_mobile_${Date.now()}`;
+                    const mobileExt = String(msg.name || "").split('.').pop()?.toLowerCase() || '';
+                    const isMobileDocument = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'hwpx', 'txt', 'csv'].includes(mobileExt);
+                    const mobileTaskType = isMobileDocument ? "document_extraction" : "image_extraction";
+                    const mobileRefHash = await hashId(fullPath);
+
+                    openWidget("settings");
+                    await GlobalTaskManager.addToQueue(taskId, mobileTaskType, {
+                        id: taskId,
+                        type: mobileTaskType,
+                        image_path: fullPath,
+                        document_ext: mobileExt,
+                        ref: mobileRefHash,
+                        cc: activeContext.cc || "",
+                        bcc: activeContext.bcc || "",
+                        link: `Mobile Upload: ${msg.name || "file"}`,
+                        device_preference: getDevicePref(),
+                        search_mode: currentSearchMode
+                    });
+                    if (dataChannel?.readyState === "open") {
+                        dataChannel.send(JSON.stringify({
+                            type: "task_queued",
+                            taskId: taskId,
+                            summary: `Uploading: ${msg.name || "file"}`
+                        }));
+                    }
+                    await updateExtractButtonVisibility();
+                } catch (err) {
+                    console.error("[WebRTC] Mobile upload failed:", err);
+                    if (dataChannel?.readyState === "open") {
+                        dataChannel.send(JSON.stringify({
+                            type: "extraction_progress",
+                            payload: {
+                                task_id: `task_mobile_err_${Date.now()}`,
+                                category: "Error",
+                                summary: `Upload failed: ${err}`
+                            }
+                        }));
+                    }
+                }
+            }
+        } catch (err) {
+            console.error("[WebRTC] Message handle error:", err);
+        }
+    };
+}
+
+// --- Relay Desktop Progress to Mobile ---
+listen("extraction-progress", (event: any) => {
+    if (dataChannel && dataChannel.readyState === "open") {
+        dataChannel.send(JSON.stringify({
+            type: "extraction_progress",
+            payload: event.payload
+        }));
+    }
+});
+listen("app_error_alert", async (event: any) => {
+    const payload = event.payload as any;
+    // 🌟 Settings 탭 자동 열기 + 다운로드 시작
+    if (payload.action === "open_settings") {
+        // 1. 리스트 탭 열기 (설정 패널은 리스트 탭 내부에 있음)
+        openWidget("list");
+        // 2. Settings 패널 내 체크박스 켜기 (설정 패널 보이게)
+        const toggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        if (toggle) {
+            if (!toggle.checked) {
+                toggle.checked = true;
+            }
+            toggle.dispatchEvent(new Event("change"));
+        }
+        // 3. 모델 목록 렌더링 후 다운로드 시작
+        if (payload.model) {
+            console.log(`[AUTO-DL] ${payload.model} 자동 다운로드 시작...`);
+            try {
+                await invoke("download_model", { modelName: payload.model });
+                console.log(`[AUTO-DL] ${payload.model} 다운로드 명령 전송 완료`);
+            } catch (e) {
+                console.error(`[AUTO-DL] ${payload.model} 다운로드 실패:`, e);
+            }
+        }
+    } else {
+        // 기본 폴백: 기존 alert 동작
+        alert(payload.message || "알 수 없는 오류가 발생했습니다.");
+    }
+});
+
+listen("task-console-log", async (event: any) => {
+    const { task_id, text } = event.payload;
+    const key = `term_${task_id}`;
+    
+    // 🌟 localStorage -> Dexie(appDb) 로 영구 보존!
+    let logs = (await kvGet(key)) || "";
+    logs += text;
+    await kvSet(key, logs);
+
+    const termArea = document.getElementById("terminal-logs");
+    if (termArea && termArea.dataset.activeTaskId === task_id) {
+        termArea.appendChild(document.createTextNode(text));
+        termArea.style.display = "block"; // 🌟 [추가] 텍스트가 도착하면 까만 박스를 보여줍니다!
+        termArea.scrollTop = termArea.scrollHeight; 
+    }
+});
+
+async function handleTaskClick(el: HTMLElement) {
+    const taskId = el.dataset.taskId;
+    const status = parseInt(el.dataset.status || "0");
+    if (!taskId) return;
+    
+    console.log("[Chat] Task clicked:", taskId);
+
+    if (taskId.startsWith("search_") && status !== 1) {
+        openWidget("list");
+        listView.style.display = "block";
+        detailView.style.display = "none";
+        return;
+    }
+
+    openWidget("list"); 
+    listView.style.display = "none"; 
+    detailView.style.display = "flex";
+    
+    if (status === 1) {
+        if (btnStopTask) btnStopTask.style.display = "flex";
+    } else {
+        if (btnStopTask) btnStopTask.style.display = "none";
+    }
+    if (btnDetailDelete) btnDetailDelete.style.display = "none";
+
+    detailTitle.innerText = taskId.startsWith("search_") ? "Search Progress" : "Task Progress";
+    
+    let logArea = document.getElementById("extraction-log");
+    if (!logArea) {
+        detailContent.innerHTML = `<div id="extraction-log"></div>`;
+        logArea = document.getElementById("extraction-log");
+    }
+
+    if (logArea) {
+        logArea.dataset.activeTaskId = taskId;
+        
+        const savedLogs = await kvGet(`term_${taskId}`);
+        // 🌟 저장된 로그가 있을 때만 박스를 보여주고, 없으면 숨깁니다. (Connecting... 텍스트 제거)
+        const displayStyle = savedLogs && savedLogs.trim() !== "" ? "block" : "none"; 
+        
+        logArea.innerHTML = `
+            <div id="progress-container"></div>
+            <div id="terminal-logs" data-active-task-id="${taskId}" style="display: ${displayStyle}; background: #0a0a0a; color: #4ade80; padding: 12px; font-family: monospace; font-size: 0.8rem; border-radius: 6px; max-height: 250px; overflow-y: auto; white-space: pre-wrap; border: 1px solid #333; box-shadow: inset 0 0 10px rgba(0,0,0,0.8); line-height: 1.4;">${savedLogs || ""}</div>
+        `;
+        
+        const termArea = document.getElementById("terminal-logs");
+        if (termArea && displayStyle === "block") termArea.scrollTop = termArea.scrollHeight;
+        
+        isFetchingLogs = true;
+        pendingLiveEvents = [];
+
+        invoke<any[]>("get_task_logs", { taskId: taskId }).then(async logs => {
+            if (logArea!.dataset.activeTaskId !== taskId) {
+                isFetchingLogs = false;
+                return;
+            }
+
+            // 🌟 로컬 스토리지엔 없지만 백엔드에 로그가 남아있을 경우 복구하면서 박스를 노출합니다!
+            if (!savedLogs && logs && logs.length > 0 && termArea) {
+                const reconstructed = logs.map(l => `[${l.category ? l.category.toUpperCase() : 'SYSTEM'}] ${l.summary || ''}\n`).join("");
+                if (reconstructed.trim() !== "") {
+                    termArea.innerHTML = reconstructed;
+                    termArea.style.display = "block"; // 숨겨뒀던 박스 노출!
+                    await kvSet(`term_${taskId}`, reconstructed); 
+                    termArea.scrollTop = termArea.scrollHeight;
+                }
+            }
+            
+            if (logs && logs.length > 0) {
+                logs.forEach(payload => {
+                    payload.task_id = payload.task_id || taskId; 
+                    renderProgressToUI(payload, true);
+                });
+            } else if (status === 1) {
+                const progContainer = document.getElementById("progress-container");
+                if (progContainer) progContainer.insertAdjacentHTML('beforeend', `<div id="temp-spinner" style="padding: 10px; text-align: center; color: var(--primary);"><span class="spinner active-spinner">⠋</span> Generating Insights...</div>`);
+            }
+
+            if (status === 1 || status === 10) {
+                const live = livePayloads.get(taskId);
+                if (live) {
+                    live.task_id = taskId;
+                    renderProgressToUI(live, true);
+                }
+            }
+
+            isFetchingLogs = false;
+            pendingLiveEvents.forEach(p => renderProgressToUI(p, false));
+            pendingLiveEvents = [];
+
+        }).catch(err => {
+            console.error(err);
+            isFetchingLogs = false;
+        });
+    }
+    
+    activeTaskId = taskId; 
+}
+
+async function sendSignalingMessage(hash: string, payload: any) {
+    try {
+        await invoke("proxy_fetch", {
+            url: `${API_HOST}/relay/${hash}`,
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: payload // payload is already JSON object or will be stringified
+        });
+    } catch (e) {
+        console.error("[WebRTC] Relay send failed:", e);
+    }
+}
+
+// --- WebRTC SDP Template for Compact Handshake ---
+const SDP_TEMPLATE = `v=0
+o=- {{sessId}} 2 IN IP4 {{ip}}
+s=-
+t=0 0
+a=group:BUNDLE 0
+a=msid-semantic: WMS
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP4 {{ip}}
+a=ice-ufrag:{{ufrag}}
+a=ice-pwd:{{pwd}}
+a=fingerprint:sha-256 {{fingerprint}}
+a=setup:{{setup}}
+a=mid:0
+a=sctp-port:5000
+a=max-message-size:262144`;
+
+function extractSdp(sdp: string) {
+    return {
+        u: sdp.match(/a=ice-ufrag:(.*)/)?.[1] || "",
+        p: sdp.match(/a=ice-pwd:(.*)/)?.[1] || "",
+        f: sdp.match(/a=fingerprint:sha-256 (.*)/)?.[1] || "",
+        s: sdp.match(/o=- (\d+) /)?.[1] || "0"
+    };
+}
+
+function buildSdp(type: 'offer' | 'answer', ip: string, u: string, p: string, f: string, s: string) {
+    return SDP_TEMPLATE
+        .replace(/{{sessId}}/g, s)
+        .replace(/{{ip}}/g, ip)
+        .replace(/{{ufrag}}/g, u)
+        .replace(/{{pwd}}/g, p)
+        .replace(/{{fingerprint}}/g, f)
+        .replace(/{{setup}}/g, type === 'offer' ? 'actpass' : 'active');
+}
+
+async function showPcPairingQr() {
+    const qrTarget = document.getElementById("sync-qrcode");
+    const pcView = document.getElementById("pc-qr-view");
+    const mobileView = document.getElementById("mobile-scan-view");
+    
+    if (!qrTarget || !pcView || !mobileView) return;
+    
+    // Clear existing interval if any
+    if (qrRotationInterval) {
+        clearInterval(qrRotationInterval);
+        qrRotationInterval = null;
+    }
+
+    pcView.classList.remove("hidden");
+    mobileView.classList.add("hidden");
+    stopDesktopCamera();
+
+    qrTarget.innerHTML = "<div style='padding:20px;'><div class='spinner'></div><p>Generating P2P Offer...</p></div>";
+
+    try {
+        // 0. Get Local IP
+        const myIp = await invoke<string>("get_my_full_ip");
+
+        // 1. Initialize PeerConnection (No STUN for local only)
+        peerConn = new RTCPeerConnection({ iceServers: [] });
+        
+        // 2. Create Data Channel (Must create before offer)
+        dataChannel = peerConn.createDataChannel("logis-sync");
+        setupDataChannel(dataChannel);
+
+        // 3. Create Offer
+        const offer = await peerConn.createOffer();
+        await peerConn.setLocalDescription(offer);
+
+        // 4. Wait for ICE Gathering (Essential for LAN connection)
+        console.log("[WebRTC] Gathering ICE candidates (5s)...");
+        await new Promise<void>(resolve => {
+            if (peerConn?.iceGatheringState === 'complete') {
+                resolve();
+            } else {
+                const check = () => {
+                    if (peerConn?.iceGatheringState === 'complete') {
+                        peerConn?.removeEventListener('icegatheringstatechange', check);
+                        resolve();
+                    }
+                };
+                peerConn?.addEventListener('icegatheringstatechange', check);
+                setTimeout(resolve, 5000); // 5s timeout
+            }
+        });
+
+        // Add 1 second stability delay
+        await new Promise(r => setTimeout(r, 1000));
+
+        // 5. Generate QR Data (Multipart/Chunked)
+        const finalSdp = peerConn.localDescription?.sdp || "";
+        const laptopHash = currentSession.hash;
+        
+        // [Relay] Also post to relay server so mobile can find us without scan next time
+        sendSignalingMessage(laptopHash, { type: "offer", sdp: finalSdp });
+
+        const parts = extractSdp(finalSdp);
+        const compactOffer = { t: "offer", h: laptopHash, i: await invoke("get_my_full_ip"), u: parts.u, p: parts.p, f: parts.f, s: parts.s };
+        const qrData = JSON.stringify(compactOffer);
+        
+        console.log(`[WebRTC] Offer Generated. Compact Length: ${qrData.length}`);
+
+        // 6. Show Single QR
+        qrTarget.innerHTML = ""; 
+        const header = document.createElement("div");
+        header.style.marginBottom = "10px";
+        header.style.fontWeight = "bold";
+        header.style.color = "var(--primary)";
+        header.innerText = `Scan to Pair (P2P)`;
+        qrTarget.appendChild(header);
+
+        const qrDiv = document.createElement("div");
+        qrTarget.appendChild(qrDiv);
+
+        new (window as any).QRCode(qrDiv, {
+            text: qrData,
+            width: 250, height: 250, 
+            colorDark: "#000000", colorLight: "#ffffff",
+            correctLevel: (window as any).QRCode.CorrectLevel.M
+        });
+        // Clean up interval when view changes
+        const cleanup = () => {
+            if (qrRotationInterval) clearInterval(qrRotationInterval);
+            document.getElementById("btn-switch-to-camera")?.removeEventListener("click", cleanup);
+        };
+        document.getElementById("btn-switch-to-camera")?.addEventListener("click", cleanup);
+
+    } catch (e) {
+        console.error("[WebRTC] Offer Generation Failed:", e);
+        qrTarget.innerHTML = "<p style='color:red'>Failed to gen offer</p>";
+    }
+}
+
+btnDetailDelete?.addEventListener("click", async () => {
+    console.log("[WIDGET] Delete button clicked. UUID:", currentDetailUuid);
+    if (!currentDetailUuid) {
+        console.error("[WIDGET] No document UUID selected for deletion.");
+        return;
+    }
+    try {
+        const confirmed = await ask("Are you sure you want to delete this document?", {
+            title: "Confirm Delete",
+            kind: "warning"
+        });
+        if (confirmed) {
+            console.log("[WIDGET] Deletion confirmed for:", currentDetailUuid);
+            const res = await invoke<string>("delete_document", { uuid: currentDetailUuid });
+            console.log("[WIDGET] Delete response:", res);
+            if (appDb && currentDetailUuid) {
+                try {
+                    await appDb.table("items").delete(currentDetailUuid);
+                    await appDb.table("users").delete(currentDetailUuid);
+                    await appDb.table("pages").delete(currentDetailUuid);
+                    console.log(`[WIDGET] Dexie cache cleared for: ${currentDetailUuid}`);
+                } catch (dexieErr) {
+                    console.warn("[WIDGET] Dexie delete failed (non-critical):", dexieErr);
+                }
+            }
+            await addItemTombstone(currentDetailUuid);
+            detailView.style.display = "none";
+            listView.style.display = "block";
+            await refreshList();
+            updateResultCount();
+        }
+    } catch (e) {
+        console.error("[WIDGET] Deletion process failed:", e);
+    }
+});
+
+async function refreshList() {
+    currentPage = 0; hasMore = true; cachedDocs = []; selectedUuids.clear();
+    listCurrentY = 0; // Reset scroll
+    if(docListContainer) docListContainer.innerHTML = "";
+    await loadMoreDocs(true);
+}
+
+async function loadMoreDocs(reset: boolean = false, isSync: boolean = false) {
+    const resultH3 = document.querySelector('.nav-section.search h3');
+    const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
+    
+    if (isSearching || isShowingSearchResult) {
+        if (reset && !isSearching) {
+            isLoading = false;
+        } else {
+            return;
+        }
+    }
+
+    if (reset) {
+        currentPage = 0; hasMore = true;
+        if (docListContainer) docListContainer.innerHTML = "";
+        cachedDocs = [];
+        listCurrentY = 0;
+        totalResultCount = -1;
+        updateListTransform();
+        isLoading = false; 
+    }
+
+    if (isLoading || (!reset && !isSync && !hasMore)) {
+        if (reset && !isSync) stopSpinner();
+        return;
+    }
+
+    if (!isSync) startSpinner();
+    isLoading = true;
+    
+    if (headerLoading) {
+        headerLoading.style.display = "inline-block";
+    }
+    
+    try {
+        const allowedTypes = TYPE_SETS[currentSearchMode] || TYPE_SETS.commerce;
+        const textQuery = searchInput?.value.trim() || "";
+        const currentOffset = isSync ? 0 : currentPage * pageSize;
+        let latestUpdateTime = 0;
+        const allCards = docListContainer.querySelectorAll('.logis-result');
+        allCards.forEach(el => {
+            const up = parseInt((el as HTMLElement).dataset.updatedAt || "0");
+            if (up > latestUpdateTime) latestUpdateTime = up;
+        });
+
+        console.log(`[DEBUG-LIST] 🔍 문서 조회 시작 | mode=${currentSearchMode} | isSync=${isSync} | offset=${currentOffset}`);
+        console.log(`[DEBUG-LIST] 활성 컨텍스트:`, JSON.stringify(activeContext));
+
+        let docs: any[] = [];
+
+        if (textQuery) {
+            let scopeSql = `mode = '${currentSearchMode}'`;
+            if (activeContext.ref) scopeSql += ` AND \`ref\` = '${activeContext.ref}'`;
+            else if (activeContext.bcc) scopeSql += ` AND bcc = '${activeContext.bcc}'`;
+            else if (activeContext.cc) scopeSql += ` AND cc = '${activeContext.cc}'`;
+
+            const searchResults = await invoke<any[]>("search_documents", {
+                query: textQuery,
+                limit: pageSize * 4,
+                offset: 0,
+                filter: scopeSql
+            });
+
+            const ids = searchResults.map((r: any) => r[0]).filter(Boolean);
+            if (ids.length > 0 && appDb) {
+                const rows = await appDb.table('items').where('id').anyOf(ids).toArray();
+                const orderMap = new Map<string, number>();
+                ids.forEach((id: string, i: number) => orderMap.set(id, i));
+                rows.sort((a: any, b: any) => (orderMap.get(a.id) ?? 999) - (orderMap.get(b.id) ?? 999));
+                docs = rows.filter((r: any) => allowedTypes.includes(r.type));
+            }
+            if (docs.length === 0 && ids.length > 0) {
+                for (const id of ids.slice(0, pageSize)) {
+                    const fullDoc = await invoke<any>("get_document", { uuid: id });
+                    if (fullDoc) docs.push(fullDoc);
+                }
+            }
+            if (!isSync) totalResultCount = docs.length;
+            docs = docs.slice(currentOffset, currentOffset + pageSize);
+
+        } else if (appDb) {
+            let coll: any;
+            if (activeContext.ref) {
+                coll = appDb.table('items').where('ref').equals(activeContext.ref);
+            } else if (activeContext.bcc) {
+                coll = appDb.table('items').where('bcc').equals(activeContext.bcc);
+            } else if (activeContext.cc) {
+                coll = appDb.table('items').where('cc').equals(activeContext.cc);
+            } else {
+                coll = appDb.table('items').where('mode').equals(currentSearchMode);
+            }
+
+            let rows: any[];
+            if (!activeContext.ref && !activeContext.bcc && !activeContext.cc) {
+                const pairs = allowedTypes.map(t => [currentSearchMode, t]);
+                rows = await appDb.table('items').where('[mode+type]').anyOf(pairs).toArray();
+                console.log(`[DEBUG-LIST] 복합 인덱스 [mode+type] anyOf ${pairs.length}쌍 → ${rows.length}건 적재`);
+            } else {
+                rows = await coll.toArray();
+                rows = rows.filter((r: any) => (r.mode || 'commerce') === currentSearchMode);
+                rows = rows.filter((r: any) => allowedTypes.includes(r.type));
+            }
+            if (isSync && latestUpdateTime > 0) {
+                rows = rows.filter((r: any) => (r.updated_at || 0) > latestUpdateTime);
+            }
+            rows.sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
+            if (!isSync) totalResultCount = rows.length;
+
+            console.log(`[DEBUG-LIST] Dexie 스코프 조회: ${rows.length}건 (allowedTypes=${allowedTypes.length}종)`);
+            docs = isSync ? rows.slice(0, pageSize) : rows.slice(currentOffset, currentOffset + pageSize);
+            if (rows.length === 0 && currentPage === 0) {
+                let scopeSql = `mode = '${currentSearchMode}'`;
+                if (activeContext.ref) scopeSql += ` AND \`ref\` = '${activeContext.ref}'`;
+                else if (activeContext.bcc) scopeSql += ` AND bcc = '${activeContext.bcc}'`;
+                else if (activeContext.cc) scopeSql += ` AND cc = '${activeContext.cc}'`;
+
+                const fromRust = await invoke<any[]>("get_all_documents", {
+                    limit: pageSize * 5,
+                    offset: 0,
+                    filter: scopeSql
+                });
+                if (fromRust.length > 0) {
+                    console.log(`[DEBUG-LIST] ❄️ Cold start: Rust 에서 ${fromRust.length}건 적재 후 Dexie 캐시 채움`);
+                    await appDb.table("items").bulkPut(normalizeEnvelope(fromRust)).catch(() => null);
+                    const coldRows = normalizeEnvelope(fromRust)
+                        .filter((r: any) => allowedTypes.includes(r.type));
+                    if (!isSync) totalResultCount = coldRows.length;
+                    docs = coldRows.slice(0, pageSize);
+                }
+            }
+        }
+        console.log(`[DEBUG-LIST] 📥 조회된 문서 개수: ${docs.length}`);
+        if (docs.length === 0) {
+            console.warn(`[DEBUG-LIST] ⚠️ 데이터가 없습니다. 스코프가 좁거나 해당 타입 데이터가 없습니다.`);
+        }
+        if (appDb && docs.length > 0) {
+            try {
+                await appDb.table("items").bulkPut(normalizeEnvelope(docs));
+            } catch (e) {
+                console.error("[Dexie] Local cache update failed:", e);
+            }
+        }
+        if (textQuery !== (searchInput?.value.trim() || "")) {
+            return;
+        }
+        const currentH3 = document.querySelector('.nav-section.search h3');
+        const currentlyShowingSearch = currentH3 && currentH3.textContent?.toLowerCase().includes("search");
+        if ((isSearching || currentlyShowingSearch) && !textQuery && !isSync) {
+            console.log(`[SEARCH-DEBUG] 일반 리스트 백그라운드 로딩이 완료되었으나, 현재 검색 결과가 활성화되어 있어 덮어쓰기를 원천 차단합니다.`);
+            return;
+        }
+
+        if (!isSync && docs.length < pageSize) hasMore = false;
+
+        if (docs.length > 0) {
+            const mode = isSync ? 'prepend' : 'append';
+            upsertListItems(docs, mode);
+            if (!isSync) {
+                if (reset) currentPage = 1;
+                else currentPage++;
+            }
+            
+            if (isSync) {
+                renderNavigation();
+            }
+        } else if (reset) {
+            docListContainer.innerHTML = `<div class="empty">No documents found.</div>`;
+        }
+    } catch (e) { 
+        console.error("[WIDGET] loadMoreDocs error:", e);
+        if (reset && docListContainer) docListContainer.innerHTML = `<div style='text-align:center; padding:20px; color:#ef4444;'>Error loading data.</div>`;
+    } 
+    finally { 
+        isLoading = false;
+        if (headerLoading) {
+            headerLoading.style.display = "none";
+        }
+        if (!isSync) stopSpinner();
+        updateResultCount();
+    }
+}
+let totalResultCount = -1;
+function updateResultCount() {
+    const h3El = document.querySelector('.nav-section.search h3');
+    if (h3El && h3El.textContent?.includes("searching")) {
+        return; // 검색 중일 때는 카운트 업데이트 무시
+    }
+    const countEl = document.querySelector('.nav-section.search h3 strong.count');
+    if (countEl) {
+        const rendered = document.querySelectorAll('#doc-list .logis-result').length;
+        const total = totalResultCount >= 0 ? totalResultCount : rendered;
+        console.log(`[COUNT] 전체 ${total}건 / 현재 렌더링 ${rendered}건`);
+        countEl.textContent = total > 0 ? `(${total})` : "";
+    } else {
+        console.log(`[SEARCH-DEBUG] DOM 업데이트 실패: H3 카운트 요소(strong.count)를 찾을 수 없습니다.`);
+    }
+}
+
+// keepOrder: 검색 결과는 백엔드 관련도 순서(목표 → 조건 통과 → 구출 → 연결 문서)를 그대로 보여 줍니다.
+// 문서 목록(둘러보기)은 지금처럼 최신순입니다. 예전에는 검색 결과도 created_at 으로 다시 정렬되어 관련도 순위가 화면에서 사라졌습니다.
+function upsertListItems(docs: any[], mode: 'prepend' | 'append', keepOrder: boolean = false) {
+    if (!docListContainer) return;
+
+    const scrollEl = document.getElementById("list-scroll");
+    const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
+    const wasAtTop = listCurrentY <= 10; 
+
+    const sortedBatch = keepOrder ? [...docs] : [...docs].sort((a, b) => b.created_at - a.created_at);
+    const processBatch = mode === 'prepend' ? [...sortedBatch].reverse() : sortedBatch;
+
+    processBatch.forEach(doc => {
+        const docId = doc.id || doc.uuid || (doc.data && (doc.data.id || doc.data.uuid)) || doc.uuid_val || doc.ref || doc.index;
+        const existingEl = docListContainer.querySelector(`[id="${docId}"]`) as HTMLElement;
+        const html = item2html(doc, false, currentDetectedUrl);
+        const temp = document.createElement('div');
+        temp.innerHTML = html;
+        const newCheckbox = temp.querySelector(`input#more-${docId}`) as HTMLElement || temp.querySelector('.toggle-more') as HTMLElement;
+        const newCard = temp.querySelector(`div[id="${docId}"]`) as HTMLElement || temp.querySelector('.logis-result') as HTMLElement;
+
+        if (existingEl) {
+            const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
+            if (doc.updated_at > cachedUpdatedAt) {
+                console.log(`[List] Updating item ${docId}`);
+                const oldCheckbox = docListContainer.querySelector(`#more-${docId}`);
+                if (oldCheckbox && newCheckbox) docListContainer.replaceChild(newCheckbox, oldCheckbox);
+                
+                if (newCard) {
+                    docListContainer.replaceChild(newCard, existingEl);
+                    bindCardEvents(newCard, doc);
+                }
+            }
+        } else {
+            if (mode === 'prepend') {
+                if (newCard) docListContainer.prepend(newCard);
+                if (newCheckbox) docListContainer.prepend(newCheckbox);
+            } else {
+                if (newCheckbox) docListContainer.appendChild(newCheckbox);
+                if (newCard) docListContainer.appendChild(newCard);
+            }
+            if (newCard) bindCardEvents(newCard, doc);
+        }
+    });
+
+    if (mode === 'prepend' && scrollEl) {
+        const newScrollHeight = scrollEl.scrollHeight;
+        const heightDiff = newScrollHeight - prevScrollHeight;
+        if (heightDiff > 0) {
+            if (wasAtTop) listCurrentY = 0;
+            else listCurrentY += heightDiff;
+            updateListTransform();
+        }
+    }
+}
+
+function bindCardEvents(el: HTMLElement, doc: any) {
+    const toggleCheckbox = el.querySelector('.toggle-more') as HTMLInputElement;
+    const moreContent = el.querySelector('.more-content') as HTMLElement;
+    const moreLabel = el.querySelector('.more-label') as HTMLElement;
+    const relateContainer = el.querySelector('.logis-relate') as HTMLElement;
+    if (toggleCheckbox && moreContent && moreLabel) {
+        toggleCheckbox.addEventListener('change', async () => {
+            if (toggleCheckbox.checked) {
+                moreContent.style.display = "block";
+                moreLabel.innerHTML = "fold ▲";
+                if (relateContainer) {
+                    await loadRelatedData(doc, relateContainer);
+                }
+            } else {
+                moreContent.style.display = "none";
+                moreLabel.innerHTML = "more ▼";
+            }
+        });
+    }
+    el.addEventListener("click", (e) => {
+        const target = e.target as HTMLElement;
+        if (target.closest('.toggle-more') || target.closest('.more-label') || target.closest('.more-content') || target.closest('.logis-relate')) {
+            return;
+        }
+        const docId = doc.id || doc.uuid || (doc.data && (doc.data.id || doc.data.uuid)) || doc.uuid_val || doc.ref || doc.index;
+        if (!target.closest('a') && !target.closest('input') && !target.closest('button')) {
+            if (docId) showDetail(String(docId));
+        }
+    });
+}
+async function loadRelatedData(doc: any, container: HTMLElement) {
+    if (!container || container.dataset.loaded === "true") return;
+    // 스피너 표시
+    container.innerHTML = `<div style="padding:10px; text-align:center; font-size:0.8rem; color:var(--primary);"><span class="active-spinner">⠋</span> Loading related data...</div>`;
+    try {
+        const docId = doc.id || doc.uuid;
+        const docRef = doc.ref;
+        let uniqueDocs: any[] = [];
+        if (appDb) {
+            const refTargets = [docId];
+            if (docRef && docRef !== "") refTargets.push(docRef);
+            const refRows = await appDb.table('items').where('ref').anyOf(refTargets).limit(20).toArray();
+            for (const r of refRows) {
+                if (r.id !== docId && !uniqueDocs.some(d => d.id === r.id)) {
+                    uniqueDocs.push(r);
+                }
+            }
+            const relKeys = Object.keys(doc.data || {}).filter(k => k.startsWith("rel_"));
+            for (const relKey of relKeys) {
+                const relVal = doc.data?.[relKey];
+                if (relVal === undefined || relVal === null) continue;
+                const relValNum = Number(relVal);
+                if (isNaN(relValNum)) continue;
+                try {
+                    const revRows = await appDb.table('items')
+                        .where('data.index')
+                        .equals(relValNum)
+                        .limit(5)
+                        .toArray();
+                    for (const r of revRows) {
+                        if (r.id !== docId && !uniqueDocs.some(d => d.id === r.id)) {
+                            uniqueDocs.push(r);
+                        }
+                    }
+                } catch (_e) { /* 인덱스 없으면 무시 */ }
+            }
+            const myIndex = doc.data?.index;
+            if (myIndex !== undefined && myIndex !== null) {
+                const myIndexNum = Number(myIndex);
+                if (!isNaN(myIndexNum)) {
+                    // rel_* 컬럼 중 하나로 나를 참조하는 문서들
+                    for (const relKey of relKeys) {
+                        try {
+                            const relRows = await appDb.table('items')
+                                .where(`data.${relKey}`)
+                                .equals(myIndexNum)
+                                .limit(5)
+                                .toArray();
+                            for (const r of relRows) {
+                                if (r.id !== docId && !uniqueDocs.some(d => d.id === r.id)) {
+                                    uniqueDocs.push(r);
+                                }
+                            }
+                        } catch (_e) { /* 인덱스 없으면 무시 */ }
+                    }
+                }
+            }
+
+            uniqueDocs = uniqueDocs.slice(0, 10);
+        }
+        // Dexie 가 비어 있으면 Rust 로 폴백합니다.
+        if (uniqueDocs.length === 0) {
+            let filterStr = `\`ref\` = '${docId}'`;
+            if (docRef && docRef !== "") {
+                filterStr += ` OR \`ref\` = '${docRef}'`;
+            }
+            const relatedDocs = await invoke<any[]>("get_all_documents", {
+                limit: 10,
+                offset: 0,
+                filter: filterStr
+            });
+            uniqueDocs = relatedDocs.filter(d => (d.id || d.uuid) !== docId);
+        }
+        if (uniqueDocs.length > 0) {
+            const relatedHtml = uniqueDocs.map(d => {
+                // 🌟 하위 아이템은 무한 확장을 막기 위해 checked=true (펼쳐짐) 및 부가 정보 축소 형태로 렌더링
+                return item2html(d, true, currentDetectedUrl);
+            }).join("");
+            // 연관 데이터 UI 주입
+            container.innerHTML = `<div style="margin-top:15px; border-top:1px dashed rgba(255,255,255,0.2); padding-top:10px;">
+<strong style="font-size:0.8rem; color:#aaa; margin-bottom:10px; display:block;">🔗 Related Documents</strong>
+${relatedHtml}
+</div>`;
+            // 내부 연관 카드의 클릭 이벤트(상세 페이지 진입)도 재귀적으로 바인딩
+            const newCards = container.querySelectorAll('.logis-result');
+            newCards.forEach((card, idx) => {
+                bindCardEvents(card as HTMLElement, uniqueDocs[idx]);
+            });
+        } else {
+            // 연관 데이터가 없으면 깔끔하게 비움
+            container.innerHTML = "";
+        }
+        container.dataset.loaded = "true"; // 불필요한 중복 쿼리 방지 (캐싱)
+    } catch (e) {
+        console.error("[Relay] Failed to load related data:", e);
+        container.innerHTML = `<div style="color:#ef4444; font-size:0.7rem; padding:5px;">Failed to load related data.</div>`;
+    }
+}
+
+function renderDocs(docs: any[]) {
+    // This is now handled by upsertListItems for consistency
+    upsertListItems(docs, 'append');
+}
+
+async function showDetail(uuid: string) {
+    console.log("[WIDGET] Opening detail view for ID:", uuid);
+    if (!uuid) {
+        console.error("[WIDGET] Cannot open detail: ID is undefined");
+        return;
+    }
+    currentDetailUuid = uuid;
+    listView.style.display = "none";
+    detailView.style.display = "flex";
+    if (btnDetailDelete) btnDetailDelete.style.display = "flex";
+    if (btnStopTask) btnStopTask.style.display = "none";
+
+    detailTitle.innerText = "Loading...";
+    detailContent.innerHTML = "Fetching details...";
+    try {
+        const doc = await invoke<any>("get_document", { uuid: uuid });
+        if (doc) {
+            detailTitle.innerText = `${doc.doc_type || 'Detail'} ${doc.doc_number || ''}`;
+            let prettyJson = doc.json_data;
+            try { prettyJson = JSON.stringify(JSON.parse(doc.json_data), null, 2); } catch(e) {}
+            detailContent.innerHTML = `<div style="margin-bottom:10px;"><strong>Summary:</strong><br>${doc.text}</div><hr style="border-color:#444;"><pre style="white-space: pre-wrap; font-size: 0.8rem; color:#fff; background:#111; padding:10px;">${prettyJson}</pre>`;
+        } else {
+            detailContent.innerHTML = `<div class="empty">Document not found in database.</div>`;
+        }
+    } catch (e) { 
+        console.error("[WIDGET] get_document failed:", e);
+        detailContent.innerHTML = "Failed to load document details: " + e; 
+    }
+}
+
+btnDetailBack?.addEventListener("click", () => { detailView.style.display = "none"; listView.style.display = "block"; });
+document.getElementById("btn-settings-back")?.addEventListener("click", collapseWidget);
+
+// 🌟 [수정] 세팅 패널이 열려있을 때는 세팅을 닫고 리스트로 복귀하며, 일반 리스트 상태일 때는 위젯을 닫습니다.
+btnListBack?.addEventListener("click", () => {
+    const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+    
+    // 🌟 [추가] 검색 결과가 표시된 상태에서 뒤로가기 버튼 클릭 시 위젯을 닫지 않고 전체 리스트로 복구합니다.
+    const resultH3 = document.querySelector('.nav-section.search h3');
+    const isShowingSearchResult = resultH3 && resultH3.textContent?.toLowerCase().includes("search");
+    
+    // 🌟 [CRITICAL FIX] 검색이 진행 중(isSearching)일 때는 리스트 초기화를 막습니다.
+    if (isShowingSearchResult && !isSearching) {
+        if (searchInput) searchInput.value = "";
+        if (resultH3) resultH3.innerHTML = `Result <strong class="count"></strong>`;
+        refreshList();
+        return; // 검색 복구만 수행하고 위젯은 닫지 않음
+    } else if (isSearching) {
+        // 🌟 진행 중일 때는 화면(결과, 상태)을 보존한 채로 패널만 닫거나 위젯을 축소합니다.
+        if (settingsToggle && settingsToggle.checked) {
+            settingsToggle.checked = false;
+            settingsToggle.dispatchEvent(new Event("change"));
+        } else {
+            collapseWidget();
+        }
+        return;
+    }
+
+    if (settingsToggle && settingsToggle.checked) {
+        settingsToggle.checked = false;
+        settingsToggle.dispatchEvent(new Event("change")); // 세팅 패널 닫기 이벤트 트리거
+    } else {
+        collapseWidget(); // 기존처럼 위젯 닫기
+    }
+});
+
+document.getElementById("nav-signin")?.addEventListener("click", () => openWidget("settings"));
+document.getElementById("nav-signout")?.addEventListener("click", () => { document.getElementById("btn-logout")?.click(); });
+
+async function handleImageUpload(path: string) {
+    currentImage = path;
+    if (navPreviewContainer && navImgThumbnail) {
+        navPreviewContainer.classList.remove("hidden");
+        navUploadBtn?.classList.add("active-emoji");
+        
+        // 🌟 [수정] 이미지 업로드 시 검색창을 막고 버튼을 숨기던 로직을 제거합니다.
+        if (searchInput) {
+            searchInput.disabled = false;
+            if (btnSubmit) {
+                const currentVal = searchInput.value.trim();
+                if (currentVal !== "" && !isQueryActive(currentVal)) {
+                    btnSubmit.style.display = "flex";
+                } else {
+                    btnSubmit.style.display = "none";
+                }
+            }
+        }
+        if (btnExtract) btnExtract.style.display = "flex";
+        
+        try {
+            const ext = path.split('.').pop()?.toLowerCase() || '';
+            const isDocument = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'hwpx', 'txt', 'csv'].includes(ext);
+
+            if (isDocument) {
+                // 문서는 아이콘 형태나 텍스트(확장자) 표시
+                navImgThumbnail.src = `./assets/doc_icon.svg`; // 문서용 기본 아이콘 (퍼블릭 폴더에 파일이 없을 경우 엑박 및 alt 텍스트 표시됨)
+                navImgThumbnail.alt = `Doc: ${ext.toUpperCase()}`;
+                navImgThumbnail.style.objectFit = "contain";
+                navImgThumbnail.style.background = "#fff";
+            } else {
+                const contents = await readFile(currentImage);
+                const blob = new Blob([contents]);
+                const reader = new FileReader();
+                reader.onloadend = () => { navImgThumbnail.src = reader.result as string; };
+                reader.readAsDataURL(blob);
+                navImgThumbnail.style.objectFit = "cover";
+                navImgThumbnail.style.background = "transparent";
+            }
+        } catch (e) { 
+            navImgThumbnail.src = convertFileSrc(currentImage); 
+        }
+
+        console.log("[WIDGET] File selected. Extraction button (⚡) is now visible.");
+        
+        // 🌟 [추가] 이미지 선택 시 설정(채팅) 탭으로 화면을 전환하고 스크롤을 맨 아래로 내립니다.
+        openWidget("settings");
+        setTimeout(() => {
+            const scrollEl = document.getElementById("chat-scroll");
+            const container = document.querySelector(".chat-container") as HTMLElement;
+            if (scrollEl && container) {
+                const maxScroll = Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+                currentY = maxScroll;
+                scrollEl.style.transition = "transform 0.3s ease-out";
+                updateTransform();
+                setTimeout(() => { scrollEl.style.transition = ""; }, 300);
+            }
+        }, 100);
+    }
+}
+
+navImgClear?.addEventListener("click", async () => {
+    currentImage = null;
+    navPreviewContainer.classList.add("hidden");
+    navUploadBtn?.classList.remove("active-emoji");
+    
+    // 🌟 [유지] 검색창 활성화 및 조건부 검색 버튼 노출을 명시적으로 보장합니다.
+    searchInput.disabled = false;
+    if (btnSubmit) {
+        const currentVal = searchInput.value.trim();
+        if (currentVal !== "" && !isQueryActive(currentVal)) {
+            btnSubmit.style.display = "flex";
+        } else {
+            btnSubmit.style.display = "none";
+        }
+    }
+    
+    await updateExtractButtonVisibility();
+});
+
+navUploadBtn?.addEventListener("click", async () => {
+    const file = await open({ 
+        multiple: false, 
+        filters: [
+            { name: 'Supported Files', extensions: ['png', 'jpg', 'jpeg', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'hwpx', 'txt', 'csv'] }
+        ] 
+    });
+    if (file) await handleImageUpload(file as string);
+});
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
+
+async function checkAuthStatus() {
+    const origin = "https://commerce.logis.center"; 
+    const now = Date.now();
+    const createdAt = now - timezoneOffset; 
+    try {
+        let targetHref = currentDetectedUrl || "https://commerce.logis.center/tracking";
+        if (targetHref.includes("localhost") || targetHref.includes("127.0.0.1") || targetHref === "about:blank") {
+            targetHref = "https://commerce.logis.center/tracking";
+        }
+        const queryParams: Record<string, string> = { 
+            origin: origin, 
+            created_at: createdAt.toString(), 
+            href: targetHref 
+        };
+        const hasPairedCredential = !!(currentSession.hash && currentSession.token);
+        if (hasPairedCredential) {
+            queryParams.hash = currentSession.hash;
+            queryParams.token = currentSession.token as string;
+        } else {
+            console.log("[AUTH] 🔑 자격증명 쌍이 없어 bootstrap 요청을 보냅니다. 서버가 (hash, token) 을 새로 발급합니다.");
+        }
+        const senderName = currentSession.email || currentSession.name || "";
+        if (senderName) queryParams.sender = senderName;
+        const params = new URLSearchParams(queryParams);
+        const finalUrl = `${API_HOST}/?${params.toString()}`.toLowerCase();
+        const sessionParams = hasPairedCredential
+            ? { hash: currentSession.hash, token: currentSession.token }
+            : null;
+        const sentHash = currentSession.hash || "";
+        console.log('sessionParams',sessionParams);
+        const data = await invoke<any>("proxy_fetch", { url: finalUrl, method: "GET", headers: { "Content-Type": "application/json" }, session_params: sessionParams });
+        stepQrSpinner();
+        let session = data.session || data; 
+        if (session && session.hash) {
+            const hashChanged = session.hash !== currentSession.hash;
+            if (hashChanged && hasPairedCredential) {
+                console.warn(
+                    `[AUTH] ⚠️ 서버가 자격증명을 거부하고 hash 를 회전시켰습니다. ` +
+                    `sent='${sentHash}' → issued='${session.hash}'. ` +
+                    `(S3 /hash/{hash} 객체 소실 또는 워커 세션 블록 예외 가능성)`
+                );
+            }
+            currentSession = { ...currentSession, ...session };
+            await saveSession();
+            isHashServerConfirmed = true;
+            if (hashChanged && !currentSession.email && currentTab === "settings") performQrAuth();
+            console.log('currentSession',currentSession);
+            if (currentSession.email) {
+                await invoke("initialize_hub", { address: currentSession.address, email: currentSession.email, flag: session.flag || "kr" });
+                updateAuthUI(); fetchChatHistory(); syncData();
+            }
+        }
+    } catch (e) { 
+        console.warn("Auth check failed:", e); 
+    }
+}
+
+function updateAuthUI() {
+    const authStatus = document.getElementById("auth-status-text");
+    const btnLogout = document.getElementById("btn-logout");
+    const btnQrAuth = document.getElementById("btn-qr-auth");
+    const chatForm = document.querySelector(".chat-form") as HTMLElement;
+    const cloudToggle = document.getElementById("cloud-mode-toggle") as HTMLInputElement;
+    const cloudMembersSection = document.getElementById("nav-list-users")?.closest(".nav-section") as HTMLElement;
+    console.log('currentSession',currentSession);
+    if (currentSession.email) {
+        if (authStatus) authStatus.innerText = "Authenticated";
+        if (btnLogout) btnLogout.style.display = "block";
+        if (btnQrAuth) btnQrAuth.style.display = "none";
+        if (chatForm) chatForm.classList.remove("hidden");
+        const qrMsg = document.getElementById("msg-qr-auth");
+        if (qrMsg) qrMsg.remove();
+        if (cloudToggle) {
+            cloudToggle.disabled = false;
+            cloudToggle.title = "Cloud AI Mode is available";
+        }
+        const isSettingsOpen = (document.getElementById("settings-toggle") as HTMLInputElement)?.checked;
+        if (cloudMembersSection) cloudMembersSection.style.display = isSettingsOpen ? "none" : "";
+    } else {
+        if (authStatus) authStatus.innerText = "Waiting for Auth...";
+        if (btnLogout) btnLogout.style.display = "none";
+        if (btnQrAuth) btnQrAuth.style.display = "block";
+        if (chatForm) chatForm.classList.add("hidden");
+        
+        if (cloudToggle) {
+            cloudToggle.disabled = true;
+            cloudToggle.checked = false;
+            cloudToggle.title = "Login required to use Cloud AI";
+        }
+        if (cloudMembersSection) cloudMembersSection.style.display = "none"; 
+    }
+}
+
+let authPollInterval: number | null = null;
+let renderedQrHash = "";
+let isHashServerConfirmed = false;
+
+function stopAuthPolling() {
+    if (authPollInterval) {
+        clearTimeout(authPollInterval);
+        authPollInterval = null;
+    }
+}
+
+function startAuthPolling() {
+    if (authPollInterval) clearTimeout(authPollInterval);
+    const poll = async () => {
+        if (currentSession.email) {
+            stopAuthPolling();
+            return;
+        }
+        await checkAuthStatus();
+        if (!currentSession.email) {
+            authPollInterval = window.setTimeout(poll, 3000);
+        } else {
+            stopAuthPolling();
+        }
+    };
+    authPollInterval = window.setTimeout(poll, 3000);
+}
+
+async function performQrAuth() {
+    if (!chatTalks) return;
+    if (!currentSession.hash || !isHashServerConfirmed) {
+        const placeholderId = "msg-qr-auth";
+        if (!document.getElementById(placeholderId)) {
+            chatTalks.insertAdjacentHTML('beforeend',
+                `<div class="chat-talk system" id="${placeholderId}" data-created-at="9999999999999">
+                    <div class="chat-message" style="padding:0; background:#fff; color:#000; border:0;">
+                        <div style="font-size:0.8rem; font-weight:bold; color:#333;">
+                            <span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:#000; font-weight:bold;">⠋</span>Preparing secure session...
+                        </div>
+                    </div>
+                </div>`
+            );
+        }
+        startAuthPolling();
+        return;
+    }
+    const alreadyRendered = document.getElementById("qr-code-target");
+    if (alreadyRendered && renderedQrHash === currentSession.hash) {
+        if (!authPollInterval && !currentSession.email) startAuthPolling();
+        return;
+    }
+    const existing = document.getElementById("msg-qr-auth");
+    if (existing) existing.remove();
+    const html = `<div class="chat-talk system" id="msg-qr-auth" data-created-at="9999999999999"><div class="chat-message" style="padding:0; background: #fff; color: #000; border:0;"><div style="font-size:0.8rem; font-weight: bold; margin-bottom: 15px; color: #333;"><span id="qr-auth-spinner" class="active-spinner" style="margin-right:5px; font-family:monospace; color:#000; font-weight:bold;">⠋</span>Scan the QR code</div><div id="qr-code-target" style="display: inline-block; background: #fff; border-radius: 8px;"></div></div></div>`;
+    chatTalks.insertAdjacentHTML('beforeend', html);
+    const qrTarget = document.getElementById("qr-code-target");
+    if (qrTarget) {
+        qrTarget.innerHTML = "";
+        const mailtoAddr = `mailto:${encodeURIComponent(currentSession.hash + ".logis.center@oauth.email")}`;
+        new (window as any).QRCode(qrTarget, { text: mailtoAddr, width: 300, height: 300, colorDark: "#000000", colorLight: "#ffffff", correctLevel: (window as any).QRCode.CorrectLevel.M });
+        renderedQrHash = currentSession.hash;
+        console.log(`[AUTH] 🔳 QR rendered for server-confirmed hash '${currentSession.hash}'`);
+        const scroll = document.getElementById("chat-scroll");
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    }
+    startAuthPolling();
+}
+window.addEventListener("blur", () => {
+    isFocus = false;
+    if (chatPollInterval) {
+        clearTimeout(chatPollInterval);
+        chatPollInterval = null;
+        console.log("[WIDGET] Window blurred. Polling paused to save resources.");
+    }
+});
+window.addEventListener("focus", () => {
+    isFocus = true;
+    syncBrowserStatus();
+    if (!chatPollInterval) {
+        console.log("[WIDGET] Window focused. Polling resumed.");
+        if (currentSession.email) {
+            fetchChatHistory(false, true); 
+        }
+        startPolling();
+    }
+});
+function startPolling() {
+    if (chatPollInterval) {
+        clearTimeout(chatPollInterval);
+        chatPollInterval = null;
+    }
+    if (!isFocus) return;
+    const poll = async () => {
+        if (!isFocus) return;
+        if (currentTab === "settings" && isExpanded) {
+            try {
+                if (!currentSession.email) {
+                    await checkAuthStatus();
+                } else {
+                    await syncData();
+                }
+            } catch (e) {
+                console.error("[POLLING] Error during poll:", e);
+            }
+        }
+        const nextInterval = computeSyncInterval();
+        if (isFocus) {
+            chatPollInterval = window.setTimeout(poll, nextInterval);
+        }
+    };
+    const initialInterval = computeSyncInterval();
+    chatPollInterval = window.setTimeout(poll, initialInterval);
+}
+
+
+
+async function saveSession() { await kvSet("chat_session", JSON.stringify(currentSession)); }
+let hiddenPages: string[] = [];
+async function initSession() {
+    updateAuthUI();
+    const savedHiddenPages = await kvGet("hidden_pages");
+    if (savedHiddenPages) {
+        try { hiddenPages = JSON.parse(savedHiddenPages); } catch(e) {}
+    }
+    await loadTalkTombstones();
+    const allKeys = await appDb.table("kv_store").toCollection().primaryKeys();
+    const nowTimeMs = Date.now();
+    // 30일을 밀리초 단위로 계산 (30일 * 24시간 * 60분 * 60초 * 1000)
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+
+    for (const key of allKeys) {
+        if (typeof key === "string") {
+            // 1. 기존 터미널 로그 찌꺼기는 즉시 청소
+            if (key.startsWith("term_")) {
+                await kvRemove(key);
+            }
+            // 2. 30일이 지난 과거 검색 결과 가비지 컬렉션 (자동 청소)
+            else if (key.startsWith("search_res_search_")) {
+                // key 포맷: search_res_search_1715610000000 -> 타임스탬프 숫자만 추출
+                const timestampStr = key.replace("search_res_search_", "");
+                const timestamp = parseInt(timestampStr, 10);
+
+                // 유효한 숫자인지 확인 후, 30일이 경과했으면 로컬 DB에서 삭제
+                if (!isNaN(timestamp) && (nowTimeMs - timestamp > thirtyDaysMs)) {
+                    console.log(`[GC] Deleting expired search result (older than 30 days): ${key}`);
+                    await kvRemove(key);
+                }
+            }
+        }
+    }
+
+    // 🌟 [TRANSLIT CACHE GC] 90일이 지난 음차 캐시 정리.
+    //    음차는 원문 값이 바뀌면 키가 달라지므로 자동 무효화되지만,
+    //    삭제된 아이템의 잔재가 쌓이는 것을 방지하기 위해 주기적으로 청소합니다.
+    try {
+        const ninetyDaysMs = 90 * 24 * 60 * 60 * 1000;
+        const cutoff = nowTimeMs - ninetyDaysMs;
+        const staleCount = await appDb.table("translit_cache")
+            .where("created_at")
+            .below(cutoff)
+            .delete();
+
+        if (staleCount > 0) {
+            console.log(`[GC] Deleted ${staleCount} stale translit cache entries (older than 90 days).`);
+        }
+    } catch (e) {
+        console.warn("[GC] translit_cache cleanup failed:", e);
+    }
+    // 🌟 search_mode 도 여기서 비동기로 불러와 초기화합니다.
+    //    남은 트랙은 commerce / shipping 둘뿐이므로, 이전 버전이 저장한 'analytic' 같은 값은 무시하고 기본값(commerce)을 씁니다.
+    const savedSearchMode = await kvGet("search_mode");
+    if (savedSearchMode === "commerce" || savedSearchMode === "shipping") {
+        currentSearchMode = savedSearchMode;
+        applySearchModeUI(); // UI에 즉시 반영
+    }
+
+    const saved = await kvGet("chat_session");
+    if (saved) { try { currentSession = { ...currentSession, ...JSON.parse(saved) }; } catch (e) {} } 
+    else { const legacy = await kvGet("device_hash"); if (legacy) currentSession.hash = legacy; }
+    if (currentSession.hash && currentSession.token) {
+        isHashServerConfirmed = true;
+    } else if (currentSession.hash && !currentSession.token) {
+        console.warn(`[AUTH] ⚠️ hash 는 있으나 token 이 없어 세션이 성립하지 않습니다. 폐기 후 서버에서 재발급받습니다. (orphan hash: ${currentSession.hash})`);
+        currentSession.hash = "";
+        currentSession.token = undefined;
+        isHashServerConfirmed = false;
+    }
+
+    await saveSession(); 
+    currentSession.address = currentSession.address || ZERO_ADDRESS;
+    currentSession.team = currentSession.team || await hashId(ZERO_ADDRESS);
+    updateAuthUI(); 
+    startPolling();
+
+    try {
+        console.log("[WIDGET] UI Ready handshake starting...");
+        await GlobalTaskManager.loadQueue();
+        const data = await invoke<any>("mark_ui_ready");
+        try {
+            if (data.users && data.users.length > 0) await appDb.table("users").bulkPut(normalizeEnvelope(data.users));
+            if (data.pages && data.pages.length > 0) await appDb.table("pages").bulkPut(normalizeEnvelope(data.pages));
+            if (data.items && data.items.length > 0) await appDb.table("items").bulkPut(normalizeEnvelope(data.items));
+        } catch(dbErr) {
+            console.error("[Dexie] Initial sync failed:", dbErr);
+        }
+        const runningTask = data.tasks && data.tasks.find((t: any) => t.status === 1);
+        if (runningTask) {
+            GlobalTaskManager.isBusy = true;
+            GlobalTaskManager.currentTaskId = runningTask.id;
+            console.log(`[QUEUE] Backend is busy with ${runningTask.id}. Pausing frontend queue.`);
+        }
+
+        const currentLockId = await kvGet("sys_lock");
+        if (currentLockId) {
+            const isTaskStillAlive = data.tasks && data.tasks.some((t: any) => t.id === currentLockId && (t.status === 1 || t.status === 10));
+            const isPendingInQueue = GlobalTaskManager.queue.some(q => q.taskId === currentLockId);
+            if (!isTaskStillAlive && !isPendingInQueue) {
+                console.log(`[LOCK] Zombie detected: ${currentLockId} is not active in Backend or Queue. Releasing.`);
+                await kvRemove("sys_lock");
+                GlobalTaskManager.isBusy = false;
+                GlobalTaskManager.currentTaskId = null;
+                GlobalTaskManager.currentTaskPayload = null;
+                GlobalTaskManager.activeRefs.clear();
+                GlobalTaskManager.queue = [];
+                GlobalTaskManager.backendQueued = [];
+                try {
+                    await appDb.table("ts_queue").clear();
+                } catch (e) {
+                    console.warn("[LOCK] ts_queue clear failed:", e);
+                }
+                console.log("[LOCK] Zombie lock released. Session and settings preserved.");
+            } else {
+                console.log(`[LOCK] Valid task detected: ${currentLockId}. Keeping lock.`);
+                if (currentLockId.startsWith("search_")) isSearching = true;
+                else isExtracting = true;
+                activeTaskId = currentLockId;
+                startSpinner();
+            }
+        }
+
+        // 🌟 3. 큐 복구 후 밀린 작업이 있다면 자동 재개
+        if (GlobalTaskManager.queue.length > 0 && !GlobalTaskManager.isBusy) {
+            GlobalTaskManager.processNext();
+        }
+
+        // 🌟 4. DOM 청소 시 TS Queue 생존자도 보호
+        const allBubbles = chatTalks.querySelectorAll('.task-bubble');
+        allBubbles.forEach(el => {
+            const bubbleId = el.id;
+            const bubbleStatus = parseInt((el as HTMLElement).dataset.status || "0");
+            if (bubbleStatus === 1 || bubbleStatus === 10) {
+                const existsInDb = data.tasks && data.tasks.some((t: any) => t.id === bubbleId);
+                const existsInQueue = GlobalTaskManager.queue.some(q => q.taskId === bubbleId);
+                
+                if (!existsInDb && !existsInQueue) {
+                    console.log(`[UI] Removing zombie bubble from DOM: ${bubbleId}`);
+                    el.remove();
+                    const queryEl = document.getElementById(`${bubbleId}_query`);
+                    if (queryEl) queryEl.remove();
+                }
+            }
+        });
+
+        // 🌟 새로고침 시 DB에 살아남은 진짜 대기열 목록만 복구
+        if (data.tasks && data.tasks.length > 0) {
+            for (const t of data.tasks) {
+                if (t.status === 10 || t.status === 1) {
+                    let taskData: any = {};
+                    let taskQuery = "";
+                    try {
+                        taskData = typeof t.data_json === 'string' ? JSON.parse(t.data_json) : t.data_json;
+                        taskQuery = taskData.query || "";
+                    } catch(e) {
+                        console.warn("[WIDGET] Failed to parse task data for query recovery:", e);
+                    }
+
+                    // 1. 사용자 질문 말풍선 강제 복구 (100% DB 기반)
+                    if (taskQuery) {
+                        const userMsgId = `${t.id}_query`;
+                        if (!document.getElementById(userMsgId)) {
+                            await renderMessage({
+                                id: userMsgId,
+                                role: "user",
+                                text: taskQuery,
+                                status: 9,
+                                // 🌟 [최종 수정] 시스템 태스크(t.created_at)보다 100ms 앞당겨 정렬 엔진의 충돌을 완벽히 회피합니다.
+                                created_at: Number(t.created_at) - 100,
+                                updated_at: Number(t.created_at) - 100
+                            });
+                        }
+                    }
+
+                    // 2. 시스템 대기열/진행 상태 말풍선 복구
+                    if (!document.getElementById(t.id)) {
+                        await renderMessage({
+                            id: t.id,
+                            task_id: t.id,
+                            role: "system_task",
+                            text: t.id.startsWith("search_") ? "Task Started: AI Search" : ("Task Started: " + (t.ref || "Local Source")),
+                            status: t.status,
+                            // 🌟 [핵심 수정] 기준 시간(t.created_at) 그대로 사용하여 질문 뒤에 오게 함
+                            created_at: t.created_at,
+                            updated_at: t.updated_at
+                        });
+                    }
+                    const isSearchGhost = t.id.startsWith("search_") && !GlobalTaskManager.queue.some(q => q.taskId === t.id);
+                    if (!isSearchGhost) {
+                        if (t.status === 1) {
+                            await kvSet("sys_lock", t.id);
+                            
+                            if (t.id.startsWith("search_")) {
+                                isSearching = true;
+                                if (btnSubmit) btnSubmit.style.display = "none";
+                            } else {
+                                isExtracting = true;
+                            }
+                            activeTaskId = t.id;
+                            startSpinner();
+
+                            GlobalTaskManager.isBusy = true;
+                            GlobalTaskManager.currentTaskId = t.id;
+                            GlobalTaskManager.currentTaskPayload = taskData;
+                        } else if (t.status === 10) {
+                            taskData.taskId = t.id;
+                            GlobalTaskManager.backendQueued.push(taskData);
+                            GlobalTaskManager.activeRefs.add(t.id);
+                        }
+                    } else {
+                        console.log(`[WIDGET] Ignoring ghost search task: ${t.id}`);
+                    }
+                }
+            }
+            await GlobalTaskManager.saveQueue(); // 🌟 Dexie에 복구된 전체 큐 상태를 영구 저장
+            await updateExtractButtonVisibility();
+        }
+
+        // 브라우저 런처 상태 동기화
+        if (btnAutoLaunch) {
+            if (data.browser_status === "running") {
+                isBrowserRunning = true;
+                btnAutoLaunch.style.display = "none";
+                btnAutoLaunch.classList.add("hidden");
+            } else {
+                isBrowserRunning = false;
+                isAutoLaunchLocked = false;
+                btnAutoLaunch.style.display = "flex";
+                btnAutoLaunch.classList.remove("hidden");
+            }
+            console.log(`[WIDGET] 🔵 [${new Date().toISOString().split('T')[1].slice(0, -1)}] UI Ready Browser Status: ${data.browser_status}`);
+        }
+        if (data.current_url) {
+            currentDetectedUrl = data.current_url;
+            isCurrentShop = data.is_client || data.is_admin;
+            await updateExtractButtonVisibility();
+        }
+        try {
+            const RESTORE_TABLES: Array<{ name: string; hint: string; lanceKey: string }> = [
+                { name: "items", hint: "items", lanceKey: "items" },
+                { name: "users", hint: "users", lanceKey: "users" },
+                { name: "pages", hint: "pages", lanceKey: "pages" }
+            ];
+
+            let needsRestore = false;
+            for (const t of RESTORE_TABLES) {
+                const dexieCount = await appDb.table(t.name).count();
+                const lanceArr = (data as any)[t.lanceKey];
+                const lanceCount = (lanceArr && lanceArr.length) ? lanceArr.length : 0;
+                if (dexieCount > 0 && lanceCount === 0) {
+                    needsRestore = true;
+                    break;
+                }
+            }
+
+            const alreadyNotified = await kvGet("schema_v4_notified");
+            if (needsRestore && !alreadyNotified && currentSession.email) {
+                await kvSet("schema_v4_notified", "true");
+                console.warn("[SCHEMA] v4 generation detected. LanceDB was rebuilt; local index needs re-population.");
+                for (const t of RESTORE_TABLES) {
+                    const allRows = await appDb.table(t.name).limit(5000).toArray();
+                    if (allRows.length === 0) continue;
+                    const restorePayload = allRows.map((r: any) => ({
+                        id: r.id,
+                        table: t.hint,
+                        type: r.type,
+                        flag: r.flag,
+                        from: r.from,
+                        to: r.to,
+                        cc: r.cc,
+                        bcc: r.bcc,
+                        ref: r.ref,
+                        mode: r.mode,
+                        created_at: r.created_at,
+                        updated_at: r.updated_at,
+                        ...(r.data || {})
+                    }));
+                    console.log(`[SCHEMA] Restoring ${restorePayload.length} '${t.name}' document(s) into LanceDB v4...`);
+                    for (let i = 0; i < restorePayload.length; i += 100) {
+                        const chunk = restorePayload.slice(i, i + 100);
+                        try {
+                            await invoke("upsert_items", { items: chunk });
+                        } catch (e) {
+                            console.warn(`[SCHEMA] restore chunk failed for ${t.name}:`, e);
+                        }
+                    }
+                }
+                console.log(`[SCHEMA] ✅ Restore complete. Re-indexing will run in background.`);
+                runLocalEmbeddingSync();
+                await renderNavigation();
+            }
+        } catch (e) {
+            console.warn("[SCHEMA] Generation check skipped:", e);
+        }
+        await renderNavigation();
+        if (currentSession.email) {
+            console.log("[WIDGET] 로그인 확인됨. 서버 데이터를 백그라운드에서 동기화합니다...");
+            syncData(); // await를 제거하여 UI 블로킹 방지
+        }
+
+        setTimeout(() => { runLocalEmbeddingSync(); }, 4000);
+
+    } catch (e) { 
+        console.error("[WIDGET] Handshake failed:", e); 
+    }
+}
+document.getElementById("btn-qr-auth")?.addEventListener("click", performQrAuth);
+document.getElementById("btn-logout")?.addEventListener("click", async () => {
+    if (await ask("Are you sure you want to sign out?", { title: "Sign Out", kind: "warning" })) {
+        currentSession = { hash: "", cc: "logis.center" };
+        await kvRemove("chat_session");
+        await kvRemove("search_mode");
+        await kvRemove("hidden_pages");
+        await kvRemove("trading_sync_cursor");
+        await kvRemove("trading_push_cursor");
+        sessionStorage.clear();
+        try {
+            await invoke("unload_model");
+        } catch (_e) { /* 이미 해제된 경우 무시 */ }
+        window.location.reload();
+    }
+});
+document.getElementById("btn-reset-db")?.addEventListener("click", async () => {
+    if (await ask("정말 로컬 데이터베이스를 초기화하시겠습니까?\n모든 로컬 큐 데이터와 캐시가 삭제되며 앱이 재시작됩니다.", { title: "Initialize Local DB", kind: "warning" })) {
+        try {
+            await invoke("stop_current_extraction", { taskId: null }).catch(() => null);
+            console.log("[RESET] Backend extraction stopped and cancellation token set.");
+
+            await invoke("unload_model").catch(() => null);
+            console.log("[RESET] Backend model and store unloaded.");
+
+            if (chatPollInterval) {
+                clearTimeout(chatPollInterval);
+                chatPollInterval = null;
+            }
+            stopAuthPolling();
+            if (reindexDebounceTimer) {
+                clearTimeout(reindexDebounceTimer);
+                reindexDebounceTimer = null;
+            }
+            reindexScheduled = false;
+            isReindexing = false;
+            console.log("[RESET] All frontend polling and scheduling timers cleared.");
+            await GlobalTaskManager.forceReset();
+            isExtracting = false;
+            isSearching = false;
+            stopSpinner();
+            cachedDocs = [];
+            currentPage = 0;
+            hasMore = true;
+            selectedUuids.clear();
+            activeTags = [];
+            activeContext = { cc: "", bcc: "", ref: "" };
+            if (docListContainer) docListContainer.innerHTML = "";
+            if (chatTalks) chatTalks.innerHTML = "";
+            console.log("[RESET] LanceDB backend reset delegated to forceReset().");
+            await appDb.delete();
+            await appDb.open();
+            console.log("[RESET] Dexie DB deleted and reopened.");
+            await kvRemove("schema_v4_notified");
+            sessionStorage.clear();
+            window.location.reload();
+        } catch (e) {
+            console.error("DB Initialization failed:", e);
+            alert("DB 초기화 중 오류가 발생했습니다: " + e);
+        }
+    }
+});
+
+// 🚀 모델 관리 UI 렌더링 엔진
+async function updateModelStatusUI() {
+    try {
+        modelStatus = await invoke("check_model_status");
+    } catch (e) {}
+
+    const container = document.getElementById("model-list-container");
+    if (!container) return;
+    container.innerHTML = "";
+
+    TARGET_MODELS.forEach(m => {
+        const isDownloaded = modelStatus[m];
+        const safeId = m.replace(/[\s\(\)]+/g, '-');
+        let displayName = m;
+        if (m.startsWith('stanza_')) {
+            const lang = m.replace('stanza_', '');
+            displayName = `Stanza ${lang.charAt(0).toUpperCase() + lang.slice(1)}`;
+        }
+        const row = document.createElement("div");
+        row.style.display = "flex";
+        row.style.flexDirection = "column";
+        row.style.background = "rgba(0,0,0,0.05)";
+        row.style.border = "1px solid rgba(0,0,0,0.1)";
+        row.style.padding = "8px";
+        row.style.borderRadius = "6px";
+        const topRow = document.createElement("div");
+        topRow.style.display = "flex";
+        topRow.style.justifyContent = "space-between";
+        topRow.style.alignItems = "center";
+        const nameSpan = document.createElement("span");
+        nameSpan.innerText = `${displayName} / apache 2.0`;
+        nameSpan.style.fontSize = "0.75rem";
+        nameSpan.style.fontWeight = "bold";
+        const btn = document.createElement("button");
+        btn.id = `btn-download-${safeId}`;
+        btn.style.padding = "4px 8px";
+        btn.style.fontSize = "0.65rem";
+        btn.style.borderRadius = "4px";
+        btn.style.border = "none";
+        btn.style.cursor = "pointer";
+        if (isDownloaded) {
+            btn.innerText = "Downloaded";
+            btn.style.background = "#6c757d";
+            btn.style.color = "white";
+            btn.disabled = true;
+        } else {
+            btn.innerText = "Download";
+            btn.style.background = "#28a745";
+            btn.style.color = "white";
+            btn.onclick = async () => {
+                btn.innerText = "Downloading...";
+                btn.disabled = true;
+                btn.style.background = "#6c757d";
+                document.getElementById(`progress-container-${safeId}`)!.style.display = "block";
+                await invoke("download_model", { modelName: m });
+            };
+        }
+
+        topRow.appendChild(nameSpan);
+        topRow.appendChild(btn);
+
+        const progContainer = document.createElement("div");
+        progContainer.id = `progress-container-${safeId}`;
+        progContainer.style.width = "100%";
+        progContainer.style.background = "rgba(0,0,0,0.1)";
+        progContainer.style.marginTop = "6px";
+        progContainer.style.borderRadius = "4px";
+        progContainer.style.display = "none";
+
+        const progBar = document.createElement("div");
+        progBar.id = `progress-bar-${safeId}`;
+        progBar.style.height = "8px";
+        progBar.style.width = "0%";
+        progBar.style.background = "#007bff";
+        progBar.style.borderRadius = "4px";
+        progBar.style.fontSize = "6px";
+        progBar.style.color = "white";
+        progBar.style.textAlign = "center";
+        progBar.style.lineHeight = "8px";
+
+        progContainer.appendChild(progBar);
+        row.appendChild(topRow);
+        row.appendChild(progContainer);
+        container.appendChild(row);
+    });
+}
+listen("download_progress", (event: any) => {
+    const payload = event.payload;
+    const safeId = payload.model.replace(/[\s\(\)]+/g, '-');
+    const bar = document.getElementById(`progress-bar-${safeId}`);
+    const btn = document.getElementById(`btn-download-${safeId}`);
+    if (bar) {
+        bar.style.width = `${payload.percent}%`;
+        bar.innerText = `${payload.percent}%`;
+    }
+    if (btn) {
+        btn.innerText = `Wait (${payload.percent}%)`;
+    }
+});
+listen("download_complete", (event: any) => {
+    const payload = event.payload;
+    updateModelStatusUI();
+});
+listen("download_error", (event: any) => {
+    const payload = event.payload;
+    updateModelStatusUI();
+    alert(`Error downloading ${payload.model}: ${payload.error}`);
+});
+function renderModelStatusUI(status: any) {
+    const models: Array<{ key: string; label: string }> = [
+        { key: "Qwen3", label: "Qwen3 (0.6B)" },
+        { key: "Qwen3.5", label: "Qwen3.5 (2B)" },
+        { key: "Granite", label: "Granite Embedding" },
+        { key: "Embedding", label: "Embedding Model" },
+        { key: "SigLIP2", label: "SigLIP2 Vision" },
+    ];
+    
+    // 기존 컨테이너 초기화
+    const container = document.getElementById("model-list-container");
+    if (container) {
+        container.innerHTML = "";
+        
+        models.forEach(({ key, label }) => {
+            const isDownloaded = status[key] === true;
+            const row = document.createElement("div");
+            row.style.cssText = `
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 8px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+            `;
+            
+            const labelSpan = document.createElement("span");
+            labelSpan.textContent = label;
+            labelSpan.style.cssText = `
+                font-size: 0.75rem;
+                color: ${isDownloaded ? "#4ade80" : "#999"};
+            `;
+            
+            const safeId = key.replace(/[\s\(\)]+/g, '-');
+
+            const statusBtn = document.createElement("button");
+            statusBtn.id = `btn-download-${safeId}`;
+            statusBtn.textContent = isDownloaded ? "Downloaded" : "Download";
+            statusBtn.style.cssText = `
+                padding: 4px 8px;
+                font-size: 0.65rem;
+                border-radius: 4px;
+                border: none;
+                cursor: ${isDownloaded ? "default" : "pointer"};
+                background: ${isDownloaded ? "#6c757d" : "#28a745"};
+                color: white;
+            `;
+            if (!isDownloaded) {
+                statusBtn.onclick = () => {
+                    console.log(`[AUTO-DL] ${key} 다운로드 시작...`);
+                    statusBtn.innerText = "Downloading...";
+                    statusBtn.disabled = true;
+                    statusBtn.style.background = "#6c757d";
+                    const pc = document.getElementById(`progress-container-${safeId}`);
+                    if (pc) pc.style.display = "block";
+                    invoke("download_model", { modelName: key }).then(() => {
+                        invoke("check_model_status").then((newStatus) => {
+                            renderModelStatusUI(newStatus);
+                        });
+                    });
+                };
+            }
+
+            // 🌟 [추가] 프로그레스 바 컨테이너 및 바 생성
+            const progContainer = document.createElement("div");
+            progContainer.id = `progress-container-${safeId}`;
+            progContainer.style.width = "100%";
+            progContainer.style.background = "rgba(0,0,0,0.1)";
+            progContainer.style.marginTop = "6px";
+            progContainer.style.borderRadius = "4px";
+            progContainer.style.display = "none";
+
+            const progBar = document.createElement("div");
+            progBar.id = `progress-bar-${safeId}`;
+            progBar.style.height = "8px";
+            progBar.style.width = "0%";
+            progBar.style.background = "#007bff";
+            progBar.style.borderRadius = "4px";
+            progBar.style.fontSize = "6px";
+            progBar.style.color = "white";
+            progBar.style.textAlign = "center";
+            progBar.style.lineHeight = "8px";
+
+            progContainer.appendChild(progBar);
+
+            row.appendChild(labelSpan);
+            row.appendChild(statusBtn);
+            row.appendChild(progContainer);
+            container.appendChild(row);
+        });
+    }
+}
+
+document.getElementById("btn-download-all-models")?.addEventListener("click", async () => {
+    const missing = TARGET_MODELS.filter(m => !modelStatus[m]);
+    if (missing.length === 0) {
+        alert("All models are already downloaded.");
+        return;
+    }
+    if (await ask("Download all missing models?", { title: "Confirm Download", kind: "info" })) {
+        for (const m of missing) {
+            const safeId = m.replace(/[\s\(\)]+/g, '-');
+            const btn = document.getElementById(`btn-download-${safeId}`) as HTMLButtonElement;
+            if (btn) btn.click();
+        }
+    }
+});
+
+document.getElementById("btn-delete-all-models")?.addEventListener("click", async () => {
+    if (await ask("Are you sure you want to delete all models? You will need to download them again for offline capabilities.", { title: "Warning", kind: "warning" })) {
+        await invoke("delete_all_models");
+        alert("All models deleted.");
+        updateModelStatusUI();
+    }
+});
+updateModelStatusUI();
+settingsBtn?.addEventListener("click", () => { if (currentTab === "settings" && isExpanded) collapseWidget(); else openWidget("settings"); });
+document.getElementById("nav-to-auto")?.addEventListener("click", () => switchTab("automation"));
+document.getElementById("unload-btn")?.addEventListener("click", async () => {
+    try {
+        GlobalTaskManager.isBusy = false;
+        GlobalTaskManager.currentTaskId = null;
+        GlobalTaskManager.currentTaskPayload = null;
+        isExtracting = false;
+        isSearching = false;
+        stopSpinner();
+        await invoke("unload_model");
+        alert("Memory cleared.");
+        await updateExtractButtonVisibility();
+        if (btnSubmit && searchInput) {
+            const currentVal = searchInput.value.trim();
+            if (currentVal !== "" && !isQueryActive(currentVal)) {
+                btnSubmit.style.display = "flex";
+            } else {
+                btnSubmit.style.display = "none";
+            }
+        }
+    } catch (e) {
+        console.error("[WIDGET] Unload failed:", e);
+    }
+});
+
+document.getElementById("invite-email-input")?.addEventListener("input", (e) => {
+    const input = e.target as HTMLInputElement;
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    const btn = document.getElementById("btn-send-invite") as HTMLButtonElement;
+
+    if (input.value.trim() === "") {
+        input.style.outline = "none";
+        if (btn) btn.disabled = false;
+    } else if (!emailRegex.test(input.value.trim())) {
+        input.style.outline = "1px solid #ef4444";
+        if (btn) btn.style.opacity = "0.5";
+    } else {
+        input.style.outline = "1px solid #4ade80";
+        if (btn) {
+            btn.disabled = false;
+            btn.style.opacity = "1";
+        }
+    }
+});
+
+async function syncBrowserStatus() { 
+    try { 
+        const res = await invoke<any>("get_browser_status"); 
+        const s = res.status;
+        if (res.url !== undefined) {
+            const urlChanged = currentDetectedUrl !== res.url;
+            currentDetectedUrl = res.url;
+            isCurrentShop = res.is_client || res.is_admin;
+            if (urlChanged && !activeContext.cc && currentTab === "settings") {
+                fetchChatHistory(true, true);
+            }
+        }
+        if (s === "running") {
+            isBrowserRunning = true;
+            if (btnAutoLaunch) {
+                btnAutoLaunch.style.display = "none";
+                btnAutoLaunch.classList.add("hidden");
+            }
+        } else {
+            console.log("[WIDGET] Browser stopped. Resetting UI.");
+            isBrowserRunning = false;
+            isAutoLaunchLocked = false;
+            if (btnAutoLaunch) {
+                btnAutoLaunch.style.display = "flex";
+                btnAutoLaunch.classList.remove("hidden");
+            }
+            currentDetectedUrl = ""; 
+        }
+        await updateExtractButtonVisibility();
+    } catch (e) {
+        console.warn("Status sync failed", e);
+    } 
+}
+
+// --- Device Preference Logic ---
+const forceCpuToggle = document.getElementById("force-cpu-toggle") as HTMLInputElement;
+
+// --- List Scroll & Pull Engine ---
+let listCurrentY = 0;
+let listPullY = 0;
+let listPullTimer: number | null = null;
+let listPushStartTime = 0;
+let listPushDir: 'top' | 'bottom' | null = null;
+
+function updateListTransform(resetting: boolean = false) {
+    const scrollEl = document.getElementById("list-scroll");
+    const container = document.getElementById("list-scroll-container");
+    const topLoader = document.getElementById("list-pull-top");
+    const bottomLoader = document.getElementById("list-pull-bottom");
+    
+    if (!scrollEl || !container || !topLoader || !bottomLoader) return;
+
+    if (resetting) scrollEl.classList.add("resetting");
+    else scrollEl.classList.remove("resetting");
+
+    let effectiveOffset = listPullY;
+    if (listPullY === 0 && listPushStartTime !== 0) {
+        const pushElapsed = Date.now() - listPushStartTime;
+        if (pushElapsed > 50) { 
+            effectiveOffset = listPushDir === 'top' ? 50 : -50;
+        }
+    }
+
+    scrollEl.style.transform = `translateY(${-listCurrentY + effectiveOffset}px)`;
+
+    const loader = effectiveOffset !== 0 ? (effectiveOffset > 0 ? topLoader : bottomLoader) : null;
+    
+    if (loader) {
+        loader.classList.add("visible");
+        const absPull = Math.abs(effectiveOffset);
+        loader.style.opacity = "1";
+        
+        if (absPull >= PULL_THRESHOLD) (loader as HTMLElement).classList.add("ready");
+        else (loader as HTMLElement).classList.remove("ready");
+
+        const spinner = (loader as HTMLElement).querySelector('.spinner') as HTMLElement;
+        if (spinner) {
+            const frameIndex = Math.floor(Date.now() / 80) % spinnerFrames.length;
+            spinner.innerText = spinnerFrames[frameIndex];
+        }
+    } else {
+        [topLoader, bottomLoader].forEach(el => {
+            if (el) {
+                el.classList.remove("visible", "ready");
+                (el as HTMLElement).style.opacity = "0";
+                const s = el.querySelector('.spinner') as HTMLElement;
+                if (s && !el.classList.contains("loading")) s.innerText = "";
+            }
+        });
+    }
+}
+
+function initListPullLogic() {
+    const container = document.getElementById("list-scroll-container") as HTMLElement;
+    const scrollEl = document.getElementById("list-scroll") as HTMLElement;
+    const topLoader = document.getElementById("list-pull-top") as HTMLElement;
+    const bottomLoader = document.getElementById("list-pull-bottom") as HTMLElement;
+    
+    if (!container || !scrollEl || !topLoader || !bottomLoader) return;
+
+    let loopId: number | null = null;
+    let lastTouchY = 0;
+
+    const resetPull = () => {
+        listPullY = 0;
+        listPushStartTime = 0;
+        listPushDir = null;
+        updateListTransform(true);
+        setTimeout(() => {
+            scrollEl.classList.remove("resetting");
+            topLoader.classList.remove("loading");
+            bottomLoader.classList.remove("loading");
+        }, 400);
+    };
+
+    const triggerAction = async (dir: 'top' | 'bottom') => {
+        if (isLoading) return;
+        const loader = dir === 'top' ? topLoader : bottomLoader;
+        loader.classList.add("loading");
+        
+        listPullY = dir === 'top' ? 40 : -40;
+        listPushStartTime = 0;
+        updateListTransform(true);
+
+        if (dir === 'top') {
+            // [Top Pull] Sync Updates (opposite of chat)
+            console.log("[List] Syncing latest updates...");
+            await loadMoreDocs(false, true); 
+        } else {
+            // [Bottom Pull] Load More History (opposite of chat)
+            console.log("[List] Loading more history...");
+            await loadMoreDocs(false, false); 
+        }
+
+        resetPull();
+    };
+
+    const startAnimationLoop = () => {
+        if (loopId) return;
+        const tick = () => {
+            const now = Date.now();
+            if (listPushStartTime !== 0 && now - listPushStartTime >= 1000 && listPullY === 0) {
+                const dir = listPushDir;
+                if (dir) {
+                    listPullY = dir === 'top' ? TRIGGER_THRESHOLD : -TRIGGER_THRESHOLD;
+                    triggerAction(dir);
+                }
+            }
+            updateListTransform();
+            if (listPullY !== 0 || listPushStartTime !== 0 || isLoading) {
+                loopId = requestAnimationFrame(tick);
+            } else {
+                loopId = null;
+            }
+        };
+        loopId = requestAnimationFrame(tick);
+    };
+
+    const getMaxScroll = () => Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+
+    const handleDelta = (delta: number) => {
+        // 🌟 Settings 패널 상태를 확인하여 열려있다면 모든 델타 계산을 중단합니다.
+        const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        if (currentTab !== "list" || (settingsToggle && settingsToggle.checked)) return;
+
+        const maxScroll = getMaxScroll();
+        const isAtTop = listCurrentY <= 0;
+        const isAtBottom = listCurrentY >= maxScroll;
+
+        if (!isLoading && (listPullY !== 0 || (isAtTop && delta < 0) || (isAtBottom && delta > 0))) {
+            const currentDir = (isAtTop && delta < 0) ? 'top' : 'bottom';
+            if (listPullY === 0) {
+                if (listPushDir !== currentDir) {
+                    listPushDir = currentDir;
+                    listPushStartTime = Date.now();
+                }
+                startAnimationLoop(); 
+                if (Date.now() - listPushStartTime < 1000) return; 
+            }
+
+            listPullY -= delta * FRICTION;
+            if (listPullY > PULL_MAX) listPullY = PULL_MAX;
+            if (listPullY < -PULL_MAX) listPullY = -PULL_MAX;
+            
+            if ((listPullY < 0 && listCurrentY <= 0) || (listPullY > 0 && listCurrentY >= maxScroll)) {
+                resetPull();
+            }
+            startAnimationLoop();
+        } 
+        else {
+            listPushDir = null;
+            listPushStartTime = 0;
+            listCurrentY += delta;
+            if (listCurrentY < 0) listCurrentY = 0;
+            else if (listCurrentY > maxScroll) listCurrentY = maxScroll;
+        }
+        updateListTransform();
+    };
+
+    container.addEventListener('wheel', (e) => {
+        // 🌟 [CRITICAL CHECK] Settings 패널이 활성화되어 있는지 체크합니다.
+        const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        const isSettingsOpen = settingsToggle && settingsToggle.checked;
+
+        // 리스트 탭이 아니거나 Settings 패널이 열려 있으면 리스트 전용 스크롤 로직을 완전히 차단합니다.
+        if (currentTab !== "list" || isSettingsOpen) return;
+
+        e.preventDefault();
+        handleDelta(e.deltaY);
+        if (listPullTimer) clearTimeout(listPullTimer);
+        listPullTimer = window.setTimeout(() => {
+            if (Math.abs(listPullY) >= PULL_THRESHOLD) triggerAction(listPullY > 0 ? 'top' : 'bottom');
+            else if (listPushStartTime === 0 && !isLoading) resetPull();
+        }, 200);
+    }, { passive: false });
+
+    container.addEventListener('touchstart', (e) => {
+        lastTouchY = e.touches[0].pageY;
+        scrollEl.classList.remove("resetting");
+    }, { passive: true });
+
+    container.addEventListener('touchmove', (e) => {
+        // 🌟 [CRITICAL CHECK] Settings 패널이 활성화되어 있는지 체크합니다.
+        const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        const isSettingsOpen = settingsToggle && settingsToggle.checked;
+
+        // Settings가 열려있다면 리스트의 Pull-to-refresh 로직이 간섭하지 못하게 합니다.
+        if (currentTab !== "list" || isSettingsOpen) return;
+
+        const currentTouchY = e.touches[0].pageY;
+        handleDelta(lastTouchY - currentTouchY);
+        lastTouchY = currentTouchY;
+        e.preventDefault();
+    }, { passive: false });
+
+    container.addEventListener('touchend', () => {
+        if (Math.abs(listPullY) >= PULL_THRESHOLD) triggerAction(listPullY > 0 ? 'top' : 'bottom');
+        else if (listPushStartTime === 0) resetPull();
+    });
+}
+
+async function initDevicePreference() {
+    if (!forceCpuToggle) return;
+
+    // 1. Check GPU Availability
+    try {
+        const gpuInfo = await invoke<any>("check_gpu_availability");
+        const hasGpu = typeof gpuInfo === "boolean" ? gpuInfo : gpuInfo.has_gpu;
+        const vendor = typeof gpuInfo === "object" ? gpuInfo.vendor : "none";
+
+        if (!hasGpu) {
+            forceCpuToggle.disabled = true;
+            forceCpuToggle.checked = true;
+            const label = document.querySelector('label[for="force-cpu-toggle"]') as HTMLElement;
+            if (label) label.innerText = "CPU Mode (No GPU detected)";
+        } else {
+            // 2. Load saved preference
+            const savedPrefStr = await kvGet("force_cpu_mode");
+            const savedPref = savedPrefStr === "true";
+            forceCpuToggle.checked = savedPref;
+        }
+
+        // 🌟 [추가] GPU 라이선스 표기 제어 로직 (NVIDIA, AMD에 따라 표시 전환)
+        const cudaLicense = document.getElementById("cuda-license");
+        const rocmLicense = document.getElementById("rocm-license");
+        const gpuLicenseContainer = document.getElementById("gpu-license-container");
+
+        if (cudaLicense && rocmLicense && gpuLicenseContainer) {
+            if (vendor === "nvidia") {
+                cudaLicense.style.display = "block";
+                rocmLicense.style.display = "none";
+                gpuLicenseContainer.style.display = "block";
+            } else if (vendor === "amd") {
+                cudaLicense.style.display = "none";
+                rocmLicense.style.display = "block";
+                gpuLicenseContainer.style.display = "block";
+            } else {
+                gpuLicenseContainer.style.display = "none";
+            }
+        }
+    } catch (e) {
+        console.error("[WIDGET] Failed to check GPU status:", e);
+    }
+
+    // 3. Save on change
+    forceCpuToggle.addEventListener("change", async () => {
+        await kvSet("force_cpu_mode", forceCpuToggle.checked.toString());
+    });
+}
+
+// --- Chat Virtual Scroll & Pull Engine ---
+let currentY = 0; // Standard scroll position (positive)
+let pullY = 0;    // Pull distance (positive for top, negative for bottom)
+let pullTimer: number | null = null;
+let pushStartTime = 0; // [NEW] Track hold time
+let pushDir: 'top' | 'bottom' | null = null; 
+const PULL_THRESHOLD = 50;
+const PULL_MAX = 90;
+const FRICTION = 0.3;
+const TRIGGER_THRESHOLD = 50; 
+
+function updateTransform(resetting: boolean = false) {
+    const scrollEl = document.getElementById("chat-scroll");
+    const container = document.querySelector(".chat-container") as HTMLElement;
+    const topLoader = document.getElementById("chat-pull-top");
+    const bottomLoader = document.getElementById("chat-pull-bottom");
+    
+    if (!scrollEl || !container || !topLoader || !bottomLoader) return;
+
+    if (resetting) scrollEl.classList.add("resetting");
+    else scrollEl.classList.remove("resetting");
+
+    let effectiveOffset = pullY;
+    if (pullY === 0 && pushStartTime !== 0) {
+        const pushElapsed = Date.now() - pushStartTime;
+        if (pushElapsed > 50) { 
+            effectiveOffset = pushDir === 'top' ? 50 : -50; // Full 50px peek to show loader
+        }
+    }
+
+    scrollEl.style.transform = `translateY(${-currentY + effectiveOffset}px)`;
+
+    const loader = effectiveOffset !== 0 ? (effectiveOffset > 0 ? topLoader : bottomLoader) : null;
+    
+    if (loader) {
+        loader.classList.add("visible");
+        const absPull = Math.abs(effectiveOffset);
+        loader.style.opacity = "1";
+        
+        if (absPull >= PULL_THRESHOLD) (loader as HTMLElement).classList.add("ready");
+        else (loader as HTMLElement).classList.remove("ready");
+
+        const spinner = (loader as HTMLElement).querySelector('.spinner') as HTMLElement;
+        if (spinner) {
+            const frameIndex = Math.floor(Date.now() / 80) % spinnerFrames.length;
+            spinner.innerText = spinnerFrames[frameIndex];
+        }
+    } else {
+        [topLoader, bottomLoader].forEach(el => {
+            if (el) {
+                el.classList.remove("visible", "ready");
+                (el as HTMLElement).style.opacity = "0";
+                const s = el.querySelector('.spinner') as HTMLElement;
+                if (s && !el.classList.contains("loading")) s.innerText = "";
+            }
+        });
+    }
+}
+
+function initChatPullLogic() {
+    const container = document.querySelector(".chat-container") as HTMLElement;
+    const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
+    const topLoader = document.getElementById("chat-pull-top") as HTMLElement;
+    const bottomLoader = document.getElementById("chat-pull-bottom") as HTMLElement;
+    
+    if (!container || !scrollEl || !topLoader || !bottomLoader) return;
+
+    let loopId: number | null = null;
+    let lastTouchY = 0;
+
+    const resetPull = () => {
+        pullY = 0;
+        pushStartTime = 0;
+        pushDir = null;
+        updateTransform(true);
+        setTimeout(() => {
+            scrollEl.classList.remove("resetting");
+            topLoader.classList.remove("loading");
+            bottomLoader.classList.remove("loading");
+        }, 400);
+    };
+
+    const triggerAction = async (dir: 'top' | 'bottom') => {
+        if (isChatLoading) return;
+        const loader = dir === 'top' ? topLoader : bottomLoader;
+        loader.classList.add("loading");
+        
+        pullY = dir === 'top' ? 40 : -40;
+        pushStartTime = 0;
+        updateTransform(true);
+
+        if (dir === 'top') {
+            // [Top Pull] Load Older History
+            console.log("[Chat] Loading history (older than top)...");
+            await loadMoreChat(true); 
+        } else {
+            // [Bottom Pull] Refresh/Load Latest Sync
+            console.log("[Chat] Syncing latest/updated states...");
+            await loadMoreChat(false); 
+        }
+
+        resetPull();
+    };
+
+    const startAnimationLoop = () => {
+        if (loopId) return;
+        const tick = () => {
+            const now = Date.now();
+            if (pushStartTime !== 0 && now - pushStartTime >= 1000 && pullY === 0) {
+                const dir = pushDir;
+                if (dir) {
+                    pullY = dir === 'top' ? TRIGGER_THRESHOLD : -TRIGGER_THRESHOLD;
+                    triggerAction(dir);
+                }
+            }
+            updateTransform();
+            if (pullY !== 0 || pushStartTime !== 0 || isChatLoading) {
+                loopId = requestAnimationFrame(tick);
+            } else {
+                loopId = null;
+            }
+        };
+        loopId = requestAnimationFrame(tick);
+    };
+
+    const getMaxScroll = () => Math.max(0, scrollEl.scrollHeight - container.clientHeight);
+
+    const handleDelta = (delta: number) => {
+        const maxScroll = getMaxScroll();
+        const isAtTop = currentY <= 0;
+        const isAtBottom = currentY >= maxScroll;
+
+        if (!isChatLoading && (pullY !== 0 || (isAtTop && delta < 0) || (isAtBottom && delta > 0))) {
+            const currentDir = (isAtTop && delta < 0) ? 'top' : 'bottom';
+            if (pullY === 0) {
+                if (pushDir !== currentDir) {
+                    pushDir = currentDir;
+                    pushStartTime = Date.now();
+                }
+                startAnimationLoop(); 
+                if (Date.now() - pushStartTime < 1000) return; 
+            }
+
+            pullY -= delta * FRICTION;
+            if (pullY > PULL_MAX) pullY = PULL_MAX;
+            if (pullY < -PULL_MAX) pullY = -PULL_MAX;
+            
+            if ((pullY < 0 && currentY <= 0) || (pullY > 0 && currentY >= maxScroll)) {
+                resetPull();
+            }
+            startAnimationLoop();
+        } 
+        else {
+            pushDir = null;
+            pushStartTime = 0;
+            currentY += delta;
+            if (currentY < 0) currentY = 0;
+            else if (currentY > maxScroll) currentY = maxScroll;
+
+            if (!isChatLoading && chatHasMore && currentY <= 50 && chatPage > 0) {
+                loadMoreChat(false);
+            }
+        }
+        updateTransform();
+    };
+
+    container.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        handleDelta(e.deltaY);
+        if (pullTimer) clearTimeout(pullTimer);
+        pullTimer = window.setTimeout(() => {
+            if (Math.abs(pullY) >= PULL_THRESHOLD) triggerAction(pullY > 0 ? 'top' : 'bottom');
+            else if (pushStartTime === 0 && !isChatLoading) resetPull();
+        }, 200);
+    }, { passive: false });
+
+    container.addEventListener('touchstart', (e) => {
+        lastTouchY = e.touches[0].pageY;
+        scrollEl.classList.remove("resetting");
+    }, { passive: true });
+
+    container.addEventListener('touchmove', (e) => {
+        // 🌟 [CRITICAL CHECK] Settings 패널이 활성화되어 있는지 체크합니다.
+        const settingsToggle = document.getElementById("settings-toggle") as HTMLInputElement;
+        const isSettingsOpen = settingsToggle && settingsToggle.checked;
+
+        // Settings가 열려있다면 리스트의 Pull-to-refresh 로직이 간섭하지 못하게 합니다.
+        if (currentTab !== "list" || isSettingsOpen) return;
+
+        const currentTouchY = e.touches[0].pageY;
+        handleDelta(lastTouchY - currentTouchY);
+        lastTouchY = currentTouchY;
+        e.preventDefault();
+    }, { passive: false });
+
+    container.addEventListener('touchend', () => {
+        if (Math.abs(pullY) >= PULL_THRESHOLD) triggerAction(pullY > 0 ? 'top' : 'bottom');
+        else if (pushStartTime === 0) resetPull();
+    });
+}
+
+// Call init functions
+const getDevicePref = () => forceCpuToggle.checked ? "cpu" : null;
+const talksScroll = document.getElementById("chat-scroll");
+if (talksScroll) {
+    initChatPullLogic();
+}
+const listScroll = document.getElementById("list-scroll");
+if (listScroll) {
+    initListPullLogic();
+}
+async function fetchChatHistory(reset: boolean = true, silent: boolean = false, shouldSnap: boolean = true) { 
+    if (reset) { 
+        chatPage = 0;
+        chatHasMore = true;
+        if (chatTalks) {
+            chatTalks.innerHTML = "";
+        }
+    } 
+    // Initial load is NOT history (isHistory = false)
+    await loadMoreChat(false, silent); 
+}
+
+interface ChatMessage {
+    id: string;
+    role: string;
+    text: string;
+    updated_at: number;
+    created_at: number;
+    status: number;
+    task_id?: string;
+    content?: string | any;
+    from?: string;
+    ref?: string;
+}
+
+const LOCAL_ECHO_PREFIX = "talk_";
+
+async function reconcileLocalEchoes(incoming: ChatMessage[]): Promise<Set<string>> {
+    const superseded = new Set<string>();
+    if (!chatTalks) return superseded;
+    if (!incoming || incoming.length === 0) return superseded;
+
+    // ── 서버가 발급한 talk 행만 승계 기준이 됩니다 ──
+    const serverRows = incoming
+        .filter(m => String(m.id || "").startsWith("0x"))
+        .filter(m => String(m.text || "").trim().length > 0)
+        .sort((a, b) => Number(a.created_at || 0) - Number(b.created_at || 0));
+    if (serverRows.length === 0) return superseded;
+
+    type Echo = { id: string; role: string; text: string; createdAt: number; node: HTMLElement | null };
+    const echoes: Echo[] = [];
+
+    for (const node of Array.from(chatTalks.querySelectorAll('.chat-talk')) as HTMLElement[]) {
+        if (!node.id.startsWith(LOCAL_ECHO_PREFIX)) continue;
+        echoes.push({
+            id: node.id,
+            role: node.classList.contains('user') ? 'user' : 'system',
+            text: node.querySelector('.content')?.textContent?.trim() || "",
+            createdAt: Number(node.dataset.createdAt || 0),
+            node
+        });
+    }
+    for (const m of incoming) {
+        const mid = String(m.id || "");
+        if (!mid.startsWith(LOCAL_ECHO_PREFIX)) continue;
+        if (echoes.some(e => e.id === mid)) continue;
+        echoes.push({
+            id: mid,
+            role: m.role === "user" ? "user" : "system",
+            text: String(m.text || "").trim(),
+            createdAt: Number(m.created_at || 0),
+            node: null
+        });
+    }
+    if (echoes.length === 0) return superseded;
+
+    echoes.sort((a, b) => a.createdAt - b.createdAt);
+
+    for (const srv of serverRows) {
+        const srvFp = {
+            role: srv.role === "user" ? "user" : "system",
+            text: String(srv.text || "").trim(),
+            id: String(srv.id)
+        };
+
+        for (const echo of echoes) {
+            if (superseded.has(echo.id)) continue;
+            const echoFp = { role: echo.role, text: echo.text, id: echo.id };
+
+            // 🌟 키 3개 중 id 하나만 다르면 동일 메시지 (diffCount === 1)
+            if (!isAlmostEqual(echoFp, srvFp)) continue;
+
+            superseded.add(echo.id);
+
+            // ① 화면에서 제거
+            if (echo.node) echo.node.remove();
+
+            // ② LanceDB messages 에서 제거 (upsert_items 가 task_id 에 자기 id 를 각인해 둡니다)
+            try {
+                await invoke("delete_message", { taskId: echo.id });
+            } catch (e) {
+                console.warn(`[CHAT] local echo '${echo.id}' DB delete failed:`, e);
+            }
+
+            // ③ Dexie talks 캐시에서 제거
+            try {
+                if (appDb) await appDb.table("talks").delete(echo.id);
+            } catch (e) { /* 캐시에 없을 수 있으므로 무시 */ }
+
+            console.log(`[CHAT] ♻️ [LOCAL ECHO RECONCILE] '${echo.id}' → 서버 행 '${srv.id}' 로 승계 (중복 제거)`);
+            break;
+        }
+    }
+
+    return superseded;
+}
+
+async function upsertChatMessages(messages: ChatMessage[], mode: 'prepend' | 'append') {
+    if (!chatTalks) return;
+    if (messages && messages.length > 0) {
+        const tombs = await loadTalkTombstones();
+        if (tombs.size > 0) {
+            const before = messages.length;
+            messages = messages.filter(m => !tombs.has(String(m.id || "")) && !tombs.has(String(m.task_id || "")));
+            if (before !== messages.length) {
+                console.log(`[TOMBSTONE] 🪦 [RENDER] 삭제된 메시지 ${before - messages.length}건을 렌더링 대상에서 제외했습니다.`);
+            }
+            if (messages.length === 0) return;
+        }
+    }
+    if (messages && messages.length > 0) {
+        const noMsgEl = chatTalks.querySelector('.no-msg');
+        if (noMsgEl) noMsgEl.remove();
+    }
+    const supersededIds = await reconcileLocalEchoes(messages);
+    if (supersededIds.size > 0) {
+        messages = messages.filter(m => !supersededIds.has(String(m.id || "")));
+        if (messages.length === 0) return;
+    }
+
+    const scrollEl = document.getElementById("chat-scroll");
+    const prevScrollHeight = scrollEl ? scrollEl.scrollHeight : 0;
+
+    for (const msg of messages) {
+        let textContent = msg.text || "";
+        const rawContent = msg.content || (msg as any).data;
+
+        if (rawContent && rawContent !== "undefined") {
+            try {
+                let contentObj: any = rawContent;
+                if (typeof rawContent === 'string') {
+                    try {
+                        contentObj = JSON.parse(rawContent);
+                    } catch (e) {
+                        contentObj = rawContent;
+                    }
+                }
+                if (contentObj && typeof contentObj === 'object' && !contentObj.text && !contentObj.title) {
+                    if (Array.isArray(contentObj) || contentObj.buffer) {
+                        try {
+                            const arr = new Uint8Array(contentObj.data || contentObj);
+                            const decompressed = (window as any).pako ? (window as any).pako.ungzip(arr, { to: 'string' }) : new TextDecoder().decode(arr);
+                            contentObj = JSON.parse(decompressed);
+                        } catch (err) {}
+                    }
+                }
+
+                if (typeof contentObj === 'object' && contentObj !== null) {
+                    textContent = contentObj.text || contentObj.title || contentObj.summary || contentObj.markdown || textContent;
+                } else if (typeof contentObj === 'string') {
+                    textContent = contentObj;
+                }
+            } catch (e) {
+                if (!textContent) textContent = String(rawContent);
+            }
+        }
+        let computedRole = msg.role;
+        if (msg.from && currentSession.address) {
+            computedRole = (msg.from.toLowerCase() === currentSession.address.toLowerCase()) ? "user" : "system";
+        }
+
+        const displayMsg: ChatMessage = { ...msg, role: computedRole, text: textContent };
+        const isTask = displayMsg.role === "system_task" || (displayMsg.role === "user" && !!displayMsg.task_id && displayMsg.task_id.startsWith("search_") && !displayMsg.id.endsWith("_query") && !displayMsg.task_id.endsWith("_query"));
+        const domId = isTask ? (displayMsg.task_id || displayMsg.id) : displayMsg.id;
+        
+        const existingEl = chatTalks.querySelector(`[id="${domId}"]`) as HTMLElement;
+
+        if (existingEl) {
+            const cachedStatus = parseInt(existingEl.dataset.status || "0");
+            if ([1, 2, 6, 9].includes(cachedStatus) && msg.status === 10) {
+                msg.status = cachedStatus; 
+            }
+            if ([2, 6, 9].includes(cachedStatus) && msg.status === 1) {
+                msg.status = cachedStatus; 
+            }
+
+            const isTransitionFromVirtual = cachedStatus === 10 && displayMsg.status !== 10;
+            const cachedUpdatedAt = parseInt(existingEl.dataset.updatedAt || "0");
+            const cachedText = existingEl.querySelector('.content')?.textContent || "";
+            if (isTransitionFromVirtual || displayMsg.updated_at > cachedUpdatedAt || displayMsg.status !== cachedStatus || (displayMsg.text && cachedText !== displayMsg.text)) {
+                const contentEl = existingEl.querySelector('.content');
+                if (contentEl && contentEl.textContent !== displayMsg.text) {
+                    contentEl.textContent = displayMsg.text;
+                }
+                let finalStatus = displayMsg.status;
+                if (finalStatus === 1 && !isSearching && !isExtracting && activeTaskId !== domId && GlobalTaskManager.currentTaskId !== domId) {
+                    finalStatus = 2;
+                }
+
+                if (finalStatus !== cachedStatus) {
+                    existingEl.dataset.status = finalStatus.toString();
+                    
+                    const currentLock = await kvGet("sys_lock");
+                    if (currentLock === domId && [2, 6, 9].includes(finalStatus)) {
+                        console.log(`[LOCK] Task ${domId} reached terminal state ${finalStatus}. Releasing lock.`);
+                        await kvRemove("sys_lock");
+                    }
+
+                    const statusBar = existingEl.querySelector('.status-bar') as HTMLElement;
+                    if (statusBar) {
+                        const statusMap: any = {
+                            1: { icon: "⠋", text: "PROCESSING", color: "#000" },
+                            9: { icon: "✅", text: "DONE", color: "#22c55e" },
+                            10: { icon: "📥", text: "QUEUED", color: "#999999" },
+                            2: { icon: "❌", text: "STOPPED", color: "#ef4444" }, // 🌟 아이콘을 ❌로 변경하고 색상을 빨간색으로 고정
+                            6: { icon: "❌", text: "ERROR", color: "#ef4444" }
+                        };
+                        const s = statusMap[finalStatus] || statusMap[msg.status] || { icon: "⏳", text: "WAITING", color: "#999999" };
+                        statusBar.style.color = s.color;
+                        statusBar.innerHTML = `<span class="${(finalStatus === 1 || msg.status === 1) ? 'active-spinner' : ''}">${s.icon}</span> ${s.text}`;
+                    }
+                }
+                existingEl.dataset.updatedAt = msg.updated_at.toString();
+            }
+        } else {
+            const temp = document.createElement('div');
+            temp.innerHTML = createMessageHTML(displayMsg);
+            const newEl = temp.firstElementChild as HTMLElement;
+            if (isTask) { newEl.onclick = () => handleTaskClick(newEl); }
+            if (mode === 'prepend') {
+                chatTalks.prepend(newEl);
+            } else {
+                chatTalks.appendChild(newEl);
+            }
+        }
+    }
+    const sortedChildren = Array.from(chatTalks.children) as HTMLElement[];
+    const messageNodes = sortedChildren.filter(node => !node.classList.contains('no-msg') && !node.classList.contains('chat-history-end'));
+    const infoNodes = sortedChildren.filter(node => node.classList.contains('no-msg') || node.classList.contains('chat-history-end'));
+    const uniqueIds = new Set();
+    const uniqueNodes = [];
+    for (let i = messageNodes.length - 1; i >= 0; i--) {
+        const node = messageNodes[i];
+        if (!uniqueIds.has(node.id)) {
+            uniqueIds.add(node.id);
+            uniqueNodes.unshift(node); // 원래 순서를 유지하기 위해 앞으로 넣음
+        } else {
+            node.remove();
+        }
+    }
+
+    uniqueNodes.sort((a, b) => {
+        const timeA = Number(a.dataset.createdAt || 0);
+        const timeB = Number(b.dataset.createdAt || 0);
+        if (timeA !== timeB) {
+            return timeA - timeB;
+        }
+        const aId = a.id || "";
+        const bId = b.id || "";
+        const aIsQuery = aId.endsWith("_query") || aId.includes("_query");
+        const bIsQuery = bId.endsWith("_query") || bId.includes("_query");
+        if (aIsQuery && !bIsQuery) return -1;
+        if (!aIsQuery && bIsQuery) return 1;
+        return aId.localeCompare(bId);
+    });
+    const finalNodes = [...infoNodes, ...uniqueNodes];
+    finalNodes.forEach((node, idx) => {
+        if (chatTalks.children[idx] !== node) {
+            chatTalks.insertBefore(node, chatTalks.children[idx] || null);
+        }
+    });
+    if (mode === 'prepend' && scrollEl) {
+        const newScrollHeight = scrollEl.scrollHeight;
+        const heightDiff = newScrollHeight - prevScrollHeight;
+        if (heightDiff > 0) {
+            currentY += heightDiff;
+            updateTransform();
+        }
+    } else if (mode === 'append' && scrollEl) {
+        const container = document.querySelector(".chat-container") as HTMLElement;
+        const maxScroll = Math.max(0, scrollEl.scrollHeight - (container?.clientHeight || 0));
+        
+        if (prevScrollHeight === 0 || (currentY >= prevScrollHeight - (container?.clientHeight || 0) - 50)) {
+            currentY = maxScroll;
+            updateTransform();
+        }
+    }
+}
+
+function createMessageHTML(msg: ChatMessage) {
+    const statusMap: Record<number, { icon: string, text: string, color: string }> = {
+        9: { icon: "✅", text: "DONE", color: "#22c55e" },
+        0: { icon: "✅", text: "DONE", color: "#22c55e" },
+        1: { icon: "⠋", text: "PROCESSING", color: "#000" },
+        6: { icon: "❌", text: "ERROR", color: "#ef4444" },
+        2: { icon: "❌", text: "STOPPED", color: "#ef4444" }, // 🌟 좀비 테스크(2)를 ERROR 아이콘과 색상으로 지정
+        10: { icon: "📥", text: "PENDING", color: "#999999" },
+        3: { icon: "🛑", text: "STOPPED", color: "#ef4444" }
+    };
+    const currentStatus = statusMap[msg.status] || { icon: "⏳", text: "WAITING", color: "#999999" };
+    const isTaskBubble = msg.role === "system_task" || (!!msg.task_id && msg.task_id.startsWith("search_") && !msg.id.endsWith("_query"));
+    const roleClass = msg.role === "user" ? "user" : "system";
+    const domId = isTaskBubble ? (msg.task_id || msg.id) : msg.id;
+    const timeStr = new Date(Number(msg.created_at)).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const bubbleClass = isTaskBubble ? 'task-bubble' : '';
+    const displayContent = msg.text && msg.text.trim() !== "" ? msg.text : "대기 중인 작업입니다...";
+
+    const canDelete = !isTaskBubble && msg.role === 'user' && !!msg.id;
+    const deleteBtn = canDelete
+        ? `<button class="btn-delete-talk" data-talk-id="${domId}" title="Delete for me"
+                style="background:none; border:none; color:inherit; opacity:0.35; cursor:pointer; font-size:0.75rem; line-height:1; padding:0 0 0 8px;">✕</button>`
+        : "";
+
+    return `<div id="${domId}" class="chat-talk ${roleClass} ${bubbleClass}" 
+        data-task-id="${msg.task_id || msg.id}" 
+        data-status="${msg.status}" 
+        data-updated-at="${msg.updated_at}"
+        data-created-at="${msg.created_at}"
+        data-from="${msg.from || ''}"
+        data-ref="${msg.ref || ''}"
+        style="${isTaskBubble ? 'cursor:pointer;' : ''}">
+        <div class="chat-message">
+            <div style="font-size:0.8rem; opacity:0.5; margin-bottom:4px; display:flex; justify-content:space-between; align-items:center;">
+                <span>${msg.role === 'user' ? '@YOU' : 'LOGIS AI'}</span>
+                <span style="display:flex; align-items:center;">${timeStr}${deleteBtn}</span>
+            </div>
+            <div class="content">${displayContent}</div>
+            ${isTaskBubble && msg.status !== 0 ? `
+                <div class="status-bar" style="margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.1); font-size: 0.65rem; font-weight: bold; color: ${currentStatus.color};">
+                    <span class="${msg.status === 1 ? 'active-spinner' : ''}">${currentStatus.icon}</span> ${currentStatus.text}
+                </div>` : ""}
+        </div>
+    </div>`;
+}
+
+async function loadMoreChat(isHistory: boolean = false, silent: boolean = false) {
+    if (isChatLoading || (isHistory && !chatHasMore)) {
+        if (!silent) stopSpinner();
+        return;
+    }
+
+    if (!silent) startSpinner();
+    isChatLoading = true;
+
+    try {
+        let effectiveCc = activeContext.cc;
+        let effectiveBcc = activeContext.bcc;
+        let effectiveRef = activeContext.ref;
+
+        const isDefaultForced = activeTags.some(t => t.value === "logis.center" && t.type === "domain");
+
+        if (!effectiveCc || (!isDefaultForced && activeTags.length === 0)) {
+            let targetUrlStr = currentDetectedUrl || "https://commerce.logis.center/tracking";
+            if (targetUrlStr.includes("localhost") || targetUrlStr.includes("127.0.0.1") || targetUrlStr === "about:blank") {
+                targetUrlStr = "https://commerce.logis.center/tracking";
+            }
+            try {
+                const urlObj = new URL(targetUrlStr.toLowerCase());
+                const rootDomain = getRootDomain(urlObj.hostname);
+                effectiveCc = await hashId(rootDomain);
+                const link = (urlObj.pathname + urlObj.search).toLowerCase();
+                effectiveRef = await hashId((currentSession.team || "") + effectiveCc + link);
+            } catch (err) {}
+        }
+
+        let baseFilter = "";
+        if (effectiveRef) baseFilter = `ref = '${effectiveRef}'`;
+        else if (effectiveBcc) baseFilter = `bcc = '${effectiveBcc}'`;
+        else if (effectiveCc) baseFilter = `cc = '${effectiveCc}'`;
+        
+        let finalFilter = baseFilter;
+        let oldestTime = 0;
+        let latestUpdateTime = 0;
+
+        const allMsgs = chatTalks.querySelectorAll('.chat-talk');
+        allMsgs.forEach(el => {
+            const up = parseInt((el as HTMLElement).dataset.updatedAt || "0");
+            if (up > latestUpdateTime) latestUpdateTime = up;
+        });
+
+        if (isHistory) {
+            const firstMsg = chatTalks.querySelector('.chat-talk:not(.chat-history-end)');
+            if (firstMsg) {
+                oldestTime = parseInt((firstMsg as HTMLElement).dataset.createdAt || "0");
+            }
+            
+            if (oldestTime > 0) {
+                let timeFilter = `created_at < ${oldestTime}`;
+                if (latestUpdateTime > 0) {
+                    timeFilter = `(${timeFilter}) OR (updated_at > ${latestUpdateTime})`;
+                }
+                finalFilter = baseFilter ? `${baseFilter} AND (${timeFilter})` : timeFilter;
+            }
+        } else if (latestUpdateTime > 0) {
+            const syncFilter = `updated_at > ${latestUpdateTime}`;
+            finalFilter = baseFilter ? `${baseFilter} AND ${syncFilter}` : syncFilter;
+        }
+
+        const limit = 10; 
+        const offset = 0;
+
+        let messages = await invoke<any[]>("get_chat_messages", { limit: limit, offset: offset, filter: finalFilter });
+        
+        messages = messages.map(m => {
+            if ((m.status === 1 || m.status === 10) && !isSearching && !isExtracting) {
+                return m; 
+            }
+            if (m.role === "user" && m.id.endsWith("_query")) {
+                return { ...m, created_at: Number(m.created_at) - 50 };
+            }
+            return m;
+        });
+        let activeMemContext: any = null;
+        try {
+            activeMemContext = await invoke<any>("get_active_task_context");
+        } catch (e) {}
+        try {
+            const activeTasks = await invoke<any[]>("get_active_tasks");
+            const queuedTasks = GlobalTaskManager.queue.map(q => ({
+                id: q.taskId,
+                task_id: q.taskId,
+                status: 10, // Pending
+                created_at: parseInt(q.taskId.split('_')[1]) || Date.now(),
+                data_json: q.payload,
+                ref: q.payload.link || q.payload.image_path || "Queued Task"
+            }));
+            const combinedTasks = [...activeTasks];
+            queuedTasks.forEach(qt => {
+                const dbEquivalent = activeTasks.find(t => t.id === qt.id);
+                if (!dbEquivalent) {
+                    combinedTasks.push(qt);
+                }
+            });
+
+            combinedTasks.forEach((t: any) => {
+                let taskQuery = "";
+                try {
+                    const taskData = typeof t.data_json === 'string' ? JSON.parse(t.data_json) : t.data_json;
+                    taskQuery = taskData.query || "";
+                } catch(e) {}
+                if (taskQuery) {
+                    const userMsgId = `${t.id}_query`;
+                    const userExistsInBatch = messages.some(m => m.id === userMsgId);
+                    const userExistsInDom = document.getElementById(userMsgId);
+                    if (!userExistsInBatch && !userExistsInDom) {
+                        messages.push({
+                            id: userMsgId,
+                            task_id: t.id,
+                            role: "user",
+                            text: taskQuery,
+                            status: 9,
+                            created_at: Number(t.created_at) - 100, 
+                            updated_at: Number(t.created_at) - 100
+                        });
+                        console.log(`[RECOVERY] Restored missing user query for task: ${t.id}`);
+                    }
+                }
+
+                const exists = messages.find(m => m.id === t.id || m.task_id === t.id);
+                if (!exists) {
+                    messages.push({
+                        id: t.id,
+                        task_id: t.id,
+                        role: "system_task",
+                        text: t.id.startsWith("search_") ? "Waiting in Queue: AI Search" : ("Waiting in Queue: " + (t.ref || "Local Source")),
+                        status: t.status,
+                        created_at: t.created_at + 1,
+                        updated_at: t.updated_at + 1
+                    });
+                }
+            });
+        } catch (e) { }
+
+        for (let m of messages) {
+            if (m.status === 1 && (m.role === "system_task" || m.task_id)) {
+                try {
+                    const tId = m.task_id || m.id;
+                    const logs = await invoke<any[]>("get_task_logs", { taskId: tId });
+                    
+                    let lastLog = null;
+                    if (logs && logs.length > 0) {
+                        lastLog = logs[logs.length - 1];
+                    }
+                    
+                    let rawSummary = "Processing...";
+                    const live = livePayloads.get(tId);
+                    
+                    if (live && live.summary) {
+                        rawSummary = live.summary;
+                    } else if (lastLog && lastLog.summary) {
+                        rawSummary = lastLog.summary;
+                    } else if (activeMemContext && activeMemContext.id === tId && activeMemContext.summary) {
+                        rawSummary = activeMemContext.summary;
+                    }
+
+                    const pctMatch = rawSummary.match(/\(\d+%\)/);
+                    const hasDots = rawSummary.endsWith("...");
+                    if (hasDots) rawSummary = rawSummary.slice(0, -3).trim();
+                    if (pctMatch) rawSummary = rawSummary.replace(pctMatch[0], '').trim();
+                    
+                    let fractionStr = "";
+                    const targetCat = (live && live.category) ? live.category : (lastLog && lastLog.category ? lastLog.category : "");
+
+                    // 🌟 [UI 심플화] 채팅방 히스토리에도 오직 List Extraction 단계에서만 [N/M]을 보여줍니다.
+                    if (targetCat.includes("List Extraction")) {
+                        const match = targetCat.match(/\((\d+)\/(\d+)\)/);
+                        if (match) {
+                            fractionStr = ` [${match[1]}/${match[2]}]`;
+                        }
+                    }
+                    
+                    m.text = `${rawSummary}${fractionStr}${pctMatch ? ' ' + pctMatch[0] : ''}${hasDots ? '...' : ''}`;
+                    m.updated_at = Date.now();
+                    
+                } catch (e) {}
+            }
+        }
+
+        const scrollEl = document.getElementById("chat-scroll") as HTMLElement;
+
+        if (chatTalks) {
+            if (messages && messages.length > 0) {
+                const mode = isHistory ? 'prepend' : 'append';
+                upsertChatMessages(messages, mode);
+                if (isHistory && messages.length < limit) chatHasMore = false;
+            } else { 
+                if (isHistory) chatHasMore = false;
+                // 🌟 [보강] 이미 no-msg 엘리먼트가 존재한다면 추가하지 않도록 방어합니다.
+                const hasNoMsgEl = chatTalks.querySelector('.no-msg');
+                if (!isHistory && chatTalks.querySelectorAll('.chat-talk').length === 0 && !hasNoMsgEl) {
+                    chatTalks.insertAdjacentHTML('beforeend', "<div class='no-msg' data-created-at=\"0\" style='text-align:center; padding:20px; color:#999; font-size:0.8rem;'>No messages yet.</div>");
+                }
+            }
+
+            if (isHistory && !chatHasMore && !chatTalks.querySelector('.chat-history-end')) {
+                const endHtml = `<div class="chat-talk system chat-history-end" data-created-at="0" style="text-align:center; opacity:0.4; font-size:0.8rem; padding:15px 10px;">
+                    <div style="border-top:1px solid rgba(255,255,255,0.05); margin-bottom:10px;"></div>
+                    <span>No more older messages</span>
+                </div>`;
+                chatTalks.insertAdjacentHTML('afterbegin', endHtml);
+            }
+
+            if (!currentSession.email && currentTab === "settings") {
+                const qrExists = !!document.getElementById("qr-code-target");
+                if (!qrExists || renderedQrHash !== currentSession.hash) {
+                    performQrAuth();
+                }
+            }
+        }
+    } catch (e) { 
+        console.error(e); 
+    } finally { 
+        isChatLoading = false; 
+        if (!silent) stopSpinner();
+    }
+}
+
+async function renderMessage(msg: any, shouldScroll: boolean = true, isPrepend: boolean = false) {
+    if (!chatTalks) return;
+    await upsertChatMessages([msg], isPrepend ? 'prepend' : 'append');
+}
+bindModeRuntime({
+    appDb: appDb,
+    timezoneOffset: timezoneOffset,
+    kvGet: kvGet,
+    kvSet: kvSet,
+    normalizeEnvelope: normalizeEnvelope,
+    loadItemTombstones: loadItemTombstones,
+    loadTalkTombstones: loadTalkTombstones,
+    getSession: () => currentSession as any,
+    getContext: () => activeContext,
+    getSearchMode: () => currentSearchMode,
+    getDetectedUrl: () => currentDetectedUrl,
+    getActiveTags: () => activeTags as any,
+    getCurrentTab: () => currentTab,
+    getCloudPendingTasks: () => cloudPendingTasks as any,
+
+    // ── UI 콜백 ──
+    renderNavigation: renderNavigation,
+    loadMoreDocs: loadMoreDocs,
+    renderMessage: (msg: any) => renderMessage(msg),
+    renderProgressToUI: (payload: any) => renderProgressToUI(payload),
+    fetchChatHistory: (reset?: boolean, silent?: boolean) => fetchChatHistory(reset, silent),
+    runLocalEmbeddingSync: runLocalEmbeddingSync,
+    stopSpinner: stopSpinner,
+    stepQrSpinner: stepQrSpinner,
+    restoreSubmitButton: restoreSubmitButton
+});
+
+initSession();
+setWindowSize(false);
+syncBrowserStatus();
+initDevicePreference();
+
+listen("translit-cache-query", async (event: any) => {
+    const { request_id, word, lang } = event.payload;
+
+    const respond = async (results: Array<[string, string]>) => {
+        try {
+            await invoke("translit_cache_respond", { requestId: request_id, results });
+        } catch (e) {
+            console.warn("[TRANSLIT CACHE] respond failed:", e);
+        }
+    };
+
+    try {
+        const candidates = await appDb.table("translit_cache")
+            .where("[source_word+doc_lang]")
+            .equals([word, lang])
+            .toArray();
+
+        if (!candidates || candidates.length === 0) {
+            try {
+                const others = await appDb.table("translit_cache")
+                    .where("source_word").equals(word).toArray();
+                if (others && others.length > 0) {
+                    const langs = Array.from(new Set(others.map((o: any) => String(o.doc_lang))));
+                    console.warn(
+                        `[TRANSLIT CACHE] ⚠️ MISS on lang='${lang}' but the same word exists under langs=[${langs.join(', ')}]. ` +
+                        `doc_lang 확정 경로(scheduler.rs DOC LANG EARLY DETECT)를 확인하세요. word='${word}'`
+                    );
+                }
+            } catch (_e) {
+            }
+            console.log(`[TRANSLIT CACHE] MISS word='${word}' lang='${lang}'`);
+            await respond([]);
+            return;
+        }
+
+        if (candidates.length === 1) {
+            const c = candidates[0];
+            const nv = c.native || "";
+            const rm = c.roman || "";
+            console.log(
+                `[TRANSLIT CACHE] ${(!nv && !rm) ? "NEGATIVE HIT" : "HIT"} word='${word}' lang='${lang}' → native='${nv}' roman='${rm}'`
+            );
+            await respond([[nv, rm]]);
+            return;
+        }
+
+        // 복수 후보: 원문과의 코사인 유사도로 최적 후보를 고릅니다.
+        const candidateTexts = candidates.map((c: any) =>
+            `${c.native || ""} ${c.roman || ""}`.trim()
+        );
+
+        try {
+            const embeddings: number[][] = await invoke("get_embedding_batch_for_translit", {
+                texts: candidateTexts
+            });
+            const queryEmb: number[] = await invoke("get_query_embedding", {
+                text: word,
+                devicePreference: null
+            });
+
+            let bestIdx = 0;
+            let bestSim = -1;
+            for (let i = 0; i < embeddings.length; i++) {
+                const sim = cosineSimLocal(queryEmb, embeddings[i]);
+                if (sim > bestSim) {
+                    bestSim = sim;
+                    bestIdx = i;
+                }
+            }
+            const best = candidates[bestIdx];
+            console.log(
+                `[TRANSLIT CACHE] HIT(cosine ${bestSim.toFixed(4)}, ${candidates.length} cands) word='${word}' lang='${lang}'`
+            );
+            await respond([[best.native || "", best.roman || ""]]);
+        } catch (embErr) {
+            // 임베딩 실패 시 최신 후보 폴백
+            const sorted = [...candidates].sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
+            console.log(
+                `[TRANSLIT CACHE] HIT(latest fallback, ${candidates.length} cands) word='${word}' lang='${lang}'`
+            );
+            await respond([[sorted[0].native || "", sorted[0].roman || ""]]);
+        }
+    } catch (e) {
+        console.warn("[TRANSLIT CACHE] query failed:", e);
+        await respond([]);
+    }
+});
+
+listen("translit-cache-save", async (event: any) => {
+    const { word, lang, native, roman } = event.payload;
+    const nv = native || "";
+    const rm = roman || "";
+    try {
+        // 기존 동일 키 삭제 후 삽입 (upsert)
+        const removed = await appDb.table("translit_cache")
+            .where("[source_word+doc_lang]")
+            .equals([word, lang])
+            .delete();
+
+        await appDb.table("translit_cache").add({
+            source_word: word,
+            doc_lang: lang,
+            native: nv,
+            roman: rm,
+            created_at: Date.now()
+        });
+
+        console.log(
+            `[TRANSLIT CACHE] SAVED${(!nv && !rm) ? "(negative)" : ""} word='${word}' lang='${lang}' ` +
+            `→ native='${nv}' roman='${rm}' (replaced ${removed})`
+        );
+    } catch (e) {
+        console.error(
+            `[TRANSLIT CACHE] ❌ SAVE FAILED word='${word}' lang='${lang}'. ` +
+            `이 값은 다음 태스크에서 다시 LLM 으로 생성됩니다.`, e
+        );
+    }
+});
+
+// ── 로컬 코사인 계산 헬퍼 (프론트 전용) ──
+function cosineSimLocal(a: number[], b: number[]): number {
+    if (a.length !== b.length || a.length === 0) return 0;
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    const denom = Math.sqrt(na) * Math.sqrt(nb);
+    return denom === 0 ? 0 : dot / denom;
+}
+
+function stopDesktopCamera() {
+    if (desktopStream) {
+        desktopStream.getTracks().forEach(track => track.stop());
+        desktopStream = null;
+    }
+}
+
+async function startMobileScanning(video: HTMLVideoElement) {
+    if (!video || !(video instanceof HTMLVideoElement)) {
+        console.error('Invalid video element provided to startMobileScanning');
+        return;
+    }
+
+    try {
+        console.log("Starting desktop camera stream...");
+        desktopStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+        video.srcObject = desktopStream;
+        await video.play();
+        
+        document.getElementById("mobile-scan-view")?.classList.remove("hidden");
+        document.getElementById("pc-qr-view")?.classList.add("hidden");
+    } catch (err) {
+        console.error("Failed to start desktop camera:", err);
+        alert("Camera start failed: " + err);
+        return;
+    }
+
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    
+    const receivedChunks: string[] = [];
+    let expectedTotal = 0;
+    
+    const scanLoop = async () => {
+        if (!video || video.paused || video.ended) return;
+        try {
+            if (video.readyState >= 2) {
+                canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+                if (ctx && canvas.width > 0 && canvas.height > 0) {
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    // @ts-ignore
+                    const code = jsQR(imageData.data, imageData.width, imageData.height);
+                    if (code) {
+                        try {
+                            const data = JSON.parse(code.data);
+                            // Handle compact Answer
+                            if (data.t === "answer") {
+                                const sdp = buildSdp('answer', data.i, data.u, data.p, data.f, data.s);
+                                const answer = new RTCSessionDescription({ type: 'answer', sdp });
+                                if (peerConn) {
+                                    await peerConn.setRemoteDescription(answer);
+                                    stopDesktopCamera();
+                                    const profileName = document.getElementById("nav-profile-name");
+                                    if (profileName) {
+                                        profileName.textContent = "✅ Mobile Connected";
+                                        profileName.style.color = "#4ade80";
+                                    }
+                                    document.getElementById("nav-qr-container")?.classList.add("hidden");
+                                }
+                                return;
+                            }
+                            // Fallback for legacy chunked format
+                            if (Array.isArray(data) && data.length === 3) {
+                                const [idx, total, chunkStr] = data;
+                                if (expectedTotal === 0) {
+                                    expectedTotal = total;
+                                    for(let i=0; i<total; i++) receivedChunks.push(""); 
+                                }
+                                if (!receivedChunks[idx]) {
+                                    receivedChunks[idx] = chunkStr;
+                                    const profileName = document.getElementById("nav-profile-name");
+                                    if (profileName) {
+                                        const count = receivedChunks.filter(c => c).length;
+                                        profileName.textContent = `Scanning... ${count}/${total}`;
+                                    }
+                                }
+                                if (receivedChunks.every(c => c !== "")) {
+                                    const answer = new RTCSessionDescription({ type: 'answer', sdp: receivedChunks.join("") });
+                                    if (peerConn) {
+                                        await peerConn.setRemoteDescription(answer);
+                                        stopDesktopCamera();
+                                        const profileName = document.getElementById("nav-profile-name");
+                                        if (profileName) {
+                                            profileName.textContent = "✅ Mobile Connected";
+                                            profileName.style.color = "#4ade80";
+                                        }
+                                        document.getElementById("nav-qr-container")?.classList.add("hidden");
+                                    }
+                                    return;
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                }
+            }
+        } catch (e) {}
+        requestAnimationFrame(scanLoop);
+    };
+    requestAnimationFrame(scanLoop);
+}
+
+document.getElementById("btn-switch-to-camera")?.addEventListener("click", () => {
+    const video = document.getElementById("desktop-camera-video") as HTMLVideoElement;
+    if (video) startMobileScanning(video);
+});
+document.getElementById("btn-switch-to-qr")?.addEventListener("click", () => {
+    const video = document.getElementById("desktop-camera-video") as HTMLVideoElement;
+    if (video) stopDesktopCamera();
+    showPcPairingQr();
+});

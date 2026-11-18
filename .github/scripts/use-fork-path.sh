@@ -3,7 +3,7 @@
 # commented local path form (../candle-rocm-vulkan/..., the fork checkout next to logis-center):
 #   [workspace.dependencies] candle-rocm (used by crates/logis-llm)
 #   [patch.crates-io]        candle-core · candle-nn · candle-flash-attn
-# Argument: the workspace root Cargo.toml (an app manifest commerce/src-tauri/Cargo.toml is mapped to its root).
+# Argument: the workspace root Cargo.toml (an app manifest apps/desktop/Cargo.toml is mapped to its root).
 # CI / local only — never commit.
 set -euo pipefail
 root="${1:-Cargo.toml}"
@@ -20,7 +20,7 @@ for c in candle-rocm candle-core candle-nn candle-flash-attn; do
 done
 n=$(grep -cE '^candle-(rocm|core|nn|flash-attn) = \{ path = "(\.\./)+candle-rocm-vulkan/' "$root")
 [ "$n" -eq 4 ] || { echo "expected 4 path lines, found $n"; grep -n candle-rocm-vulkan "$root"; exit 1; }
-if grep -rlE '^candle-rocm = \{ git = ' --include=Cargo.toml "$ws/commerce/src-tauri" "$ws/crates" 2>/dev/null; then
+if grep -rlE '^candle-rocm = \{ git = ' --include=Cargo.toml "$ws/apps" "$ws/crates" 2>/dev/null; then
   echo "a member manifest above still pins candle-rocm by git (the pin belongs in the workspace root)"; exit 1
 fi
 echo "Cargo.toml: 4 fork lines -> path candle-rocm-vulkan (workspace root: candle-rocm + 3 patches)"

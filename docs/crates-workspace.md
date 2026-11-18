@@ -3,6 +3,9 @@
 기획서 "웹 분석(`analytic`) 이관 이후 `crates/` 모듈화 및 `premium-discount` 공용 엔진 통합"의 1 · 2단계, 3단계의 검색 · 생성 모델 crate,
 4단계의 `EventSink` 를 반영한 기록입니다. 나머지(문서 비전 crate, `commerce/app` 분리)는 아래 "남은 단계"에 실측한 결합도와 함께 적었습니다.
 
+> 1 ~ 6단계 본문의 경로는 그때의 것(`commerce/app` · `commerce/src-tauri` · `commerce/crates`)입니다. 7단계에서 폴더를 다시 배치했고,
+> 옛 경로 → 새 경로는 [7단계 표](#7단계-폴더-재배치-apps--crates--web--workers--vendor)에 있습니다.
+
 ## 1단계: 루트 작업 공간 · candle 포크 고정 · premium-discount 링크
 
 | 무엇 | 어디 |
@@ -259,6 +262,37 @@ logis 쪽: `tests/it/stanza_runtime.rs::dump_analyses`, `synthetic_eval::embed_d
 - 루트 `[workspace.dependencies]` 에 `premium-discount-nms` 를 같은 리비전으로 선언만 했습니다. PD 의 스팬 NMS(Stanza 역할 · granite 임베딩 위의
   의미 NMS)에 해당하는 코드가 이 앱에는 없고, 이 앱의 NMS 는 비전 패치(`logis-vision-doc` `nms_arena`)뿐입니다.
 
+## 7단계: 폴더 재배치 (apps · crates · web · workers · vendor)
+
+Rust 는 `apps/` · `crates/`, TypeScript 는 `web/` · `workers/` 로 나눴습니다. 데스크톱 셸과 헤드리스 코어가 같은 높이(`apps/`)에 섭니다.
+모두 `git mv` 라 이력이 이어집니다.
+
+| 예전 | 지금 | 비고 |
+| :--- | :--- | :--- |
+| `commerce/app` | `apps/core` | crate `logis-app` (깊이 2 그대로라 시험의 `CARGO_MANIFEST_DIR/../../SyntheticData` · `include_str!` 경로 변경 없음) |
+| `commerce/src-tauri` | `apps/desktop` | crate `logis-center`, tauri.conf · icons · models · DirectStorage. `frontendDist` = `../../web/desktop/dist` |
+| `commerce/mobile/src-tauri` | `apps/mobile` | 계속 작업 공간 밖. `frontendDist` = `../../web/mobile/dist` |
+| `commerce/crates/embed-cpu-kernels` · `ggml-kquant` | `crates/` | 직접 짠 CPU 커널 (암묵 멤버) |
+| `commerce/crates/boa-engine` · `direct-storage` | `vendor/` | 자기 `[workspace]`, `exclude` |
+| `commerce/tools/cpu-embed-bench` | `tools/` | `exclude` |
+| `commerce/src` · `public` · vite · vitest · `package.json` | `web/desktop` | 상대 경로(`root: src`, `outDir: ../dist`)가 그대로 맞음 |
+| `commerce/mobile` (프런트엔드) | `web/mobile` | `outDir` 를 `dist` 로 (예전 `commerce/dist/mobile`) |
+| `commerce/landing` | `web/landing` | |
+| `commerce/*.bat` · `_rocm_select.ps1` · `test_linux.sh` · `patch_gguf.py` | `scripts/` | 작업 폴더 `%~dp0..\apps\desktop` |
+| `apac` · `proxy` | `workers/` | 쓰지 않던 `apac/src/backup.ts` · `backup__.ts` 삭제 |
+| `commerce/src-tauri/target` | `target/` (루트) | `.cargo/config.toml` `target-dir = "target"`. 옛 폴더를 그대로 옮겨 다시 빌드하지 않음 |
+
+- Tauri CLI 는 셸과 프런트엔드가 갈라진 것을 `TAURI_APP_PATH=apps/desktop` · `TAURI_FRONTEND_PATH=web/desktop` 로 압니다(설치된 CLI 2.12.1 이
+  두 이름을 읽는 것을 확인, `tauri info` 가 `frontendDist ../../web/desktop/dist` · `bundler: Vite` 를 보고). `scripts/_env_rocm.bat` ·
+  `_env_vulkan.bat` · `dev_cargo.bat` · `build_cargo.bat` 이 둘을 정합니다.
+- 고친 경로: 루트 · `crates/logis-llm` · `logis-vision-doc` · `apps/core` · `tools` 매니페스트, CI(`cross-verify.yml` · `mac-verify.yml` ·
+  `.github/scripts/*`: 작업 폴더 · 캐시 `logis-center/target` · `../../target` 의 onnxruntime.dll · it exe), `SyntheticData/eval/run_eval.bat`,
+  `web/mobile/install_mobile.ps1`(다른 PC 의 절대 경로였음 → 저장소 기준), 개발 중 모델 폴더(`apps/desktop/src/lib.rs`: 저장소 루트에서 실행하면
+  `apps/desktop/models`).
+- 함께 고친 옛 결함: `SyntheticData/eval/make_vision_cases.py` · `score_commerce.py` · `score_vision.py` 의 `bias.json` 경로가
+  `commerce/src-tauri/src/utils/bias.json`(2단계에서 `crates/logis-bias/src/bias.json` 으로 옮겨 없어진 곳)을 가리키고 있었습니다.
+- 검증: 아래 "검증"의 7단계 줄.
+
 ## 기획서와 다른 점 (코드 · 저장소로 확인)
 
 - 기획서의 candle 커밋 `ebaf93db1c65fe2fb3bf3ebde3fc2bdab07ff311` 은 포크에 없습니다. 실제 커밋은 `ebaf93db065f22be67a9a4a250eec5a212e143fe` 이고,
@@ -345,9 +379,9 @@ logis 쪽: `tests/it/stanza_runtime.rs::dump_analyses`, `synthetic_eval::embed_d
 
 ## 빌드 · 시험
 
-- 앱: 예전처럼 `commerce/*.bat` (작업 폴더 `commerce/src-tauri`). 이 PC(RAM 16 GB)는 마지막 LTO 링크 두 개(lib · bin, 시험 exe)가 겹치면
+- 앱: `scripts/*.bat` (작업 폴더 `apps/desktop`, 산출물 루트 `target/`). 이 PC(RAM 16 GB)는 마지막 LTO 링크 두 개(lib · bin, 시험 exe)가 겹치면
   os error 1455 가 나므로, `cargo build --release … -j 3` 으로 lib → bin 을 만든 뒤
   `cargo test --release --no-run -p logis-center -p logis-app --test it … -j 3` 을 돌리면 겹치지 않습니다.
 - 통합 시험: 어디서든 `cargo test -p logis-center -p logis-app --test it --no-default-features [--features rocm|vulkan|metal]`
-  (`commerce/test_cargo*.bat` 가 이것). Windows debug 는 `CARGO_PROFILE_DEV_DEBUG=0`(PDB 한도, 위 함정).
+  (`scripts/test_cargo*.bat` 가 이것). Windows debug 는 `CARGO_PROFILE_DEV_DEBUG=0`(PDB 한도, 위 함정).
 - crate: 루트에서 `cargo test -p logis-schema -p logis-bias -p logis-sds -p logis-pug -p logis-parsers -p logis-search`.

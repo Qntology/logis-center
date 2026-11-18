@@ -59,9 +59,11 @@ All inference, embedding, and storage are performed **locally on the client**, w
 ```
 
 cron-logis-center/
-├── Cargo.toml                          # Root Cargo workspace (crates/logis-* + commerce/app + commerce/src-tauri), candle fork + PD pins
-├── .cargo/config.toml                  # target-cpu=native, build output kept in commerce/src-tauri/target
+├── Cargo.toml                          # Root Cargo workspace (crates/* + apps/core + apps/desktop), candle fork + PD pins
+├── .cargo/config.toml                  # target-cpu=native, build output in target/
 ├── crates/                             # Domain and engine libraries (no Tauri · LanceDB; only logis-llm · logis-vision-doc use candle)
+│   ├── embed-cpu-kernels/              # CPU kernels for the embedding encoder (GLU · matmul)
+│   ├── ggml-kquant/                    # GGUF k-quant blocks (Q4_K · Q8_0 …)
 │   ├── logis-schema/                   # canonical (field normalization), logic (trade groups · 28 forms · hub fields), hash, text, embed_space,
 │   │                                   # app data paths (tmp · kv · task data · logs · extraction stop signal), json_order (sorted JSON key
 │   │                                   # order: lancedb 0.41 turns on serde_json preserve_order, outputs stay as before)
@@ -78,16 +80,8 @@ cron-logis-center/
 │   └── logis-vision-doc/               # Document vision: siglip2/ (SigLIP2 towers · GGUF · quantize-on-use + precision fingerprint,
 │                                       # vision_encoder heatmap/classification, vision_crop + nms_arena, legibility, value_grounding,
 │                                       # layout/phrase caches, tokenizer, NaFlex preprocessor)
-├── commerce/                           # Desktop client (Tauri v2 + Vite/TS)
-│   ├── src/                            # Frontend (TypeScript)
-│   ├── mobile/                         # Mobile companion app (Tauri)
-│   ├── landing/                        # Landing page
-│   ├── build_cargo*.bat / dev_cargo*.bat / test_cargo*.bat  # CUDA / ROCm / Vulkan scripts
-│   ├── test_linux.sh                   # Linux integration tests (vulkan|cuda|rocm)
-│   ├── crates/
-│   │   ├── boa-engine/                 # Boa JS engine (local build)
-│   │   └── direct-storage/             # DirectStorage (Windows)
-│   ├── app/                            # Headless core (crate logis-app, no Tauri): model residency, LanceDB store, scheduler, search
+├── apps/                               # Rust applications
+│   ├── core/                           # Headless core (crate logis-app, no Tauri): model residency, LanceDB store, scheduler, search
 │   │   ├── Cargo.toml                  # GPU features only forward to logis-llm / logis-vision-doc (the core code has no #[cfg(feature)])
 │   │   ├── tests/it/                   # Integration tests + synthetic eval, no Tauri (cargo test -p logis-center -p logis-app --test it)
 │   │   └── src/
@@ -129,7 +123,7 @@ cron-logis-center/
 │   │           └── ...                 # (bias_schema · canonical · hash · time_guide · lang_utils · json_* · nl_convert · pug_utils:
 │   │                                   #  crates/logis-*; device_utils · resources · tensor_utils · crypto · img_utils · direct_loader ·
 │   │                                   #  misc_utils: crates/logis-llm; paths: crates/logis-schema)
-│   └── src-tauri/                      # Thin Tauri shell (crate tauri_app_lib)
+│   ├── desktop/                        # Thin Tauri shell (crate tauri_app_lib), tauri.conf.json · icons · models
 │       ├── Cargo.toml                  # Tauri + feature flags (cuda/rocm/vulkan/metal/flash-attn/turbo-quant/full-bias → logis-app)
 │       └── src/
 │           ├── lib.rs                  # Tauri entry: thin #[tauri::command] wrappers over logis_app::commands / query (State +
@@ -137,8 +131,17 @@ cron-logis-center/
 │           ├── automation.rs           # Chromium browser automation
 │           ├── sink.rs                 # TauriSink (AppHandle::emit) + re-export of the core sink
 │           └── main.rs
-├── apac/                               # Cloudflare Worker + D1 backend
-├── proxy/                              # Cloudflare Worker + D1 backend (proxy)
+│   └── mobile/                         # Mobile companion Tauri shell (outside the workspace)
+├── web/                                # Frontends (Vite + TypeScript)
+│   ├── desktop/                        # Desktop UI (src/, public/, vite · vitest; tauri.conf → ../../web/desktop/dist)
+│   ├── mobile/                         # Mobile UI (+ install_mobile.ps1)
+│   └── landing/                        # Landing page
+├── workers/                            # Cloudflare Workers (proxy · apac) + shared D1 migrations
+├── vendor/                             # Third-party code with its own workspace
+│   ├── boa-engine/                     # Boa JS engine (local build)
+│   └── direct-storage/                 # DirectStorage (Windows)
+├── scripts/                            # build_cargo*.bat / dev_cargo*.bat / test_cargo*.bat (CUDA / ROCm / Vulkan), test_linux.sh
+├── tools/cpu-embed-bench/              # CPU embedding benchmark (own workspace)
 ├── SyntheticData/trading/              # Synthetic trade documents (YAML → PDF generators)
 ├── logic.md                            # Pipeline logic notes
 └── readme.md
@@ -500,11 +503,10 @@ model.load_kv_cache(path, device, expected_len, refill_len, kv_name).await?;
 
 ```bash
 # Frontend build
-cd commerce && npm install && npm run build
+cd web/desktop && npm install && npm run build
 
-# Rust Backend build (CUDA default)
-cd src-tauri
-cargo build --release
+# Rust build (CUDA default), from the repository root
+cargo build --release -p logis-center
 # Other backends
 cargo build --release --no-default-features --features rocm     # or vulkan / metal
 ```
@@ -512,26 +514,23 @@ cargo build --release --no-default-features --features rocm     # or vulkan / me
 ### Run
 
 ```bash
-cargo tauri dev      # Development mode
-or
-.\dev_cargo.bat      # .\dev_cargo_rocm.bat / .\dev_cargo_vulkan.bat
-
-cargo tauri build    # Production build
-or
-.\build_cargo.bat    # .\build_cargo_rocm.bat / .\build_cargo_vulkan.bat
+.\scripts\dev_cargo.bat      # .\scripts\dev_cargo_rocm.bat / dev_cargo_vulkan.bat (Development mode)
+.\scripts\build_cargo.bat    # .\scripts\build_cargo_rocm.bat / build_cargo_vulkan.bat (Production build)
+# The Tauri CLI finds the shell and the frontend through TAURI_APP_PATH=apps/desktop and
+# TAURI_FRONTEND_PATH=web/desktop (the scripts set both).
 ```
 
 ### Test
 
 ```bash
 # Windows
-.\test_cargo.bat     # .\test_cargo_rocm.bat / .\test_cargo_vulkan.bat
+.\scripts\test_cargo.bat     # .\scripts\test_cargo_rocm.bat / test_cargo_vulkan.bat
 
 # Linux (vulkan | cuda | rocm)
-./test_linux.sh vulkan
+./scripts/test_linux.sh vulkan
 
 # Frontend
-npm test
+cd web/desktop && npm test
 ```
 
 ### Model Download
@@ -577,7 +576,7 @@ Apache License 2.0
 
 ### Open Source Libraries
 
-#### Rust (`commerce/src-tauri`)
+#### Rust (`apps/desktop`)
 
 | Library | License |
 | --- | --- |
@@ -638,7 +637,7 @@ Apache License 2.0
 | windows / windows-sys | MIT OR Apache-2.0 |
 | zip | MIT |
 
-#### JavaScript / TypeScript (`commerce`, `commerce/mobile`, `apac`, `proxy`)
+#### JavaScript / TypeScript (`web/desktop`, `web/mobile`, `workers/apac`, `workers/proxy`)
 
 | Library | License |
 | --- | --- |
@@ -670,7 +669,7 @@ Licensed under the MIT License and/or Apache License 2.0.
 #### Microsoft DirectStorage
 
 This application uses Microsoft DirectStorage 1.3.0 on Windows for fast KV cache block I/O.
-See `commerce/src-tauri/dstorage.license.txt` for license terms.
+See `apps/desktop/dstorage.license.txt` for license terms.
 
 ---
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from truth import ROOT, trading_docs
 
 TWINS = {"BC": "BK", "CA": "COA", "PHYTO": "PC", "INS": "IP"}
-BIAS = ROOT.parent / "commerce" / "src-tauri" / "src" / "utils" / "bias.json"
+BIAS = ROOT.parent / "crates" / "logis-bias" / "src" / "bias.json"
 
 
 def same_code(a: str, b: str) -> bool:
