@@ -1,0 +1,40 @@
+[package]
+name = "logis-vision-doc"
+description = "logis-center 문서 비전: SigLIP2 So400m/16 NaFlex 비전 · 텍스트 타워(safetensors · GGUF, 사용 시 양자화 · 정밀도 지문), 무역 서식 히트맵 · 2단계 문서 분류, 가독성 지도, 크롭 계획(NMS), 값 그라운딩, 레이아웃 · 구 캐시. Tauri · DB 없음"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# 앱(commerce/src-tauri)의 같은 이름 기능이 이 기능도 켭니다. quant.rs 의 GPU 기본 정밀도(rocm 이면서 cuda 가 아니면 q8)와
+# gguf.rs · vision_encoder.rs 의 장치별 경로가 이 crate 의 기능을 봅니다.
+cuda = ["logis-llm/cuda", "candle-core/cuda", "candle-nn/cuda"]
+rocm = ["logis-llm/rocm", "candle-core/rocm", "candle-nn/rocm"]
+vulkan = ["logis-llm/vulkan", "candle-core/vulkan", "candle-nn/vulkan"]
+metal = ["logis-llm/metal", "candle-core/metal", "candle-nn/metal"]
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+# candle 은 crates.io 이름으로 적고, 루트 Cargo.toml 의 [patch.crates-io] 가 포크 커밋으로 바꿉니다.
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+chrono = { version = "0.4", features = ["serde"] }
+embed-cpu-kernels = { path = "../../commerce/crates/embed-cpu-kernels" }
+ggml-kquant = { path = "../../commerce/crates/ggml-kquant" }
+half = "2.4"
+image = { version = "0.25", features = ["jpeg", "png"] }
+logis-bias.workspace = true
+logis-llm.workspace = true
+logis-pug.workspace = true
+logis-schema.workspace = true
+logis-sds.workspace = true
+memmap2 = "0.9"
+once_cell.workspace = true
+rayon = "1.10"
+serde.workspace = true
+serde_json.workspace = true
+tokenizers = "0.22.2"
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory"] }

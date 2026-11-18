@@ -13,7 +13,7 @@ const LAYOUT_RECIPE: &str = "layout-v1:siglip2-so400m-naflex/label-anchor-int8/r
 /// 🌟 [WEIGHTS FINGERPRINT] 템플릿의 앵커는 SigLIP2 히트맵에서 나오므로 정밀도가 다르면 레시피도 다릅니다.
 /// 예전 정밀도(GPU BF16 · CPU F32)는 예전 레시피 · 파일 그대로입니다.
 fn layout_recipe() -> String {
-    match crate::models::siglip2::quant::fingerprint_suffix() {
+    match crate::siglip2::quant::fingerprint_suffix() {
         Some(s) => format!("{LAYOUT_RECIPE}|w={s}"),
         None => LAYOUT_RECIPE.to_string(),
     }
@@ -507,8 +507,8 @@ impl LayoutCache {
             }
         }
         if let Some((m, w, k)) = near {
-            crate::utils::score_dynamics::record_baseline("vision.layout_probe_median", m);
-            crate::utils::score_dynamics::record_baseline("vision.layout_probe_win", w);
+            logis_sds::record_baseline("vision.layout_probe_median", m);
+            logis_sds::record_baseline("vision.layout_probe_win", w);
             if best.is_none() {
                 emit(&format!(
                     "  🗂️ [LAYOUT CACHE / MISS] 같은 격자 크기의 서식 템플릿 중 가장 가까운 것도 라벨 앵커 정렬 코사인 중앙값 {:.3} (기준 {:.2}) · 제자리 우세율 {:.2} (기준 {:.2}) · 잉크 겹침 {:.2} (기준 {:.2}) 로 같은 서식이 아닙니다. 전체 분석을 수행합니다.",
@@ -572,7 +572,7 @@ impl LayoutCache {
         let agreement = peaks.min(corr);
         let type_ok = hit.detected_type == detected_type;
         let agree = type_ok && agreement >= AGREE_FLOOR;
-        crate::utils::score_dynamics::record_baseline("vision.layout_agreement", agreement);
+        logis_sds::record_baseline("vision.layout_agreement", agreement);
         self.ensure_loaded();
         let mut g = match self.file.write() {
             Ok(g) => g,
@@ -643,7 +643,7 @@ impl LayoutCache {
         emit: &dyn Fn(&str),
     ) {
         let filled = count_filled(extracted);
-        crate::utils::score_dynamics::record_baseline("vision.layout_yield", filled as f32);
+        logis_sds::record_baseline("vision.layout_yield", filled as f32);
         self.ensure_loaded();
         let mut g = match self.file.write() {
             Ok(g) => g,
@@ -776,7 +776,7 @@ impl LayoutCache {
 }
 
 pub static LAYOUT_CACHE: Lazy<LayoutCache> = Lazy::new(|| LayoutCache {
-    path: crate::utils::get_app_dir()
+    path: logis_schema::paths::get_app_dir()
         .join("cache")
         .join("vision_layouts")
         .join("templates.json"),

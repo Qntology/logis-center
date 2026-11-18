@@ -6887,6 +6887,7 @@ dependencies = [
  "logis-schema",
  "logis-sds",
  "logis-search",
+ "logis-vision-doc",
  "memmap2",
  "metal 0.33.0",
  "mimalloc",
@@ -6939,12 +6940,15 @@ dependencies = [
  "candle-nn",
  "candle-rocm",
  "candle-transformers",
+ "chrono",
  "direct-storage",
+ "embed-cpu-kernels",
  "ggml-kquant",
  "image 0.25.10",
  "io-uring",
  "libc",
  "logis-bias",
+ "logis-pug",
  "logis-schema",
  "logis-sds",
  "memmap2",
@@ -7038,6 +7042,33 @@ dependencies = [
  "logis-schema",
  "once_cell",
  "serde_json",
+]
+
+[[package]]
+name = "logis-vision-doc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "candle-core",
+ "candle-nn",
+ "chrono",
+ "embed-cpu-kernels",
+ "ggml-kquant",
+ "half",
+ "image 0.25.10",
+ "logis-bias",
+ "logis-llm",
+ "logis-pug",
+ "logis-schema",
+ "logis-sds",
+ "memmap2",
+ "once_cell",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tokenizers",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

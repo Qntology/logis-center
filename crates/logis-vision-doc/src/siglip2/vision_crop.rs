@@ -2,7 +2,7 @@ use image::DynamicImage;
 
 use super::preprocessor::patch_index_to_bbox;
 use super::vision_encoder::{CategoryHeatmap, PatchGrid};
-use crate::utils::ai_utils::exclusive_assign_by_score;
+use logis_pug::utils::ai_utils::exclusive_assign_by_score;
 
 /// 카테고리 하나에 대한 크롭 계획.
 #[derive(Debug, Clone)]
@@ -617,7 +617,7 @@ fn presence_gate(
     heatmaps: &[CategoryHeatmap],
     n: usize,
     identity_category: &str,
-    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    legibility: &crate::siglip2::legibility::LegibilityMap,
     emit: &dyn Fn(&str),
 ) -> (std::collections::HashSet<String>, Vec<Option<usize>>) {
     use std::collections::{HashMap, HashSet};
@@ -654,7 +654,7 @@ fn presence_gate(
             continue;
         }
         let ratio = lg as f32 / (lg + bl) as f32;
-        crate::utils::score_dynamics::record_baseline("crop.territory.legible_ratio", ratio);
+        logis_sds::record_baseline("crop.territory.legible_ratio", ratio);
         emit(&format!(
             "    🕳️ [TERRITORY BLIND] '{}' 가 argmax 로 차지한 {}칸 중 글자가 있는 칸은 {}칸({:.0}%) 뿐입니다. 나머지 {}칸은 여백이라 어떤 축도 설명할 내용이 없으므로 영토에서 제외합니다. 여백을 영토로 남겨두면 세로 밴드 확장이 남의 여백에서 멈추고 구제 지분까지 갉아먹습니다.",
             hm.category, lg + bl, lg, ratio * 100.0, bl
@@ -705,7 +705,7 @@ fn ensure_identity_band_crop(
     content: &[f32],
     content_gate: f32,
     grid: &PatchGrid,
-    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    legibility: &crate::siglip2::legibility::LegibilityMap,
     identity_category: &str,
     identity_field: &str,
     emit: &dyn Fn(&str),
@@ -840,7 +840,7 @@ fn rescue_uncovered_cells(
     content: &[f32],
     content_gate: f32,
     grid: &PatchGrid,
-    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    legibility: &crate::siglip2::legibility::LegibilityMap,
     area_cap: usize,
     emit: &dyn Fn(&str),
 ) {
@@ -1144,8 +1144,8 @@ pub fn measure_doc_text_height(
         "  📐 [DOC TEXT HEIGHT] 글자 행 밴드 {}개 | 중앙값 {:.1}px | MAD {:.1}px | 허용 상한 {:.1}px | 괘선으로 배제한 잉크 행 {}줄. 표 테두리는 행 전체가 하나의 연속 잉크 런이고 글자 행은 글자 사이 공백 때문에 런이 끊깁니다. 이 구분이 없으면 격자가 촘촘한 서식에서 1~2px 괘선이 밴드 다수를 차지해 중앙값이 글자 높이가 아니라 선 두께가 되고, 그러면 전 크롭이 상한 배율로 포화되어 추정이 사실상 상수가 됩니다.",
         bands.len(), median, mad, median + mad.max(1.0), rule_rows
     ));
-    crate::utils::score_dynamics::record_baseline("vision.doc_text_height", median);
-    crate::utils::score_dynamics::record_baseline(
+    logis_sds::record_baseline("vision.doc_text_height", median);
+    logis_sds::record_baseline(
         "vision.doc_rule_rows",
         rule_rows as f32 / h.max(1) as f32,
     );
@@ -1171,7 +1171,7 @@ pub fn clamp_text_height(
         "    📐 [TEXT HEIGHT CLAMP / {}] 추정 {:.1}px 가 문서 상한 {:.1}px(중앙값 {:.1} + MAD {:.1})를 넘어 중앙값으로 되돌립니다. 이 크롭의 잉크 행 밴드가 서명 획이나 여러 행이 붙은 덩어리를 한 행으로 재고 있습니다. 그대로 두면 배율이 1.00x 로 떨어져 2B 모델이 한 글자도 읽지 못합니다.",
         tag, estimated, cap, median, mad
     ));
-    crate::utils::score_dynamics::record_baseline("vision.text_height_clamp", 1.0);
+    logis_sds::record_baseline("vision.text_height_clamp", 1.0);
     median
 }
 
@@ -1189,7 +1189,7 @@ pub fn split_coverage_floor(band: Option<(f32, f32, u64)>) -> f32 {
 pub fn plan_crops(
     heatmaps: &[CategoryHeatmap],
     grid: &PatchGrid,
-    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    legibility: &crate::siglip2::legibility::LegibilityMap,
     table_categories: &[&str],
     identity_category: &str,
     identity_field: &str,
@@ -1201,7 +1201,7 @@ pub fn plan_crops(
     // 분할 하한은 이 쪽의 1차 크롭이 커버리지 손실을 기록하기 전에 읽습니다(자기 관측이 자기 기준선에 섞이지 않게).
     let split_floors: Vec<(String, f32)> = heatmaps
         .iter()
-        .map(|h| (h.category.clone(), split_coverage_floor(crate::utils::score_dynamics::spatial_coverage_band(&h.category))))
+        .map(|h| (h.category.clone(), split_coverage_floor(logis_sds::spatial_coverage_band(&h.category))))
         .collect();
 
     let rows = grid.grid_rows;
@@ -1636,7 +1636,7 @@ pub fn plan_crops(
                 //   경고(coverage < 0.70)만 기록하면 '손실이 적은 정상 케이스' 가
                 //   표본에서 빠져 분포가 한쪽으로 치우칩니다.
                 //   V-2 는 '이 서식의 통상 손실률' 을 알아야 하므로 전량 기록합니다.
-                crate::utils::score_dynamics::record_coverage_loss(
+                logis_sds::record_coverage_loss(
                     &per_cat[ci].0,
                     1.0 - coverage,
                 );
@@ -1714,7 +1714,7 @@ pub fn plan_crops(
             let ratio = covered as f32 / hot as f32;
             let floor = split_floors.iter().find(|(c, _)| c == cat).map(|(_, f)| *f).unwrap_or(SPLIT_COVERAGE_FLOOR);
             if floor != SPLIT_COVERAGE_FLOOR {
-                crate::utils::score_dynamics::record_baseline("vision.split_floor", floor);
+                logis_sds::record_baseline("vision.split_floor", floor);
             }
             if ratio >= floor {
                 continue;
@@ -2060,7 +2060,7 @@ fn band_measured_text_height(img: &DynamicImage, w: u32, h: u32) -> Option<f32> 
     let floor = TEXT_HEIGHT_FLOOR_PX.max(h as f32 / TEXT_HEIGHT_CROP_FRACTION);
     let ceil = (h as f32 / TEXT_HEIGHT_CEIL_FRACTION).max(floor);
     let th = picked.max(floor).min(ceil);
-    crate::utils::score_dynamics::record_baseline("crop.text_height.band_only", th);
+    logis_sds::record_baseline("crop.text_height.band_only", th);
     println!(
         "    📏 [TEXT HEIGHT / BAND MEASURED] 잉크 행 밴드 {}개 | 채택 기준 {} | 실측 {:.1}px → 채택 {:.1}px (허용 {:.1}~{:.1}px, 크롭 높이 {}px). 자기상관 주기가 성립하지 않는 소형 크롭에서는 실측한 행 밴드 높이 자체가 글자 높이입니다.",
         n,
@@ -2155,7 +2155,7 @@ fn estimate_text_height(img: &DynamicImage) -> Option<f32> {
     let n_band = band_h.len();
     let low = if n_band >= TEXT_HEIGHT_MIN_BANDS { band_h[n_band / 4] } else { band_h[0] };
     let th = low.min(th_pitch).max(floor);
-    crate::utils::score_dynamics::record_baseline("crop.text_height.band_ratio", low / th_pitch.max(1e-6));
+    logis_sds::record_baseline("crop.text_height.band_ratio", low / th_pitch.max(1e-6));
     if th < th_pitch {
         println!(
             "    📏 [TEXT HEIGHT / SMALLEST BAND] 잉크 행 밴드 {}개 | 채택 기준 {} 밴드 높이 {:.1}px | 지배 주기가 말하는 높이 {:.1}px → 채택 {:.1}px (하한 {:.1}px). 배율은 가장 작은 글자가 읽힐 때까지 올려야 하므로, 다수 본문의 주기만 보면 소형 라벨이 통째로 뭉개집니다.",
@@ -2329,10 +2329,10 @@ pub fn audit_crops(
     plans: &mut Vec<CropPlan>,
     heatmaps: &[CategoryHeatmap],
     grid: &PatchGrid,
-    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    legibility: &crate::siglip2::legibility::LegibilityMap,
     emit: &dyn Fn(&str),
 ) {
-    use crate::utils::ai_utils::gumbel_expected_z;
+    use logis_pug::utils::ai_utils::gumbel_expected_z;
 
     if plans.is_empty() {
         return;
@@ -2861,11 +2861,11 @@ pub fn decide_tile_count(
     plan: &CropPlan,
     heatmaps: &[CategoryHeatmap],
     grid: &PatchGrid,
-    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    legibility: &crate::siglip2::legibility::LegibilityMap,
     table_categories: &[&str],
     emit: &dyn Fn(&str),
 ) -> (usize, String) {
-    use crate::utils::ai_utils::gumbel_expected_z;
+    use logis_pug::utils::ai_utils::gumbel_expected_z;
 
     let rows = grid.grid_rows;
     let cols = grid.grid_cols;

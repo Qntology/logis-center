@@ -34,7 +34,7 @@ impl PhraseCache {
     /// 🌟 [WEIGHTS FINGERPRINT] 예전 정밀도(GPU BF16 · CPU F32)의 키는 예전과 같고, 다른 정밀도(ROCm 기본 q8 · F32 강제 ·
     /// 양자화 계획)는 그 꼬리표가 키에 들어가 같은 구라도 따로 저장됩니다 (`siglip2::quant::fingerprint_suffix`).
     pub fn key_of(phrase: &str) -> u64 {
-        Self::key_with(phrase, crate::models::siglip2::quant::fingerprint_suffix().as_deref())
+        Self::key_with(phrase, crate::siglip2::quant::fingerprint_suffix().as_deref())
     }
 
     pub fn key_with(phrase: &str, suffix: Option<&str>) -> u64 {
@@ -218,7 +218,7 @@ impl PhraseCache {
 }
 
 pub static SIGLIP2_PHRASE_CACHE: Lazy<PhraseCache> = Lazy::new(|| {
-    let p = crate::utils::get_app_dir()
+    let p = logis_schema::paths::get_app_dir()
         .join("cache")
         .join("siglip2_phrases")
         .join("anchors.bin");

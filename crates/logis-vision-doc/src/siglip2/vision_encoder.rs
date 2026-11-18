@@ -3,8 +3,8 @@ use image::DynamicImage;
 
 use super::preprocessor::{preprocess_image, PreprocessedImage};
 use super::{Siglip2Config, Siglip2Model};
-use crate::logic::TRADE_DOC_TITLES;
-use crate::utils::ai_utils::{split_bias_phrases_full, surprisal_dual_scores};
+use logis_schema::logic::TRADE_DOC_TITLES;
+use logis_pug::utils::ai_utils::{split_bias_phrases_full, surprisal_dual_scores};
 
 pub const ERR_TEXT_ENCODER_REQUIRED: &str = "SIGLIP2_TEXT_ENCODER_REQUIRED";
 
@@ -64,7 +64,7 @@ fn encode_phrases_persisted(
     phrases: &[String],
     persist: bool,
 ) -> anyhow::Result<Vec<std::sync::Arc<Vec<f32>>>> {
-    use crate::models::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE as CACHE;
+    use crate::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE as CACHE;
 
     if phrases.is_empty() {
         return Ok(Vec::new());
@@ -115,7 +115,7 @@ fn encode_phrases_persisted(
     let mut fresh: Vec<(String, std::sync::Arc<Vec<f32>>)> = Vec::with_capacity(miss_idx.len());
 
     // 🌟 [VISION-BATCH] 미스 구를 텍스트 임베딩(embed_many)과 같은 장치 정책으로 묶어 인코딩합니다.
-    let fixed_shape = crate::models::embedding::BatchOpts::for_device(&model.device).fixed_shape;
+    let fixed_shape = logis_llm::models::embedding::BatchOpts::for_device(&model.device).fixed_shape;
     let owned: Vec<String> = miss_idx.iter().map(|&i| phrases[i].clone()).collect();
     let rows = encode_phrase_rows_with(model, text, tok, &owned, fixed_shape)?;
     for (bi, r) in rows.into_iter().enumerate() {
@@ -179,7 +179,7 @@ fn encode_phrase_rows_with(
     }
     #[cfg(feature = "vulkan")]
     let _vk_mode = model.device.is_vulkan().then(|| {
-        candle_core::vulkan_backend::shaders::scoped_exec_mode(crate::models::embedding::vulkan_exec_mode())
+        candle_core::vulkan_backend::shaders::scoped_exec_mode(logis_llm::models::embedding::vulkan_exec_mode())
     });
     let mut outs: Vec<Tensor> = Vec::new();
     for chunk in phrases.chunks(PHRASE_BATCH_ROWS) {
@@ -215,7 +215,7 @@ pub fn encode_phrases(
 }
 
 pub fn phrases_all_cached(phrases: &[String]) -> bool {
-    crate::models::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE.all_cached(phrases)
+    crate::siglip2::phrase_cache::SIGLIP2_PHRASE_CACHE.all_cached(phrases)
 }
 
 pub fn build_anchor_bank(
@@ -389,7 +389,7 @@ pub struct DocTypeVerdict {
 fn bank_neutral_key_scores(
     grid: &PatchGrid,
     bank: &AnchorBank,
-    legible: Option<&crate::models::siglip2::legibility::LegibilityMap>,
+    legible: Option<&crate::siglip2::legibility::LegibilityMap>,
 ) -> (Vec<(String, f32)>, usize) {
     let (keys, matrix) = score_patches_bank_neutral(grid, bank, legible);
     let mut out: Vec<(String, f32)> = keys
@@ -549,7 +549,7 @@ fn run_title_gate(
     chrome_phrases: &[String],
     emit: &dyn Fn(&str),
 ) -> Option<(TitleGateVerdict, Vec<(String, f32)>)> {
-    let (t_bias, mut t_prej) = crate::logic::trade_title_bank_defs("title");
+    let (t_bias, mut t_prej) = logis_schema::logic::trade_title_bank_defs("title");
     if t_bias.is_empty() {
         return None;
     }
@@ -723,7 +723,7 @@ fn run_title_gate(
     let top_code = band_top[0].0.clone();
     let verdict_score = band_top[0].1;
     let margin = if band_top.len() >= 2 { band_top[0].1 - band_top[1].1 } else { verdict_score };
-    crate::utils::score_dynamics::record_baseline("vision.title_margin", margin);
+    logis_sds::record_baseline("vision.title_margin", margin);
     emit(&format!(
         "     👑 [TITLE GATE VERDICT] '{}' | 풀링 × {} + 띠 z 합 {:+.4} | 2위 마진 {:+.4} | 후보 {:?}",
         top_code,
@@ -739,7 +739,7 @@ fn run_title_gate(
         .map(|(_, t)| t.to_string())
         .unwrap_or_default();
 
-    let group = crate::logic::TRADE_GROUP_CODES
+    let group = logis_schema::logic::TRADE_GROUP_CODES
         .iter()
         .find(|(_, cs)| cs.iter().any(|c| *c == top_code.as_str()))
         .map(|(g, _)| g.to_string())
@@ -773,17 +773,17 @@ pub fn classify_doc_type(
     // 🌟 [SPLIT 1회 캐시] 구버전은 split_bias_phrases_full 을 그룹당 (그룹수)번
     //    재호출했습니다. 6그룹이면 36회, Part 20 확장 후 7그룹이면 49회입니다.
     //    같은 문자열을 매번 다시 쪼개고 HashSet 을 다시 만드는 순수 낭비입니다.
-    let group_phrases: Vec<(&str, Vec<String>)> = crate::logic::TRADE_GROUPS
+    let group_phrases: Vec<(&str, Vec<String>)> = logis_schema::logic::TRADE_GROUPS
         .iter()
         .map(|(g, raw)| {
             let mut own = split_bias_phrases_full(raw);
-            for t in crate::utils::ai_utils::trade_group_title_phrases(g) {
+            for t in logis_pug::utils::ai_utils::trade_group_title_phrases(g) {
                 if !own.iter().any(|e| e.eq_ignore_ascii_case(&t)) { own.push(t); }
             }
             (*g, own)
         })
         .collect();
-    let chrome_phrases: Vec<String> = crate::logic::vision_chrome_phrases();
+    let chrome_phrases: Vec<String> = logis_schema::logic::vision_chrome_phrases();
 
     let mut g_bias: Vec<(String, String, String)> = Vec::new();
     let mut g_prej: Vec<(String, String, String)> = Vec::new();
@@ -911,7 +911,7 @@ pub fn classify_doc_type(
     ));
 
     // ── Depth 2 : 코드 뱅크 (승리 그룹 + 증거가 있는 그룹의 합집합) ──
-    let mut codes: Vec<&'static str> = crate::logic::TRADE_GROUP_CODES
+    let mut codes: Vec<&'static str> = logis_schema::logic::TRADE_GROUP_CODES
         .iter()
         .find(|(g, _)| *g == best_group)
         .map(|(_, c)| c.to_vec())
@@ -924,7 +924,7 @@ pub fn classify_doc_type(
         if g == "parcel" {
             continue;
         }
-        if let Some((_, extra)) = crate::logic::TRADE_GROUP_CODES.iter().find(|(gn, _)| gn == g) {
+        if let Some((_, extra)) = logis_schema::logic::TRADE_GROUP_CODES.iter().find(|(gn, _)| gn == g) {
             for c in extra.iter() {
                 if !codes.iter().any(|x| x == c) {
                     codes.push(c);
@@ -937,8 +937,8 @@ pub fn classify_doc_type(
     let code_phrases: Vec<(&str, Vec<String>)> = codes
         .iter()
         .map(|c| {
-            let mut own = split_bias_phrases_full(crate::logic::trade_code_anchor(c));
-            for t in crate::utils::ai_utils::trade_code_title_phrases(c) {
+            let mut own = split_bias_phrases_full(logis_schema::logic::trade_code_anchor(c));
+            for t in logis_pug::utils::ai_utils::trade_code_title_phrases(c) {
                 if !own.iter().any(|e| e.eq_ignore_ascii_case(&t)) { own.push(t); }
             }
             (*c, own)
@@ -1054,8 +1054,8 @@ pub fn classify_doc_type(
         //   호출부(model/vision.rs)가 enter_scope 로 세운 전역 스코프를 읽으며,
         //   세워지지 않았으면 record_decay 가 즉시 반환합니다.
         let arr: Vec<f32> = c_scores.iter().map(|(_, s)| *s).collect();
-        crate::utils::score_dynamics::record_decay("vision.doc_code", &arr);
-        crate::utils::score_dynamics::record_baseline("vision.code_margin", code_margin);
+        logis_sds::record_decay("vision.doc_code", &arr);
+        logis_sds::record_baseline("vision.code_margin", code_margin);
     }
 
     // 🌟 [TITLE AXIS NMS INTEGRATION] 상단 밴드 전문 점수를 바디 점수와 합성합니다.
@@ -1085,19 +1085,19 @@ pub fn classify_doc_type(
                 .sqrt()
                 .max(1e-6);
             let top = vals.iter().cloned().fold(f32::MIN, f32::max);
-            (top - mean) / sd - crate::utils::ai_utils::gumbel_expected_z(n)
+            (top - mean) / sd - logis_pug::utils::ai_utils::gumbel_expected_z(n)
         };
         let body_vals: Vec<f32> = c_scores.iter().map(|(_, s)| *s).collect();
         let title_vals: Vec<f32> = title_sorted.iter().map(|(_, s)| *s).collect();
         let body_excess = axis_excess(&body_vals);
         let title_excess = axis_excess(&title_vals);
-        crate::utils::score_dynamics::record_baseline("vision.code_body_excess", body_excess);
-        crate::utils::score_dynamics::record_baseline("vision.code_title_excess", title_excess);
+        logis_sds::record_baseline("vision.code_body_excess", body_excess);
+        logis_sds::record_baseline("vision.code_title_excess", title_excess);
         if title_vals.len() >= 2 {
-            crate::utils::score_dynamics::record_decay("vision.doc_title", &title_vals);
+            logis_sds::record_decay("vision.doc_title", &title_vals);
         }
         let body_noise = if body_vals.len() >= 2 {
-            crate::utils::ai_utils::gumbel_max_sd(body_vals.len())
+            logis_pug::utils::ai_utils::gumbel_max_sd(body_vals.len())
         } else {
             f32::MAX
         };
@@ -1110,13 +1110,13 @@ pub fn classify_doc_type(
         let body_top = c_scores.first().map(|(c, _)| c.clone()).unwrap_or_default();
         let leader_is_candidate = c_scores.iter().any(|(c, _)| *c == gate.code);
         let conflict = body_decisive && !body_top.is_empty() && body_top != gate.code;
-        crate::utils::score_dynamics::record_baseline("vision.title_band_margin", band_margin);
-        crate::utils::score_dynamics::record_baseline("vision.title_band_top", gate.score);
-        crate::utils::score_dynamics::record_baseline(
+        logis_sds::record_baseline("vision.title_band_margin", band_margin);
+        logis_sds::record_baseline("vision.title_band_top", gate.score);
+        logis_sds::record_baseline(
             "vision.body_decisive",
             if body_decisive { 1.0 } else { 0.0 },
         );
-        crate::utils::score_dynamics::record_baseline(
+        logis_sds::record_baseline(
             "vision.title_body_conflict",
             if conflict { 1.0 } else { 0.0 },
         );
@@ -1182,7 +1182,7 @@ pub fn classify_doc_type(
 
     // 🌟 [GROUP RE-ANCHOR] 그룹은 최종 코드가 속한 그룹으로 재확정합니다.
     //    그룹 단계가 customs 를 외쳐도 코드 단계가 CI 를 뽑으면 shipping 이 정답입니다.
-    if let Some((g, _)) = crate::logic::TRADE_GROUP_CODES
+    if let Some((g, _)) = logis_schema::logic::TRADE_GROUP_CODES
         .iter()
         .find(|(_, cs)| cs.iter().any(|c| *c == code.as_str()))
     {
@@ -1258,7 +1258,7 @@ pub fn build_column_heatmaps(
     grid: &PatchGrid,
     doc_type: &str,
     doc_lang: &str,
-    legibility: Option<&crate::models::siglip2::legibility::LegibilityMap>,
+    legibility: Option<&crate::siglip2::legibility::LegibilityMap>,
     title_prejudice: &[String],
     emit: &dyn Fn(&str),
 ) -> anyhow::Result<Vec<CategoryHeatmap>> {
@@ -1266,7 +1266,7 @@ pub fn build_column_heatmaps(
 
     // ── 1) 카테고리 × 필드 앵커 구 수집 ──
     //    필드 → 카테고리 매핑은 logic.rs 가 소유합니다.
-    let schema_fields = crate::parsing::get_detail_schema_fields(doc_type, "", doc_lang);
+    let schema_fields = logis_pug::utils::parsing::get_detail_schema_fields(doc_type, "", doc_lang);
     let mut bias_defs: Vec<(String, String, String)> = Vec::new();
     let mut field_to_cat: HashMap<String, String> = HashMap::new();
     let mut sup_stage: Vec<(String, String, String)> = Vec::new();
@@ -1287,9 +1287,9 @@ pub fn build_column_heatmaps(
     //   scheduler.rs 의 [SELF-REFERENCE DROP] 은 '저장 직전' 에 자기 참조를 지웁니다.
     //   그 시점에는 이미 크롭이 잘못 착지한 뒤라 되돌릴 수 없습니다.
     //   같은 판정을 히트맵 단계로 앞당깁니다. 사전은 logic.rs 것을 그대로 씁니다.
-    let self_ref_field = crate::logic::trade_reference_field_of(doc_type).unwrap_or("");
+    let self_ref_field = logis_schema::logic::trade_reference_field_of(doc_type).unwrap_or("");
     for (fname, _, bias_target, _) in schema_fields.iter() {
-        let cat = crate::logic::trade_field_category(fname);
+        let cat = logis_schema::logic::trade_field_category(fname);
         if cat.is_empty() {
             continue;
         }
@@ -1333,7 +1333,7 @@ pub fn build_column_heatmaps(
         //        — 네 건 전부 값이 아니라 라벨을 읽은 결과입니다.
         //   라벨 축과 값 축을 모두 두면 두 봉우리가 생기고,
         //   expand_row_band 가 같은 행 밴드에서 둘을 이어 붙입니다.
-        let sem = crate::utils::ai_utils::semantic_anchor_text(doc_lang, doc_type, fname);
+        let sem = logis_pug::utils::ai_utils::semantic_anchor_text(doc_lang, doc_type, fname);
         let mut label_cnt = 0usize;
         let mut value_cnt = 0usize;
         let mut dup_cnt = 0usize;
@@ -1348,7 +1348,7 @@ pub fn build_column_heatmaps(
                 dup_cnt += 1;
                 continue;
             }
-            if crate::utils::ai_utils::is_value_example_phrase(&p) {
+            if logis_pug::utils::ai_utils::is_value_example_phrase(&p) {
                 value_cnt += 1;
             } else {
                 label_cnt += 1;
@@ -1369,7 +1369,7 @@ pub fn build_column_heatmaps(
         }
         // bias 구 (동의어 나열)
         for p in split_bias_phrases_full(bias_target) {
-            if crate::utils::ai_utils::is_value_example_phrase(&p) {
+            if logis_pug::utils::ai_utils::is_value_example_phrase(&p) {
                 continue;
             }
             if bias_defs
@@ -1380,9 +1380,9 @@ pub fn build_column_heatmaps(
             }
             bias_defs.push((cat.to_string(), fname.clone(), p));
         }
-        let (ml_phrases, _) = crate::utils::ai_utils::label_phrase_bank_multilingual(doc_lang, doc_type, fname);
+        let (ml_phrases, _) = logis_pug::utils::ai_utils::label_phrase_bank_multilingual(doc_lang, doc_type, fname);
         for p in ml_phrases.into_iter() {
-            if crate::utils::ai_utils::is_value_example_phrase(&p) {
+            if logis_pug::utils::ai_utils::is_value_example_phrase(&p) {
                 continue;
             }
             if bias_defs
@@ -1393,8 +1393,8 @@ pub fn build_column_heatmaps(
             }
             bias_defs.push((cat.to_string(), fname.clone(), p));
         }
-        if crate::utils::bias_schema::is_trade_doc_type(doc_type) {
-            for p in crate::logic::trade_label_supplement(fname).into_iter() {
+        if logis_bias::bias_schema::is_trade_doc_type(doc_type) {
+            for p in logis_schema::logic::trade_label_supplement(fname).into_iter() {
                 let compact: Vec<char> = p.chars().filter(|c| !c.is_whitespace()).collect();
                 let digits = compact.iter().filter(|c| c.is_ascii_digit()).count();
                 if compact.is_empty() || digits * 4 >= compact.len() {
@@ -1472,8 +1472,8 @@ pub fn build_column_heatmaps(
     //  '표' 라는 시각 구조 자체를 앵커로 세워 위치 신호를 복원합니다.
     {
         let table_axes: [(&str, &str, &str); 2] = [
-            ("items", "__table_structure__", crate::logic::TRADE_TABLE_STRUCTURE_ANCHOR),
-            ("containers", "__container_table__", crate::logic::TRADE_CONTAINER_TABLE_ANCHOR),
+            ("items", "__table_structure__", logis_schema::logic::TRADE_TABLE_STRUCTURE_ANCHOR),
+            ("containers", "__container_table__", logis_schema::logic::TRADE_CONTAINER_TABLE_ANCHOR),
         ];
         for (cat, pseudo_field, anchor) in table_axes.iter() {
             // 그 카테고리에 실제 스키마 필드가 하나라도 있을 때만 편입합니다.
@@ -1523,7 +1523,7 @@ pub fn build_column_heatmaps(
     let mut prej_defs: Vec<(String, String, String)> = Vec::new();
     {
         let mut global: Vec<String> = Vec::new();
-        for p in crate::logic::vision_chrome_phrases() {
+        for p in logis_schema::logic::vision_chrome_phrases() {
             if !global.iter().any(|e| e == &p) {
                 global.push(p);
             }
@@ -1670,7 +1670,7 @@ pub fn build_column_heatmaps(
         let mean = vals.iter().map(|(_, v)| *v).sum::<f32>() / cnt;
         let sd = (vals.iter().map(|(_, v)| (*v - mean) * (*v - mean)).sum::<f32>() / cnt).sqrt();
         if sd <= 1e-6 { continue; }
-        let gate = crate::utils::ai_utils::gumbel_expected_z(vals.len());
+        let gate = logis_pug::utils::ai_utils::gumbel_expected_z(vals.len());
         let mut ranked: Vec<(usize, f32)> = vals
             .iter()
             .map(|(i, v)| (*i, (*v - mean) / sd))
@@ -1695,7 +1695,7 @@ pub fn build_column_heatmaps(
                 .flat_map(|v| v.iter())
                 .find(|(f, p, _)| f == owner && *p == ranked[0].0)
                 .map(|(_, _, z)| *z);
-            crate::utils::score_dynamics::record_confusion(
+            logis_sds::record_confusion(
                 owner,
                 &fname,
                 owner_z.map(|oz| oz - ranked[0].1).unwrap_or(f32::NAN),
@@ -1721,7 +1721,7 @@ pub fn build_column_heatmaps(
                     .find(|(q, _)| *q == p)
                     .map(|(_, o)| o.clone())
                     .unwrap_or_else(|| "-".to_string());
-                crate::utils::score_dynamics::record_baseline("vision.peak_shared_z", z);
+                logis_sds::record_baseline("vision.peak_shared_z", z);
                 shared.push(format!("{}↔{}(패치 {}, z {:+.2})", fname, owner, p, z));
                 field_peaks_by_cat.entry(cat).or_default().push((fname, p, z));
             }
@@ -1788,12 +1788,12 @@ pub fn build_column_heatmaps(
         for ci in 0..cats.len() {
             // 🌟 구 수를 N 으로 씁니다. 집계 실패 시에만 필드 수로 폴백합니다.
             let n_eff = cat_phrases[ci].max(cat_fields[ci]).max(1);
-            let base = crate::utils::ai_utils::gumbel_expected_z(n_eff) * FIELD_COUNT_NEUTRAL_WEIGHT;
+            let base = logis_pug::utils::ai_utils::gumbel_expected_z(n_eff) * FIELD_COUNT_NEUTRAL_WEIGHT;
             detail.push(format!(
                 "{}({}구/{}필드 −{:.3})",
                 cats[ci], cat_phrases[ci], cat_fields[ci], base
             ));
-            crate::utils::score_dynamics::record_baseline(
+            logis_sds::record_baseline(
                 &format!("vision.neutral_n.{}", cats[ci]),
                 n_eff as f32,
             );
@@ -2038,11 +2038,11 @@ pub fn build_column_heatmaps(
             // 🌟 [SDS 계측] 잔차화 전후 확산도를 남깁니다.
             //    'V-1 이 실제로 확산을 줄였는가' 가 수용 기준이고,
             //    doc_type 별로 얼마나 줄었는지가 Phase 2 의 크롭 재수립(V-2) 입력입니다.
-            crate::utils::score_dynamics::record_baseline(
+            logis_sds::record_baseline(
                 &format!("vision.spread_before.{}", cats[ci]),
                 hot_before as f32 / n.max(1) as f32,
             );
-            crate::utils::score_dynamics::record_baseline(
+            logis_sds::record_baseline(
                 &format!("vision.spread_after.{}", cats[ci]),
                 hot_after as f32 / n.max(1) as f32,
             );
@@ -2160,8 +2160,8 @@ pub fn build_column_heatmaps(
         //   V-1 공간 잔차화를 적용한 뒤 이 값이 실제로 내려갔는지가 수용 기준이고,
         //   잔차화가 정상 신호까지 지운 경우(리스크 R7)를 감지해
         //   원본 히트맵으로 폴백하는 판정의 기준선이 됩니다.
-        crate::utils::score_dynamics::record_spatial(c, hot, n);
-        crate::utils::score_dynamics::record_category_max(c, cat_fields[ci], top_score);
+        logis_sds::record_spatial(c, hot, n);
+        logis_sds::record_category_max(c, cat_fields[ci], top_score);
 
         // 🌟 [LOG] 히트맵 분포 + 잘림 체크
         emit(&format!(
@@ -2327,7 +2327,7 @@ impl PatchPhraseDots {
 pub fn score_patches_bank_neutral(
     grid: &PatchGrid,
     bank: &AnchorBank,
-    legible: Option<&crate::models::siglip2::legibility::LegibilityMap>,
+    legible: Option<&crate::siglip2::legibility::LegibilityMap>,
 ) -> (Vec<String>, Vec<Vec<f32>>) {
     use std::collections::HashMap;
 
@@ -2500,7 +2500,7 @@ pub fn score_patches_bank_neutral(
 
 pub fn pool_row_runs(
     grid: &PatchGrid,
-    legible: &crate::models::siglip2::legibility::LegibilityMap,
+    legible: &crate::siglip2::legibility::LegibilityMap,
 ) -> (Vec<Vec<f32>>, Vec<Vec<usize>>) {
     let mut embs: Vec<Vec<f32>> = Vec::new();
     let mut members: Vec<Vec<usize>> = Vec::new();

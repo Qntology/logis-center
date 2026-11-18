@@ -24,7 +24,7 @@ use candle_core::DType;
 
 use super::gguf::TOKEN_TABLE;
 use super::quant::{QType, WeightPlan};
-use crate::model::lang_gguf::{pad_to, put_meta, put_str, Meta, StFile, ALIGN};
+use logis_llm::lang_gguf::{pad_to, put_meta, put_str, Meta, StFile, ALIGN};
 
 const RECIPE: &str = "siglip2-quant/1";
 const VISION_FILE: &str = "mmproj-siglip2.gguf";

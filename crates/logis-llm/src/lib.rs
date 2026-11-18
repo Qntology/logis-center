@@ -1,7 +1,7 @@
-//! logis-center 의 생성 모델 엔진 crate (Tauri · DB 없음).
+//! logis-center 의 모델 엔진 crate: 생성 모델과 granite 임베딩 (Tauri · DB 없음).
 //!
 //! - [`models`]: Qwen2.5-VL(`qwen`) · Qwen3 · Qwen3.5 · Qwen3-VL · Qwen4-Exp · granite 생성 루프, 공용 층(`common`: GGUF 적재 ·
-//!   어휘 잘라 내기 · TurboQuant KV · 가속 점검), 비전 임베딩 캐시
+//!   어휘 잘라 내기 · TurboQuant KV · 가속 점검), granite 임베딩(`embedding`: 배치 · 텍스트 캐시 · 눈금 보정), 비전 임베딩 캐시
 //! - [`lang_gguf`]: Qwen3.5 언어 엔진 safetensors → Q4_K_M GGUF 변환 · 적재 (SigLIP2 양자화가 쓰는 GGUF 쓰기 도우미 포함)
 //! - [`tokenizer`] · [`chat_template`] · [`openai_types`] · [`position_embed`]: 토크나이저, Jinja 채팅 템플릿, 메시지 형식, RoPE
 //! - [`utils`]: 장치 · VRAM · RAM · KV 배치(`resources`), 텐서 · 이미지 · 직접 적재 · KV 블록 암호화

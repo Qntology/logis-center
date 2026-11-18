@@ -14,7 +14,7 @@ mod batched;
 pub(crate) mod cpu_packed;
 pub use batched::{BatchOpts, BatchRunStats};
 #[cfg(feature = "vulkan")]
-pub(crate) use batched::vulkan_exec_mode;
+pub use batched::vulkan_exec_mode;
 
 pub use logis_schema::embed_space::{EMBED_DIM, ForwardMode, EMBED_FORWARD_ENV, forward_mode, CLS_TO_LEGACY_COS, cls_to_legacy_knots, interp_knots, calibrate_cos};
 /// 한 번의 순전파에 넣는 최대 토큰 수 (기존 embed() 와 동일한 512 청크).
@@ -1047,7 +1047,7 @@ mod space_tests {
 
     #[test]
     fn cosine_primitives_calibrate_only_granite_vectors() {
-        use crate::utils::ai_utils::{cosine_similarity, cosine_with_norms, l2_norm_exact};
+        use logis_pug::utils::ai_utils::{cosine_similarity, cosine_with_norms, l2_norm_exact};
         let mut a = vec![0.0f32; EMBED_DIM];
         let mut b = vec![0.0f32; EMBED_DIM];
         a[0] = 1.0;

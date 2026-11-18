@@ -1,5 +1,5 @@
-use crate::models::siglip2::legibility::LegibilityMap;
-use crate::utils::ai_utils::gumbel_expected_z;
+use crate::siglip2::legibility::LegibilityMap;
+use logis_pug::utils::ai_utils::gumbel_expected_z;
 
 /// [SOURCE BLANK SURGE] 출처 여백 비율 띠의 위쪽 경계: 평균 + 이 값 × σ (verify_claims_v2 설명의 실측으로 정함).
 pub const BLANK_SURGE_SIGMA: f32 = 3.0;
@@ -69,15 +69,15 @@ pub fn verify_claims<F>(
     grid_cols: usize,
     orig_w: u32,
     orig_h: u32,
-    legibility: &crate::models::siglip2::legibility::LegibilityMap,
+    legibility: &crate::siglip2::legibility::LegibilityMap,
     encode_batch_fn: F,
     emit: &dyn Fn(&str),
 ) -> Vec<GroundingVerdict>
 where
     F: FnOnce(&[String]) -> Vec<Vec<f32>>,
 {
-    use crate::models::siglip2::legibility::PatchLegibility;
-    use crate::models::siglip2::vision_encoder::PatchPhraseDots;
+    use crate::siglip2::legibility::PatchLegibility;
+    use crate::siglip2::vision_encoder::PatchPhraseDots;
 
     let n = patch_embs.len();
     let mut out: Vec<GroundingVerdict> = Vec::with_capacity(claims.len());
@@ -332,7 +332,7 @@ pub fn strip_name_residue(
             continue;
         }
         let Some(cut) = trim_name_residue(&c.field, &c.value) else {
-            crate::utils::score_dynamics::record_baseline("vision.name_residue", 0.0);
+            logis_sds::record_baseline("vision.name_residue", 0.0);
             continue;
         };
         let old = c.value.trim().to_string();
@@ -346,7 +346,7 @@ pub fn strip_name_residue(
         for node in data.values_mut() {
             hits += fix(node, &c.field, &old, &cut);
         }
-        crate::utils::score_dynamics::record_baseline("vision.name_residue", 1.0);
+        logis_sds::record_baseline("vision.name_residue", 1.0);
         emit(&format!(
             "    ✂️ [NAME RESIDUE TRIM] [{}] '{}' = \"{}\" → \"{}\" | 인명은 하이픈 · 빗금 · 밑줄로 시작하거나 끝나지 않습니다. 서명 획을 글자로 읽은 잔해로 보고 깎습니다(저장본 {}곳 · 주장 함께).",
             c.category, c.field, old, cut, hits
@@ -374,7 +374,7 @@ pub fn verify_claims_v2(
     let mut rejected = 0usize;
     // 출처 여백 비율의 평소 띠 위쪽(SDS: 이 서식 스코프에 지난 문서들이 남긴 vision.source_blank_ratio). 한 문서의 주장끼리 서로의
     // 기준선이 되지 않게 판정 전에 한 번만 읽습니다. 표본이 비전 트랙 하한에 못 미치면 None 이고 [SOURCE BLANK SURGE] 는 쉽니다.
-    let blank_bound = crate::utils::score_dynamics::adaptive_upper_bound("vision.source_blank_ratio", BLANK_SURGE_SIGMA);
+    let blank_bound = logis_sds::adaptive_upper_bound("vision.source_blank_ratio", BLANK_SURGE_SIGMA);
     for c in claims {
         // 🌟 [LABEL ECHO GATE] 값 자리에 서식의 '박스 라벨' 이 그대로 들어온 경우를 폐기합니다.
         //    "SIGNATORY COMPANY" 는 이미지에 실제로 인쇄되어 있어 판독성 검사는 반드시 통과합니다.
@@ -384,12 +384,12 @@ pub fn verify_claims_v2(
         //    메아리가 아니라 단위 낱말입니다. (합성 비전 평가: 포장 명세서 · 판매 계약서의 unit = PCS 가 쪽마다 버려졌습니다 — 읽히는
         //    값을 버린 24건이 모두 이것)
         let unit_word = c.field == "unit"
-            && crate::parsing::is_column_alias_of("quantity", &c.value, doc_lang)
-            && !crate::parsing::is_column_alias_of("unit", &c.value, doc_lang);
+            && logis_pug::utils::parsing::is_column_alias_of("quantity", &c.value, doc_lang)
+            && !logis_pug::utils::parsing::is_column_alias_of("unit", &c.value, doc_lang);
         if !role_field(&c.field)
             && !unit_word
-            && (crate::parsing::is_printed_label_echo(&c.value, doc_lang)
-                || crate::parsing::is_printed_label_fragment(&c.value, doc_lang))
+            && (logis_pug::utils::parsing::is_printed_label_echo(&c.value, doc_lang)
+                || logis_pug::utils::parsing::is_printed_label_fragment(&c.value, doc_lang))
         {
             rejected += 1;
             emit(&format!(
@@ -455,20 +455,20 @@ pub fn verify_claims_v2(
         //   폐기 건만 모으면 분포가 한쪽 꼬리만 남습니다.
         {
             let total = (lg + il + bl).max(1) as f32;
-            crate::utils::score_dynamics::record_baseline(
+            logis_sds::record_baseline(
                 "vision.source_legible_ratio",
                 lg as f32 / total,
             );
-            crate::utils::score_dynamics::record_baseline(
+            logis_sds::record_baseline(
                 "vision.source_blank_ratio",
                 bl as f32 / total,
             );
-            crate::utils::score_dynamics::record_baseline(
+            logis_sds::record_baseline(
                 "vision.source_illegible_ratio",
                 il as f32 / total,
             );
-            let claim_fmt = crate::utils::ai_utils::detect_field_format(&c.field);
-            crate::utils::score_dynamics::record_baseline(
+            let claim_fmt = logis_pug::utils::ai_utils::detect_field_format(&c.field);
+            logis_sds::record_baseline(
                 &format!("vision.source_illegible_ratio.{:?}", claim_fmt),
                 il as f32 / total,
             );
@@ -483,7 +483,7 @@ pub fn verify_claims_v2(
         }
         if blank_surge {
             rejected += 1;
-            crate::utils::score_dynamics::record_baseline("vision.source_blank_surge", 1.0);
+            logis_sds::record_baseline("vision.source_blank_surge", 1.0);
             emit(&format!(
                 "    🌫️ [SOURCE BLANK SURGE] [{}] '{}' = \"{}\" | 출처 판독가능 {} / 판독불가 {} / 여백 {} — 여백 비율 {:.2} 가 이 서식의 평소 띠 위쪽 {:.2}(평균 + 3σ)를 넘고 판독가능 패치가 소수입니다. 크게 흐려지거나 지워진 글자는 여백으로 잡히므로, 라벨만 선명한 자리에서 읽힌 값으로 보고 폐기합니다.",
                 c.category, c.field, c.value, lg, il, bl, bl as f32 / total, blank_bound.unwrap_or(0.0)
@@ -495,7 +495,7 @@ pub fn verify_claims_v2(
                 c.category, c.field, c.value, lg, il, bl
             ));
         } else if lg > 0 {
-            crate::utils::score_dynamics::record_baseline("vision.source_blank_surge", 0.0);
+            logis_sds::record_baseline("vision.source_blank_surge", 0.0);
         }
         out.push(GroundingVerdict {
             category: c.category.clone(),
@@ -524,10 +524,10 @@ pub fn verify_claims_v2(
             ratios.push(lg as f32 / total);
         }
         if ratios.len() >= 2 {
-            crate::utils::score_dynamics::record_decay("vision.grounding", &ratios);
+            logis_sds::record_decay("vision.grounding", &ratios);
         }
         if !ratios.is_empty() {
-            crate::utils::score_dynamics::record_baseline(
+            logis_sds::record_baseline(
                 "vision.grounding_reject_ratio",
                 rejected as f32 / claims.len().max(1) as f32,
             );

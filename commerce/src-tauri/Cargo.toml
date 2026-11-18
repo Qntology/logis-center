@@ -67,8 +67,10 @@ logis-sds.workspace = true
 logis-parsers.workspace = true
 logis-pug.workspace = true
 logis-search.workspace = true
-# 생성 모델 엔진 (예전 models/ 의 Qwen · granite · common, 토크나이저 · 채팅 템플릿, 장치 · 메모리 도우미). GPU 기능은 아래 [features] 가 함께 켭니다.
+# 모델 엔진 (예전 models/ 의 Qwen · granite · common · 임베딩, 토크나이저 · 채팅 템플릿, 장치 · 메모리 도우미)과
+# 문서 비전 (예전 models/siglip2). GPU 기능은 아래 [features] 가 함께 켭니다.
 logis-llm.workspace = true
+logis-vision-doc.workspace = true
 arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
 ego-tree = "0.10"
@@ -103,11 +105,11 @@ metal = "0.33.0"
 
 [features]
 default = ["cuda", "flash-attn", "turbo-quant"]
-# 각 GPU · 가속 기능은 crates/logis-llm 의 같은 기능도 켭니다 (옮긴 모델 코드의 #[cfg(feature = …)] 는 그 crate 의 기능을 봄).
-cuda = ["logis-llm/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "candle-flash-attn?/cuda"]
-rocm = ["logis-llm/rocm", "candle-core/rocm", "candle-nn/rocm", "candle-flash-attn?/rocm"]
-vulkan = ["logis-llm/vulkan", "candle-core/vulkan", "candle-nn/vulkan", "candle-flash-attn?/vulkan"]
-metal = ["logis-llm/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# 각 GPU · 가속 기능은 crates/logis-llm · logis-vision-doc 의 같은 기능도 켭니다 (옮긴 모델 코드의 #[cfg(feature = …)] 는 그 crate 의 기능을 봄).
+cuda = ["logis-llm/cuda", "logis-vision-doc/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "candle-flash-attn?/cuda"]
+rocm = ["logis-llm/rocm", "logis-vision-doc/rocm", "candle-core/rocm", "candle-nn/rocm", "candle-flash-attn?/rocm"]
+vulkan = ["logis-llm/vulkan", "logis-vision-doc/vulkan", "candle-core/vulkan", "candle-nn/vulkan", "candle-flash-attn?/vulkan"]
+metal = ["logis-llm/metal", "logis-vision-doc/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 # Fused FlashAttention (v1/v2/v3 tiers, picked per GPU) from the candle-rocm-vulkan fork.
 # Activates the `#[cfg(feature = "flash-attn")]` paths in logis-llm models/common · models/qwen/common and the app.
 flash-attn = ["logis-llm/flash-attn", "dep:candle-flash-attn", "candle-flash-attn/flash-attn", "candle-core/flash-attn", "candle-nn/flash-attn"]

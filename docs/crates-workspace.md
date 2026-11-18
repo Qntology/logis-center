@@ -55,7 +55,8 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 | `logis-pug` | `utils::{parsing, ai_utils, nl_convert, json_parse, json_utils, pug_utils}` · `prompts` · `js_templates` · `merge_rules` (model/merge.rs 의 순수 규칙) · `scripts` (model/lang_llm.rs 의 문자 체계) | logis-schema, logis-bias, logis-sds, premium-discount-sds |
 | `logis-parsers` | `documents` (parsers/mod.rs) · `compression` (utils/compression.rs) | — |
 | `logis-search` | `fusion` (search_fusion.rs) · `relation` (search_relation.rs 의 유형 · 고정점 · 연결 · 서식 질의 근거 규칙) | logis-schema, logis-bias, logis-pug |
-| `logis-llm` | `models::{qwen, qwen3, qwen3_5, qwen3vl, qwen4_exp, granite, common, vision_cache}` (models/) · `lang_gguf` (model/lang_gguf.rs) · `tokenizer` · `chat_template` · `openai_types` · `position_embed` · `utils::{device_utils, resources, tensor_utils, direct_loader, img_utils, crypto, misc_utils}` (utils/) · `progress` (scheduler 의 `PROGRESS_TX` · lib.rs 의 `CURRENT_UI_CATEGORY`) · `lang_resident` (lang_llm 의 올라 있는 변형) · `rt` (spawn 훅) | candle(포크) · tokenizers · logis-schema · logis-bias · logis-sds · premium-discount-quant, 기능 cuda · rocm · vulkan · metal · flash-attn · turbo-quant (앱의 같은 기능이 켬) |
+| `logis-llm` | `models::{qwen, qwen3, qwen3_5, qwen3vl, qwen4_exp, granite, common, vision_cache, embedding}` (models/, granite 임베딩 포함) · `lang_gguf` (model/lang_gguf.rs) · `tokenizer` · `chat_template` · `openai_types` · `position_embed` · `utils::{device_utils, resources, tensor_utils, direct_loader, img_utils, crypto, misc_utils}` (utils/) · `progress` (scheduler 의 `PROGRESS_TX` · lib.rs 의 `CURRENT_UI_CATEGORY`) · `lang_resident` (lang_llm 의 올라 있는 변형) · `rt` (spawn 훅) | candle(포크) · tokenizers · logis-schema · logis-bias · logis-sds · premium-discount-quant, 기능 cuda · rocm · vulkan · metal · flash-attn · turbo-quant (앱의 같은 기능이 켬) |
+| `logis-vision-doc` | `siglip2` (models/siglip2 전부: 타워 · GGUF · 사용 시 양자화 · 정밀도 지문, 문서 분류 히트맵 · 가독성 · 크롭 계획 · NMS · 값 그라운딩 · 레이아웃 · 구 캐시) | logis-llm · logis-pug · logis-schema · logis-bias · logis-sds, 기능 cuda · rocm · vulkan · metal |
 
 - 앱의 예전 파일은 한 줄 재수출(`pub use logis_…::*;`)로 남아 호출부가 바뀌지 않았습니다. 임베딩 모델(`LogisModel`)이나 토크나이저가 필요한
   함수 5개(`status_key_banks` · `status_pivot_bank` · `canonicalize_trade_columns_with_embedding` · `extract_doc_table_headers_async` ·
@@ -83,6 +84,20 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   `flash-attn` · `turbo-quant` 가 `logis-llm/…` 도 켭니다 — 빠뜨리면 컴파일 오류 없이 그 경로가 조용히 빠지므로 기능 목록은 둘이 같아야 합니다.
 - candle-rocm(포크 커밋 고정)은 logis-llm 만 써서 루트 `[workspace.dependencies]` 로 옮겼습니다. 포크 path 전환(`use-fork-path.sh`)은 이제 루트
   한 파일의 4줄을 바꿉니다.
+- granite 임베딩(`models/embedding`)도 candle 모델이고 앱에 기대는 곳이 경로 · GPU 정보뿐이라 logis-llm 의 `models::embedding` 으로 옮겼습니다.
+  기획서는 순전파 코어를 premium-discount-nlp(granite)로 바꾸라고 하지만, 캐시 공간 태그 · 눈금 보정 · 배치 경로의 출력을 실제 모델로 대조하기
+  전에는 바꾸지 않습니다(Stanza · NMS 와 같은 이유).
+
+### logis-vision-doc (문서 비전)
+
+- `models/siglip2` 전체를 `crates/logis-vision-doc/src/siglip2` 로 옮기고 경로를 crate 이름으로 바꿨습니다(`crate::logic` → `logis_schema::logic`,
+  `crate::utils::ai_utils` · `parsing` → `logis_pug`, `score_dynamics` → `logis_sds`, `model::lang_gguf` → `logis_llm::lang_gguf`, 배치 정책 ·
+  Vulkan 실행 모드 → `logis_llm::models::embedding`). 앱은 `crate::models::siglip2` 로 재수출하고, SDS 의 비전 정밀도 꼬리표 등록도 그 경로 그대로입니다.
+- 기획서는 타워(vision · text · tokenizer · quant · preprocessor)를 premium-discount-vision · -sensor 로 바꾸고 서식 전용 모듈만 남기라고 하지만,
+  이 앱의 ROCm q8 GGUF · 정밀도 지문 경로와 HF 로더 차이(열 순서 · antialias · bilinear · 토크나이저 패딩)를 실제 모델로 대조하기 전에는 바꾸지 않고
+  타워까지 그대로 옮겼습니다.
+- `quant.rs` 의 GPU 기본 정밀도(`cfg!(feature = "rocm") && !cfg!(feature = "cuda")` 이면 q8)가 이 crate 의 기능을 보므로 앱의 rocm · cuda 가
+  `logis-vision-doc/…` 도 켭니다.
 
 ## 4단계 첫 조각: EventSink
 
@@ -117,7 +132,6 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 
 - **logis-search 의 나머지**: 기획서가 이 crate 에 넣은 `model/merge.rs`(병합 · 그라운딩, SigLIP2 결과를 씀)와 `model/research.rs` 의 집계는
   모델 · 저장소 호출과 섞여 있어 순수 부분을 먼저 떼어야 합니다 (`merge_rules` 로 두 규칙만 옮김).
-- **logis-vision-doc**: SigLIP2 가 앱에 기대는 곳은 임베딩 모듈의 배치 정책(`BatchOpts::for_device` 의 고정 모양 여부)과 Vulkan 실행 모드뿐입니다.
 - **commerce/app 분리**: EventSink · spawn 훅 · `CURRENT_UI_CATEGORY` 다음 걸림돌은 lib.rs 에 있는 전역 상태 2개(`ACTIVE_TASK_MEM` 6곳 ·
   `LATEST_PROGRESS_PAYLOAD` 2곳)를 model · scheduler 가 `crate::` 로 직접 읽는 것입니다. 이것들을 코어로 옮기면 store · residency · model · scheduler 를
   `commerce/app` 으로 옮기고 Tauri 셸(lib.rs 명령 · automation · TauriSink)만 남길 수 있습니다.
@@ -135,6 +149,8 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 - logis-llm 분리 뒤 (CI 와 같은 조건): `cargo test --test it` 286 통과 · 0 실패 · 65 무시(옮기기 전과 같음), lib 단위 시험(앱 + logis-llm
   함께) 8 통과, `cargo test -p logis-llm` 단독 6 통과 · 1 무시, 도메인 crate 시험 통과. 단독 빌드에서 windows-sys `Win32_Foundation` 이 빠져
   있던 것이 드러나 매니페스트에 넣었습니다(앱 빌드에서는 다른 crate 가 켜 주어 보이지 않음).
+- 임베딩 · logis-vision-doc 분리 뒤 (같은 조건): `it` 286 통과 · 0 실패 · 65 무시, lib 단위 8 통과, `cargo test -p logis-llm -p logis-vision-doc`
+  단독 21 통과 · 3 무시(logis-vision-doc 의 ROCm 전용 시험 1개는 CPU 빌드에서 빠짐).
 - 함정: 같은 `target/debug` 에 `cargo check`(ROCm, 메타데이터만)와 CPU 빌드를 섞으면 boa 의 타입이 엉뚱하게 읽혀 `str` 크기 오류 · "rlib 형식이
   없음" 오류가 났습니다(폴더를 비우고 다시 빌드하면 사라짐). debug 정보를 켠 채 `it` 시험 exe 를 링크하면 PDB 가 1.7 GB 를 넘어 LNK1318(LIMIT 12) —
   CI 처럼 `CARGO_PROFILE_DEV_DEBUG=0` 을 씁니다.

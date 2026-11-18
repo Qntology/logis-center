@@ -1,6 +1,6 @@
 [package]
 name = "logis-llm"
-description = "logis-center 생성 모델 엔진: Qwen(2.5-VL · 3 · 3.5 · 3-VL · 4-Exp) · granite 생성 루프, KV 배치(VRAM · RAM · SSD) · 암호화 KV 블록, 어휘 잘라 내기, GGUF 변환(Q4_K_M), 토크나이저 · 채팅 템플릿 · 위치 임베딩, 장치 · 메모리 도우미. Tauri · DB 없음"
+description = "logis-center 모델 엔진: Qwen(2.5-VL · 3 · 3.5 · 3-VL · 4-Exp) · granite 생성 루프, granite 임베딩(97m, 배치 · 텍스트 캐시 · 눈금 보정), KV 배치(VRAM · RAM · SSD) · 암호화 KV 블록, 어휘 잘라 내기, GGUF 변환(Q4_K_M), 토크나이저 · 채팅 템플릿 · 위치 임베딩, 장치 · 메모리 도우미. Tauri · DB 없음"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -28,6 +28,9 @@ candle-flash-attn = { version = "0.11.0", optional = true, default-features = fa
 candle-nn = "0.11.0"
 candle-rocm = { workspace = true, optional = true }
 candle-transformers = "0.11.0"
+chrono = { version = "0.4", features = ["serde"] }
+# 🌟 [EMBED-CPU-PACKED] CPU 임베딩 패킹 GEMM (opt-in: LOGIS_EMBED_CPU_KERNEL=packed, models/embedding/cpu_packed.rs)
+embed-cpu-kernels = { path = "../../commerce/crates/embed-cpu-kernels" }
 # 🌟 [PYRAMID-QUANT] 원본 가중치를 한 번 양자화하는 GGML 블록 인코더 (lang_gguf.rs)
 ggml-kquant = { path = "../../commerce/crates/ggml-kquant" }
 image = { version = "0.25", features = ["jpeg", "png"] }
@@ -54,6 +57,10 @@ url = "2.5.7"
 # Win32_Foundation: HANDLE · BOOL 을 쓰는 함수(GetCurrentProcess · SetProcessWorkingSetSizeEx · VirtualUnlock …)에 필요. 앱 빌드에서는
 # 다른 crate 가 켜 주어 드러나지 않았고, 이 crate 만 빌드(-p logis-llm)하면 빠집니다.
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory"] }
+
+[dev-dependencies]
+# models/embedding.rs 의 임베딩 공간 시험이 코사인 도우미를 씀
+logis-pug.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 direct-storage = { path = "../../commerce/crates/direct-storage" }

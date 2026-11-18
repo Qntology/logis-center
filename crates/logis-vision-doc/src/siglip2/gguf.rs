@@ -33,7 +33,7 @@ use memmap2::Mmap;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 
-use crate::model::lang_gguf::{pad_to, put_meta, put_str, Meta, StFile, ALIGN};
+use logis_llm::lang_gguf::{pad_to, put_meta, put_str, Meta, StFile, ALIGN};
 
 pub use super::gguf_quant::{prepare_quant, quant_ready, quant_text_path, quant_vision_path};
 
@@ -599,7 +599,7 @@ mod tests {
     #[test]
     #[ignore]
     fn real_towers_read_the_same_from_gguf_and_from_safetensors() -> Result<()> {
-        use crate::models::siglip2::{vision_encoder as ve, Siglip2Config, Siglip2Model};
+        use crate::siglip2::{vision_encoder as ve, Siglip2Config, Siglip2Model};
         use std::time::Instant;
 
         let source = PathBuf::from(std::env::var("LOGIS_SIGLIP2_DIR")?);
@@ -610,7 +610,7 @@ mod tests {
         let config = Siglip2Config::from_json(&dir.join("config.json"))?;
         let device = Device::new_rocm(0)?;
         // 이 시험은 BF16 타워 GGUF 를 봅니다 (ROCm 기본 계획은 q8).
-        crate::models::siglip2::quant::set_active(Some(crate::models::siglip2::quant::WeightPlan::bf16()));
+        crate::siglip2::quant::set_active(Some(crate::siglip2::quant::WeightPlan::bf16()));
         let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(640, 480, |x, y| image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])));
         let phrases = vec!["logis gguf 비교 문구 하나".to_string(), "logis gguf comparison phrase two".to_string()];
         let read = |label: &str| -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {

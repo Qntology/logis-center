@@ -46,7 +46,7 @@ use candle_nn::VarBuilder;
 use ggml_kquant::Format;
 use once_cell::sync::Lazy;
 
-use crate::model::lang_gguf::StFile;
+use logis_llm::lang_gguf::StFile;
 
 pub const QUANT_ENV: &str = "LOGIS_SIGLIP2_QUANT";
 

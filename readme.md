@@ -61,7 +61,7 @@ All inference, embedding, and storage are performed **locally on the client**, w
 cron-logis-center/
 ├── Cargo.toml                          # Root Cargo workspace (crates/logis-* + commerce/src-tauri), candle fork + premium-discount pins
 ├── .cargo/config.toml                  # target-cpu=native, build output kept in commerce/src-tauri/target
-├── crates/                             # Domain and engine libraries (no Tauri · LanceDB; only logis-llm uses candle · tokio)
+├── crates/                             # Domain and engine libraries (no Tauri · LanceDB; only logis-llm · logis-vision-doc use candle)
 │   ├── logis-schema/                   # canonical (field normalization), logic (trade groups · 28 forms · hub fields), hash, text, embed_space,
 │   │                                   # app data paths (tmp · kv · task data · logs · extraction stop signal)
 │   ├── logis-bias/                     # bias.json / full_bias.json + override, label/prejudice banks, time guide, language detection, entity keys
@@ -69,10 +69,14 @@ cron-logis-center/
 │   ├── logis-pug/                      # HTML↔PUG, ai_utils, LLM JSON parsing, JSON→natural language (nl_convert), prompts, JS templates
 │   ├── logis-parsers/                  # Offline document readers (Excel/Word/HWP/CSV/PDF), gzip helpers
 │   ├── logis-search/                   # Search fusion + relation-step rules (anchors → target types); store/model steps stay in the app
-│   └── logis-llm/                      # Generation engine: Qwen (2.5-VL · 3 · 3.5 · 3-VL · 4-Exp) · granite loops, models/common (GGUF,
-│                                       # vocab trim, TurboQuant KV), KV placement (VRAM/RAM/SSD) + encrypted KV blocks, lang_gguf (Q4_K_M),
-│                                       # tokenizer · chat_template · openai_types · position_embed, device/memory/tensor/image helpers,
-│                                       # progress channel + rt::spawn hook (cuda/rocm/vulkan/metal/flash-attn/turbo-quant follow the app)
+│   ├── logis-llm/                      # Model engine: Qwen (2.5-VL · 3 · 3.5 · 3-VL · 4-Exp) · granite loops, granite-embedding-97m (384d,
+│   │                                   # batched · text cache · calibration), models/common (GGUF, vocab trim, TurboQuant KV), KV placement
+│   │                                   # (VRAM/RAM/SSD) + encrypted KV blocks, lang_gguf (Q4_K_M), tokenizer · chat_template · openai_types ·
+│   │                                   # position_embed, device/memory/tensor/image helpers, progress channel + rt::spawn hook
+│   │                                   # (cuda/rocm/vulkan/metal/flash-attn/turbo-quant follow the app)
+│   └── logis-vision-doc/               # Document vision: siglip2/ (SigLIP2 towers · GGUF · quantize-on-use + precision fingerprint,
+│                                       # vision_encoder heatmap/classification, vision_crop + nms_arena, legibility, value_grounding,
+│                                       # layout/phrase caches, tokenizer, NaFlex preprocessor)
 ├── commerce/                           # Desktop client (Tauri v2 + Vite/TS)
 │   ├── src/                            # Frontend (TypeScript)
 │   ├── mobile/                         # Mobile companion app (Tauri)
@@ -115,22 +119,9 @@ cron-logis-center/
 │           ├── stanza.rs               # Stanza NLP (tokenization/POS/lemma/syntax)
 │           ├── prompts.rs              # Prompt templates
 │           ├── models/
-│           │   ├── mod.rs              # re-exports crates/logis-llm models: common (GateUpDownMLP, Attention, GGUF), qwen (VL, KV
-│           │   │                       # offloading), qwen3 (0.6B), qwen3_5 (2B / AlphaEdge 4B), qwen3vl, qwen4_exp, granite, vision_cache
-│           │   ├── siglip2/            # SigLIP2 Vision Encoder
-│           │   │   ├── mod.rs          # Model load (Text/Vision separated)
-│           │   │   ├── vision.rs       # Vision Transformer
-│           │   │   ├── text.rs         # Text encoder
-│           │   │   ├── preprocessor.rs # NaFlex preprocessing
-│           │   │   ├── vision_encoder.rs # Heatmap/Classification pipeline
-│           │   │   ├── vision_crop.rs  # NMS crop + Tile splitting
-│           │   │   ├── nms_arena.rs    # NMS arena allocator
-│           │   │   ├── layout_cache.rs # Layout heatmap cache
-│           │   │   ├── phrase_cache.rs # Text anchor embedding cache
-│           │   │   ├── legibility.rs   # Legibility map (blur/margin detection)
-│           │   │   ├── value_grounding.rs # Value grounding validation
-│           │   │   └── tokenizer.rs    # SigLIP2 tokenizer
-│           │   └── embedding.rs        # granite-embedding-97m (384d)
+│           │   └── mod.rs              # re-exports crates/logis-llm models: common (GateUpDownMLP, Attention, GGUF), qwen (VL, KV
+│           │                           # offloading), qwen3 (0.6B), qwen3_5 (2B / AlphaEdge 4B), qwen3vl, qwen4_exp, granite, embedding,
+│           │                           # vision_cache — and siglip2 from crates/logis-vision-doc
 │           ├── utils/
 │           │   ├── parsing.rs          # HTML→PUG conversion, schema management
 │           │   ├── bias_schema.rs      # bias.json access layer
