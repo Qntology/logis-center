@@ -25,7 +25,7 @@ premium-discount-* (rev `9925011`, raon-zena 와 같음):
   NaN · ±inf 칸이 섞인 행렬 10.9만 개에서는 예전 코드가 2,254번(약 2 %) 정렬 비교자 패닉을 냈고(Rust 1.81+, 릴리스는 `panic = "abort"`),
   PD 판은 그런 칸을 후보 · 평균에서 빼 0번이었습니다.
 - **어휘 잘라 내기 규칙 → `premium-discount-quant::trim`**: 토큰 종류 · `Langs` · `TrimRule` · `select_from` 은 토큰 단위로 같습니다.
-  토크나이저 · 출력 투영(`TrimmedHead`) · 실행 흐름별 언어 범위(`DocLangScope`)는 PD 에 없어 앱에 남겼습니다
+  토크나이저 · 출력 투영(`TrimmedHead`) · 실행 흐름별 언어 범위(`DocLangScope`)는 PD 에 없어 logis-llm(`models/common/vocab_trim.rs`)에 남겼습니다
   (`Langs::of_document` → `langs_of_document`, `TrimRule::from_env` → `rule_from_env`).
 
 ## 2 · 3단계: 웹 분석 제거 · crate 6종
@@ -60,10 +60,10 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 
 - 앱의 예전 파일은 한 줄 재수출(`pub use logis_…::*;`)로 남아 호출부가 바뀌지 않았습니다. 임베딩 모델(`LogisModel`)이나 토크나이저가 필요한
   함수 5개(`status_key_banks` · `status_pivot_bank` · `canonicalize_trade_columns_with_embedding` · `extract_doc_table_headers_async` ·
-  `truncate_pug_by_tokens`)는 앱의 `utils/ai_utils.rs` · `utils/parsing.rs` 에, 저장소 · 모델을 쓰는 관계 단계 3개(`relation_join` ·
-  `trade_relation_join` · `cross_lingual_title_anchors`)는 앱의 `search_relation.rs` 에 남았습니다.
+  `truncate_pug_by_tokens`)는 코어(commerce/app)의 `utils/ai_utils.rs` · `utils/parsing.rs` 에, 저장소 · 모델을 쓰는 관계 단계 3개(`relation_join` ·
+  `trade_relation_join` · `cross_lingual_title_anchors`)는 코어의 `search_relation.rs` 에 남았습니다.
 - `logis-pug` 안의 코드는 경로(`crate::utils::…` · `crate::parsing` · `crate::logic`)를 그대로 쓰도록 아래 crate 의 모듈을 같은 자리에 다시 내보냅니다.
-- SDS 원장은 모델 계층을 모르도록, 비전 트랙 키의 정밀도 꼬리표(SigLIP2 양자화 지문)를 앱의 `enter_scope` 가 등록합니다(`set_vision_precision`).
+- SDS 원장은 모델 계층을 모르도록, 비전 트랙 키의 정밀도 꼬리표(SigLIP2 양자화 지문)를 코어 `utils/score_dynamics.rs` 의 `enter_scope` 가 등록합니다(`set_vision_precision`).
 - 각 crate 는 모델 · DB · Tauri 없이 `cargo test -p logis-schema -p logis-bias -p logis-sds -p logis-pug -p logis-parsers -p logis-search` 로 몇 초 안에 돕니다.
 
 ### logis-llm (생성 모델 엔진)
@@ -113,7 +113,7 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 ### commerce/app (crate `logis-app`)
 
 - `commerce/src-tauri/src` 의 46개 파일(model · store · scheduler · stanza · search_fusion · search_relation · logic · prompts · js_templates · parsers ·
-  models · utils · sink)을 `git mv` 로 `commerce/app/src` 에 옮겼습니다. 셸에는 lib.rs(명령 49개 · 검색 명령 본문 · `run()`), automation.rs(브라우저
+  models · utils · sink)을 `git mv` 로 `commerce/app/src` 에 옮겼습니다. 셸에는 lib.rs(명령 49개 · `run()`), automation.rs(브라우저
   자동화), main.rs, sink.rs(`TauriSink`)만 남았고, lib.rs 가 코어 모듈을 예전 이름으로 재수출해(`pub use logis_app::{model, store, …}`) 명령과
   통합 시험(`tauri_app_lib::…`)의 경로가 그대로입니다. 코어의 의존성 그래프에는 tauri 가 없습니다(`cargo tree -p logis-app -i tauri` → 없음).
 - 코어가 셸에 기대던 곳: lib.rs 전역 `ACTIVE_TASK_MEM` · `LATEST_PROGRESS_PAYLOAD`(정의를 코어 루트로, 셸은 재수출), automation.rs 의
@@ -124,8 +124,12 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 - 셸 매니페스트에서는 코어만 쓰는 의존성(lancedb · arrow · boa_engine · onnxruntime · whatlang · rcgen · ndarray · num · encoding_rs · windows-sys ·
   logis-* · premium-discount-*)을 뺐습니다. 셸 코드 · 시험이 쓰지 않는 예전 의존성(webrtc · drag · ahash · minijinja · ego-tree · libc · any_ascii ·
   embed-cpu-kernels, windows · direct-storage · metal)은 빼면 기능 통합이 바뀌어 다시 빌드되므로 이번에는 남기고 매니페스트에 표시했습니다.
-- 아직 셸에 있는 것: 검색 명령 본문(`ai_search_complex` 1,538줄 · `upsert_items` · `reindex_pending_embeddings` · dexie 계획/평가 · 조건 그라운딩)은
-  `AppHandle` · `State` 를 받는 명령과 한 함수로 묶여 있어 그대로 두었습니다. 기획서의 `query/` 모듈로 옮기려면 명령 껍데기와 본문을 나눠야 합니다.
+- 자연어 검색(`ai_search_complex` 1,538줄)과 그 도우미 29개(범위 필터 · dexie 계획/평가 · 저장 축 맞추기 · 조건 그라운딩 · 무역 질의 탐침 ·
+  질의 융합, 정적 캐시 2개)는 코어 `query` 모듈로 옮겼습니다(셸 lib.rs 5,557 → 2,517줄). 본문의 `tauri::AppHandle` 은 진행 이벤트를 보내는 데만
+  쓰였으므로 같은 이름의 `Sink` 매개변수가 되었고(`use tauri::Emitter` 1곳 삭제, `sink::tauri(&app_handle)` 4곳 → `app_handle.clone()`),
+  `State<AppState>` 는 `&AppState` 입니다. 셸의 `#[tauri::command] ai_search_complex` 는 같은 이름 · 인자로 코어를 부르는 껍데기이고,
+  `AppState` · `IS_SEARCHING` 은 코어 루트에 있습니다(셸 재수출, 통합 시험 경로 `tauri_app_lib::AppState` · `ground_trade_conditions` 그대로).
+- 아직 셸에 있는 것: `upsert_items` · `reindex_pending_embeddings` · `download_model` 등 나머지 명령 본문(각각 수백 줄)과 문서 조회 · 삭제 명령.
 
 ## 기획서와 다른 점 (코드 · 저장소로 확인)
 
@@ -151,9 +155,9 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 
 - **logis-search 의 나머지**: 기획서가 이 crate 에 넣은 `model/merge.rs`(병합 · 그라운딩, SigLIP2 결과를 씀)와 `model/research.rs` 의 집계는
   모델 · 저장소 호출과 섞여 있어 순수 부분을 먼저 떼어야 합니다 (`merge_rules` 로 두 규칙만 옮김).
-- **검색 명령 본문 → 코어 `query`**: lib.rs 의 `ai_search_complex` 등은 명령 인자(`AppHandle` · `State<AppState>`)와 본문이 한 함수입니다.
-  `Sink` · `&AppState` 를 받는 코어 함수로 나누고 셸에는 껍데기만 두면, 합성 평가(`eval_ai_search`)도 Tauri 앱 없이 돌 수 있습니다.
-  `AppState` 도 그때 코어로 옮깁니다.
+- **나머지 명령 본문 → 코어**: `upsert_items` · `reindex_pending_embeddings` · `download_model` 등도 `ai_search_complex` 처럼 `Sink` · `&AppState`
+  를 받는 코어 함수와 셸 껍데기로 나눕니다. 합성 평가(`tests/it/synthetic_eval.rs`)는 이제 `logis_app::query::ai_search_complex` 를 Tauri 앱 없이
+  부를 수 있으니, `build_headless_app` 대신 그쪽으로 바꾸면 기획서 5단계("Tauri 모킹 없이 합성 데이터 검색 시험")가 됩니다.
 - **셸 의존성 정리**: 매니페스트에 표시한 쓰지 않는 의존성(webrtc 등)을 빼고 다시 빌드 · 시험합니다.
 - **SigLIP2 타워 · 임베딩 · Stanza · NMS 를 premium-discount 로**: 실제 모델 출력 대조 뒤.
 - **LanceDB 0.41**: premium-discount 앱이 옮긴 API 변경(테이블 add · 질의 실행)을 store.rs 에 적용합니다. 이 작업 공간은 아직 0.31 입니다.
@@ -176,6 +180,11 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   ROCm + flash-attn + turbo-quant, Vulkan + flash-attn + turbo-quant 로 각각 통과(기존 경고만).
 - commerce/app 분리 뒤 (같은 조건): `it` 286 통과 · 0 실패 · 65 무시, lib 단위 8 통과(코어 3 · logis-llm 5, 셸 lib 에는 단위 시험이 없음).
   통합 시험 하나가 `include_str!("../../src/model/lifecycle.rs")` 로 소스를 읽고 있어 코어 경로로 고쳤습니다.
+  코어만 따로(`cargo check -p logis-app --lib --tests`, 셸 · tauri 없이) 통과 — 그때 새 산출물 폴더라 onnxruntime-sys 가 GitHub 404 뒤 NuGet
+  예비 경로로 ORT 1.28.0 을 받는 것도 다시 확인했습니다.
+- 세 단계(logis-llm · logis-vision-doc · commerce/app)를 합친 상태의 release ROCm `cargo build`(lib + bin) 통과 (27분 12초).
+- 검색 본문을 코어 `query` 로 옮긴 뒤 (CI 와 같은 조건): `it` 286 통과 · 0 실패 · 65 무시, lib 단위 8 통과, crate 시험 통과. 첫 빌드에 그대로
+  컴파일됐고(코어 · 셸 모두 `#[cfg(feature)]` 가 없어 CPU 빌드가 모든 경로를 봄), 옮기며 남은 쓰지 않는 import 4개만 지웠습니다.
 - 함정: 같은 `target/debug` 에 `cargo check`(ROCm, 메타데이터만)와 CPU 빌드를 섞으면 boa 의 타입이 엉뚱하게 읽혀 `str` 크기 오류 · "rlib 형식이
   없음" 오류가 났습니다(폴더를 비우고 다시 빌드하면 사라짐). debug 정보를 켠 채 `it` 시험 exe 를 링크하면 PDB 가 1.7 GB 를 넘어 LNK1318(LIMIT 12) —
   CI 처럼 `CARGO_PROFILE_DEV_DEBUG=0` 을 씁니다.

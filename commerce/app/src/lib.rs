@@ -11,7 +11,12 @@
 
 use once_cell::sync::Lazy;
 use serde_json::Value;
-use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, RwLock};
+use tokio::sync::Mutex as TokioMutex;
+
+use crate::model::LogisModel;
+use crate::store::VectorStore;
 
 pub mod model;
 pub mod store;
@@ -28,6 +33,8 @@ pub mod utils;
 // 🌟 [EVENT SINK] model · scheduler 는 tauri::AppHandle 대신 Sink 로 이벤트를 내보냅니다 (셸의 명령 진입점에서 TauriSink 로 감쌈).
 pub mod sink;
 pub mod browser_state;
+// 🌟 [QUERY] 자연어 검색 (예전 셸 lib.rs 의 ai_search_complex 본문과 도우미)
+pub mod query;
 
 pub use utils::parsing;
 pub use utils::bias_schema;
@@ -48,3 +55,13 @@ pub static ACTIVE_TASK_MEM: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::n
 pub use logis_llm::progress::CURRENT_UI_CATEGORY;
 /// 마지막 진행 이벤트 (화면이 늦게 붙어도 다시 보여 줄 수 있게)
 pub static LATEST_PROGRESS_PAYLOAD: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
+
+// ── 셸 명령과 코어 검색이 함께 쓰는 상태 (예전 lib.rs) ──
+// 🌟 [PUB] AI 검색이 도는 동안 임베딩 재색인 · 스케줄러가 VRAM 을 양보할 수 있도록 공개합니다.
+pub static IS_SEARCHING: AtomicBool = AtomicBool::new(false);
+
+pub struct AppState {
+    pub model: Arc<TokioMutex<Option<LogisModel>>>,
+    pub store: Arc<TokioMutex<Option<VectorStore>>>,
+    pub cancellation_token: Arc<AtomicBool>,
+}
