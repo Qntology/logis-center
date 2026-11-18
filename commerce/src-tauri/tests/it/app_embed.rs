@@ -157,7 +157,8 @@ fn text_cache_first_vector_wins_and_spaces_are_isolated() {
 fn global_text_cache_survives_purge_paths() {
     // lifecycle.rs 의 실제 퍼지 경로(unload_embedding / deep_purge / relay)가 캐시를 비우지 않고
     // note_purge 만 부르는지 소스로 확인합니다(LogisModel 없이 돌릴 수 있는 범위의 검증).
-    let lifecycle = include_str!("../../src/model/lifecycle.rs");
+    // 모델 수명주기는 헤드리스 코어(commerce/app)에 있습니다.
+    let lifecycle = include_str!("../../../app/src/model/lifecycle.rs");
     for site in ["note_purge(\"unload_embedding\")", "note_purge(\"deep_purge\")", "note_purge(\"relay (image pipeline)\")"] {
         assert!(lifecycle.contains(site), "lifecycle.rs 에 {} 가 없습니다", site);
     }

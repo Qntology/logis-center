@@ -99,14 +99,33 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 - `quant.rs` 의 GPU 기본 정밀도(`cfg!(feature = "rocm") && !cfg!(feature = "cuda")` 이면 q8)가 이 crate 의 기능을 보므로 앱의 rocm · cuda 가
   `logis-vision-doc/…` 도 켭니다.
 
-## 4단계 첫 조각: EventSink
+## 4단계: EventSink · commerce/app (헤드리스 코어) 분리
 
-- `commerce/src-tauri/src/sink.rs`: `EventSink`(`emit_json` · `log_progress`) · `Sink = Arc<dyn EventSink>` · `TauriSink` · `NoopSink`.
+### EventSink
+
+- `EventSink`(`emit_json` · `log_progress`) · `Sink = Arc<dyn EventSink>` · `NoopSink` 는 코어 `commerce/app/src/sink.rs`, Tauri 창으로 보내는
+  `TauriSink` · `sink::tauri(&app_handle)` 는 셸 `commerce/src-tauri/src/sink.rs`(코어 `sink` 를 같은 이름으로 재수출)에 있습니다.
   `dyn EventSink` 에 `tauri::Emitter::emit` 과 같은 모양의 `emit` 을 두어, model · scheduler 의 `app_handle.emit(…)` · `app_handle.clone()` 호출은 그대로입니다.
 - model · scheduler · utils(logger · network) 의 `tauri::AppHandle` 인자 · 필드(`LogisModel::app_handle` 포함)는 `Sink` 입니다. lib.rs 의 명령 진입점이
-  `sink::tauri(&app_handle)` 로 감싸 넘기고, 시험 · CLI 는 `sink::noop()` 을 넘길 수 있습니다. `tauri::` 가 lib.rs · automation.rs 밖에 남은 곳은
-  utils/network.rs 의 `#[tauri::command]` 3개뿐입니다 (Qwen 생성 루프의 `tauri::async_runtime::spawn` 9곳은 logis-llm 의 `rt::spawn` 훅으로).
+  `sink::tauri(&app_handle)` 로 감싸 넘기고, 시험 · CLI 는 `sink::noop()` 을 넘길 수 있습니다.
 - 경로 도우미(`get_kv_dir` · `get_task_log_file` …)의 쓰지 않던 `Option<&AppHandle>` 인자를 뺐습니다(37곳).
+
+### commerce/app (crate `logis-app`)
+
+- `commerce/src-tauri/src` 의 46개 파일(model · store · scheduler · stanza · search_fusion · search_relation · logic · prompts · js_templates · parsers ·
+  models · utils · sink)을 `git mv` 로 `commerce/app/src` 에 옮겼습니다. 셸에는 lib.rs(명령 49개 · 검색 명령 본문 · `run()`), automation.rs(브라우저
+  자동화), main.rs, sink.rs(`TauriSink`)만 남았고, lib.rs 가 코어 모듈을 예전 이름으로 재수출해(`pub use logis_app::{model, store, …}`) 명령과
+  통합 시험(`tauri_app_lib::…`)의 경로가 그대로입니다. 코어의 의존성 그래프에는 tauri 가 없습니다(`cargo tree -p logis-app -i tauri` → 없음).
+- 코어가 셸에 기대던 곳: lib.rs 전역 `ACTIVE_TASK_MEM` · `LATEST_PROGRESS_PAYLOAD`(정의를 코어 루트로, 셸은 재수출), automation.rs 의
+  `LAST_DETECTED_STATE`(코어 `browser_state`, URL 도우미가 읽음), utils/network.rs 의 `#[tauri::command]`(코어는 평범한 함수, 등록된 두 명령
+  `get_local_network_prefix` · `get_my_full_ip` 는 셸 lib.rs 의 같은 이름 · 인자 껍데기 — 등록되지 않던 `get_deterministic_cert` 는 함수만).
+- 코어 코드는 `#[cfg(feature = …)]` 를 보지 않습니다. 셸의 GPU · 가속 기능과 `full-bias` 는 `logis-app/…` 을 켜고, 코어가 다시 logis-llm ·
+  logis-vision-doc · logis-bias 의 같은 기능을 켭니다(헤드리스로 `-p logis-app --features rocm` 도 같은 경로).
+- 셸 매니페스트에서는 코어만 쓰는 의존성(lancedb · arrow · boa_engine · onnxruntime · whatlang · rcgen · ndarray · num · encoding_rs · windows-sys ·
+  logis-* · premium-discount-*)을 뺐습니다. 셸 코드 · 시험이 쓰지 않는 예전 의존성(webrtc · drag · ahash · minijinja · ego-tree · libc · any_ascii ·
+  embed-cpu-kernels, windows · direct-storage · metal)은 빼면 기능 통합이 바뀌어 다시 빌드되므로 이번에는 남기고 매니페스트에 표시했습니다.
+- 아직 셸에 있는 것: 검색 명령 본문(`ai_search_complex` 1,538줄 · `upsert_items` · `reindex_pending_embeddings` · dexie 계획/평가 · 조건 그라운딩)은
+  `AppHandle` · `State` 를 받는 명령과 한 함수로 묶여 있어 그대로 두었습니다. 기획서의 `query/` 모듈로 옮기려면 명령 껍데기와 본문을 나눠야 합니다.
 
 ## 기획서와 다른 점 (코드 · 저장소로 확인)
 
@@ -132,9 +151,11 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 
 - **logis-search 의 나머지**: 기획서가 이 crate 에 넣은 `model/merge.rs`(병합 · 그라운딩, SigLIP2 결과를 씀)와 `model/research.rs` 의 집계는
   모델 · 저장소 호출과 섞여 있어 순수 부분을 먼저 떼어야 합니다 (`merge_rules` 로 두 규칙만 옮김).
-- **commerce/app 분리**: EventSink · spawn 훅 · `CURRENT_UI_CATEGORY` 다음 걸림돌은 lib.rs 에 있는 전역 상태 2개(`ACTIVE_TASK_MEM` 6곳 ·
-  `LATEST_PROGRESS_PAYLOAD` 2곳)를 model · scheduler 가 `crate::` 로 직접 읽는 것입니다. 이것들을 코어로 옮기면 store · residency · model · scheduler 를
-  `commerce/app` 으로 옮기고 Tauri 셸(lib.rs 명령 · automation · TauriSink)만 남길 수 있습니다.
+- **검색 명령 본문 → 코어 `query`**: lib.rs 의 `ai_search_complex` 등은 명령 인자(`AppHandle` · `State<AppState>`)와 본문이 한 함수입니다.
+  `Sink` · `&AppState` 를 받는 코어 함수로 나누고 셸에는 껍데기만 두면, 합성 평가(`eval_ai_search`)도 Tauri 앱 없이 돌 수 있습니다.
+  `AppState` 도 그때 코어로 옮깁니다.
+- **셸 의존성 정리**: 매니페스트에 표시한 쓰지 않는 의존성(webrtc 등)을 빼고 다시 빌드 · 시험합니다.
+- **SigLIP2 타워 · 임베딩 · Stanza · NMS 를 premium-discount 로**: 실제 모델 출력 대조 뒤.
 - **LanceDB 0.41**: premium-discount 앱이 옮긴 API 변경(테이블 add · 질의 실행)을 store.rs 에 적용합니다. 이 작업 공간은 아직 0.31 입니다.
 
 ## 검증 (2026-11-18, 이 PC: Windows · RAM 16 GB)
@@ -151,6 +172,10 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   있던 것이 드러나 매니페스트에 넣었습니다(앱 빌드에서는 다른 crate 가 켜 주어 보이지 않음).
 - 임베딩 · logis-vision-doc 분리 뒤 (같은 조건): `it` 286 통과 · 0 실패 · 65 무시, lib 단위 8 통과, `cargo test -p logis-llm -p logis-vision-doc`
   단독 21 통과 · 3 무시(logis-vision-doc 의 ROCm 전용 시험 1개는 CPU 빌드에서 빠짐).
+- logis-llm · logis-vision-doc 의 GPU 기능 경로: 별도 산출물 폴더에서 `cargo check -p logis-llm -p logis-vision-doc --lib --tests` 를
+  ROCm + flash-attn + turbo-quant, Vulkan + flash-attn + turbo-quant 로 각각 통과(기존 경고만).
+- commerce/app 분리 뒤 (같은 조건): `it` 286 통과 · 0 실패 · 65 무시, lib 단위 8 통과(코어 3 · logis-llm 5, 셸 lib 에는 단위 시험이 없음).
+  통합 시험 하나가 `include_str!("../../src/model/lifecycle.rs")` 로 소스를 읽고 있어 코어 경로로 고쳤습니다.
 - 함정: 같은 `target/debug` 에 `cargo check`(ROCm, 메타데이터만)와 CPU 빌드를 섞으면 boa 의 타입이 엉뚱하게 읽혀 `str` 크기 오류 · "rlib 형식이
   없음" 오류가 났습니다(폴더를 비우고 다시 빌드하면 사라짐). debug 정보를 켠 채 `it` 시험 exe 를 링크하면 PDB 가 1.7 GB 를 넘어 LNK1318(LIMIT 12) —
   CI 처럼 `CARGO_PROFILE_DEV_DEBUG=0` 을 씁니다.

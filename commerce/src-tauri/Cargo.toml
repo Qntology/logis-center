@@ -16,81 +16,63 @@ tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
 tauri = { version = "2.10.1", features = [] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-# mistralrs = { path = "mistralrs/mistralrs", default-features = false, features = ["cuda"] }
-image = { version = "0.25", features = ["jpeg", "png"] }
-base64 = "0.22"
-anyhow = "1.0"
-regex = "1"
-encoding_rs = "0.8"
-futures = "0.3"
-uuid = { version = "1.4", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
+# 🌟 [APP CORE] 헤드리스 코어(commerce/app): 모델 상주 · LanceDB 저장소 · 스케줄러 · 검색 도우미. lib.rs 가 예전 모듈 이름으로
+#    재수출합니다. GPU 기능은 아래 [features] 가 이 crate 를 거쳐 모델 crate(logis-llm · logis-vision-doc)까지 켭니다.
+logis-app.workspace = true
+# 모델 엔진의 spawn 훅(logis_llm::rt::set_spawner)을 run() 이 Tauri 전역 런타임으로 등록합니다.
+logis-llm.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+# mistralrs = { path = "mistralrs/mistralrs", default-features = false, features = ["cuda"] }
+base64 = "0.22"
+anyhow = "1.0"
+regex = "1"
+futures = "0.3"
+uuid = { version = "1.4", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
-sysinfo = "0.30"
 mimalloc = { version = "*", features = ["v3"] }
-drag = "2.1.1"
-candle-core = "0.11.0"
-ahash = "0.8.11"
-candle-nn = "0.11.0"
-candle-transformers = "0.11.0"
-candle-flash-attn = { version = "0.11.0", optional = true, default-features = false }
-# 🌟 [FORK-GIT] candle-rocm-vulkan 포크 커밋(ebaf93d, premium-discount · raon-zena 와 같음)은 루트 Cargo.toml 한 곳에서 고정합니다:
-#    [patch.crates-io] 3줄(candle-core · candle-nn · candle-flash-attn)과 candle-rocm(crates/logis-llm 만 씀).
-tokenizers = "0.22.2"
-num = "0.4.3"
-minijinja = "2.12.0"
-rayon = "1.10"
-dirs = "6.0.0"
 url = "2.5.7"
 fantoccini = "0.19"
 chromiumoxide = { version = "0.8.0", features = ["tokio-runtime"] }
 which = "6.0"
 once_cell = "1.18"
+# candle: 통합 시험(tests/it)이 직접 쓰고, 아래 GPU 기능이 이 이름으로도 켭니다.
+# 🌟 [FORK-GIT] candle-rocm-vulkan 포크 커밋(ebaf93d, premium-discount · raon-zena 와 같음)은 루트 Cargo.toml 한 곳에서 고정합니다:
+#    [patch.crates-io] 3줄(candle-core · candle-nn · candle-flash-attn)과 candle-rocm(crates/logis-llm 만 씀).
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+candle-flash-attn = { version = "0.11.0", optional = true, default-features = false }
+# 통합 시험(tests/it)이 직접 쓰는 crate
+image = { version = "0.25", features = ["jpeg", "png"] }
+tokenizers = "0.22.2"
 scraper = "0.25.0"
-lancedb = { version = "0.31.0", default-features = false }
+sysinfo = "0.30"
+dirs = "6.0.0"
 safetensors = "0.4"
-# premium-discount 공용 엔진 (루트 Cargo.toml 이 리비전을 고정): hashId(EIP-191) · SDS 통계와 배타 배정 · 어휘 잘라 내기 규칙
-premium-discount-identity.workspace = true
-premium-discount-sds.workspace = true
-premium-discount-quant.workspace = true
-# 순수 도메인 crate (crates/logis-*): 예전 utils/ · logic.rs 경로에서 재수출합니다
-logis-schema.workspace = true
-logis-bias.workspace = true
-logis-sds.workspace = true
-logis-parsers.workspace = true
-logis-pug.workspace = true
-logis-search.workspace = true
-# 모델 엔진 (예전 models/ 의 Qwen · granite · common · 임베딩, 토크나이저 · 채팅 템플릿, 장치 · 메모리 도우미)과
-# 문서 비전 (예전 models/siglip2). GPU 기능은 아래 [features] 가 함께 켭니다.
-logis-llm.workspace = true
-logis-vision-doc.workspace = true
-arrow-array = "58.3.0"
-arrow-schema = "58.3.0"
-ego-tree = "0.10"
 nvml-wrapper = "0.9.0"
 half = "2.4"
 memmap2 = "0.9"
-webrtc = "0.10"
-rcgen = "0.13"
 rand = "0.8"
 rand_chacha = "0.3"
-windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_System_Memory"] }
-libc = "0.2"
-boa_engine = { path = "../crates/boa-engine/core/engine" }
-onnxruntime = { path = "../crates/onnxruntime" }
-# 🌟 [EMBED-CPU-PACKED] CPU 임베딩 패킹 GEMM (opt-in: LOGIS_EMBED_CPU_KERNEL=packed, models/embedding/cpu_packed.rs)
-embed-cpu-kernels = { path = "../crates/embed-cpu-kernels" }
-# 🌟 [PYRAMID-QUANT] 원본 가중치를 한 번 양자화하는 GGML 블록 인코더 (models/siglip2/quant.rs · model/lang_gguf.rs)
+# 🌟 [PYRAMID-QUANT] 원본 가중치를 한 번 양자화하는 GGML 블록 인코더 (시험이 씀, 코드는 logis-llm lang_gguf · logis-vision-doc quant)
 ggml-kquant = { path = "../crates/ggml-kquant" }
-ndarray = "0.15.1"
-whatlang = "0.18.0"
+# 셸 코드 · 시험이 직접 쓰지 않는 예전 의존성입니다 (코어 · 모델 crate 가 쓰거나 아무도 쓰지 않음). 빼면 의존성 그래프와 기능 통합이
+# 바뀌어 다시 빌드되므로 이 분리와 따로 정리합니다.
+drag = "2.1.1"
+ahash = "0.8.11"
+minijinja = "2.12.0"
+ego-tree = "0.10"
+webrtc = "0.10"
+libc = "0.2"
+# 🌟 [EMBED-CPU-PACKED] CPU 임베딩 패킹 GEMM (코드는 logis-llm models/embedding/cpu_packed.rs)
+embed-cpu-kernels = { path = "../crates/embed-cpu-kernels" }
 any_ascii = "0.3.3"
 
 [target.'cfg(windows)'.dependencies]
@@ -105,18 +87,19 @@ metal = "0.33.0"
 
 [features]
 default = ["cuda", "flash-attn", "turbo-quant"]
-# 각 GPU · 가속 기능은 crates/logis-llm · logis-vision-doc 의 같은 기능도 켭니다 (옮긴 모델 코드의 #[cfg(feature = …)] 는 그 crate 의 기능을 봄).
-cuda = ["logis-llm/cuda", "logis-vision-doc/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "candle-flash-attn?/cuda"]
-rocm = ["logis-llm/rocm", "logis-vision-doc/rocm", "candle-core/rocm", "candle-nn/rocm", "candle-flash-attn?/rocm"]
-vulkan = ["logis-llm/vulkan", "logis-vision-doc/vulkan", "candle-core/vulkan", "candle-nn/vulkan", "candle-flash-attn?/vulkan"]
-metal = ["logis-llm/metal", "logis-vision-doc/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# 각 GPU · 가속 기능은 코어(logis-app)를 거쳐 crates/logis-llm · logis-vision-doc 의 같은 기능도 켭니다
+# (옮긴 모델 코드의 #[cfg(feature = …)] 는 그 crate 의 기능을 봄). 이 crate 의 #[cfg] 는 이제 통합 시험에만 있습니다.
+cuda = ["logis-app/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "candle-flash-attn?/cuda"]
+rocm = ["logis-app/rocm", "candle-core/rocm", "candle-nn/rocm", "candle-flash-attn?/rocm"]
+vulkan = ["logis-app/vulkan", "candle-core/vulkan", "candle-nn/vulkan", "candle-flash-attn?/vulkan"]
+metal = ["logis-app/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 # Fused FlashAttention (v1/v2/v3 tiers, picked per GPU) from the candle-rocm-vulkan fork.
-# Activates the `#[cfg(feature = "flash-attn")]` paths in logis-llm models/common · models/qwen/common and the app.
-flash-attn = ["logis-llm/flash-attn", "dep:candle-flash-attn", "candle-flash-attn/flash-attn", "candle-core/flash-attn", "candle-nn/flash-attn"]
+# Activates the `#[cfg(feature = "flash-attn")]` paths in logis-llm models/common · models/qwen/common.
+flash-attn = ["logis-app/flash-attn", "dep:candle-flash-attn", "candle-flash-attn/flash-attn", "candle-core/flash-attn", "candle-nn/flash-attn"]
 # TurboQuant / NVFP4 / MXFP4 / MXFP8 / FP8 quantization kernels (candle_nn::turbo_quant).
-turbo-quant = ["logis-llm/turbo-quant", "candle-core/turbo-quant", "candle-nn/turbo-quant"]
+turbo-quant = ["logis-app/turbo-quant", "candle-core/turbo-quant", "candle-nn/turbo-quant"]
 # 디버그 빌드에서도 모든 언어 도메인 사전(full_bias.json)을 넣습니다. 릴리스 빌드는 이 기능 없이도 full_bias.json 입니다
 # (crates/logis-bias/src/bias_schema.rs BIAS_SOURCE). 개발 빌드 기본값은 한국어 · 영어만 담은 bias.json 입니다.
-full-bias = ["logis-bias/full-bias"]
+full-bias = ["logis-app/full-bias"]
 
 # [patch.crates-io](candle 포크 커밋)와 [profile.*] 는 루트 Cargo.toml 에 있습니다. 작업 공간 멤버의 것은 무시됩니다.

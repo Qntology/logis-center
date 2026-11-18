@@ -1,29 +1,12 @@
-// 통합 테스트(tests/it)에서 앱 계층(모델 수명주기·저장소·업무규칙·스케줄러)을 검증할 수 있도록 pub 으로 노출합니다.
-pub mod model;
-pub mod store;
+// 🌟 [APP CORE] 모델 상주 · 저장소 · 업무 규칙 · 스케줄러 · 검색 도우미는 헤드리스 코어 crate(commerce/app, logis-app)에 있습니다.
+//    이 셸(Tauri 명령 · 창 · 브라우저 자동화)은 그 모듈들을 예전 이름으로 다시 내보내므로, 명령과 통합 테스트(tests/it)의
+//    경로(crate::model · tauri_app_lib::store …)는 그대로입니다.
+pub use logis_app::{
+    js_templates, logic, model, models, parsers, prompts, scheduler, search_fusion, search_relation, stanza, store, utils,
+};
+pub use logis_app::{bias_schema, json_parse, nl_convert, parsing, score_dynamics, time_guide};
+pub use logis_app::{chat_template, openai_types, position_embed, tokenizer};
 mod automation;
-pub use utils::parsing;
-pub use utils::bias_schema;
-pub use utils::json_parse;
-pub use utils::nl_convert;
-pub use utils::time_guide;
-// 🌟 [SCORE DYNAMICS] 점수를 신호로 취급하는 관측·통계 계층.
-//    bias.json 이 정적 사전이라면 이것은 동적 사전입니다.
-//    Phase 0 에서는 계측과 영속화만 수행하고 판정에는 개입하지 않습니다.
-pub use utils::score_dynamics;
-pub mod logic;
-pub mod scheduler;
-pub mod stanza;
-pub mod search_fusion;
-pub mod search_relation;
-pub mod js_templates;
-pub mod prompts; // 🌟 새로 추가된 프롬프트 모듈 선언
-pub mod parsers; // 🌟 문서 파서 모듈 선언
-pub mod models;
-pub mod utils;
-// 🌟 [LOGIS-LLM] 텍스트 · VL 생성 모델 · 토크나이저 · 채팅 템플릿 · 위치 임베딩 · 장치 도우미는 crates/logis-llm 으로 옮겼습니다.
-//    예전 경로(crate::position_embed · crate::openai_types · crate::chat_template · crate::tokenizer)는 그대로 씁니다.
-pub use logis_llm::{chat_template, openai_types, position_embed, tokenizer};
 // 🌟 [EVENT SINK] model · scheduler 는 tauri::AppHandle 대신 Sink 로 이벤트를 내보냅니다 (명령 진입점에서 sink::tauri 로 감쌈).
 pub mod sink;
 
@@ -47,11 +30,8 @@ pub static IS_BROWSER_LAUNCHING: AtomicBool = AtomicBool::new(false);
 pub static CURRENT_BROWSER_STATE: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("stopped".to_string()));
 pub static LAST_BROWSER_STATE_CHANGE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-pub static ACTIVE_TASK_MEM: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
-// 생성 진행 이벤트에 붙는 화면 분류 (모델이 읽으므로 crates/logis-llm 에 있음)
-pub use logis_llm::progress::CURRENT_UI_CATEGORY;
-
-pub static LATEST_PROGRESS_PAYLOAD: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
+// 작업 문맥 · 화면 분류 · 마지막 진행 이벤트는 코어(스케줄러 · 로거 · 모델)가 쓰므로 logis-app 루트에 있습니다.
+pub use logis_app::{ACTIVE_TASK_MEM, CURRENT_UI_CATEGORY, LATEST_PROGRESS_PAYLOAD};
 
 pub struct AppState {
     pub model: Arc<TokioMutex<Option<LogisModel>>>,
@@ -5275,6 +5255,17 @@ pub async fn eval_ai_search(
     .await
 }
 
+// 로컬 네트워크 도우미는 코어(utils::network)에 있고, Tauri 명령 껍데기만 여기 둡니다 (명령 이름 · 인자는 예전 그대로).
+#[tauri::command]
+fn get_local_network_prefix() -> String {
+    crate::utils::network::get_local_network_prefix()
+}
+
+#[tauri::command]
+fn get_my_full_ip() -> String {
+    crate::utils::network::get_my_full_ip()
+}
+
 pub fn run() {
     // 모델이 띄우는 비동기 작업(KV 슬롯 반환 · 굽기 · 지연 해제)도 예전처럼 Tauri 전역 런타임에서 돕니다.
     logis_llm::rt::set_spawner(|task| {
@@ -5517,7 +5508,7 @@ pub fn run() {
             resize_window, start_drag, move_to_top_center, set_login_state, check_active_task, get_chat_messages, proxy_fetch,
             get_known_pages, get_known_users, initialize_hub, get_browser_status, get_active_tasks, unload_model, get_task_logs,
             upsert_items, set_ignore_cursor_events, mark_ui_ready, delete_document, delete_documents, delete_message, check_gpu_availability,
-            save_mobile_temp_file, crate::utils::network::get_local_network_prefix, crate::utils::network::get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
+            save_mobile_temp_file, get_local_network_prefix, get_my_full_ip, connect_with_seed, start_listener_command, send_signal_offer, submit_signal_answer,
             get_active_task_context, check_model_status, download_model, delete_all_models, reset_lancedb,
             get_query_embedding, reindex_pending_embeddings,
             translit_cache_respond, get_embedding_batch_for_translit,

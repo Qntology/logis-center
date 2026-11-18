@@ -16,7 +16,7 @@ pub async fn resolve_absolute_url(task_data: &Value) -> (String, String) {
     
     // 브라우저 자동화 모듈이 감지한 '진짜 현재 활성화 탭 URL'을 강제로 끌어와서 완벽한 절대 주소로 병합(Join)합니다!
     {
-        let state = crate::automation::LAST_DETECTED_STATE.lock().await;
+        let state = crate::browser_state::LAST_DETECTED_STATE.lock().await;
         let active_tab_url = state.url.clone();
         
         if !active_tab_url.is_empty() {

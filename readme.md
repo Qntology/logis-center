@@ -59,7 +59,7 @@ All inference, embedding, and storage are performed **locally on the client**, w
 ```
 
 cron-logis-center/
-├── Cargo.toml                          # Root Cargo workspace (crates/logis-* + commerce/src-tauri), candle fork + premium-discount pins
+├── Cargo.toml                          # Root Cargo workspace (crates/logis-* + commerce/app + commerce/src-tauri), candle fork + PD pins
 ├── .cargo/config.toml                  # target-cpu=native, build output kept in commerce/src-tauri/target
 ├── crates/                             # Domain and engine libraries (no Tauri · LanceDB; only logis-llm · logis-vision-doc use candle)
 │   ├── logis-schema/                   # canonical (field normalization), logic (trade groups · 28 forms · hub fields), hash, text, embed_space,
@@ -88,61 +88,54 @@ cron-logis-center/
 │   │   ├── onnxruntime/                # ONNX Runtime bindings (local build)
 │   │   ├── onnxruntime-sys/            # ONNX Runtime FFI
 │   │   └── direct-storage/             # DirectStorage (Windows)
-│   └── src-tauri/
-│       ├── Cargo.toml                  # Rust dependencies & feature flags (cuda/rocm/vulkan/metal)
-│       ├── tests/it/                   # Integration tests (cargo test --test it)
+│   ├── app/                            # Headless core (crate logis-app, no Tauri): model residency, LanceDB store, scheduler, search
+│   │   ├── Cargo.toml                  # GPU features only forward to logis-llm / logis-vision-doc (the core code has no #[cfg(feature)])
+│   │   └── src/
+│   │       ├── lib.rs                  # Module tree + old crate-root re-exports, ACTIVE_TASK_MEM / LATEST_PROGRESS_PAYLOAD
+│   │       ├── scheduler.rs            # Background task scheduler (main pipeline)
+│   │       ├── scheduler/
+│   │       │   ├── worker.rs           # Task worker loop
+│   │       │   ├── trading.rs          # Trade & logistics pipeline
+│   │       │   ├── translit.rs         # Transliteration alias generation
+│   │       │   ├── indexing.rs         # Chunk indexing
+│   │       │   ├── list_census.rs      # List page census
+│   │       │   └── relay_ledger.rs     # Document relay ledger
+│   │       ├── model.rs                # Model manager (ModelSize, residency budgets)
+│   │       ├── model/
+│   │       │   ├── lifecycle.rs        # Load/unload, VRAM crossover, lang_route()
+│   │       │   ├── lang_llm.rs         # AlphaEdge Qwen3.5-4B: language codes, download, routing
+│   │       │   │                       # (lang_gguf: safetensors → Q4_K_M GGUF conversion, now in crates/logis-llm)
+│   │       │   ├── inference.rs        # Generation entry points
+│   │       │   ├── vision.rs           # Vision inference
+│   │       │   ├── merge.rs            # Result merging
+│   │       │   ├── research.rs         # Research flow
+│   │       │   └── query_{commerce,shipping}.rs  # Domain search queries
+│   │       ├── store.rs                # LanceDB vector store (envelope schema)
+│   │       ├── stanza.rs               # Stanza NLP (tokenization/POS/lemma/syntax)
+│   │       ├── search_fusion.rs / search_relation.rs  # Search fusion + relation steps (rules in crates/logis-search)
+│   │       ├── sink.rs                 # EventSink · Sink · NoopSink (TauriSink lives in the shell)
+│   │       ├── browser_state.rs        # Active browser tab state (written by the shell's automation, read by url_utils)
+│   │       ├── logic.rs / prompts.rs / js_templates.rs / parsers/  # re-exports of crates/logis-schema · logis-pug · logis-parsers
+│   │       ├── models/
+│   │       │   └── mod.rs              # re-exports crates/logis-llm models: common (GateUpDownMLP, Attention, GGUF), qwen (VL, KV
+│   │       │                           # offloading), qwen3 (0.6B), qwen3_5 (2B / AlphaEdge 4B), qwen3vl, qwen4_exp, granite, embedding,
+│   │       │                           # vision_cache — and siglip2 from crates/logis-vision-doc
+│   │       └── utils/
+│   │           ├── parsing.rs / ai_utils.rs  # re-exports of crates/logis-pug + the helpers that need the embedding model
+│   │           ├── score_dynamics.rs   # re-export of crates/logis-sds + vision precision tag registration
+│   │           ├── logger.rs / metrics.rs / network.rs / sync_utils.rs / url_utils.rs
+│   │           └── ...                 # (bias_schema · canonical · hash · time_guide · lang_utils · json_* · nl_convert · pug_utils:
+│   │                                   #  crates/logis-*; device_utils · resources · tensor_utils · crypto · img_utils · direct_loader ·
+│   │                                   #  misc_utils: crates/logis-llm; paths: crates/logis-schema)
+│   └── src-tauri/                      # Thin Tauri shell (crate tauri_app_lib)
+│       ├── Cargo.toml                  # Tauri + feature flags (cuda/rocm/vulkan/metal/flash-attn/turbo-quant/full-bias → logis-app)
+│       ├── tests/it/                   # Integration tests (cargo test --test it), still through tauri_app_lib::… paths
 │       └── src/
-│           ├── lib.rs                  # Tauri entry, IPC command registration, model downloads
-│           │                           # (utils/{canonical,bias_schema,parsing,ai_utils,nl_convert,...}.rs, logic.rs and prompts.rs
-│           │                           #  are now one-line re-exports of crates/logis-*; only model-bound helpers stay here)
-│           ├── scheduler.rs            # Background task scheduler (main pipeline)
-│           ├── scheduler/
-│           │   ├── worker.rs           # Task worker loop
-│           │   ├── trading.rs          # Trade & logistics pipeline
-│           │   ├── translit.rs         # Transliteration alias generation
-│           │   ├── indexing.rs         # Chunk indexing
-│           │   ├── list_census.rs      # List page census
-│           │   └── relay_ledger.rs     # Document relay ledger
-│           ├── model.rs                # Model manager (ModelSize, residency budgets)
-│           ├── model/
-│           │   ├── lifecycle.rs        # Load/unload, VRAM crossover, lang_route()
-│           │   ├── lang_llm.rs         # AlphaEdge Qwen3.5-4B: language codes, download, routing
-│           │   │                       # (lang_gguf: safetensors → Q4_K_M GGUF conversion, now in crates/logis-llm)
-│           │   ├── inference.rs        # Generation entry points
-│           │   ├── vision.rs           # Vision inference
-│           │   ├── merge.rs            # Result merging
-│           │   ├── research.rs         # Research flow
-│           │   └── query_{commerce,shipping}.rs  # Domain search queries
-│           ├── logic.rs                # Business logic (relay, state, trade rules)
-│           ├── store.rs                # LanceDB vector store (envelope schema)
+│           ├── lib.rs                  # Tauri entry, IPC commands (incl. ai_search_complex), model downloads; re-exports the core
+│           │                           # modules under their old names (crate::model, crate::store, …)
 │           ├── automation.rs           # Chromium browser automation
-│           ├── stanza.rs               # Stanza NLP (tokenization/POS/lemma/syntax)
-│           ├── prompts.rs              # Prompt templates
-│           ├── models/
-│           │   └── mod.rs              # re-exports crates/logis-llm models: common (GateUpDownMLP, Attention, GGUF), qwen (VL, KV
-│           │                           # offloading), qwen3 (0.6B), qwen3_5 (2B / AlphaEdge 4B), qwen3vl, qwen4_exp, granite, embedding,
-│           │                           # vision_cache — and siglip2 from crates/logis-vision-doc
-│           ├── utils/
-│           │   ├── parsing.rs          # HTML→PUG conversion, schema management
-│           │   ├── bias_schema.rs      # bias.json access layer
-│           │   ├── ai_utils.rs         # Cosine, exclusive assignment, format gating
-│           │   ├── score_dynamics.rs   # Adaptive baselines (SDS pass rates for routing)
-│           │   ├── json_parse.rs       # LLM JSON parsing/recovery
-│           │   ├── nl_convert.rs       # JSON→Natural language, chunk segmentation
-│           │   │                       # (direct_loader · device_utils · resources · tensor_utils · crypto · img_utils · misc_utils are
-│           │   │                       #  re-exported from crates/logis-llm, paths from crates/logis-schema)
-│           │   ├── compression.rs      # Compression helpers
-│           │   ├── json_utils.rs       # JSON merge
-│           │   ├── pug_utils.rs        # PUG grid parser
-│           │   ├── hash.rs             # ID hashing, CRC32
-│           │   ├── canonical.rs        # Type normalization rules
-│           │   ├── time_guide.rs       # Time intent parsing
-│           │   ├── lang_utils.rs       # Language detection
-│           │   └── logger.rs / metrics.rs / network.rs / sync_utils.rs / url_utils.rs / ...
-│           ├── parsers/
-│           │   └── mod.rs              # PDF/Excel/Word/HWP/CSV text extraction
-│           │                           # (chat_template · tokenizer · position_embed · openai_types: crates/logis-llm, same paths)
-│           └── js_templates.rs         # Boa engine JS templates
+│           ├── sink.rs                 # TauriSink (AppHandle::emit) + re-export of the core sink
+│           └── main.rs
 ├── apac/                               # Cloudflare Worker + D1 backend
 ├── proxy/                              # Cloudflare Worker + D1 backend (proxy)
 ├── SyntheticData/trading/              # Synthetic trade documents (YAML → PDF generators)

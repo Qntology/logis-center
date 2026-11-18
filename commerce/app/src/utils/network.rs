@@ -26,7 +26,6 @@ pub struct SignalMessage {
     pub sdp: String,
 }
 
-#[tauri::command]
 pub fn get_deterministic_cert(seed_num: u64) -> (String, String) {
     let _rng = ChaCha20Rng::seed_from_u64(seed_num);
     let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
@@ -37,7 +36,6 @@ pub fn get_deterministic_cert(seed_num: u64) -> (String, String) {
     (cert.pem(), key_pair.serialize_pem())
 }
 
-#[tauri::command]
 pub fn get_my_full_ip() -> String {
     let socket = match std::net::UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
@@ -52,7 +50,6 @@ pub fn get_my_full_ip() -> String {
     }
 }
 
-#[tauri::command]
 pub fn get_local_network_prefix() -> String {
     let ip = get_my_full_ip();
     let parts: Vec<&str> = ip.split('.').collect();

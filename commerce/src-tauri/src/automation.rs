@@ -130,22 +130,8 @@ pub async fn try_reconnect_existing_browser(app_handle: tauri::AppHandle) -> any
     }
 }
 
-// Global storage for the last detected browser state
-pub struct DetectedState {
-    pub url: String,
-    pub tab_id: String, 
-    pub is_client: bool,
-    pub is_admin: bool,
-}
-
-pub(crate) static LAST_DETECTED_STATE: Lazy<Arc<tokio::sync::Mutex<DetectedState>>> = Lazy::new(|| {
-    Arc::new(tokio::sync::Mutex::new(DetectedState {
-        url: String::new(),
-        tab_id: String::new(), 
-        is_client: false,
-        is_admin: false,
-    }))
-});
+// Global storage for the last detected browser state: 코어의 URL 도우미도 읽으므로 logis-app 의 browser_state 에 있습니다.
+pub(crate) use logis_app::browser_state::LAST_DETECTED_STATE;
 
 fn spawn_browser_monitor(browser: Arc<Browser>, app_handle: tauri::AppHandle) {
     tokio::spawn(async move {

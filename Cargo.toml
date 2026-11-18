@@ -1,7 +1,8 @@
 # logis-center 루트 작업 공간.
 #
 #   crates/logis-*      Tauri · LanceDB 를 모르는 도메인 · 엔진 라이브러리 (candle · tokio 는 모델 엔진 logis-llm · 문서 비전 logis-vision-doc 만 씀)
-#   commerce/src-tauri  데스크톱 앱 (Tauri 셸 + 아직 나누지 않은 헤드리스 코어)
+#   commerce/app        헤드리스 코어 logis-app (모델 상주 · LanceDB 저장소 · 스케줄러 · 검색, Tauri 없음)
+#   commerce/src-tauri  데스크톱 앱의 얇은 Tauri 셸 (명령 · 창 · 브라우저 자동화 · TauriSink, 통합 시험 tests/it)
 #
 # premium-discount · raon-zena 와 같은 candle 포크 커밋과 premium-discount-* 리비전을 쓴다.
 # 빌드 산출물은 예전 자리(commerce/src-tauri/target)에 그대로 둔다: .cargo/config.toml 의 target-dir.
@@ -17,6 +18,7 @@ members = [
     "crates/logis-search",
     "crates/logis-llm",
     "crates/logis-vision-doc",
+    "commerce/app",
     "commerce/src-tauri",
 ]
 # 자기 [workspace] 를 가진 vendored crate 는 그 작업 공간에 남긴다 (path 의존성으로만 링크).
@@ -50,6 +52,8 @@ logis-pug = { path = "crates/logis-pug" }
 logis-search = { path = "crates/logis-search" }
 logis-llm = { path = "crates/logis-llm" }
 logis-vision-doc = { path = "crates/logis-vision-doc" }
+# 헤드리스 코어 (commerce/app): 모델 상주 · 저장소 · 스케줄러 · 검색. Tauri 셸(commerce/src-tauri)이 재수출합니다.
+logis-app = { path = "commerce/app" }
 
 # premium-discount 공용 라이브러리 (raon-zena 와 같은 리비전).
 # 로컬 ../premium-discount 로 같이 고칠 때는 아래 [patch."https://github.com/Qntology/premium-discount"] 의 주석을 푼다.
