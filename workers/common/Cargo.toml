@@ -22,3 +22,6 @@ wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 # getrandom_backend="wasm_js" (.cargo/config.toml) 와 짝
 getrandom = { version = "0.3", features = ["wasm_js"] }
+
+[dev-dependencies]
+serde_json.workspace = true

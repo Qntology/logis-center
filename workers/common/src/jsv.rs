@@ -348,11 +348,17 @@ impl V {
         self.get(&i.to_string())
     }
 
-    /// `a.b = v` — a 가 undefined · null 이면 TypeError. 원시값에 쓰면 조용히 무시(엄격 모드 아님)
+    /// `a.b = v` — 원본은 ES 모듈이라 엄격 모드다: a 가 undefined · null 이면 TypeError, 원시값(문자열 · 수 · 참거짓)에 쓰면
+    /// 그것도 TypeError (`Cannot create property 'b' on string '…'`)
     pub fn s_(&self, key: &str, val: V) -> R<()> {
         match self {
             V::Undef | V::Null => Err(Throw::type_error(format!(
                 "Cannot set properties of {} (setting '{key}')",
+                self.to_str()
+            ))),
+            V::Str(_) | V::Num(_) | V::Bool(_) => Err(Throw::type_error(format!(
+                "Cannot create property '{key}' on {} '{}'",
+                self.type_of(),
                 self.to_str()
             ))),
             _ => {
@@ -607,8 +613,13 @@ pub fn add(a: &V, b: &V) -> V {
     }
 }
 
-/// `a < b` 등 관계 비교 (둘 다 문자열이면 UTF-16 사전순, 아니면 수)
+/// `a < b` 등 관계 비교: 먼저 ToPrimitive(배열 · 객체는 문자열), 둘 다 문자열이면 UTF-16 사전순, 아니면 수
 pub fn less_than(a: &V, b: &V) -> Option<bool> {
+    let prim = |v: &V| match v {
+        V::Arr(_) | V::Obj(_) | V::Bytes(_) | V::Ext(_) => V::Str(v.to_str()),
+        other => other.clone(),
+    };
+    let (a, b) = (&prim(a), &prim(b));
     if let (V::Str(x), V::Str(y)) = (a, b) {
         return Some(x.encode_utf16().lt(y.encode_utf16()));
     }
@@ -1047,6 +1058,8 @@ mod tests {
         let e = V::Undef.g("base").unwrap_err();
         assert_eq!(e.to_string(), "TypeError: Cannot read properties of undefined (reading 'base')");
         assert!(V::Null.s_("x", V::Null).is_err());
+        assert_eq!(V::from("abc").s_("x", V::Null).unwrap_err().message, "Cannot create property 'x' on string 'abc'");
+        assert_eq!(less_than(&arr![10], &V::from("9")), Some(true), "['10'] < '9' compares strings");
         assert!(V::Undef.push(V::Null).is_err());
     }
 

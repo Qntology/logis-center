@@ -37,7 +37,7 @@
 | `new Date(v).getTime()` · `toISOString()` | `date::get_time(&v)` · `date::to_iso_string(t)?` |
 | `Date.now()` · `Math.random()` | `platform::now()` · `platform::random()` (`Math.floor(Math.random()*n)` = `util::random_below(n)`) |
 | `console.log('x', y)` | `console_log!("x", y)` — 원본의 꼬리표 그대로 |
-| `new URL(s)` | `url::Url::parse(&s)` (실패 → `Throw::type_error("Invalid URL")`), `pathname` = `.path()` |
+| `new URL(s)` | `url::Url::parse(&s)` (실패 → `Throw::type_error("Invalid URL string.")`), `pathname` = `.path()` |
 
 ## 변수: `Ctx`
 

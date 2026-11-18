@@ -15,7 +15,13 @@ scraper.workspace = true
 url = "2"
 regex.workspace = true
 fancy-regex.workspace = true
+# dom 의 선택자 일치 (scraper 0.25 가 쓰는 것과 같은 판 — 선택자 문법은 scraper 것을 그대로 쓴다)
+selectors = "0.33"
+cssparser = "0.36"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 worker.workspace = true
 wasm-bindgen.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -279,7 +279,7 @@ Rust 는 `apps/` · `crates/`, TypeScript 는 `web/` · `workers/` 로 나눴습
 | `commerce/mobile` (프런트엔드) | `web/mobile` | `outDir` 를 `dist` 로 (예전 `commerce/dist/mobile`) |
 | `commerce/landing` | `web/landing` | |
 | `commerce/*.bat` · `_rocm_select.ps1` · `test_linux.sh` · `patch_gguf.py` | `scripts/` | 작업 폴더 `%~dp0..\apps\desktop` |
-| `apac` · `proxy` | `workers/` | 쓰지 않던 `apac/src/backup.ts` · `backup__.ts` 삭제 |
+| `apac` · `proxy` | `workers/` | 쓰지 않던 `apac/src/backup.ts` · `backup__.ts` 삭제. 그 뒤 workers-rs 로 다시 씀 → [workers-rs.md](workers-rs.md) |
 | `commerce/src-tauri/target` | `target/` (루트) | `.cargo/config.toml` `target-dir = "target"`. 옛 폴더를 그대로 옮겨 다시 빌드하지 않음 |
 
 - Tauri CLI 는 셸과 프런트엔드가 갈라진 것을 `TAURI_APP_PATH=apps/desktop` · `TAURI_FRONTEND_PATH=web/desktop` 로 압니다(설치된 CLI 2.12.1 이

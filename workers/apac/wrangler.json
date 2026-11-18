@@ -1,6 +1,9 @@
 {
   "compatibility_date": "2025-12-01",
-  "main": "src/index.ts",
+  "main": "build/index.js",
+  "build": {
+    "command": "cargo install -q worker-build@0.8.7 --locked && worker-build --release"
+  },
   "name": "commerce-apac-logis-center",
   "upload_source_maps": true,
   "d1_databases": [
@@ -12,7 +15,8 @@
     {
       "binding": "DB",
       "database_id": "54991e7a-7240-4f34-8c8a-da9923eb170c",
-      "database_name": "logis_center"
+      "database_name": "logis_center",
+      "migrations_dir": "../migrations"
     }
   ],
   "ai": {

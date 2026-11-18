@@ -136,7 +136,9 @@ cron-logis-center/
 │   ├── desktop/                        # Desktop UI (src/, public/, vite · vitest; tauri.conf → ../../web/desktop/dist)
 │   ├── mobile/                         # Mobile UI (+ install_mobile.ps1)
 │   └── landing/                        # Landing page
-├── workers/                            # Cloudflare Workers (proxy · apac) + shared D1 migrations
+├── workers/                            # Cloudflare Workers in Rust (workers-rs → wasm): common · proxy · apac, shared D1
+│                                       # migrations; port of the TypeScript workers, same behaviour (docs/workers-rs.md)
+├── scripts/workers-diff/               # Miniflare harness: original TS vs Rust, same D1 / LLM / AI / Vectorize mocks
 ├── vendor/                             # Third-party code with its own workspace
 │   ├── boa-engine/                     # Boa JS engine (local build)
 │   └── direct-storage/                 # DirectStorage (Windows)
@@ -637,7 +639,24 @@ Apache License 2.0
 | windows / windows-sys | MIT OR Apache-2.0 |
 | zip | MIT |
 
-#### JavaScript / TypeScript (`web/desktop`, `web/mobile`, `workers/apac`, `workers/proxy`)
+#### Rust (`workers/` — Cloudflare Workers)
+
+| Library | License |
+| --- | --- |
+| worker (workers-rs) / worker-build | Apache-2.0 |
+| wasm-bindgen / wasm-bindgen-futures / js-sys | MIT OR Apache-2.0 |
+| getrandom | MIT OR Apache-2.0 |
+| selectors / cssparser | MPL-2.0 |
+| scraper | ISC |
+| serde_json / indexmap / url / regex | MIT OR Apache-2.0 |
+| fancy-regex | MIT |
+| ryu-js | Apache-2.0 OR BSL-1.0 |
+| flate2 / miniz_oxide | MIT OR Apache-2.0 (miniz_oxide: MIT OR Zlib OR Apache-2.0) |
+
+The HTML entity decode table in `workers/proxy/src/dom/entity_tree.rs` is generated from the `entities` package (BSD-2-Clause);
+the tokenizer follows htmlparser2 (MIT).
+
+#### JavaScript / TypeScript (`web/desktop`, `web/mobile`, `scripts/workers-diff`)
 
 | Library | License |
 | --- | --- |
@@ -647,9 +666,11 @@ Apache License 2.0
 | happy-dom | MIT |
 | typescript | Apache-2.0 |
 | wrangler | MIT OR Apache-2.0 |
-| ethers | MIT |
-| linkedom | ISC |
-| pako | MIT AND Zlib |
+| miniflare | MIT |
+| esbuild | MIT |
+| ethers (test harness only) | MIT |
+| linkedom (test harness only) | ISC |
+| pako (test harness only) | MIT AND Zlib |
 
 ### GPU Notices
 

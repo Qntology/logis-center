@@ -814,10 +814,13 @@ dependencies = [
 name = "logis-worker-proxy"
 version = "0.1.0"
 dependencies = [
+ "cssparser",
  "fancy-regex",
  "logis-worker-common",
  "regex",
  "scraper",
+ "selectors",
+ "serde_json",
  "url",
  "wasm-bindgen",
  "worker",
