@@ -79,7 +79,7 @@ fn homoglyph_digit(c: char) -> char {
     }
 }
 
-/// `cleanNumber(str)` — 원본 그대로: `.` 이 있으면 `/./gi` 로 줄바꿈 아닌 모든 글자를 지운다
+/// `cleanNumber(str)` — 번호의 `-` · `_` · `.` · `,` 를 지운다 (고침: 원본은 `/./gi` 라 점이 있으면 줄바꿈 밖의 모든 글자를 지웠다)
 pub fn clean_number(v: &V) -> R<V> {
     let V::Str(s) = v else {
         return Err(Throw::type_error(format!("str.indexOf is not a function ({})", v.type_of())));
@@ -92,7 +92,7 @@ pub fn clean_number(v: &V) -> R<V> {
         s = s.replace('_', "");
     }
     if index_of(&s, ".") > -1 {
-        s = s.chars().filter(|c| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')).collect();
+        s = s.replace('.', "");
     }
     if index_of(&s, ",") > -1 {
         s = s.replace(',', "");
@@ -126,8 +126,8 @@ pub fn merge_node(obj1: &V, obj2: &V) -> V {
     merged
 }
 
-/// `isDiff(obj1, obj2)`. 원본은 키가 `data` 이면 `Buffer.isBuffer(...)` 를 부르는데, `nodejs_compat` 없는 Workers 에는
-/// `Buffer` 가 없어 ReferenceError 가 난다 — 그대로 던진다
+/// `isDiff(obj1, obj2)` — 키 순서와 상관없이 값이 다르면 참 (고침: 원본은 키가 `data` 이면 `Buffer.isBuffer` 를 불렀는데
+/// `nodejs_compat` 없는 Workers 에는 `Buffer` 가 없어 ReferenceError 로 끝났다. 이제 다른 객체처럼 견준다)
 pub fn is_diff(a: &V, b: &V) -> R<bool> {
     if !a.truthy() && !b.truthy() {
         return Ok(false);
@@ -141,9 +141,6 @@ pub fn is_diff(a: &V, b: &V) -> R<bool> {
         return Ok(true);
     }
     for key in k1 {
-        if key == "data" {
-            return Err(Throw::reference_error("Buffer is not defined"));
-        }
         let (x, y) = (a.get(&key), b.get(&key));
         if x.type_of() == "object" && y.type_of() == "object" {
             if is_diff(&x, &y)? {
@@ -199,7 +196,7 @@ mod tests {
     #[test]
     fn clean_number_keeps_the_original_quirks() {
         assert_eq!(clean_number(&V::from("12-34_5,6")).unwrap(), V::from("123456"));
-        assert_eq!(clean_number(&V::from("1.234")).unwrap(), V::from(""), "/./gi removes everything");
+        assert_eq!(clean_number(&V::from("1.234")).unwrap(), V::from("1234"), "dots are removed, not every character");
         assert!(clean_number(&V::Undef).is_err());
     }
 
@@ -220,7 +217,8 @@ mod tests {
         b.get("base").put("n", V::from(2));
         assert_eq!(is_diff(&a, &b), Ok(true));
         assert_eq!(is_diff(&V::Undef, &V::Null), Ok(false));
-        assert_eq!(is_diff(&obj! { "data" => 1 }, &obj! { "data" => 1 }).unwrap_err().name, "ReferenceError");
+        assert_eq!(is_diff(&obj! { "data" => 1 }, &obj! { "data" => 1 }), Ok(false));
+        assert_eq!(is_diff(&obj! { "data" => 1 }, &obj! { "data" => 2 }), Ok(true));
     }
 
     #[test]

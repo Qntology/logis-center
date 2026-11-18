@@ -18,16 +18,13 @@ pub fn gzip(data: &[u8]) -> Vec<u8> {
     enc.finish().expect("in-memory gzip")
 }
 
-/// `ungzip(x)` — x 는 ArrayBuffer · Uint8Array · 숫자 배열(D1 BLOB). 풀 수 없으면 pako 처럼 던진다.
+/// `ungzip(x)` — x 는 ArrayBuffer · Uint8Array · 숫자 배열(D1 BLOB). 풀 수 없으면 던진다.
 ///
-/// 원본 그대로: D1 은 BLOB 을 **숫자 배열**로 돌려주는데, pako 는 배열을 Uint8Array 로 바꾸지 않고 그대로 읽다가 저장 블록(압축하지 않은
-/// 블록, 짧거나 잘 줄지 않는 글에 생김)이나 gzip FEXTRA 를 복사할 때 `input.subarray` 를 불러 TypeError 를 던진다. 배열 입력이면 같은
-/// 자리에서 던진다 ([`pako_array_throws`]).
+/// 고침: D1 은 BLOB 을 숫자 배열로 돌려주는데, 원본(pako 에 배열을 그대로 넘김)은 저장 블록이나 gzip FEXTRA 를 만나면
+/// `input.subarray is not a function` 으로 던져 그 작업을 통째로 버렸다([`pako_array_throws`] 가 그 자리를 안다). 이제 바이트로 바꿔 푼다
+/// (원본에서는 `ungzip(new Uint8Array(row.data))`).
 pub fn ungzip(v: &V) -> R<Vec<u8>> {
     let bytes = v.to_bytes().ok_or_else(|| Throw::error("invalid input"))?;
-    if matches!(v, V::Arr(_)) && pako_array_throws(&bytes) {
-        return Err(Throw::type_error("input.subarray is not a function"));
-    }
     let mut out = Vec::new();
     GzDecoder::new(&bytes[..])
         .read_to_end(&mut out)
@@ -237,9 +234,9 @@ pub fn ungzip_json(v: &V) -> R<V> {
 }
 
 /// `gzip(new TextEncoder('utf-8').encode(JSON.stringify(x)), …).buffer` — D1 에 넣는 ArrayBuffer.
-/// `JSON.stringify(undefined)` 는 undefined 라 TextEncoder 가 "undefined" 를 인코딩한다(원본 그대로)
+/// `JSON.stringify(undefined)` 는 undefined 이고 `TextEncoder.encode(undefined)` 는 빈 바이트다
 pub fn gzip_json(v: &V) -> R<V> {
-    let text = stringify_checked(v)?.unwrap_or_else(|| "undefined".into());
+    let text = stringify_checked(v)?.unwrap_or_default();
     Ok(V::bytes(gzip(text.as_bytes())))
 }
 

@@ -6,13 +6,18 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { patchOriginal } from "./fixes.mjs";
 // 원본 TypeScript 는 저장소 이력에서 꺼낸다 (workers-rs 로 바꾸기 직전 커밋)
 const ORIGINAL_COMMIT = "801b0ce0";
 const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "..");
-function original(name) {
+async function original(name) {
   const file = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "out", "ts", `${name}.ts`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, execFileSync("git", ["-C", REPO, "show", `${ORIGINAL_COMMIT}:workers/${name}/src/index.ts`]));
+  const raw = execFileSync("git", ["-C", REPO, "show", `${ORIGINAL_COMMIT}:workers/${name}/src/index.ts`]).toString("utf8");
+  // ORIGINAL=raw 면 버그를 고치기 전의 원본 그대로, 아니면 fixes.mjs 의 수정을 덧댄 "고친 원본"
+  const { source, applied } = process.env.ORIGINAL === "raw" ? { source: raw, applied: [] } : await patchOriginal(name, raw);
+  if (applied.length) console.log(`[${name}] fixes applied to the original: ${applied.join(", ")}`);
+  fs.writeFileSync(file, source);
   return file;
 }
 
@@ -23,7 +28,7 @@ fs.mkdirSync(OUT, { recursive: true });
 
 // 원본 TS 묶기
 await esbuild.build({
-  entryPoints: [original("apac")],
+  entryPoints: [await original("apac")],
   bundle: true, format: "esm", platform: "neutral", mainFields: ["module", "main"],
   outfile: path.join(OUT, "apac-ts.mjs"), logLevel: "error",
 });

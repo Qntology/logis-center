@@ -185,9 +185,10 @@ impl Env {
     }
 }
 
-/// `stmt.bind(...params)` — 새 준비된 문장
+/// `stmt.bind(...params)` — 새 준비된 문장. 고침: undefined 는 null 로 묶는다 (D1 은 undefined 를
+/// `D1_TYPE_ERROR` 로 거절해, 원본은 빠진 칸 하나 때문에 그 회차의 문장을 통째로 잃었다)
 pub fn bind(stmt: &V, params: &[V]) -> R<V> {
-    let args: Vec<JsValue> = params.iter().map(to_js).collect();
+    let args: Vec<JsValue> = params.iter().map(|p| if p.is_undef() { JsValue::NULL } else { to_js(p) }).collect();
     Ok(V::ext(Js(call(stmt, "bind", &args)?)))
 }
 
@@ -205,6 +206,18 @@ pub async fn run(stmt: &V) -> R<V> {
 pub async fn query(env: &Env, db: &str, sql: &str) -> R<V> {
     let stmt = env.prepare(db, sql)?;
     all(&stmt).await?.g("results")
+}
+
+/// `(await env[db].prepare(sql).bind(...params).all()).results` — 값은 SQL 글에 넣지 않고 묶는다
+pub async fn query_bound(env: &Env, db: &str, sql: &str, params: &[V]) -> R<V> {
+    let stmt = bind(&env.prepare(db, sql)?, params)?;
+    all(&stmt).await?.g("results")
+}
+
+/// `await env[db].prepare(sql).bind(...params).run()`
+pub async fn run_bound(env: &Env, db: &str, sql: &str, params: &[V]) -> R<V> {
+    let stmt = bind(&env.prepare(db, sql)?, params)?;
+    run(&stmt).await
 }
 
 /// fetch 의 요청 본문

@@ -7,13 +7,18 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { patchOriginal } from "./fixes.mjs";
 // 원본 TypeScript 는 저장소 이력에서 꺼낸다 (workers-rs 로 바꾸기 직전 커밋)
 const ORIGINAL_COMMIT = "801b0ce0";
 const REPO = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "..");
-function original(name) {
+async function original(name) {
   const file = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "out", "ts", `${name}.ts`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, execFileSync("git", ["-C", REPO, "show", `${ORIGINAL_COMMIT}:workers/${name}/src/index.ts`]));
+  const raw = execFileSync("git", ["-C", REPO, "show", `${ORIGINAL_COMMIT}:workers/${name}/src/index.ts`]).toString("utf8");
+  // ORIGINAL=raw 면 버그를 고치기 전의 원본 그대로, 아니면 fixes.mjs 의 수정을 덧댄 "고친 원본"
+  const { source, applied } = process.env.ORIGINAL === "raw" ? { source: raw, applied: [] } : await patchOriginal(name, raw);
+  if (applied.length) console.log(`[${name}] fixes applied to the original: ${applied.join(", ")}`);
+  fs.writeFileSync(file, source);
   return file;
 }
 import { SCENARIOS } from "./proxy_scenarios.mjs";
@@ -30,7 +35,7 @@ const OUT = path.join(HERE, "out");
 fs.mkdirSync(OUT, { recursive: true });
 
 await esbuild.build({
-  entryPoints: [original("proxy")],
+  entryPoints: [await original("proxy")],
   bundle: true, format: "esm", platform: "browser", mainFields: ["browser", "module", "main"], conditions: ["workerd", "worker", "browser"],
   outfile: path.join(OUT, "proxy-ts.mjs"), logLevel: "error",
 });
@@ -96,8 +101,25 @@ function mockVec(name) {
 }
 const ai = mockAI();
 const vecs = Object.fromEntries(VECTORS.map((n) => [n, mockVec(n)]));
+// fix-bind-undefined: D1 bind 의 undefined 를 null 로 (원본은 D1_TYPE_ERROR). ORIGINAL=raw 면 감싸지 않는다
+const RAW = ${JSON.stringify(process.env.ORIGINAL === "raw")};
+const real = new WeakMap();
+function wrapStmt(stmt) {
+  const p = new Proxy(stmt, { get(t, prop) {
+    if (prop === "bind") return (...args) => wrapStmt(t.bind(...args.map((a) => (a === undefined ? null : a))));
+    const v = Reflect.get(t, prop); return typeof v === "function" ? v.bind(t) : v; } });
+  real.set(p, stmt);
+  return p;
+}
+function wrapD1(db) {
+  if (RAW || !db || typeof db.prepare !== "function") return db;
+  return new Proxy(db, { get(t, prop) {
+    if (prop === "prepare") return (sql) => wrapStmt(t.prepare(sql));
+    if (prop === "batch") return (list) => t.batch(list.map((s) => real.get(s) || s));
+    const v = Reflect.get(t, prop); return typeof v === "function" ? v.bind(t) : v; } });
+}
 export function wrapEnv(env) {
-  return new Proxy(env, { get(target, prop) { if (prop === "AI") return ai; if (prop in vecs) return vecs[prop]; return Reflect.get(target, prop); } });
+  return new Proxy(env, { get(target, prop) { if (prop === "AI") return ai; if (prop in vecs) return vecs[prop]; return wrapD1(Reflect.get(target, prop)); } });
 }`;
 
 fs.writeFileSync(path.join(OUT, "mocks.mjs"), MOCKS);

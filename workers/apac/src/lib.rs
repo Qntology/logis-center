@@ -7,7 +7,7 @@
 #[cfg(target_arch = "wasm32")]
 mod worker_main {
     use logis_worker_common::js::{self, Body, Env};
-    use logis_worker_common::jsv::{num_to_string, Throw};
+    use logis_worker_common::jsv::Throw;
     use logis_worker_common::platform::{now, sleep};
     use logis_worker_common::tables::{lookup, LOGIS_REGION};
     use logis_worker_common::util::{is_diff, random_below};
@@ -45,10 +45,11 @@ mod worker_main {
         let mut limits = limits;
 
         let body: R<()> = async {
-            let results = js::query(
+            let results = js::query_bound(
                 env,
                 &region,
-                &format!(r#"SELECT * FROM tasks WHERE "created_at" < {} ORDER BY created_at ASC LIMIT 300"#, num_to_string(created_at)),
+                r#"SELECT * FROM tasks WHERE "created_at" < ?1 ORDER BY created_at ASC LIMIT 300"#,
+                &[V::Num(created_at)],
             )
             .await?;
             len = results.length()?;
@@ -61,11 +62,13 @@ mod worker_main {
                 let mut i = 0usize;
                 while (i as f64) < len.to_num() {
                     let cron = results.gi(i)?;
-                    let task = gzip::ungzip_json(&cron.g("data")?)?;
+                    // 고침: lock 행(data 가 null, created_at 1 이라 늘 맨 앞)을 풀기 전에 본다. 원본은 ungzip(null) 이 먼저 던져
+                    // lock 이 걸린 동안 매 회차가 통째로 예외로 끝났다
                     if loose_eq(&cron.g("id")?, &V::from("lock")) {
                         tasks = V::new_arr();
                         break;
                     }
+                    let task = gzip::ungzip_json(&cron.g("data")?)?;
                     if task.g("method")?.truthy() {
                         task.del("method")?;
                     }
@@ -86,13 +89,11 @@ mod worker_main {
                             break;
                         }
 
-                        let results = js::query(
+                        let results = js::query_bound(
                             env,
                             &region,
-                            &format!(
-                                r#"SELECT * FROM tasks WHERE "created_at" <= {} AND "updated_at" > 0 ORDER BY created_at ASC LIMIT 1"#,
-                                task.g("created_at")?.to_str()
-                            ),
+                            r#"SELECT * FROM tasks WHERE "created_at" <= ?1 AND "updated_at" > 0 ORDER BY created_at ASC LIMIT 1"#,
+                            &[task.g("created_at")?],
                         )
                         .await?;
 
@@ -107,14 +108,11 @@ mod worker_main {
                                 let prev_task = gzip::ungzip_json(&cron_prev.g("data")?)?;
                                 let before = prev_task.g("team")?;
                                 let logis_region = lookup(LOGIS_REGION, &prev_task.g("flag")?);
-                                let users = js::query(
+                                let users = js::query_bound(
                                     env,
                                     &logis_region.to_key(),
-                                    &format!(
-                                        r#"SELECT * FROM users WHERE "type" = 'team' AND "id" = '{}' AND "created_at" < {} LIMIT 1"#,
-                                        before.g("id")?.to_str(),
-                                        num_to_string(now)
-                                    ),
+                                    r#"SELECT * FROM users WHERE "type" = 'team' AND "id" = ?1 AND "created_at" < ?2 LIMIT 1"#,
+                                    &[before.g("id")?, V::Num(now)],
                                 )
                                 .await?;
                                 let after = users.gi(0)?;
@@ -130,11 +128,7 @@ mod worker_main {
                                 } else {
                                     console_log!("1.remove 2.통과 진입");
                                     timeout.s_("delay", V::Num(0.5))?;
-                                    let stmt = env.prepare(
-                                        &region,
-                                        &format!("\n\t\t\t\t\t\t\t\t\tDELETE FROM tasks WHERE \"id\" = '{}'\n\t\t\t\t\t\t\t\t", cron_prev.g("id")?.to_str()),
-                                    )?;
-                                    js::run(&stmt).await?;
+                                    js::run_bound(env, &region, r#"DELETE FROM tasks WHERE "id" = ?1"#, &[cron_prev.g("id")?]).await?;
 
                                     if loose_eq(&cron_prev.g("id")?, &task.g("id")?) {
                                         console_log!("self stop 진입");
@@ -179,11 +173,8 @@ mod worker_main {
                                 llm_api = ks.clone();
                                 llm_model = ms.clone();
                             } else if !models.get("deepinfra").truthy() {
-                                let stmt = env.prepare(
-                                    &region,
-                                    &format!("\n\t\t\t\t\t\t\t\tDELETE FROM tasks WHERE id = \"{}\"\n\t\t\t\t\t\t\t", task.g("id")?.to_str()),
-                                )?;
-                                js::run(&stmt).await?;
+                                // 고침: 원본은 id = "…"(큰따옴표 — SQLite 는 먼저 열 이름으로 읽는다)로 지웠다
+                                js::run_bound(env, &region, r#"DELETE FROM tasks WHERE "id" = ?1"#, &[task.g("id")?]).await?;
                                 t += 1;
                                 continue;
                             }
@@ -283,10 +274,10 @@ mod worker_main {
         models.put("deepinfra", V::Num(10000.0));
         models.put("cloudflare", V::Num(3000.0));
         let (g1, g2) = (env.get("gemini1").to_str(), env.get("gemini2").to_str());
-        models.put(&format!("{g1}-gemini-2.5-flash-lite"), V::Num(4000.0));
-        models.put(&format!("{g2}-gemini-2.5-flash-lite"), V::Num(4000.0));
-        models.put(&format!("{g1}-gemini-2.0-flash-lite"), V::Num(4000.0));
-        models.put(&format!("{g2}-gemini-2.0-flash-lite"), V::Num(4000.0));
+        // 고침: 쿼터 키를 실제로 고르는 모델(gemini_model)에 맞춘다. 원본은 2.5 · 2.0 flash-lite 키만 채우고
+        // gemini-flash-lite-latest 로 찾아, Gemini 가 한 번도 골라지지 않았다
+        models.put(&format!("{g1}-gemini-flash-lite-latest"), V::Num(4000.0));
+        models.put(&format!("{g2}-gemini-flash-lite-latest"), V::Num(4000.0));
 
         let timeout = obj! { "value" => 1000, "delay" => 0.5, "start" => now(), "max" => 50 * 1000 };
 

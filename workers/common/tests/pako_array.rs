@@ -28,7 +28,8 @@ fn array_inputs_throw_where_pako_throws() {
         let expect = c["throws"].as_bool().unwrap();
         assert_eq!(pako_array_throws(&gz), expect, "case {i} ({})", c["by"]);
         let as_array = V::from(gz.iter().map(|x| V::Num(*x as f64)).collect::<Vec<_>>());
-        assert_eq!(ungzip(&as_array).is_err(), expect, "case {i}");
+        // 고친 뒤: 숫자 배열도 언제나 풀린다 (원본은 expect 인 경우에 던졌다)
+        assert!(ungzip(&as_array).is_ok(), "case {i}");
         // ArrayBuffer · Uint8Array 로는 언제나 풀린다
         assert!(ungzip(&V::bytes(gz.clone())).is_ok(), "case {i}");
         throws += expect as usize;
