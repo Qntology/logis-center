@@ -12,7 +12,7 @@ pub const RUNTIME_DIR: &str = "runtime-q4km";
 pub const RUNTIME_FILE: &str = "model-q4km.gguf";
 const READY_FILE: &str = "READY";
 const RECIPE: &str = "qwen35-q4km/1";
-pub(crate) const ALIGN: u64 = 32;
+pub const ALIGN: u64 = 32;
 const ROUND_ELEMS: usize = 16 * 1024 * 1024;
 
 pub const CHAT_TEMPLATE: &str = "{%- for message in messages -%}{{- '<|im_start|>' + message.role + '\\n' -}}{%- if message.content is string -%}{{- message.content -}}{%- else -%}{%- for part in message.content -%}{%- if part.text is defined -%}{{- part.text -}}{%- endif -%}{%- endfor -%}{%- endif -%}{{- '<|im_end|>\\n' -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' -}}{%- endif -%}";
@@ -67,22 +67,22 @@ struct Item {
     vperm: Option<VPerm>,
 }
 
-pub(crate) struct StEntry {
-    pub(crate) dtype: DType,
-    pub(crate) shape: Vec<usize>,
+pub struct StEntry {
+    pub dtype: DType,
+    pub shape: Vec<usize>,
     begin: u64,
     end: u64,
 }
 
-pub(crate) struct StFile {
+pub struct StFile {
     data_start: u64,
-    pub(crate) entries: HashMap<String, StEntry>,
+    pub entries: HashMap<String, StEntry>,
     /// 파일 전체의 읽기 전용 매핑. 텐서마다 파일을 다시 열어 힙에 복사하지 않습니다.
     map: memmap2::Mmap,
 }
 
 impl StFile {
-    pub(crate) fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path) -> Result<Self> {
         let mut f = std::fs::File::open(path).with_context(|| format!("{:?} 를 열 수 없습니다", path))?;
         let mut len = [0u8; 8];
         f.read_exact(&mut len)?;
@@ -125,7 +125,7 @@ impl StFile {
     }
 
     /// 텐서의 저장 바이트. 매핑을 그대로 빌려 줍니다.
-    pub(crate) fn bytes(&self, name: &str) -> Result<&[u8]> {
+    pub fn bytes(&self, name: &str) -> Result<&[u8]> {
         let e = self.entries.get(name).ok_or_else(|| anyhow!("model.safetensors 에 {} 가 없습니다", name))?;
         let (start, end) = ((self.data_start + e.begin) as usize, (self.data_start + e.end) as usize);
         let raw = self.map.get(start..end).ok_or_else(|| {
@@ -142,7 +142,7 @@ impl StFile {
     }
 
     /// 파일 처음부터 텐서 바이트가 시작하는 위치
-    pub(crate) fn offset(&self, name: &str) -> Result<usize> {
+    pub fn offset(&self, name: &str) -> Result<usize> {
         let e = self.entries.get(name).ok_or_else(|| anyhow!("model.safetensors 에 {} 가 없습니다", name))?;
         Ok((self.data_start + e.begin) as usize)
     }
@@ -156,13 +156,13 @@ impl StFile {
 
 /// 🌟 [SHARDED] 한 파일(`model.safetensors`) 또는 색인(`model.safetensors.index.json`)으로 나뉜 조각 파일들.
 /// 원본 Qwen/Qwen3.5-4B 는 두 조각입니다.
-pub(crate) struct StSet {
+pub struct StSet {
     files: Vec<StFile>,
     which: HashMap<String, usize>,
 }
 
 impl StSet {
-    pub(crate) fn open_dir(dir: &Path) -> Result<Self> {
+    pub fn open_dir(dir: &Path) -> Result<Self> {
         let mut files = Vec::new();
         let mut which = HashMap::new();
         for (i, p) in weight_files(dir)?.iter().enumerate() {
@@ -177,7 +177,7 @@ impl StSet {
         Ok(Self { files, which })
     }
 
-    pub(crate) fn names(&self) -> HashSet<String> {
+    pub fn names(&self) -> HashSet<String> {
         self.which.keys().cloned().collect()
     }
 
@@ -188,7 +188,7 @@ impl StSet {
 }
 
 /// 가중치 파일: `model.safetensors` 가 있으면 그것, 없으면 색인이 가리키는 조각들 (이름 순)
-pub(crate) fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
+pub fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let single = dir.join("model.safetensors");
     if single.is_file() {
         return Ok(vec![single]);
@@ -234,7 +234,7 @@ struct TextCfg {
     tied: bool,
 }
 
-pub(crate) enum Meta {
+pub enum Meta {
     U32(u32),
     F32(f32),
     Str(String),
@@ -758,13 +758,13 @@ fn read_tokenizer_meta(model_dir: &Path, vocab: usize) -> Result<(Vec<String>, V
     Ok((tokens, types, eos, pad))
 }
 
-pub(crate) fn put_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
+pub fn put_str<W: Write>(w: &mut W, s: &str) -> Result<()> {
     w.write_all(&(s.len() as u64).to_le_bytes())?;
     w.write_all(s.as_bytes())?;
     Ok(())
 }
 
-pub(crate) fn put_meta<W: Write>(w: &mut W, key: &str, v: &Meta) -> Result<()> {
+pub fn put_meta<W: Write>(w: &mut W, key: &str, v: &Meta) -> Result<()> {
     put_str(w, key)?;
     match v {
         Meta::U32(x) => {
@@ -799,7 +799,7 @@ pub(crate) fn put_meta<W: Write>(w: &mut W, key: &str, v: &Meta) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn pad_to<W: Write>(w: &mut W, written: u64) -> Result<u64> {
+pub fn pad_to<W: Write>(w: &mut W, written: u64) -> Result<u64> {
     let pad = (ALIGN - written % ALIGN) % ALIGN;
     if pad > 0 {
         w.write_all(&vec![0u8; pad as usize])?;
@@ -924,7 +924,7 @@ fn produce(st: &StSet, it: &Item, cfg: &TextCfg, threads: usize, quantizer: Quan
     Ok(())
 }
 
-pub(crate) fn convert_with(model_dir: &Path, out: &Path, precision: Precision, progress: &(dyn Fn(u64, u64) + Sync)) -> Result<()> {
+pub fn convert_with(model_dir: &Path, out: &Path, precision: Precision, progress: &(dyn Fn(u64, u64) + Sync)) -> Result<()> {
     convert_variant(model_dir, out, precision, QUANTIZER, progress)
 }
 

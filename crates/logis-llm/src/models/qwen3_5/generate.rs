@@ -629,14 +629,14 @@ impl Qwen3_5GenerateModel {
                     15 + (84.0 * (1.0 - (-0.05 * (i as f32)).exp())) as i32
                 };
                 
-                if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
+                if let Some(tx) = crate::progress::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
                         let task_id = if sid.starts_with("task_") || sid.starts_with("img_") || sid.starts_with("search_") {
                             let p: Vec<&str> = sid.split('_').collect();
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
-                        let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
+                        let current_cat = crate::progress::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
                         let summary_msg = if current_cat.contains("Classification") {
                             format!("Analyzing structure ({}%)...", pct)
@@ -1071,14 +1071,14 @@ impl Qwen3_5GenerateModel {
                     15 + (84.0 * (1.0 - (-0.05 * (i as f32)).exp())) as i32
                 };
                 
-                if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
+                if let Some(tx) = crate::progress::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
                         let task_id = if sid.starts_with("task_") || sid.starts_with("img_") || sid.starts_with("search_") {
                             let p: Vec<&str> = sid.split('_').collect();
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
-                        let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
+                        let current_cat = crate::progress::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
                         let summary_msg = if current_cat.contains("Classification") {
                             format!("Analyzing structure ({}%)...", pct)

@@ -116,7 +116,7 @@ jobs:
       - name: apply fork patch series + path dependencies (job only)
         run: |
           logis-center/.github/scripts/apply-fork-patches.sh
-          logis-center/.github/scripts/use-fork-path.sh logis-center/commerce/src-tauri/Cargo.toml
+          logis-center/.github/scripts/use-fork-path.sh logis-center/Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
@@ -310,7 +310,7 @@ jobs:
             exit 1
           fi
           notice_lines "suite result" "$RUNNER_TEMP/suite.log" '^test result'
-      # The lib's own unit tests (src/**/mod tests) are not in `--test it`. These need no GPU or model files:
+      # The lib unit tests (src/**/mod tests of the app and crates/logis-llm) are not in `--test it`. These need no GPU or model files:
       # vocab trim (row choice, per-flow language scopes, trimmed head = original rows), stable search ranking, store.
       - name: "lib unit tests (vocab trim · stable search ranking · store)"
         if: matrix.name == 'linux-cpu' || matrix.name == 'windows-cpu'
@@ -318,7 +318,7 @@ jobs:
         run: |
           . "$RUNNER_TEMP/annot.sh"; set +e; ort_path
           f="${{ matrix.features }}"
-          cargo test --lib --no-default-features ${f:+--features $f} -- vocab_trim stable_rank store:: --test-threads 2 2>&1 | tee "$RUNNER_TEMP/lib.log" | tail -5
+          cargo test --lib -p logis-center -p logis-llm --no-default-features ${f:+--features $f} -- vocab_trim stable_rank store:: --test-threads 2 2>&1 | tee "$RUNNER_TEMP/lib.log" | tail -5
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/lib.log"; exit 1; }
           notice_lines "lib unit tests" "$RUNNER_TEMP/lib.log" '^test result'
       # crates/logis-* : pure domain crates split out of the app (no Tauri, LanceDB, models or GPU).

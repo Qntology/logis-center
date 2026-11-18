@@ -217,9 +217,9 @@ pub async fn drain_global_io() {
 pub fn init_bake_worker() {
     let (btx, brx) = mpsc::channel(64); let (ltx, lrx) = mpsc::channel(64);
     let _ = BAKE_TX.set(btx); let _ = LOAD_TX.set(ltx);
-    if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { tauri::async_runtime::spawn(async move { spawn_slot_dispatcher(rx).await; }); }
-    tauri::async_runtime::spawn(async move { spawn_slot_worker(brx); }); 
-    tauri::async_runtime::spawn(async move { spawn_slot_worker(lrx); });
+    if let Some(rx) = SLOT_MANAGER_DATA.1.lock().unwrap().take() { crate::rt::spawn(async move { spawn_slot_dispatcher(rx).await; }); }
+    crate::rt::spawn(async move { spawn_slot_worker(brx); }); 
+    crate::rt::spawn(async move { spawn_slot_worker(lrx); });
 }
 
 async fn spawn_slot_dispatcher(mut rx: mpsc::Receiver<SlotRequest>) {
@@ -515,7 +515,7 @@ fn spawn_slot_worker(mut rx: mpsc::Receiver<SlotTask>) {
 }
 
 struct ReadSlotGuard { sid: usize, active: bool }
-impl Drop for ReadSlotGuard { fn drop(&mut self) { if self.active { let sid = self.sid; tauri::async_runtime::spawn(async move { SLOT_MANAGER.release_slot(sid).await; }); } } }
+impl Drop for ReadSlotGuard { fn drop(&mut self) { if self.active { let sid = self.sid; crate::rt::spawn(async move { SLOT_MANAGER.release_slot(sid).await; }); } } }
 
 #[derive(Clone)]
 pub enum ModelVariant { Standard(QwenVLModel), QuantizedVL(QuantizedQwenVLModel), QuantizedText(crate::models::qwen::quantized_model::QuantizedQwenTextModel) }
@@ -972,14 +972,14 @@ impl QwenVLGenerateModel {
                     15 + (84.0 * (1.0 - (-0.012 * (i as f32)).exp())) as i32
                 };
 
-                if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
+                if let Some(tx) = crate::progress::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
                         let task_id = if sid.starts_with("task_") || sid.starts_with("img_") || sid.starts_with("search_") {
                             let p: Vec<&str> = sid.split('_').collect();
                             if p.len() >= 2 { format!("{}_{}", p[0], p[1]) } else { sid.clone() }
                         } else { sid.clone() };
                         
-                        let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
+                        let current_cat = crate::progress::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
                         let summary_msg = if current_cat.contains("Classification") {
                             format!("Analyzing structure ({}%)...", pct)

@@ -1,7 +1,7 @@
 # crates 작업 공간 · premium-discount 공용 엔진 통합 (2026-11-18)
 
-기획서 "웹 분석(`analytic`) 이관 이후 `crates/` 모듈화 및 `premium-discount` 공용 엔진 통합"의 1 · 2단계, 3단계의 검색 crate, 4단계의
-`EventSink` 를 반영한 기록입니다. 나머지(문서 비전 · 생성 LLM crate, `commerce/app` 분리)는 아래 "남은 단계"에 실측한 결합도와 함께 적었습니다.
+기획서 "웹 분석(`analytic`) 이관 이후 `crates/` 모듈화 및 `premium-discount` 공용 엔진 통합"의 1 · 2단계, 3단계의 검색 · 생성 모델 crate,
+4단계의 `EventSink` 를 반영한 기록입니다. 나머지(문서 비전 crate, `commerce/app` 분리)는 아래 "남은 단계"에 실측한 결합도와 함께 적었습니다.
 
 ## 1단계: 루트 작업 공간 · candle 포크 고정 · premium-discount 링크
 
@@ -11,8 +11,8 @@
 | 자기 `[workspace]` 가 있는 boa-engine · direct-storage · cpu-embed-bench 와 `[workspace]` 없는 모바일 셸은 `exclude` (모바일을 빼지 않으면 그 폴더의 cargo 가 실패) | `Cargo.toml` |
 | `[patch.crates-io]` · `[profile.*]` 는 루트로 (멤버의 것은 무시됨). `Cargo.lock` 도 루트로 | `Cargo.toml`, `Cargo.lock` |
 | `target-cpu=native` 와 산출물 폴더(`commerce/src-tauri/target`)를 루트 config 한 곳에. 배치 파일 · CI 캐시 · Tauri 번들 경로가 그대로이고, config 를 여러 곳에 두면 rustflags 배열이 이어 붙어 전부 다시 빌드됨 | `.cargo/config.toml` |
-| candle-rocm-vulkan 포크를 `branch = "master"`(잠금 60ec257) 대신 premium-discount · raon-zena 와 같은 커밋 `ebaf93d` 로 고정 | 루트 `[patch.crates-io]`, `commerce/src-tauri/Cargo.toml` 의 `candle-rocm` |
-| CI 의 포크 path 전환이 두 매니페스트(앱 `candle-rocm` · 루트 패치 3줄)를 함께 바꿈, 캐시 키는 루트 `Cargo.lock` | `.github/scripts/use-fork-path.sh`, `env-report.sh`, `app-tests.sh`, 워크플로 |
+| candle-rocm-vulkan 포크를 `branch = "master"`(잠금 60ec257) 대신 premium-discount · raon-zena 와 같은 커밋 `ebaf93d` 로 고정 | 루트 `[patch.crates-io]` 3줄과 `[workspace.dependencies]` 의 `candle-rocm`(logis-llm 이 씀) |
+| CI 의 포크 path 전환이 루트 4줄(`candle-rocm` · 패치 3줄)을 바꿈, 캐시 키는 루트 `Cargo.lock` | `.github/scripts/use-fork-path.sh`, `env-report.sh`, `app-tests.sh`, 워크플로 |
 
 premium-discount-* (rev `9925011`, raon-zena 와 같음):
 
@@ -49,12 +49,13 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 
 | crate | 모듈 (예전 위치) | 의존 |
 | :--- | :--- | :--- |
-| `logis-schema` | `canonical` (utils/canonical.rs) · `logic` (logic.rs) · `hash` (utils/hash.rs) · `text` (ai_utils 의 숫자 · 월 · 구 나누기) · `embed_space` (models/embedding.rs 의 차원 · 순전파 모드 · 코사인 눈금 표) · `envelope` (store.rs 봉투 컬럼) · `paths` (get_app_dir) | premium-discount-identity |
+| `logis-schema` | `canonical` (utils/canonical.rs) · `logic` (logic.rs) · `hash` (utils/hash.rs) · `text` (ai_utils 의 숫자 · 월 · 구 나누기) · `embed_space` (models/embedding.rs 의 차원 · 순전파 모드 · 코사인 눈금 표) · `envelope` (store.rs 봉투 컬럼) · `paths` (utils/paths.rs 전부: 앱 데이터 · tmp · kv · 작업 폴더 · 로그, sync_utils 의 추출 중단 신호) | premium-discount-identity |
 | `logis-bias` | `bias_schema` + `bias.json` · `full_bias.json` (utils/) · `bank` (ai_utils 의 라벨 · 선입견 뱅크) · `time_guide` · `lang_utils` · `query_lang` (stanza.rs 의 질의 언어 판정 · 따옴표 구간 · 앱 언어 코드) · `entity` (scheduler/entity.rs) | logis-schema, 기능 `full-bias` |
 | `logis-sds` | SDS 원장 (utils/score_dynamics.rs) | logis-schema, premium-discount-sds |
 | `logis-pug` | `utils::{parsing, ai_utils, nl_convert, json_parse, json_utils, pug_utils}` · `prompts` · `js_templates` · `merge_rules` (model/merge.rs 의 순수 규칙) · `scripts` (model/lang_llm.rs 의 문자 체계) | logis-schema, logis-bias, logis-sds, premium-discount-sds |
 | `logis-parsers` | `documents` (parsers/mod.rs) · `compression` (utils/compression.rs) | — |
 | `logis-search` | `fusion` (search_fusion.rs) · `relation` (search_relation.rs 의 유형 · 고정점 · 연결 · 서식 질의 근거 규칙) | logis-schema, logis-bias, logis-pug |
+| `logis-llm` | `models::{qwen, qwen3, qwen3_5, qwen3vl, qwen4_exp, granite, common, vision_cache}` (models/) · `lang_gguf` (model/lang_gguf.rs) · `tokenizer` · `chat_template` · `openai_types` · `position_embed` · `utils::{device_utils, resources, tensor_utils, direct_loader, img_utils, crypto, misc_utils}` (utils/) · `progress` (scheduler 의 `PROGRESS_TX` · lib.rs 의 `CURRENT_UI_CATEGORY`) · `lang_resident` (lang_llm 의 올라 있는 변형) · `rt` (spawn 훅) | candle(포크) · tokenizers · logis-schema · logis-bias · logis-sds · premium-discount-quant, 기능 cuda · rocm · vulkan · metal · flash-attn · turbo-quant (앱의 같은 기능이 켬) |
 
 - 앱의 예전 파일은 한 줄 재수출(`pub use logis_…::*;`)로 남아 호출부가 바뀌지 않았습니다. 임베딩 모델(`LogisModel`)이나 토크나이저가 필요한
   함수 5개(`status_key_banks` · `status_pivot_bank` · `canonicalize_trade_columns_with_embedding` · `extract_doc_table_headers_async` ·
@@ -64,13 +65,32 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 - SDS 원장은 모델 계층을 모르도록, 비전 트랙 키의 정밀도 꼬리표(SigLIP2 양자화 지문)를 앱의 `enter_scope` 가 등록합니다(`set_vision_precision`).
 - 각 crate 는 모델 · DB · Tauri 없이 `cargo test -p logis-schema -p logis-bias -p logis-sds -p logis-pug -p logis-parsers -p logis-search` 로 몇 초 안에 돕니다.
 
+### logis-llm (생성 모델 엔진)
+
+- 파일은 `git mv` 로 옮겼고(이력 유지), 앱은 예전 모듈 경로에서 재수출합니다: `models/mod.rs` 의 `pub use logis_llm::models::{…}`,
+  lib.rs 의 `pub use logis_llm::{chat_template, openai_types, position_embed, tokenizer}`, `model.rs` 의 `pub use logis_llm::lang_gguf`,
+  `utils/mod.rs` 의 `pub use logis_llm::utils::{…}`. 옮긴 코드 안의 `crate::utils::…` 는 crate 가 같은 이름 모듈을 두고 아래 crate(사전 · 경로 · SDS)를
+  같은 자리에 다시 내보내 그대로 둡니다.
+- 앱 쪽에 기대던 곳은 이렇게 끊었습니다.
+  - 진행 채널(`scheduler::PROGRESS_TX`)과 화면 분류(`CURRENT_UI_CATEGORY`): 정의를 `logis_llm::progress` 로 내리고 앱은 재수출 (정의는 하나).
+  - RAM 압박 기준 · 스냅숏 · 힙 반환(model.rs 의 6개)과 올라 있는 언어 엔진 변형(lang_llm 의 `RESIDENT`): 순수 함수 · 상태라 아래로 내림.
+  - `tauri::async_runtime::spawn` 9곳(KV 슬롯 반환 · 굽기 · 읽기 · 지연 해제): `logis_llm::rt::spawn`. 앱 `run()` 이 `set_spawner` 로
+    `tauri::async_runtime::spawn` 을 등록해 예전과 같은 런타임에서 돌고, 등록이 없으면(통합 시험 · 헤드리스) crate 가 처음 쓸 때 만드는 전역
+    멀티스레드 런타임에 띄웁니다 — Tauri 가 `async_runtime::set` 없이 스스로 만드는 기본 런타임과 같은 성질(부른 스레드의 런타임과 무관).
+  - `lang_gguf` 는 Qwen3.5 변환 · 적재뿐이라 통째로 내리고 `pub(crate)` 18개를 `pub` 으로 (SigLIP2 양자화가 GGUF 쓰기 도우미를 씀).
+  - 앱 경로 도우미(`utils/paths.rs`)는 std 만 써서 `logis_schema::paths` 로 합쳤습니다(`get_kv_dir` 등 그대로).
+- GPU 기능: 옮긴 코드의 `#[cfg(feature = "rocm")]` 등은 이제 logis-llm 의 기능을 봅니다. 앱의 `cuda` · `rocm` · `vulkan` · `metal` ·
+  `flash-attn` · `turbo-quant` 가 `logis-llm/…` 도 켭니다 — 빠뜨리면 컴파일 오류 없이 그 경로가 조용히 빠지므로 기능 목록은 둘이 같아야 합니다.
+- candle-rocm(포크 커밋 고정)은 logis-llm 만 써서 루트 `[workspace.dependencies]` 로 옮겼습니다. 포크 path 전환(`use-fork-path.sh`)은 이제 루트
+  한 파일의 4줄을 바꿉니다.
+
 ## 4단계 첫 조각: EventSink
 
 - `commerce/src-tauri/src/sink.rs`: `EventSink`(`emit_json` · `log_progress`) · `Sink = Arc<dyn EventSink>` · `TauriSink` · `NoopSink`.
   `dyn EventSink` 에 `tauri::Emitter::emit` 과 같은 모양의 `emit` 을 두어, model · scheduler 의 `app_handle.emit(…)` · `app_handle.clone()` 호출은 그대로입니다.
 - model · scheduler · utils(logger · network) 의 `tauri::AppHandle` 인자 · 필드(`LogisModel::app_handle` 포함)는 `Sink` 입니다. lib.rs 의 명령 진입점이
   `sink::tauri(&app_handle)` 로 감싸 넘기고, 시험 · CLI 는 `sink::noop()` 을 넘길 수 있습니다. `tauri::` 가 lib.rs · automation.rs 밖에 남은 곳은
-  Qwen 생성 루프의 `tauri::async_runtime::spawn` 9곳과 utils/network.rs 의 `#[tauri::command]` 3개뿐입니다.
+  utils/network.rs 의 `#[tauri::command]` 3개뿐입니다 (Qwen 생성 루프의 `tauri::async_runtime::spawn` 9곳은 logis-llm 의 `rt::spawn` 훅으로).
 - 경로 도우미(`get_kv_dir` · `get_task_log_file` …)의 쓰지 않던 `Option<&AppHandle>` 인자를 뺐습니다(37곳).
 
 ## 기획서와 다른 점 (코드 · 저장소로 확인)
@@ -83,7 +103,10 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   `ScopeStat` 의 시각 칸(`updated_at` ↔ `updated_ms`)과 logis 고유 레코드(카테고리 · 공간 · 검색 필드)가 다릅니다. 같은 것만 재수출했고,
   원장 계층은 `logis-sds` 라는 crate 하나를 더 만들어 옮겼습니다(텍스트 파이프라인이 그 위에 있어야 해서).
 - `scheduler/entity.rs` 는 서식 판정(`bias_schema`)을 써서 `logis-schema` 가 아니라 `logis-bias` 에 두었습니다.
-- `utils/img_utils.rs` 는 이미지를 candle 텐서로 바꾸는 VLM 전처리라 "모델 의존 없음" 인 `logis-parsers` 가 아니라 `logis-llm` 쪽이 맞아 앱에 남겼습니다.
+- `utils/img_utils.rs` 는 이미지를 candle 텐서로 바꾸는 VLM 전처리라 "모델 의존 없음" 인 `logis-parsers` 가 아니라 `logis-llm` 으로 옮겼습니다.
+- 기획서의 logis-llm 목록(models 7종 · position_embed · chat_template · openai_types · tokenizer · tensor_utils · device_utils · direct_loader)만으로는
+  컴파일되지 않습니다. 모델이 KV 배치(`utils::resources` 82곳) · KV 블록 암호화(`crypto`) · 어휘 판정 도우미(`misc_utils`) · Qwen3.5 GGUF
+  변환(`model/lang_gguf.rs`)을 쓰므로 함께 옮겼습니다. `vocab_trim.rs` 는 이미 premium-discount-quant 규칙 위의 얇은 층이라 그대로 옮겼습니다.
 - Analytic 의 이관처는 `premium-discount-nav` · `-nms` 가 아니라 `premium-discount-analytic` 입니다(앞 작업에서 만듦).
 - Stanza · granite 순전파를 `premium-discount-nlp` 로, 스팬 NMS 를 `premium-discount-nms` 로 바꾸는 것은 하지 않았습니다. 두 저장소가 따로 갖던
   `onnxruntime(-sys)` 사본은 이 저장소 판(`commerce/crates`, ORT 1.28.0)을 기준으로 premium-discount 쪽을 다시 맞췄습니다(premium-discount
@@ -94,9 +117,9 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 
 - **logis-search 의 나머지**: 기획서가 이 crate 에 넣은 `model/merge.rs`(병합 · 그라운딩, SigLIP2 결과를 씀)와 `model/research.rs` 의 집계는
   모델 · 저장소 호출과 섞여 있어 순수 부분을 먼저 떼어야 합니다 (`merge_rules` 로 두 규칙만 옮김).
-- **logis-vision-doc · logis-llm**: candle 텐서 · 장치 · 자원 관리(`utils::resources` · `paths` · `scheduler`)에 묶여 있어, 자원 · 경로 결합을 먼저 끊어야 합니다.
-- **commerce/app 분리**: EventSink 다음 걸림돌은 lib.rs 에 있는 전역 상태 3개(`ACTIVE_TASK_MEM` 6곳 · `LATEST_PROGRESS_PAYLOAD` 2곳 ·
-  `CURRENT_UI_CATEGORY` 1곳)를 model · scheduler 가 `crate::` 로 직접 읽는 것과, Qwen 생성 루프의 `tauri::async_runtime::spawn` 입니다. 이것들을 코어로 옮기면 store · residency · model · scheduler 를
+- **logis-vision-doc**: SigLIP2 가 앱에 기대는 곳은 임베딩 모듈의 배치 정책(`BatchOpts::for_device` 의 고정 모양 여부)과 Vulkan 실행 모드뿐입니다.
+- **commerce/app 분리**: EventSink · spawn 훅 · `CURRENT_UI_CATEGORY` 다음 걸림돌은 lib.rs 에 있는 전역 상태 2개(`ACTIVE_TASK_MEM` 6곳 ·
+  `LATEST_PROGRESS_PAYLOAD` 2곳)를 model · scheduler 가 `crate::` 로 직접 읽는 것입니다. 이것들을 코어로 옮기면 store · residency · model · scheduler 를
   `commerce/app` 으로 옮기고 Tauri 셸(lib.rs 명령 · automation · TauriSink)만 남길 수 있습니다.
 - **LanceDB 0.41**: premium-discount 앱이 옮긴 API 변경(테이블 add · 질의 실행)을 store.rs 에 적용합니다. 이 작업 공간은 아직 0.31 입니다.
 
@@ -109,6 +132,9 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   - CI(windows-cpu)와 같은 조건(debug · CPU · `CARGO_PROFILE_DEV_DEBUG=0`): `cargo test --test it` 286 통과 · 0 실패 · 65 무시,
     lib 단위 시험(`vocab_trim stable_rank store::`) 8 통과. 시험 수는 388 → 375 로, 지운 분석 시험 13개(analytic_page 10 · search_relation 3)만큼.
   - crate 단위 시험(`-p logis-schema … -p logis-search`) 통과, 프런트엔드 tsc 0 오류 · vitest 217 통과(지운 분석 · OAuth 시험 74개 제외).
+- logis-llm 분리 뒤 (CI 와 같은 조건): `cargo test --test it` 286 통과 · 0 실패 · 65 무시(옮기기 전과 같음), lib 단위 시험(앱 + logis-llm
+  함께) 8 통과, `cargo test -p logis-llm` 단독 6 통과 · 1 무시, 도메인 crate 시험 통과. 단독 빌드에서 windows-sys `Win32_Foundation` 이 빠져
+  있던 것이 드러나 매니페스트에 넣었습니다(앱 빌드에서는 다른 crate 가 켜 주어 보이지 않음).
 - 함정: 같은 `target/debug` 에 `cargo check`(ROCm, 메타데이터만)와 CPU 빌드를 섞으면 boa 의 타입이 엉뚱하게 읽혀 `str` 크기 오류 · "rlib 형식이
   없음" 오류가 났습니다(폴더를 비우고 다시 빌드하면 사라짐). debug 정보를 켠 채 `it` 시험 exe 를 링크하면 PDB 가 1.7 GB 를 넘어 LNK1318(LIMIT 12) —
   CI 처럼 `CARGO_PROFILE_DEV_DEBUG=0` 을 씁니다.

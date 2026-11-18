@@ -2341,7 +2341,7 @@ impl Qwen3_5TextModel {
                 let headroom = if legacy_plan { QWEN35_DECODE_HEADROOM_TOKENS } else { self.decode_headroom_tokens() };
                 let planned = seqlen_offset + seq_len + headroom;
                 let already = if legacy_plan { 0 } else { self.vram_kv_tokens().min(seqlen_offset) };
-                let label = if crate::model::lang_llm::resident_variant().is_some() { "Qwen3.5-4B" } else { "Qwen3.5(2B)" };
+                let label = if crate::lang_resident::resident_variant().is_some() { "Qwen3.5-4B" } else { "Qwen3.5(2B)" };
                 let mut per_token = if legacy_plan {
                     (full_attn_layers * kv_heads * kv_head_dim * 2 * self.kv_elem_bytes()) as u64
                 } else {
@@ -2430,7 +2430,7 @@ impl Qwen3_5TextModel {
                 let streamed_bytes = if keep { 0 } else { weight_bytes.saturating_sub(prefix_bytes) };
                 let ram_free = crate::utils::resources::free_ram_bytes() as u64;
                 let release_streamed =
-                    streamed_bytes > 0 && ram_free < crate::model::RAM_PRESSURE_MARGIN_BYTES + streamed_bytes;
+                    streamed_bytes > 0 && ram_free < crate::utils::resources::RAM_PRESSURE_MARGIN_BYTES + streamed_bytes;
                 self.keep_weights_resident = keep;
                 self.resident_prefix = prefix;
                 self.release_streamed_pages = release_streamed;
@@ -2510,7 +2510,7 @@ impl Qwen3_5TextModel {
             };
             self.release_streamed_pages = streamed_bytes > 0
                 && (crate::utils::resources::free_ram_bytes() as u64)
-                    < crate::model::RAM_PRESSURE_MARGIN_BYTES + streamed_bytes;
+                    < crate::utils::resources::RAM_PRESSURE_MARGIN_BYTES + streamed_bytes;
             for layer in self.layers.iter_mut() {
                 layer.set_kv_residency(crate::utils::resources::KvResidency::Ssd);
             }
@@ -2824,7 +2824,7 @@ impl Qwen3_5TextModel {
                             if let Some(tx) = crate::models::qwen::generate::BAKE_TX.get() {
                                 let reg_clone = attn.registry.clone();
                                 let sub_path_clone = sub_path.clone();
-                                tauri::async_runtime::spawn(async move {
+                                crate::rt::spawn(async move {
                                     for (dump, off, b_idx) in dumps {
                                         let sid = crate::models::qwen::generate::SLOT_MANAGER.acquire_write_slot(1024).await;
                                         let block_dir = base_dir.join(format!("b{}", off));
@@ -2855,8 +2855,8 @@ impl Qwen3_5TextModel {
         let phase = if is_decoding { "첫 디코딩 토큰" } else { "프리필" };
         if resident_decided && keep_resident && newly_resident > 0 {
             let free_prev = crate::utils::resources::free_ram_bytes() as u64;
-            crate::model::release_os_working_set();
-            let (free_now, total) = crate::model::ram_snapshot();
+            crate::utils::resources::release_os_working_set();
+            let (free_now, total) = crate::utils::resources::ram_snapshot();
             println!(
                 "[DECODE-RESIDENT] {}에서 층 {}개를 VRAM 에 올렸습니다 (전체 {}개 상주). 남은 계산은 mmap 을 읽지 않으므로 작업 집합을 반환합니다 | RAM 여유 {}MB → {}MB | {}",
                 phase,
@@ -2864,10 +2864,10 @@ impl Qwen3_5TextModel {
                 total_layers,
                 free_prev / 1_000_000,
                 free_now / 1_000_000,
-                crate::model::ram_pressure_line(free_now, total)
+                crate::utils::resources::ram_pressure_line(free_now, total)
             );
         } else if resident_decided && resident_prefix > 0 && newly_resident > 0 {
-            let (free_now, total) = crate::model::ram_snapshot();
+            let (free_now, total) = crate::utils::resources::ram_snapshot();
             println!(
                 "[DECODE-RESIDENT] {}에서 층 {}/{}개를 VRAM 에 올렸고 그 층의 파일 페이지는 바로 작업 집합에서 내려놓았습니다. 나머지 {}개 층은 매번 mmap 에서 읽고 {} | {}",
                 phase,
@@ -2875,7 +2875,7 @@ impl Qwen3_5TextModel {
                 total_layers,
                 total_layers - resident_prefix,
                 if release_streamed { "읽은 직후 그 층의 파일 페이지도 내려놓습니다" } else { "RAM 여유가 기준 위라 그 층의 파일 페이지는 작업 집합에 둡니다" },
-                crate::model::ram_pressure_line(free_now, total)
+                crate::utils::resources::ram_pressure_line(free_now, total)
             );
         }
         tokio::task::yield_now().await;
@@ -4328,7 +4328,7 @@ impl Qwen3_5Model {
                 
                 
                 let pct = ((processed as f32 / total_len as f32) * 100.0) as i32;
-                if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
+                if let Some(tx) = crate::progress::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
                         let task_id = if sid.starts_with("task_") || sid.starts_with("search_") || sid.starts_with("img_") {
                             let p: Vec<&str> = sid.split('_').collect();
@@ -4336,7 +4336,7 @@ impl Qwen3_5Model {
                         } else { sid.clone() };
                         
                         
-                        let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
+                        let current_cat = crate::progress::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
                         let summary_msg = format!("Reading context ({}%)...", pct);
 

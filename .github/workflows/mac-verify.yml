@@ -189,7 +189,7 @@ jobs:
       - name: apply fork patch series + path dependencies (job only)
         run: |
           logis-center/.github/scripts/apply-fork-patches.sh
-          logis-center/.github/scripts/use-fork-path.sh logis-center/commerce/src-tauri/Cargo.toml
+          logis-center/.github/scripts/use-fork-path.sh logis-center/Cargo.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }

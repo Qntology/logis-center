@@ -10,7 +10,7 @@ use crate::model::LogisModel;
 use serde_json::{Value, json};
 use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::Lazy;
 use std::sync::Mutex as StdMutex;
 
 pub mod translit;
@@ -34,7 +34,8 @@ use crate::js_templates::*;
 pub use worker::start_background_worker;
 pub use entity::{normalize_entity_key, entity_index, entity_id, entity_bcc, entity_seed, entity_key_index, relay_type_key, relay_seed};
 
-pub static PROGRESS_TX: OnceCell<tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = OnceCell::new();
+// 진행 채널은 모델(Qwen 생성 루프)도 보내므로 crates/logis-llm 에 있습니다. 여기서 처음 채웁니다(worker).
+pub use logis_llm::progress::PROGRESS_TX;
 
 pub static TRANSLIT_PENDING: Lazy<StdMutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<(String, String)>>>>> =
     Lazy::new(|| StdMutex::new(std::collections::HashMap::new()));

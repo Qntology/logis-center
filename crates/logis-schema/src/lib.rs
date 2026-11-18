@@ -5,7 +5,7 @@
 //! - [`hash`]: hashId(premium-discount-identity 위) · 숫자 동형문자 정규화 · 릴레이 키 · crc32 · 기준 도메인
 //! - [`text`]: 숫자 · 월 이름 · 구(phrase) 나누기 (정규화 · 무역 규칙 · 도메인 사전이 함께 씀)
 //! - [`embed_space`]: granite 임베딩 차원 · 순전파 모드 · 코사인 눈금 보정 표
-//! - [`envelope`]: 저장소 봉투 컬럼, [`paths`]: 앱 데이터 폴더
+//! - [`envelope`]: 저장소 봉투 컬럼, [`paths`]: 앱 데이터 폴더 · tmp(kv · 작업 데이터 · 로그) · 추출 중단 신호
 //!
 //! 앱(commerce/src-tauri)은 예전 경로(`crate::utils::canonical` · `crate::logic` · `crate::utils::hash` …)에서 이 모듈을
 //! 그대로 재수출하므로 호출부는 바뀌지 않았습니다.

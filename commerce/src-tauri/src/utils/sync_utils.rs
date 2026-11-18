@@ -17,16 +17,5 @@ pub fn notify_new_task() {
     TASK_QUEUED_SIGNAL.notify_waiters();
 }
 
-// --- GLOBAL EXTRACTION CONTROL (misc_utils.rs에서 이동) ---
-pub fn is_extraction_stopped() -> bool {
-    crate::utils::paths::get_stop_signal_file().exists()
-}
-
-pub fn set_extraction_stop_signal(stopped: bool) {
-    let file = crate::utils::paths::get_stop_signal_file();
-    if stopped {
-        let _ = std::fs::File::create(file);
-    } else {
-        let _ = std::fs::remove_file(file);
-    }
-}
+// --- GLOBAL EXTRACTION CONTROL: 중단 신호 파일은 모델 생성 루프도 보므로 crates/logis-schema 의 paths 에 있습니다 ---
+pub use logis_schema::paths::{is_extraction_stopped, set_extraction_stop_signal};

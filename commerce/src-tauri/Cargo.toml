@@ -41,11 +41,8 @@ ahash = "0.8.11"
 candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
 candle-flash-attn = { version = "0.11.0", optional = true, default-features = false }
-# 🌟 [FORK-GIT] candle-rocm-vulkan 포크는 premium-discount · raon-zena 와 같은 커밋(ebaf93d)으로 고정합니다.
-#    루트 Cargo.toml 의 [patch.crates-io] 3줄(candle-core · candle-nn · candle-flash-attn)과 반드시 같은 git 주소 · 커밋이어야
-#    candle-core 가 하나로 합쳐집니다. 원격에 아직 없는 로컬 포크로 빌드할 때만 아래 path 줄로 바꾸세요 (루트 패치도 함께).
-candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "ebaf93db065f22be67a9a4a250eec5a212e143fe", optional = true }
-# candle-rocm = { path = "../../../candle-rocm-vulkan/candle-backend", optional = true }
+# 🌟 [FORK-GIT] candle-rocm-vulkan 포크 커밋(ebaf93d, premium-discount · raon-zena 와 같음)은 루트 Cargo.toml 한 곳에서 고정합니다:
+#    [patch.crates-io] 3줄(candle-core · candle-nn · candle-flash-attn)과 candle-rocm(crates/logis-llm 만 씀).
 tokenizers = "0.22.2"
 num = "0.4.3"
 minijinja = "2.12.0"
@@ -70,6 +67,8 @@ logis-sds.workspace = true
 logis-parsers.workspace = true
 logis-pug.workspace = true
 logis-search.workspace = true
+# 생성 모델 엔진 (예전 models/ 의 Qwen · granite · common, 토크나이저 · 채팅 템플릿, 장치 · 메모리 도우미). GPU 기능은 아래 [features] 가 함께 켭니다.
+logis-llm.workspace = true
 arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
 ego-tree = "0.10"
@@ -104,15 +103,16 @@ metal = "0.33.0"
 
 [features]
 default = ["cuda", "flash-attn", "turbo-quant"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "candle-flash-attn?/cuda"]
-rocm = ["dep:candle-rocm", "candle-core/rocm", "candle-nn/rocm", "candle-flash-attn?/rocm"]
-vulkan = ["candle-core/vulkan", "candle-nn/vulkan", "candle-flash-attn?/vulkan"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+# 각 GPU · 가속 기능은 crates/logis-llm 의 같은 기능도 켭니다 (옮긴 모델 코드의 #[cfg(feature = …)] 는 그 crate 의 기능을 봄).
+cuda = ["logis-llm/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "candle-flash-attn?/cuda"]
+rocm = ["logis-llm/rocm", "candle-core/rocm", "candle-nn/rocm", "candle-flash-attn?/rocm"]
+vulkan = ["logis-llm/vulkan", "candle-core/vulkan", "candle-nn/vulkan", "candle-flash-attn?/vulkan"]
+metal = ["logis-llm/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 # Fused FlashAttention (v1/v2/v3 tiers, picked per GPU) from the candle-rocm-vulkan fork.
-# Activates the `#[cfg(feature = "flash-attn")]` paths in models/common and models/qwen/common.
-flash-attn = ["dep:candle-flash-attn", "candle-flash-attn/flash-attn", "candle-core/flash-attn", "candle-nn/flash-attn"]
+# Activates the `#[cfg(feature = "flash-attn")]` paths in logis-llm models/common · models/qwen/common and the app.
+flash-attn = ["logis-llm/flash-attn", "dep:candle-flash-attn", "candle-flash-attn/flash-attn", "candle-core/flash-attn", "candle-nn/flash-attn"]
 # TurboQuant / NVFP4 / MXFP4 / MXFP8 / FP8 quantization kernels (candle_nn::turbo_quant).
-turbo-quant = ["candle-core/turbo-quant", "candle-nn/turbo-quant"]
+turbo-quant = ["logis-llm/turbo-quant", "candle-core/turbo-quant", "candle-nn/turbo-quant"]
 # 디버그 빌드에서도 모든 언어 도메인 사전(full_bias.json)을 넣습니다. 릴리스 빌드는 이 기능 없이도 full_bias.json 입니다
 # (crates/logis-bias/src/bias_schema.rs BIAS_SOURCE). 개발 빌드 기본값은 한국어 · 영어만 담은 bias.json 입니다.
 full-bias = ["logis-bias/full-bias"]

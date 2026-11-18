@@ -1090,7 +1090,7 @@ impl QuantizedQwenVLTextAttention {
                 if inner.index < reg.len() { reg[inner.index].slot_ids[self.layer_idx] } else { None }
             };
             if let Some(id) = slot_id {
-                tauri::async_runtime::spawn(async move {
+                crate::rt::spawn(async move {
                     SLOT_MANAGER.release_slot(id).await;
                 });
             }
@@ -1173,7 +1173,7 @@ impl QuantizedQwenVLTextAttention {
             
             crate::models::qwen::generate::GLOBAL_IO_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-            tauri::async_runtime::spawn(async move {
+            crate::rt::spawn(async move {
                 if let Some(tx) = crate::models::qwen::generate::BAKE_TX.get() {
                     let kv_dir = crate::utils::paths::get_kv_dir();
                     let block_dir = kv_dir.join(&sub_path).join(format!("b{}", off));
@@ -2217,7 +2217,7 @@ impl QuantizedQwenVLTextModel {
                                     let reg_clone = self.registry.clone();
                                     let kv_name_for_load = kv_name.clone();
                                     let is_cpu_mode = self.is_forced_cpu; 
-                                    tauri::async_runtime::spawn(async move {
+                                    crate::rt::spawn(async move {
                                         use crate::models::qwen::generate::{SLOT_MANAGER, SlotTask, LoadTask, get_load_worker};
                                         let sid = SLOT_MANAGER.acquire_read_slot().await;
                                         if let Ok(tx) = get_load_worker().await {
@@ -2475,7 +2475,7 @@ impl QuantizedQwenVLTextModel {
                     
                     // 수집된 쓰레기들을 메인 스레드가 아닌 비동기 런타임에서 조용히 파괴합니다.
                     if !garbage_bin.is_empty() {
-                        tauri::async_runtime::spawn(async move {
+                        crate::rt::spawn(async move {
                             drop(garbage_bin);
                         });
                     }
@@ -3734,7 +3734,7 @@ impl QuantizedQwenTextModel {
                 
                 
                 let pct = ((processed as f32 / seq_len as f32) * 100.0) as i32;
-                if let Some(tx) = crate::scheduler::PROGRESS_TX.get() {
+                if let Some(tx) = crate::progress::PROGRESS_TX.get() {
                     if let Some(sid) = &session_id {
                         let task_id = if sid.starts_with("task_") || sid.starts_with("search_") || sid.starts_with("img_") {
                             let p: Vec<&str> = sid.split('_').collect();
@@ -3742,7 +3742,7 @@ impl QuantizedQwenTextModel {
                         } else { sid.clone() };
                         
                         
-                        let current_cat = crate::CURRENT_UI_CATEGORY.read().unwrap().clone();
+                        let current_cat = crate::progress::CURRENT_UI_CATEGORY.read().unwrap().clone();
 
                         let summary_msg = format!("Reading context ({}%)...", pct);
                         

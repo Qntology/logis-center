@@ -61,13 +61,18 @@ All inference, embedding, and storage are performed **locally on the client**, w
 cron-logis-center/
 ├── Cargo.toml                          # Root Cargo workspace (crates/logis-* + commerce/src-tauri), candle fork + premium-discount pins
 ├── .cargo/config.toml                  # target-cpu=native, build output kept in commerce/src-tauri/target
-├── crates/                             # Pure domain libraries (no Tauri · LanceDB · tokio · models)
-│   ├── logis-schema/                   # canonical (field normalization), logic (trade groups · 28 forms · hub fields), hash, text, embed_space
+├── crates/                             # Domain and engine libraries (no Tauri · LanceDB; only logis-llm uses candle · tokio)
+│   ├── logis-schema/                   # canonical (field normalization), logic (trade groups · 28 forms · hub fields), hash, text, embed_space,
+│   │                                   # app data paths (tmp · kv · task data · logs · extraction stop signal)
 │   ├── logis-bias/                     # bias.json / full_bias.json + override, label/prejudice banks, time guide, language detection, entity keys
 │   ├── logis-sds/                      # SDS ledger (scopes, baselines, recipe sds-v3) on premium-discount-sds statistics
 │   ├── logis-pug/                      # HTML↔PUG, ai_utils, LLM JSON parsing, JSON→natural language (nl_convert), prompts, JS templates
 │   ├── logis-parsers/                  # Offline document readers (Excel/Word/HWP/CSV/PDF), gzip helpers
-│   └── logis-search/                   # Search fusion + relation-step rules (anchors → target types); store/model steps stay in the app
+│   ├── logis-search/                   # Search fusion + relation-step rules (anchors → target types); store/model steps stay in the app
+│   └── logis-llm/                      # Generation engine: Qwen (2.5-VL · 3 · 3.5 · 3-VL · 4-Exp) · granite loops, models/common (GGUF,
+│                                       # vocab trim, TurboQuant KV), KV placement (VRAM/RAM/SSD) + encrypted KV blocks, lang_gguf (Q4_K_M),
+│                                       # tokenizer · chat_template · openai_types · position_embed, device/memory/tensor/image helpers,
+│                                       # progress channel + rt::spawn hook (cuda/rocm/vulkan/metal/flash-attn/turbo-quant follow the app)
 ├── commerce/                           # Desktop client (Tauri v2 + Vite/TS)
 │   ├── src/                            # Frontend (TypeScript)
 │   ├── mobile/                         # Mobile companion app (Tauri)
@@ -98,7 +103,7 @@ cron-logis-center/
 │           ├── model/
 │           │   ├── lifecycle.rs        # Load/unload, VRAM crossover, lang_route()
 │           │   ├── lang_llm.rs         # AlphaEdge Qwen3.5-4B: language codes, download, routing
-│           │   ├── lang_gguf.rs        # safetensors → Q4_K_M GGUF runtime conversion
+│           │   │                       # (lang_gguf: safetensors → Q4_K_M GGUF conversion, now in crates/logis-llm)
 │           │   ├── inference.rs        # Generation entry points
 │           │   ├── vision.rs           # Vision inference
 │           │   ├── merge.rs            # Result merging
@@ -110,12 +115,8 @@ cron-logis-center/
 │           ├── stanza.rs               # Stanza NLP (tokenization/POS/lemma/syntax)
 │           ├── prompts.rs              # Prompt templates
 │           ├── models/
-│           │   ├── mod.rs
-│           │   ├── common/             # Common layer (GateUpDownMLP, Attention, GGUF)
-│           │   ├── qwen/               # Qwen VL (Vision + Language), KV offloading
-│           │   ├── qwen3/              # Qwen3 0.6B (Text only)
-│           │   ├── qwen3_5/            # Qwen3.5 2B / AlphaEdge 4B (shared runtime)
-│           │   ├── qwen3vl/            # Qwen3 VL (Next-gen Vision)
+│           │   ├── mod.rs              # re-exports crates/logis-llm models: common (GateUpDownMLP, Attention, GGUF), qwen (VL, KV
+│           │   │                       # offloading), qwen3 (0.6B), qwen3_5 (2B / AlphaEdge 4B), qwen3vl, qwen4_exp, granite, vision_cache
 │           │   ├── siglip2/            # SigLIP2 Vision Encoder
 │           │   │   ├── mod.rs          # Model load (Text/Vision separated)
 │           │   │   ├── vision.rs       # Vision Transformer
@@ -129,9 +130,7 @@ cron-logis-center/
 │           │   │   ├── legibility.rs   # Legibility map (blur/margin detection)
 │           │   │   ├── value_grounding.rs # Value grounding validation
 │           │   │   └── tokenizer.rs    # SigLIP2 tokenizer
-│           │   ├── granite/            # Granite MoE model
-│           │   ├── embedding.rs        # granite-embedding-97m (384d)
-│           │   └── vision_cache.rs     # ViT output disk cache
+│           │   └── embedding.rs        # granite-embedding-97m (384d)
 │           ├── utils/
 │           │   ├── parsing.rs          # HTML→PUG conversion, schema management
 │           │   ├── bias_schema.rs      # bias.json access layer
@@ -139,26 +138,19 @@ cron-logis-center/
 │           │   ├── score_dynamics.rs   # Adaptive baselines (SDS pass rates for routing)
 │           │   ├── json_parse.rs       # LLM JSON parsing/recovery
 │           │   ├── nl_convert.rs       # JSON→Natural language, chunk segmentation
-│           │   ├── direct_loader.rs    # DirectStorage / io_uring KV block I/O
-│           │   ├── device_utils.rs     # Device/backend detection
-│           │   ├── resources.rs        # RAM/VRAM resource probes
-│           │   ├── tensor_utils.rs     # Tensor helpers
+│           │   │                       # (direct_loader · device_utils · resources · tensor_utils · crypto · img_utils · misc_utils are
+│           │   │                       #  re-exported from crates/logis-llm, paths from crates/logis-schema)
 │           │   ├── compression.rs      # Compression helpers
-│           │   ├── crypto.rs           # Data / KV block encryption
-│           │   ├── img_utils.rs        # Image resize/patch
 │           │   ├── json_utils.rs       # JSON merge
 │           │   ├── pug_utils.rs        # PUG grid parser
 │           │   ├── hash.rs             # ID hashing, CRC32
 │           │   ├── canonical.rs        # Type normalization rules
 │           │   ├── time_guide.rs       # Time intent parsing
 │           │   ├── lang_utils.rs       # Language detection
-│           │   └── paths.rs / logger.rs / metrics.rs / network.rs / url_utils.rs / ...
+│           │   └── logger.rs / metrics.rs / network.rs / sync_utils.rs / url_utils.rs / ...
 │           ├── parsers/
 │           │   └── mod.rs              # PDF/Excel/Word/HWP/CSV text extraction
-│           ├── chat_template/          # ChatML template
-│           ├── tokenizer/              # GGUF tokenizer wrapper
-│           ├── position_embed/         # RoPE / sinusoidal positional encoding
-│           ├── openai_types.rs         # OpenAI compatible type definitions
+│           │                           # (chat_template · tokenizer · position_embed · openai_types: crates/logis-llm, same paths)
 │           └── js_templates.rs         # Boa engine JS templates
 ├── apac/                               # Cloudflare Worker + D1 backend
 ├── proxy/                              # Cloudflare Worker + D1 backend (proxy)

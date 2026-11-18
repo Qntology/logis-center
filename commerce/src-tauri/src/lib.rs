@@ -21,10 +21,9 @@ pub mod prompts; // 🌟 새로 추가된 프롬프트 모듈 선언
 pub mod parsers; // 🌟 문서 파서 모듈 선언
 pub mod models;
 pub mod utils;
-pub mod position_embed;
-pub mod openai_types;
-pub mod chat_template;
-pub mod tokenizer;
+// 🌟 [LOGIS-LLM] 텍스트 · VL 생성 모델 · 토크나이저 · 채팅 템플릿 · 위치 임베딩 · 장치 도우미는 crates/logis-llm 으로 옮겼습니다.
+//    예전 경로(crate::position_embed · crate::openai_types · crate::chat_template · crate::tokenizer)는 그대로 씁니다.
+pub use logis_llm::{chat_template, openai_types, position_embed, tokenizer};
 // 🌟 [EVENT SINK] model · scheduler 는 tauri::AppHandle 대신 Sink 로 이벤트를 내보냅니다 (명령 진입점에서 sink::tauri 로 감쌈).
 pub mod sink;
 
@@ -49,7 +48,8 @@ pub static CURRENT_BROWSER_STATE: Lazy<RwLock<String>> = Lazy::new(|| RwLock::ne
 pub static LAST_BROWSER_STATE_CHANGE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 pub static ACTIVE_TASK_MEM: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
-pub static CURRENT_UI_CATEGORY: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(String::from("Processing")));
+// 생성 진행 이벤트에 붙는 화면 분류 (모델이 읽으므로 crates/logis-llm 에 있음)
+pub use logis_llm::progress::CURRENT_UI_CATEGORY;
 
 pub static LATEST_PROGRESS_PAYLOAD: Lazy<RwLock<Option<Value>>> = Lazy::new(|| RwLock::new(None));
 
@@ -5276,6 +5276,10 @@ pub async fn eval_ai_search(
 }
 
 pub fn run() {
+    // 모델이 띄우는 비동기 작업(KV 슬롯 반환 · 굽기 · 지연 해제)도 예전처럼 Tauri 전역 런타임에서 돕니다.
+    logis_llm::rt::set_spawner(|task| {
+        tauri::async_runtime::spawn(task);
+    });
     crate::model::lang_llm::register_loader(crate::models::qwen4_exp::registry::load_lang_runtime);
     let model = Arc::new(TokioMutex::new(None));
     let store = Arc::new(TokioMutex::new(None));

@@ -233,7 +233,6 @@ static RUNTIME_FAIL: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::
 static QUEUE: Lazy<Mutex<VecDeque<(String, crate::sink::Sink, String)>>> =
     Lazy::new(|| Mutex::new(VecDeque::new()));
 static WORKER: AtomicBool = AtomicBool::new(false);
-static RESIDENT: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 static BOUND: Lazy<Mutex<Option<(String, usize)>>> = Lazy::new(|| Mutex::new(None));
 static WAITERS: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
@@ -276,15 +275,8 @@ pub fn runtime_failure(code: &str) -> Option<String> {
     RUNTIME_FAIL.lock().ok().and_then(|m| m.get(code).cloned())
 }
 
-pub fn resident_variant() -> Option<String> {
-    RESIDENT.lock().ok().and_then(|g| g.clone())
-}
-
-pub fn set_resident_variant(v: Option<String>) {
-    if let Ok(mut g) = RESIDENT.lock() {
-        *g = v;
-    }
-}
+// 지금 올라 있는 언어 엔진 변형은 Qwen3.5 모델도 로그에 쓰므로 crates/logis-llm 에 둡니다.
+pub use logis_llm::lang_resident::{resident_variant, set_resident_variant};
 
 pub struct TranslitBinding {
     code: Option<String>,

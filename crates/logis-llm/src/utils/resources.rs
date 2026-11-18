@@ -516,3 +516,57 @@ pub async fn wait_for_memory_release(baseline_ram: u64, baseline_vram: u64, time
         sleep(Duration::from_millis(150)).await; // Faster polling (0.15s)
     }
 }
+
+// ── RAM 압박 기준 · 스냅숏 · 힙 반환 (예전 앱 model.rs, 모델의 KV 계획과 앱 수명주기가 함께 씀) ──
+
+/// 여유 RAM 이 이보다 적으면 압박으로 봅니다 (KV-PLAN 의 RAM margin 과 같은 값).
+pub const RAM_PRESSURE_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+pub fn ram_snapshot() -> (u64, u64) {
+    let avail = free_ram_bytes() as u64;
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    (avail, sys.total_memory())
+}
+
+pub fn ram_used_pct(avail: u64, total: u64) -> f32 {
+    if total == 0 {
+        return 0.0;
+    }
+    (total.saturating_sub(avail) as f64 * 100.0 / total as f64) as f32
+}
+
+pub fn process_rss_bytes() -> Option<u64> {
+    let pid = sysinfo::get_current_pid().ok()?;
+    let sys = sysinfo::System::new_all();
+    sys.process(pid).map(|p| p.memory())
+}
+
+pub fn ram_pressure_line(avail: u64, total: u64) -> String {
+    let limit_pct = if total > 0 {
+        (100.0 - RAM_PRESSURE_MARGIN_BYTES as f64 * 100.0 / total as f64).max(0.0)
+    } else {
+        0.0
+    };
+    format!(
+        "RAM 사용 {:.1}% (여유 {}MB / 총 {}MB · 이 프로세스 작업 집합 {}) | 압박 기준: 여유 {}MB 미만 = 이 PC 에서 사용 {:.1}% 이상 (KV-PLAN 의 RAM margin 과 같은 값)",
+        ram_used_pct(avail, total),
+        avail / 1_000_000,
+        total / 1_000_000,
+        process_rss_bytes().map_or("-".to_string(), |b| format!("{}MB", b / 1_000_000)),
+        RAM_PRESSURE_MARGIN_BYTES / 1_000_000,
+        limit_pct
+    )
+}
+
+/// 🌟 [HEAP-RELEASE] RAM 압박 시 메모리 반환.
+/// 기본은 mimalloc 의 빈 힙 페이지만 OS 로 돌려줍니다(utils::release_heap). 예전처럼 작업 집합 전체를
+/// 내쫓으면(SetProcessWorkingSetSizeEx) mmap 가중치·토크나이저 페이지가 곧바로 다시 읽혀 RAM 이 톱니처럼
+/// 오르내리고 수 초씩 멈췄습니다. `LOGIS_MEM_TRIM=legacy` 이면 예전 동작입니다.
+pub fn release_os_working_set() {
+    if crate::utils::legacy_ws_trim_enabled() {
+        crate::utils::force_working_set_trim();
+    } else {
+        crate::utils::release_heap();
+    }
+}

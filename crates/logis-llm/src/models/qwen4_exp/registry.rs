@@ -106,7 +106,7 @@ impl TextGenerator {
     pub fn load_dir(model_dir: &Path, device: &Device, dtype: Option<DType>) -> Result<Self> {
         match detect_text_arch(model_dir) {
             TextArch::Qwen4Exp => Self::load_qwen4_exp(model_dir, device, dtype),
-            TextArch::Qwen35 => Ok(Self::Qwen35(Box::new(crate::model::lang_gguf::load_runtime(model_dir, device)?))),
+            TextArch::Qwen35 => Ok(Self::Qwen35(Box::new(crate::lang_gguf::load_runtime(model_dir, device)?))),
             TextArch::Unknown(t) => bail!("[QWEN4-EXP] {:?}: 지원하지 않는 텍스트 아키텍처 '{t}'", model_dir),
         }
     }
@@ -170,6 +170,6 @@ impl TextGenerator {
 pub fn load_lang_runtime(model_dir: &Path, device: &Device) -> Result<TextGenerator> {
     match detect_text_arch(model_dir) {
         TextArch::Qwen4Exp => TextGenerator::load_qwen4_exp(model_dir, device, None),
-        _ => Ok(TextGenerator::Qwen35(Box::new(crate::model::lang_gguf::load_runtime(model_dir, device)?))),
+        _ => Ok(TextGenerator::Qwen35(Box::new(crate::lang_gguf::load_runtime(model_dir, device)?))),
     }
 }
