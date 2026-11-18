@@ -86,7 +86,7 @@ pub fn remote_base(code: &str) -> String {
 pub fn manifest_files(vocab: &Value) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     if let Some(o) = vocab.get("files").and_then(|f| f.as_object()) {
-        for v in o.values() {
+        for v in logis_schema::json_order::sorted_values(o) {
             for f in units(v) {
                 if !f.is_empty() && !out.contains(&f) {
                     out.push(f);
@@ -113,7 +113,7 @@ pub async fn remote_manifest(base_url: &str) -> Result<Vec<String>> {
     if !res.status().is_success() {
         return Err(anyhow!("{url}: HTTP {}", res.status()));
     }
-    let v: Value = serde_json::from_slice(&res.bytes().await?).with_context(|| format!("{url} 해석"))?;
+    let v: Value = serde_json::from_slice(&res.bytes().await?).map(logis_schema::json_order::sorted).with_context(|| format!("{url} 해석"))?;
     if v.get("format").and_then(|x| x.as_i64()) != Some(2) {
         return Err(anyhow!(
             "{base_url} 의 Stanza 변환본이 이전 판(format 1)입니다. stanza-onnx-export 의 onnx_final/<lang> (format 2)을 올려야 합니다"

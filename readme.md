@@ -63,7 +63,8 @@ cron-logis-center/
 ├── .cargo/config.toml                  # target-cpu=native, build output kept in commerce/src-tauri/target
 ├── crates/                             # Domain and engine libraries (no Tauri · LanceDB; only logis-llm · logis-vision-doc use candle)
 │   ├── logis-schema/                   # canonical (field normalization), logic (trade groups · 28 forms · hub fields), hash, text, embed_space,
-│   │                                   # app data paths (tmp · kv · task data · logs · extraction stop signal)
+│   │                                   # app data paths (tmp · kv · task data · logs · extraction stop signal), json_order (sorted JSON key
+│   │                                   # order: lancedb 0.41 turns on serde_json preserve_order, outputs stay as before)
 │   ├── logis-bias/                     # bias.json / full_bias.json + override, label/prejudice banks, time guide, language detection, entity keys
 │   ├── logis-sds/                      # SDS ledger (scopes, baselines, recipe sds-v3) on premium-discount-sds statistics
 │   ├── logis-pug/                      # HTML↔PUG, ai_utils, LLM JSON parsing, JSON→natural language (nl_convert), prompts, JS templates
@@ -90,8 +91,11 @@ cron-logis-center/
 │   │   └── direct-storage/             # DirectStorage (Windows)
 │   ├── app/                            # Headless core (crate logis-app, no Tauri): model residency, LanceDB store, scheduler, search
 │   │   ├── Cargo.toml                  # GPU features only forward to logis-llm / logis-vision-doc (the core code has no #[cfg(feature)])
+│   │   ├── tests/it/                   # Integration tests + synthetic eval, no Tauri (cargo test -p logis-center -p logis-app --test it)
 │   │   └── src/
-│   │       ├── lib.rs                  # Module tree + old crate-root re-exports, ACTIVE_TASK_MEM / LATEST_PROGRESS_PAYLOAD
+│   │       ├── lib.rs                  # Module tree + old crate-root re-exports, AppState, init_headless(), ACTIVE_TASK_MEM
+│   │       ├── commands.rs             # IPC command bodies (upsert_items, reindex_pending_embeddings, download_model, …): &AppState + Sink
+│   │       ├── query.rs                # Natural-language search (ai_search_complex) and its helpers
 │   │       ├── scheduler.rs            # Background task scheduler (main pipeline)
 │   │       ├── scheduler/
 │   │       │   ├── worker.rs           # Task worker loop
@@ -129,10 +133,9 @@ cron-logis-center/
 │   │                                   #  misc_utils: crates/logis-llm; paths: crates/logis-schema)
 │   └── src-tauri/                      # Thin Tauri shell (crate tauri_app_lib)
 │       ├── Cargo.toml                  # Tauri + feature flags (cuda/rocm/vulkan/metal/flash-attn/turbo-quant/full-bias → logis-app)
-│       ├── tests/it/                   # Integration tests (cargo test --test it), still through tauri_app_lib::… paths
 │       └── src/
-│           ├── lib.rs                  # Tauri entry, IPC commands (incl. ai_search_complex), model downloads; re-exports the core
-│           │                           # modules under their old names (crate::model, crate::store, …)
+│           ├── lib.rs                  # Tauri entry: thin #[tauri::command] wrappers over logis_app::commands / query (State +
+│           │                           # TauriSink), window · browser commands, run(); re-exports the core modules under their old names
 │           ├── automation.rs           # Chromium browser automation
 │           ├── sink.rs                 # TauriSink (AppHandle::emit) + re-export of the core sink
 │           └── main.rs

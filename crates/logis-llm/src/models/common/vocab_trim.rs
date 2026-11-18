@@ -102,7 +102,7 @@ pub fn corpus() -> &'static Vec<String> {
             match v {
                 serde_json::Value::String(s) => out.push(s.clone()),
                 serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
-                serde_json::Value::Object(o) => o.iter().for_each(|(k, x)| {
+                serde_json::Value::Object(o) => logis_schema::json_order::sorted_iter(o).for_each(|(k, x)| {
                     out.push(k.clone());
                     walk(x, out)
                 }),
@@ -286,14 +286,14 @@ fn read_values(text: &str) -> String {
                 out.push('\n');
             }
             serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
-            serde_json::Value::Object(m) => m.values().for_each(|x| walk(x, out)),
+            serde_json::Value::Object(m) => logis_schema::json_order::sorted_values(m).for_each(|x| walk(x, out)),
             _ => {}
         }
     }
     let t = text.trim();
     let body = t.find(|c| c == '{' || c == '[').map_or(t, |s| &t[s..]);
     let body = body.rfind(|c| c == '}' || c == ']').map_or(body, |e| &body[..=e]);
-    match serde_json::from_str::<serde_json::Value>(body) {
+    match serde_json::from_str::<serde_json::Value>(body).map(logis_schema::json_order::sorted) {
         Ok(v) => {
             let mut out = String::new();
             walk(&v, &mut out);

@@ -92,7 +92,7 @@ impl StFile {
         }
         let mut head = vec![0u8; n as usize];
         f.read_exact(&mut head)?;
-        let v: Value = serde_json::from_slice(&head).context("safetensors 헤더 JSON 을 읽을 수 없습니다")?;
+        let v: Value = serde_json::from_slice(&head).map(logis_schema::json_order::sorted).context("safetensors 헤더 JSON 을 읽을 수 없습니다")?;
         let mut entries = HashMap::new();
         for (name, e) in v.as_object().ok_or_else(|| anyhow!("safetensors 헤더가 객체가 아닙니다"))? {
             if name == "__metadata__" {
@@ -196,7 +196,7 @@ pub fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let index = dir.join("model.safetensors.index.json");
     let v = read_json(&index).with_context(|| format!("{:?} 에 model.safetensors 도 색인도 없습니다", dir))?;
     let map = v.get("weight_map").and_then(|m| m.as_object()).ok_or_else(|| anyhow!("{:?} 에 weight_map 이 없습니다", index))?;
-    let mut names: Vec<String> = map.values().filter_map(|x| x.as_str()).map(str::to_string).collect();
+    let mut names: Vec<String> = logis_schema::json_order::sorted_values(map).filter_map(|x| x.as_str()).map(str::to_string).collect();
     names.sort();
     names.dedup();
     if names.is_empty() {
@@ -353,11 +353,11 @@ fn install_chat_template(rdir: &Path) -> Result<()> {
     std::fs::create_dir_all(rdir)?;
     std::fs::write(
         rdir.join("tokenizer_config.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
+        serde_json::to_vec_pretty(&logis_schema::json_order::Sorted(&serde_json::json!({
             "chat_template": CHAT_TEMPLATE,
             "eos_token": "<|im_end|>",
             "pad_token": "<|endoftext|>",
-        }))?,
+        })))?,
     )?;
     std::fs::write(rdir.join("chat_template.jinja"), CHAT_TEMPLATE)?;
     let probe_text = "ALPHAEDGE-TEMPLATE-PROBE";
@@ -708,7 +708,7 @@ fn read_tokenizer_meta(model_dir: &Path, vocab: usize) -> Result<(Vec<String>, V
     let mut types: Vec<i32> = vec![1; vocab];
     let mut by_content: HashMap<String, u32> = HashMap::new();
     if let Some(v) = tj.get("model").and_then(|m| m.get("vocab")).and_then(|v| v.as_object()) {
-        for (tok, id) in v.iter() {
+        for (tok, id) in logis_schema::json_order::sorted_iter(v) {
             if let Some(id) = id.as_u64() {
                 let id = id as usize;
                 if id >= vocab {

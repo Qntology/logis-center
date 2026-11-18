@@ -1786,7 +1786,7 @@ fn find_relay_value(data: &Value, key: &str) -> Option<String> {
         if let Some(t) = as_text(v) { return Some(t); }
     }
     if let Some(map) = data.as_object() {
-        for (_, sub) in map.iter() {
+        for (_, sub) in logis_schema::json_order::sorted_iter(map) {
             match sub {
                 Value::Object(_) => {
                     if let Some(v) = sub.get(key) {

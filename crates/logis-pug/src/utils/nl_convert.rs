@@ -49,7 +49,7 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                     sentences.push(intro.clone());
                 }
 
-                for (key, v) in map {
+                for (key, v) in logis_schema::json_order::sorted_iter(map) {
                     if [
                         "title", "name", "type", "currency", "text", "masked_text",
                         "json_data", "data", "id", "index", "no", "link", "path",
@@ -67,7 +67,7 @@ pub fn json_to_natural_language(json_val: &serde_json::Value) -> String {
                     if v.is_null() || (v.is_string() && v.as_str().unwrap_or("").trim().is_empty()) { continue; }
                     if crate::utils::canonical::is_relay_index_key(key)
                         && (!crate::utils::canonical::relay_value_is_content(v)
-                            || map.iter().any(|(k2, v2)| v2 == v && k2.starts_with(&format!("{}_", key))))
+                            || logis_schema::json_order::sorted_iter(map).any(|(k2, v2)| v2 == v && k2.starts_with(&format!("{}_", key))))
                     {
                         continue;
                     }
@@ -603,7 +603,7 @@ fn get_field_bias_phrases(doc_lang: &str, page_type: &str, field_name: &str) -> 
                     }
                     if !bias_phrases.is_empty() { break; }
                 }
-                for (_, v) in obj {
+                for (_, v) in logis_schema::json_order::sorted_iter(obj) {
                     if v.is_object() { stack.push(v); }
                 }
             }
@@ -1264,7 +1264,7 @@ fn schema_value<'a>(parsed: &'a serde_json::Value, name: &str) -> Option<&'a ser
     }
     let other = TRANSLIT_SCHEMA_KEYS.iter().copied().find(|k| *k != name).unwrap_or("");
     let mut best: Option<(usize, &String, &serde_json::Value)> = None;
-    for (k, v) in map.iter() {
+    for (k, v) in logis_schema::json_order::sorted_iter(map) {
         if TRANSLIT_SCHEMA_KEYS.contains(&k.as_str()) || k.trim().eq_ignore_ascii_case("language") {
             continue;
         }
@@ -1290,7 +1290,7 @@ fn word_key_value<'a>(map: &'a serde_json::Map<String, serde_json::Value>, word:
         return Some(s);
     }
     let lw = word.trim().to_lowercase();
-    if let Some(s) = map.iter().find(|(k, _)| k.trim().to_lowercase() == lw).and_then(|(_, v)| usable(v)) {
+    if let Some(s) = logis_schema::json_order::sorted_iter(map).find(|(k, _)| k.trim().to_lowercase() == lw).and_then(|(_, v)| usable(v)) {
         return Some(s);
     }
     let n = word.trim().chars().count();

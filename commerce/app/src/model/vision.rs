@@ -984,7 +984,7 @@ impl crate::model::LogisModel {
                                 if let (Some(dst), Some(src)) =
                                     (tile_json.as_object_mut(), parsed_pass.as_object())
                                 {
-                                    for (k, v) in src.iter() {
+                                    for (k, v) in logis_schema::json_order::sorted_iter(src) {
                                         let empty = v.is_null()
                                             || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false);
                                         let have = dst
@@ -1084,7 +1084,7 @@ impl crate::model::LogisModel {
                                     }
                                 }
                                 if let Some(o) = tile_json.as_object() {
-                                    for (k, v) in o.iter() {
+                                    for (k, v) in logis_schema::json_order::sorted_iter(o) {
                                         let filled = !(v.is_null() || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false));
                                         if filled
                                             && (k.as_str() == crate::logic::TRADE_IDENTITY_FIELD || k.starts_with("reference_"))
@@ -1638,12 +1638,12 @@ impl crate::model::LogisModel {
                                                 };
                                                 for (ri, row) in rows.iter().enumerate() {
                                                     let o = match row.as_object() { Some(o) => o, None => continue };
-                                                    let hit = o.iter().find(|(_, v)| {
+                                                    let hit = logis_schema::json_order::sorted_iter(o).find(|(_, v)| {
                                                         let s = scalar_text(*v);
                                                         !s.is_empty() && crate::model::merge::same_printed_value(&s, &value)
                                                     });
                                                     let afield = match hit { Some((k, _)) => k.clone(), None => continue };
-                                                    let label_in_row = o.iter().any(|(k, v)| {
+                                                    let label_in_row = logis_schema::json_order::sorted_iter(o).any(|(k, v)| {
                                                         if *k == afield { return false; }
                                                         let s = scalar_text(v);
                                                         !s.is_empty() && crate::model::merge::same_printed_value(&s, &label)
@@ -1917,7 +1917,7 @@ impl crate::model::LogisModel {
                                     let mut filled_n = 0usize;
                                     let mut pair_echo: Vec<String> = Vec::new();
                                     if let (Some(dst), Some(src)) = (tile_json.as_object_mut(), parsed_res.as_object()) {
-                                        for (k, v) in src.iter() {
+                                        for (k, v) in logis_schema::json_order::sorted_iter(src) {
                                             let empty = v.is_null()
                                                 || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false);
                                             if empty { continue; }
@@ -2048,7 +2048,7 @@ impl crate::model::LogisModel {
                                     let mut seen: Vec<(String, String)> = Vec::new();
                                     let mut dup: Vec<(String, String)> = Vec::new();
                                     if let Some(o) = tile_json.as_object() {
-                                        for (k, v) in o.iter() {
+                                        for (k, v) in logis_schema::json_order::sorted_iter(o) {
                                             let s = match v {
                                                 Value::String(s) => s.trim().to_string(),
                                                 Value::Number(n) => n.to_string(),
@@ -2268,7 +2268,7 @@ impl crate::model::LogisModel {
                             }
                             let violation_scan = match &tile_json {
                                 Value::Object(o) if !pair_routed_fields.is_empty() => Value::Object(
-                                    o.iter()
+                                    logis_schema::json_order::sorted_iter(o)
                                         .filter(|(k, _)| !pair_routed_fields.contains(*k))
                                         .map(|(k, v)| (k.clone(), v.clone()))
                                         .collect(),
@@ -2289,7 +2289,7 @@ impl crate::model::LogisModel {
                                 let mut count_obj = |o: &serde_json::Map<String, Value>,
                                                      filled: &mut usize,
                                                      total: &mut usize| {
-                                    for (_, v) in o.iter() {
+                                    for (_, v) in logis_schema::json_order::sorted_iter(o) {
                                         *total += 1;
                                         let empty = v.is_null()
                                             || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false);
@@ -2368,7 +2368,7 @@ impl crate::model::LogisModel {
                                     };
                                     for row in rows.iter() {
                                         let o = match row.as_object() { Some(o) => o, None => continue };
-                                        for (k, v) in o.iter() {
+                                        for (k, v) in logis_schema::json_order::sorted_iter(o) {
                                             let s = match v {
                                                 Value::String(s) => s.trim().to_string(),
                                                 Value::Number(n) => n.to_string(),
@@ -3860,7 +3860,7 @@ impl crate::model::LogisModel {
                     const FREE_TEXT_AXES: [&str; 2] = ["special_instructions", "marks_numbers"];
                     let mut cands: Vec<(String, String, String)> = Vec::new();
                     if let Some(root) = extracted_data.as_object() {
-                        for (cat, node) in root.iter() {
+                        for (cat, node) in logis_schema::json_order::sorted_iter(root) {
                             let obj = match node.as_object() { Some(o) => o, None => continue };
                             for f in FREE_TEXT_AXES.iter() {
                                 let s = match obj.get(*f).and_then(|v| v.as_str()) {
@@ -4001,7 +4001,7 @@ impl crate::model::LogisModel {
                             .cloned()
                             .or_else(|| {
                                 extracted_data.as_object().and_then(|o| {
-                                    o.values()
+                                    logis_schema::json_order::sorted_values(o)
                                         .filter_map(|v| v.as_object())
                                         .find_map(|inner| inner.get(name).cloned())
                                 })
@@ -4226,7 +4226,7 @@ impl crate::model::LogisModel {
                             None => continue,
                         };
                         let obj = final_data.as_object_mut().unwrap();
-                        for (k, v) in src {
+                        for (k, v) in logis_schema::json_order::sorted_iter(&src) {
                             if v.is_null() { continue; }
                             if let Some(s) = v.as_str() {
                                 if crate::model::merge::is_schema_echo(s) { continue; }
@@ -4301,7 +4301,7 @@ impl crate::model::LogisModel {
                     .await
                     .ok()
                     .flatten()
-                    .and_then(|d| serde_json::from_str::<Value>(&d.json_data).ok());
+                    .and_then(|d| serde_json::from_str::<Value>(&d.json_data).map(logis_schema::json_order::sorted).ok());
                 let prev_prior = crate::utils::canonical::ledger_prior(prev_json.as_ref());
                 let mut vision_stats: std::collections::HashMap<String, (i64, i64, i64)> = std::collections::HashMap::new();
                 let mut vision_linked = 0usize;
@@ -4340,7 +4340,7 @@ impl crate::model::LogisModel {
                     let mut carried: Vec<String> = Vec::new();
                     if prev_prior == crate::utils::canonical::LedgerPrior::Placeholder {
                         if let (Some(prev), Some(obj)) = (prev_json.as_ref().and_then(|v| v.as_object()), final_data.as_object_mut()) {
-                            for (k, v) in prev.iter() {
+                            for (k, v) in logis_schema::json_order::sorted_iter(prev) {
                                 if !(k.starts_with("rel_") || k.starts_with("reference_")) {
                                     continue;
                                 }
@@ -4500,7 +4500,7 @@ impl crate::model::LogisModel {
                                     ));
                                     continue;
                                 }
-                                if let Ok(parsed) = serde_json::from_str::<Value>(&doc.json_data) {
+                                if let Ok(parsed) = serde_json::from_str::<Value>(&doc.json_data).map(logis_schema::json_order::sorted) {
                                     emit_term(&format!(
                                         "  🔍 [TRADE RELAY / DIRECT ID] {} → {} | 번호 '{}' 로 index {} 를 재현해 id '{}' 를 바로 찾았습니다.",
                                         doc_type, target_type, link_value, direct_index, direct_id
@@ -4780,7 +4780,7 @@ impl crate::model::LogisModel {
                         if o.get("created_at").is_none() {
                             o.insert("created_at".to_string(), json!(now_ms_metrics));
                         }
-                        let rel_keys: Vec<String> = o.keys().filter(|k| k.starts_with("rel_")).cloned().collect();
+                        let rel_keys: Vec<String> = logis_schema::json_order::sorted_keys(o).filter(|k| k.starts_with("rel_")).cloned().collect();
                         for k in rel_keys {
                             o.remove(&k);
                         }
@@ -4868,7 +4868,7 @@ impl crate::model::LogisModel {
         if schema.is_empty() { return 0; }
 
         let mut orphans: Vec<(String, String)> = Vec::new();
-        for (k, v) in map.iter() {
+        for (k, v) in logis_schema::json_order::sorted_iter(map) {
             if v.is_object() || v.is_array() || v.is_null() { continue; }
             let s = match v {
                 Value::String(s) => s.trim().to_string(),

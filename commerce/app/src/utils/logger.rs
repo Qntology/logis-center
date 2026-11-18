@@ -15,7 +15,7 @@ pub fn log_task_progress(app: &crate::sink::Sink, task_id: &str, payload: &Value
         .append(true)
         .open(log_path) 
     {
-        let line = format!("{}\n", final_payload.to_string());
+        let line = format!("{}\n", logis_schema::json_order::to_string_sorted(&final_payload));
         let _ = file.write_all(line.as_bytes());
     }
 

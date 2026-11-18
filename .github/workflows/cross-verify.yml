@@ -282,19 +282,21 @@ jobs:
         if: matrix.kind == 'run'
         run: |
           python -m pip install -q numpy
-          python -I logis-center/commerce/src-tauri/tests/fixtures/granite_mock/gen_granite_mock.py "$RUNNER_TEMP/mock-models"
+          python -I logis-center/commerce/app/tests/fixtures/granite_mock/gen_granite_mock.py "$RUNNER_TEMP/mock-models"
 
       - name: environment report (after setup, before build)
         run: logis-center/.github/scripts/env-report.sh before-build
 
       # ── run: build + suite ──
+      # The it suite is commerce/app/tests/it (package logis-app; the test binary does not link Tauri).
+      # -p logis-center only makes the build use the desktop app's feature set.
       - name: build (cargo test --no-run)
         if: matrix.kind == 'run' || matrix.kind == 'build'
         working-directory: logis-center/commerce/src-tauri
         run: |
           . "$RUNNER_TEMP/annot.sh"; set +e
           f="${{ matrix.features }}"
-          cargo test --test it --no-default-features ${f:+--features $f} --no-run 2>&1 | tee "$RUNNER_TEMP/build.log" | tail -3
+          cargo test -p logis-center -p logis-app --test it --no-default-features ${f:+--features $f} --no-run 2>&1 | tee "$RUNNER_TEMP/build.log" | tail -3
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/build.log"; exit 1; }
       - name: suite (it, non-ignored)
         if: matrix.kind == 'run'
@@ -302,7 +304,7 @@ jobs:
         run: |
           . "$RUNNER_TEMP/annot.sh"; set +e; ort_path
           f="${{ matrix.features }}"
-          cargo test --test it --no-default-features ${f:+--features $f} -- --test-threads 2 2>&1 | tee "$RUNNER_TEMP/suite.log" | tail -5
+          cargo test -p logis-center -p logis-app --test it --no-default-features ${f:+--features $f} -- --test-threads 2 2>&1 | tee "$RUNNER_TEMP/suite.log" | tail -5
           rc=${PIPESTATUS[0]}
           if [ "$rc" != 0 ]; then
             echo "suite exit code: $rc"; annot "$RUNNER_TEMP/suite.log"
@@ -336,7 +338,7 @@ jobs:
         run: |
           . "$RUNNER_TEMP/annot.sh"; set +e; ort_path
           f="${{ matrix.features }}"
-          cargo test --test it --no-default-features ${f:+--features $f} -- vision_batch --ignored --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/vision.log" | tail -5
+          cargo test -p logis-center -p logis-app --test it --no-default-features ${f:+--features $f} -- vision_batch --ignored --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/vision.log" | tail -5
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/vision.log"; exit 1; }
           if grep -q 'VISION-BATCH\] 구 인코딩' "$RUNNER_TEMP/vision.log"; then
             notice_lines "vision batch (device test ran)" "$RUNNER_TEMP/vision.log" 'VISION-BATCH'
@@ -356,7 +358,7 @@ jobs:
           LOGIS_REQUIRE_MODELS: "1"
         run: |
           . "$RUNNER_TEMP/annot.sh"; ort_path
-          LOGIS_MODELS_DIR="$RUNNER_TEMP/mock-models" cargo test --test it --no-default-features -- app_embed::gpu_embed_many_matches_per_text_and_is_faster --ignored --nocapture --test-threads 1
+          LOGIS_MODELS_DIR="$RUNNER_TEMP/mock-models" cargo test -p logis-center -p logis-app --test it --no-default-features -- app_embed::gpu_embed_many_matches_per_text_and_is_faster --ignored --nocapture --test-threads 1
 
       # ── check: type check only ──
       - name: type check (cargo check — not executed)
@@ -365,7 +367,7 @@ jobs:
         working-directory: logis-center/commerce/src-tauri
         run: |
           . "$RUNNER_TEMP/annot.sh"; set +e
-          cargo check --no-default-features --features "${{ matrix.features }}" --lib --bins --test it 2>&1 | tee "$RUNNER_TEMP/check.log" | tail -3
+          cargo check -p logis-center -p logis-app --no-default-features --features "${{ matrix.features }}" --lib --bins --test it 2>&1 | tee "$RUNNER_TEMP/check.log" | tail -3
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/check.log"; exit 1; }
 
       # ── scope: say plainly what this job covered (a skipped stage is not a pass) ──

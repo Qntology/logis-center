@@ -54,7 +54,7 @@ pub struct Siglip2Config {
 impl Siglip2Config {
     pub fn from_json(config_path: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(config_path)?;
-        let v: serde_json::Value = serde_json::from_str(&raw)?;
+        let v: serde_json::Value = serde_json::from_str(&raw).map(logis_schema::json_order::sorted)?;
         let vc = &v["vision_config"];
         let tc = &v["text_config"];
         Ok(Self {

@@ -1485,7 +1485,7 @@ impl crate::model::LogisModel {
         }
 
         if !hints.is_empty() {
-            let hint_fields: Vec<String> = hints.keys().cloned().collect();
+            let hint_fields: Vec<String> = logis_schema::json_order::sorted_keys(&hints).cloned().collect();
             for field in hint_fields.into_iter() {
                 if cancel_token.load(std::sync::atomic::Ordering::Relaxed) { break; }
                 let raw = match hints.get(&field).and_then(|v| v.get("value")).and_then(|v| v.as_str()) {
@@ -1642,7 +1642,7 @@ impl crate::model::LogisModel {
         // STEP 10 : 벡터 근거가 전무하면 레거시 폴백 1회
         // =====================================================================
         {
-            let hard_fields: Vec<String> = conditions.keys().cloned().collect();
+            let hard_fields: Vec<String> = logis_schema::json_order::sorted_keys(&conditions).cloned().collect();
             for f in hard_fields.into_iter() {
                 if let Some(reason) = ship_sds_demotion_reason(&f, &final_scope) {
                     if let Some(v) = conditions.remove(&f) {
@@ -1652,10 +1652,10 @@ impl crate::model::LogisModel {
                     emit_term(&format!("   🧮 [SDS DEMOTE] '{}' 하드 조건을 힌트로 내립니다 | {}", f, reason));
                 }
             }
-            for f in conditions.keys() {
+            for f in logis_schema::json_order::sorted_keys(&conditions) {
                 crate::utils::score_dynamics::record_search_proposal(f, true);
             }
-            for f in hints.keys() {
+            for f in logis_schema::json_order::sorted_keys(&hints) {
                 crate::utils::score_dynamics::record_search_proposal(f, false);
             }
         }
@@ -1689,7 +1689,7 @@ impl crate::model::LogisModel {
 
             let parsed = crate::parsing::parse_json_from_llm(&res);
             if let Some(obj) = parsed.as_object() {
-                for (k, v) in obj {
+                for (k, v) in logis_schema::json_order::sorted_iter(obj) {
                     let op = v.get("operator").and_then(|x| x.as_str()).unwrap_or("").trim().to_lowercase();
                     let val = match v.get("value") { Some(x) => x.clone(), None => continue };
                     let is_empty = match &val {
@@ -1774,7 +1774,7 @@ impl crate::model::LogisModel {
         //    Dexie(executeDexiePlan)가 alternates 를 읽어 재질의하므로,
         //    LanceDB 스코프를 좁히지 않고도 정밀 필터가 성립합니다.
         let mut alternates = serde_json::Map::new();
-        for (k, v) in identity_alternates.iter() {
+        for (k, v) in logis_schema::json_order::sorted_iter(&identity_alternates) {
             alternates.insert(k.clone(), v.clone());
         }
         if !hub_values.is_empty() {
@@ -1796,7 +1796,7 @@ impl crate::model::LogisModel {
 
         // 🌟 [ALTERNATE AXIS] 참조 축은 서로 오배정될 수 있으므로,
         //    같은 값이 갈 수 있었던 다른 참조 축을 대안으로 함께 실어 보냅니다.
-        for (k, v) in conditions.iter() {
+        for (k, v) in logis_schema::json_order::sorted_iter(&conditions) {
             let identifier_axis = k.starts_with("reference_") || k == "doc_number" || k == "no";
             if !identifier_axis { continue; }
             if alternates.contains_key(k) { continue; }
@@ -1821,7 +1821,7 @@ impl crate::model::LogisModel {
             || !final_scope.is_empty()
             || !projection.is_empty();
         let mut keywords: Vec<String> = Vec::new();
-        for (k, v) in conditions.iter() {
+        for (k, v) in logis_schema::json_order::sorted_iter(&conditions) {
             let fmt = crate::utils::ai_utils::query_value_format(k);
             if !matches!(
                 fmt,
@@ -1873,13 +1873,13 @@ impl crate::model::LogisModel {
         emit_term(&format!(
             "[STAGE-2 CONDITIONS] 확정 조건 {}개: {}",
             conditions.len(),
-            serde_json::to_string(&Value::Object(conditions.clone())).unwrap_or_default()
+            serde_json::to_string(&logis_schema::json_order::Sorted(&Value::Object(conditions.clone()))).unwrap_or_default()
         ));
         if !hints.is_empty() {
             emit_term(&format!(
                 "[STAGE-2 HINTS] 속성 힌트 {}개 (Dexie 필터 아님, 청크 property 타겟 검색 전용): {}",
                 hints.len(),
-                serde_json::to_string(&Value::Object(hints.clone())).unwrap_or_default()
+                serde_json::to_string(&logis_schema::json_order::Sorted(&Value::Object(hints.clone()))).unwrap_or_default()
             ));
         }
         if !projection.is_empty() {
@@ -2806,7 +2806,7 @@ impl crate::model::LogisModel {
                 .and_then(|v| v.get("bias"))
                 .and_then(|v| v.as_object())
             {
-                for (_, v) in obj.iter() {
+                for (_, v) in logis_schema::json_order::sorted_iter(obj) {
                     if let Some(s) = v.as_str() {
                         for p in split_bias_phrases_full(s) {
                             if !func_phr.contains(&p) { func_phr.push(p); }
@@ -2842,7 +2842,7 @@ impl crate::model::LogisModel {
         let mut op_bias_phr: Vec<Vec<String>> = Vec::new();
         let mut op_prej_phr: Vec<Vec<String>> = Vec::new();
         if let Some(ops) = crate::parsing::BIAS_DICT.get("operators").and_then(|v| v.as_object()) {
-            for (k, node) in ops.iter() {
+            for (k, node) in logis_schema::json_order::sorted_iter(ops) {
                 if k == "top" || k == "bottom" { continue; }
                 let mut b: Vec<String> = Vec::new();
                 for f in ["semantic", "bias"] {

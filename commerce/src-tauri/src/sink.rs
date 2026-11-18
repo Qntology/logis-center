@@ -11,8 +11,10 @@ pub use logis_app::sink::*;
 pub struct TauriSink(pub tauri::AppHandle);
 
 impl EventSink for TauriSink {
-    fn emit_json(&self, event: &str, payload: Value) {
+    fn emit_json(&self, event: &str, mut payload: Value) {
         use tauri::Emitter;
+        // 화면으로 나가는 JSON 의 키 순서를 예전(키 정렬)과 같게 (serde_json preserve_order 대비, logis_app::json_order)
+        logis_app::json_order::sort_all(&mut payload);
         let _ = self.0.emit(event, payload);
     }
 }

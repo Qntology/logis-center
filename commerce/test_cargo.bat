@@ -7,5 +7,6 @@ set "PYTHONIOENCODING=utf-8"
 set "NVCC_PREPEND_FLAGS=-Xcompiler /Zc:preprocessor"
 cd /d "%~dp0src-tauri"
 
-echo [TEST] cargo test --test it (CUDA)...
-cargo test --test it %*
+rem 통합 시험은 commerce/app/tests/it (logis-app, 시험 exe 에 Tauri 없음). -p logis-center 는 앱과 같은 기능 집합으로 빌드하게 합니다.
+echo [TEST] cargo test -p logis-center -p logis-app --test it (CUDA)...
+cargo test -p logis-center -p logis-app --test it %*

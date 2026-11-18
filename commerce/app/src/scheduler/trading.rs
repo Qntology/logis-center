@@ -1176,14 +1176,14 @@ fn reconcile_party_sections(
             }
         };
         if let Some(o) = final_data_map.get("parties").and_then(|v| v.as_object()) {
-            for v in o.values() {
+            for v in logis_schema::json_order::sorted_values(o) {
                 take(v);
             }
         }
         if let Some(arr) = final_data_map.get("other_parties").and_then(|v| v.as_array()) {
             for row in arr.iter() {
                 if let Some(o) = row.as_object() {
-                    for v in o.values() {
+                    for v in logis_schema::json_order::sorted_values(o) {
                         take(v);
                     }
                 }
@@ -1466,7 +1466,7 @@ fn reconcile_party_sections(
                 }
                 fixes.push(format!(
                     "other_parties 행 추가 {} (섹션 '{}' 의 인쇄 블록)",
-                    Value::Object(row.clone()),
+                    logis_schema::json_order::Sorted(&Value::Object(row.clone())),
                     ev.sections[k]
                 ));
                 rows.push(Value::Object(row));
@@ -1525,7 +1525,7 @@ fn prune_absent_keys(
 ) {
     match v {
         Value::Object(map) => {
-            let ks: Vec<String> = map.keys().cloned().collect();
+            let ks: Vec<String> = logis_schema::json_order::sorted_keys(map).cloned().collect();
             for k in ks {
                 if absent.contains(&k) {
                     let was_filled = map.get(&k).map(|v| match v {
@@ -1613,7 +1613,7 @@ fn merge_trading_page_map(
             if a_ident && b_ident { i += 1; continue; }
             let src = arr[i + 1].clone();
             if let (Some(tgt_obj), Some(src_obj)) = (arr[i].as_object_mut(), src.as_object()) {
-                for (k, v) in src_obj {
+                for (k, v) in logis_schema::json_order::sorted_iter(src_obj) {
                     if is_empty_val(v) { continue; }
                     tgt_obj.insert(k.clone(), v.clone());
                 }
@@ -1627,14 +1627,14 @@ fn merge_trading_page_map(
     // 🌟 [SECTION CARRY] 연속 페이지 첫머리 줄(앞 페이지 마지막 섹션의 값)은 지금까지 쌓인 마지막 행의 빈 칸을 채웁니다.
     //    새 행으로 붙이면 한 품목의 값이 두 행으로 갈라지고, 다른 품목 행에 섞이면 값이 틀립니다.
     if let Some(carry) = source.get(CARRY_ROWS_KEY).and_then(|v| v.as_object()) {
-        for (arr_key, row) in carry.iter() {
+        for (arr_key, row) in logis_schema::json_order::sorted_iter(carry) {
             let row = match row.as_object() { Some(r) => r, None => continue };
             let entry = target.entry(arr_key.clone()).or_insert_with(|| json!([]));
             if !entry.is_array() { *entry = json!([]); }
             if let Some(arr) = entry.as_array_mut() {
                 match arr.last_mut().and_then(|v| v.as_object_mut()) {
                     Some(last) => {
-                        for (k, v) in row.iter() {
+                        for (k, v) in logis_schema::json_order::sorted_iter(row) {
                             if is_empty_val(v) { continue; }
                             let need = last.get(k).map_or(true, |cur| is_empty_val(cur));
                             if need { last.insert(k.clone(), v.clone()); }
@@ -1646,7 +1646,7 @@ fn merge_trading_page_map(
         }
     }
 
-    for (cat, src_val) in source {
+    for (cat, src_val) in logis_schema::json_order::sorted_iter(source) {
         if cat == CARRY_ROWS_KEY { continue; }
 
         if let Some(src_arr) = src_val.as_array() {
@@ -1674,7 +1674,7 @@ fn merge_trading_page_map(
             let entry = target.entry(cat.clone()).or_insert_with(|| json!({}));
             if !entry.is_object() { *entry = json!({}); }
             if let Some(tgt_obj) = entry.as_object_mut() {
-                for (k, v) in src_obj {
+                for (k, v) in logis_schema::json_order::sorted_iter(src_obj) {
                     if is_empty_val(v) { continue; }
                     let need = match tgt_obj.get(k) {
                         None => true,
@@ -1835,7 +1835,7 @@ pub(crate) fn normalize_trading_data(item: &mut Value, doc_lang: &str) {
     fn walk(v: &mut Value, doc_lang: &str, decimal_comma: bool) {
         match v {
             Value::Object(map) => {
-                let keys: Vec<String> = map.keys().cloned().collect();
+                let keys: Vec<String> = logis_schema::json_order::sorted_keys(map).cloned().collect();
                 for k in keys {
                     if is_date_key(&k) {
                         let converted = map.get(&k).and_then(|x| to_iso_date(x, doc_lang));
@@ -2825,7 +2825,7 @@ pub async fn process_trading_task(
         //   그대로 두면 key_secondary() 와 key_primary() 가 같아져
         //   폴백 3단이 1단으로 붕괴합니다.
         //   같은 벤더가 보낸 서식은 레이아웃이 같으므로 발행처를 2차 키로 씁니다.
-        let scope_src: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+        let scope_src: Value = serde_json::from_str(&task.data_json).map(logis_schema::json_order::sorted).unwrap_or(json!({}));
         let origin_key = scope_src
             .get("origin")
             .or_else(|| scope_src.get("domain"))
@@ -2870,7 +2870,7 @@ pub async fn process_trading_task(
 
     if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
-    let mut task_data: Value = serde_json::from_str(&task.data_json).unwrap_or(json!({}));
+    let mut task_data: Value = serde_json::from_str(&task.data_json).map(logis_schema::json_order::sorted).unwrap_or(json!({}));
     let language = "english";
     let mut doc_lang = "en".to_string();
 
@@ -4985,7 +4985,7 @@ pub async fn process_trading_task(
                 .map(|(k, v)| json!({ "target_column": k, "extracted_value": v }))
                 .collect();
             format!("\n\n[ALREADY CLAIMED VALUES]\nThese values are already assigned to OTHER fields by the deterministic engine. You MUST NOT return any of them:\n{}",
-                serde_json::to_string_pretty(&list).unwrap_or_default())
+                serde_json::to_string_pretty(&logis_schema::json_order::SortedSlice(&list)).unwrap_or_default())
         };
 
         // 🌟 [PRESENCE FILTER v2] 부재 필드는 스키마 자체에서 빠졌으므로
@@ -5045,7 +5045,7 @@ pub async fn process_trading_task(
             let mut tile_json = crate::parsing::parse_json_from_llm(&res);
             
             if let Some(obj) = tile_json.as_object_mut() {
-                let ks: Vec<String> = obj.keys().cloned().collect();
+                let ks: Vec<String> = logis_schema::json_order::sorted_keys(obj).cloned().collect();
                 let mut protected = 0usize;
                 for k in ks {
                     if assigned_fields.contains_key(&k) {
@@ -5174,7 +5174,7 @@ pub async fn process_trading_task(
                 None => continue,
             };
             let obj = extracted_data.as_object_mut().unwrap();
-            for (k, v) in src {
+            for (k, v) in logis_schema::json_order::sorted_iter(&src) {
                 if v.is_null() { continue; }
                 if let Some(s) = v.as_str() {
                     if crate::model::merge::is_schema_echo(s) { continue; }
@@ -5312,7 +5312,7 @@ pub async fn process_trading_task(
             let seed = extracted_data.get("text")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| serde_json::to_string(&extracted_data).unwrap_or_default());
+                .unwrap_or_else(|| serde_json::to_string(&logis_schema::json_order::Sorted(&extracted_data)).unwrap_or_default());
             let fallback = format!("AUTO-{}-{}", doc_type, crate::utils::hash::digest(&seed));
             emit_term(&format!(
                 "  ⚠️ [DOC NUMBER FALLBACK] '{}' 문서에서 문서번호를 찾지 못했습니다. 내용 기반 결정론 ID '{}' 를 사용합니다. (task_id 를 쓰면 재스캔마다 중복 문서가 생깁니다)",
@@ -5358,12 +5358,12 @@ pub async fn process_trading_task(
         .await
         .ok()
         .flatten()
-        .and_then(|d| serde_json::from_str::<Value>(&d.json_data).ok());
+        .and_then(|d| serde_json::from_str::<Value>(&d.json_data).map(logis_schema::json_order::sorted).ok());
     let prev_prior = crate::utils::canonical::ledger_prior(prev_json.as_ref());
     let mut carried: Vec<String> = Vec::new();
     if prev_prior == crate::utils::canonical::LedgerPrior::Placeholder {
         if let (Some(prev), Some(obj)) = (prev_json.as_ref().and_then(|v| v.as_object()), extracted_data.as_object_mut()) {
-            for (k, v) in prev.iter() {
+            for (k, v) in logis_schema::json_order::sorted_iter(prev) {
                 if !(k.starts_with("rel_") || k.starts_with("reference_")) {
                     continue;
                 }
@@ -5477,7 +5477,7 @@ pub async fn process_trading_task(
                         
             if let Ok(results) = store.get_all_items("items", 1, 0, Some(idx_filter)).await {
                 if let Some(doc) = results.into_iter().next() {
-                    if let Ok(data) = serde_json::from_str::<Value>(&doc.json_data) {
+                    if let Ok(data) = serde_json::from_str::<Value>(&doc.json_data).map(logis_schema::json_order::sorted) {
                         hit = Some((doc.id, data));
                         emit_term(&format!(
                             "  🔍 [RELAY LOOKUP 1st] index={} 로 '{}' 문서 발견: '{}'",
@@ -5724,7 +5724,7 @@ pub async fn process_trading_task(
             if o.get("updated_at").is_none() { o.insert("updated_at".to_string(), json!(now_ms_metrics)); }
             if o.get("created_at").is_none() { o.insert("created_at".to_string(), json!(now_ms_metrics)); }
 
-            let rel_keys: Vec<String> = o.keys()
+            let rel_keys: Vec<String> = logis_schema::json_order::sorted_keys(o)
                 .filter(|k| k.starts_with("rel_"))
                 .cloned()
                 .collect();
@@ -5995,7 +5995,7 @@ mod continuation_tests {
         let assigned = assign_continuation_pairs(
             &banks, &labels, &vals, &lines, &sections, &carried, &leaf_embs, &section_embs, &mut out, &emit,
         );
-        println!("{}", serde_json::to_string_pretty(&Value::Object(out.clone())).unwrap());
+        println!("{}", serde_json::to_string_pretty(&logis_schema::json_order::Sorted(&Value::Object(out.clone()))).unwrap());
         assert!(assigned > 0);
 
         let rows = out["line_items"].as_array().unwrap();
@@ -6019,7 +6019,7 @@ mod continuation_tests {
         assert_eq!(cargo.get("package_count").cloned(), Some(json!("50")));
         assert_eq!(cargo.get("package_unit").cloned(), Some(json!("PLTS")));
         assert!(
-            out["conditions"].as_object().unwrap().values().all(|v| v != "15.0"),
+            logis_schema::json_order::sorted_values(out["conditions"].as_object().unwrap()).all(|v| v != "15.0"),
             "수치는 열거형 조건 축(payment_terms 등)으로 가지 않습니다"
         );
     }

@@ -60,7 +60,7 @@ fn arch_of_value(v: &serde_json::Value) -> TextArch {
 pub fn detect_text_arch(model_dir: &Path) -> TextArch {
     match std::fs::read(model_dir.join("config.json"))
         .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).map(logis_schema::json_order::sorted).ok())
     {
         Some(v) => arch_of_value(&v),
         None => TextArch::Unknown(String::new()),

@@ -23,8 +23,8 @@ pub fn bias_node(doc_lang: &str, page_type: &str, field_name: &str) -> Option<se
             }
         }
         if let Some(n) = lang_node.get("default").and_then(|p| p.get(field_name)) {
-            let raw = n.to_string().replace("{TYPE}", page_type);
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) { return Some(v); }
+            let raw = logis_schema::json_order::to_string_sorted(n).replace("{TYPE}", page_type);
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw).map(logis_schema::json_order::sorted) { return Some(v); }
         }
     }
     None

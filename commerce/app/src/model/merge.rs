@@ -170,7 +170,7 @@ pub fn trade_resolve_condition_operator(field: &str, chunk: &str) -> String {
     let mut best_key = String::new();
     let mut best_len = 0usize;
 
-    for (key, node) in ops {
+    for (key, node) in logis_schema::json_order::sorted_iter(ops) {
         if key == "top" || key == "bottom" { continue; }
         for field_name in ["bias", "semantic"] {
             let raw = match node.get(field_name).and_then(|v| v.as_str()) { Some(s) => s, None => continue };
@@ -447,13 +447,13 @@ pub fn reconcile_monetary_axes(
         if let Some(v) = m.get(f).and_then(num_of) {
             return Some(v);
         }
-        m.values()
+        logis_schema::json_order::sorted_values(m)
             .filter_map(|v| v.as_object())
             .find_map(|o| o.get(f).and_then(num_of))
     }
     fn purge(m: &mut serde_json::Map<String, Value>, field: &str) {
         m.remove(field);
-        let cats: Vec<String> = m.keys().cloned().collect();
+        let cats: Vec<String> = logis_schema::json_order::sorted_keys(m).cloned().collect();
         for c in cats {
             if let Some(o) = m.get_mut(&c).and_then(|v| v.as_object_mut()) {
                 o.remove(field);
@@ -633,13 +633,13 @@ pub fn reconcile_weight_basis(
     }
     fn read(m: &serde_json::Map<String, Value>, f: &str) -> Option<f64> {
         if let Some(v) = m.get(f).and_then(num_of) { return Some(v); }
-        m.values()
+        logis_schema::json_order::sorted_values(m)
             .filter_map(|v| v.as_object())
             .find_map(|o| o.get(f).and_then(num_of))
     }
     fn move_axis(m: &mut serde_json::Map<String, Value>, from: &str, to: &str, v: Value) {
         m.remove(from);
-        let cats: Vec<String> = m.keys().cloned().collect();
+        let cats: Vec<String> = logis_schema::json_order::sorted_keys(m).cloned().collect();
         for c in cats {
             if let Some(o) = m.get_mut(&c).and_then(|x| x.as_object_mut()) {
                 o.remove(from);
@@ -2448,13 +2448,13 @@ pub fn reroute_closed_vocab_values(
                 Some(c) => c,
                 None => continue,
             };
-            for (cat, fields) in cats.iter() {
+            for (cat, fields) in logis_schema::json_order::sorted_iter(cats) {
                 if crate::logic::is_trade_array_category(cat) { continue; }
                 let fm = match fields.as_object() {
                     Some(f) => f,
                     None => continue,
                 };
-                for (f, _) in fm.iter() {
+                for (f, _) in logis_schema::json_order::sorted_iter(fm) {
                     if owners.iter().any(|(_, x, _)| x == f) { continue; }
                     let vocab = crate::parsing::trade_expected_vocab(cat, doc_type, f);
                     if !vocab.is_empty() {
@@ -2466,7 +2466,7 @@ pub fn reroute_closed_vocab_values(
     }
     if owners.is_empty() { return 0; }
 
-    let keys: Vec<String> = merged.keys().cloned().collect();
+    let keys: Vec<String> = logis_schema::json_order::sorted_keys(merged).cloned().collect();
     let mut moved = 0usize;
     for k in keys.into_iter() {
         let from_cat = crate::logic::trade_field_category(&k);
@@ -2531,7 +2531,7 @@ pub fn reroute_closed_vocab_values(
 
 pub fn collect_claimed(merged: &serde_json::Map<String, Value>) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    for (k, v) in merged.iter() {
+    for (k, v) in logis_schema::json_order::sorted_iter(merged) {
         // 카테고리 그룹 객체는 루트에 이미 미러링되어 있으므로 건너뜁니다.
         if v.is_object() || v.is_array() {
             continue;
@@ -2571,7 +2571,7 @@ pub fn record_claim_violations(
         s.chars().filter(|c| c.is_alphanumeric()).count() >= 2
     }
     fn harvest(o: &serde_json::Map<String, Value>, out: &mut Vec<(String, String)>) {
-        for (k, v) in o.iter() {
+        for (k, v) in logis_schema::json_order::sorted_iter(o) {
             let s = match v {
                 Value::String(s) => s.trim().to_string(),
                 Value::Number(n) => n.to_string(),
@@ -2640,7 +2640,7 @@ pub fn record_grounding_claims(
         o: &serde_json::Map<String, Value>,
         bbox: (u32, u32, u32, u32),
     ) {
-        for (k, v) in o.iter() {
+        for (k, v) in logis_schema::json_order::sorted_iter(o) {
             let s = match v {
                 Value::String(s) => s.trim().to_string(),
                 Value::Number(n) => n.to_string(),
@@ -2865,7 +2865,7 @@ pub fn trade_schema_owner_of(doc_type: &str, field: &str) -> (bool, String) {
         if !found.is_empty() {
             continue;
         }
-        for (cat, fields) in cats.iter() {
+        for (cat, fields) in logis_schema::json_order::sorted_iter(cats) {
             if fields.as_object().map_or(false, |fm| fm.contains_key(field)) {
                 found = cat.clone();
                 break;
@@ -2892,7 +2892,7 @@ pub fn merge_extracted(
     let unwrapped: Value;
     let incoming = {
         let single = incoming.as_object().filter(|o| o.len() == 1).and_then(|o| {
-            let (k, v) = o.iter().next()?;
+            let (k, v) = logis_schema::json_order::sorted_iter(o).next()?;
             if !(v.is_object() || v.is_array()) { return None; }
             let norm = |s: &str| -> String {
                 s.chars()
@@ -2924,7 +2924,7 @@ pub fn merge_extracted(
     let coerced: Value;
     let incoming = if is_array_category && incoming.is_object() {
         let has_content = incoming.as_object().map(|o| {
-            o.values().any(|v| {
+            logis_schema::json_order::sorted_values(o).any(|v| {
                 !(v.is_null()
                     || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
                     || v.as_array().map(|a| a.is_empty()).unwrap_or(false))
@@ -2958,7 +2958,7 @@ pub fn merge_extracted(
                 //    겹침 영역에서 나온 중복 행을 여기서 제거합니다.
                 //    판정은 '의미' 가 아니라 '정규화된 스칼라 값 집합의 완전 일치' 입니다.
                 let row_key = |v: &Value| -> String {
-                    let o = match v.as_object() { Some(o) => o, None => return v.to_string() };
+                    let o = match v.as_object() { Some(o) => o, None => return logis_schema::json_order::to_string_sorted(&v) };
                     let mut parts: Vec<String> = o
                         .iter()
                         .filter_map(|(k, x)| match x {
@@ -2988,7 +2988,7 @@ pub fn merge_extracted(
                 };
                 let scalars = |v: &Value| -> Vec<(String, String)> {
                     let o = match v.as_object() { Some(o) => o, None => return Vec::new() };
-                    o.iter()
+                    logis_schema::json_order::sorted_iter(o)
                         .filter_map(|(k, x)| match x {
                             Value::String(s) if !s.trim().is_empty() => {
                                 Some((k.clone(), s.trim().to_lowercase()))
@@ -3073,7 +3073,7 @@ pub fn merge_extracted(
     let mut off_schema = 0usize;
     let mut off_schema_null = 0usize;
 
-    for (k, v) in obj.iter() {
+    for (k, v) in logis_schema::json_order::sorted_iter(obj) {
         let is_empty = v.is_null()
             || v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false)
             || v.as_array().map(|a| a.is_empty()).unwrap_or(false);
@@ -3088,7 +3088,7 @@ pub fn merge_extracted(
                 let shown: String = v
                     .as_str()
                     .map(|s| s.to_string())
-                    .unwrap_or_else(|| v.to_string())
+                    .unwrap_or_else(|| logis_schema::json_order::to_string_sorted(&v))
                     .chars()
                     .take(40)
                     .collect();
@@ -3171,9 +3171,9 @@ pub fn merge_extracted(
                 let full_value = v
                     .as_str()
                     .map(|s| s.trim().to_string())
-                    .unwrap_or_else(|| v.to_string());
+                    .unwrap_or_else(|| logis_schema::json_order::to_string_sorted(&v));
                 let scalar_ok = v.is_string() || v.is_number();
-                let dup_owner = merged.iter().any(|(ek, ev)| {
+                let dup_owner = logis_schema::json_order::sorted_iter(merged).any(|(ek, ev)| {
                     ek != k
                         && ev.as_str().map(|s| same_printed_value(s, &full_value)).unwrap_or(false)
                 });
@@ -3321,7 +3321,7 @@ pub fn merge_json_manual(root: &mut Map<String, Value>, cat: &str, data: Value) 
             }
         } else if let Some(target_obj) = target.as_object_mut() {
             if let Some(source_obj) = actual_data.as_object() {
-                for (k, v) in source_obj {
+                for (k, v) in logis_schema::json_order::sorted_iter(source_obj) {
                     if v.is_null() { continue; }
                     if let Some(s) = v.as_str() {
                         if is_schema_echo(s) {

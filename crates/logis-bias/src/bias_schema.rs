@@ -19,13 +19,17 @@ pub const BIAS_SOURCE: (&str, &str) = ("bias.json", include_str!("bias.json"));
 
 /// 도메인 사전. 내장 사전([`BIAS_SOURCE`]) 위에 앱 폴더의 덮어쓰기 파일(있으면)을 얹은 결과입니다 ([`BIAS_OVERRIDE_FILE`]).
 pub static BIAS_DICT: Lazy<Value> = Lazy::new(|| {
-    let mut dict: Value = serde_json::from_str(BIAS_SOURCE.1).unwrap_or(serde_json::json!({}));
+    let mut dict: Value = serde_json::from_str(BIAS_SOURCE.1).map(logis_schema::json_order::sorted).unwrap_or(serde_json::json!({}));
+    logis_schema::json_order::sort_all(&mut dict);
     let langs: Vec<&str> = dict
         .as_object()
         .map(|o| o.keys().filter(|k| k.len() <= 3 || k.contains('-')).map(|k| k.as_str()).collect())
         .unwrap_or_default();
     println!("[BIAS] 내장 사전 {} (언어 구역 {:?})", BIAS_SOURCE.0, langs);
     load_bias_overlay(&mut dict);
+    // 🌟 [KEY ORDER] 사전을 도는 함수(스키마 필드 · 카테고리 · 삼중항 · 뱅크 …)가 예전처럼 키 정렬 순서를 보게 합니다.
+    //    serde_json `preserve_order`(lancedb 0.41)이면 파일에 적힌 순서가 남기 때문입니다 (logis_schema::json_order).
+    logis_schema::json_order::sort_all(&mut dict);
     dict
 });
 
@@ -67,7 +71,7 @@ pub fn merge_patch(target: &mut Value, patch: &Value) -> usize {
     }
     let map = target.as_object_mut().expect("바로 위에서 객체로 만들었습니다");
     let mut changed = 0;
-    for (key, value) in entries {
+    for (key, value) in logis_schema::json_order::sorted_iter(entries) {
         if value.is_null() {
             changed += map.remove(key).is_some() as usize;
         } else {
@@ -79,7 +83,7 @@ pub fn merge_patch(target: &mut Value, patch: &Value) -> usize {
 
 /// 덮어쓰기 문서를 해석해 `dict` 에 얹습니다. 최상위가 객체가 아니거나 JSON 이 아니면 `dict` 를 건드리지 않고 오류를 돌려줍니다.
 pub fn apply_bias_overlay(dict: &mut Value, overlay_text: &str) -> anyhow::Result<usize> {
-    let patch: Value = serde_json::from_str(overlay_text.trim_start_matches('\u{feff}'))
+    let patch: Value = serde_json::from_str(overlay_text.trim_start_matches('\u{feff}')).map(logis_schema::json_order::sorted)
         .map_err(|e| anyhow::anyhow!("JSON 해석 실패: {}", e))?;
     if !patch.is_object() {
         anyhow::bail!("최상위가 객체가 아닙니다 (바꿀 키만 담은 객체여야 합니다)");
@@ -267,9 +271,9 @@ pub fn trade_schema_triples(doc_type: &str) -> Vec<(String, String, String)> {
 
     let absorb = |cat_obj: &Value, out: &mut Vec<(String, String, String)>| {
         let map = match cat_obj.as_object() { Some(m) => m, None => return };
-        for (category, fields) in map {
+        for (category, fields) in logis_schema::json_order::sorted_iter(map) {
             let fmap = match fields.as_object() { Some(f) => f, None => continue };
-            for (field, desc) in fmap {
+            for (field, desc) in logis_schema::json_order::sorted_iter(fmap) {
                 let d = desc.as_str().unwrap_or("").to_string();
                 // overlay 가 base 필드를 덮어쓰는 경우 설명만 교체합니다.
                 if let Some(slot) = out.iter_mut()
@@ -405,7 +409,7 @@ pub fn canonical_field_name(raw: &str) -> String {
         .and_then(|sb| sb.get("path_alias"))
         .and_then(|v| v.as_object())
     {
-        for (canonical, list) in alias_obj {
+        for (canonical, list) in logis_schema::json_order::sorted_iter(alias_obj) {
             if canonical == k { return canonical.clone(); }
             if let Some(arr) = list.as_array() {
                 if arr.iter().any(|a| a.as_str().map_or(false, |s| s == k)) {
@@ -547,7 +551,7 @@ pub fn get_page_type_full_bias(page_type: &str, lang: &str) -> String {
     let localized_type = get_localized_page_type(page_type, lang);
     if let Some(localized_obj) = BIAS_DICT.get(lang_code).or_else(|| BIAS_DICT.get("en")).and_then(|l| l.get(page_type).or_else(|| l.get("default"))) {
         if let Some(obj) = localized_obj.as_object() {
-            for (_, v) in obj {
+            for (_, v) in logis_schema::json_order::sorted_iter(obj) {
                 if let Some(b) = v.get("bias").and_then(|bv| bv.as_str()) {
                     full_bias.push_str(" ");
                     full_bias.push_str(&b.replace("{TYPE}", &localized_type));
@@ -665,7 +669,7 @@ pub fn get_list_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec<(
     };
     // 🌟 [비대칭 가중치 반영] bias.json의 insight 블록을 읽어 현재 page_type이 target_domain에 포함된 경우에만 스키마에 추가합니다.
     if let Some(insight_obj) = BIAS_DICT.get("insight").and_then(|v| v.as_object()) {
-        for (insight_key, insight_val) in insight_obj {
+        for (insight_key, insight_val) in logis_schema::json_order::sorted_iter(insight_obj) {
             let target_domains = insight_val.get("target_domain").and_then(|v| v.as_array()).map(|arr| {
                 arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
             }).unwrap_or_default();
@@ -819,7 +823,7 @@ pub fn get_multi_pass_contexts(page_type: &str, lang: &str) -> Vec<(String, Stri
     }
     // 🌟 [비대칭 가중치 반영] bias.json의 insight 블록을 순회하며 특정 도메인(page_type)에만 통계/분석 편향 점수를 폭발시킵니다.
     if let Some(insight_obj) = BIAS_DICT.get("insight").and_then(|v| v.as_object()) {
-        for (insight_key, insight_val) in insight_obj {
+        for (insight_key, insight_val) in logis_schema::json_order::sorted_iter(insight_obj) {
             let target_domains = insight_val.get("target_domain").and_then(|v| v.as_array()).map(|arr| {
                 arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
             }).unwrap_or_default();
@@ -858,7 +862,7 @@ pub fn get_multi_pass_contexts(page_type: &str, lang: &str) -> Vec<(String, Stri
         .and_then(|l| l.get(page_type).or_else(|| l.get("default")))
         .and_then(|p| p.as_object())
     {
-        for (key, val) in localized_obj {
+        for (key, val) in logis_schema::json_order::sorted_iter(localized_obj) {
             let mut final_bias = String::new();
             let mut final_prej = String::new();
             if let Some(b) = val.get("bias").and_then(|v| v.as_str()) {
@@ -957,7 +961,7 @@ pub fn get_detail_schema_fields(page_type: &str, _href: &str, lang: &str) -> Vec
     };
     // 🌟 [비대칭 가중치 반영] bias.json의 insight 블록을 읽어 현재 page_type이 target_domain에 포함된 경우에만 스키마에 추가합니다.
     if let Some(insight_obj) = BIAS_DICT.get("insight").and_then(|v| v.as_object()) {
-        for (insight_key, insight_val) in insight_obj {
+        for (insight_key, insight_val) in logis_schema::json_order::sorted_iter(insight_obj) {
             let target_domains = insight_val.get("target_domain").and_then(|v| v.as_array()).map(|arr| {
                 arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>()
             }).unwrap_or_default();

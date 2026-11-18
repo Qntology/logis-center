@@ -909,7 +909,7 @@ pub fn get_trade_category_schema_present(
     // 1) base
     let mut fields: Vec<(String, String)> = Vec::new();
     if let Some(obj) = read_node(&["trade_schema", "base", category]) {
-        for (k, v) in obj {
+        for (k, v) in logis_schema::json_order::into_sorted(obj) {
             fields.push((k, v.as_str().unwrap_or("{String}").to_string()));
         }
     } else {
@@ -921,7 +921,7 @@ pub fn get_trade_category_schema_present(
     // 2) overlay : 이 서식에만 존재하는 축을 덧붙입니다.
     //    같은 이름이면 overlay 설명이 이깁니다(서식별 뉘앙스가 더 정확하므로).
     if let Some(obj) = read_node(&["trade_schema", "overlay", doc_type, category]) {
-        for (k, v) in obj {
+        for (k, v) in logis_schema::json_order::into_sorted(obj) {
             let desc = v.as_str().unwrap_or("{String}").to_string();
             if let Some(slot) = fields.iter_mut().find(|(n, _)| n == &k) {
                 slot.1 = desc;

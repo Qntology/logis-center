@@ -12,14 +12,8 @@ fn main() {
             .join("libs");
         println!("cargo:rustc-link-search=native={}", lib_path.display());
         println!("cargo:rustc-link-lib=dstorage");
-
-        // tests/it 의 평가 하네스는 tauri::Builder 를 쓰므로 comctl32 v6 의 TaskDialogIndirect 를 참조합니다.
-        // 앱 바이너리는 tauri-build 가 매니페스트를 넣지만 테스트 바이너리에는 없어서,
-        // 그대로면 시작하자마자 STATUS_ENTRYPOINT_NOT_FOUND 로 죽습니다.
-        if std::env::var("TARGET").map_or(false, |t| t.contains("msvc")) {
-            println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
-            println!("cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'");
-        }
+        // (통합 시험은 commerce/app 으로 옮겨 tauri::Builder 를 쓰지 않으므로, 시험 exe 에 comctl32 v6 매니페스트를 넣던
+        //  rustc-link-arg-tests 는 뺐습니다. 이 패키지에는 시험 대상이 없어 그 지시는 cargo 가 거부합니다.)
     }
     tauri_build::build()
 }

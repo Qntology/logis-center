@@ -3,7 +3,7 @@ use serde_json::Value;
 pub fn merge_node(obj1: &Value, obj2: &Value) -> Value {
     let mut merged = obj1.clone();
     if let (Some(m_obj), Some(o2_obj)) = (merged.as_object_mut(), obj2.as_object()) {
-        for (k, v) in o2_obj {
+        for (k, v) in logis_schema::json_order::sorted_iter(o2_obj) {
             let is_empty = match v {
                 Value::Null => true,
                 Value::String(s) => s.is_empty(),

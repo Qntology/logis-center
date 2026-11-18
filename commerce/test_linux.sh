@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 리눅스에서 Rust 통합 테스트(src-tauri/tests/it)와 프론트엔드 테스트(src/tests, vitest)를 실행합니다.
+# 리눅스에서 Rust 통합 테스트(app/tests/it, logis-app)와 프론트엔드 테스트(src/tests, vitest)를 실행합니다.
 #
 #   ./test_linux.sh [vulkan|cuda|rocm] [cargo test 추가 인자...]
 #   예) ./test_linux.sh vulkan                 # 기본 스위트
@@ -39,7 +39,7 @@ trap 'rm -rf "$XDG_DATA_HOME"' EXIT
 mkdir -p src-tauri/dlls
 [ -n "$(ls -A src-tauri/dlls)" ] || touch src-tauri/dlls/.gitkeep
 
-(cd src-tauri && cargo test --test it "${FEATURE_ARGS[@]}" "$@")
+(cd src-tauri && cargo test -p logis-center -p logis-app --test it "${FEATURE_ARGS[@]}" "$@")
 
 [ -d node_modules ] || npm install
 npm test

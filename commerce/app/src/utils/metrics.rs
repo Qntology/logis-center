@@ -20,13 +20,13 @@ pub async fn update_team_base_metrics(
     let (team_json_str, t_from, t_to, t_cc, t_bcc, t_ref) = match store.get_item_by_id("users", team_id).await {
         Ok(Some(doc)) => (doc.json_data, doc.from, doc.to, doc.cc, doc.bcc, doc.r#ref),
         _ => (
-            json!({ "base": { "pages": {} }, "mode": "commerce", "text": "team" }).to_string(),
+            logis_schema::json_order::to_string_sorted(&json!({ "base": { "pages": {} }, "mode": "commerce", "text": "team" })),
             "".to_string(), "".to_string(), "".to_string(), "".to_string(), "".to_string()
         )
     };
 
     
-    let mut parsed_val: serde_json::Value = serde_json::from_str(&team_json_str).unwrap_or(json!({ "base": { "pages": {} } }));
+    let mut parsed_val: serde_json::Value = serde_json::from_str(&team_json_str).map(logis_schema::json_order::sorted).unwrap_or(json!({ "base": { "pages": {} } }));
     
     
     while let Some(inner_str) = parsed_val.get("json_data").and_then(|v| v.as_str()) {
@@ -150,7 +150,7 @@ pub async fn update_team_base_metrics(
 
     
     if let Some(base_json) = team_data.get("base") {
-        println!("\n[DEBUG-METRICS] 최종 반영된 Base JSON 값:\n{}", serde_json::to_string_pretty(base_json).unwrap_or_default());
+        println!("\n[DEBUG-METRICS] 최종 반영된 Base JSON 값:\n{}", serde_json::to_string_pretty(&logis_schema::json_order::Sorted(base_json)).unwrap_or_default());
     }
 
     
@@ -185,9 +185,9 @@ pub async fn update_team_base_metrics(
         println!("- 타겟 ID: {}", saved_doc.id);
         println!("- 갱신된 Timestamp: {}", saved_doc.updated_at_ts);
         
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&saved_doc.json_data) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&saved_doc.json_data).map(logis_schema::json_order::sorted) {
             if let Some(base_stats) = parsed.get("base") {
-                println!("- DB 내 실제 Base 통계:\n{}", serde_json::to_string_pretty(base_stats).unwrap_or_default());
+                println!("- DB 내 실제 Base 통계:\n{}", serde_json::to_string_pretty(&logis_schema::json_order::Sorted(base_stats)).unwrap_or_default());
             }
         }
         println!("==================================================\n");

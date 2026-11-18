@@ -382,7 +382,7 @@ fn word_matches(query_word: &str, title_word: &str) -> bool {
 fn trade_title_plurals() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     if let Some(m) = logis_pug::parsing::BIAS_DICT.get("search_bridge").and_then(|b| b.get("trade_title_plurals")).and_then(|v| v.as_object()) {
-        for (code, list) in m {
+        for (code, list) in logis_schema::json_order::sorted_iter(m) {
             for t in list.as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
                 out.push((code.clone(), t.to_string()));
             }
@@ -727,7 +727,7 @@ pub fn structure_bank() -> &'static [String] {
         };
         let sb = b.get("search_bridge");
         if let Some(o) = sb.and_then(|s| s.get("domain_words")).and_then(|v| v.as_object()) {
-            for (ty, ws) in o {
+            for (ty, ws) in logis_schema::json_order::sorted_iter(o) {
                 add(ty);
                 strs(Some(ws)).iter().for_each(|w| add(w));
             }
@@ -736,11 +736,11 @@ pub fn structure_bank() -> &'static [String] {
             strs(sb.and_then(|s| s.get(key))).iter().for_each(|w| add(w));
         }
         if let Some(o) = sb.and_then(|s| s.get("trade_title_plurals")).and_then(|v| v.as_object()) {
-            for ws in o.values() {
+            for ws in logis_schema::json_order::sorted_values(o) {
                 match ws {
                     Value::Array(_) => strs(Some(ws)).iter().for_each(|w| add(w)),
                     Value::Object(m) => {
-                        for v in m.values() {
+                        for v in logis_schema::json_order::sorted_values(m) {
                             match v {
                                 Value::Array(_) => strs(Some(v)).iter().for_each(|w| add(w)),
                                 Value::String(s) => add(s),
@@ -762,16 +762,16 @@ pub fn structure_bank() -> &'static [String] {
             "substantial_filters",
             "find_filters",
         ] {
-            for ent in b.get(cat).and_then(|v| v.as_object()).into_iter().flat_map(|o| o.values()) {
+            for ent in b.get(cat).and_then(|v| v.as_object()).into_iter().flat_map(|o| logis_schema::json_order::sorted_values(o)) {
                 strs(ent.get("exact_match")).iter().for_each(|w| add(w));
             }
         }
-        for ent in b.get("analytic_action_filters").and_then(|v| v.as_object()).into_iter().flat_map(|o| o.values()) {
+        for ent in b.get("analytic_action_filters").and_then(|v| v.as_object()).into_iter().flat_map(|o| logis_schema::json_order::sorted_values(o)) {
             strs(ent.get("stems")).iter().for_each(|w| add(w));
         }
         for cat in ["verb", "expression"] {
-            for ent in b.get(cat).and_then(|v| v.as_object()).into_iter().flat_map(|o| o.values()) {
-                for s in ent.as_object().into_iter().flat_map(|o| o.values()).filter_map(|v| v.as_str()) {
+            for ent in b.get(cat).and_then(|v| v.as_object()).into_iter().flat_map(|o| logis_schema::json_order::sorted_values(o)) {
+                for s in ent.as_object().into_iter().flat_map(|o| logis_schema::json_order::sorted_values(o)).filter_map(|v| v.as_str()) {
                     s.split(',').for_each(|p| add(p));
                 }
             }

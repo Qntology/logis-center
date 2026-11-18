@@ -115,7 +115,7 @@ impl ResearchDigest {
 
     fn visit(&mut self, doc_type: &str, path: &str, v: &Value, depth: usize) {
         let Value::Object(map) = v else { return };
-        for (key, value) in map {
+        for (key, value) in logis_schema::json_order::sorted_iter(map) {
             let child = if path.is_empty() { key.clone() } else { format!("{}.{}", path, key) };
             if value.is_object() {
                 if depth < 2 {

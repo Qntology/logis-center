@@ -1065,7 +1065,7 @@ pub fn harvest_titles(info: &serde_json::Value, raw: &str) -> Vec<String> {
                 }
             }
             if out.is_empty() {
-                for (k, v) in o.iter() {
+                for (k, v) in logis_schema::json_order::sorted_iter(o) {
                     if preferred.contains(&k.as_str()) {
                         continue;
                     }
@@ -1073,7 +1073,7 @@ pub fn harvest_titles(info: &serde_json::Value, raw: &str) -> Vec<String> {
                 }
             }
             if out.is_empty() && o.len() == 1 {
-                if let Some(serde_json::Value::String(s)) = o.values().next() {
+                if let Some(serde_json::Value::String(s)) = logis_schema::json_order::sorted_values(o).next() {
                     push_title(s, &mut out);
                 }
             }

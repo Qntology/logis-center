@@ -115,12 +115,12 @@ pub struct Qwen4ExpForCausalLM {
 pub fn safetensors_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let index = dir.join("model.safetensors.index.json");
     if index.exists() {
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&index)?)?;
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&index)?).map(logis_schema::json_order::sorted)?;
         let map = v
             .get("weight_map")
             .and_then(|m| m.as_object())
             .ok_or_else(|| anyhow!("[QWEN4-EXP] {:?} 에 weight_map 이 없습니다", index))?;
-        let mut files: Vec<String> = map.values().filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
+        let mut files: Vec<String> = logis_schema::json_order::sorted_values(map).filter_map(|x| x.as_str().map(|s| s.to_string())).collect();
         files.sort();
         files.dedup();
         return Ok(files.into_iter().map(|f| dir.join(f)).collect());

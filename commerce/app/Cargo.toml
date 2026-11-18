@@ -30,7 +30,10 @@ chrono = { version = "0.4", features = ["serde"] }
 encoding_rs = "0.8"
 futures = "0.3"
 image = { version = "0.25", features = ["jpeg", "png"] }
-lancedb = { version = "0.31.0", default-features = false }
+# LanceDB: premium-discount · raon-zena 와 같은 0.41 (lance 14 · datafusion 54). 0.31(lance 8)이 쓴 테이블을 그대로 읽고 이어 씁니다.
+# 0.41 의 매니페스트가 serde_json `preserve_order` 를 켜 앱 전체 JSON 맵이 넣은 순서가 되므로, 순서가 드러나는 곳은
+# logis_schema::json_order 로 예전(키 정렬) 출력을 지킵니다 (docs/crates-workspace.md).
+lancedb = { version = "0.41", default-features = false }
 logis-bias.workspace = true
 logis-llm.workspace = true
 logis-parsers.workspace = true
@@ -59,3 +62,20 @@ uuid = { version = "1.4", features = ["v4"] }
 whatlang = "0.18.0"
 # Win32_Foundation: GetCurrentProcess · SetProcessWorkingSetSizeEx 가 HANDLE · BOOL 을 써서 이 crate 만 빌드할 때도 필요합니다.
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Memory"] }
+
+# 통합 시험(tests/it, 예전 commerce/src-tauri/tests)이 직접 쓰는 crate. Tauri 없이 코어만 빌드합니다:
+#   cargo test -p logis-app --test it --no-default-features [--features rocm|vulkan|metal …]
+[dev-dependencies]
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+dirs = "6.0.0"
+ggml-kquant = { path = "../crates/ggml-kquant" }
+memmap2 = "0.9"
+# 시험 바이너리의 전역 할당기 (tests/it/main.rs, 앱 main.rs 와 같음)
+mimalloc = { version = "0.1.48", features = ["v3"] }
+nvml-wrapper = "0.9.0"
+safetensors = "0.4"
+sysinfo = "0.30"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+io-uring = "0.7.13"

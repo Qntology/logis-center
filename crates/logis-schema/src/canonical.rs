@@ -365,7 +365,7 @@ pub fn relay_edges(doc: &serde_json::Value) -> Vec<(String, u32)> {
             }
         }
     }
-    for (k, v) in obj.iter() {
+    for (k, v) in crate::json_order::sorted_iter(obj) {
         let code = match k.strip_prefix("rel_") {
             Some(c) => c.trim().to_uppercase(),
             None => continue,
@@ -711,7 +711,7 @@ pub fn drop_placeholder_values(v: &mut serde_json::Value) -> Vec<String> {
     let mut dropped: Vec<String> = Vec::new();
     match v {
         serde_json::Value::Object(obj) => {
-            let keys: Vec<String> = obj.keys().cloned().collect();
+            let keys: Vec<String> = crate::json_order::sorted_keys(obj).cloned().collect();
             for k in keys {
                 if is_structural_key(&k.to_lowercase()) {
                     continue;
