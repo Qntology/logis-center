@@ -267,11 +267,15 @@ pub async fn req_from(mut req: worker::Request) -> crate::web::Req {
     crate::web::Req { method, url, headers, cf, body }
 }
 
-/// [`crate::web::Resp`] → worker::Response (같은 이름의 머리글은 append 로 여럿)
+/// [`crate::web::Resp`] → worker::Response (같은 이름의 머리글은 append 로 여럿).
+/// JS 의 `new Response(문자열, {headers})` 처럼 글 본문에 Content-Type 이 없으면 `text/plain;charset=UTF-8` 을 붙인다
 pub fn resp_into(resp: crate::web::Resp) -> worker::Result<worker::Response> {
     let headers = worker::Headers::new();
     for (k, v) in &resp.headers {
         headers.append(k, v)?;
+    }
+    if matches!(resp.body, crate::web::Body::Text(_)) && !headers.has("content-type")? {
+        headers.set("content-type", "text/plain;charset=UTF-8")?;
     }
     let base = match resp.body {
         crate::web::Body::Text(t) => worker::Response::ok(t)?,
