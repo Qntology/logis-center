@@ -140,3 +140,16 @@ export const SCENARIOS = [
   },
   ...scanScenarios({ ROWS, TASK, REQUEST, extraRows: SALES(3) }),
 ];
+
+// scenarios/<묶음>.mjs: export default (helpers) => [ 시나리오… ] — 버그 수정마다 그것을 드러내는 시나리오
+{
+  const fs = await import("node:fs");
+  const dir = new URL("./scenarios/", import.meta.url);
+  if (fs.existsSync(dir)) {
+    const helpers = { T0, REQUEST, ROWS, TASK, TEAM_DATA, SALES, chat, gemini, promptOf, SEARCH_LLM };
+    for (const f of fs.readdirSync(dir).filter((f) => f.endsWith(".mjs")).sort()) {
+      const mod = await import(new URL(f, dir));
+      SCENARIOS.push(...mod.default(helpers));
+    }
+  }
+}
