@@ -52,7 +52,7 @@ scripts/workers-diff/       차분 시험대 (아래)
 | linkedom 대조 (`workers/proxy/tests/dom_vectors.rs`) | Pug 452/452 바이트 동일, 선택자 31,027/31,027 (SyntheticData 화면 96 · 경계 56 · 무작위 300). 따로 무작위 6,000 문서도 100 % |
 | pako 대조 (`workers/common/tests/pako_array.rs`) | 430 경우 (93 던짐) 모두 같음 |
 | `cargo test`(common · proxy), `cargo check --target wasm32-unknown-unknown` | 통과, 경고 없음 |
-| 차분 시험 commerce (`node commerce.mjs`) | 고치기 전 원본과 28/28 (370d67a3), 고친 원본과 45/45 — 응답(상태 · 머리글 · Set-Cookie · 본문) · S3 요청(서명은 aws4fetch 로 다시 계산해 확인) · D1 · S3 끝 상태 |
+| 차분 시험 commerce (`node commerce.mjs`) | 고치기 전 원본과 28/28 (370d67a3), 고친 원본과 50/50 (fix-member-per-page 를 빼면 perpage_* 넷만 DIFF) — 응답(상태 · 머리글 · Set-Cookie · 본문) · S3 요청(서명은 aws4fetch 로 다시 계산해 확인) · D1 · S3 끝 상태 |
 | 차분 시험 trading (`node trading.mjs`) | 고치기 전 원본과 41/41 (370d67a3), 고친 원본과 58/58 |
 | `wrangler deploy --dry-run` (두 워커) | 빌드 · 바인딩 확인 통과. proxy 2,547 KiB (gzip 889 KiB), apac 419 KiB (gzip 166 KiB) |
 
@@ -165,6 +165,7 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
 | fix-app-extraction | 1998~ | 앱 추출 POST 는 `created_at` 이 없어 418 → 기본 now, 봉투 `{type, body, link…}` 를 풂: 이미지 = data URL 의 base64 + `image/*`, html = 스캔 갈래, 문서 = `{success:false, error}` (proxy 에 문서 해석기 없음) |
 | fix-app-relay | (없던 길) | `/relay/{hash}` 가 없었음 → POST 는 `hash/{hash}` 의 토큰이 맞아야 S3 `relay/{hash}` 에 저장(64 KB 이하 JSON), GET 은 10분 안의 것. 앱(main.ts `sendSignalingMessage`)이 세션을 안 실어 보내던 것도 고침 |
 | fix-app-invite | 1723~1889 | 앱의 초대 PUT(email · ref[] · id 없음 · `results[0].hook` 기대)을 받는 곳이 없었고, 권한 주기가 쓰는 행 꼴과 멤버 판정이 읽는 꼴이 달랐음 → 아래 |
+| fix-member-per-page | 1108 · 1561~1577 · 2000 · 1894 · 2494 | 팀 행(늘 읽힘)이 `member = true` 라 팀원 모두가 모든 페이지의 멤버였고, member 는 GET 동기화만 막았음(POST · PUT 대화는 보지 않음) → 팀장 · 페이지 멤버 · 팀 공통 페이지만 멤버, `cookies.pages` 거름, POST · PUT 대화도 멤버만 (아래 "페이지별 멤버") |
 
 멤버 초대(사용자 결정: 대기 초대 → 첫 로그인 때 확정):
 
@@ -175,8 +176,33 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
   고른 페이지마다 멤버 행을 만든 뒤 초대 행을 지웁니다.
 - 멤버 행(초대 · 권한 주기 · 내보내기가 같이 씀, 1567 의 판정이 읽는 꼴): `type 'member'` · `from` 멤버 주소 · `to` 팀 · `cc` 준 사람 ·
   `bcc` = 그 페이지 행의 `bcc`(`hashId(type + cc)`) · `ref` 페이지 id · `id = hashId(member + team + bcc)`.
-- 알아 둘 것: 원본은 팀에 속한 사용자(`users.to` = 팀)면 1108 줄 규칙으로 이미 모든 페이지의 멤버로 봅니다. 그래서 페이지별 권한은 팀 행을
-  읽지 못한 경우에만 의미가 있습니다 — 실제로 페이지별로 막으려면 그 규칙을 바꿔야 합니다(아직 결정 전). 다른 지역(logisRegion)의 초대는 찾지 않습니다.
+- 다른 지역(logisRegion)의 초대는 찾지 않습니다.
+
+페이지별 멤버(fix-member-per-page, 사용자 결정: "페이지별로 막는 규칙으로"). 원본은 팀에 속한 사용자(`users.to` = 팀)면 1108 줄에서 팀 행을 읽는
+순간 `member = true` 였습니다(팀 행은 `?created_at=` 이 있는 요청마다 읽힘). 이제 판정은 1561 한 곳(Rust `resolve.rs`)입니다:
+
+- 팀장: 팀 행의 `from`(`teamOwner()` — 1089 가 찾은 admin 이 있으면 그것, 없으면 users 의 팀 행을 읽음, fix-revoke-owner 와 같은 도우미).
+  `cookies.address` 가 팀장이면 모든 페이지의 멤버. 팀 행을 못 읽은 요청(`created_at` 없음)에서도 팀장이면 멤버입니다(원본은 그때 아니었음).
+- 페이지 멤버: 그 밖의 팀원은 멤버 행이 있어야 합니다 — `from` = 나 · `to` = 팀 · `bcc` = 이 페이지의 `cookies.bcc`(`hashId(page.type + cc)`, 상세면 대문자 cc),
+  또는 `bcc` = `cookies.cc`(사이트 멤버 행: 그 사이트의 모든 페이지). 바인딩한 원래 두 질의 그대로이고, 페이지(`page`)를 못 찾은 요청이면 멤버가 아닙니다.
+- 팀 공통 페이지: 요청 href 의 도메인 cc(`ccOfHost(url.host)`, 세션 505~517 과 같은 규칙)가 `homeCc` = `hashId('logis.center')` 이면 팀원 누구나 멤버.
+  앱의 클라우드 검색(`href=https://commerce.logis.center/tracking`, `origin=https://commerce.logis.center`)과 추출(`href=https://console.logis.center/`,
+  origin 없음 → `cookies.cc` 가 없어 `cookies.cc` 로는 못 가림)이 여기에 듭니다. `homeId`/`pageId` 로는 가릴 수 없습니다(홈 id 는 대문자 cc 로 만들어
+  `pageId` 와 같아지지 않고, fix-app-cloud-search 의 `page = home` 은 POST 본문을 읽을 때에야 정해짐). 앱의 페이지 목록에 없어 초대로는 이 페이지의
+  멤버 행이 생기지 않으므로, 막으면 초대받은 팀원은 앱을 쓸 수 없습니다.
+- `cookies.pages`: 팀 `base.pages` 는 proxy 가 채우는 `{ [사이트 cc]: { [페이지 type]: { draft, count } } }`(페이지 id 가 아님). 팀장은 그대로,
+  그 밖에는 그 사람의 멤버 행 `bcc` 로 거릅니다 — cc 가 `homeCc` 이거나 사이트 멤버 행(`bcc` = cc)이 있으면 그 cc 통째로, 아니면
+  `bcc` = `hashId(type + cc)`(또는 대문자 cc)인 type 만, 남는 type 이 없는 cc 는 뺍니다(`fixes.rs::member_pages`). 개수(goods · order · …)는 팀 것 그대로.
+- 쓰기: POST(화면 글 · 이미지 · `{query, vector}` · URL 목록 · 앱 추출 전부)와 PUT 대화는 `member` 여야 합니다. 아니면 200
+  `{success:false, results:[], error:"not a member of this page", session}`(PUT 은 `{results, success, error, session}` 순서 — 초대 거절과 같은 꼴),
+  Content-Type `application/json`. 초대 · 권한 주기는 팀장만, 거두기는 팀장 또는 본인 — 그대로입니다. 멤버가 아닌 JSON GET 에는 동기화(2494~)뿐 아니라
+  1132 의 상세 아이템도 싣지 않습니다(페이지 · 팀 사용자 목록은 그대로).
+- PUT 벡터(Vectorize upsert)는 막지 않습니다: 데스크톱 앱이 팀의 로컬 색인을 통째로 올리는 팀 단위 작업이고 어느 페이지에 딸린 것이 아니며,
+  검증된 세션의 팀(`cookies.team`)이 있어야 하는 원래 조건으로 충분합니다. (벡터마다 `to` · `cc` 를 덮어쓸 수 있는 것은 원래 동작이고 고치지 않았습니다.)
+- 결과: `users.to` = 팀이지만 팀장이 아니고 멤버 행이 없는 사용자 — 이 변경 전에 들어온 팀원, refs 없이 초대된 사람 — 은 이제 팀 공통 페이지만 봅니다.
+  팀장이 권한 주기(PUT `id` = 팀 · `cc` = 팀장 · `ref` = 페이지들)로 페이지를 주어야 합니다. 의도한 결과입니다.
+- 남은 것: `member` 가 참이면 원래의 동기화(2494~2849)는 페이지가 아니라 팀 · 사이트 단위 질의(같은 cc 의 아이템, 다른 cc 의 최근 아이템, 팀 초안)라,
+  한 페이지의 멤버는 동기화로 팀의 다른 페이지 아이템도 받습니다. 앱 추출의 html 봉투는 `link` 의 가게 페이지로 작업을 넣지만 판정은 요청 href(console)로 합니다.
 
 고치지 않고 적어 둔 것: `cookies.hash` 를 S3 경로에 검증 없이 씀, 홈 id 를 대문자 cc 로 만들어 `pageId` 와 같아지지 않음(클라우드 검색만 보정),
 `?created_at=%20` 의 NaN 이 SQL 로(418), 1474~1558 의 페이지 트리는 결과를 버리는 죽은 코드, POST 가 sender · 잔액 없으면 빈 418,

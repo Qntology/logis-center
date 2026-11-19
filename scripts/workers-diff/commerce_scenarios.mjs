@@ -269,3 +269,77 @@ SCENARIOS.push(
     PUT({ from: OTHER, to: OTHER, id: TEAM, cc: ZERO, ref: JSON.stringify([PAGE2]) }, { hash: HASH3, token: TOKEN3 }),
   ] },
 );
+
+// ---------------------------------------------------------------------------------------------------------------------
+// fix-member-per-page: 팀장은 모든 페이지, 그 밖의 팀원은 페이지(bcc) · 사이트(cc) 멤버 행이 있는 페이지와 팀 공통 페이지(logis.center)만.
+// 팀 base.pages 는 { [사이트 cc]: { [type]: { draft, count } } } — 팀장이 아니면 멤버인 것만 남는다
+const HOME_CC = hashId("logis.center");
+const OTHER_CC = hashId("other.com");
+const PAGE_A = PAGE1; // HREF(/goods/view?no=12) 의 페이지
+const PAGE_B = hashId(CC + "/order/view");
+const HREF_B = "https://shop.example.com/order/view?no=3";
+const PERPAGE_BASE = () => ({ ...TEAM_BASE(), pages: {
+  [CC]: { goods: { draft: 0, count: 2 }, order: { draft: 0, count: 1 } },
+  [OTHER_CC]: { goods: { draft: 1, count: 4 } },
+  [HOME_CC]: { tracking: { draft: 0, count: 3 } },
+} });
+const PERPAGE_ROWS = (extra = []) => [...ZONES,
+  ...MEMBERS().map((r) => (r.values.type === "team" ? { ...r, values: { ...r.values, data: { ...r.values.data, base: PERPAGE_BASE() } } } : r)),
+  OTHER_USER, PAGE_ROW(PAGE_A, "goods"), PAGE_ROW(PAGE_B, "order"),
+  ITEM("0x" + "11".repeat(20), { cc: CC }), ITEM("0x" + "12".repeat(20), { cc: CC, type: "order" }), ...extra];
+const OTHER_COOKIES = { hash: HASH3, token: TOKEN3 };
+const INVITEE_COOKIES = { hash: HASH2, token: TOKEN2 };
+const S3_PERPAGE = { ...S3_SESSION, ...S3_OTHER, ...S3_INVITEE,
+  [`address/${hashId("lee@example.com")}`]: { balance: "1000" }, [`address/${hashId("new@example.com")}`]: { balance: "1000" } };
+const JGET = (cookies, over = {}) => ({ ...JSON_GET(over), cookies });
+const POST_TEXT = (cookies, from, href, text, over = {}) => ({ method: "POST", cookies, headers: { "Content-Type": "text/html" },
+  gzip: encodeURIComponent(`<html><body><h1>${text}</h1></body></html>`), path: q({ origin: ORIGIN, href, created_at: T0 + 1000, from, to: TEAM, ...over }) });
+// 사이트 멤버 행 (bcc = 사이트 cc) — 초대 · 권한 주기는 만들지 않는 꼴이지만 1572 의 판정이 읽는다
+const SITE_MEMBER = { db: "commerce_logis_apac1_items", table: "items", values: { id: hashId(OTHER + TEAM + CC), type: "member", from: OTHER, to: TEAM, cc: USER,
+  bcc: CC, ref: "", data: { name: "lee" }, created_at: T0 - 100000, updated_at: T0 - 100000 } };
+
+SCENARIOS.push(
+  // 팀장: 페이지 B 도 멤버(동기화 · 전체 base.pages), POST · PUT 대화가 받아진다, 페이지 A 도
+  { name: "perpage_owner", rows: PERPAGE_ROWS(), s3: S3_PERPAGE, requests: [
+    JSON_GET({ href: HREF_B }),
+    POST_TEXT(COOKIES, USER, HREF_B, "주문 B"),
+    PUT({ href: HREF_B, from: USER, to: TEAM, text: "B 의 대화" }),
+    JSON_GET(),
+  ] },
+  // 초대(refs [A]) → 첫 로그인 → A 는 멤버(동기화 · 걸러진 base.pages), B 는 아님(팀 아이템 없음) → POST · PUT 대화도 A 만
+  { name: "perpage_invited", rows: PERPAGE_ROWS(), s3: S3_PERPAGE, requests: [
+    PUT({ from: TEAM, to: USER, email: "new@example.com", ref: JSON.stringify([PAGE_A]) }),
+    { method: "GET", path: q({ hash: HASH2, token: TOKEN2 }) },
+    JGET(INVITEE_COOKIES),
+    JGET(INVITEE_COOKIES, { href: HREF_B }),
+    POST_TEXT(INVITEE_COOKIES, NEWADDR, HREF, "상품 A", { sender: "대구광역시 1" }),
+    POST_TEXT(INVITEE_COOKIES, NEWADDR, HREF_B, "주문 B", { sender: "대구광역시 1" }),
+    PUT({ from: NEWADDR, to: TEAM, text: "A 의 대화" }, INVITEE_COOKIES),
+    PUT({ href: HREF_B, from: NEWADDR, to: TEAM, text: "B 의 대화" }, INVITEE_COOKIES),
+  ] },
+  // 멤버 행이 없는 옛 팀원: 앱의 클라우드 검색(홈 /tracking) · 이미지 추출(console)은 팀 공통이라 받아진다. 가게 페이지 A 는 막힌다
+  { name: "perpage_app_old_member", rows: PERPAGE_ROWS(), s3: S3_PERPAGE, requests: [
+    { method: "POST", headers: { "Content-Type": "application/json" }, gzip: { query: " 무거운 상자 ", vector: [0.1, 0.2, 0.3] },
+      path: q({ origin: HOME_ORIGIN, created_at: T0 + 1000, hash: HASH3, token: TOKEN3, href: HOME_HREF, from: OTHER, to: TEAM }) + `&hash=${HASH3}&token=${TOKEN3}` },
+    { method: "POST", headers: { "Content-Type": "application/json" },
+      gzip: { id: "task_1", from: OTHER, to: TEAM, cc: "", bcc: "", ref: "", link: "local", type: "image_extraction", body: "data:application/octet-stream;base64,iVBORw0KGgo=" },
+      path: q({ from: OTHER, to: TEAM, format: encodeURIComponent("image/png"), hash: HASH3, token: TOKEN3, href: "https://console.logis.center/" }) },
+    JGET(OTHER_COOKIES),
+    POST_TEXT(OTHER_COOKIES, OTHER, HREF, "상품 A"),
+  ] },
+  // 권한 주기(A) → A 멤버 → 거두기 → A 가 다시 막힌다
+  { name: "perpage_revoke", rows: PERPAGE_ROWS(), s3: S3_PERPAGE, requests: [
+    PUT({ from: USER, to: OTHER, id: TEAM, cc: USER, ref: JSON.stringify([PAGE_A]) }),
+    JGET(OTHER_COOKIES),
+    POST_TEXT(OTHER_COOKIES, OTHER, HREF, "상품 A"),
+    PUT({ from: USER, to: OTHER, id: TEAM, cc: ZERO, ref: JSON.stringify([PAGE_A]) }),
+    JGET(OTHER_COOKIES),
+    POST_TEXT(OTHER_COOKIES, OTHER, HREF, "상품 A 다시"),
+  ] },
+  // 사이트 멤버 행(bcc = cc)은 그 사이트의 모든 페이지를 덮는다 (base.pages 는 그 cc 통째로 + 팀 공통)
+  { name: "perpage_site_member", rows: PERPAGE_ROWS([SITE_MEMBER]), s3: S3_PERPAGE, requests: [
+    JGET(OTHER_COOKIES),
+    JGET(OTHER_COOKIES, { href: HREF_B }),
+    POST_TEXT(OTHER_COOKIES, OTHER, HREF_B, "주문 B"),
+  ] },
+);

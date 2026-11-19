@@ -1025,3 +1025,160 @@ var hints_condition = ' OR '
 `SELECT * FROM ${type} WHERE "to" = ?1 AND "cc" = ?2 AND "bcc" = ?3 ${conditions[page.type] ? conditions[page.type] : condition} ORDER BY created_at DESC LIMIT 100`
 								).bind(cookies.team, cookies.cc, page.bcc).all()
 >>>
+
+=====================================================================================================================
+fix-member-per-page: 팀 행(1108)이 늘 읽혀 팀원 모두가 모든 페이지의 멤버였고, member 는 GET 동기화만 막았다 → 팀장(팀 행의 from)은 모든 페이지,
+서비스 자신의 페이지(요청 href 의 도메인 cc == homeCc — 앱의 클라우드 검색 · 추출)는 팀 공통, 그 밖의 팀원은 페이지(bcc) · 사이트(cc) 멤버 행이
+있어야 멤버. 팀장이 아니면 cookies.pages 를 멤버인 것만, POST 와 PUT 대화는 멤버만, 멤버가 아닌 GET 에는 상세 아이템도 싣지 않는다.
+workers/commerce/src/resolve.rs · fixes.rs(member_pages) · post.rs · put_delete.rs · get.rs 와 1:1.
+@@ fix-member-per-page
+<<< find
+async function teamOwner(
+=== replace
+// fix-member-per-page: 팀장이 아닌 팀원의 cookies.pages — 팀 base.pages 는 { [사이트 cc]: { [페이지 type]: { draft, count } } }.
+// 그 사람의 멤버 행 bcc 로 거른다: cc 가 homeCc(팀 공통)이거나 사이트 멤버 행(bcc = cc)이 있으면 그 cc 통째로,
+// 아니면 페이지 멤버 행(bcc = hashId(type + cc), 상세면 hashId(type + 대문자 cc))이 있는 type 만. 남는 type 이 없는 cc 는 뺀다
+async function memberPages(env, zone, address, team, pages, homeCc){
+	var { results } = await env[`commerce_logis_${zone}_items`].prepare(`SELECT "bcc" FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 LIMIT 1000`).bind(address, team).all()
+	var bccs = results.map(row => row.bcc).filter(bcc => typeof bcc == "string")
+	var out = {}
+	var ccs = Object.keys(pages)
+	for(var c = 0; c < ccs.length; c++){
+		var cc = ccs[c]
+		if(cc == homeCc || bccs.indexOf(cc) > -1){
+			out[cc] = pages[cc]
+			continue
+		}
+		var types = pages[cc]
+		var kept = {}
+		var any = false
+		if(types && typeof types == "object" && !Array.isArray(types)){
+			var names = Object.keys(types)
+			for(var t = 0; t < names.length; t++){
+				if(bccs.indexOf(hashId(names[t] + cc)) > -1 || bccs.indexOf(hashId(names[t] + cc.toUpperCase())) > -1){
+					kept[names[t]] = types[names[t]]
+					any = true
+				}
+			}
+		}
+		if(any){
+			out[cc] = kept
+		}
+	}
+	return out
+}
+
+async function teamOwner(
+>>>
+
+@@ fix-member-per-page
+<<< find
+admin = user
+
+						member = true
+
+						cookies.pages = data.base.pages
+=== replace
+admin = user
+
+						// fix-member-per-page: 팀 행은 개수(와 base.pages)만 준다 — 멤버 판정은 아래 1561 에서
+
+						cookies.pages = data.base.pages
+>>>
+
+@@ fix-member-per-page
+<<< find
+cookies.bcc = ''
+
+			if(Object.keys(page).length){
+=== replace
+cookies.bcc = ''
+
+			// fix-member-per-page: 팀장은 모든 페이지의 멤버, 서비스 자신의 페이지(href 의 도메인 cc 가 homeCc)는 팀 공통,
+			// 그 밖의 팀원은 아래 멤버 행(페이지 bcc · 사이트 cc)이 있어야 멤버
+			var memberOwner = false
+
+			if(cookies.address && cookies.team){
+				memberOwner = cookies.address == await teamOwner(env, logisRegion, admin, cookies.team)
+
+				member = memberOwner || ccOfHost(url.host) == homeCc
+			}
+
+			if(Object.keys(page).length){
+>>>
+
+@@ fix-member-per-page
+<<< find
+if(results.length){
+							member = true
+						}
+					}
+				}
+			}
+
+
+			cookies.href = href
+=== replace
+if(results.length){
+							member = true
+						}
+					}
+				}
+			}
+
+			// fix-member-per-page: 팀장이 아니면 팀 base.pages 를 멤버인 것만
+			if(cookies.address && cookies.team && !memberOwner && cookies.pages && typeof cookies.pages == "object" && !Array.isArray(cookies.pages) && Object.keys(cookies.pages).length){
+				cookies.pages = await memberPages(env, zoneRegion, cookies.address, cookies.team, cookies.pages, homeCc)
+			}
+
+
+			cookies.href = href
+>>>
+
+@@ fix-member-per-page
+<<< find
+}else if(req.query.text){
+
+							var text = decodeURIComponent(req.query.text)
+=== replace
+}else if(req.query.text && !member){
+							// fix-member-per-page: 이 페이지의 멤버가 아니면 대화를 넣지 않는다
+							headers.set('Content-Type', 'application/json')
+
+							return new Response(JSON.stringify({ results : [], success : false, error : 'not a member of this page', session : cookies }), { headers : headers })
+						}else if(req.query.text){
+
+							var text = decodeURIComponent(req.query.text)
+>>>
+
+@@ fix-member-per-page
+<<< find
+if(cookies.sender && created_at){
+					var task = {
+=== replace
+// fix-member-per-page: 이 페이지의 멤버(팀장 · 페이지 멤버 행 · 팀 공통 페이지)만 작업을 넣는다
+				if(cookies.sender && created_at && !member){
+					headers.set('Content-Type', 'application/json')
+
+					return new Response(JSON.stringify({ success : false, results : [], error : 'not a member of this page', session : cookies }), { headers : headers })
+				}
+
+				if(cookies.sender && created_at){
+					var task = {
+>>>
+
+@@ fix-member-per-page
+<<< find
+var talks = []
+
+					if(member && cookies.address){
+=== replace
+var talks = []
+
+					// fix-member-per-page: 이 페이지의 멤버가 아닌 팀원에게는 팀 아이템(1132 의 상세 행)도 싣지 않는다
+					if(!member && cookies.address){
+						items = []
+					}
+
+					if(member && cookies.address){
+>>>

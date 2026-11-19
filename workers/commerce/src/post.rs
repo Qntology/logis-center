@@ -157,6 +157,21 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
         return Ok(Step::Next);
     }
 
+    // 고침 (fix-member-per-page): 이 페이지의 멤버(팀장 · 페이지 멤버 행 · 팀 공통 페이지 — resolve 1561)만 작업을 넣는다.
+    // 원본은 POST 에서 member 를 보지 않았다 (화면 글 · 이미지 · { query, vector } · URL 목록 · 앱 추출 모두)
+    if !ctx.member.truthy() {
+        headers_set(&ctx.headers, "Content-Type", &V::from("application/json"))?;
+        return Ok(Step::Return(respond(
+            ctx,
+            &obj! {
+                "success" => false,
+                "results" => V::new_arr(),
+                "error" => "not a member of this page",
+                "session" => ctx.cookies.clone(),
+            },
+        )?));
+    }
+
     // 2000
     ctx.task = obj! {
         "cc" => ctx.cookies.g("cc")?,

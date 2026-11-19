@@ -100,6 +100,41 @@ pub fn page_link(href: &str, origin: &str) -> String {
     }
 }
 
+/// `await memberPages(env, zone, address, team, pages, homeCc)` — fix-member-per-page: 팀장이 아닌 팀원의 `cookies.pages`.
+/// 팀 base.pages 는 proxy 가 채우는 `{ [사이트 cc]: { [페이지 type]: { draft, count } } }` (페이지 id 가 아니라 사이트 cc · type 으로 묶임).
+/// 그 사람의 멤버 행 bcc 로 거른다: cc 가 homeCc(팀 공통)이거나 사이트 멤버 행(bcc = cc)이 있으면 그 cc 통째로,
+/// 아니면 페이지 멤버 행(bcc = hashId(type + cc), 상세 페이지면 hashId(type + 대문자 cc))이 있는 type 만. 남는 type 이 없는 cc 는 뺀다
+pub async fn member_pages(env: &Env, zone: &V, address: &V, team: &V, pages: &V, home_cc: &V) -> R<V> {
+    let db = format!("commerce_logis_{}_items", zone.to_str());
+    let rows = js::query_bound(env, &db, r#"SELECT "bcc" FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 LIMIT 1000"#, &[address.clone(), team.clone()]).await?;
+    let bccs: Vec<String> = rows.items().iter().filter_map(|row| row.get("bcc").as_str().map(str::to_string)).collect();
+    let has = |s: &str| bccs.iter().any(|b| b == s);
+
+    let out = V::new_obj();
+    for (cc, types) in pages.entries() {
+        if cc == home_cc.to_str() || has(&cc) {
+            out.put(&cc, types);
+            continue;
+        }
+        let kept = V::new_obj();
+        let mut any = false;
+        if matches!(types, V::Obj(_)) {
+            for (type_, slot) in types.entries() {
+                let lower = hash_id(&V::from(type_.clone() + &cc))?;
+                let upper = hash_id(&V::from(type_.clone() + &logis_worker_common::jsv::to_upper(&cc)))?;
+                if has(&lower) || has(&upper) {
+                    kept.put(&type_, slot);
+                    any = true;
+                }
+            }
+        }
+        if any {
+            out.put(&cc, kept);
+        }
+    }
+    Ok(out)
+}
+
 /// `await teamOwner(env, logisRegion, admin, team)` — 팀 행(id == to == 팀)의 from
 pub async fn team_owner(env: &Env, logis_region: &str, admin: &V, team: &V) -> R<V> {
     if admin.truthy() && admin.get("id").truthy() && logis_worker_common::loose_eq(&admin.get("id"), team) {

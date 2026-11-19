@@ -340,7 +340,8 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
             if loose_eq(&ctx.user.g("id")?, &ctx.user.g("to")?) {
                 ctx.admin = ctx.user.clone();
 
-                ctx.member = V::Bool(true);
+                // 고침 (fix-member-per-page): 원본은 여기서 `member = true` — 팀 행은 늘 읽히므로 팀원 모두가 모든 페이지의 멤버였다.
+                // 팀 행은 이제 개수(와 base.pages)만 준다. 멤버 판정은 1561 에서 (팀장 · 페이지 멤버 행 · 팀 공통 페이지)
 
                 ctx.cookies.s_("pages", ctx.data.g("base")?.g("pages")?)?;
 
@@ -375,6 +376,18 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
     // 1561
     ctx.cookies.s_("bcc", V::from(""))?;
 
+    // 고침 (fix-member-per-page): 팀장(팀 행의 from — fix-revoke-owner 와 같은 teamOwner)은 모든 페이지의 멤버.
+    // 서비스 자신의 페이지(요청 href 의 도메인 cc 가 homeCc = hashId('logis.center') — 앱의 클라우드 검색 commerce.logis.center/tracking,
+    // 추출의 console.logis.center)는 팀 공통이라 팀원 누구나 멤버. 그 밖의 팀원은 아래 멤버 행(페이지 bcc · 사이트 cc)이 있어야 멤버
+    let mut member_owner = false;
+    if ctx.cookies.g("address")?.truthy() && ctx.cookies.g("team")?.truthy() {
+        let owner = crate::fixes::team_owner(env, &ctx.logisRegion.to_key(), &ctx.admin, &ctx.cookies.g("team")?).await?;
+        member_owner = loose_eq(&ctx.cookies.g("address")?, &owner);
+
+        let common = crate::fixes::cc_of_host(&ctx.url.g("host")?.to_str())? == ctx.homeCc.to_str();
+        ctx.member = V::Bool(member_owner || common);
+    }
+
     if !ctx.page.keys_checked()?.is_empty() {
         let page_type = ctx.page.g("type")?;
         let cc = if ctx.isDetail.truthy() { V::from(upper(&ctx.cookies.g("cc")?, "cookies.cc")?) } else { ctx.cookies.g("cc")? };
@@ -398,6 +411,13 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
                 }
             }
         }
+    }
+
+    // 고침 (fix-member-per-page): 팀장이 아니면 팀 base.pages({ [사이트 cc]: { [페이지 type]: { draft, count } } })를 멤버인 것만 남긴다
+    let pages = ctx.cookies.g("pages")?;
+    if ctx.cookies.g("address")?.truthy() && ctx.cookies.g("team")?.truthy() && !member_owner && matches!(pages, V::Obj(_)) && !pages.keys().is_empty() {
+        let kept = crate::fixes::member_pages(env, &ctx.zoneRegion, &ctx.cookies.g("address")?, &ctx.cookies.g("team")?, &pages, &ctx.homeCc).await?;
+        ctx.cookies.s_("pages", kept)?;
     }
 
     // 1582

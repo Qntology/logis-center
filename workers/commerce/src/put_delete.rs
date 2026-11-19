@@ -148,6 +148,17 @@ pub async fn put(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
         if eth::is_address(&query.g("id")?) && ctx.refs.g("length")?.truthy() {
             members(ctx, env, &query).await?;
         } else if query.g("text")?.truthy() {
+            // 고침 (fix-member-per-page): 이 페이지의 멤버가 아니면 대화를 넣지 않는다 (원본은 member 를 보지 않았다)
+            if !ctx.member.truthy() {
+                headers_set(&ctx.headers, "Content-Type", &V::from("application/json"))?;
+                let body = obj! {
+                    "results" => V::new_arr(),
+                    "success" => false,
+                    "error" => "not a member of this page",
+                    "session" => ctx.cookies.clone(),
+                };
+                return Ok(Step::Return(json_response(ctx, &body)?));
+            }
             talk(ctx, env, &query).await?;
         }
     }

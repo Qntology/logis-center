@@ -248,6 +248,11 @@ pub async fn run(ctx: &mut Ctx, env: &Env, _req: &Req) -> R<Step> {
         // 2490
         ctx.talks = V::new_arr();
 
+        // 고침 (fix-member-per-page): 이 페이지의 멤버가 아닌 팀원에게는 팀 아이템(1132 에서 찾은 이 주소의 상세 행)도 싣지 않는다
+        if !ctx.member.truthy() && ctx.cookies.g("address")?.truthy() {
+            ctx.items = V::new_arr();
+        }
+
         if ctx.member.truthy() && ctx.cookies.g("address")?.truthy() {
             member_rows(ctx, env).await?;
         }
