@@ -65,14 +65,15 @@ async function moreFixes() {
   return out;
 }
 
-/** 원본 글에 수정을 덧댄다. 맞는 수가 1 이 아니면 던진다 */
-export async function patchOriginal(worker, source) {
+/** 원본 글에 수정을 덧댄다. 맞는 수가 1 이 아니면 던진다. omit 에 든 id 의 수정은 건너뛴다 (그 수정 하나만 뺀 "고친 원본" — 그 수정이 바꾸는 시나리오만 DIFF) */
+export async function patchOriginal(worker, source, { omit = [] } = {}) {
   let s = source;
   const applied = [];
   for (const fix of [...FIXES, ...(await moreFixes())]) {
     // "both" 는 apac · proxy 둘. commerce · trading 은 이름으로만 (배열이면 그 안의 워커들)
     const targets = Array.isArray(fix.worker) ? fix.worker : fix.worker === "both" ? ["apac", "proxy"] : [fix.worker];
     if (!targets.includes(worker)) continue;
+    if (omit.includes(fix.id)) continue;
     const re = fix.find instanceof RegExp ? fix.find : loose(fix.find);
     const n = (s.match(re) || []).length;
     const want = fix.count ?? 1;

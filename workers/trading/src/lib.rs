@@ -36,8 +36,8 @@ mod worker_main {
         }
     }
 
-    /// `#[event(fetch)]` 대신: 원본은 `request.cf` 가 없으면 처리기가 던진다(500 응답이 아니라 예외). 그 경계를 지키려고
-    /// 오류를 응답으로 바꾸지 않고 프라미스를 거절한다
+    /// `#[event(fetch)]` 대신: 원본은 바깥 try 앞(AwsClient 생성)에서 던지면 처리기가 던진다(500 응답이 아니라 예외). 그 경계를
+    /// 지키려고 오류를 응답으로 바꾸지 않고 프라미스를 거절한다 (`request.cf` 가 없을 때 던지던 것은 fix-trading-cf-optional 로 고침)
     #[wasm_bindgen(js_name = fetch)]
     pub async fn fetch(req: web_sys::Request, env: worker::Env, _ctx: worker::worker_sys::Context) -> Result<JsValue, JsValue> {
         logis_worker_common::platform::install_panic_hook();

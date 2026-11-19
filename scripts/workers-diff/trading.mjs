@@ -6,6 +6,8 @@
 //   MASK_SIG=1   (선택) 바깥 요청의 authorization · x-amz-date 값을 양쪽 모두 비운다. 기본은 서명 그대로 견주고
 //                가짜 S3 가 AwsV4Signer 로 다시 계산해 sig: ok/bad 를 남긴다
 //   WORKERS=<logis-center/workers 경로>  Rust 빌드(trading/build) 위치
+//   ORIGINAL=raw  고치지 않은 원본 그대로 (기본은 fixes/trading.mjs 를 덧댄 "고친 원본")
+//   OMIT_FIX=<id>[,<id>]  그 수정만 뺀 "고친 원본" — DIFF 가 나는 시나리오가 곧 그 수정이 바꾸는 시나리오
 import { Miniflare } from "miniflare";
 import * as esbuild from "esbuild";
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -14,6 +16,7 @@ import path from "node:path";
 // 운영 Workers 의 시간대는 UTC 다
 process.env.TZ = "UTC";
 import { AwsV4Signer } from "aws4fetch";
+import { patchOriginal } from "./fixes.mjs";
 import { SCENARIOS } from "./trading_scenarios.mjs";
 
 const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"));
@@ -26,9 +29,17 @@ const MASK_SIG = process.env.MASK_SIG === "1";
 const OUT = path.join(HERE, "out");
 fs.mkdirSync(path.join(OUT, "ts"), { recursive: true });
 
-// 원본 TS 를 복사해 묶는다 (pako · ethers · aws4fetch 는 이 폴더의 node_modules)
+// 원본 TS 를 복사해 묶는다 (pako · ethers · aws4fetch 는 이 폴더의 node_modules).
+// ORIGINAL=raw 면 버그를 고치기 전의 원본 그대로, 아니면 fixes/trading.mjs 의 수정을 덧댄 "고친 원본" (proxy.mjs · commerce.mjs 와 같음)
 const TS_COPY = path.join(OUT, "ts", "trading.ts");
-fs.copyFileSync(path.join(SRC, "src", "index.ts"), TS_COPY);
+{
+  const raw = fs.readFileSync(path.join(SRC, "src", "index.ts"), "utf8");
+  const omit = (process.env.OMIT_FIX || "").split(",").map((x) => x.trim()).filter(Boolean);
+  const { source, applied } = process.env.ORIGINAL === "raw" ? { source: raw, applied: [] } : await patchOriginal("trading", raw, { omit });
+  if (applied.length) console.log(`[trading] fixes applied to the original: ${[...new Set(applied)].join(", ")}`);
+  if (omit.length) console.log(`[trading] omitted: ${omit.join(", ")}`);
+  fs.writeFileSync(TS_COPY, source);
+}
 await esbuild.build({
   entryPoints: [TS_COPY],
   bundle: true, format: "esm", platform: "browser", mainFields: ["browser", "module", "main"], conditions: ["workerd", "worker", "browser"],
@@ -65,10 +76,11 @@ fs.writeFileSync(path.join(RS, "strip.mjs"), STRIP);
 fs.writeFileSync(path.join(RS, "entry.mjs"), ['import "./prelude.mjs";', 'import W from "./index.js";', 'import { strip } from "./strip.mjs";',
   'export default { fetch(req, env, ctx) { return new W(ctx, env).fetch(strip(req)); } };', ""].join(NL));
 
-// 마이그레이션: 주석 줄을 빼고 ; 로 나눈다
-const MIGRATION = fs.readFileSync(path.join(WORKERS, "trading", "migrations", "0001_create_items_table.sql"), "utf8")
-  .split(/\r?\n/).filter((l) => !l.trim().startsWith("--")).join("\n")
-  .split(";").map((s) => s.trim()).filter(Boolean);
+// 마이그레이션: migrations/ 의 .sql 을 이름 차례로 모두 (wrangler 와 같음). 주석 줄을 빼고 ; 로 나눈다
+const MIGRATION = fs.readdirSync(path.join(WORKERS, "trading", "migrations")).filter((f) => f.endsWith(".sql")).sort()
+  .flatMap((f) => fs.readFileSync(path.join(WORKERS, "trading", "migrations", f), "utf8")
+    .split(/\r?\n/).filter((l) => !l.trim().startsWith("--")).join("\n")
+    .split(";").map((s) => s.trim()).filter(Boolean));
 
 const BUCKET = "logis-bucket", REGION = "ap-northeast-2";
 const S3_HOST = `${BUCKET}.s3.${REGION}.amazonaws.com`;
@@ -90,6 +102,7 @@ function encodeBody(r) {
 
 async function run(variant, scenario) {
   const outbound = [];
+  let commerceCalls = 0; // 시나리오의 commerce(url, n): 이 실행에서 n 번째 팀 확인 (팀이 바뀌는 흐름을 흉내)
   const isTs = variant === "ts";
   const handler = async (req) => {
     const url = new URL(req.url);
@@ -117,7 +130,7 @@ async function run(variant, scenario) {
       return new Response(null, { status: entry.status ?? 200, headers: entry.headers || {} });
     }
     if (url.host === "commerce.logis.center") {
-      const reply = scenario.commerce ? scenario.commerce(url) : { body: { session: {} } };
+      const reply = scenario.commerce ? scenario.commerce(url, commerceCalls++) : { body: { session: {} } };
       const text = typeof reply.body === "string" ? reply.body : JSON.stringify(reply.body);
       return new Response(text, { status: reply.status ?? 200, headers: { "content-type": "application/json" } });
     }
@@ -149,8 +162,10 @@ async function run(variant, scenario) {
     const headers = { ...(r.headers || {}) };
     if (r.cookie) headers.cookie = r.cookie;
     if (r.noCf) headers["x-harness-no-cf"] = "1";
+    // query 가 함수면 앞 응답들로 만든다 (앱처럼 받은 cursor 를 다음 since 로)
+    const query = typeof r.query === "function" ? r.query(responses) : r.query;
     try {
-      const res = await mf.dispatchFetch(`https://trading.logis.center/${r.query ? "?" + r.query : ""}`, {
+      const res = await mf.dispatchFetch(`https://trading.logis.center/${query ? "?" + query : ""}`, {
         method: r.method || "GET", headers, body: encodeBody(r), cf: r.cf === undefined ? { country: "KR" } : r.cf,
       });
       const text = await res.text();

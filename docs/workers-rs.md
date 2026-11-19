@@ -96,6 +96,42 @@ fix-schema-* 는 마이그레이션 대신 코드를 스키마에 맞췄습니�
 지역 DB(`commerce_logis_apac1_*`)에는 적용하지 않기 때문입니다. 운영 지역 DB 에 그 열이 따로 만들어져 있다면 되돌릴 자리입니다.
 닿는 시나리오가 없는 수정(같은 요청 안에서 작업은 `LIMIT 1` 이라 "앞 작업" 누수는 재현되지 않음, `CLIENT_EMBEDDING` 이 참이라 죽은 갈래)은 코드 검토로만 확인했습니다.
 
+## trading (trading-logis-center 65684e6) 고친 버그
+
+`workers/trading` 은 원본과 41/41 같음을 확인한 뒤(370d67a3) 아래를 고쳤습니다. Rust 의 `// 고침 (fix-trading-…)` 과 원본에 덧대는
+`scripts/workers-diff/fixes/trading.mjs` 가 1:1 입니다. `node trading.mjs` 는 고친 원본 · `ORIGINAL=raw` 는 고치지 않은 원본 ·
+`OMIT_FIX=<id>` 는 그 수정 하나만 뺀 고친 원본과 견줍니다(수정은 서로 같은 글을 찾지 않아 하나씩 뺄 수 있음 — DIFF 가 나는 시나리오가
+곧 그 수정이 바꾸는 시나리오). 실제 소비자는 데스크톱 앱(`web/desktop/src/modes/trading.ts` → `proxy_fetch`)뿐이고, 그 GET · POST
+꼴 그대로의 시나리오(`app_*`)가 모두 받아들여짐을 확인합니다.
+
+| id | 원본 자리 | 무엇이 틀렸나 → 고침 |
+| --- | --- | --- |
+| fix-trading-cookie-identity | 484 · 629 · 754 · 991 | Cookie 의 모든 이름을 cookies 에 담아, S3 세션이 실패해도 `address` · `team` 쿠키만으로 남의 팀을 읽고 쓰고 지움 → 머리글에서는 `hash` · `token` 만 |
+| fix-trading-token-required | 548 | S3 token 메타도 요청 token 도 없으면 `null == undefined` 로 hash 만으로 통과, commerce 에 `token=undefined` → 둘 다 있고 같아야 |
+| fix-trading-setcookie-verified | 559 | 확인 안 된 hash · token 을 Set-Cookie 로 되돌려 `?hash=x;%20Domain=logis.center` 로 쿠키 속성 끼워 넣기 → 확인된 세션만 |
+| fix-trading-token-echo | 모든 응답 | 모든 `session`(과 HTML)에 token — HttpOnly 로 감춘 비밀을 본문으로 → 본문에서 뺌 (쓰는 소비자 없음) |
+| fix-trading-html-escape | 619~625 | `<pre>${JSON}</pre>` 반사 XSS (S3 가 200 을 주는 hash 뒤에 `#<script>` 등) → HTML 이스케이프 |
+| fix-trading-cors | 605~609 | 아무 Origin 이나 `Allow-Credentials` 와 함께 반사 → `https://logis.center` · `commerce.` · `trading.` 만 (Origin 없음은 원본 그대로) |
+| fix-trading-options-first | 605~613 | preflight 가 세션 뒤라 OPTIONS 마다 bootstrap S3 PUT → 세션보다 먼저 답함 |
+| fix-trading-upsert-scope | 806~812 · 910~922 | `ON CONFLICT (id) DO UPDATE` 가 팀을 보지 않아 남의 행을 덮어쓰고 가져감 → 사전 조회를 팀 없이 해 다른 팀 id 는 거부 + `WHERE items."to" = EXCLUDED."to"` |
+| fix-trading-preload-chunk | 809~812 | 1 + id 수 바인딩이 100 을 넘으면 D1 이 거절, 오류를 삼켜 SKIP GUARD 가 조용히 꺼짐 → 99건씩 |
+| fix-trading-delta-cursor | 643~668 · 733 · 903 | 클라이언트 시각 `max(updated_at, created_at)` 을 서버 커서와 견주어, 커서보다 옛 시각으로 나중에 들어온 행(오프라인 편집 · 처음 올리는 옛 서류 · 시계 늦은 기기)을 다른 기기가 영영 못 받음, `created_at <` 상한이 시계 빠른 기기 서류를 흘림, LIMIT 에 잘려도 커서를 now 로 → 서버가 쓸 때 찍는 `synced_at`(migrations/0002)으로 고르고 `synced_at, id` 순으로 쪽을 나눔. 꽉 찬 쪽은 마지막 시각의 남은 행을 붙이고 커서를 그 시각으로 |
+| fix-trading-id-case | 800 · 828 · 998 | id 를 trim · 소문자로 저장 — 앱(store.rs)은 id 를 그대로 써서 내려받으면 다른 문서(로컬 두 벌 · 묘비 · 봉투 반영 실패) → 보낸 그대로 (공백뿐인 id 는 거부) |
+| fix-trading-nan-params | 639 · 661 · 858 · 866 | `since=` · `limit=` · `Infinity` 가 `LIMIT NaN` · NaN 바인딩으로 0건(커서도 없음), `created_at: "Infinity"` 가 NULL 로 저장 → 기본값 |
+| fix-trading-team-mismatch | 412 · 452 | 요청 팀 != 확인된 팀이면 본인 팀으로 강등 — 다른 팀 멤버의 서류가 개인 팀에 저장(함수 주석이 막으려던 오염) → 확인된 팀이 본인 팀이면 본인 팀, 아니면 거부. 캐시가 다르면 다시 물음(팀을 옮긴 뒤 5분 강등 없음) |
+| fix-trading-cf-optional | 464 | `request.cf` 가 없으면 try 밖 TypeError 로 처리기가 던짐 → `{}` |
+| fix-trading-relay-order | 298 | `for-in` 순서(정수 키 먼저)가 앱 `find_relay_value`(키 정렬)와 달라 서버 ref ≠ 로컬 ref → 코드 포인트 순 |
+| fix-trading-proto-keys | 476 · 496 · 716 · 797 · 806 · 962 | 평범한 객체 조회: id `constructor` 는 사전 조회에서 빠져 늘 다시 씀, `__proto__` 행이 프로토타입을 바꿈 → `Object.create(null)` · hasOwnProperty |
+| fix-trading-double-decode | 654 · 1004 · 1008 | 이미 풀린 쿼리를 다시 `decodeURIComponent` — `%` 가 든 id 는 URIError(418), `%41` 은 `A` 로 → 한 번만 |
+| fix-trading-inflate-grow | Rust 판만 (jsrt.rs) | pako 흉내 inflate 가 출력 칸(입력 × 4 + 1 KiB)이 차면 'buffer error' — 4배 넘게 줄어든 gzip 본문(앱의 200건 push)을 못 풀어 POST 가 빈 목록 → 칸을 늘려 끝까지 |
+
+클라이언트 쪽 짝: `web/desktop/src/modes/trading.ts` 의 push 커서가 `accepted + skipped` 만 세어, 거부된 행 하나에 커서가 묶였습니다
+(BUG-TR-3) → `!res.error && accepted + skipped + rejected >= batch.length`. 같은 시각이 200건을 넘으면 경계 행을 못 올리는
+BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡니다.
+
+고치지 않은 것: `stableStringify` 는 중첩 객체의 volatile 키도 이미 뺍니다(재귀가 매 단계 거름 — 시나리오 `kv`). 앱의 `digest` 는
+다른 함수(`logis_schema::hash::digest`)라 서버 폴백 값과 원래 같지 않습니다(클라이언트 digest 가 1순위).
+
 ## 알려진 차이 (재현할 수 없거나 관찰되지 않는 것)
 
 - gzip 압축 바이트는 pako 와 다릅니다(miniz_oxide). 푼 글은 같고, 저장 · 비교는 늘 풀어서 하므로 동작은 같습니다.

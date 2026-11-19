@@ -372,8 +372,11 @@ fn inflate_raw(input: &[u8]) -> R<(Vec<u8>, usize)> {
         }
         let in_pos = d.total_in() as usize;
         let out_before = d.total_out();
+        // 고침 (fix-trading-inflate-grow, Rust 판만): Finish 로 부르면 처음 잡은 출력 칸(입력 × 4 + 1 KiB)이 차는 순간
+        // 진전 없이 끝나 'buffer error' 가 되었다 — 4배 넘게 줄어든 gzip 본문(앱이 올리는 200건 JSON 이 그렇다)을 못 풀어
+        // POST 가 빈 목록으로 끝났다. None 으로 부르고 칸을 늘려 가며 끝까지 푼다
         let status = d
-            .decompress_vec(&input[in_pos.min(input.len())..], &mut out, FlushDecompress::Finish)
+            .decompress_vec(&input[in_pos.min(input.len())..], &mut out, FlushDecompress::None)
             .map_err(|_| throw_str("invalid stored block lengths"))?;
         if let Status::StreamEnd = status {
             return Ok((out, d.total_in() as usize));
@@ -556,5 +559,13 @@ mod tests {
         assert!(pako_ungzip(&full[..full.len() - 3]).is_err());
         assert!(pako_ungzip(b"[1,2]").is_err());
         assert!(pako_ungzip(b"").is_err());
+        // fix-trading-inflate-grow: 4배 넘게 줄어든 본문 (처음 잡은 출력 칸을 넘는다)
+        let big: Vec<u8> = (0..200).flat_map(|i| format!("{{\"id\":\"k-{i}\",\"type\":\"BL\",\"data\":{{\"doc_number\":\"K{i}\"}}}},").into_bytes()).collect();
+        let packed = gz(&big);
+        assert!(packed.len() * 4 + 1024 < big.len());
+        assert_eq!(pako_ungzip(&packed).unwrap(), big);
+        assert_eq!(pako_ungzip(&zl(&big)).unwrap(), big);
+        let zeros = vec![0u8; 1 << 20];
+        assert_eq!(pako_ungzip(&gz(&zeros)).unwrap(), zeros);
     }
 }

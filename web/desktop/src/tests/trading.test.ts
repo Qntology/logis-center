@@ -184,7 +184,7 @@ describe("pushTradingData", () => {
     expect(pushed.size).toBe(201);
   });
 
-  it.fails("BUG-TR-3 trading.ts:167 one permanently rejected row freezes the push cursor, so later rows are never sent", async () => {
+  it("BUG-TR-3 (fixed) a permanently rejected row no longer freezes the push cursor", async () => {
     setup(Array.from({ length: 201 }, (_, i) => shippingRow(`r${String(i).padStart(3, "0")}`, i + 1)));
     const accepted = new Set<string>();
     serve({
@@ -197,6 +197,19 @@ describe("pushTradingData", () => {
     });
     for (let i = 0; i < 3; i++) await pushTradingData();
     expect(accepted.has("r200")).toBe(true);
+  });
+
+  it("keeps the push cursor on a failed batch (error) or an unauthenticated reply (all counts 0)", async () => {
+    setup([shippingRow("a", 1), shippingRow("b", 2)]);
+    serve({ push: () => ({ results: [], accepted: 0, skipped: 0, rejected: 2, error: "D1_ERROR" }) });
+    await pushTradingData();
+    expect(env.kv.get("trading_push_cursor")).toBeUndefined();
+    serve({ push: () => ({ results: [], accepted: 0, skipped: 0, rejected: 0 }) });
+    await pushTradingData();
+    expect(env.kv.get("trading_push_cursor")).toBeUndefined();
+    serve({ push: () => ({ results: [], accepted: 1, skipped: 0, rejected: 1 }) });
+    await pushTradingData();
+    expect(env.kv.get("trading_push_cursor")).toBe("2");
   });
 });
 

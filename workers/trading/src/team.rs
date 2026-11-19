@@ -56,8 +56,12 @@ pub async fn resolve_team(_env: &Env, hash: &V, token: &V, address: &V, requeste
                 if loose_eq(&cached.g("team")?, &to) {
                     return Ok(Some(obj! { "team" => to.clone(), "role" => "member" }));
                 }
-                console_log!(tpl(T412, &[to.clone(), cached.g("team")?]));
-                return Ok(Some(obj! { "team" => own.clone(), "role" => "owner" }));
+                // 고침 (fix-trading-team-mismatch): 확인된 팀이 본인 팀일 때만 본인 팀. 다른 팀이면 강등하지 않고
+                // (팀을 옮겼을 수 있으니) 캐시를 버리고 commerce 에 다시 묻는다
+                if loose_eq(&cached.g("team")?, &own) {
+                    return Ok(Some(obj! { "team" => own.clone(), "role" => "owner" }));
+                }
+                console_log!(tpl(T412_FIXED, &[to.clone(), cached.g("team")?]));
             }
         }
         Ok(None)
@@ -108,6 +112,15 @@ pub async fn resolve_team(_env: &Env, hash: &V, token: &V, address: &V, requeste
         let role = if loose_eq(&resolved_team, &own) { "owner" } else { "member" };
         return Ok(obj! { "team" => to, "role" => role });
     }
-    console_log!(tpl(T452, &[to, resolved_team]));
-    Ok(obj! { "team" => own, "role" => "owner" })
+    // 고침 (fix-trading-team-mismatch): 원본은 요청 팀 != 확인된 팀이면 본인 팀으로 강등했다 — 다른 팀의 멤버가 올린
+    // 서류가 개인 팀에 저장되는, 위 주석이 막으려던 바로 그 오염. 확인된 팀이 본인 팀이면 본인 팀, 아니면 거부
+    if loose_eq(&resolved_team, &own) {
+        return Ok(obj! { "team" => own, "role" => "owner" });
+    }
+    console_log!(tpl(T452_FIXED, &[to, resolved_team]));
+    Ok(obj! { "team" => "", "role" => "denied" })
 }
+
+/// 고침 (fix-trading-team-mismatch) 의 로그 글
+const T412_FIXED: &[&str] = &["[TRADING] (cache) 요청 팀 '", "' != 확인된 팀 '", "'. commerce 에 다시 묻습니다."];
+const T452_FIXED: &[&str] = &["[TRADING] 🚫 요청 팀 '", "' != 확인된 팀 '", "'. 거부합니다."];

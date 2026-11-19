@@ -27,11 +27,38 @@ const JSON_CT = { "content-type": "application/json" };
 const b64gz = (o) => gzipSync(Buffer.from(JSON.stringify(o))).toString("base64");
 const arrgz = (o) => Array.from(gzipSync(Buffer.from(JSON.stringify(o))));
 
-// 미리 넣을 행 (data 가 객체면 gzip BLOB)
-const row = (id, over = {}) => ({
-  id, type: "BL", flag: "kr", from: ADDR_A, to: OWN_A, cc: CC, bcc: hashId("BL" + CC), ref: hashId(OWN_A + CC + "#R1"),
-  mode: "shipping", digest: "d-" + id, data: { id, doc_number: id.toUpperCase() }, created_at: T0 - 50000, updated_at: 0, ...over,
+// 미리 넣을 행 (data 가 객체면 gzip BLOB). synced_at 을 주지 않으면 migrations/0002 가 옛 행에 채우는 값과 같게
+const row = (id, over = {}) => {
+  const r = {
+    id, type: "BL", flag: "kr", from: ADDR_A, to: OWN_A, cc: CC, bcc: hashId("BL" + CC), ref: hashId(OWN_A + CC + "#R1"),
+    mode: "shipping", digest: "d-" + id, data: { id, doc_number: id.toUpperCase() }, created_at: T0 - 50000, updated_at: 0, ...over,
+  };
+  if (!("synced_at" in over)) r.synced_at = Math.max(r.created_at ?? 0, r.updated_at ?? 0);
+  return r;
+};
+
+// ── 앱(web/desktop/src/modes/trading.ts tradingApiFetch → apps/core proxy_fetch · reqwest)이 보내는 꼴 그대로 ──
+//  GET  /?hash=&token=&to=<S.team>&since=<저장한 cursor>&created_at=<now+60s 상한>&limit=1000   Content-Type: application/json
+//  POST /?hash=&token=&to=<S.team>   Content-Type: application/json · Content-Encoding: gzip, 본문은 gzip(키를 정렬한 JSON {items:[…]})
+//  (session_params 는 null 이라 proxy_fetch 가 쿼리에 아무것도 더하지 않는다 · Cookie · Origin 없음 · DELETE 는 쓰지 않는다)
+const sortKeys = (v) => (Array.isArray(v) ? v.map(sortKeys) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])])) : v);
+const appQuery = (team, extra = {}) => {
+  const sp = new URLSearchParams();
+  sp.append("hash", HASH_A);
+  sp.append("token", TOKEN_A);
+  if (team) sp.append("to", team);
+  for (const [k, v] of Object.entries(extra)) if (v !== undefined && v !== null && v !== "") sp.append(k, String(v));
+  return sp.toString();
+};
+const APP_UPPER = T0 + 9 * 3600 * 1000 + 60000; // max(now, now - timezoneOffset) + 60 s (KST)
+const appPull = (team, since) => ({ query: typeof since === "function" ? (prev) => appQuery(team, { since: since(prev), created_at: APP_UPPER, limit: 1000 }) : appQuery(team, { since, created_at: APP_UPPER, limit: 1000 }), headers: JSON_CT });
+const appPush = (team, items) => ({
+  method: "POST", query: appQuery(team), headers: { ...JSON_CT, "content-encoding": "gzip" }, gzip: true,
+  // pushTradingData 의 payload: id · type · flag · digest · created_at · updated_at · data (compress_value 가 키를 정렬)
+  body: sortKeys({ items: items.map((r) => ({ id: r.id, type: r.type, flag: r.flag || "", digest: r.digest || "", created_at: r.created_at || 0, updated_at: r.updated_at || 0, data: r.data || {} })) }),
 });
+const lastCursor = (prev) => prev[prev.length - 1].body.cursor;
+const ZERO_TEAM = hashId("0x0000000000000000000000000000000000000000"); // main.ts: session.team 이 없을 때의 자리표
 const ROWS = [
   row("bl-1", { created_at: T0 - 50000, updated_at: 0 }),
   row("ci-1", { type: "CI", bcc: hashId("CI" + CC), created_at: T0 - 40000, updated_at: T0 - 1000 }),
@@ -152,8 +179,9 @@ export const SCENARIOS = [
     requests: [{ method: "POST", cookie: AUTH, body: "not json" }, { method: "POST", cookie: AUTH }, { method: "POST", cookie: AUTH, body: { items: "x" } },
       { method: "POST", cookie: AUTH, body: [] }, { method: "POST", cookie: AUTH, body: "5" }, { method: "POST", cookie: AUTH, body: [1, 2] }] },
   { name: "post_infinity_created_at", s3: S3_A, requests: [{ method: "POST", cookie: AUTH, body: [{ id: "inf-1", type: "BL", data: {}, created_at: "Infinity" }, { id: "ok-1", type: "BL", data: {} }] }] },
-  // D1 배치 실패: 트리거로 한 문장을 막는다 (배치는 원자적이라 모두 안 들어감)
-  { name: "post_batch_error", s3: S3_A, setup: ["CREATE TRIGGER no_boom BEFORE INSERT ON items WHEN NEW.id = 'boom' BEGIN SELECT RAISE(ABORT, 'boom blocked'); END"],
+  // D1 배치 실패: 트리거로 한 문장을 막는다 (배치는 원자적이라 모두 안 들어감). id 를 그대로 두는 fix-trading-id-case 뒤에도
+  // 같은 문장이 막히게 lower() 로
+  { name: "post_batch_error", s3: S3_A, setup: ["CREATE TRIGGER no_boom BEFORE INSERT ON items WHEN lower(NEW.id) = 'boom' BEGIN SELECT RAISE(ABORT, 'boom blocked'); END"],
     requests: [{ method: "POST", cookie: AUTH, body: [{ id: "ok-1", type: "BL", data: {} }, { id: "BOOM", type: "BL", data: {} }, { id: "x", type: "memo" }] }] },
   { name: "delete_batch_error", s3: S3_A, rows: ROWS, setup: ["CREATE TRIGGER keep_bl BEFORE DELETE ON items WHEN OLD.id = 'bl-1' BEGIN SELECT RAISE(ABORT, 'keep bl-1'); END"],
     requests: [{ method: "DELETE", cookie: AUTH, body: ["ci-1", "bl-1"] }, { cookie: AUTH, headers: JSON_CT }] },
@@ -170,4 +198,103 @@ export const SCENARIOS = [
       { cookie: AUTH, headers: JSON_CT }] },
   { name: "delete_over_200", s3: S3_A, rows: ROWS,
     requests: [{ method: "DELETE", cookie: AUTH, body: Array.from({ length: 230 }, (_, i) => (i === 210 ? "sd-1" : `x-${i}`)) }, { cookie: AUTH, headers: JSON_CT }] },
+
+  // ══════════ 버그 수정 (docs/workers-rs.md "고친 버그", fixes/trading.mjs) ══════════
+
+  // ── 앱이 보내는 꼴 그대로 (모두 받아들여야 한다) ──
+  // 본인 팀 · 멤버 팀(commerce 확인) · 자리표 팀(hashId(0x0…0), commerce 가 본인 팀이라 답함)으로 push → pull
+  { name: "app_own_team_cycle", s3: S3_A, rows: ROWS,
+    requests: [appPull(OWN_A, 0),
+      appPush(OWN_A, [{ id: "app-bl-1", type: "BL", created_at: T0 - 3000, updated_at: T0 - 2000, digest: "dg1", data: { header: { doc_number: "BL-9", reference_po: "PO-9" }, text: "t" } },
+        { id: "app-ci-1", type: "CI", created_at: T0 - 3000, updated_at: 0, data: { doc_number: "CI-9", items: [{ reference_bl: "BL-9" }] } }]),
+      appPull(OWN_A, lastCursor),
+      appPush(OWN_A, [{ id: "app-bl-1", type: "BL", created_at: T0 - 3000, updated_at: T0 - 2000, digest: "dg1", data: { header: { doc_number: "BL-9", reference_po: "PO-9" }, text: "t" } }])] },
+  { name: "app_member_team_cycle", s3: S3_A, rows: [row("b-1", { to: TEAM_B })],
+    commerce: () => ({ body: { session: { team: TEAM_B } } }),
+    requests: [appPull(TEAM_B, 0), appPush(TEAM_B, [{ id: "app-m-1", type: "PL", created_at: T0 - 1000, data: { containers: [{ container_number: "MSCU1" }] } }]), appPull(TEAM_B, lastCursor)] },
+  { name: "app_placeholder_team", s3: S3_A, rows: ROWS,
+    commerce: () => ({ body: { session: { team: OWN_A } } }),
+    requests: [appPull(ZERO_TEAM, 0), appPush(ZERO_TEAM, [{ id: "app-z-1", type: "BL", data: {} }]), appPull(ZERO_TEAM, 0)] },
+
+  // fix-trading-delta-cursor: 기기 B 가 당겨 간 뒤 기기 A 가 하루 전에 만든 서류를 처음 올린다 → B 의 다음 pull 이 받아야 한다
+  // (원본: max(updated_at, created_at) 이 B 의 cursor 보다 옛 시각이라 영영 빠짐)
+  { name: "delta_late_upload", s3: S3_A,
+    requests: [appPull(OWN_A, 0),
+      appPush(OWN_A, [{ id: "late-1", type: "BL", created_at: T0 - 86400000, updated_at: T0 - 86400000, data: { doc_number: "L1" } },
+        { id: "late-2", type: "CI", created_at: T0 - 86400000, updated_at: 0, data: { doc_number: "L2" } }]),
+      appPull(OWN_A, lastCursor)] },
+  // fix-trading-delta-cursor: LIMIT 에 잘린 쪽 — 같은 synced_at 은 나누지 않고, 커서는 그 시각에서 이어진다 (원본: now 로 넘겨 남은 행을 잃음)
+  { name: "delta_paging", s3: S3_A,
+    rows: [row("p1", { created_at: T0 - 500000, synced_at: T0 - 500000 }), row("p2", { created_at: T0 - 100000, synced_at: T0 - 400000 }),
+      row("p3", { created_at: T0 - 200000, synced_at: T0 - 400000 }), row("p4", { created_at: T0 - 300000, synced_at: T0 - 400000 }),
+      row("p5", { created_at: T0 - 600000, synced_at: T0 - 300000 }), row("p6", { created_at: T0 + 500000, synced_at: T0 - 200000 })],
+    requests: [{ cookie: AUTH, query: "since=0&limit=2", headers: JSON_CT },
+      { cookie: AUTH, query: (prev) => `since=${lastCursor(prev)}&limit=2`, headers: JSON_CT },
+      { cookie: AUTH, query: (prev) => `since=${lastCursor(prev)}&limit=2`, headers: JSON_CT }] },
+
+  // fix-trading-cookie-identity: S3 세션 없이 address · team 쿠키만으로 쓰기 · 지우기 (원본: 남의 팀 OWN_A 에 쓰고 지움)
+  { name: "cookie_identity_write", rows: ROWS,
+    requests: [{ method: "POST", cookie: `address=0xattacker; team=${OWN_A}`, body: [{ id: "injected", type: "BL", data: {} }] },
+      { method: "DELETE", cookie: `address=0xattacker; team=${OWN_A}; email=e`, query: "id=bl-1" },
+      { cookie: AUTH + `; team=${TEAM_C}; role=owner`, headers: JSON_CT }] },
+
+  // fix-trading-upsert-scope: 다른 팀 행의 id 로 올리기 (원본: TEAM_C 의 행을 덮어쓰고 "to" 를 OWN_A 로 가져감)
+  { name: "post_takeover", s3: S3_A, rows: [row("victim", { to: TEAM_C, data: { secret: 1 } }), row("mine", {})],
+    requests: [appPush(OWN_A, [{ id: "victim", type: "BL", data: { x: 1 } }, { id: "mine", type: "BL", data: { y: 2 } }]), appPull(OWN_A, 0)] },
+
+  // fix-trading-html-escape: S3 가 200 을 주는 hash 에 태그 (token 은 틀림 → bootstrap 없이 그대로 반사)
+  { name: "html_xss", s3: { [HASH_A]: S3_A[HASH_A], "<img src=x onerror=alert(1)>": { status: 200, headers: meta("x@x.io", ADDR_A, "other") } },
+    requests: [{ query: `hash=${encodeURIComponent("<img src=x onerror=alert(1)>")}&token=nope` }, { cookie: AUTH }] },
+
+  // fix-trading-setcookie-verified: 확인하지 않은 hash 로 쿠키 속성 끼워 넣기
+  { name: "setcookie_injection", s3: { [`${HASH_A}; Domain=logis.center; Path=/`]: { status: 200, headers: meta("x@x.io", ADDR_A, "other") } },
+    requests: [{ query: `hash=${encodeURIComponent(`${HASH_A}; Domain=logis.center; Path=/`)}&token=nope`, headers: JSON_CT }] },
+
+  // fix-trading-cors · fix-trading-options-first
+  { name: "cors_origins", s3: S3_A,
+    requests: [{ method: "OPTIONS", headers: { origin: "https://commerce.logis.center", "access-control-request-method": "POST" } },
+      { method: "OPTIONS", headers: { origin: "https://evil.example" } },
+      { method: "OPTIONS" },
+      { cookie: AUTH, headers: { ...JSON_CT, origin: "https://evil.example" } },
+      { cookie: AUTH, headers: { ...JSON_CT, origin: "https://logis.center" } },
+      { cookie: AUTH, headers: { ...JSON_CT, origin: "null" } }] },
+
+  // fix-trading-id-case: 대소문자 · 앞뒤 공백이 든 id 는 앱이 쓰는 그대로 (원본: 소문자로 바꿔 내려줘 앱에 두 벌)
+  { name: "id_case_roundtrip", s3: S3_A,
+    requests: [appPush(OWN_A, [{ id: "Doc-ABC", type: "BL", data: {} }, { id: "doc-abc", type: "BL", data: { other: 1 } }, { id: " pad ", type: "CI", data: {} }, { id: "   ", type: "CI", data: {} }]),
+      appPull(OWN_A, 0),
+      { method: "DELETE", cookie: AUTH, query: "id=Doc-ABC" },
+      { method: "DELETE", cookie: AUTH, body: [" pad "] },
+      appPull(OWN_A, 0)] },
+
+  // fix-trading-double-decode: '%' 가 든 id · 서식
+  { name: "double_decode", s3: S3_A, rows: [row("50%off", {}), row("a%41", {})],
+    requests: [{ method: "DELETE", cookie: AUTH, query: `id=${encodeURIComponent("50%off")}` },
+      { method: "DELETE", cookie: AUTH, query: `ids=${encodeURIComponent(JSON.stringify(["a%41"]))}` },
+      { cookie: AUTH, query: `doc_type=${encodeURIComponent("B%4C")}`, headers: JSON_CT },
+      { cookie: AUTH, headers: JSON_CT }] },
+
+  // fix-trading-relay-order: 정수 꼴 키 — 앱(정렬: "10" < "2")과 원본(for-in: 2 먼저)이 다른 허브를 골랐다
+  { name: "relay_order", s3: S3_A,
+    requests: [appPush(OWN_A, [{ id: "ro-1", type: "CI", data: { "2": { reference_bl: "TWO" }, "10": { reference_bl: "TEN" } } },
+      { id: "ro-2", type: "PL", data: { "가": { container_number: "KOR1" }, z: [{ container_number: "Z1" }] } }])] },
+
+  // fix-trading-team-mismatch: 팀을 옮김 (B 확인 → 캐시 B · 이제 C). 원본은 캐시가 다르면 5분 동안 본인 팀으로 강등
+  { name: "team_moved_cache", s3: S3_A, rows: [row("c-1", { to: TEAM_C }), row("b-1", { to: TEAM_B })],
+    commerce: (url, n) => ({ body: { session: { team: n === 0 ? TEAM_B : TEAM_C } } }),
+    requests: [appPull(TEAM_B, 0), appPull(TEAM_C, 0), appPush(TEAM_C, [{ id: "c-2", type: "BL", data: {} }])] },
+  // 자리표 팀인데 실제 팀은 C → 원본은 본인 팀에 써 C 의 서류가 개인 팀으로 갈라짐
+  { name: "team_placeholder_other", s3: S3_A, rows: ROWS, commerce: () => ({ body: { session: { team: TEAM_C } } }),
+    requests: [appPush(ZERO_TEAM, [{ id: "z-1", type: "BL", data: {} }]), appPull(ZERO_TEAM, 0)] },
+
+  // fix-trading-nan-params: 앱 꼴의 pull 에 since 가 비었을 때 · Infinity 시각
+  { name: "nan_params", s3: S3_A, rows: ROWS,
+    requests: [{ cookie: AUTH, query: "since=Infinity&limit=Infinity", headers: JSON_CT },
+      { method: "POST", cookie: AUTH, body: [{ id: "inf-u", type: "BL", data: {}, created_at: "-Infinity", updated_at: "Infinity" }] },
+      { cookie: AUTH, query: "since=0", headers: JSON_CT }] },
+
+  // fix-trading-preload-chunk: 앱 꼴 200건을 두 번 (두 번째는 모두 SKIP 이어야 한다)
+  { name: "app_push_200_twice", s3: S3_A,
+    requests: [appPush(OWN_A, Array.from({ length: 200 }, (_, i) => ({ id: `k-${i}`, type: "BL", created_at: T0 - 9000, updated_at: T0 - 9000, digest: `dg-${i}`, data: { doc_number: `K${i}` } }))),
+      appPush(OWN_A, Array.from({ length: 200 }, (_, i) => ({ id: `k-${i}`, type: "BL", created_at: T0 - 9000, updated_at: T0 - 9000, digest: `dg-${i}`, data: { doc_number: `K${i}` } })))] },
 ];

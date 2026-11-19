@@ -58,8 +58,8 @@ pub fn hello(language: &V) -> V {
         "English" => "Trading documents are being synchronized",
         "Japanese" => "貿易書類を同期します",
         "Chinese" => "正在同步贸易单据",
-        // 원본 그대로: 평범한 객체라 Object.prototype 의 이름도 읽힌다 (language 가 그런 글일 때)
-        _ => return jsrt::oget(&V::new_obj(), &key),
+        // 고침 (fix-trading-proto-keys): 자기 속성만 본다 (Object.prototype 의 이름은 없는 것)
+        _ => return V::Undef,
     };
     V::from(v)
 }
@@ -72,10 +72,33 @@ pub fn language_code(flag: &V) -> V {
         "jp" => "Japanese",
         "cn" | "tw" | "hk" => "Chinese",
         "us" | "ca" | "gb" | "au" | "nz" | "sg" | "in" | "ph" => "English",
-        // 원본 그대로: FLAG 가 'constructor' · '__proto__' 면 Object.prototype 의 값(참)이 language 가 된다
-        _ => return jsrt::oget(&V::new_obj(), &key),
+        // 고침 (fix-trading-proto-keys): 'constructor' · '__proto__' 같은 FLAG 는 없는 나라 (→ English)
+        _ => return V::Undef,
     };
     V::from(v)
+}
+
+/// 고침 (fix-trading-cors): 자격증명(쿠키)과 함께 응답을 읽어도 되는 출처. 그 밖의 Origin 에는 CORS 허가 머리글을 붙이지 않는다.
+/// 실제 소비자(데스크톱 앱의 proxy_fetch · reqwest)는 Origin 을 보내지 않는다 — 여기 있는 것은 logis.center 의 웹 출처뿐
+pub const ALLOWED_ORIGINS: &[&str] = &["https://logis.center", "https://commerce.logis.center", "https://trading.logis.center"];
+
+/// 고침 (fix-trading-preload-chunk): digest 사전 조회 한 번에 묶는 id 수 (D1 바인딩 상한 100)
+pub const PRELOAD_CHUNK: usize = 99;
+
+/// 고침 (fix-trading-html-escape): `escapeHtml(s)` — `& < > " '` 를 엔티티로
+pub fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// 100~107: `hashId(text)`
@@ -257,7 +280,12 @@ pub fn find_relay_value(data: &V, key: &str) -> String {
         if !direct.is_empty() {
             return direct;
         }
-        for k in data.keys() {
+        // 고침 (fix-trading-relay-order): 앱(logis-pug parsing.rs find_relay_value)처럼 키를 정렬 순서(코드 포인트 =
+        // UTF-8 바이트 순)로 훑는다. JS 의 for-in 순서(정수 키 먼저 · 넣은 순서)는 보낸 JSON 의 키 순서에 따라 바뀌어
+        // 서버 ref 와 로컬 ref 가 갈렸다
+        let mut keys = data.keys();
+        keys.sort();
+        for k in keys {
             let sub = data.get(&k);
             if !sub.truthy() || sub.type_of() != "object" {
                 continue;
@@ -356,5 +384,11 @@ mod tests {
         assert_eq!(find_relay_value(&data, "reference_bl"), "77");
         assert_eq!(resolve_hub_key(&V::from("CI"), &data, &V::from("id1")), "77");
         assert_eq!(resolve_hub_key(&V::from("CI"), &obj! { "doc_number" => "ci-1" }, &V::from("id1")), "CI1");
+        // fix-trading-relay-order: 넣은 순서 · 정수 키와 상관없이 키 정렬 순서 ("10" < "2" < "b" < "가")
+        let data = obj! { "가" => obj!{ "reference_bl" => "K" }, "b" => obj!{ "reference_bl" => "B" }, "2" => arr![obj!{ "reference_bl" => "TWO" }], "10" => obj!{ "reference_bl" => "TEN" } };
+        assert_eq!(find_relay_value(&data, "reference_bl"), "TEN");
+        let data = obj! { "가" => obj!{ "reference_bl" => "K" }, "b" => obj!{ "reference_bl" => "B" } };
+        assert_eq!(find_relay_value(&data, "reference_bl"), "B");
+        assert_eq!(escape_html(r#"<a href="x">&'</a>"#), "&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;");
     }
 }

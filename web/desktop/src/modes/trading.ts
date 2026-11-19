@@ -164,7 +164,10 @@ export async function pushTradingData(): Promise<number> {
     const accepted = Number(res.accepted || 0);
     const skipped = Number(res.skipped || 0);
     const rejected = Number(res.rejected || 0);
-    if (accepted + skipped >= batch.length) {
+    // 🌟 [REJECTED = DONE] 서버가 거부한 행(무역 서식이 아님 · 다른 팀의 id)은 다시 보내도 결과가 같습니다.
+    //    거부를 빼고 세면 그 한 행에 커서가 묶여 뒤의 행이 영영 올라가지 않습니다(BUG-TR-3).
+    //    배치 실패(error) · 미인증(셋 다 0)은 커서를 그대로 두고 다음 회차에 다시 보냅니다.
+    if (!res.error && accepted + skipped + rejected >= batch.length) {
         const maxStamp = batch.reduce((m: number, r: any) => Math.max(m, stampOf(r)), pushedCursor);
         await R.kvSet("trading_push_cursor", String(maxStamp));
     }
