@@ -157,6 +157,18 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
         return Ok(Step::Next);
     }
 
+    // 고침 (fix-member-app-link): 앱 추출의 요청 href 는 proxy_fetch 의 기본값(console — 팀 공통)이지만, 봉투의 link 가 http(s) 주소면
+    // 작업은 그 가게 페이지의 것이다(fix-app-extraction 의 appHref · task.cc) → 그 페이지로 판정한다. "local" 이면 요청 href 그대로
+    if ctx.cookies.g("address")?.truthy() && ctx.cookies.g("team")?.truthy() {
+        if let Some(link) = crate::fixes::app_extraction_link(&ctx.contentEncoding, &ctx.contentType, &req.body) {
+            let owner = crate::fixes::team_owner(env, &ctx.logisRegion.to_key(), &ctx.admin, &ctx.cookies.g("team")?).await?;
+            let member_owner = loose_eq(&ctx.cookies.g("address")?, &owner);
+            let on_link = member_owner
+                || crate::fixes::link_member(env, &ctx.zoneRegion, &ctx.cookies.g("address")?, &ctx.cookies.g("team")?, &link).await?;
+            ctx.member = V::Bool(on_link);
+        }
+    }
+
     // 고침 (fix-member-per-page): 이 페이지의 멤버(팀장 · 페이지 멤버 행 · 팀 공통 페이지 — resolve 1561)만 작업을 넣는다.
     // 원본은 POST 에서 member 를 보지 않았다 (화면 글 · 이미지 · { query, vector } · URL 목록 · 앱 추출 모두)
     if !ctx.member.truthy() {

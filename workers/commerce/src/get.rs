@@ -15,6 +15,7 @@ use logis_worker_common::web::{headers_set, headers_vec, Body, Req, Resp};
 use logis_worker_common::{console_log, eth, loose_eq, obj, parse_str, R, V};
 
 use crate::ctx::Ctx;
+use crate::fixes::{scope_params, scope_sql, SyncScope};
 use crate::flow::Step;
 use crate::render::render_html;
 use crate::templates::*;
@@ -289,9 +290,28 @@ pub async fn run(ctx: &mut Ctx, env: &Env, _req: &Req) -> R<Step> {
     Ok(Step::Return(r))
 }
 
+/// `var memberScope = memberOwner ? null : await memberSyncScope(…)` — fix-member-sync-scope: 팀장(resolve 의 memberOwner 와 같은 판정)이면 None
+async fn sync_scope(ctx: &Ctx, env: &Env) -> R<Option<SyncScope>> {
+    let address = ctx.cookies.g("address")?;
+    let team = ctx.cookies.g("team")?;
+    if team.truthy() {
+        let owner = crate::fixes::team_owner(env, &ctx.logisRegion.to_key(), &ctx.admin, &team).await?;
+        if loose_eq(&address, &owner) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(crate::fixes::member_sync_scope(env, &ctx.zoneRegion, &address, &team, &ctx.homeCc).await?))
+}
+
 /// 2492~2849 `if(member && cookies.address){ … }`
 async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
     let cookies = ctx.cookies.clone();
+
+    // 고침 (fix-member-sync-scope): 원본은 member 이면 팀 · 사이트 단위로 읽어 한 페이지의 멤버가 팀의 다른 페이지 행까지 받았다.
+    // 팀장이 아니면 아래 모든 질의를 멤버 범위(사이트 cc · 페이지 bcc · 페이지 ref)로 묶는다. 팀장은 그대로(None)
+    let scope = sync_scope(ctx, env).await?;
+    let scope = scope.as_ref();
+
     let items_db = tpl(T2496, &[ctx.zoneRegion.clone()]);
 
     // 2494 relate update item
@@ -299,8 +319,11 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
     let stmt = prepare_bound(
         env,
         &items_db,
-        || Ok(format!(r#"SELECT * FROM items WHERE "cc" = ?1 AND "to" = ?2 {condition} AND "updated_at" > 0 ORDER BY created_at DESC LIMIT 100"#)),
-        || Ok(vec![cookies.g("cc")?, cookies.g("team")?]),
+        || {
+            let s = scope_sql(scope, 3);
+            Ok(format!(r#"SELECT * FROM items WHERE "cc" = ?1 AND "to" = ?2 {condition} AND "updated_at" > 0{s} ORDER BY created_at DESC LIMIT 100"#))
+        },
+        || Ok([vec![cookies.g("cc")?, cookies.g("team")?], scope_params(scope)].concat()),
     )?;
     all_into(ctx, stmt).await?;
 
@@ -315,8 +338,11 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
     let stmt = prepare_bound(
         env,
         &items_db,
-        || Ok(format!(r#"SELECT * FROM items WHERE "cc" != ?1 AND "to" = ?2 {condition}  AND "updated_at" > 0 ORDER BY created_at DESC LIMIT 100"#)),
-        || Ok(vec![cookies.g("cc")?, cookies.g("team")?]),
+        || {
+            let s = scope_sql(scope, 3);
+            Ok(format!(r#"SELECT * FROM items WHERE "cc" != ?1 AND "to" = ?2 {condition}  AND "updated_at" > 0{s} ORDER BY created_at DESC LIMIT 100"#))
+        },
+        || Ok([vec![cookies.g("cc")?, cookies.g("team")?], scope_params(scope)].concat()),
     )?;
     all_into(ctx, stmt).await?;
 
@@ -329,8 +355,11 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
     let stmt = prepare_bound(
         env,
         &items_db,
-        || Ok(format!(r#"SELECT * FROM items WHERE "to" = ?1 {condition} AND "updated_at" = 0 ORDER BY created_at DESC LIMIT 100"#)),
-        || Ok(vec![cookies.g("team")?]),
+        || {
+            let s = scope_sql(scope, 2);
+            Ok(format!(r#"SELECT * FROM items WHERE "to" = ?1 {condition} AND "updated_at" = 0{s} ORDER BY created_at DESC LIMIT 100"#))
+        },
+        || Ok([vec![cookies.g("team")?], scope_params(scope)].concat()),
     )?;
     all_into(ctx, stmt).await?;
 
@@ -363,8 +392,11 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
     let stmt = prepare_bound(
         env,
         &logis_db,
-        || Ok(format!(r#"SELECT * FROM tasks WHERE "from" = ?1 AND "cc" = ?2 {condition} ORDER BY created_at DESC LIMIT 10"#)),
-        || Ok(vec![cookies.g("address")?, cookies.g("cc")?]),
+        || {
+            let s = scope_sql(scope, 3);
+            Ok(format!(r#"SELECT * FROM tasks WHERE "from" = ?1 AND "cc" = ?2 {condition}{s} ORDER BY created_at DESC LIMIT 10"#))
+        },
+        || Ok([vec![cookies.g("address")?, cookies.g("cc")?], scope_params(scope)].concat()),
     )?;
     all_into(ctx, stmt).await?;
 
@@ -388,9 +420,10 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
         &talks_db,
         || {
             let c = cond_for(ctx, &ctx.page.g("type")?)?.to_str();
-            Ok(format!(r#"SELECT * FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2 {c} ORDER BY created_at DESC LIMIT 10"#))
+            let s = scope_sql(scope, 3);
+            Ok(format!(r#"SELECT * FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2 {c}{s} ORDER BY created_at DESC LIMIT 10"#))
         },
-        || Ok(vec![cookies.g("cc")?, ctx.itemId.clone()]),
+        || Ok([vec![cookies.g("cc")?, ctx.itemId.clone()], scope_params(scope)].concat()),
     )?;
     all_into(ctx, stmt).await?;
 
@@ -421,8 +454,8 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
         let stmt = prepare_bound(
             env,
             &talks_db,
-            || Ok(r#"SELECT COUNT(*) AS "talks" FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2"#.to_string()),
-            || Ok(vec![cookies.g("cc")?, ctx.itemId.clone()]),
+            || Ok(format!(r#"SELECT COUNT(*) AS "talks" FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2{}"#, scope_sql(scope, 3))),
+            || Ok([vec![cookies.g("cc")?, ctx.itemId.clone()], scope_params(scope)].concat()),
         )?;
         all_into(ctx, stmt).await?;
 
@@ -444,9 +477,10 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
         &talks_db,
         || {
             let c = cond_for(ctx, &ctx.page.g("type")?)?.to_str();
-            Ok(format!(r#"SELECT * FROM talks WHERE "from" = ?1 AND "to" = ?2 {c} ORDER BY created_at DESC LIMIT 10"#))
+            let s = scope_sql(scope, 3);
+            Ok(format!(r#"SELECT * FROM talks WHERE "from" = ?1 AND "to" = ?2 {c}{s} ORDER BY created_at DESC LIMIT 10"#))
         },
-        || Ok(vec![cookies.g("team")?, cookies.g("address")?]),
+        || Ok([vec![cookies.g("team")?, cookies.g("address")?], scope_params(scope)].concat()),
     )?;
     all_into(ctx, stmt).await?;
 
@@ -482,7 +516,7 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
         }
 
         if !ctx.detail.keys_checked()?.is_empty() {
-            detail_rows(ctx, env).await?;
+            detail_rows(ctx, env, scope).await?;
         } else {
             // 2767 list
             let db = tpl(T2770, &[ctx.zoneRegion.clone(), ctx.type_.clone()]);
@@ -492,9 +526,10 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
                 || {
                     let c = cond_for(ctx, &ctx.page.g("type")?)?.to_str();
                     let t = ctx.type_.to_str();
-                    Ok(format!(r#"SELECT * FROM {t} WHERE "to" = ?1 AND "cc" = ?2 AND "bcc" = ?3 {c} ORDER BY created_at DESC LIMIT 100"#))
+                    let s = scope_sql(scope, 4);
+                    Ok(format!(r#"SELECT * FROM {t} WHERE "to" = ?1 AND "cc" = ?2 AND "bcc" = ?3 {c}{s} ORDER BY created_at DESC LIMIT 100"#))
                 },
-                || Ok(vec![cookies.g("team")?, cookies.g("cc")?, ctx.page.g("bcc")?]),
+                || Ok([vec![cookies.g("team")?, cookies.g("cc")?, ctx.page.g("bcc")?], scope_params(scope)].concat()),
             )?;
             all_into(ctx, stmt).await?;
 
@@ -513,7 +548,7 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
 }
 
 /// 2652~2764 `if(Object.keys(detail).length){ … }` (type 이 있을 때)
-async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
+async fn detail_rows(ctx: &mut Ctx, env: &Env, scope: Option<&SyncScope>) -> R<()> {
     let cookies = ctx.cookies.clone();
 
     // 2652 hints
@@ -522,8 +557,11 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
     let stmt = prepare_bound(
         env,
         &items_db,
-        || Ok(format!(r#"SELECT * FROM items WHERE "type" = ?1 AND "digest" = ?2 {condition} ORDER BY created_at DESC LIMIT 1"#)),
-        || Ok(vec![ctx.page.g("type")?, ctx.detail.g("digest")?]),
+        || {
+            let s = scope_sql(scope, 3);
+            Ok(format!(r#"SELECT * FROM items WHERE "type" = ?1 AND "digest" = ?2 {condition}{s} ORDER BY created_at DESC LIMIT 1"#))
+        },
+        || Ok([vec![ctx.page.g("type")?, ctx.detail.g("digest")?], scope_params(scope)].concat()),
     )?;
     all_into(ctx, stmt).await?;
 
@@ -546,11 +584,21 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
         ctx.hints_condition = V::from(ctx.hints_condition.to_str().replacen(" OR ", "", 1));
 
         let db = tpl(T2669, &[ctx.zoneRegion.clone(), ctx.type_.clone()]);
+        let n = hints_params.len() + 1;
         let stmt = prepare_bound(
             env,
             &db,
-            || Ok(tpl(T2670, &[ctx.type_.clone(), ctx.hints_condition.clone(), ctx.condition.clone()])),
-            || Ok(hints_params),
+            || {
+                // 고침 (fix-member-sync-scope): 범위가 있으면 OR 로 이은 조각을 괄호로 묶고 그 뒤에 범위를 붙인다 (조각마다 condition 이 들어 있어 결과는 같다)
+                if scope.is_some() {
+                    let hc = V::from(format!("({})", ctx.hints_condition.to_str()));
+                    let c = V::from(ctx.condition.to_str() + &scope_sql(scope, n));
+                    Ok(tpl(T2670, &[ctx.type_.clone(), hc, c]))
+                } else {
+                    Ok(tpl(T2670, &[ctx.type_.clone(), ctx.hints_condition.clone(), ctx.condition.clone()]))
+                }
+            },
+            || Ok([hints_params, scope_params(scope)].concat()),
         )?;
         all_into(ctx, stmt).await?;
 
@@ -576,9 +624,10 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
         &db,
         || {
             let t = ctx.type_.to_str();
-            Ok(format!(r#"SELECT * FROM {t} WHERE "id" = ?1 {condition} ORDER BY created_at DESC LIMIT 1"#))
+            let s = scope_sql(scope, 2);
+            Ok(format!(r#"SELECT * FROM {t} WHERE "id" = ?1 {condition}{s} ORDER BY created_at DESC LIMIT 1"#))
         },
-        || Ok(vec![ctx.detail.g("id")?]),
+        || Ok([vec![ctx.detail.g("id")?], scope_params(scope)].concat()),
     )?;
     all_into(ctx, stmt).await?;
 
@@ -598,9 +647,10 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
                 &db,
                 || {
                     let c = cond_for(ctx, &ctx.type_)?.to_str();
-                    Ok(format!(r#"SELECT * FROM sales WHERE "goods" = ?1 AND "cc" = ?2 AND "to" = ?3 {c} ORDER BY created_at DESC LIMIT 10000"#))
+                    let s = scope_sql(scope, 4);
+                    Ok(format!(r#"SELECT * FROM sales WHERE "goods" = ?1 AND "cc" = ?2 AND "to" = ?3 {c}{s} ORDER BY created_at DESC LIMIT 10000"#))
                 },
-                || Ok(vec![ctx.s_item.g("index")?, cookies.g("cc")?, cookies.g("team")?]),
+                || Ok([vec![ctx.s_item.g("index")?, cookies.g("cc")?, cookies.g("team")?], scope_params(scope)].concat()),
             )?;
             all_into(ctx, stmt).await?;
 
@@ -616,9 +666,10 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
                     &db,
                     || {
                         let c = cond_for(ctx, &ctx.type_)?.to_str();
-                        Ok(format!(r#"SELECT * FROM tracking WHERE "order" = ?1 AND "to" = ?2 {c} ORDER BY created_at DESC LIMIT 10000"#))
+                        let s = scope_sql(scope, 3);
+                        Ok(format!(r#"SELECT * FROM tracking WHERE "order" = ?1 AND "to" = ?2 {c}{s} ORDER BY created_at DESC LIMIT 10000"#))
                     },
-                    || Ok(vec![ctx.s_item.g("index")?, cookies.g("team")?]),
+                    || Ok([vec![ctx.s_item.g("index")?, cookies.g("team")?], scope_params(scope)].concat()),
                 )?;
                 all_into(ctx, stmt).await?;
 
@@ -634,9 +685,10 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
                     &db,
                     || {
                         let c = cond_for(ctx, &ctx.type_)?.to_str();
-                        Ok(format!(r#"SELECT * FROM tracking WHERE "order" = ?1 AND "to" = ?2 {c} ORDER BY created_at DESC LIMIT 10000"#))
+                        let s = scope_sql(scope, 3);
+                        Ok(format!(r#"SELECT * FROM tracking WHERE "order" = ?1 AND "to" = ?2 {c}{s} ORDER BY created_at DESC LIMIT 10000"#))
                     },
-                    || Ok(vec![ctx.s_item.g("index")?, cookies.g("team")?]),
+                    || Ok([vec![ctx.s_item.g("index")?, cookies.g("team")?], scope_params(scope)].concat()),
                 )?;
                 all_into(ctx, stmt).await?;
 

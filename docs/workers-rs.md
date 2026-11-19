@@ -52,7 +52,7 @@ scripts/workers-diff/       차분 시험대 (아래)
 | linkedom 대조 (`workers/proxy/tests/dom_vectors.rs`) | Pug 452/452 바이트 동일, 선택자 31,027/31,027 (SyntheticData 화면 96 · 경계 56 · 무작위 300). 따로 무작위 6,000 문서도 100 % |
 | pako 대조 (`workers/common/tests/pako_array.rs`) | 430 경우 (93 던짐) 모두 같음 |
 | `cargo test`(common · proxy), `cargo check --target wasm32-unknown-unknown` | 통과, 경고 없음 |
-| 차분 시험 commerce (`node commerce.mjs`) | 고치기 전 원본과 28/28 (370d67a3), 고친 원본과 50/50 (fix-member-per-page 를 빼면 perpage_* 넷만 DIFF) — 응답(상태 · 머리글 · Set-Cookie · 본문) · S3 요청(서명은 aws4fetch 로 다시 계산해 확인) · D1 · S3 끝 상태 |
+| 차분 시험 commerce (`node commerce.mjs`) | 고치기 전 원본과 28/28 (370d67a3), 고친 원본과 54/54 (fix-member-per-page 를 빼면 perpage_* 넷만 DIFF — 그때는 위에 덧댄 둘도 함께 뺌, fix-member-sync-scope 를 빼면 scope_member_a · scope_site_member 와 멤버 동기화가 바뀐 invite_login · perpage_invited · perpage_revoke 만, fix-member-app-link 를 빼면 applink_member_a 만 DIFF) — 응답(상태 · 머리글 · Set-Cookie · 본문) · S3 요청(서명은 aws4fetch 로 다시 계산해 확인) · D1 · S3 끝 상태 |
 | 차분 시험 trading (`node trading.mjs`) | 고치기 전 원본과 41/41 (370d67a3), 고친 원본과 58/58 |
 | `wrangler deploy --dry-run` (두 워커) | 빌드 · 바인딩 확인 통과. proxy 2,547 KiB (gzip 889 KiB), apac 419 KiB (gzip 166 KiB) |
 
@@ -166,6 +166,8 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
 | fix-app-relay | (없던 길) | `/relay/{hash}` 가 없었음 → POST 는 `hash/{hash}` 의 토큰이 맞아야 S3 `relay/{hash}` 에 저장(64 KB 이하 JSON), GET 은 10분 안의 것. 앱(main.ts `sendSignalingMessage`)이 세션을 안 실어 보내던 것도 고침 |
 | fix-app-invite | 1723~1889 | 앱의 초대 PUT(email · ref[] · id 없음 · `results[0].hook` 기대)을 받는 곳이 없었고, 권한 주기가 쓰는 행 꼴과 멤버 판정이 읽는 꼴이 달랐음 → 아래 |
 | fix-member-per-page | 1108 · 1561~1577 · 2000 · 1894 · 2494 | 팀 행(늘 읽힘)이 `member = true` 라 팀원 모두가 모든 페이지의 멤버였고, member 는 GET 동기화만 막았음(POST · PUT 대화는 보지 않음) → 팀장 · 페이지 멤버 · 팀 공통 페이지만 멤버, `cookies.pages` 거름, POST · PUT 대화도 멤버만 (아래 "페이지별 멤버") |
+| fix-member-sync-scope | 2494~2849 | member 이면 동기화가 팀 · 사이트 단위 질의(같은 cc 의 아이템, 다른 cc 의 최근 아이템, 팀 초안, 내 작업, 대화, 힌트, sales · tracking)라 한 페이지의 멤버가 팀의 다른 페이지 행까지 받았음 → 팀장이 아니면 모든 질의에 멤버 범위(`cc` ∈ 사이트 · `bcc` ∈ 페이지 · `ref` ∈ 페이지의 작업/대화 ref)를 바인딩으로 붙임, 팀장은 그대로 (아래 "페이지별 멤버") |
+| fix-member-app-link | 1561 · 1998~ | 앱 추출은 요청 href 가 proxy_fetch 의 기본값(console — 팀 공통)이라 봉투 link 의 가게 페이지에 팀원 누구나 작업을 넣었고, 팀 공통이 homeCc 의 아무 호스트(`*.logis.center`)였음 → link 가 http(s) 면 그 페이지로 판정, 팀 공통은 logis.center · commerce · console 호스트만 |
 
 멤버 초대(사용자 결정: 대기 초대 → 첫 로그인 때 확정):
 
@@ -185,7 +187,8 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
   `cookies.address` 가 팀장이면 모든 페이지의 멤버. 팀 행을 못 읽은 요청(`created_at` 없음)에서도 팀장이면 멤버입니다(원본은 그때 아니었음).
 - 페이지 멤버: 그 밖의 팀원은 멤버 행이 있어야 합니다 — `from` = 나 · `to` = 팀 · `bcc` = 이 페이지의 `cookies.bcc`(`hashId(page.type + cc)`, 상세면 대문자 cc),
   또는 `bcc` = `cookies.cc`(사이트 멤버 행: 그 사이트의 모든 페이지). 바인딩한 원래 두 질의 그대로이고, 페이지(`page`)를 못 찾은 요청이면 멤버가 아닙니다.
-- 팀 공통 페이지: 요청 href 의 도메인 cc(`ccOfHost(url.host)`, 세션 505~517 과 같은 규칙)가 `homeCc` = `hashId('logis.center')` 이면 팀원 누구나 멤버.
+- 팀 공통 페이지: 요청 href 의 호스트가 서비스 자신의 것(`logis.center` · `commerce.logis.center` · `console.logis.center`, `fixes.rs::team_common_host`
+  — fix-member-app-link 가 좁힘, 그 전에는 도메인 cc 가 `homeCc` 인 아무 호스트)이면 팀원 누구나 멤버.
   앱의 클라우드 검색(`href=https://commerce.logis.center/tracking`, `origin=https://commerce.logis.center`)과 추출(`href=https://console.logis.center/`,
   origin 없음 → `cookies.cc` 가 없어 `cookies.cc` 로는 못 가림)이 여기에 듭니다. `homeId`/`pageId` 로는 가릴 수 없습니다(홈 id 는 대문자 cc 로 만들어
   `pageId` 와 같아지지 않고, fix-app-cloud-search 의 `page = home` 은 POST 본문을 읽을 때에야 정해짐). 앱의 페이지 목록에 없어 초대로는 이 페이지의
@@ -201,8 +204,37 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
   검증된 세션의 팀(`cookies.team`)이 있어야 하는 원래 조건으로 충분합니다. (벡터마다 `to` · `cc` 를 덮어쓸 수 있는 것은 원래 동작이고 고치지 않았습니다.)
 - 결과: `users.to` = 팀이지만 팀장이 아니고 멤버 행이 없는 사용자 — 이 변경 전에 들어온 팀원, refs 없이 초대된 사람 — 은 이제 팀 공통 페이지만 봅니다.
   팀장이 권한 주기(PUT `id` = 팀 · `cc` = 팀장 · `ref` = 페이지들)로 페이지를 주어야 합니다. 의도한 결과입니다.
-- 남은 것: `member` 가 참이면 원래의 동기화(2494~2849)는 페이지가 아니라 팀 · 사이트 단위 질의(같은 cc 의 아이템, 다른 cc 의 최근 아이템, 팀 초안)라,
-  한 페이지의 멤버는 동기화로 팀의 다른 페이지 아이템도 받습니다. 앱 추출의 html 봉투는 `link` 의 가게 페이지로 작업을 넣지만 판정은 요청 href(console)로 합니다.
+- 동기화 범위(fix-member-sync-scope): 원래의 동기화(2494~2849)는 `member` 가 참이면 팀 · 사이트 단위로 읽어, 한 페이지의 멤버가 팀의 다른 페이지 행도 받았습니다.
+  팀장이 아니면 그 안의 모든 질의에 멤버 범위를 붙입니다(`fixes.rs::member_sync_scope` · `scope_sql`, 원본 쪽 `memberSyncScope` · `scopeSql`). 팀장은 질의 그대로입니다.
+  - 범위: 그 사람의 멤버 행(`from` = 나 · `to` = 팀) `bcc` 들에서 — `ccs` = `homeCc` + 멤버 행 bcc(사이트 행은 bcc = cc 라 그 사이트 통째),
+    `bccs` = 멤버 행 bcc + 그 bcc 를 가진 팀 페이지 행(`type 'pages'`)의 `hashId(type + cc)` · `hashId(type + 대문자 cc)`(같은 type 의 목록 · 상세 두 꼴 —
+    proxy 는 상세를 읽은 아이템의 bcc 를 대문자 꼴로 옮기고, `memberPages` 도 base.pages 의 type 칸을 두 꼴로 봄), `refs` = `bccs` 에 드는 팀 페이지 행의 `id`
+    (상세 대화의 ref) 와 `hashId(팀 + cc + pathname)` · `hashId(팀 + 대문자 cc + pathname)`(pathname = 페이지 data.link 의 `?` 앞 — 작업 · proxy 대화의 ref).
+  - 행 조건: `("cc" IN ccs OR "bcc" IN bccs OR "ref" IN refs)` 를 각 질의의 ORDER BY 앞에 붙입니다. 목록은 JSON 배열 하나씩을 바인딩하고 `json_each` 로 풉니다
+    (D1 의 바인딩 수 한도 · 빈 목록을 피하려고). 모든 표가 `cc` · `bcc` · `ref` 열을 가지므로 SQL 에서 거르고, 걸러 낸 뒤 버리는 단계는 없습니다
+    (뒤에서 거르면 `LIMIT 10` · `LIMIT 1` 이 범위 밖 행으로 채워져 범위 안 행이 빠짐).
+  - 표마다 페이지를 가리키는 열: items(아이템 · 초안 · 페이지 행 · 멤버 행 — `cc` = 사이트, `bcc` = `hashId(type + cc)`/대문자, 멤버 행은 `cc` = 준 사람이라 `bcc` 로),
+    sales · event · tracking(proxy 가 아이템의 `cc` · `bcc` 를 그대로 씀 — tracking 은 주문 아이템의 것), talks(PUT 대화는 `bcc` = 페이지 bcc,
+    proxy 대화는 작업의 `bcc`(prompt 면 '') · `ref` = 작업 ref 또는 상세 페이지 id), tasks(POST 가 `cc` = 사이트, `bcc` = ''(prompt) 또는
+    `hashId('tracking' + 대문자 cc)`(이미지), `ref` = `hashId(팀 + cc + pathname)` — prompt 작업은 `ref` 로만 페이지가 정해짐).
+  - 고친 질의: 같은 cc 의 아이템 · 다른 cc 의 최근 아이템 · 초안(그래서 `cookies.draft` 도 범위 안 초안만 셈) · 내 작업 · 이 주소의 대화와 그 개수 · 팀이 나에게 보낸 대화 ·
+    힌트 두 질의(두 번째는 OR 조각을 괄호로 묶고 범위를 붙임 — 조각마다 condition 이 있어 결과는 같음) · 상세 행 · 상품의 sales · 주문의 tracking 두 갈래 · 목록.
+  - 그대로 둔 것: 응답의 페이지 목록(1145 · 1256 의 팀 · cc 페이지 행)과 팀 사용자 목록 — 원래 멤버가 아니어도 실리는 목록이고, `cookies.pages` 는 이미 거릅니다.
+- 앱 추출의 페이지(fix-member-app-link): 앱(main.ts 3001~)은 추출 봉투를 `proxy_fetch` 로 보내 요청 href 가 기본값 `https://console.logis.center/` 이고
+  (팀 공통), 봉투의 `link` 는 `currentDetectedUrl`(가게 주소) 또는 `"local"` 입니다. fix-app-extraction 은 link 가 http(s) 면 그 주소로 작업(`task.cc` = 그 호스트의 cc)을
+  넣으므로, 이제 그 주소로 판정합니다(`fixes.rs::app_extraction_link` · `link_member`, POST 의 멤버 검사 바로 앞):
+  팀장이면 멤버, 서비스 호스트면 팀 공통, 아니면 resolve 와 같은 방법 — cc = 그 호스트의 cc, 그 주소의 아이템(`to` = 팀 · `ref` = `hashId(팀 + cc + link)`)이 있으면
+  bcc 가 같은 페이지(상세), 없으면 `id = hashId(cc + pathname)` 인 페이지(팀 페이지에서, 없으면 그 cc 의 페이지에서), 페이지 bcc = `hashId(type + cc)`(상세면 대문자 cc),
+  멤버 행의 bcc 가 그것이거나 cc 면 멤버. 페이지를 못 찾으면 멤버가 아닙니다(resolve 와 같이 사이트 멤버도). link 가 `"local"` 이거나 http(s) 가 아니면(이미지 · 문서의 로컬 파일)
+  요청 href(console)로 판정해 팀 공통 그대로이고, 클라우드 검색(`{query, vector}`, href `/tracking`)은 봉투가 아니라 그대로입니다.
+  팀 공통을 호스트 목록으로 좁힌 까닭: 데스크톱 앱이 보내는 href 는 `commerce.logis.center/tracking`(기본 · localhost 대체), `console.logis.center/`(proxy_fetch 기본),
+  `currentDetectedUrl`(가게 — 팀 공통 아님)뿐이고, 확장(`web/commerce/static/js`)은 요청을 `logis.center` 로 보내며 href 는 보고 있는 가게 주소입니다.
+  commerce.logis.center 의 다른 경로(워커가 그리는 셸 화면)도 쓰이므로 경로까지는 묶지 않았습니다. 그 밖의 `*.logis.center`(trading 등)는 homeCc 라도 팀 공통이 아니고,
+  그런 href 의 페이지는 없으므로 팀장만 씁니다.
+- 원본 쪽 패치는 fix-member-per-page 위에 덧대므로 `COMMERCE_SKIP=fix-member-per-page` 는 `fix-member-sync-scope,fix-member-app-link` 와 함께 줘야 합니다.
+- 남은 것: `?id=` 질의(1020)는 `pageId` 를 바꿔 판정할 페이지를 고를 수 있습니다 — 그 주소에 아이템이 없으면 href 가 다른 페이지여도 `?id=` 의 페이지로 판정합니다
+  (동기화의 행은 범위로 묶여 새지 않지만, POST 작업 · PUT 대화는 href 의 주소로 들어감). proxy 는 처리한 작업 행의 data 를 `{id, flag, team, created_at}` 으로 덮어
+  (`team` 은 팀 행 통째 — base.pages 포함), 그 작업을 만든 멤버는 동기화의 작업 행으로 팀 base.pages 를 봅니다. 둘 다 이번에 고치지 않았습니다.
 
 고치지 않고 적어 둔 것: `cookies.hash` 를 S3 경로에 검증 없이 씀, 홈 id 를 대문자 cc 로 만들어 `pageId` 와 같아지지 않음(클라우드 검색만 보정),
 `?created_at=%20` 의 NaN 이 SQL 로(418), 1474~1558 의 페이지 트리는 결과를 버리는 죽은 코드, POST 가 sender · 잔액 없으면 빈 418,

@@ -343,3 +343,82 @@ SCENARIOS.push(
     POST_TEXT(OTHER_COOKIES, OTHER, HREF_B, "주문 B"),
   ] },
 );
+
+// ---------------------------------------------------------------------------------------------------------------------
+// fix-member-sync-scope: 팀장이 아니면 JSON GET 동기화의 모든 질의가 멤버 범위(사이트 cc · 페이지 bcc · 페이지 작업/대화 ref)만 읽는다.
+// 페이지 A(goods 상세) · B(order 상세)의 행을 모든 표(items · 초안 · tasks · talks · 힌트 · sales · tracking)에 두고, 다른 사이트 · 팀 공통(logis.center) 행도 둔다
+const CC_UP = CC.toUpperCase();
+const BCC_A = hashId("goods" + CC_UP);
+const BCC_A_LIST = hashId("goods" + CC); // 같은 type 의 목록 꼴 — 상세를 읽기 전의 아이템
+const BCC_B = hashId("order" + CC_UP);
+const BCC_O = hashId("goods" + OTHER_CC);
+const BCC_O_ORDER = hashId("order" + OTHER_CC);
+const HOME_BCC = hashId("tracking" + HOME_CC.toUpperCase());
+const ITEM_A = hashId(TEAM + CC + "/goods/view?no=12"); // HREF 의 itemId
+const ITEM_B = hashId(TEAM + CC + "/order/view?no=3"); // HREF_B 의 itemId
+const REF_A = hashId(TEAM + CC + "/goods/view"); // 작업 ref = hashId(팀 + cc + pathname)
+const REF_B = hashId(TEAM + CC + "/order/view");
+const SALES = (values) => ({ db: "commerce_logis_apac1_sales", table: "sales", values: { from: USER, to: TEAM, ref: "", data: { n: 1 }, created_at: T0 - 300000, ...values } });
+const TRACKING = (values) => ({ db: "commerce_logis_apac1_tracking", table: "tracking", values: { type: "tracking", from: USER, to: TEAM, ref: "", data: { no: "1" }, created_at: T0 - 200000, ...values } });
+const TALK = (values) => ({ db: "commerce_logis_apac1_talks", table: "talks", values: { type: "talk", from: USER, to: TEAM, ref: "x", ...values, updated_at: values.created_at } });
+const MEMBER_A = { db: "commerce_logis_apac1_items", table: "items", values: { id: hashId(OTHER + TEAM + BCC_A), type: "member", from: OTHER, to: TEAM, cc: USER,
+  bcc: BCC_A, ref: PAGE_A, data: { name: "lee" }, created_at: T0 - 100000, updated_at: T0 - 100000 } };
+const SCOPE_ROWS = (extra = []) => [...ZONES,
+  ...MEMBERS().map((r) => (r.values.type === "team" ? { ...r, values: { ...r.values, data: { ...r.values.data, base: PERPAGE_BASE() } } } : r)),
+  OTHER_USER,
+  PAGE_ROW(PAGE_A, "goods", { bcc: BCC_A, data: { type: "goods", origin: ORIGIN, link: "/goods/view", detail: true } }),
+  PAGE_ROW(PAGE_B, "order", { bcc: BCC_B, data: { type: "order", origin: ORIGIN, link: "/order/view", detail: true } }),
+  // items: 상세 아이템 A · B, 목록 꼴 A(힌트), 다른 사이트(힌트 · 최근), 팀 공통, 초안 A · B
+  ITEM("0x" + "61".repeat(20), { cc: CC, bcc: BCC_A, ref: ITEM_A, digest: "dgA", created_at: T0 - 500000 }),
+  ITEM("0x" + "62".repeat(20), { cc: CC, bcc: BCC_A_LIST, ref: "ra2", digest: "dgA", created_at: T0 - 450000 }),
+  ITEM("0x" + "63".repeat(20), { type: "order", cc: CC, bcc: BCC_B, ref: ITEM_B, digest: "dgB", created_at: T0 - 440000 }),
+  ITEM("0x" + "64".repeat(20), { cc: OTHER_CC, bcc: BCC_O, ref: "ro1", digest: "dgA", created_at: T0 - 430000 }),
+  ITEM("0x" + "65".repeat(20), { type: "order", cc: OTHER_CC, bcc: BCC_O_ORDER, ref: "ro2", digest: "dgB", created_at: T0 - 420000 }),
+  ITEM("0x" + "66".repeat(20), { type: "tracking", cc: HOME_CC, bcc: HOME_BCC, ref: "rh1", created_at: T0 - 410000 }),
+  ITEM("0x" + "67".repeat(20), { cc: CC, bcc: BCC_A, ref: "rA", updated_at: 0 }),
+  ITEM("0x" + "68".repeat(20), { type: "order", cc: CC, bcc: BCC_B, ref: "rB", updated_at: 0 }),
+  // sales: 상세 행 · 힌트 행, 상품 A(101)의 주문 — A 페이지 것과 B 페이지 것
+  SALES({ id: "0x" + "61".repeat(20), type: "goods", cc: CC, bcc: BCC_A, index: 101 }),
+  SALES({ id: "0x" + "62".repeat(20), type: "goods", cc: CC, bcc: BCC_A_LIST, index: 102 }),
+  SALES({ id: "0x" + "64".repeat(20), type: "goods", cc: OTHER_CC, bcc: BCC_O, index: 103 }),
+  SALES({ id: "0x" + "71".repeat(20), type: "order", cc: CC, bcc: BCC_A, goods: 101, index: 111 }),
+  SALES({ id: "0x" + "72".repeat(20), type: "order", cc: CC, bcc: BCC_B, goods: 101, index: 112 }),
+  SALES({ id: "0x" + "63".repeat(20), type: "order", cc: CC, bcc: BCC_B, index: 201, tracking: 0 }),
+  SALES({ id: "0x" + "65".repeat(20), type: "order", cc: OTHER_CC, bcc: BCC_O_ORDER, index: 202, tracking: 0 }),
+  // tracking: 주문 B(201)의 것 — 이 사이트 · 다른 사이트
+  TRACKING({ id: "0x" + "81".repeat(20), cc: CC, bcc: BCC_B, order: 201 }),
+  TRACKING({ id: "0x" + "82".repeat(20), cc: OTHER_CC, bcc: BCC_O_ORDER, order: 201 }),
+  // tasks(지역 DB): OTHER 의 A · B 작업(prompt 의 bcc 는 '' — ref 로만 페이지가 정해진다), 팀장의 B 작업
+  LOGIS_TASK("0x" + "91".repeat(20), REF_A, OTHER, { type: "prompt", cc: CC }),
+  LOGIS_TASK("0x" + "92".repeat(20), REF_B, OTHER, { type: "prompt", cc: CC }),
+  LOGIS_TASK("0x" + "93".repeat(20), REF_B, USER, { type: "prompt", cc: CC }),
+  // talks: 이 주소(ITEM_A)의 대화 — A 에서 쓴 것 · B 에서 쓴 것, 팀이 OTHER · 팀장에게 보낸 것
+  TALK({ id: "0x" + "4a".repeat(20), cc: CC, bcc: BCC_A, ref: ITEM_A, data: { text: "A 대화" }, created_at: T0 - 100000 }),
+  TALK({ id: "0x" + "4b".repeat(20), cc: CC, bcc: BCC_B, ref: ITEM_A, data: { text: "B 에서 쓴 대화" }, created_at: T0 - 99000 }),
+  TALK({ id: "0x" + "4c".repeat(20), from: TEAM, to: OTHER, cc: CC, bcc: BCC_A, data: { text: "A 로 온 글" }, created_at: T0 - 98000 }),
+  TALK({ id: "0x" + "4d".repeat(20), from: TEAM, to: OTHER, cc: CC, bcc: BCC_B, data: { text: "B 로 온 글" }, created_at: T0 - 97000 }),
+  TALK({ id: "0x" + "4e".repeat(20), from: TEAM, to: OTHER, cc: HOME_CC, bcc: "", data: { text: "팀 공통 글" }, created_at: T0 - 96000 }),
+  TALK({ id: "0x" + "4f".repeat(20), from: TEAM, to: USER, cc: CC, bcc: BCC_B, data: { text: "팀장에게 B" }, created_at: T0 - 95000 }),
+  ...extra];
+// 앱(OTHER)의 추출 봉투 — href 는 proxy_fetch 의 기본값(console)
+const APP_EXTRACT_OTHER = (envelope, extra = {}) => ({ method: "POST", headers: { "Content-Type": "application/json" },
+  gzip: { id: "task_1", from: OTHER, to: TEAM, cc: "", bcc: "", ref: "", link: "local", ...envelope },
+  path: q({ from: OTHER, to: TEAM, ...extra, hash: HASH3, token: TOKEN3, href: "https://console.logis.center/" }) });
+
+SCENARIOS.push(
+  // 페이지 A 의 멤버(멤버 행 bcc = A 의 bcc): A 의 동기화에는 A(목록 꼴 포함) · 팀 공통 행만 — B · 다른 사이트 행은 어느 표에서도 빠진다
+  { name: "scope_member_a", rows: SCOPE_ROWS([MEMBER_A]), s3: S3_PERPAGE, requests: [JGET(OTHER_COOKIES)] },
+  // 같은 데이터에서 팀장은 지금과 같이 전부 (A 상세 · B 상세)
+  { name: "scope_owner", rows: SCOPE_ROWS([MEMBER_A]), s3: S3_PERPAGE, requests: [JSON_GET(), JSON_GET({ href: HREF_B })] },
+  // 사이트 멤버(bcc = cc)는 그 사이트 통째(A · B) + 팀 공통 — 다른 사이트 행은 빠진다
+  { name: "scope_site_member", rows: SCOPE_ROWS([SITE_MEMBER]), s3: S3_PERPAGE, requests: [JGET(OTHER_COOKIES), JGET(OTHER_COOKIES, { href: HREF_B })] },
+  // fix-member-app-link: A 의 멤버가 앱으로 추출 — link 가 B 면 막히고 A 면 받아진다, link 가 "local" 이면 팀 공통(console)으로 받아진다.
+  // 팀 공통은 서비스 호스트만: trading.logis.center 의 화면 글은 homeCc 라도 막힌다
+  { name: "applink_member_a", rows: SCOPE_ROWS([MEMBER_A]), s3: S3_PERPAGE, requests: [
+    APP_EXTRACT_OTHER({ type: "html_extraction", link: HREF_B, body: "<html><body><h1>주문 B</h1></body></html>" }),
+    APP_EXTRACT_OTHER({ type: "html_extraction", link: HREF, body: "<html><body><h1>상품 A</h1></body></html>" }),
+    APP_EXTRACT_OTHER({ type: "image_extraction", body: "data:application/octet-stream;base64,iVBORw0KGgo=" }, { format: encodeURIComponent("image/png") }),
+    { method: "POST", cookies: OTHER_COOKIES, headers: { "Content-Type": "text/html" }, gzip: encodeURIComponent("<html><body><h1>trading</h1></body></html>"),
+      path: q({ origin: "https://trading.logis.center", href: "https://trading.logis.center/x", created_at: T0 + 1000, from: OTHER, to: TEAM }) },
+  ] },
+);
