@@ -1,6 +1,7 @@
 # Cloudflare Workers → workers-rs (2026-11-18 · 버그 수정 2026-11-19)
 
 `workers/proxy`(proxy-commerce-logis-center) · `workers/apac`(commerce-apac-logis-center)의 TypeScript 를 Rust(workers-rs 0.8.7, wasm32)로
+(2026-11-19 에 별도 저장소였던 commerce-logis-center · trading-logis-center 도 `workers/commerce` · `workers/trading` 으로 같은 방법으로)
 다시 썼습니다. 목표는 **원본과 같은 동작**입니다. 같은 SQL, 같은 프롬프트 글, 같은 JSON(키 순서 · 수 표기), 같은 예외 경계를 지키고,
 원본의 버그까지 그대로 옮겨 같음을 확인한 뒤(커밋 2e82ecbb), 버그를 고쳤습니다(아래 "고친 버그"). 원본은 커밋 `801b0ce0` 의
 `workers/*/src/index.ts` 입니다.
@@ -17,6 +18,8 @@ workers/                    자기 Cargo 작업 공간 (wasm32, 루트 작업 �
 │  ├─ js.rs                 D1 · Workers AI · Vectorize · fetch 를 JS 그대로 부름 (wasm 전용)
 │  ├─ gzip.rs               pako ungzip/gzip — D1 숫자 배열 입력에서 pako 가 던지는 자리까지 재현
 │  ├─ date.rs · util.rs · dirty_json.rs · tables.rs · platform.rs
+├─ commerce/                commerce-logis-center: 세션(S3) · 페이지 · 멤버 · 작업 대기열 API (원본 별도 저장소 fd1e991, 아래 "commerce")
+├─ trading/                 trading-logis-center: 무역 문서 동기화 API (원본 65684e6, 새 D1 · migrations/ 는 이 워커 것)
 ├─ apac/                    cron 워커 (lib.rs 하나)
 └─ proxy/                   fetch 워커
    ├─ handler.rs            처리기 뼈대: 머리 · 작업 반복 · 꼬리 · 배치 · 418
@@ -49,6 +52,8 @@ scripts/workers-diff/       차분 시험대 (아래)
 | linkedom 대조 (`workers/proxy/tests/dom_vectors.rs`) | Pug 452/452 바이트 동일, 선택자 31,027/31,027 (SyntheticData 화면 96 · 경계 56 · 무작위 300). 따로 무작위 6,000 문서도 100 % |
 | pako 대조 (`workers/common/tests/pako_array.rs`) | 430 경우 (93 던짐) 모두 같음 |
 | `cargo test`(common · proxy), `cargo check --target wasm32-unknown-unknown` | 통과, 경고 없음 |
+| 차분 시험 commerce (`node commerce.mjs`) | 고치기 전 원본과 28/28 (370d67a3), 고친 원본과 45/45 — 응답(상태 · 머리글 · Set-Cookie · 본문) · S3 요청(서명은 aws4fetch 로 다시 계산해 확인) · D1 · S3 끝 상태 |
+| 차분 시험 trading (`node trading.mjs`) | 고치기 전 원본과 41/41 (370d67a3), 고친 원본과 58/58 |
 | `wrangler deploy --dry-run` (두 워커) | 빌드 · 바인딩 확인 통과. proxy 2,547 KiB (gzip 889 KiB), apac 419 KiB (gzip 166 KiB) |
 
 차분 시험대는 원본(git 이력에서 꺼낸 TS 를 esbuild 로 묶음)과 Rust 빌드를 Miniflare 에서 같은 조건으로 돌립니다:
@@ -132,6 +137,54 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
 고치지 않은 것: `stableStringify` 는 중첩 객체의 volatile 키도 이미 뺍니다(재귀가 매 단계 거름 — 시나리오 `kv`). 앱의 `digest` 는
 다른 함수(`logis_schema::hash::digest`)라 서버 폴백 값과 원래 같지 않습니다(클라이언트 digest 가 1순위).
 
+## commerce (commerce-logis-center fd1e991) 고친 버그
+
+`workers/commerce` 는 원본(HEAD fd1e991 — 1594 줄의 짝 없는 `}else if` 한 곳만 고침, 하네스가 raw 에서도 고침)을 구역별로 옮긴 것입니다:
+`session.rs`(341~965) · `resolve.rs`(966~1593) · `put_delete.rs`(1594~1997) · `post.rs`(1998~2454) · `get.rs`(2455~2869), 고친 동작의 도우미는
+`fixes.rs`. 먼저 원본 버그까지 그대로 옮겨 28/28 같음을 확인했고(370d67a3), 아래를 고쳤습니다. 원본 쪽 패치는
+`scripts/workers-diff/fixes/commerce.mjs` + `commerce_patches.txt`(긴 JS 블록), `COMMERCE_SKIP=<id>` 는 그 수정 하나만 뺍니다.
+
+| id | 원본 자리 | 무엇이 틀렸나 → 고침 |
+| --- | --- | --- |
+| fix-cookie-whitelist | 421~428 | Cookie 머리글을 통째로 믿어 `address` · `team` · `sender` · `balance` · `cc` 를 위조할 수 있었음(지금은 `zoneRegion` 이 비어 우연히 418, 그 전에 `team` 이 SQL 글로 실행) → `hash` · `token` 만 |
+| fix-session-token | 607 | S3 hash 객체에 token 메타가 없으면 `null == undefined` 로 hash 만으로 로그인 → 토큰이 있어야 |
+| fix-sql-bind | 곳곳 | 쿠키 · DB 에서 온 글을 SQL 에 이어 붙임(2172 · 2187 은 큰따옴표) → 바인딩. 검증된 주소 · 수 · 서버 해시는 그대로 |
+| fix-preflight-session | 922 | 쿠키 없는 preflight 마다 새 지갑 + S3 PUT → OPTIONS 는 세션 전에 답함 |
+| fix-cors-methods | 969 | Allow-Methods 에 PUT · DELETE 없음 → 더함 |
+| fix-delete-tasks-db | 1970 | `DELETE FROM tasks` 를 tasks 가 없는 items DB 에 큰따옴표로 → 지역 DB 에서 `ref` · 내 `from` · 내 팀 `to` 로 묶어서 |
+| fix-task-column | 2397 · 2359 | `?error=` 재시도의 ON CONFLICT 가 없는 `"task"` 열 → 실제 열, 그리고 "이미 있음" 조기 반환을 건너뛰어 다시 넣을 수 있게 |
+| fix-coupon-count | 1119 | `data.base.event.coupon`(없음) → `data.base.coupon.count` |
+| fix-tracking-index | 2746 | 지난 반복의 `item.index`(또는 COUNT 행 → `"order" = undefined` 로 418) → `$item.index` |
+| fix-draft-count | 2552 | `undefined++` 가 NaN(JSON null) → 0 부터 |
+| fix-revoke-owner | 1738 · 1768 | `team.from` — `team` 은 팀 이름 글이라 "소유자는 못 내보냄" 검사가 늘 통과 → 팀 행(`admin`) 또는 users 의 팀 행에서 소유자 |
+| fix-link-hoist | 666 | `link` 를 996 줄에서야 정해 `user.ref = hashId(…+undefined)` → 같은 방법으로 먼저 계산 |
+| fix-zone-pool | 700~863 | 빈 자리(pool < 1000) 있는 지역이 없으면 `zoneRegion = ''` 로 사용자를 저장해 영영 `commerce_logis__items` → 만들지 않고 로그인 안 된 세션 |
+| fix-region-fallback | 401 | wrangler 는 APAC DB 만 묶는데 미국 등은 `commerce_logis_enam` 이라 모든 요청 418 → 묶이지 않은 지역은 apac |
+| fix-crons-query | 1414~1468 | `?crons=` JSON 글을 글자마다 돌고, 주소가 없으면 `WHERE  ORDER BY`, 지울 자리를 crons 순번으로 → 배열만 · 98개 · 바인딩 · id 로 지움 |
+| fix-app-cloud-search | 2030 · 2113 | 앱의 `{query, vector}`(from=주소 · to=팀)가 글 갈래로 가 벡터가 버려짐, 검색 작업에 `contentType` 이 없어 proxy 가 `indexOf` 에서 버림 → 방향과 무관하게 질의 갈래, contentType 채움, 홈 페이지 |
+| fix-app-extraction | 1998~ | 앱 추출 POST 는 `created_at` 이 없어 418 → 기본 now, 봉투 `{type, body, link…}` 를 풂: 이미지 = data URL 의 base64 + `image/*`, html = 스캔 갈래, 문서 = `{success:false, error}` (proxy 에 문서 해석기 없음) |
+| fix-app-relay | (없던 길) | `/relay/{hash}` 가 없었음 → POST 는 `hash/{hash}` 의 토큰이 맞아야 S3 `relay/{hash}` 에 저장(64 KB 이하 JSON), GET 은 10분 안의 것. 앱(main.ts `sendSignalingMessage`)이 세션을 안 실어 보내던 것도 고침 |
+| fix-app-invite | 1723~1889 | 앱의 초대 PUT(email · ref[] · id 없음 · `results[0].hook` 기대)을 받는 곳이 없었고, 권한 주기가 쓰는 행 꼴과 멤버 판정이 읽는 꼴이 달랐음 → 아래 |
+
+멤버 초대(사용자 결정: 대기 초대 → 첫 로그인 때 확정):
+
+- 초대 PUT: 검증된 세션 · `from` = 내 팀 · `to` = 나 · 내가 팀 소유자 · 이메일 꼴이면, 지역 DB `users` 에
+  `id = hashId(team + email)` · `type 'invite'` · `from` 초대한 사람 · `to` 팀 · `cc = hashId(email)` · `data = gzip({email, refs, zone, flag, name})` 를
+  upsert 하고 `{results:[{id, table:'users', type:'invite', hook}]}` 로 답합니다. `hook` 은 앱의 기존 기본값(`${hash}.logis.center@oauth.email`) 그대로입니다.
+- 첫 로그인(사용자 행이 아직 없을 때): 그 이메일의 초대가 있으면 새 팀 대신 초대한 팀 · 그 지역으로 들어가고(팀 행 · pool 증가 없음),
+  고른 페이지마다 멤버 행을 만든 뒤 초대 행을 지웁니다.
+- 멤버 행(초대 · 권한 주기 · 내보내기가 같이 씀, 1567 의 판정이 읽는 꼴): `type 'member'` · `from` 멤버 주소 · `to` 팀 · `cc` 준 사람 ·
+  `bcc` = 그 페이지 행의 `bcc`(`hashId(type + cc)`) · `ref` 페이지 id · `id = hashId(member + team + bcc)`.
+- 알아 둘 것: 원본은 팀에 속한 사용자(`users.to` = 팀)면 1108 줄 규칙으로 이미 모든 페이지의 멤버로 봅니다. 그래서 페이지별 권한은 팀 행을
+  읽지 못한 경우에만 의미가 있습니다 — 실제로 페이지별로 막으려면 그 규칙을 바꿔야 합니다(아직 결정 전). 다른 지역(logisRegion)의 초대는 찾지 않습니다.
+
+고치지 않고 적어 둔 것: `cookies.hash` 를 S3 경로에 검증 없이 씀, 홈 id 를 대문자 cc 로 만들어 `pageId` 와 같아지지 않음(클라우드 검색만 보정),
+`?created_at=%20` 의 NaN 이 SQL 로(418), 1474~1558 의 페이지 트리는 결과를 버리는 죽은 코드, POST 가 sender · 잔액 없으면 빈 418,
+DELETE 응답의 Content-Type 없음, POST 성공 응답의 `ref` 에 href.
+
+하네스 한계: 한쪽에만 있는 40 · 64자리 16진 값은 자리표가 되므로, **고치지 않은 원본과 견줄 때** 해시 값만 바뀌는 수정(fix-link-hoist 의
+`users.ref`)은 SAME 으로 보입니다. 고친 원본 vs Rust 비교는 같은 값을 그대로 두므로 영향이 없습니다.
+
 ## 알려진 차이 (재현할 수 없거나 관찰되지 않는 것)
 
 - gzip 압축 바이트는 pako 와 다릅니다(miniz_oxide). 푼 글은 같고, 저장 · 비교는 늘 풀어서 하므로 동작은 같습니다.
@@ -147,3 +200,9 @@ BUG-TR-2(`it.fails`)는 커서 꼴(시각 + id)을 바꿔야 해 그대로 둡�
 `wrangler.json` 의 바인딩 · 이름 · 크론은 그대로이고, `main` 이 `build/index.js`, `build.command` 가
 `cargo install -q worker-build@0.8.7 --locked && worker-build --release` 입니다. 배포 PC 에는 Rust 와 `wasm32-unknown-unknown` 표적이 있어야 합니다.
 `npm run deploy`(predeploy 가 `migrations/` 를 DB 에 적용).
+
+- commerce: 정적 자산(셸 HTML 이 읽는 `static/js/content.js` 등)은 `web/commerce/` 에서 올라갑니다(`assets.directory`). 비밀 값
+  `aws_access_key_id` · `aws_secret_access_key` · `aws_region` · `aws_bucket` 은 `wrangler secret put` 으로(원본과 같음).
+- trading: 아직 배포된 적 없는 워커입니다. `wrangler d1 create trading_logis_center` 로 만든 id 를 `wrangler.json` 의 자리표시
+  `00000000-…` 에 넣고, 위 aws 비밀 네 개를 넣은 뒤 `wrangler d1 migrations apply DB --remote`(0001 · 0002) → `wrangler deploy`.
+  경로는 `trading.logis.center`(custom domain).

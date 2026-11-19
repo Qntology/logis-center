@@ -4859,7 +4859,9 @@ async function sendSignalingMessage(hash: string, payload: any) {
             url: `${API_HOST}/relay/${hash}`,
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: payload // payload is already JSON object or will be stringified
+            body: payload, // payload is already JSON object or will be stringified
+            // 🌟 [RELAY AUTH] 서버는 hash/{hash} 의 토큰이 맞을 때만 offer 를 저장합니다(남이 offer 를 바꿔치기해 연결을 가로채지 못하게).
+            session_params: { hash: currentSession.hash, token: currentSession.token }
         });
     } catch (e) {
         console.error("[WebRTC] Relay send failed:", e);
