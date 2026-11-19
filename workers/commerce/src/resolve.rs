@@ -155,23 +155,6 @@ fn spread_children(x: &V, children: V) -> V {
     out
 }
 
-/// `arr.splice(index, 1)` (지운 것은 버린다)
-fn splice_one(arr: &V, index: &V) -> R<()> {
-    let V::Arr(a) = arr else {
-        return Err(Throw::type_error("tasks.splice is not a function"));
-    };
-    let len = a.borrow().len() as f64;
-    let n = index.to_num();
-    let rel = if n.is_nan() { 0.0 } else { n.trunc() };
-    let start = if rel < 0.0 { (len + rel).max(0.0) } else { rel.min(len) };
-    let start = start as usize;
-    let mut a = a.borrow_mut();
-    if start < a.len() {
-        a.remove(start);
-    }
-    Ok(())
-}
-
 /// 1174~1183 · 1195~1204 · 1287~1296 · 1309~1318 의 세 갈래 (`_page.type` → `type`, 맞는 갈래가 없으면 그대로)
 fn page_kind(t: &V) -> Option<&'static str> {
     let is = |s: &str| loose_eq(t, &V::from(s));
@@ -197,7 +180,8 @@ fn set_kind(ctx: &mut Ctx) -> R<()> {
 pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
     // 968
     headers_set(&ctx.headers, "Access-Control-Allow-Origin", &V::from("*"))?;
-    headers_set(&ctx.headers, "Access-Control-Allow-Methods", &V::from("GET, POST, OPTIONS"))?;
+    // 고침 (fix-cors-methods): 서버가 처리하는 PUT · DELETE 도 (원본은 GET, POST, OPTIONS)
+    headers_set(&ctx.headers, "Access-Control-Allow-Methods", &V::from("GET, POST, PUT, DELETE, OPTIONS"))?;
     headers_set(&ctx.headers, "Access-Control-Allow-Headers", &V::from("Content-Type, Content-Encoding, Authorization, X-Requested-With"))?;
 
     headers_set(&ctx.headers, "Content-Security-Policy", &V::from(tpl(T972, &[ctx.origin.clone()])))?;
@@ -326,8 +310,10 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
     // 1088 — logisRegion 이 없으면 env["undefined"].prepare 로 TypeError
     {
         let db = ctx.logisRegion.to_key();
-        let sql = tpl(T1089, &[ctx.cookies.g("team")?, ctx.created_at.clone()]);
-        let out = js::all(&env.prepare(&db, &sql)?).await?;
+        // 고침 (fix-sql-bind): 값은 묶는다 (수인 created_at 만 글에)
+        let sql = format!(r#"SELECT * FROM users WHERE "to" = ?1 AND "created_at" < {} ORDER BY created_at DESC LIMIT 10"#, ctx.created_at.to_str());
+        let stmt = env.prepare(&db, &sql)?;
+        let out = js::all(&js::bind(&stmt, &[ctx.cookies.g("team")?])?).await?;
         ctx.results = out.g("results")?;
         ctx.success = out.g("success")?;
         ctx.error = out.g("error")?;
@@ -362,8 +348,9 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
                 ctx.cookies.s_("order", ctx.data.g("base")?.g("order")?.g("count")?)?;
                 ctx.cookies.s_("tracking", ctx.data.g("base")?.g("tracking")?.g("count")?)?;
                 ctx.cookies.s_("event", ctx.data.g("base")?.g("event")?.g("count")?)?;
-                // 원본 그대로: coupon 은 event.coupon (count 가 아님)
-                ctx.cookies.s_("coupon", ctx.data.g("base")?.g("event")?.g("coupon")?)?;
+                // 고침 (fix-coupon-count): 원본은 event.coupon (없는 칸) — 팀 base 의 coupon 은 event 와 나란한 { draft, count }. 옛 팀은 0
+                let coupon = ctx.data.g("base")?.g("coupon")?;
+                ctx.cookies.s_("coupon", if coupon.truthy() { coupon.g("count")? } else { V::Num(0.0) })?;
             }
 
             ctx.users.push(ctx.user.clone())?;
@@ -395,15 +382,16 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
 
         if !ctx.member.truthy() {
             let db = tpl(T1567, &[ctx.zoneRegion.clone()]);
-            let sql = tpl(T1567_1, &[ctx.cookies.g("address")?, ctx.cookies.g("team")?, ctx.cookies.g("bcc")?]);
-            ctx.results = js::query(env, &db, &sql).await?;
+            // 고침 (fix-sql-bind)
+            let sql = r#"SELECT * FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 AND "bcc" = ?3 LIMIT 1"#;
+            ctx.results = js::query_bound(env, &db, sql, &[ctx.cookies.g("address")?, ctx.cookies.g("team")?, ctx.cookies.g("bcc")?]).await?;
 
             if ctx.results.g("length")?.truthy() {
                 ctx.member = V::Bool(true);
             } else {
                 let db = tpl(T1572, &[ctx.zoneRegion.clone()]);
-                let sql = tpl(T1572_1, &[ctx.cookies.g("address")?, ctx.cookies.g("team")?, ctx.cookies.g("cc")?]);
-                ctx.results = js::query(env, &db, &sql).await?;
+                let sql = r#"SELECT * FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 AND "bcc" = ?3 LIMIT 1"#;
+                ctx.results = js::query_bound(env, &db, sql, &[ctx.cookies.g("address")?, ctx.cookies.g("team")?, ctx.cookies.g("cc")?]).await?;
 
                 if ctx.results.g("length")?.truthy() {
                     ctx.member = V::Bool(true);
@@ -424,8 +412,9 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
 async fn signed_in(ctx: &mut Ctx, env: &Env) -> R<()> {
     // 1132 — 원본 그대로: zoneRegion 이 '' 면 env["commerce_logis__items"]
     let items_db = tpl(T1132, &[ctx.zoneRegion.clone()]);
-    let sql = tpl(T1132_1, &[ctx.cookies.g("team")?, ctx.itemId.clone()]);
-    ctx.results = js::query(env, &items_db, &sql).await?;
+    // 고침 (fix-sql-bind)
+    let sql = r#"SELECT * FROM items WHERE "to" = ?1 AND "ref" = ?2 LIMIT 1"#;
+    ctx.results = js::query_bound(env, &items_db, sql, &[ctx.cookies.g("team")?, ctx.itemId.clone()]).await?;
 
     if ctx.results.g("length")?.truthy() {
         ctx.detail = ctx.results.gi(0)?;
@@ -437,8 +426,9 @@ async fn signed_in(ctx: &mut Ctx, env: &Env) -> R<()> {
 
     // 1145
     let items_db = tpl(T1145, &[ctx.zoneRegion.clone()]);
-    let sql = tpl(T1145_1, &[ctx.cookies.g("team")?]);
-    ctx.results = js::query(env, &items_db, &sql).await?;
+    // 고침 (fix-sql-bind)
+    let sql = r#"SELECT * FROM items WHERE "type" = 'pages' AND "to" = ?1 LIMIT 100"#;
+    ctx.results = js::query_bound(env, &items_db, sql, &[ctx.cookies.g("team")?]).await?;
 
     console_log!("page results.length", ctx.results.g("length")?);
 
@@ -497,8 +487,9 @@ async fn signed_in(ctx: &mut Ctx, env: &Env) -> R<()> {
     // 1256
     if ctx.page.keys_checked()?.is_empty() {
         let items_db = tpl(T1257, &[ctx.zoneRegion.clone()]);
-        let sql = tpl(T1257_1, &[ctx.cookies.g("cc")?, ctx.created_at.clone()]);
-        ctx.results = js::query(env, &items_db, &sql).await?;
+        // 고침 (fix-sql-bind)
+        let sql = format!(r#"SELECT * FROM items WHERE "type" = 'pages' AND "cc" = ?1 AND "created_at" < {} LIMIT 100"#, ctx.created_at.to_str());
+        ctx.results = js::query_bound(env, &items_db, &sql, &[ctx.cookies.g("cc")?]).await?;
 
         if ctx.results.g("length")?.truthy() {
             ctx.statements = V::new_arr();
@@ -624,72 +615,46 @@ async fn signed_in(ctx: &mut Ctx, env: &Env) -> R<()> {
         }
     }
 
-    // 1414
+    // 1414 — 고침 (fix-crons-query): 원본은 글 JSON 이면 글자마다 돌았고, 주소가 없으면 "WHERE  ORDER BY" 로 던졌고,
+    // 지울 자리를 crons 의 자리(tasks 의 자리가 아님)로 골라 지울 때마다 뒤 자리가 당겨졌다 → 배열의 주소만(겹침 없이), 묶은 IN 질의, id 로 뺀다
     if ctx.req.g("query")?.g("crons")?.truthy() {
         let r: R<()> = async {
             ctx.crons = parse_str(&ctx.req.g("query")?.g("crons")?.to_str())?;
 
-            // 원본 그대로: JSON 이 글이면 그 길이만큼 글자를 돈다
-            if ctx.crons.g("length")?.truthy() {
-                ctx.cron_condition = V::from("");
+            if ctx.crons.is_arr() && ctx.crons.g("length")?.truthy() {
+                let cron_ids = crate::fixes::address_list(&ctx.crons, 98);
 
-                // 원본 그대로: `var tasks` · `var temp` 를 다시 대입한다(앞의 temp 는 버려진다)
                 ctx.tasks = V::new_arr();
 
-                ctx.temp = V::new_obj();
-
-                ctx.c = V::Num(0.0);
-                while less_than(&ctx.c, &ctx.crons.g("length")?) == Some(true) {
-                    ctx.cron = V::from(lower(&ctx.crons.gk(&ctx.c)?, "crons[c]")?);
-
-                    if eth::is_address(&ctx.cron) {
-                        let piece = tpl(T1429, &[ctx.cron.clone(), ctx.cookies.g("address")?, ctx.now.clone()]);
-                        ctx.cron_condition = add(&ctx.cron_condition, &V::from(piece));
-
-                        ctx.temp.sk(&ctx.cron, ctx.c.clone())?;
-
-                        ctx.tasks.push(obj! {
-                            "id" => ctx.cron.clone(),
-                            "table" => "tasks",
-                            "type" => "",
-                            "from" => "",
-                            "to" => "",
-                            "cc" => "",
-                            "bcc" => "",
-                            "ref" => "",
-                            "data" => V::Null,
-                            "created_at" => ctx.now.clone(),
-                            "updated_at" => ctx.now.clone(),
-                        })?;
-                    }
-
-                    ctx.c = V::Num(ctx.c.to_num() + 1.0);
+                for id in &cron_ids {
+                    ctx.tasks.push(obj! {
+                        "id" => id.as_str(),
+                        "table" => "tasks",
+                        "type" => "",
+                        "from" => "",
+                        "to" => "",
+                        "cc" => "",
+                        "bcc" => "",
+                        "ref" => "",
+                        "data" => V::Null,
+                        "created_at" => ctx.now.clone(),
+                        "updated_at" => ctx.now.clone(),
+                    })?;
                 }
 
-                // `replace(' OR ','')` — 첫 번째만
-                ctx.cron_condition = V::from(ctx.cron_condition.to_str().replacen(" OR ", "", 1));
+                if !cron_ids.is_empty() {
+                    let marks: Vec<String> = (0..cron_ids.len()).map(|n| format!("?{}", n + 3)).collect();
+                    let sql = format!(r#"SELECT "id" FROM tasks WHERE "from" = ?1 AND "created_at" < ?2 AND "id" IN ({})"#, marks.join(", "));
+                    let mut params = vec![ctx.cookies.g("address")?, ctx.now.clone()];
+                    params.extend(cron_ids.iter().map(|id| V::from(id.as_str())));
+                    let db = ctx.logisRegion.to_key();
+                    let out = js::all(&js::bind(&env.prepare(&db, &sql)?, &params)?).await?;
+                    ctx.results = out.g("results")?;
+                    ctx.success = out.g("success")?;
 
-                // 원본 그대로: 주소가 하나도 없으면 "WHERE  ORDER BY" 로 D1 이 던진다(아래 catch 가 삼킴)
-                let db = ctx.logisRegion.to_key();
-                let sql = tpl(T1451, &[ctx.cron_condition.clone(), ctx.crons.g("length")?]);
-                let out = js::all(&env.prepare(&db, &sql)?).await?;
-                ctx.results = out.g("results")?;
-                ctx.success = out.g("success")?;
-
-                if ctx.results.g("length")?.truthy() {
-                    ctx.i = V::Num(0.0);
-                    while less_than(&ctx.i, &ctx.results.g("length")?) == Some(true) {
-                        ctx.cron = ctx.results.gk(&ctx.i)?;
-
-                        ctx.index = ctx.temp.gk(&ctx.cron.g("id")?)?;
-
-                        // 원본 그대로: index 는 crons 의 자리라 tasks 의 자리와 다를 수 있고, 지울 때마다 뒤 자리가 당겨진다
-                        if ctx.index.type_of() != "undefined" {
-                            splice_one(&ctx.tasks, &ctx.index)?;
-                        }
-
-                        ctx.i = V::Num(ctx.i.to_num() + 1.0);
-                    }
+                    let found: Vec<String> = ctx.results.items().iter().map(|row| row.get("id").to_str()).collect();
+                    let kept: Vec<V> = ctx.tasks.items().into_iter().filter(|t| !found.contains(&t.get("id").to_str())).collect();
+                    ctx.tasks = V::from(kept);
                 }
             }
             Ok(())

@@ -211,6 +211,11 @@ pub async fn head(ctx: &mut Ctx, env: &Env, req: &Req) -> R<()> {
     // 401 — country 가 없으면 TypeError (try 밖)
     ctx.FLAG = V::from(lower(&ctx.geoInfo.g("country")?, "geoInfo.country")?);
     ctx.logisRegion = lookup(LOGIS_REGION, &ctx.FLAG);
+
+    // 고침 (fix-region-fallback): wrangler 는 APAC 지역 DB 만 묶는다 — 묶이지 않은 지역(US → commerce_logis_enam 등)은 모든 요청이 418 이었다
+    if !ctx.logisRegion.truthy() || env.get(&ctx.logisRegion.to_key()).is_undef() {
+        ctx.logisRegion = V::from("commerce_logis_apac");
+    }
     ctx.zoneRegion = V::from("");
     ctx.language = lookup(LANGUAGE_CODE, &ctx.FLAG);
 
@@ -234,7 +239,10 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
             if parts.len() == 2 {
                 let key = parts[0].trim_matches(logis_worker_common::jsv::is_js_space);
                 let value = parts[1].trim_matches(logis_worker_common::jsv::is_js_space);
-                ctx.cookies.s_(key, V::from(value))?;
+                // 고침 (fix-cookie-whitelist): 머리글에서 믿는 쿠키는 세션 키(hash · token)뿐 — address · team · sender · balance · cc … 는 세션이 다시 만든다
+                if key == "hash" || key == "token" {
+                    ctx.cookies.s_(key, V::from(value))?;
+                }
             }
         }
     }
@@ -468,8 +476,9 @@ async fn session(ctx: &mut Ctx, env: &Env, query: &V) -> R<()> {
         }
     }
 
-    // 607 — 원본 그대로: `==` 라 S3 에 token 이 없고(null) 쿠키에도 없으면(undefined) 같다고 본다
-    if ctx.email.truthy() && loose_eq(&ctx.token, &cookies.get("token")) {
+    // 607 — 고침 (fix-session-token): 원본은 `==` 라 S3 에 token 이 없고(null) 요청에도 없으면(undefined) 같다고 봐서,
+    // token 없는 hash 객체는 hash 만으로 로그인됐다 → S3 의 token 이 있어야 한다
+    if ctx.email.truthy() && ctx.token.truthy() && loose_eq(&ctx.token, &cookies.get("token")) {
         cookies.s_("email", ctx.email.clone())?;
 
         if ctx.phone.truthy() {
@@ -482,8 +491,9 @@ async fn session(ctx: &mut Ctx, env: &Env, query: &V) -> R<()> {
 
         // 621 — logisRegion 이 없으면 env["undefined"].prepare 로 TypeError
         let db = ctx.logisRegion.to_key();
-        let sql = tpl(T621, &[cookies.get("address"), cookies.get("address")]);
-        ctx.results = js::all(&env.prepare(&db, &sql)?).await?.g("results")?;
+        // 고침 (fix-sql-bind): 값은 묶는다
+        let sql = r#"SELECT * FROM users WHERE "type" = 'user' AND "id" = ?1 AND "from" = ?1 LIMIT 1"#;
+        ctx.results = js::query_bound(env, &db, sql, &[cookies.get("address")]).await?;
 
         ctx.teamId = V::from(hash_id(&cookies.get("address"))?);
 
@@ -579,8 +589,9 @@ async fn existing_user(ctx: &mut Ctx, env: &Env, cookies: &V, query: &V, db: &st
 
     user.s_("cc", cookies.get("cc"))?;
 
-    // 666 — 원본 그대로: `link` 는 996 에서야 대입되는 var 라 여기선 undefined ("…undefined" 를 해시)
-    let ref_text = add(&add(&cookies.get("team"), &cookies.get("cc")), &ctx.link);
+    // 666 — 고침 (fix-link-hoist): 원본의 `link` 는 996 에서야 대입되는 var 라 여기선 undefined ("…undefined" 를 해시) → 996 과 같은 값
+    let link = crate::fixes::page_link(&ctx.href.to_str(), &ctx.origin.to_str());
+    let ref_text = add(&add(&cookies.get("team"), &cookies.get("cc")), &V::from(link));
     user.s_("ref", V::from(hash_id(&ref_text)?))?;
 
     // 668 `gzip(…, { to: 'arraybuffer' }).buffer`
@@ -626,6 +637,11 @@ async fn new_user(ctx: &mut Ctx, env: &Env, cookies: &V, db: &str) -> R<()> {
     ctx.domains = V::from(logis_region.split('_').map(V::from).collect::<Vec<_>>());
     ctx.regionCode = ctx.domains.gi(2)?;
 
+    // 고침 (fix-app-invite): 초대받은 이메일이면 새 팀 대신 초대한 팀에 들어간다
+    if let Some(invite) = find_invite(env, db, &email_str).await {
+        return join_invite(ctx, env, cookies, db, &invite).await;
+    }
+
     // 696
     ctx.results = js::query(env, CENTER_REGION, T696[0]).await?;
 
@@ -662,6 +678,13 @@ async fn new_user(ctx: &mut Ctx, env: &Env, cookies: &V, db: &str) -> R<()> {
         }
 
         ctx.z = V::Num(ctx.z.to_num() + 1.0);
+    }
+
+    // 고침 (fix-zone-pool): 자리가 남은 zone 이 없으면 사용자를 만들지 않는다 (원본은 region '' 로 만들어 commerce_logis__items 를 찾다
+    // 영영 깨졌다). 던지면 세션이 오류 쿠키로 바뀌어 로그인하지 않은 채로 남는다
+    if ctx.pool.is_undef() {
+        console_log!("no zone with room", ctx.regionCode);
+        return Err(Throw::error(format!("no zone with room for {}", ctx.regionCode.to_str())));
     }
 
     // 725
@@ -780,12 +803,113 @@ async fn new_user(ctx: &mut Ctx, env: &Env, cookies: &V, db: &str) -> R<()> {
     let r: R<()> = async {
         env.batch(db, &ctx.statements).await?;
 
-        // 원본 그대로: 맞는 zone 이 없으면 pool 은 undefined 라 pool+1 = NaN, zoneRegion 은 ''
+        // 맞는 zone 이 없으면 위(fix-zone-pool)에서 이미 던졌다
         let stmt = js::bind(&env.prepare(CENTER_REGION, T856[0])?, &[ctx.zoneRegion.clone(), add(&ctx.pool, &V::Num(1.0))])?;
         js::run(&stmt).await?;
         Ok(())
     }
     .await;
     let _ = r;
+    Ok(())
+}
+
+/// fix-app-invite: `SELECT * FROM users WHERE "type" = 'invite' AND "cc" = ?1 ORDER BY created_at DESC LIMIT 1` (cc = hashId(소문자 이메일)).
+/// data 를 풀어 zone 과 팀(to)이 있어야 초대로 본다. 던지면 원본 패치처럼 없는 것으로 ('invite err')
+async fn find_invite(env: &Env, db: &str, email: &str) -> Option<V> {
+    let r: R<Option<V>> = async {
+        let cc = hash_id(&V::from(to_lower(email)))?;
+        let sql = r#"SELECT * FROM users WHERE "type" = 'invite' AND "cc" = ?1 ORDER BY created_at DESC LIMIT 1"#;
+        let results = js::query_bound(env, db, sql, &[V::from(cc)]).await?;
+        if !results.g("length")?.truthy() {
+            return Ok(None);
+        }
+        let invite = results.gi(0)?;
+        let data = parse_str(&decode_utf8(&ungzip(&invite.g("data")?)?))?;
+        invite.s_("data", data.clone())?;
+        if !data.truthy() || !data.g("zone")?.truthy() || !invite.g("to")?.truthy() {
+            return Ok(None);
+        }
+        Ok(Some(invite))
+    }
+    .await;
+    match r {
+        Ok(v) => v,
+        Err(err) => {
+            console_log!("invite err", err);
+            None
+        }
+    }
+}
+
+/// fix-app-invite: 초대한 팀에 들어간다 — 사용자 행(to = 초대의 팀, region = 초대의 zone), 초대한 페이지마다 멤버 행, 초대 행 지우기.
+/// 팀 행 · zones.pool 은 건드리지 않는다. 쓰기가 던지면 삼킨다('invite join err' — 다음 로그인에서 다시 한다)
+async fn join_invite(ctx: &mut Ctx, env: &Env, cookies: &V, db: &str, invite: &V) -> R<()> {
+    ctx.zoneRegion = invite.g("data")?.g("zone")?;
+
+    ctx.user_arr = gzip_json(&obj! {
+        "flag" => ctx.FLAG.clone(),
+        "name" => ctx.name.clone(),
+        "title" => "",
+        "region" => ctx.zoneRegion.clone(),
+        "page_count" => 0,
+        "favicon" => V::Null,
+    })?;
+
+    ctx.user = obj! {
+        "id" => cookies.get("address"),
+        "type" => "user",
+        "from" => cookies.get("address"),
+        "to" => invite.g("to")?,
+        "cc" => "",
+        "bcc" => "",
+        "ref" => "",
+        "data" => ctx.user_arr.clone(),
+        "created_at" => ctx.now.clone(),
+        "updated_at" => ctx.now.clone(),
+    };
+
+    cookies.s_("name", ctx.name.clone())?;
+    cookies.s_("team", invite.g("to")?)?;
+
+    let r: R<()> = async {
+        let refs = crate::fixes::address_list(&invite.g("data")?.g("refs")?, 50);
+        let (statements, _rows) = crate::fixes::member_statements(
+            env,
+            &ctx.zoneRegion,
+            &cookies.get("address"),
+            &invite.g("to")?,
+            &invite.g("from")?,
+            &refs,
+            &ctx.user_arr,
+            &ctx.now,
+        )
+        .await?;
+        if statements.g("length")?.truthy() {
+            env.batch(&format!("commerce_logis_{}_items", ctx.zoneRegion.to_str()), &statements).await?;
+        }
+
+        let user = ctx.user.clone();
+        let fields = [
+            user.g("id")?,
+            user.g("type")?,
+            user.g("from")?,
+            user.g("to")?,
+            user.g("cc")?,
+            user.g("bcc")?,
+            user.g("ref")?,
+            user.g("data")?,
+            user.g("created_at")?,
+            user.g("updated_at")?,
+        ];
+        let list = V::new_arr();
+        list.push(js::bind(&env.prepare(db, T845[0])?, &fields)?)?;
+        list.push(js::bind(&env.prepare(db, r#"DELETE FROM users WHERE "id" = ?1 AND "type" = 'invite'"#)?, &[invite.g("id")?])?)?;
+        env.batch(db, &list).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(err) = r {
+        console_log!("invite join err", err);
+    }
     Ok(())
 }

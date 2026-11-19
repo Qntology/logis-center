@@ -1,4 +1,5 @@
 // commerce 차분 시험의 시나리오: D1 행 · S3 객체(메타) · 차례로 보낼 요청들
+import { ethers } from "ethers";
 export const AWS = { aws_access_key_id: "AKIDTESTKEY", aws_secret_access_key: "testsecret", aws_region: "ap-northeast-2", aws_bucket: "logis-test" };
 
 const T0 = 1760000000000;
@@ -146,3 +147,125 @@ export const SCENARIOS = [
     { method: "GET", jar: true, path: "/" },
   ] },
 ];
+
+// ---------------------------------------------------------------------------------------------------------------------
+// 고친 버그(fix-*)마다의 시나리오 — 고친 원본 · Rust 는 SAME, ORIGINAL=raw(또는 COMMERCE_SKIP=<id>)면 그 수정이 닿는 곳에서 DIFF
+const hashId = (text) => ethers.computeAddress(ethers.hashMessage(text)).toLowerCase();
+const ZERO = "0x" + "0".repeat(40);
+const CC = hashId("example.com"); // shop.example.com 의 cc
+const HOME_ORIGIN = "https://commerce.logis.center";
+const HOME_HREF = "https://commerce.logis.center/tracking";
+const HASH2 = "a7".repeat(20);
+const TOKEN2 = "b8".repeat(32);
+const NEWADDR = "0x" + "e9".repeat(20);
+const HASH3 = "c4".repeat(20);
+const TOKEN3 = "d5".repeat(32);
+const PAGE1 = hashId(CC + "/goods/view"); // HREF 의 pageId
+const PAGE2 = "0x" + "5a".repeat(20);
+const PAGE_ROW = (id, type, over = {}) => ({ db: "commerce_logis_apac1_items", table: "items", values: { id, type: "pages", from: USER, to: TEAM, cc: CC,
+  bcc: hashId(type + CC), ref: "", data: { type, origin: ORIGIN, link: "/" + type + "/view" }, created_at: T0 - 600000, updated_at: T0 - 600000, ...over } });
+const OTHER_USER = { db: "commerce_logis_apac", table: "users", values: { id: OTHER, type: "user", from: OTHER, to: TEAM, cc: "", bcc: "", ref: "",
+  data: { flag: "kr", name: "lee", title: "", region: "apac1", page_count: 0, favicon: null, team: "Kim Shop", sender: "부산광역시 1" }, created_at: T0 - 800000, updated_at: T0 - 800000 } };
+const S3_OTHER = { [`hash/${HASH3}`]: { email: "lee@example.com", token: TOKEN3, address: OTHER, phone: "" } };
+const S3_INVITEE = { [`hash/${HASH2}`]: { email: "new@example.com", token: TOKEN2, address: NEWADDR, phone: "" } };
+const LOGIS_TASK = (id, ref, from, over = {}) => ({ db: "commerce_logis_apac", table: "tasks", values: { id, type: "tracking", from, to: TEAM, cc: "", bcc: "", ref,
+  data: { id, type: "tracking" }, created_at: T0 - 60000, updated_at: 0, ...over } });
+const PUT = (over, cookies = COOKIES) => ({ method: "PUT", cookies, path: q({ origin: ORIGIN, href: HREF, created_at: T0 + 1000, ...over }) });
+// 앱(proxy_fetch)은 질의에 hash · token 을 한 번 더 붙인다
+const APP_SESSION = `&hash=${HASH}&token=${TOKEN}`;
+const APP_EXTRACT = (envelope, extra = {}) => ({ method: "POST", headers: { "Content-Type": "application/json" },
+  gzip: { id: "task_1", from: USER, to: TEAM, cc: "", bcc: "", ref: "", link: "local", ...envelope },
+  path: q({ from: USER, to: TEAM, ...extra, hash: HASH, token: TOKEN, href: "https://console.logis.center/" }) });
+
+SCENARIOS.push(
+  // fix-session-token: S3 hash 객체에 token 이 없으면 hash 쿠키만으로 로그인됐다
+  { name: "session_no_token", rows: [...ZONES, ...MEMBERS()], s3: { [`hash/${HASH}`]: { email: "kim@example.com", address: USER } },
+    requests: [{ method: "GET", cookies: { hash: HASH }, headers: { "Content-Type": "application/json" }, path: q({ origin: ORIGIN, href: HREF, created_at: T0 + 1000 }) }] },
+  // fix-zone-pool: 자리 남은 zone 이 없으면 사용자를 만들지 않는다 (원본은 region '' 사용자)
+  { name: "login_zone_full", rows: [{ db: "commerce_logis_center", table: "zones", values: { id: "apac1", pool: 1000 } }], s3: S3_SESSION,
+    requests: [{ method: "GET", path: q({ hash: HASH, token: TOKEN }) }] },
+  // fix-region-fallback: 묶이지 않은 지역(US)의 로그인 — APAC 로 내려간다
+  { name: "login_us", rows: ZONES, s3: S3_SESSION, requests: [{ method: "GET", cf: { country: "US", city: "Ashburn" }, path: q({ hash: HASH, token: TOKEN }) }] },
+  // fix-coupon-count · fix-draft-count: base.coupon.count, 초안 ref 마다 센 수
+  { name: "member_coupon_drafts", rows: [...ZONES, ...MEMBERS().map((r) => (r.values.type === "team"
+      ? { ...r, values: { ...r.values, data: { ...r.values.data, base: { ...TEAM_BASE(), coupon: { draft: 0, count: 4 } } } } } : r)),
+    ITEM("0x" + "21".repeat(20), { updated_at: 0, ref: "r1" }), ITEM("0x" + "22".repeat(20), { updated_at: 0, ref: "r1" }), ITEM("0x" + "23".repeat(20), { updated_at: 0, ref: "r2" })],
+    s3: S3_SESSION, requests: [JSON_GET()] },
+  // fix-tracking-index: 주문 상세(추적 번호 없음)의 tracking 행 — 원본은 앞에서 남은 item.index 로 "order" = undefined (418)
+  { name: "detail_order_tracking", rows: [...ZONES, ...MEMBERS(),
+      PAGE_ROW("0x" + "5b".repeat(20), "order", { bcc: hashId("order" + CC.toUpperCase()), data: { type: "order", origin: ORIGIN, link: "/order/view", detail: true } }),
+      ITEM("0x" + "31".repeat(20), { type: "order", cc: CC, bcc: hashId("order" + CC.toUpperCase()), ref: hashId(TEAM + CC + "/order/view?no=5"), digest: "dg1" }),
+      { db: "commerce_logis_apac1_sales", table: "sales", values: { id: "0x" + "31".repeat(20), type: "order", from: USER, to: TEAM, cc: CC, bcc: "", ref: "", data: { n: 1 },
+        created_at: T0 - 300000, index: 7, tracking: 0 } },
+      { db: "commerce_logis_apac1_tracking", table: "tracking", values: { id: "0x" + "41".repeat(20), type: "tracking", from: USER, to: TEAM, cc: CC, bcc: "", ref: "",
+        data: { no: "123" }, created_at: T0 - 200000, order: 7 } }],
+    s3: S3_SESSION, requests: [JSON_GET({ href: "https://shop.example.com/order/view?no=5" })] },
+  // fix-crons-query: 글 · 겹친 id 가 섞인 crons — 원본은 crons 의 자리로 지워 엉뚱한 작업을 뺐다
+  { name: "member_crons", rows: [...ZONES, ...MEMBERS(), LOGIS_TASK("0x" + "72".repeat(20), "r", USER)], s3: S3_SESSION,
+    requests: [JSON_GET({ crons: JSON.stringify(["0x" + "71".repeat(20), "x", "0x" + "72".repeat(20), "0x" + "71".repeat(20)]) }),
+      JSON_GET({ crons: JSON.stringify("0x" + "71".repeat(20)) })] },
+  // fix-delete-tasks-db: 지역 DB 의 자기 작업만 지운다
+  { name: "delete_own_tasks", rows: [...ZONES, ...MEMBERS(), LOGIS_TASK("t1", "0x" + "77".repeat(20), USER), LOGIS_TASK("t2", "0x" + "77".repeat(20), OTHER),
+      LOGIS_TASK("t3", "0x" + "78".repeat(20), USER)], s3: S3_SESSION,
+    requests: [{ method: "DELETE", cookies: COOKIES, path: q({ type: "crons", ref: "0x" + "77".repeat(20) }) }] },
+  // fix-task-column: ?error= 로 같은 글을 다시 넣는다 (ON CONFLICT DO UPDATE)
+  { name: "post_error_retry", rows: [...ZONES, ...MEMBERS()], s3: S3_SESSION, requests: [
+    { method: "POST", cookies: COOKIES, headers: { "Content-Type": "text/plain" }, gzip: "same text", path: q({ origin: ORIGIN, href: HREF, created_at: T0 + 1000, from: USER, to: TEAM }) },
+    { method: "POST", cookies: COOKIES, headers: { "Content-Type": "text/plain" }, gzip: "same text", path: q({ origin: ORIGIN, href: HREF, created_at: T0 + 1000, from: USER, to: TEAM, error: "1" }) },
+  ] },
+  // fix-app-cloud-search: 데스크톱 앱의 클라우드 검색 그대로 (세션은 질의, href 는 logis.center 홈)
+  { name: "app_cloud_search", rows: [...ZONES, ...MEMBERS()], s3: S3_SESSION, requests: [
+    { method: "POST", headers: { "Content-Type": "application/json" }, gzip: { query: " 무거운 상자 ", vector: [0.1, 0.2, 0.3] },
+      path: q({ origin: HOME_ORIGIN, created_at: T0 + 1000, hash: HASH, token: TOKEN, href: HOME_HREF, from: USER, to: TEAM }) + APP_SESSION },
+  ] },
+  // fix-app-extraction: 앱의 추출 봉투 (created_at · origin 없음, href 는 proxy_fetch 의 기본값)
+  { name: "app_extract_image", rows: [...ZONES, ...MEMBERS()], s3: S3_SESSION, requests: [
+    APP_EXTRACT({ type: "image_extraction", body: "data:application/octet-stream;base64,iVBORw0KGgo=" }, { format: encodeURIComponent("image/png") }),
+  ] },
+  { name: "app_extract_html", rows: [...ZONES, ...MEMBERS()], s3: S3_SESSION, requests: [
+    APP_EXTRACT({ type: "html_extraction", link: HREF, body: "<html><body><h1>무거운 상자</h1><p>12,000원</p></body></html>" }),
+  ] },
+  { name: "app_extract_document", rows: [...ZONES, ...MEMBERS()], s3: S3_SESSION, requests: [
+    APP_EXTRACT({ type: "document_extraction", body: "data:application/pdf;base64,JVBERi0=" }),
+  ] },
+  // fix-app-relay: 데스크톱이 offer 를 올리고(세션) 모바일이 읽는다(10분), 틀린 token · 오래된 것 · 없는 것 · JSON 아님
+  { name: "relay_roundtrip", s3: { ...S3_SESSION, [`relay/${HASH2}`]: { created_at: String(T0 - 700000), __body: '{"type":"offer","sdp":"old"}' } }, requests: [
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "offer", sdp: "v=0\r\no=- 1 2 IN IP4 10.0.0.1" }), path: `/relay/${HASH}?hash=${HASH}&token=${TOKEN}` },
+    { method: "GET", path: `/relay/${HASH}` },
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"type":"offer","sdp":"evil"}', path: `/relay/${HASH}?token=nope` },
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"type":"offer","sdp":"evil"}', path: `/relay/${HASH}` },
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: "[1,2]", path: `/relay/${HASH}?token=${TOKEN}` },
+    { method: "GET", path: `/relay/${HASH2}` },
+    { method: "GET", path: `/relay/${HASH3}/` },
+    { method: "PUT", path: `/relay/${HASH}` },
+  ] },
+  // fix-app-invite: 팀장의 이메일 초대 (같은 이메일은 대소문자를 가리지 않는다), 이상한 ref 는 버린다
+  { name: "invite_owner", rows: [...ZONES, ...MEMBERS(), PAGE_ROW(PAGE1, "goods"), PAGE_ROW(PAGE2, "order")], s3: S3_SESSION, requests: [
+    PUT({ from: TEAM, to: USER, email: " New@Example.com ", ref: JSON.stringify([PAGE1, PAGE2, "junk", 7]) }),
+  ] },
+  // 팀장이 아닌 사람 · 틀린 이메일 · 남의 팀
+  { name: "invite_rejected", rows: [...ZONES, ...MEMBERS(), OTHER_USER, PAGE_ROW(PAGE1, "goods")], s3: { ...S3_SESSION, ...S3_OTHER }, requests: [
+    PUT({ from: TEAM, to: OTHER, email: "x@example.com", ref: JSON.stringify([PAGE1]) }, { hash: HASH3, token: TOKEN3 }),
+    PUT({ from: TEAM, to: USER, email: "not-an-email", ref: JSON.stringify([PAGE1]) }),
+    PUT({ from: OTHER, to: USER, email: "x@example.com", ref: JSON.stringify([PAGE1]) }),
+  ] },
+  // 다시 초대하면 refs 를 덮는다
+  { name: "invite_reinvite", rows: [...ZONES, ...MEMBERS(), PAGE_ROW(PAGE1, "goods"), PAGE_ROW(PAGE2, "order")], s3: S3_SESSION, requests: [
+    PUT({ from: TEAM, to: USER, email: "new@example.com", ref: JSON.stringify([PAGE1]) }),
+    PUT({ from: TEAM, to: USER, email: "new@example.com", ref: JSON.stringify([PAGE2]) }),
+  ] },
+  // 초대 → 초대받은 사람의 첫 로그인(그 팀에 들어감 · 멤버 행 · 초대 지움) → 그 사람의 JSON GET (초대한 페이지 · 팀 아이템이 보인다)
+  { name: "invite_login", rows: [...ZONES, ...MEMBERS(), PAGE_ROW(PAGE1, "goods"), PAGE_ROW(PAGE2, "order"), ITEM("0x" + "11".repeat(20), { cc: CC })],
+    s3: { ...S3_SESSION, ...S3_INVITEE }, requests: [
+    PUT({ from: TEAM, to: USER, email: "new@example.com", ref: JSON.stringify([PAGE1, PAGE2]) }),
+    { method: "GET", path: q({ hash: HASH2, token: TOKEN2 }) },
+    { method: "GET", jar: true, headers: { "Content-Type": "application/json" }, path: q({ origin: ORIGIN, href: HREF, created_at: T0 + 1000 }) },
+  ] },
+  // 주기 · 거두기 한 바퀴 (팀에 든 OTHER 에게 두 페이지, 하나를 거둠, 팀장은 거둘 수 없음)
+  { name: "member_grant_revoke", rows: [...ZONES, ...MEMBERS(), OTHER_USER, PAGE_ROW(PAGE1, "goods"), PAGE_ROW(PAGE2, "order")], s3: { ...S3_SESSION, ...S3_OTHER }, requests: [
+    PUT({ from: USER, to: OTHER, id: TEAM, cc: USER, ref: JSON.stringify([PAGE1, PAGE2]) }),
+    PUT({ from: USER, to: OTHER, id: TEAM, cc: ZERO, ref: JSON.stringify([PAGE1]) }),
+    PUT({ from: USER, to: USER, id: TEAM, cc: ZERO, ref: JSON.stringify([PAGE2]) }),
+    PUT({ from: OTHER, to: OTHER, id: TEAM, cc: ZERO, ref: JSON.stringify([PAGE2]) }, { hash: HASH3, token: TOKEN3 }),
+  ] },
+);

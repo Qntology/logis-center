@@ -135,8 +135,22 @@ fn no_page(ctx: &Ctx) -> R<Resp> {
     respond(ctx, &obj! { "success" => false, "results" => V::new_arr(), "session" => ctx.cookies.clone() })
 }
 
+/// 고침 (fix-app-extraction) 이 더한 `var appHref, appFormat` — 앱 봉투의 페이지 주소 · 이미지 형식 (없으면 undefined)
+#[derive(Default)]
+struct App {
+    href: V,
+    format: V,
+}
+
 /// 1998~2454
 pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
+    let mut app = App::default();
+
+    // 고침 (fix-app-extraction): 앱의 추출 요청에는 created_at 이 없다 — 없으면 지금 (원본은 아래 문에서 아무 응답 없이 418)
+    if ctx.req.g("query")?.g("created_at")?.is_undef() {
+        ctx.created_at = ctx.now.clone();
+    }
+
     // 1999
     if !(ctx.cookies.g("sender")?.truthy() && ctx.created_at.truthy()) {
         // 2451 `else { }`
@@ -168,7 +182,7 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
     }
 
     // 2021
-    match body(ctx, env, req, &query).await {
+    match body(ctx, env, req, &query, &mut app).await {
         Ok(Some(resp)) => return Ok(Step::Return(resp)),
         Ok(None) => {}
         Err(err) => console_log!("gzip or json err", err),
@@ -181,7 +195,7 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
     console_log!("typeof task.body", task.get("body").type_of());
 
     // 2245
-    match enqueue(ctx, env, &query).await {
+    match enqueue(ctx, env, &query, &app).await {
         Ok(Some(resp)) => return Ok(Step::Return(resp)),
         Ok(None) => {}
         // 원본은 console.error
@@ -191,7 +205,7 @@ pub async fn run(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
 }
 
 /// 2022~2232 (try 안 — 던지면 'gzip or json err' 로그 뒤 작업 구역으로)
-async fn body(ctx: &mut Ctx, env: &Env, req: &Req, query: &V) -> R<Option<Resp>> {
+async fn body(ctx: &mut Ctx, env: &Env, req: &Req, query: &V, app: &mut App) -> R<Option<Resp>> {
     if !loose_eq(&ctx.contentEncoding, &V::from("gzip")) {
         return Ok(None);
     }
@@ -209,14 +223,69 @@ async fn body(ctx: &mut Ctx, env: &Env, req: &Req, query: &V) -> R<Option<Resp>>
     let cookies = ctx.cookies.clone();
     let task = ctx.task.clone();
 
+    // 고침 (fix-app-cloud-search · fix-app-extraction): 앱은 from = 주소 · to = 팀 으로 JSON 본문을 보낸다 — { query, vector } 는 검색 갈래(아래)로,
+    // { type: '*_extraction', body, link, … } 봉투는 풀어서 이 갈래로 (원본은 둘 다 날 글로 받아 벡터를 버리고 봉투 JSON 을 작업 본문으로 넣었다)
+    let content_type = if ctx.contentType.truthy() { ctx.contentType.to_str() } else { String::new() };
+    let app_body = if index_of(&content_type, "application/json") > -1 {
+        crate::fixes::app_json(&decode_utf8(&ungzip(&ctx.buffer)?))
+    } else {
+        None
+    };
+    let envelope = app_body.clone().filter(|b| {
+        b.get("body").is_str() && ["image_extraction", "html_extraction", "document_extraction"].iter().any(|t| b.get("type").as_str() == Some(t))
+    });
+    let search = app_body.filter(|b| envelope.is_none() && (b.get("query").truthy() || b.get("vector").truthy()));
+
     // 2031 — 화면 HTML · 이미지 (원본 그대로: 둘 다 undefined 여도 `==` 라 같다고 본다)
-    if loose_eq(&query.get("from"), &cookies.get("address")) && loose_eq(&query.get("to"), &cookies.get("team")) {
+    if search.is_none() && loose_eq(&query.get("from"), &cookies.get("address")) && loose_eq(&query.get("to"), &cookies.get("team")) {
         task.s_("from", cookies.get("address"))?;
         task.s_("to", cookies.get("team"))?;
 
         ctx.body = V::from(decode_utf8(&ungzip(&ctx.buffer)?));
 
-        if query.get("format").truthy() {
+        if let Some(envelope) = &envelope {
+            if envelope.get("type").as_str() == Some("document_extraction") {
+                // proxy 에는 문서 해석기가 없다 — 아무도 처리하지 못할 작업을 넣지 않는다
+                headers_set(&ctx.headers, "Content-Type", &V::from("application/json"))?;
+                return Ok(Some(respond(
+                    ctx,
+                    &obj! {
+                        "success" => false,
+                        "results" => V::new_arr(),
+                        "error" => "document_extraction is not supported by the server",
+                        "session" => cookies.clone(),
+                    },
+                )?));
+            }
+
+            // 봉투의 link 가 http(s) 주소면 그 페이지의 작업 (아니면 — 이미지의 "local" — 질의의 href)
+            if let Ok(u) = url::Url::parse(&envelope.get("link").to_str()) {
+                if u.scheme() == "http" || u.scheme() == "https" {
+                    app.href = V::from(to_lower(u.as_str()));
+                }
+            }
+
+            let page_href = if app.href.truthy() { app.href.clone() } else { cookies.get("href") };
+            task.s_("cc", V::from(crate::fixes::cc_of_host(&crate::fixes::url_host(&new_url(&page_href)?))?))?;
+
+            let text = envelope.get("body").to_str();
+            if envelope.get("type").as_str() == Some("image_extraction") {
+                // 질의 format 은 두 번 인코딩되어 온다 (image%2Fpng) — 풀어서 image/… 면 그것, 아니면 image/png. 본문은 data URL 의 base64 만
+                let format = query.get("format");
+                let mime = decode_uri_component(&if format.truthy() { format.to_str() } else { String::new() })?;
+                app.format = V::from(if index_of(&mime, "image/") > -1 { mime } else { "image/png".to_string() });
+
+                let base64 = match (text.starts_with("data:"), text.find(',')) {
+                    (true, Some(comma)) => text[comma + 1..].to_string(),
+                    _ => text,
+                };
+                task.s_("body", V::from(base64))?;
+            } else {
+                task.s_("body", V::from(text))?;
+            }
+
+            task.s_("scan", V::Bool(true))?;
+        } else if query.get("format").truthy() {
             task.s_("body", ctx.body.clone())?;
             task.s_("scan", V::Bool(true))?;
         } else {
@@ -224,7 +293,16 @@ async fn body(ctx: &mut Ctx, env: &Env, req: &Req, query: &V) -> R<Option<Resp>>
             task.s_("body", V::from(decode_uri_component(&ctx.body.to_str())?))?;
         }
 
-        task.s_("contentType", ctx.contentType.clone())?;
+        let content_type = if envelope.is_some() {
+            if app.format.truthy() {
+                app.format.clone()
+            } else {
+                V::from("text/html")
+            }
+        } else {
+            ctx.contentType.clone()
+        };
+        task.s_("contentType", content_type)?;
 
         // 2052~2112 linkedom 선택자 추출은 주석 처리된 코드
         return Ok(None);
@@ -237,6 +315,12 @@ async fn body(ctx: &mut Ctx, env: &Env, req: &Req, query: &V) -> R<Option<Resp>>
 
     // 2125 [CLIENT-SIDE EMBEDDING] { query, vector }
     if data.truthy() && !data.is_arr() && data.type_of() == "object" && (data.get("query").truthy() || data.get("vector").truthy()) {
+        // 고침 (fix-app-cloud-search): 앱의 검색은 logis.center 의 홈(/tracking)에서 온다. homeId 는 대문자 cc 로 만들어 pageId 와 늘 달라
+        // page 가 비었다 — logis.center 의 요청이면 home 을 쓴다
+        if !has_keys(&ctx.page)? && loose_eq(&cookies.get("cc"), &ctx.homeCc) {
+            ctx.page = ctx.home.clone();
+        }
+
         if has_keys(&ctx.page)? {
             task.s_("page", ctx.page.clone())?;
             task.s_("from", cookies.get("team"))?;
@@ -244,6 +328,8 @@ async fn body(ctx: &mut Ctx, env: &Env, req: &Req, query: &V) -> R<Option<Resp>>
             let q = data.get("query");
             task.s_("body", if q.truthy() { V::from(js_trim(&q.to_str()).to_string()) } else { V::from("") })?;
             task.s_("scan", V::Null)?;
+            // 고침 (fix-app-cloud-search): proxy 는 task.contentType.indexOf 로 갈래를 고른다 — 없으면 TypeError 로 작업을 버렸다
+            task.s_("contentType", ctx.contentType.clone())?;
 
             let vector = data.get("vector");
             if vector.is_arr() && vector.g("length")?.truthy() {
@@ -265,6 +351,8 @@ async fn body(ctx: &mut Ctx, env: &Env, req: &Req, query: &V) -> R<Option<Resp>>
                 task.s_("to", cookies.get("address"))?;
                 task.s_("body", V::from(js_trim(&data.to_str()).to_string()))?;
                 task.s_("scan", V::Null)?;
+                // 고침 (fix-app-cloud-search): 위와 같음
+                task.s_("contentType", ctx.contentType.clone())?;
             } else {
                 return Ok(Some(no_page(ctx)?));
             }
@@ -296,10 +384,13 @@ async fn lookup(ctx: &mut Ctx, env: &Env, cookies: &V) -> R<Resp> {
                 ctx.condition = add(&ctx.condition, &V::from(" OR "));
             }
 
-            let team = cookies.get("team");
+            // 고침 (fix-sql-bind): 원본은 팀을 큰따옴표(SQLite 는 먼저 열 이름으로 본다)로 이어 붙였다 → ?1 로 묶는다
             let bcc = hash_id(&add(&ctx.page.g("type")?, &V::from(upper(&cookies.g("cc")?, "cookies.cc")?)))?;
             let ref_ = hash_id(&add(&add(&cookies.get("team"), &cookies.get("cc")), &ctx.link))?;
-            let clause = tpl(T2172, &[team, V::from(bcc), V::from(ref_), ctx.created_at.clone()]);
+            let clause = format!(
+                r#"("to" = ?1 AND "bcc" = '{bcc}' AND "ref" = '{ref_}' AND "created_at" < {})"#,
+                ctx.created_at.to_str()
+            );
             ctx.condition = add(&ctx.condition, &V::from(clause));
             Ok(())
         })();
@@ -316,7 +407,7 @@ async fn lookup(ctx: &mut Ctx, env: &Env, cookies: &V) -> R<Resp> {
     if ctx.condition.truthy() {
         let db = tpl(T2186, &[ctx.zoneRegion.clone()]);
         let sql = tpl(T2187, &[ctx.condition.clone()]);
-        let out = js::all(&env.prepare(&db, &sql)?).await?;
+        let out = js::all(&js::bind(&env.prepare(&db, &sql)?, &[cookies.get("team")])?).await?;
         ctx.results = out.g("results")?;
         ctx.success = out.g("success")?;
         ctx.error = out.g("error")?;
@@ -328,7 +419,7 @@ async fn lookup(ctx: &mut Ctx, env: &Env, cookies: &V) -> R<Resp> {
 }
 
 /// 2245~2448 (try 안 — 던지면 '처리 중 오류 발생:' 로그 뒤 418)
-async fn enqueue(ctx: &mut Ctx, env: &Env, query: &V) -> R<Option<Resp>> {
+async fn enqueue(ctx: &mut Ctx, env: &Env, query: &V, app: &App) -> R<Option<Resp>> {
     let task = ctx.task.clone();
     if !(task.get("from").truthy() && task.get("to").truthy() && task.get("body").truthy()) {
         return Ok(None);
@@ -337,14 +428,15 @@ async fn enqueue(ctx: &mut Ctx, env: &Env, query: &V) -> R<Option<Resp>> {
 
     task.s_("no", V::from(""))?;
 
-    // 2250
-    let u = new_url(&cookies.get("href"))?;
+    // 2250 — 고침 (fix-app-extraction): 앱 봉투의 페이지 주소가 있으면 그것
+    let page_href = if app.href.truthy() { app.href.clone() } else { cookies.get("href") };
+    let u = new_url(&page_href)?;
     ctx.url = url_obj(&u);
 
     task.s_("origin", ctx.url.get("origin"))?;
     task.s_("link", path_search_lower(&ctx.url))?;
     task.s_("ref", V::from(hash_id(&add(&add(&cookies.get("team"), &task.get("cc")), &ctx.url.get("pathname")))?))?;
-    task.s_("href", cookies.get("href"))?;
+    task.s_("href", page_href)?;
     task.s_("type", V::from("prompt"))?;
 
     let title = query.get("title");
@@ -358,13 +450,13 @@ async fn enqueue(ctx: &mut Ctx, env: &Env, query: &V) -> R<Option<Resp>> {
     // 원본 그대로: 없던 키면 undefined 로 이 자리에 생긴다(JSON 에서는 빠지고, tracking 이면 이 자리에 값이 들어간다)
     task.s_("contentType", task.get("contentType"))?;
 
-    // 2279
-    let format = query.get("format");
-    console_log!("req.query.format", format);
+    // 2279 — 고침 (fix-app-extraction): 앱 이미지의 형식(appFormat)이 있으면 그것
+    console_log!("req.query.format", query.get("format"));
+    let format = if app.format.truthy() { app.format.clone() } else { query.get("format") };
 
     if format.truthy() {
         let Some(f) = format.as_str() else {
-            return Err(Throw::type_error("req.query.format.indexOf is not a function"));
+            return Err(Throw::type_error("taskFormat.indexOf is not a function"));
         };
         if index_of(f, "image/") > -1 {
             task.s_("type", V::from("tracking"))?;
@@ -394,10 +486,13 @@ async fn enqueue(ctx: &mut Ctx, env: &Env, query: &V) -> R<Option<Resp>> {
     ctx.month = ctx.current_date.gi(1)?;
     ctx.s_to = V::from(hash_id(&add(&add(&ctx.year, &V::from("-")), &ctx.month))?);
 
-    // 2326
+    // 2326 — 고침 (fix-sql-bind)
     let db = tpl(T2326, &[ctx.zoneRegion.clone()]);
-    let sql = tpl(T2326_1, &[cookies.get("address"), ctx.s_to.clone(), ctx.now.clone()]);
-    ctx.results = js::query(env, &db, &sql).await?;
+    let sql = format!(
+        r#"SELECT * FROM items WHERE "type" = 'invoice' AND "from" = ?1 AND "to" = ?2 AND "created_at" < {} LIMIT 1"#,
+        ctx.now.to_str()
+    );
+    ctx.results = js::query_bound(env, &db, &sql, &[cookies.get("address"), ctx.s_to.clone()]).await?;
 
     // 보강해야함 - 사용자 결제 혹은 팀결제 확인해서 진행하기
     if ctx.results.g("length")?.truthy() {
@@ -433,12 +528,14 @@ async fn enqueue(ctx: &mut Ctx, env: &Env, query: &V) -> R<Option<Resp>> {
 
     // 2357
     let region = ctx.logisRegion.to_key();
+    // task.id 는 서버가 만든 해시라 글에 둔다
     let sql = tpl(T2357, &[task.get("id"), ctx.now.clone()]);
     let out = js::all(&env.prepare(&region, &sql)?).await?;
     ctx.results = out.g("results")?;
     ctx.success = out.g("success")?;
 
-    if ctx.results.g("length")?.truthy() {
+    // 고침 (fix-task-column): ?error= 는 다시 넣으라는 뜻 — 같은 id 의 작업이 있어도 아래 ON CONFLICT DO UPDATE 로 간다
+    if ctx.results.g("length")?.truthy() && !query.get("error").truthy() {
         if loose_eq(&ctx.contentEncoding, &V::from("gzip")) {
             if has_keys(&ctx.page)? {
                 let page = ctx.page.clone();
@@ -464,8 +561,8 @@ async fn enqueue(ctx: &mut Ctx, env: &Env, query: &V) -> R<Option<Resp>> {
     ctx.onConflict = V::from("ON CONFLICT (id) DO NOTHING");
 
     if query.get("error").truthy() {
-        // 원본 그대로: tasks 에 없는 "task" 열 (이 갈래의 INSERT 는 D1 오류로 던진다)
-        ctx.onConflict = V::from(T2393[0]);
+        // 고침 (fix-task-column): 원본은 tasks 에 없는 "task" 열을 써서 이 INSERT 가 늘 D1 오류(418)였다 → 진짜 열
+        ctx.onConflict = V::from(ON_CONFLICT_RETRY);
     }
 
     // 2404 tasks 추가 작업
@@ -508,3 +605,16 @@ async fn enqueue(ctx: &mut Ctx, env: &Env, query: &V) -> R<Option<Resp>> {
 
     Ok(Some(respond(ctx, &obj! { "results" => arr![row], "success" => ctx.success.clone(), "session" => cookies.clone() })?))
 }
+
+/// 2393 의 ON CONFLICT — 고침 (fix-task-column): "task" 열 대신 tasks 의 진짜 열
+const ON_CONFLICT_RETRY: &str = "ON CONFLICT (id) DO UPDATE SET
+											\"cc\" = EXCLUDED.\"cc\",
+											\"bcc\" = EXCLUDED.\"bcc\",
+											\"ref\" = EXCLUDED.\"ref\",
+											\"type\" = EXCLUDED.\"type\",
+											\"from\" = EXCLUDED.\"from\",
+											\"to\" = EXCLUDED.\"to\",
+											\"data\" = EXCLUDED.\"data\",
+											\"created_at\" = EXCLUDED.\"created_at\",
+											\"updated_at\" = EXCLUDED.\"updated_at\"
+										";

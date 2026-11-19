@@ -21,6 +21,30 @@ fn uncaught(err: logis_worker_common::Throw) -> Resp {
 }
 
 pub async fn fetch(req: Req, env: Env) -> Resp {
+    // 346 `new AwsClient(...)` — 키가 없으면 여기서 던진다 (아래 두 갈래보다 먼저)
+    if let Err(err) = crate::session::s3_checked(&env) {
+        return uncaught(err);
+    }
+
+    // 고침 (fix-preflight-session): 브라우저 사전 요청(쿠키 없음)에 세션(새 지갑 · S3 PUT)을 돌리지 않고 CORS 머리글만으로 답한다
+    if req.method == "OPTIONS" {
+        let headers = logis_worker_common::web::headers_new();
+        if let Err(err) = crate::fixes::cors_headers(&headers) {
+            return uncaught(err);
+        }
+        let mut r = Resp::new(200, Body::Text(String::new()));
+        r.headers = headers_vec(&headers);
+        return r;
+    }
+
+    // 고침 (fix-app-relay): /relay/{hash} — 세션 앞에서 (GET 이 새 지갑을 만들지 않게)
+    if let Some(hash) = url::Url::parse(&req.url).ok().and_then(|u| crate::fixes::relay_hash(u.path())) {
+        return match crate::fixes::relay(&req, &env, &hash).await {
+            Ok(r) => r,
+            Err(err) => uncaught(err),
+        };
+    }
+
     let mut ctx = Ctx::default();
     if let Err(err) = crate::session::head(&mut ctx, &env, &req).await {
         return uncaught(err);
@@ -48,12 +72,7 @@ async fn body(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Option<Resp>> {
         "DELETE" => crate::put_delete::delete(ctx, env, req).await?,
         "POST" => crate::post::run(ctx, env, req).await?,
         "GET" => crate::get::run(ctx, env, req).await?,
-        "OPTIONS" => {
-            // 2870~2873
-            let mut r = Resp::new(200, Body::Text(String::new()));
-            r.headers = headers_vec(&ctx.headers);
-            Step::Return(r)
-        }
+        // 2870~2873 의 OPTIONS 는 fix-preflight-session 이 fetch 맨 앞에서 답해 여기 닿지 않는다
         _ => Step::Next,
     };
     Ok(match step {

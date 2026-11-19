@@ -1,7 +1,7 @@
 // commerce 차분 시험: 원본 TS(commerce-logis-center fd1e991, 짝 없는 `}else if` 한 곳만 고침)와 Rust(wasm)를
 // 같은 D1 · 같은 가짜 S3/AI/Vectorize · 같은 가상 시계 · 같은 난수로 돌려 응답(상태 · 머리글 · 본문) · 바깥 요청 · D1 끝 상태 · S3 끝 상태를 견준다.
 // 시나리오는 요청 여러 개를 차례로 보낸다(앞 응답의 Set-Cookie 를 뒤 요청에 실을 수 있다).
-// usage: node commerce.mjs [시나리오 이름]   (원본 저장소 위치: COMMERCE_REPO, 기본 logis-center 옆 commerce-logis-center)
+// usage: node commerce.mjs [시나리오 이름[,이름…]]   (COMMERCE_SKIP=fix-id,… 면 그 수정을 빼고 원본을 고친다 — fixes/commerce.mjs)   (원본 저장소 위치: COMMERCE_REPO, 기본 logis-center 옆 commerce-logis-center)
 import { Miniflare } from "miniflare";
 import * as esbuild from "esbuild";
 import { gzipSync, gunzipSync } from "node:zlib";
@@ -85,23 +85,24 @@ const gz = (o) => {
 };
 const ungz = (b) => { try { return JSON.parse(gunzipSync(Buffer.from(b)).toString("utf8")); } catch { return { raw: Buffer.from(b).toString("base64") }; } };
 
-// gzip 바이트는 두 구현(pako · miniz_oxide)이 다르게 압축한다: 응답 · 상태 안의 gzip 바이트(숫자 배열 · {"0":31,…} 꼴)는 풀어서 견준다
+// gzip 바이트는 두 구현(pako · miniz_oxide)이 다르게 압축한다: 응답 · 상태 안의 gzip 바이트(숫자 배열 · {"0":31,…} 꼴)는 풀어서 견준다 (푼 JSON 안에 든 gzip — 작업의 page.data 등 — 도)
 const isGzNums = (a) => a.length >= 18 && a[0] === 31 && a[1] === 139 && a.every((x) => Number.isInteger(x) && x >= 0 && x < 256);
 function decodeGz(v) {
-  if (Array.isArray(v)) return isGzNums(v) ? { gz: ungz(v) } : v.map(decodeGz);
+  if (Array.isArray(v)) return isGzNums(v) ? { gz: decodeGz(ungz(v)) } : v.map(decodeGz);
   if (v && typeof v === "object") {
     const keys = Object.keys(v);
     if (keys.length >= 18 && keys.every((k, i) => k === String(i))) {
       const nums = keys.map((k) => v[k]);
-      if (isGzNums(nums)) return { gz: ungz(nums), shape: "Uint8Array" };
+      if (isGzNums(nums)) return { gz: decodeGz(ungz(nums)), shape: "Uint8Array" };
     }
     return Object.fromEntries(keys.map((k) => [k, decodeGz(v[k])]));
   }
   return v;
 }
 
-// 가짜 S3 (aws4fetch 가 보낸 서명을 같은 시각으로 다시 계산해 맞는지 본다 — 무작위 토큰이 서명에 들어가 값 자체는 견줄 수 없다)
-async function s3Mock(req, url, store, records) {
+// 가짜 S3 (aws4fetch 가 보낸 서명을 같은 시각으로 다시 계산해 맞는지 본다 — 무작위 토큰이 서명에 들어가 값 자체는 견줄 수 없다).
+// 객체는 메타(x-amz-meta-*)와 본문을 갖는다: PUT 의 본문을 두었다가 GET 이 돌려준다(/relay). 시나리오의 s3 값은 메타, 본문은 `__body` 키
+async function s3Mock(req, url, store, bodies, records) {
   const p = decodeURIComponent(url.pathname.slice(1));
   const meta = {};
   for (const [k, v] of req.headers) if (k.startsWith("x-amz-meta-")) meta[k.slice(11)] = v;
@@ -120,15 +121,21 @@ async function s3Mock(req, url, store, records) {
   }
   const rec = { kind: "s3", method: req.method, path: p, sig };
   if (Object.keys(meta).length) rec.meta = meta;
+  const body = req.method === "PUT" ? await req.text() : "";
+  if (body) rec.body = body;
   records.push(rec);
   if (req.method === "HEAD" || req.method === "GET") {
     if (!store.has(p)) return new Response(null, { status: 404 });
     const h = new Headers();
     for (const [k, v] of Object.entries(store.get(p))) h.set(`x-amz-meta-${k}`, String(v));
-    return new Response(req.method === "HEAD" ? null : "", { status: 200, headers: h });
+    return new Response(req.method === "HEAD" ? null : bodies.get(p) || "", { status: 200, headers: h });
   }
-  if (req.method === "PUT") { store.set(p, meta); return new Response("", { status: 200 }); }
-  if (req.method === "DELETE") { store.delete(p); return new Response(null, { status: 204 }); }
+  if (req.method === "PUT") {
+    store.set(p, meta);
+    if (body) bodies.set(p, body); else bodies.delete(p);
+    return new Response("", { status: 200 });
+  }
+  if (req.method === "DELETE") { store.delete(p); bodies.delete(p); return new Response(null, { status: 204 }); }
   return new Response("", { status: 405 });
 }
 
@@ -136,14 +143,15 @@ const DEFAULT_CF = { country: "KR", city: "Seoul", continent: "AS", timezone: "A
 
 async function run(variant, scenario) {
   const records = [];
-  const s3 = new Map(Object.entries(scenario.s3 || {}).map(([k, v]) => [k, { ...v }]));
+  const s3 = new Map(Object.entries(scenario.s3 || {}).map(([k, { __body, ...meta }]) => [k, meta]));
+  const s3Bodies = new Map(Object.entries(scenario.s3 || {}).filter(([, v]) => v.__body !== undefined).map(([k, v]) => [k, v.__body]));
   const outbound = async (req) => {
     const url = new URL(req.url);
     if (url.hostname === "record") {
       records.push({ kind: url.pathname.slice(1), ...JSON.parse(await req.text()) });
       return new Response("ok");
     }
-    if (/\.s3\.[^.]+\.amazonaws\.com$/.test(url.hostname)) return s3Mock(req, url, s3, records);
+    if (/\.s3\.[^.]+\.amazonaws\.com$/.test(url.hostname)) return s3Mock(req, url, s3, s3Bodies, records);
     const text = await req.text();
     let body; try { body = JSON.parse(text); } catch { body = text; }
     records.push({ kind: "fetch", url: req.url, method: req.method, body });
@@ -199,12 +207,12 @@ async function run(variant, scenario) {
     for (const table of TABLES) {
       let results;
       try { ({ results } = await db.prepare(`SELECT * FROM ${table} ORDER BY id`).all()); } catch { continue; }
-      if (results.length) state[`${n}.${table}`] = results.map((r) => ({ ...r, ...(r.data ? { data: ungz(r.data) } : {}) }));
+      if (results.length) state[`${n}.${table}`] = results.map((r) => ({ ...r, ...(r.data ? { data: decodeGz(ungz(r.data)) } : {}) }));
     }
   }
   await mf.dispose();
   // S3 끝 상태는 넣은 순서 그대로 (키에 무작위 hash 가 들어가 이름순 정렬은 실행마다 바뀐다)
-  return { responses, records, state, s3: [...s3].map(([key, meta]) => ({ key, meta })) };
+  return { responses, records, state, s3: [...s3].map(([key, meta]) => (s3Bodies.has(key) ? { key, meta, body: s3Bodies.get(key) } : { key, meta })) };
 }
 
 // 무작위 값(새 지갑의 주소 · 개인 키 = hash · token 쿠키, hashId() 의 무작위 id)은 실행마다 다르다:
@@ -226,7 +234,7 @@ function normalize(a, b) {
 }
 
 let fail = 0;
-for (const scenario of SCENARIOS.filter((s) => !ONLY || s.name === ONLY)) {
+for (const scenario of SCENARIOS.filter((s) => !ONLY || ONLY.split(",").includes(s.name))) {
   const ts = await run("ts", scenario);
   const rs = await run("rs", scenario);
   const [a, b] = normalize(JSON.stringify(ts, null, 1), JSON.stringify(rs, null, 1));

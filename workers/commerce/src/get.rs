@@ -29,6 +29,13 @@ fn prepare(env: &Env, name: &str, sql: impl FnOnce() -> R<String>) -> R<V> {
     env.prepare(name, &sql)
 }
 
+/// `env[name].prepare(sql).bind(...params)` — 고침 (fix-sql-bind): 값은 SQL 글에 넣지 않고 묶는다 (수인 condition 만 글에).
+/// JS 처럼 prepare(SQL 글)를 먼저, 그다음 bind 의 인자를 읽는다
+fn prepare_bound(env: &Env, name: &str, sql: impl FnOnce() -> R<String>, params: impl FnOnce() -> R<Vec<V>>) -> R<V> {
+    let stmt = prepare(env, name, sql)?;
+    js::bind(&stmt, &params()?)
+}
+
 /// `var { results, success, error } = await stmt.all()`
 async fn all_into(ctx: &mut Ctx, stmt: V) -> R<()> {
     let r = js::all(&stmt).await?;
@@ -283,7 +290,13 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
     let items_db = tpl(T2496, &[ctx.zoneRegion.clone()]);
 
     // 2494 relate update item
-    let stmt = prepare(env, &items_db, || Ok(tpl(T2497, &[cookies.g("cc")?, cookies.g("team")?, ctx.condition.clone()])))?;
+    let condition = ctx.condition.to_str();
+    let stmt = prepare_bound(
+        env,
+        &items_db,
+        || Ok(format!(r#"SELECT * FROM items WHERE "cc" = ?1 AND "to" = ?2 {condition} AND "updated_at" > 0 ORDER BY created_at DESC LIMIT 100"#)),
+        || Ok(vec![cookies.g("cc")?, cookies.g("team")?]),
+    )?;
     all_into(ctx, stmt).await?;
 
     console_log!("results.length", ctx.results.length()?);
@@ -294,7 +307,12 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
 
     // 2518 recent update item
     let items_db = tpl(T2520, &[ctx.zoneRegion.clone()]);
-    let stmt = prepare(env, &items_db, || Ok(tpl(T2521, &[cookies.g("cc")?, cookies.g("team")?, ctx.condition.clone()])))?;
+    let stmt = prepare_bound(
+        env,
+        &items_db,
+        || Ok(format!(r#"SELECT * FROM items WHERE "cc" != ?1 AND "to" = ?2 {condition}  AND "updated_at" > 0 ORDER BY created_at DESC LIMIT 100"#)),
+        || Ok(vec![cookies.g("cc")?, cookies.g("team")?]),
+    )?;
     all_into(ctx, stmt).await?;
 
     if ctx.results.length()?.truthy() {
@@ -303,7 +321,12 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
 
     // 2540 recent draft item
     let items_db = tpl(T2542, &[ctx.zoneRegion.clone()]);
-    let stmt = prepare(env, &items_db, || Ok(tpl(T2543, &[cookies.g("team")?, ctx.condition.clone()])))?;
+    let stmt = prepare_bound(
+        env,
+        &items_db,
+        || Ok(format!(r#"SELECT * FROM items WHERE "to" = ?1 {condition} AND "updated_at" = 0 ORDER BY created_at DESC LIMIT 100"#)),
+        || Ok(vec![cookies.g("team")?]),
+    )?;
     all_into(ctx, stmt).await?;
 
     if ctx.results.length()?.truthy() {
@@ -312,12 +335,13 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
             ctx.draft = ctx.results.gk(&ctx.i)?;
             ctx.draft.s_("table", V::from("draft"))?;
 
-            // 2552 `cookies.draft[draft.ref]++` — 원본 그대로: 세션이 cookies.draft 를 {} 로 둔 때만 돌고(없으면 TypeError → 418),
-            // 처음 보는 ref 는 undefined++ 라 NaN (JSON 에서 null). 그 뒤로도 NaN + 1 = NaN
+            // 2552 — 고침 (fix-draft-count): 원본 `cookies.draft[draft.ref]++` 은 처음 보는 ref 에서 undefined++ 라 NaN (JSON 에서 null) 이고
+            // 그 뒤로도 NaN 이었다 → 0 에서 센다. 세션이 cookies.draft 를 {} 로 둔 때만 돈다(없으면 TypeError → 418)
             let drafts = cookies.g("draft")?;
             let key = ctx.draft.g("ref")?;
             let old = drafts.gk(&key)?;
-            drafts.sk(&key, V::Num(old.to_num() + 1.0))?;
+            let old = if old.truthy() { old.to_num() } else { 0.0 };
+            drafts.sk(&key, V::Num(old + 1.0))?;
 
             if same_as_detail(&ctx.detail, &ctx.draft)? {
                 ctx.i = inc(&ctx.i);
@@ -331,7 +355,12 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
 
     // 2564 — logisRegion 이 없으면 env["undefined"].prepare 로 TypeError
     let logis_db = ctx.logisRegion.to_key();
-    let stmt = prepare(env, &logis_db, || Ok(tpl(T2566, &[cookies.g("address")?, cookies.g("cc")?, ctx.condition.clone()])))?;
+    let stmt = prepare_bound(
+        env,
+        &logis_db,
+        || Ok(format!(r#"SELECT * FROM tasks WHERE "from" = ?1 AND "cc" = ?2 {condition} ORDER BY created_at DESC LIMIT 10"#)),
+        || Ok(vec![cookies.g("address")?, cookies.g("cc")?]),
+    )?;
     all_into(ctx, stmt).await?;
 
     if ctx.results.length()?.truthy() {
@@ -349,10 +378,15 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
 
     // 2584
     let talks_db = tpl(T2586, &[ctx.zoneRegion.clone()]);
-    let stmt = prepare(env, &talks_db, || {
-        let c = cond_for(ctx, &ctx.page.g("type")?)?;
-        Ok(tpl(T2587, &[cookies.g("cc")?, ctx.itemId.clone(), c]))
-    })?;
+    let stmt = prepare_bound(
+        env,
+        &talks_db,
+        || {
+            let c = cond_for(ctx, &ctx.page.g("type")?)?.to_str();
+            Ok(format!(r#"SELECT * FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2 {c} ORDER BY created_at DESC LIMIT 10"#))
+        },
+        || Ok(vec![cookies.g("cc")?, ctx.itemId.clone()]),
+    )?;
     all_into(ctx, stmt).await?;
 
     if ctx.results.length()?.truthy() {
@@ -379,7 +413,12 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
 
         // 2609
         let talks_db = tpl(T2611, &[ctx.zoneRegion.clone()]);
-        let stmt = prepare(env, &talks_db, || Ok(tpl(T2612, &[cookies.g("cc")?, ctx.itemId.clone()])))?;
+        let stmt = prepare_bound(
+            env,
+            &talks_db,
+            || Ok(r#"SELECT COUNT(*) AS "talks" FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2"#.to_string()),
+            || Ok(vec![cookies.g("cc")?, ctx.itemId.clone()]),
+        )?;
         all_into(ctx, stmt).await?;
 
         if ctx.results.length()?.truthy() {
@@ -395,10 +434,15 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
 
     // 2624
     let talks_db = tpl(T2626, &[ctx.zoneRegion.clone()]);
-    let stmt = prepare(env, &talks_db, || {
-        let c = cond_for(ctx, &ctx.page.g("type")?)?;
-        Ok(tpl(T2627, &[cookies.g("team")?, cookies.g("address")?, c]))
-    })?;
+    let stmt = prepare_bound(
+        env,
+        &talks_db,
+        || {
+            let c = cond_for(ctx, &ctx.page.g("type")?)?.to_str();
+            Ok(format!(r#"SELECT * FROM talks WHERE "from" = ?1 AND "to" = ?2 {c} ORDER BY created_at DESC LIMIT 10"#))
+        },
+        || Ok(vec![cookies.g("team")?, cookies.g("address")?]),
+    )?;
     all_into(ctx, stmt).await?;
 
     if ctx.results.length()?.truthy() {
@@ -437,11 +481,16 @@ async fn member_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
         } else {
             // 2767 list
             let db = tpl(T2770, &[ctx.zoneRegion.clone(), ctx.type_.clone()]);
-            let stmt = prepare(env, &db, || {
-                let bcc = ctx.page.g("bcc")?;
-                let c = cond_for(ctx, &ctx.page.g("type")?)?;
-                Ok(tpl(T2771, &[ctx.type_.clone(), cookies.g("team")?, cookies.g("cc")?, bcc, c]))
-            })?;
+            let stmt = prepare_bound(
+                env,
+                &db,
+                || {
+                    let c = cond_for(ctx, &ctx.page.g("type")?)?.to_str();
+                    let t = ctx.type_.to_str();
+                    Ok(format!(r#"SELECT * FROM {t} WHERE "to" = ?1 AND "cc" = ?2 AND "bcc" = ?3 {c} ORDER BY created_at DESC LIMIT 100"#))
+                },
+                || Ok(vec![cookies.g("team")?, cookies.g("cc")?, ctx.page.g("bcc")?]),
+            )?;
             all_into(ctx, stmt).await?;
 
             console_log!("{type} results.length", ctx.results.length()?);
@@ -464,16 +513,26 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
 
     // 2652 hints
     let items_db = tpl(T2654, &[ctx.zoneRegion.clone()]);
-    let stmt = prepare(env, &items_db, || Ok(tpl(T2655, &[ctx.page.g("type")?, ctx.detail.g("digest")?, ctx.condition.clone()])))?;
+    let condition = ctx.condition.to_str();
+    let stmt = prepare_bound(
+        env,
+        &items_db,
+        || Ok(format!(r#"SELECT * FROM items WHERE "type" = ?1 AND "digest" = ?2 {condition} ORDER BY created_at DESC LIMIT 1"#)),
+        || Ok(vec![ctx.page.g("type")?, ctx.detail.g("digest")?]),
+    )?;
     all_into(ctx, stmt).await?;
 
     if ctx.results.length()?.truthy() {
         ctx.hints_condition = V::from(" OR ");
 
+        // 고침 (fix-sql-bind): ?1 = page.type, ?2… = hint.id
+        let mut hints_params = vec![ctx.page.g("type")?];
+
         ctx.i = V::Num(0.0);
         while below_len(&ctx.i, &ctx.results)? {
             ctx.hint = ctx.results.gk(&ctx.i)?;
-            let piece = tpl(T2664, &[ctx.page.g("type")?, ctx.hint.g("id")?, ctx.condition.clone()]);
+            hints_params.push(ctx.hint.g("id")?);
+            let piece = format!(r#" ("type" = ?1 AND "id" = ?{} {condition}) "#, hints_params.len());
             ctx.hints_condition = V::from(ctx.hints_condition.to_str() + &piece);
             ctx.i = inc(&ctx.i);
         }
@@ -482,7 +541,12 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
         ctx.hints_condition = V::from(ctx.hints_condition.to_str().replacen(" OR ", "", 1));
 
         let db = tpl(T2669, &[ctx.zoneRegion.clone(), ctx.type_.clone()]);
-        let stmt = prepare(env, &db, || Ok(tpl(T2670, &[ctx.type_.clone(), ctx.hints_condition.clone(), ctx.condition.clone()])))?;
+        let stmt = prepare_bound(
+            env,
+            &db,
+            || Ok(tpl(T2670, &[ctx.type_.clone(), ctx.hints_condition.clone(), ctx.condition.clone()])),
+            || Ok(hints_params),
+        )?;
         all_into(ctx, stmt).await?;
 
         if ctx.results.length()?.truthy() {
@@ -502,7 +566,15 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
     // 2685
     console_log!(tpl(T2687, &[ctx.type_.clone(), ctx.detail.g("id")?, ctx.condition.clone()]));
     let db = tpl(T2688, &[ctx.zoneRegion.clone(), ctx.type_.clone()]);
-    let stmt = prepare(env, &db, || Ok(tpl(T2689, &[ctx.type_.clone(), ctx.detail.g("id")?, ctx.condition.clone()])))?;
+    let stmt = prepare_bound(
+        env,
+        &db,
+        || {
+            let t = ctx.type_.to_str();
+            Ok(format!(r#"SELECT * FROM {t} WHERE "id" = ?1 {condition} ORDER BY created_at DESC LIMIT 1"#))
+        },
+        || Ok(vec![ctx.detail.g("id")?]),
+    )?;
     all_into(ctx, stmt).await?;
 
     console_log!("detail item results.length", ctx.results.length()?);
@@ -516,10 +588,15 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
         if loose_eq(&detail_type, &V::from("goods")) {
             // 2700
             let db = tpl(T2702, &[ctx.zoneRegion.clone()]);
-            let stmt = prepare(env, &db, || {
-                let c = cond_for(ctx, &ctx.type_)?;
-                Ok(tpl(T2703, &[ctx.s_item.g("index")?, cookies.g("cc")?, cookies.g("team")?, c]))
-            })?;
+            let stmt = prepare_bound(
+                env,
+                &db,
+                || {
+                    let c = cond_for(ctx, &ctx.type_)?.to_str();
+                    Ok(format!(r#"SELECT * FROM sales WHERE "goods" = ?1 AND "cc" = ?2 AND "to" = ?3 {c} ORDER BY created_at DESC LIMIT 10000"#))
+                },
+                || Ok(vec![ctx.s_item.g("index")?, cookies.g("cc")?, cookies.g("team")?]),
+            )?;
             all_into(ctx, stmt).await?;
 
             if ctx.results.length()?.truthy() {
@@ -529,23 +606,33 @@ async fn detail_rows(ctx: &mut Ctx, env: &Env) -> R<()> {
             if ctx.s_item.g("tracking")?.truthy() {
                 // 2722
                 let db = tpl(T2724, &[ctx.zoneRegion.clone()]);
-                let stmt = prepare(env, &db, || {
-                    let c = cond_for(ctx, &ctx.type_)?;
-                    Ok(tpl(T2725, &[ctx.s_item.g("index")?, cookies.g("team")?, c]))
-                })?;
+                let stmt = prepare_bound(
+                    env,
+                    &db,
+                    || {
+                        let c = cond_for(ctx, &ctx.type_)?.to_str();
+                        Ok(format!(r#"SELECT * FROM tracking WHERE "order" = ?1 AND "to" = ?2 {c} ORDER BY created_at DESC LIMIT 10000"#))
+                    },
+                    || Ok(vec![ctx.s_item.g("index")?, cookies.g("team")?]),
+                )?;
                 all_into(ctx, stmt).await?;
 
                 if ctx.results.length()?.truthy() {
                     push_rows(ctx, V::from("tracking"))?;
                 }
             } else {
-                // 2743 — 원본 그대로: `$item.index` 가 아니라 앞에서 남은 `item`(위 반복의 마지막 행, 또는 2617 의
-                // COUNT 행 { talks } — 그때는 "order" = undefined 로 D1 오류 → 418)의 index. item 이 undefined 면 TypeError
+                // 2743 — 고침 (fix-tracking-index): 원본은 `$item.index` 가 아니라 앞에서 남은 `item`(위 반복의 마지막 행, 또는 2617 의
+                // COUNT 행 { talks } — 그때는 "order" = undefined 로 D1 오류 → 418)의 index 를 썼다 → 옆 갈래(2725)와 같이 $item.index, 값은 묶는다
                 let db = tpl(T2745, &[ctx.zoneRegion.clone()]);
-                let stmt = prepare(env, &db, || {
-                    let c = cond_for(ctx, &ctx.type_)?;
-                    Ok(tpl(T2746, &[ctx.item.g("index")?, cookies.g("team")?, c]))
-                })?;
+                let stmt = prepare_bound(
+                    env,
+                    &db,
+                    || {
+                        let c = cond_for(ctx, &ctx.type_)?.to_str();
+                        Ok(format!(r#"SELECT * FROM tracking WHERE "order" = ?1 AND "to" = ?2 {c} ORDER BY created_at DESC LIMIT 10000"#))
+                    },
+                    || Ok(vec![ctx.s_item.g("index")?, cookies.g("team")?]),
+                )?;
                 all_into(ctx, stmt).await?;
 
                 if ctx.results.length()?.truthy() {

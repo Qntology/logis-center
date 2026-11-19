@@ -5,10 +5,10 @@
 
 use logis_worker_common::gzip::{decode_utf8, gzip_json, ungzip};
 use logis_worker_common::js::{self, Env};
-use logis_worker_common::jsv::{less_than, stringify_checked, to_lower, to_upper, tpl, Throw};
+use logis_worker_common::jsv::{js_trim, less_than, stringify_checked, to_lower, to_upper, tpl, Throw};
 use logis_worker_common::util::hash_id;
 use logis_worker_common::web::{headers_set, headers_vec, Body, Req, Resp};
-use logis_worker_common::{add, aws, console_log, eth, loose_eq, obj, parse, platform, R, V};
+use logis_worker_common::{add, aws, console_log, eth, loose_eq, obj, parse, parse_str, platform, R, V};
 
 use crate::ctx::Ctx;
 use crate::flow::Step;
@@ -54,15 +54,6 @@ fn upper(v: &V, what: &str) -> R<String> {
         V::Str(s) => Ok(to_upper(s)),
         V::Undef | V::Null => Err(Throw::type_error(format!("Cannot read properties of {} (reading 'toUpperCase')", v.to_str()))),
         _ => Err(Throw::type_error(format!("{what}.toUpperCase is not a function"))),
-    }
-}
-
-/// `s.split("@")[0]` — 문자열이 아니면 원본처럼 TypeError
-fn split_at_first(v: &V, what: &str) -> R<V> {
-    match v {
-        V::Str(s) => Ok(V::from(s.split('@').next().unwrap_or("").to_string())),
-        V::Undef | V::Null => Err(Throw::type_error(format!("Cannot read properties of {} (reading 'split')", v.to_str()))),
-        _ => Err(Throw::type_error(format!("{what}.split is not a function"))),
     }
 }
 
@@ -135,6 +126,11 @@ pub async fn put(ctx: &mut Ctx, env: &Env, req: &Req) -> R<Step> {
             "session" => ctx.cookies.clone(),
         };
         return Ok(Step::Return(json_response(ctx, &body)?));
+    }
+
+    // 고침 (fix-app-invite): 이메일 초대 (앱 main.ts 2480~2518 — from = 팀, to = 자기 주소, email, ref = 페이지 id 배열, id 없음)
+    if query.g("email")?.truthy() && !query.g("id")?.truthy() {
+        return Ok(Step::Return(invite(ctx, env, &query).await?));
     }
 
     // 1710
@@ -282,185 +278,186 @@ async fn vector(ctx: &mut Ctx, env: &Env, req: &Req) -> R<()> {
     Ok(())
 }
 
-/// 1724~1889 — 멤버 내보내기(cc = ZeroAddress) · 허용(cc = 주소), 끝에 한 번 배치
+/// 1724~1889 — 고침 (fix-revoke-owner · fix-app-invite): 원본의 팀장 막기(`team.from != to`)는 세션의 팀 이름 글(있는 사용자) 또는
+/// 팀 객체(새 사용자)를 읽어 듣지 않았고, 주기(from = 팀장 · to = 이메일 · cc = 팀)와 거두기(id = 팀 · bcc = 나)와 읽는 곳(1567: from = 멤버 ·
+/// to = 팀 · bcc = 페이지 bcc)의 행 꼴이 서로 달랐다 → 팀장은 팀 행의 from([`crate::fixes::team_owner`]), 멤버 행은 초대 확정과 같은 꼴
+/// ([`crate::fixes::member_statements`]). 거두기 = 팀장(내보내기) 또는 본인(나가기)이 refs 의 페이지 행을 지운다. 팀장 자신은 거둘 수 없다
 async fn members(ctx: &mut Ctx, env: &Env, query: &V) -> R<()> {
+    let logis_region = ctx.logisRegion.to_key();
+    let team = ctx.cookies.g("team")?;
+    let owner = crate::fixes::team_owner(env, &logis_region, &ctx.admin, &team).await?;
+
+    // isAddress(to) 는 put() 이 이미 봤다
+    let member = V::from(to_lower(&query.g("to")?.to_str()));
+    let page_ids = crate::fixes::address_list(&ctx.refs, 50);
+
     ctx.statements = V::new_arr();
+    let items_db = format!("commerce_logis_{}_items", ctx.zoneRegion.to_str());
 
-    ctx.r = V::Num(0.0);
-    while less_than(&ctx.r, &ctx.refs.g("length")?) == Some(true) {
-        ctx.ref_ = ctx.refs.gk(&ctx.r)?;
-
+    if loose_eq(&query.g("id")?, &team) && owner.truthy() && !loose_eq(&member, &owner) {
+        let address = ctx.cookies.g("address")?;
         if loose_eq(&query.g("cc")?, &V::from(ZERO_ADDRESS)) {
-            // 1729 나가기 · 내보내기
-            if eth::is_address(&query.g("to")?) && loose_eq(&query.g("id")?, &ctx.cookies.g("team")?) {
-                // 원본 그대로: team 은 세션의 var — 있는 사용자면 글(team.from 은 undefined, 늘 다르다), 없으면 undefined 라 TypeError (418)
-                if !loose_eq(&ctx.team.g("from")?, &query.g("to")?) {
-                    revoke(ctx, env, query).await?;
+            // 나가기(본인) · 내보내기(팀장)
+            if loose_eq(&address, &owner) || loose_eq(&address, &member) {
+                for id in &page_ids {
+                    let stmt = js::bind(
+                        &env.prepare(&items_db, r#"DELETE FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 AND "ref" = ?3"#)?,
+                        &[member.clone(), team.clone(), V::from(id.as_str())],
+                    )?;
+                    ctx.statements.push(stmt)?;
+                    ctx.results.push(obj! {
+                        "id" => id.as_str(),
+                        "table" => "items",
+                        "type" => "member",
+                        "from" => member.clone(),
+                        "to" => team.clone(),
+                        "ref" => id.as_str(),
+                    })?;
                 }
             }
         } else if eth::is_address(&query.g("cc")?) {
-            // 1761 허용
-            if loose_eq(&query.g("from")?, &ctx.cookies.g("address")?) && loose_eq(&query.g("id")?, &ctx.cookies.g("team")?) {
-                if !loose_eq(&ctx.team.g("from")?, &query.g("to")?) {
-                    grant(ctx, env, query).await?;
+            // 허용(팀장): 팀에 든 사용자에게만 — 그 멤버의 행을 지우고 refs 의 페이지마다 다시 넣는다
+            if loose_eq(&query.g("from")?, &address) && loose_eq(&address, &owner) {
+                let rows = js::query_bound(
+                    env,
+                    &logis_region,
+                    r#"SELECT "id", "data" FROM users WHERE "id" = ?1 AND "type" = 'user' AND "to" = ?2 LIMIT 1"#,
+                    &[member.clone(), team.clone()],
+                )
+                .await?;
+                if rows.g("length")?.truthy() {
+                    ctx.memberName = crate::fixes::member_name(&rows.gi(0)?.g("data")?);
+                    ctx.memberDataArr = gzip_json(&obj! {
+                        "flag" => ctx.FLAG.clone(),
+                        "name" => ctx.memberName.clone(),
+                        "title" => "",
+                        "region" => ctx.zoneRegion.clone(),
+                        "page_count" => 0,
+                        "favicon" => V::Null,
+                    })?;
+
+                    let stmt = js::bind(
+                        &env.prepare(&items_db, r#"DELETE FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2"#)?,
+                        &[member.clone(), team.clone()],
+                    )?;
+                    ctx.statements.push(stmt)?;
+
+                    let (statements, granted) = crate::fixes::member_statements(
+                        env,
+                        &ctx.zoneRegion,
+                        &member,
+                        &team,
+                        &address,
+                        &page_ids,
+                        &ctx.memberDataArr,
+                        &ctx.now,
+                    )
+                    .await?;
+                    for stmt in statements.items() {
+                        ctx.statements.push(stmt)?;
+                    }
+                    ctx.results = granted;
                 }
             }
-            // 1853 `else if (from == cookies.team && to == cookies.address)` — 본문이 모두 주석(읽기만 하고 던지지 않음)
         }
-
-        ctx.r = inc(&ctx.r);
     }
 
-    // 1884 — catch(err){} 로 삼킨다
-    let db = tpl(T1885, &[ctx.zoneRegion.clone()]);
-    let _ = env.batch(&db, &ctx.statements).await;
-    Ok(())
-}
-
-/// 1739~1757 — 권한 해제
-async fn revoke(ctx: &mut Ctx, env: &Env, query: &V) -> R<()> {
-    let db = tpl(T1739, &[ctx.zoneRegion.clone()]);
-    let stmt = js::bind(
-        &env.prepare(&db, T1740[0])?,
-        &[
-            query.g("id")?,
-            V::from("member"),
-            ctx.cookies.g("address")?,
-            query.g("to")?,
-            ctx.cookies.g("address")?,
-        ],
-    )?;
-    // `var { results } = …` — success 는 그대로
-    ctx.results = js::all(&stmt).await?.g("results")?;
-
-    if ctx.results.g("length")?.truthy() {
-        ctx.row = ctx.results.gi(0)?;
-
-        // 원본 그대로: 응답의 results 에 든 행도 같이 바뀐다(같은 객체)
-        ctx.row.s_("to", V::from(ZERO_ADDRESS))?;
-
-        // 원본 그대로: `to` 는 SQLite 키워드(ID 대체 목록에 없음)라 이 문장은 배치에서 실패하고(1886 이 삼킴) 같은 배치의 다른 문장도
-        // 함께 버려질 것이다 (D1 에서 시험하지 않음)
-        let db = tpl(T1749, &[ctx.zoneRegion.clone()]);
-        let stmt = js::bind(&env.prepare(&db, T1750[0])?, &[ctx.row.g("to")?, ctx.now.clone(), ctx.row.g("id")?])?;
-        ctx.statements.push(stmt)?;
+    if ctx.statements.g("length")?.truthy() {
+        match env.batch(&items_db, &ctx.statements).await {
+            Ok(_) => ctx.success = V::Bool(true),
+            Err(err) => {
+                console_log!("member batch err", err);
+                ctx.results = V::new_arr();
+            }
+        }
     }
     Ok(())
 }
 
-/// 1769~1849 — 권한 허용: 멤버 행을 지우고 refs 마다 다시 넣는다
-async fn grant(ctx: &mut Ctx, env: &Env, query: &V) -> R<()> {
+/// 고침 (fix-app-invite): 팀장만 같은 지역 DB 의 users 에 type 'invite' 행을 넣는다 (다시 초대하면 덮어씀).
+/// 행: id = hashId(팀 + 소문자 이메일), from = 초대한 사람, to = 팀, cc = hashId(소문자 이메일), data = gzip({ email, refs, zone, flag, name }).
+/// 응답 results[0] = { id, table: 'users', type: 'invite', hook } — hook 은 앱의 기본값과 같은 `${hash}.logis.center@oauth.email`
+async fn invite(ctx: &mut Ctx, env: &Env, query: &V) -> R<Resp> {
+    let mut invited = V::Null;
+    let mut error = "invite requires the signed-in team owner";
+    let email = to_lower(js_trim(&query.g("email")?.to_str()));
     let cookies = ctx.cookies.clone();
 
-    ctx.memberId = V::from(hash_id(&add(&add(&cookies.g("address")?, &query.g("to")?), &cookies.g("team")?))?);
+    if !is_email(&email) {
+        error = "invalid email";
+    } else if cookies.g("address")?.truthy()
+        && cookies.g("team")?.truthy()
+        && ctx.zoneRegion.truthy()
+        && loose_eq(&query.g("from")?, &cookies.g("team")?)
+        && loose_eq(&query.g("to")?, &cookies.g("address")?)
+    {
+        let logis_region = ctx.logisRegion.to_key();
+        let owner = crate::fixes::team_owner(env, &logis_region, &ctx.admin, &cookies.g("team")?).await?;
+        if owner.truthy() && loose_eq(&owner, &cookies.g("address")?) {
+            // JSON.parse(req.query.ref || '[]') 가 던지면 []
+            let q_ref = query.g("ref")?;
+            let refs_value = parse_str(&if q_ref.truthy() { q_ref.to_str() } else { "[]".to_string() }).unwrap_or_else(|_| V::new_arr());
+            let refs = crate::fixes::address_list(&refs_value, 50);
 
-    // 1771 — 원본 그대로: 값을 SQL 에 이어 붙인다
-    let db = tpl(T1771, &[ctx.zoneRegion.clone()]);
-    let out = js::all(&env.prepare(&db, &tpl(T1772, &[ctx.memberId.clone()]))?).await?;
-    take_result(ctx, &out)?;
+            let id = V::from(hash_id(&add(&cookies.g("team")?, &V::from(email.as_str())))?);
+            invited = obj! {
+                "id" => id.clone(),
+                "table" => "users",
+                "type" => "invite",
+                "hook" => format!("{}.logis.center@oauth.email", cookies.g("hash")?.to_str()),
+            };
 
-    if ctx.results.g("length")?.truthy() {
-        return Ok(());
-    }
+            let data = gzip_json(&obj! {
+                "email" => email.as_str(),
+                "refs" => V::from(refs.iter().map(|r| V::from(r.as_str())).collect::<Vec<_>>()),
+                "zone" => ctx.zoneRegion.clone(),
+                "flag" => ctx.FLAG.clone(),
+                "name" => email.split('@').next().unwrap_or(""),
+            })?;
 
-    // 1778
-    let db = tpl(T1778, &[ctx.zoneRegion.clone()]);
-    let sql = tpl(T1779, &[ctx.memberId.clone(), query.g("to")?, query.g("cc")?]);
-    let out = js::all(&env.prepare(&db, &sql)?).await?;
-    take_result(ctx, &out)?;
-
-    if !ctx.results.g("length")?.truthy() {
-        return Ok(());
-    }
-
-    // 1784
-    ctx.row = ctx.results.gi(0)?;
-    ctx.memberEmail = ctx.row.g("from")?;
-    ctx.memberName = split_at_first(&ctx.memberEmail, "memberEmail")?;
-
-    // 1789
-    ctx.allowedRefs = V::new_arr();
-    let r: R<()> = (|| {
-        let q_ref = query.g("ref")?;
-        if q_ref.truthy() {
-            ctx.allowedRefs = parse(&q_ref)?;
+            js::run_bound(
+                env,
+                &logis_region,
+                SQL_INVITE_UPSERT,
+                &[id, cookies.g("address")?, cookies.g("team")?, V::from(hash_id(&V::from(email.as_str()))?), data, ctx.now.clone()],
+            )
+            .await?;
         }
-        Ok(())
-    })();
-    if let Err(err) = r {
-        console_log!("ref parse error", err);
     }
 
-    // 1800
-    let db = tpl(T1800, &[ctx.zoneRegion.clone()]);
-    let stmt = js::bind(
-        &env.prepare(&db, T1800_1[0])?,
-        &[cookies.g("address")?, ctx.memberEmail.clone(), cookies.g("team")?],
-    )?;
-    ctx.statements.push(stmt)?;
+    headers_set(&ctx.headers, "Content-Type", &V::from("application/json"))?;
 
-    // 1805 `gzip(…, { to: 'arraybuffer' })` 는 Uint8Array, 묶는 것은 그 `.buffer` — 여기서는 처음부터 ArrayBuffer(V::Bytes) 하나로 둔다
-    ctx.memberDataArr = gzip_json(&obj! {
-        "flag" => ctx.FLAG.clone(),
-        "name" => ctx.memberName.clone(),
-        "title" => "",
-        "region" => V::Null,
-        "page_count" => 0,
-        "favicon" => V::Null,
-    })?;
-
-    // 1815 `allowedRefs.length > 0`
-    if less_than(&V::Num(0.0), &ctx.allowedRefs.g("length")?) == Some(true) {
-        // 원본 그대로: `var r` 라 바깥 refs 반복(1726)과 같은 셈 변수 — 이 반복이 끝나면 r = allowedRefs.length 라
-        // 바깥 반복은 첫 회차 뒤 끝난다
-        ctx.r = V::Num(0.0);
-        while less_than(&ctx.r, &ctx.allowedRefs.g("length")?) == Some(true) {
-            ctx.targetPageId = ctx.allowedRefs.gk(&ctx.r)?;
-
-            let text = add(&add(&add(&cookies.g("address")?, &ctx.memberEmail), &cookies.g("team")?), &ctx.targetPageId);
-            ctx.uniqueMemberRowId = V::from(hash_id(&text)?);
-
-            let db = tpl(T1822, &[ctx.zoneRegion.clone()]);
-            let stmt = js::bind(
-                &env.prepare(&db, T1822_1[0])?,
-                &[
-                    ctx.uniqueMemberRowId.clone(),
-                    cookies.g("address")?,
-                    ctx.memberEmail.clone(),
-                    cookies.g("team")?,
-                    cookies.g("address")?,
-                    ctx.targetPageId.clone(),
-                    ctx.memberDataArr.clone(),
-                    ctx.now.clone(),
-                    ctx.now.clone(),
-                ],
-            )?;
-            ctx.statements.push(stmt)?;
-
-            ctx.r = inc(&ctx.r);
-        }
+    let body = if invited.truthy() {
+        obj! { "results" => V::from(vec![invited]), "success" => true, "session" => cookies }
     } else {
-        // 1840
-        let text = add(&add(&add(&cookies.g("address")?, &ctx.memberEmail), &cookies.g("team")?), &V::from("none"));
-        ctx.baseId = V::from(hash_id(&text)?);
+        obj! { "results" => V::new_arr(), "success" => false, "error" => error, "session" => cookies }
+    };
+    json_response(ctx, &body)
+}
 
-        let db = tpl(T1842, &[ctx.zoneRegion.clone()]);
-        let stmt = js::bind(
-            &env.prepare(&db, T1842_1[0])?,
-            &[
-                ctx.baseId.clone(),
-                cookies.g("address")?,
-                ctx.memberEmail.clone(),
-                cookies.g("team")?,
-                cookies.g("address")?,
-                ctx.memberDataArr.clone(),
-                ctx.now.clone(),
-                ctx.now.clone(),
-            ],
-        )?;
-        ctx.statements.push(stmt)?;
-    }
-    Ok(())
+const SQL_INVITE_UPSERT: &str = "
+								INSERT INTO users (\"id\", \"type\", \"from\", \"to\", \"cc\", \"bcc\", \"ref\", \"data\", \"created_at\", \"updated_at\")
+								VALUES (?1, 'invite', ?2, ?3, ?4, '', '', ?5, ?6, ?6) ON CONFLICT (id) DO UPDATE SET
+									\"from\" = EXCLUDED.\"from\",
+									\"to\" = EXCLUDED.\"to\",
+									\"cc\" = EXCLUDED.\"cc\",
+									\"data\" = EXCLUDED.\"data\",
+									\"created_at\" = EXCLUDED.\"created_at\",
+									\"updated_at\" = EXCLUDED.\"updated_at\"
+							";
+
+/// `/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/` (앱 main.ts 2464 의 검사를 소문자로)
+fn is_email(s: &str) -> bool {
+    let Some((local, domain)) = s.split_once('@') else {
+        return false;
+    };
+    let local_ok = !local.is_empty() && local.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._%+-".contains(&b));
+    // 도메인 = [a-z0-9.-]+ '.' [a-z]{2,} — 어떤 점 뒤가 끝까지 두 글자 넘는 영문이고 그 앞이 비지 않으면 맞는다 (정규식의 되돌아가기와 같은 결과)
+    let domain_ok = domain.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        && (1..domain.len()).any(|i| {
+            domain.as_bytes()[i] == b'.' && domain.len() - i - 1 >= 2 && domain[i + 1..].bytes().all(|b| b.is_ascii_lowercase())
+        });
+    local_ok && domain_ok
 }
 
 /// 1894~1948 — 대화 넣기 (try 없음: 던지면 418)
@@ -535,10 +532,11 @@ pub async fn delete(ctx: &mut Ctx, env: &Env, _req: &Req) -> R<Step> {
             if eth::is_address(&q_ref) {
                 ctx.ref_ = V::from(to_lower(&q_ref.to_str()));
 
-                // 원본 그대로: tasks 를 items DB 에서 지우고(그 표가 없으면 D1 오류로 418), 값을 큰따옴표로 이어 붙인다
-                // (SQLite 는 큰따옴표를 먼저 열 이름으로 본다). try 가 없어 run 이 던지면 418
-                let db = tpl(T1970, &[ctx.zoneRegion.clone()]);
-                let out = js::run(&env.prepare(&db, &tpl(T1971, &[ctx.ref_.clone()]))?).await?;
+                // 고침 (fix-delete-tasks-db): 원본은 tasks 를 zone items DB 에서 지우려 했고(작업은 지역 DB 에 있다) 값을 큰따옴표로 이어 붙였다
+                // (SQLite 는 큰따옴표를 먼저 열 이름으로 본다) → 지역 DB 에서, 값은 묶고, 자기 작업(from = 나 · to = 내 팀)만. try 가 없어 던지면 418
+                let db = ctx.logisRegion.to_key();
+                let sql = r#"DELETE FROM tasks WHERE "ref" = ?1 AND "from" = ?2 AND "to" = ?3"#;
+                let out = js::run_bound(env, &db, sql, &[ctx.ref_.clone(), ctx.cookies.g("address")?, ctx.cookies.g("team")?]).await?;
                 take_result(ctx, &out)?;
             }
         } else {

@@ -18,6 +18,8 @@ pub mod put_delete;
 pub mod post;
 #[cfg(target_arch = "wasm32")]
 pub mod get;
+#[cfg(target_arch = "wasm32")]
+pub mod fixes;
 pub mod render;
 
 #[cfg(target_arch = "wasm32")]
