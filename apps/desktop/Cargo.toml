@@ -1,0 +1,62 @@
+[package]
+name = "logis-center"
+version = "0.1.0"
+description = "logis.center"
+authors = ["che"]
+edition = "2021"
+
+[lib]
+name = "tauri_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[build-dependencies]
+tauri-build = { version = "2.5.3", features = [] }
+
+[dependencies]
+tauri = { version = "2.10.1", features = [] }
+tauri-plugin-dialog = "2.6.0"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+# 🌟 [APP CORE] 헤드리스 코어(apps/core): 모델 상주 · LanceDB 저장소 · 스케줄러 · 검색 · 화면 명령 본문(logis_app::commands).
+#    lib.rs 가 예전 모듈 이름으로 재수출합니다. GPU 기능은 아래 [features] 가 이 crate 를 거쳐 모델 crate(logis-llm · logis-vision-doc)까지 켭니다.
+logis-app.workspace = true
+# 모델 엔진의 spawn 훅(logis_llm::rt::set_spawner)을 run() 이 Tauri 전역 런타임으로 등록합니다.
+logis-llm.workspace = true
+# 🌟 [SHELL DEPS] 셸 코드(src/lib.rs · automation.rs · sink.rs · main.rs)가 직접 쓰는 것만 둡니다. candle · 모델 · 파서 · 저장소 쪽은
+#    코어와 모델 crate 가, 통합 시험이 쓰는 crate 는 apps/core 의 [dev-dependencies] 가 가집니다.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+regex = "1"
+futures = "0.3"
+uuid = { version = "1.4", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json", "native-tls"], default-features = false }
+mimalloc = { version = "*", features = ["v3"] }
+# 브라우저 자동화 (automation.rs: Chrome · Edge 는 CDP, Firefox 는 WebDriver, 실행 파일 찾기)
+fantoccini = "0.19"
+chromiumoxide = { version = "0.8.0", features = ["tokio-runtime"] }
+which = "6.0"
+once_cell = "1.18"
+
+[features]
+default = ["cuda", "flash-attn", "turbo-quant"]
+# 각 GPU · 가속 기능은 코어(logis-app)를 거쳐 crates/logis-llm · logis-vision-doc 의 같은 기능(candle 백엔드)을 켭니다
+# (옮긴 모델 코드의 #[cfg(feature = …)] 는 그 crate 의 기능을 봄). 셸 코드에는 #[cfg(feature = …)] 가 없습니다.
+cuda = ["logis-app/cuda"]
+rocm = ["logis-app/rocm"]
+vulkan = ["logis-app/vulkan"]
+metal = ["logis-app/metal"]
+# Fused FlashAttention (v1/v2/v3 tiers, picked per GPU) from the candle-rocm-vulkan fork.
+# Activates the `#[cfg(feature = "flash-attn")]` paths in logis-llm models/common · models/qwen/common.
+flash-attn = ["logis-app/flash-attn"]
+# TurboQuant / NVFP4 / MXFP4 / MXFP8 / FP8 quantization kernels (candle_nn::turbo_quant).
+turbo-quant = ["logis-app/turbo-quant"]
+# 디버그 빌드에서도 모든 언어 도메인 사전(full_bias.json)을 넣습니다. 릴리스 빌드는 이 기능 없이도 full_bias.json 입니다
+# (crates/logis-bias/src/bias_schema.rs BIAS_SOURCE). 개발 빌드 기본값은 한국어 · 영어만 담은 bias.json 입니다.
+full-bias = ["logis-app/full-bias"]
+
+# [patch.crates-io](candle 포크 커밋)와 [profile.*] 는 루트 Cargo.toml 에 있습니다. 작업 공간 멤버의 것은 무시됩니다.

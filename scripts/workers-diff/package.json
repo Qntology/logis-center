@@ -1,0 +1,20 @@
+{
+  "name": "workers-diff",
+  "private": true,
+  "type": "module",
+  "description": "원본 TypeScript 워커(801b0ce0)와 workers-rs 판을 Miniflare 에서 같은 조건으로 돌려 견주는 시험대",
+  "scripts": {
+    "apac": "node apac.mjs",
+    "proxy": "node proxy.mjs",
+    "vectors:pako": "node pako_vectors.mjs ../../workers/common/tests/pako_array.json",
+    "vectors:dom": "node dom_vectors.mjs ../../SyntheticData/commerce/output_html ../../workers/proxy/tests/dom_vectors.json"
+  },
+  "dependencies": {
+    "esbuild": "^0.28.2",
+    "ethers": "^6.17.0",
+    "linkedom": "^0.18.11",
+    "miniflare": "^4.20260730.0",
+    "pako": "^2.2.0",
+    "wrangler": "^4.164.0"
+  }
+}

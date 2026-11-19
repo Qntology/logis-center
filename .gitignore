@@ -28,12 +28,12 @@ trade/model_cache/
 trade/model_offload/
 trade/conda_env/
 
-commerce/rust/backup-rust/
-commerce/rust/new-src-tauri/
-commerce/rust/backup-src-tauri/
-commerce/rust/before-src-tauri/
-commerce/rust/mobile/src-tauri/target/
-commerce/rust/mobile/src-tauri/gen/android/app/build/outputs
+apps/mobile/target/
+apps/mobile/gen/android/app/build/outputs
+apps/desktop/browser_profiles/*
+workers/*/node_modules/
+workers/*/.wrangler/
+workers/*/build/
 
 tmp/
 
@@ -226,5 +226,7 @@ build/
 # Turbo output
 .turbo/
 
-# Cargo (root workspace; build output goes to commerce/src-tauri/target via .cargo/config.toml)
+# Cargo (root workspace; build output goes to target/ via .cargo/config.toml)
 /target/
+workers/target/
+.claude/worktrees/

@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = []
-# 앱(commerce/src-tauri)의 같은 이름 기능이 이 기능도 켭니다. 옮긴 코드의 #[cfg(feature = …)] 는 이 crate 의 기능을 봅니다.
+# 앱(apps/desktop)의 같은 이름 기능이 이 기능도 켭니다. 옮긴 코드의 #[cfg(feature = …)] 는 이 crate 의 기능을 봅니다.
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda", "candle-flash-attn?/cuda"]
 rocm = ["dep:candle-rocm", "candle-core/rocm", "candle-nn/rocm", "candle-flash-attn?/rocm"]
 vulkan = ["candle-core/vulkan", "candle-nn/vulkan", "candle-flash-attn?/vulkan"]
@@ -30,9 +30,9 @@ candle-rocm = { workspace = true, optional = true }
 candle-transformers = "0.11.0"
 chrono = { version = "0.4", features = ["serde"] }
 # 🌟 [EMBED-CPU-PACKED] CPU 임베딩 패킹 GEMM (opt-in: LOGIS_EMBED_CPU_KERNEL=packed, models/embedding/cpu_packed.rs)
-embed-cpu-kernels = { path = "../../commerce/crates/embed-cpu-kernels" }
+embed-cpu-kernels = { path = "../embed-cpu-kernels" }
 # 🌟 [PYRAMID-QUANT] 원본 가중치를 한 번 양자화하는 GGML 블록 인코더 (lang_gguf.rs)
-ggml-kquant = { path = "../../commerce/crates/ggml-kquant" }
+ggml-kquant = { path = "../ggml-kquant" }
 image = { version = "0.25", features = ["jpeg", "png"] }
 libc = "0.2"
 logis-bias.workspace = true
@@ -44,6 +44,8 @@ mimalloc = { version = "0.1.48", features = ["v3"] }
 minijinja = "2.12.0"
 nvml-wrapper = "0.9.0"
 once_cell.workspace = true
+# granite 임베딩의 ModernBERT 인코더(예전 ForwardMode::Exact 순전파, 연산 그대로)는 premium-discount-nlp 에 있습니다 (models/embedding.rs).
+premium-discount-nlp = { workspace = true, features = ["granite"] }
 premium-discount-quant.workspace = true
 rand = "0.8"
 rayon = "1.10"
@@ -63,7 +65,7 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_
 logis-pug.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-direct-storage = { path = "../../commerce/crates/direct-storage" }
+direct-storage = { path = "../../vendor/direct-storage" }
 windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Security", "Win32_System_IO"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

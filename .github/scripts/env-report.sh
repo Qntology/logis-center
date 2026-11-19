@@ -113,11 +113,11 @@ emit "gpu-sdk" "$g3"
 
 # ── 4. build inputs + PATH names ──
 g4="$(
-  root="${GITHUB_WORKSPACE:-.}/logis-center/commerce"
-  [ -d "$root" ] || root="./commerce"
-  [ -f "$root/dist/index.html" ] && echo "dist/index.html: present" || echo "dist/index.html: MISSING"
-  if [ -d "$root/src-tauri/dlls" ] && [ -n "$(ls -A "$root/src-tauri/dlls" 2>/dev/null)" ]; then echo "src-tauri/dlls: non-empty"; else echo "src-tauri/dlls: MISSING or empty"; fi
-  [ -f "$root/src-tauri/Cargo.toml" ] && echo "fork path lines: $(cat "$root/src-tauri/Cargo.toml" "$root/../Cargo.toml" 2>/dev/null | grep -cE '^candle-(rocm|core|nn|flash-attn) = \{ path')"
+  root="${GITHUB_WORKSPACE:-.}/logis-center"
+  [ -d "$root/apps" ] || root="."
+  [ -f "$root/web/desktop/dist/index.html" ] && echo "web/desktop/dist/index.html: present" || echo "web/desktop/dist/index.html: MISSING"
+  if [ -d "$root/apps/desktop/dlls" ] && [ -n "$(ls -A "$root/apps/desktop/dlls" 2>/dev/null)" ]; then echo "apps/desktop/dlls: non-empty"; else echo "apps/desktop/dlls: MISSING or empty"; fi
+  [ -f "$root/apps/desktop/Cargo.toml" ] && echo "fork path lines: $(cat "$root/apps/desktop/Cargo.toml" "$root/Cargo.toml" 2>/dev/null | grep -cE '^candle-(rocm|core|nn|flash-attn) = \{ path')"
   present "RUSTFLAGS" "${RUSTFLAGS:-}"
   present "CARGO_ENCODED_RUSTFLAGS" "${CARGO_ENCODED_RUSTFLAGS:-}"
   present "LIB" "${LIB:-}"

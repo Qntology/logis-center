@@ -15,7 +15,7 @@ at all (CUDA 13 dropped everything below Turing), so the set is derived, not wri
 
 One line per architecture. A failure that matches a registered signature is KNOWN (warning + reason) and does not
 fail the job; a failure below the project's minimum architecture is BELOW MIN (warning + reason, still printed, never
-hidden); any other failure fails the job. Run from commerce/src-tauri.
+hidden); any other failure fails the job. Run from apps/desktop.
 Env: SWEEP_MINUTES (budget, default 60), SWEEP_SKIP (comma list of sm numbers already verified elsewhere),
      SWEEP_MIN_SM (lowest sm number the project supports, e.g. 70; default 0 = every architecture must compile),
      SWEEP_CMD (compile command, default `cargo check -p candle-kernels`; tests replace it).

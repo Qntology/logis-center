@@ -3,6 +3,9 @@
 기획서 "웹 분석(`analytic`) 이관 이후 `crates/` 모듈화 및 `premium-discount` 공용 엔진 통합"의 1 · 2단계, 3단계의 검색 · 생성 모델 crate,
 4단계의 `EventSink` 를 반영한 기록입니다. 나머지(문서 비전 crate, `commerce/app` 분리)는 아래 "남은 단계"에 실측한 결합도와 함께 적었습니다.
 
+> 1 ~ 6단계 본문의 경로는 그때의 것(`commerce/app` · `commerce/src-tauri` · `commerce/crates`)입니다. 7단계에서 폴더를 다시 배치했고,
+> 옛 경로 → 새 경로는 [7단계 표](#7단계-폴더-재배치-apps--crates--web--workers--vendor)에 있습니다.
+
 ## 1단계: 루트 작업 공간 · candle 포크 고정 · premium-discount 링크
 
 | 무엇 | 어디 |
@@ -204,6 +207,92 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   scraper · minijinja · rand · half · candle 등 동작에 닿는 crate 의 기능은 그대로입니다. 암호 crate 를 쓰는 premium-discount-identity(k256,
   `hash_id`)는 통합 시험의 ethers 벡터 시험(`utils_identity`)이 확인합니다.
 
+## 6단계: 공용 AI 엔진 1:1 대조 치환 (premium-discount 2549767)
+
+같은 입력을 두 저장소에 넣어 출력을 바이트 · 비트 단위로 견주는 덤프 시험을 양쪽에 두고(`--ignored`), 같을 때만 바꿨습니다.
+logis 쪽: `tests/it/stanza_runtime.rs::dump_analyses`, `synthetic_eval::embed_dump`(`LOGIS_SYNTH_EMBED_SINGLE=1` 이면 문장별 `embed()`) ·
+`synthetic_eval::siglip2_dump`. premium-discount 쪽: `premium-discount-nlp` 의 `stanza_runtime::dump_analyses` · `granite_reference::dump_vectors`,
+`premium-discount-vision` 의 `siglip2_dump`.
+
+| 엔진 | 대조 (실제 모델, CPU) | 결과 |
+| --- | --- | --- |
+| Stanza (12개 언어) | stanza-onnx-export 기준 원문 278개, 1,924 낱말: 토큰 · 원형 · 품사 · 형태 · 머리 · 관계 + `analyze_query` 278개 | 바이트 동일 → **바꿈** |
+| granite 임베딩 | 307문장(12개 언어 + 묶음 문장 · 빈 문자열 · 한 글자) 384차원 | 예전 PD 판은 코사인 1.000000 · 최대 차 3e-7 · 비트 동일 0/307 → PD 를 logis 순전파로 맞춘 뒤 **비트 동일 307/307** → **바꿈** |
+| SigLIP2 | 문장 60 · 이미지 8 (텍스트 토큰 · 벡터, 전처리 픽셀, 풀링 · 패치 벡터) | 같은 토큰이면 텍스트 코사인 1.000000, 그러나 토큰 정규화 · 전처리 · 위치 임베딩 보간이 달라 풀링 코사인 0.946~0.999 → **바꾸지 않음** |
+
+### Stanza → `premium_discount_nlp::stanza`
+
+- `commerce/app/src/stanza.rs`(2,005줄)는 PD 를 재수출하는 어댑터(약 120줄)가 됐습니다. 이 앱에 남은 것: 모델 폴더 규칙(`LOGIS_STANZA_DIR` 또는
+  앱 폴더 · 평가 폴더 아래 `models/stanza/<lang>` — PD 의 새 `set_dir_resolver` 로 겁니다. PD 기본 규칙은 다른 앱 폴더부터 찾음), 질의 언어 판정
+  (logis-bias `query_lang` 의 bias 사전 라틴 구역 투표 — PD 판에는 없음), 내려받기 목록(`json_order`).
+- ONNX Runtime 은 이제 링크하지 않고 실행할 때 불러옵니다(PD `runtime-load`): `ORT_DYLIB_PATH`, 실행 파일 옆(배포 앱의 `dlls/*`), 앱 모델 폴더의
+  `onnxruntime/`, 빌드가 준비한 라이브러리(`ORT_STRATEGY=system` + `ORT_LIB_LOCATION`, 또는 내려받기) 순서로 전체 경로로만 엽니다
+  (Windows `System32\onnxruntime.dll` 1.17.1 을 집지 않음). `ORT_DYLIB_PATH` 없이 빌드가 준비한 1.28.0 을 여는 것을 확인했습니다.
+- 쓰는 곳이 없어진 `commerce/crates/onnxruntime(-sys)` 사본은 지웠습니다. 같은 코드(+ `runtime-load`)가 premium-discount `crates/onnxruntime(-sys)` 에
+  있고, 바인딩을 고칠 때는 이제 그쪽을 고칩니다.
+- PyTorch Stanza 기준 대조(`real_models_match_pytorch_reference`)도 어댑터로 12개 언어 278/278 일치.
+
+### granite 임베딩 → `premium_discount_nlp::granite::Encoder`
+
+- 사전 대조에서 PD 판(Exact 경로를 옮긴 것)은 코사인 1.000000 · 최대 차 3e-7 이지만 비트 동일 0/307 이었습니다. 원인은 둘: 연산열(RoPE 표를
+  f64 cos 로 만든 것 · 융합 RoPE 커널 · 스케일 곱셈 · LayerNorm dtype · 정규화 산술)과 빌드 플래그(이 저장소는 `target-cpu=native` 라 candle CPU
+  커널이 AVX/FMA 경로). 그래서 PD 의 인코더를 이 앱의 Exact 순전파 연산 그대로 바꿨습니다(premium-discount f9a36db): 공개 `Encoder` ·
+  `EncoderConfig`(기본값은 앱이 채움 — 목업 모델은 RoPE · 창 칸이 없어 이 앱은 θ 150000 · 모든 층 전역 · 창 없음) · `forward_batch(ids, batch,
+  len, mask)` → [B, L, H], CPU GLU 커널 훅 `set_glu_kernel`(이 앱이 `embed-cpu-kernels` 병렬 판을 꽂음, candle 과 같은 비트), CUDA/ROCm 은
+  가중치 dtype 그대로(BF16) · LayerNorm · RoPE 는 F32. 같은 플래그에서 PD 단독 출력이 이 앱과 307/307 비트 동일이고(예전 PD 판은 같은
+  플래그에서도 0/307), HF transformers 기준 코사인 ≥ 0.9999 그대로.
+- `crates/logis-llm` 의 `FloatModel` 은 `Exact(Encoder)` · `Legacy(…)` 두 갈래입니다. Exact · ExactMean 은 PD 인코더, Legacy(예전 RmsNorm 순전파)와
+  그 CPU 패킹 커널(`embed-cpu-kernels`) · 배치 묶기(`batched.rs`) · 긴 텍스트 조각 합치기 · 텍스트 캐시 · 코사인 눈금 보정은 이 앱 그대로.
+  지운 것: LayerNormNoBias · Norm · ExactAttention · F32 RoPE 표(Exact 전용).
+- 바꾼 뒤 이 앱의 벡터가 바꾸기 전과 문장별 307/307 · 배치 307/307 비트 동일(텍스트 캐시 공간 · SDS 기준선 그대로).
+
+### SigLIP2 — 바꾸지 않음 (logis-vision-doc 을 확장 층으로 유지)
+
+- 텍스트 타워: 같은 토큰이면 코사인 1.000000. 그러나 토큰 정규화가 달라 60개 중 8개가 다른 토큰입니다 — 이 앱은 영숫자가 아닌 글자를 공백으로
+  바꾸고 특수 토큰 · 마스크를 쓰며, PD 는 ASCII 구두점을 지우고 EOS 뒤를 0 으로 채움("HS-8471.30" 코사인 0.749).
+- 비전 타워: 같은 RGB8 에서 전처리 픽셀이 8비트 한 단계씩 다르고(image Triangle vs PIL 방식 리사이즈), 위치 임베딩 보간이 다릅니다(이 앱은 클램프
+  bilinear, PD · transformers 는 antialias). 풀링 코사인 0.946~0.999, 패치 공유공간 행 평균 0.73~0.89(보간이 없는 16×16 격자만 0.997).
+- GPU 기본 경로(ROCm q8)는 이 앱이 원본에서 한 번 만든 GGUF Q8_0 사본 · 정밀도 지문(`quant`)을 쓰고, PD 는 불러올 때 F32 에서 Q8_0 로 양자화하고
+  MLP 폭을 4304 → 4320 으로 덧댑니다.
+- 비전 게이트 · 크롭 계획 · 값 그라운딩 · 합성 평가 기준선이 지금 출력에 맞춰져 있어, 바꾸려면 출력 변화를 받아들이고 다시 맞춰야 합니다
+  (`crates/logis-vision-doc/src/lib.rs` 머리 주석에 같은 내용).
+
+### NMS
+
+- 루트 `[workspace.dependencies]` 에 `premium-discount-nms` 를 같은 리비전으로 선언만 했습니다. PD 의 스팬 NMS(Stanza 역할 · granite 임베딩 위의
+  의미 NMS)에 해당하는 코드가 이 앱에는 없고, 이 앱의 NMS 는 비전 패치(`logis-vision-doc` `nms_arena`)뿐입니다.
+
+## 7단계: 폴더 재배치 (apps · crates · web · workers · vendor)
+
+Rust 는 `apps/` · `crates/`, TypeScript 는 `web/` · `workers/` 로 나눴습니다. 데스크톱 셸과 헤드리스 코어가 같은 높이(`apps/`)에 섭니다.
+모두 `git mv` 라 이력이 이어집니다.
+
+| 예전 | 지금 | 비고 |
+| :--- | :--- | :--- |
+| `commerce/app` | `apps/core` | crate `logis-app` (깊이 2 그대로라 시험의 `CARGO_MANIFEST_DIR/../../SyntheticData` · `include_str!` 경로 변경 없음) |
+| `commerce/src-tauri` | `apps/desktop` | crate `logis-center`, tauri.conf · icons · models · DirectStorage. `frontendDist` = `../../web/desktop/dist` |
+| `commerce/mobile/src-tauri` | `apps/mobile` | 계속 작업 공간 밖. `frontendDist` = `../../web/mobile/dist` |
+| `commerce/crates/embed-cpu-kernels` · `ggml-kquant` | `crates/` | 직접 짠 CPU 커널 (암묵 멤버) |
+| `commerce/crates/boa-engine` · `direct-storage` | `vendor/` | 자기 `[workspace]`, `exclude` |
+| `commerce/tools/cpu-embed-bench` | `tools/` | `exclude` |
+| `commerce/src` · `public` · vite · vitest · `package.json` | `web/desktop` | 상대 경로(`root: src`, `outDir: ../dist`)가 그대로 맞음 |
+| `commerce/mobile` (프런트엔드) | `web/mobile` | `outDir` 를 `dist` 로 (예전 `commerce/dist/mobile`) |
+| `commerce/landing` | `web/landing` | |
+| `commerce/*.bat` · `_rocm_select.ps1` · `test_linux.sh` · `patch_gguf.py` | `scripts/` | 작업 폴더 `%~dp0..\apps\desktop` |
+| `apac` · `proxy` | `workers/` | 쓰지 않던 `apac/src/backup.ts` · `backup__.ts` 삭제. 그 뒤 workers-rs 로 다시 씀 → [workers-rs.md](workers-rs.md) |
+| `commerce/src-tauri/target` | `target/` (루트) | `.cargo/config.toml` `target-dir = "target"`. 옛 폴더를 그대로 옮겨 다시 빌드하지 않음 |
+
+- Tauri CLI 는 셸과 프런트엔드가 갈라진 것을 `TAURI_APP_PATH=apps/desktop` · `TAURI_FRONTEND_PATH=web/desktop` 로 압니다(설치된 CLI 2.12.1 이
+  두 이름을 읽는 것을 확인, `tauri info` 가 `frontendDist ../../web/desktop/dist` · `bundler: Vite` 를 보고). `scripts/_env_rocm.bat` ·
+  `_env_vulkan.bat` · `dev_cargo.bat` · `build_cargo.bat` 이 둘을 정합니다.
+- 고친 경로: 루트 · `crates/logis-llm` · `logis-vision-doc` · `apps/core` · `tools` 매니페스트, CI(`cross-verify.yml` · `mac-verify.yml` ·
+  `.github/scripts/*`: 작업 폴더 · 캐시 `logis-center/target` · `../../target` 의 onnxruntime.dll · it exe), `SyntheticData/eval/run_eval.bat`,
+  `web/mobile/install_mobile.ps1`(다른 PC 의 절대 경로였음 → 저장소 기준), 개발 중 모델 폴더(`apps/desktop/src/lib.rs`: 저장소 루트에서 실행하면
+  `apps/desktop/models`).
+- 함께 고친 옛 결함: `SyntheticData/eval/make_vision_cases.py` · `score_commerce.py` · `score_vision.py` 의 `bias.json` 경로가
+  `commerce/src-tauri/src/utils/bias.json`(2단계에서 `crates/logis-bias/src/bias.json` 으로 옮겨 없어진 곳)을 가리키고 있었습니다.
+- 검증: 아래 "검증"의 7단계 줄.
+
 ## 기획서와 다른 점 (코드 · 저장소로 확인)
 
 - 기획서의 candle 커밋 `ebaf93db1c65fe2fb3bf3ebde3fc2bdab07ff311` 은 포크에 없습니다. 실제 커밋은 `ebaf93db065f22be67a9a4a250eec5a212e143fe` 이고,
@@ -226,16 +315,15 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   `trade_schema_triples_load_base_plus_overlay`), 자리 표시자 복원 경로 순서(`utils_text::placeholder_drop_and_informative_restore`).
   시험만의 문제가 아니라 색인 문장(임베딩 입력 · 텍스트 캐시 키)과 프롬프트의 필드 순서가 바뀌는 동작 변경이라 처음에는 0.31 로 되돌렸고,
   5단계에서 순서가 드러나는 곳의 키를 직접 정렬해 0.31 과 같은 출력을 지키며 0.41 로 올렸습니다.
-- Stanza · granite 순전파를 `premium-discount-nlp` 로, 스팬 NMS 를 `premium-discount-nms` 로 바꾸는 것은 하지 않았습니다. 두 저장소가 따로 갖던
-  `onnxruntime(-sys)` 사본은 이 저장소 판(`commerce/crates`, ORT 1.28.0)을 기준으로 premium-discount 쪽을 다시 맞췄습니다(premium-discount
-  0d83b8d: 이 판 그대로 + 기본 꺼진 `runtime-load` 기능 — 링크 대신 실행할 때 불러옴, premium-discount-nlp 의 stanza 가 켬). 남은 일은 두
-  Stanza 파이프라인 · NMS 의 출력을 실제 모델로 대조한 뒤 이 앱을 그 crate 로 바꾸는 것입니다.
+- 두 저장소가 따로 갖던 `onnxruntime(-sys)` 사본은 이 저장소 판(ORT 1.28.0)을 기준으로 premium-discount 쪽을 맞춘 뒤(premium-discount 0d83b8d:
+  이 판 그대로 + 기본 꺼진 `runtime-load`), 6단계에서 이 저장소 사본을 지우고 premium-discount 판을 씁니다.
 
 ## 남은 단계
 
 - **logis-search 의 나머지**: 기획서가 이 crate 에 넣은 `model/merge.rs`(병합 · 그라운딩, SigLIP2 결과를 씀)와 `model/research.rs` 의 집계는
   모델 · 저장소 호출과 섞여 있어 순수 부분을 먼저 떼어야 합니다 (`merge_rules` 로 두 규칙만 옮김).
-- **SigLIP2 타워 · 임베딩 · Stanza · NMS 를 premium-discount 로**: 실제 모델 출력 대조 뒤.
+- **SigLIP2 를 premium-discount-vision 으로**: 6단계 대조 결과 출력이 바뀝니다(토큰 정규화 · 전처리 · 위치 임베딩 antialias · q8 경로). 바꾸려면
+  그 변화를 받아들이고 비전 게이트 · 합성 평가 기준선을 다시 맞추는 결정이 필요합니다.
 - **LanceDB 0.41 의 기존 테이블**: 0.31(lance 8)이 쓴 테이블을 0.41(lance 14)이 그대로 읽고 이어 쓰는 것은 premium-discount 앱에서 확인했습니다.
   이 앱의 실제 데이터 폴더로는 아직 열어 보지 않았습니다(시험은 새 임시 폴더를 씀).
 
@@ -270,6 +358,13 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
   - 셸 의존성 정리 뒤: `it` 286 통과 · 0 실패 · 65 무시, lib 단위 8 통과(코어 3 · logis-llm 5), logis-llm · logis-vision-doc 단독 21 통과 · 3 무시,
     crate 시험 통과, 골든 덤프가 0.41 때와 바이트 단위로 같음. 암호 crate 기능이 바뀌어 digest 를 쓰는 lance · datafusion 까지 다시 빌드됐습니다
     (debug 7분 30초).
+- 6단계 (CI 와 같은 조건, premium-discount 2549767 을 git 리비전으로): `it` 286 통과 · 0 실패 · 67 무시(대조 덤프 시험 2개가 늘어 65 → 67),
+  lib 단위 8 통과(Stanza 단위 시험 3개는 premium-discount-nlp 로 옮겨 그쪽에서 통과), logis-llm · logis-vision-doc 단독 21 통과, crate 시험 통과.
+  실제 모델: Stanza 덤프가 바꾸기 전과 278/278 바이트 동일 · PyTorch 기준 278/278, granite 문장별 · 배치 307/307 비트 동일.
+  premium-discount 쪽: nlp 단위 12 · granite_reference 4 · stanza 시험 · nms 15 통과.
+- 함정: 디버그 산출물이 쌓여 디스크가 0 이 되면 `it` 다음 단계부터 쓰기 실패(os error 112)로 멈춥니다 — 이번에는 멈췄던 release 빌드 폴더(9.4 GB,
+  lancedb 0.31 시절 포함)를 지우고 같은 crate 의 옛 판만 지우는 정리(sweep)로 15 GB 를 비웠습니다. 시험 배치가 `ORT_LIB_LOCATION` 으로 쓰던
+  ONNX Runtime 1.28.0 배포판은 그 폴더 안에 있었으므로 먼저 밖으로 옮겼습니다.
 - 함정: 같은 `target/debug` 에 `cargo check`(ROCm, 메타데이터만)와 CPU 빌드를 섞으면 boa 의 타입이 엉뚱하게 읽혀 `str` 크기 오류 · "rlib 형식이
   없음" 오류가 났습니다(폴더를 비우고 다시 빌드하면 사라짐). debug 정보를 켠 채 `it` 시험 exe 를 링크하면 PDB 가 1.7 GB 를 넘어 LNK1318(LIMIT 12) —
   CI 처럼 `CARGO_PROFILE_DEV_DEBUG=0` 을 씁니다.
@@ -284,9 +379,9 @@ premium-discount 로 옮긴 트랙(`premium-discount-analytic`, www `/analytic`,
 
 ## 빌드 · 시험
 
-- 앱: 예전처럼 `commerce/*.bat` (작업 폴더 `commerce/src-tauri`). 이 PC(RAM 16 GB)는 마지막 LTO 링크 두 개(lib · bin, 시험 exe)가 겹치면
+- 앱: `scripts/*.bat` (작업 폴더 `apps/desktop`, 산출물 루트 `target/`). 이 PC(RAM 16 GB)는 마지막 LTO 링크 두 개(lib · bin, 시험 exe)가 겹치면
   os error 1455 가 나므로, `cargo build --release … -j 3` 으로 lib → bin 을 만든 뒤
   `cargo test --release --no-run -p logis-center -p logis-app --test it … -j 3` 을 돌리면 겹치지 않습니다.
 - 통합 시험: 어디서든 `cargo test -p logis-center -p logis-app --test it --no-default-features [--features rocm|vulkan|metal]`
-  (`commerce/test_cargo*.bat` 가 이것). Windows debug 는 `CARGO_PROFILE_DEV_DEBUG=0`(PDB 한도, 위 함정).
+  (`scripts/test_cargo*.bat` 가 이것). Windows debug 는 `CARGO_PROFILE_DEV_DEBUG=0`(PDB 한도, 위 함정).
 - crate: 루트에서 `cargo test -p logis-schema -p logis-bias -p logis-sds -p logis-pug -p logis-parsers -p logis-search`.

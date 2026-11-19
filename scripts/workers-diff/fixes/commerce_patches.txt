@@ -1,0 +1,1512 @@
+commerce 원본(fd1e991)에 덧대는 버그 수정 — fixes/commerce.mjs 가 읽는다. Rust 판(workers/commerce)의 같은 id 의 수정과 1:1.
+꼴: "@@ <id>" 줄로 시작하고, 고를 수 있는 "@@ count <n>" · "@@ regex"(find 가 정규식 소스 — 플래그 g) 줄, 그다음
+"<<< find" … "=== replace" … ">>>" 블록. find 는 공백(탭 · 줄바꿈 수)을 무시하고 맞추며 정확히 count(기본 1)번 맞아야 한다.
+블록 밖의 줄은 설명이다. 순서대로 적용한다 (뒤 수정의 find 는 앞 수정이 바꾼 글을 볼 수 있다).
+
+=====================================================================================================================
+도우미 — 아래 수정들이 같이 쓰는 함수 (export default 앞에 넣는다)
+@@ fix-helpers
+<<< find
+export default {
+	// Method GET, POST
+=== replace
+// --- 고침(fix-*)이 더한 도우미 — workers/commerce/src/fixes.rs 와 같은 동작 ---
+
+// fix-cors-methods · fix-preflight-session: CORS 머리글 (서버가 처리하는 PUT · DELETE 포함)
+function corsHeaders(h){
+	h.set('Access-Control-Allow-Origin', '*')
+	h.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+	h.set('Access-Control-Allow-Headers', 'Content-Type, Content-Encoding, Authorization, X-Requested-With')
+	return h
+}
+
+// 글 → 평범한 JSON 객체 (배열 · null · 글 · 수 · 깨진 JSON 이면 null)
+function appJson(text){
+	try{
+		var o = JSON.parse(text)
+		return o && typeof o == "object" && !Array.isArray(o) ? o : null
+	}catch(err){
+		return null
+	}
+}
+
+// 값이 배열이면 그 안의 주소 글만 (소문자, 겹침 없이, 최대 max 개)
+function addressList(value, max){
+	var out = []
+	if(!Array.isArray(value)){
+		return out
+	}
+	for(var i = 0; i < value.length && out.length < max; i++){
+		var v = typeof value[i] == "string" ? value[i].toLowerCase() : ""
+		if(ethers.isAddress(v) && out.indexOf(v) < 0){
+			out.push(v)
+		}
+	}
+	return out
+}
+
+// host → 도메인 cc (세션 505~521 과 같은 규칙: 두 부분 도메인이면 끝 세 조각, 아니면 끝 두 조각)
+function ccOfHost(currentHost){
+	var host = currentHost.split('.')
+	var isTwoPartDomain = twoPartDomains.some(domain => currentHost.endsWith(domain))
+	var cc = isTwoPartDomain ? host[host.length-3]+"."+host[host.length-2]+"."+host[host.length-1] : host[host.length-2]+"."+host[host.length-1]
+	return hashId(cc)
+}
+
+// fix-link-hoist: 996 의 link 와 같은 값 ((pathname + search) 소문자, 상대 주소면 origin 기준)
+function pageLink(href, origin){
+	try{
+		var url
+		try {
+			url = new URL(href)
+		} catch (e) {
+			url = new URL(href, origin || "https://commerce.logis.center")
+		}
+		return (url.pathname+url.search).toLowerCase()
+	}catch(err){
+		return ""
+	}
+}
+
+// fix-revoke-owner · fix-app-invite: 팀장 = 팀 행(id == to == 팀)의 from. 1089 가 찾은 admin 이 있으면 그것, 없으면(created_at 이 없는 요청) 읽는다
+async function teamOwner(env, logisRegion, admin, team){
+	if(admin && admin.id && admin.id == team){
+		return admin.from
+	}
+	var { results } = await env[logisRegion].prepare(`SELECT "from" FROM users WHERE "id" = ?1 AND "type" = 'team' LIMIT 1`).bind(team).all()
+	return results.length ? results[0].from : undefined
+}
+
+// fix-app-invite: 멤버 행 — 읽는 곳(1567)의 꼴: type 'member', from = 멤버 주소, to = 팀, cc = 준 사람, bcc = 그 페이지 행의 bcc, ref = 페이지 id.
+// 페이지는 그 팀의 zone items 의 type 'pages' 행만 (없으면 건너뜀). id = hashId(멤버 + 팀 + bcc)
+async function memberStatements(env, zone, member, team, granter, refs, data, now){
+	var db = env[`commerce_logis_${zone}_items`]
+	var statements = []
+	var rows = []
+	for(var i = 0; i < refs.length; i++){
+		var { results } = await db.prepare(`SELECT "id", "bcc" FROM items WHERE "type" = 'pages' AND "id" = ?1 AND "to" = ?2 LIMIT 1`).bind(refs[i], team).all()
+		if(!results.length || !results[0].bcc){
+			continue
+		}
+		var page = results[0]
+		var id = hashId(member + team + page.bcc)
+		if(rows.some(row => row.id == id)){
+			continue
+		}
+		statements.push(db.prepare(`
+			INSERT INTO items ("id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at")
+			VALUES (?1, 'member', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8) ON CONFLICT (id) DO UPDATE SET
+				"cc" = EXCLUDED."cc",
+				"ref" = EXCLUDED."ref",
+				"data" = EXCLUDED."data",
+				"updated_at" = EXCLUDED."updated_at"
+		`).bind(id, member, team, granter, page.bcc, page.id, data, now))
+		rows.push({ id : id, table : 'items', type : 'member', from : member, to : team, cc : granter, bcc : page.bcc, ref : page.id })
+	}
+	return { statements : statements, rows : rows }
+}
+
+// fix-app-relay: WebRTC 신호 중계 — 데스크톱(main.ts 4856)이 POST /relay/{hash} 로 offer 를 올리고 모바일(main.ts 1260)이 GET 으로 읽는다.
+// POST 는 그 hash 의 세션이 있어야 한다(질의 token 이 S3 hash/{hash} 의 token 과 같아야). GET 은 10분 안의 것만, 아니면 404 {}
+async function relayFetch(request, env, s3, hash){
+	var headers = corsHeaders(new Headers())
+	headers.set('Content-Type', 'application/json')
+	var key = `https://${env.aws_bucket}.s3.${env.aws_region}.amazonaws.com/relay/${hash}`
+	if(request.method == 'POST'){
+		var token = new URL(request.url).searchParams.get('token')
+		if(!token){
+			return new Response('{}', { status : 401, headers : headers })
+		}
+		var head = await s3.fetch(`https://${env.aws_bucket}.s3.${env.aws_region}.amazonaws.com/hash/${hash}`, { method : 'HEAD' })
+		if(!head.ok || head.headers.get('x-amz-meta-token') != token){
+			return new Response('{}', { status : 401, headers : headers })
+		}
+		var text = await request.text()
+		var payload = appJson(text)
+		if(!payload || text.length > 65536){
+			return new Response('{}', { status : 400, headers : headers })
+		}
+		await s3.fetch(key, {
+			method : 'PUT',
+			headers : { 'Content-Type' : 'application/json', 'x-amz-meta-created_at' : String(Date.now()) },
+			body : JSON.stringify(payload)
+		})
+		return new Response(JSON.stringify({ success : true }), { headers : headers })
+	}
+	if(request.method == 'GET'){
+		var res = await s3.fetch(key, { method : 'GET' })
+		if(res.ok && Date.now() - Number(res.headers.get('x-amz-meta-created_at')) < 600000){
+			return new Response(await res.text(), { headers : headers })
+		}
+		return new Response('{}', { status : 404, headers : headers })
+	}
+	return new Response('{}', { status : 405, headers : headers })
+}
+
+export default {
+	// Method GET, POST
+>>>
+
+=====================================================================================================================
+@@ fix-preflight-session
+<<< find
+region: env.aws_region,
+		})
+
+		var {
+=== replace
+region: env.aws_region,
+		})
+
+		// fix-preflight-session: 브라우저 사전 요청(쿠키 없음)에 세션(새 지갑 · S3 PUT)을 돌리지 않고 CORS 머리글만으로 답한다
+		if(request.method == 'OPTIONS'){
+			return new Response('', { headers : corsHeaders(new Headers()) })
+		}
+
+		var {
+>>>
+
+@@ fix-app-relay
+<<< find
+		var {
+			// 도시 (예: "San Jose")
+=== replace
+		// fix-app-relay: /relay/{hash} — 세션 앞에서 (GET 이 새 지갑을 만들지 않게)
+		var relayMatch = new URL(request.url).pathname.match(/^\/relay\/([0-9A-Za-z_-]{1,128})\/?$/)
+		if(relayMatch){
+			return relayFetch(request, env, s3, relayMatch[1])
+		}
+
+		var {
+			// 도시 (예: "San Jose")
+>>>
+
+@@ fix-region-fallback
+<<< find
+var logisRegion = LogisRegion[FLAG]
+=== replace
+var logisRegion = LogisRegion[FLAG]
+
+		// fix-region-fallback: wrangler 는 APAC 지역 DB 만 묶는다 — 묶이지 않은 지역(US → commerce_logis_enam 등)은 모든 요청이 418 이었다
+		if(!logisRegion || !env[logisRegion]){
+			logisRegion = 'commerce_logis_apac'
+		}
+>>>
+
+=====================================================================================================================
+@@ fix-cookie-whitelist
+<<< find
+const value = parts[1].trim()
+						cookies[key] = value
+=== replace
+const value = parts[1].trim()
+						// fix-cookie-whitelist: 머리글에서 믿는 쿠키는 세션 키(hash · token)뿐 — address · team · sender · balance · cc … 는 세션이 다시 만든다
+						if(key === 'hash' || key === 'token'){
+							cookies[key] = value
+						}
+>>>
+
+@@ fix-session-token
+<<< find
+if(email && token == cookies.token){
+=== replace
+if(email && token && token == cookies.token){
+>>>
+
+@@ fix-sql-bind
+<<< find
+.prepare(`SELECT * FROM users WHERE "type" = 'user' AND "id" = '${cookies.address}' AND "from" = '${cookies.address}' LIMIT 1`).all()
+=== replace
+.prepare(`SELECT * FROM users WHERE "type" = 'user' AND "id" = ?1 AND "from" = ?1 LIMIT 1`).bind(cookies.address).all()
+>>>
+
+@@ fix-link-hoist
+<<< find
+user.ref = hashId(cookies.team+cookies.cc+link)
+=== replace
+user.ref = hashId(cookies.team+cookies.cc+pageLink(href, origin))
+>>>
+
+=====================================================================================================================
+fix-app-invite (확정): 새 사용자 갈래(688~868)에서 사용자 · 팀을 만들기 전에 그 이메일의 초대를 찾는다. 있으면 그 팀에 들어간다
+(사용자 행 to = 초대의 팀, zone = 초대의 zone, 팀 행 · zones.pool 은 그대로), 초대한 페이지마다 멤버 행을 넣고 초대 행을 지운다.
+@@ fix-app-invite
+<<< find
+var regionCode = domains[2]
+=== replace
+var regionCode = domains[2]
+
+							newUser: {
+								// fix-app-invite: 초대받은 이메일이면 새 팀 대신 초대한 팀에 들어간다 (초대 행은 같은 지역 DB 의 users, type 'invite', cc = hashId(이메일))
+								var invite = null
+
+								try{
+									var { results } = await env[logisRegion].prepare(`SELECT * FROM users WHERE "type" = 'invite' AND "cc" = ?1 ORDER BY created_at DESC LIMIT 1`).bind(hashId(cookies.email.toLowerCase())).all()
+
+									if(results.length){
+										invite = results[0]
+										invite.data = JSON.parse(new TextDecoder('utf-8').decode(ungzip(invite.data)))
+										if(!invite.data || !invite.data.zone || !invite.to){
+											invite = null
+										}
+									}
+								}catch(err){
+									console.log('invite err', err)
+									invite = null
+								}
+
+								if(invite){
+									zoneRegion = invite.data.zone
+
+									var user_arr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+										flag : FLAG,
+										name : name,
+										title : "",
+										region : zoneRegion,
+										page_count : 0,
+										favicon : null
+									})), { to: 'arraybuffer' })
+
+									var user = {
+										id : cookies.address,
+										type : "user",
+										from : cookies.address,
+										to : invite.to,
+										cc  : "",
+										bcc : "",
+										ref  : "",
+										data : user_arr.buffer,
+										created_at : now,
+										updated_at : now
+									}
+
+									cookies.name = name
+
+									cookies.team = invite.to
+
+									try{
+										var granted = await memberStatements(env, zoneRegion, cookies.address, invite.to, invite.from, addressList(invite.data.refs, 50), user_arr.buffer, now)
+
+										if(granted.statements.length){
+											await env[`commerce_logis_${zoneRegion}_items`].batch(granted.statements)
+										}
+
+										await env[logisRegion].batch([
+											env[logisRegion].prepare(`
+												INSERT INTO users ("id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at")
+												VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT (id) DO NOTHING
+											`).bind(
+												user.id, user.type, user.from, user.to, user.cc, user.bcc, user.ref, user.data, user.created_at, user.updated_at
+											),
+											env[logisRegion].prepare(`DELETE FROM users WHERE "id" = ?1 AND "type" = 'invite'`).bind(invite.id)
+										])
+									}catch(err){
+										console.log('invite join err', err)
+									}
+
+									break newUser
+								}
+>>>
+
+@@ fix-zone-pool
+<<< find
+console.log('zoneRegion err',err);
+								}
+							}
+=== replace
+console.log('zoneRegion err',err);
+								}
+							}
+
+							// fix-zone-pool: 자리가 남은 zone 이 없으면 사용자를 만들지 않는다 (region '' 로 만들면 commerce_logis__items 를 찾아 영영 깨진다).
+							// 던지면 916 이 세션을 오류 쿠키로 바꾼다 — 로그인하지 않은 채로 남는다
+							if(typeof pool == "undefined"){
+								console.log('no zone with room', regionCode)
+								throw new Error('no zone with room for ' + regionCode)
+							}
+>>>
+
+@@ fix-app-invite
+<<< find
+pool+1
+								).run()
+							}catch(err){
+
+							}
+=== replace
+pool+1
+								).run()
+							}catch(err){
+
+							}
+							} // newUser (fix-app-invite)
+>>>
+
+=====================================================================================================================
+@@ fix-cors-methods
+<<< find
+headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+=== replace
+headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM users WHERE "to" = '${cookies.team}' AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 10`
+			).all()
+=== replace
+`SELECT * FROM users WHERE "to" = ?1 AND "created_at" < ${created_at} ORDER BY created_at DESC LIMIT 10`
+			).bind(cookies.team).all()
+>>>
+
+@@ fix-coupon-count
+<<< find
+cookies.coupon = data.base.event.coupon
+=== replace
+cookies.coupon = data.base.coupon ? data.base.coupon.count : 0
+>>>
+
+@@ fix-sql-bind
+<<< find
+.prepare(`SELECT * FROM items WHERE "to" = '${cookies.team}' AND "ref" = '${itemId}' LIMIT 1`).all()
+=== replace
+.prepare(`SELECT * FROM items WHERE "to" = ?1 AND "ref" = ?2 LIMIT 1`).bind(cookies.team, itemId).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+.prepare(`SELECT * FROM items WHERE "type" = 'pages' AND "to" = '${cookies.team}' LIMIT 100`).all()
+=== replace
+.prepare(`SELECT * FROM items WHERE "type" = 'pages' AND "to" = ?1 LIMIT 100`).bind(cookies.team).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+.prepare(`SELECT * FROM items WHERE "type" = 'pages' AND "cc" = '${cookies.cc}' AND "created_at" < ${created_at} LIMIT 100`).all()
+=== replace
+.prepare(`SELECT * FROM items WHERE "type" = 'pages' AND "cc" = ?1 AND "created_at" < ${created_at} LIMIT 100`).bind(cookies.cc).all()
+>>>
+
+fix-crons-query: `?crons=` — 글 JSON 이면 글자마다 돌았고, 주소가 없으면 "WHERE  ORDER BY" 로 던졌고, 지울 자리를 crons 의 자리(tasks 의 자리가 아님)로
+골라 지울 때마다 뒤 자리가 당겨졌다 → 배열의 주소만(겹침 없이), 묶은 IN 질의, 찾은 작업은 id 로 뺀다
+@@ fix-crons-query
+@@ regex
+<<< find
+var crons = JSON\.parse\(req\.query\.crons\)[\s\S]*?console\.log\('tasks err',err\);
+=== replace
+var crons = JSON.parse(req.query.crons)
+
+						// fix-crons-query: 배열의 주소만 (겹침 없이), 찾은 작업은 자리 대신 id 로 뺀다
+						if(Array.isArray(crons) && crons.length){
+							var cron_ids = addressList(crons, 98)
+
+							var tasks = []
+
+							for(var c = 0; c < cron_ids.length; c++){
+								tasks.push({
+									id : cron_ids[c],
+									table : 'tasks',
+									type : '',
+									from : '',
+									to : '',
+									cc : '',
+									bcc : '',
+									ref : '',
+									data : null,
+									created_at : now,
+									updated_at : now
+								})
+							}
+
+							if(cron_ids.length){
+								var { results, success } = await env[logisRegion].prepare(
+									`SELECT "id" FROM tasks WHERE "from" = ?1 AND "created_at" < ?2 AND "id" IN (${cron_ids.map((_, n) => '?' + (n + 3)).join(', ')})`
+								).bind(cookies.address, now, ...cron_ids).all()
+
+								var found = {}
+
+								for(var i = 0; i < results.length; i++){
+									found[results[i].id] = true
+								}
+
+								tasks = tasks.filter(t => !found[t.id])
+							}
+						}
+					}catch(err){
+						console.log('tasks err',err);
+>>>
+
+@@ fix-sql-bind
+<<< find
+.prepare(`SELECT * FROM items WHERE "type" = 'member' AND "from" = '${cookies.address}' AND "to" = '${cookies.team}' AND "bcc" = '${cookies.bcc}' LIMIT 1`).all()
+=== replace
+.prepare(`SELECT * FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 AND "bcc" = ?3 LIMIT 1`).bind(cookies.address, cookies.team, cookies.bcc).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+.prepare(`SELECT * FROM items WHERE "type" = 'member' AND "from" = '${cookies.address}' AND "to" = '${cookies.team}' AND "bcc" = '${cookies.cc}' LIMIT 1`).all()
+=== replace
+.prepare(`SELECT * FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 AND "bcc" = ?3 LIMIT 1`).bind(cookies.address, cookies.team, cookies.cc).all()
+>>>
+
+=====================================================================================================================
+fix-app-invite (PUT): 앱의 초대(main.ts 2480~2518: from = 팀, to = 자기 주소, email, ref = 페이지 id 배열, id 없음) — 팀장만, 같은 지역 DB 의
+users 에 type 'invite' 행 (id = hashId(팀 + 이메일), from = 초대한 사람, to = 팀, cc = hashId(이메일), data = {email, refs, zone, flag, name}).
+다시 초대하면 덮어쓴다. 응답 results[0] = { id, table: 'users', type: 'invite', hook } — hook 은 앱이 이미 쓰는 기본값과 같은 글
+@@ fix-app-invite
+<<< find
+if(cookies.sender){
+					if(ethers.isAddress(req.query.from) && ethers.isAddress(req.query.to)){
+=== replace
+// fix-app-invite: 이메일 초대 (id 없음)
+				if(req.query.email && !req.query.id){
+					var invited = null
+
+					var inviteError = 'invite requires the signed-in team owner'
+
+					var inviteEmail = String(req.query.email).trim().toLowerCase()
+
+					if(!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(inviteEmail)){
+						inviteError = 'invalid email'
+					}else if(cookies.address && cookies.team && zoneRegion && req.query.from == cookies.team && req.query.to == cookies.address){
+						var inviteOwner = await teamOwner(env, logisRegion, admin, cookies.team)
+
+						if(inviteOwner && inviteOwner == cookies.address){
+							var inviteRefs = []
+
+							try{
+								inviteRefs = addressList(JSON.parse(req.query.ref || '[]'), 50)
+							}catch(err){
+
+							}
+
+							invited = {
+								id : hashId(cookies.team + inviteEmail),
+								table : 'users',
+								type : 'invite',
+								hook : `${cookies.hash}.logis.center@oauth.email`
+							}
+
+							var inviteData = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+								email : inviteEmail,
+								refs : inviteRefs,
+								zone : zoneRegion,
+								flag : FLAG,
+								name : inviteEmail.split('@')[0]
+							})), { to: 'arraybuffer' })
+
+							await env[logisRegion].prepare(`
+								INSERT INTO users ("id", "type", "from", "to", "cc", "bcc", "ref", "data", "created_at", "updated_at")
+								VALUES (?1, 'invite', ?2, ?3, ?4, '', '', ?5, ?6, ?6) ON CONFLICT (id) DO UPDATE SET
+									"from" = EXCLUDED."from",
+									"to" = EXCLUDED."to",
+									"cc" = EXCLUDED."cc",
+									"data" = EXCLUDED."data",
+									"created_at" = EXCLUDED."created_at",
+									"updated_at" = EXCLUDED."updated_at"
+							`).bind(invited.id, cookies.address, cookies.team, hashId(inviteEmail), inviteData.buffer, now).run()
+						}
+					}
+
+					headers.set('Content-Type', 'application/json')
+
+					return new Response(JSON.stringify(invited ? {
+						results : [invited],
+						success : true,
+						session : cookies
+					} : {
+						results : [],
+						success : false,
+						error : inviteError,
+						session : cookies
+					}), {
+						headers : headers
+					})
+				}
+
+				if(cookies.sender){
+					if(ethers.isAddress(req.query.from) && ethers.isAddress(req.query.to)){
+>>>
+
+fix-revoke-owner (+ fix-app-invite 3단계): 1738 · 1768 의 `team.from` 은 세션의 팀 이름 글(있는 사용자) 또는 팀 객체(새 사용자)라 팀장 막기가
+듣지 않았다 → 팀 행의 from(teamOwner). 같은 자리의 주기 · 거두기를 초대 확정 · 읽는 곳(1567)과 같은 멤버 행 꼴로 바꾼다:
+주기 = 팀장이 팀에 든 사용자(users.to == 팀)에게 refs 의 페이지를 준다(그 멤버의 행을 지우고 다시 넣음), 거두기 = 팀장(내보내기) 또는
+본인(나가기)이 refs 의 페이지 행을 지운다. 팀장 자신은 거둘 수 없다.
+@@ fix-revoke-owner
+@@ regex
+<<< find
+if\(ethers\.isAddress\(req\.query\.id\) && refs\.length\)\{[\s\S]*?\}else if\(req\.query\.text\)\{
+=== replace
+if(ethers.isAddress(req.query.id) && refs.length){
+							// fix-revoke-owner · fix-app-invite: 팀장(팀 행의 from)만 주고 내보내며, 팀장 자신은 거둘 수 없다
+							var owner = await teamOwner(env, logisRegion, admin, cookies.team)
+
+							var memberAddress = req.query.to.toLowerCase()
+
+							var pageIds = addressList(refs, 50)
+
+							var statements = []
+
+							if(req.query.id == cookies.team && owner && memberAddress != owner){
+								if(req.query.cc == ethers.ZeroAddress){
+									// 나가기(본인) · 내보내기(팀장): 그 페이지들의 멤버 행을 지운다
+									if(cookies.address == owner || cookies.address == memberAddress){
+										for(var r = 0; r < pageIds.length; r++){
+											statements.push(
+												env[`commerce_logis_${zoneRegion}_items`].prepare(
+													`DELETE FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 AND "ref" = ?3`
+												).bind(memberAddress, cookies.team, pageIds[r])
+											)
+
+											results.push({ id : pageIds[r], table : 'items', type : 'member', from : memberAddress, to : cookies.team, ref : pageIds[r] })
+										}
+									}
+								}else if(ethers.isAddress(req.query.cc)){
+									// 허용(팀장): 팀에 든 사용자에게만 — 그 멤버의 행을 지우고 refs 의 페이지마다 다시 넣는다
+									if(req.query.from == cookies.address && cookies.address == owner){
+										var { results : memberRows } = await env[logisRegion].prepare(
+											`SELECT "id", "data" FROM users WHERE "id" = ?1 AND "type" = 'user' AND "to" = ?2 LIMIT 1`
+										).bind(memberAddress, cookies.team).all()
+
+										if(memberRows.length){
+											var memberName = ''
+
+											try{
+												memberName = JSON.parse(new TextDecoder('utf-8').decode(ungzip(memberRows[0].data))).name || ''
+											}catch(err){
+
+											}
+
+											var memberDataArr = gzip(new TextEncoder('utf-8').encode(JSON.stringify({
+												flag : FLAG,
+												name : memberName,
+												title : "",
+												region : zoneRegion,
+												page_count : 0,
+												favicon : null
+											})), { to: 'arraybuffer' })
+
+											statements.push(
+												env[`commerce_logis_${zoneRegion}_items`].prepare(
+													`DELETE FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2`
+												).bind(memberAddress, cookies.team)
+											)
+
+											var granted = await memberStatements(env, zoneRegion, memberAddress, cookies.team, cookies.address, pageIds, memberDataArr.buffer, now)
+
+											statements.push(...granted.statements)
+
+											results = granted.rows
+										}
+									}
+								}
+							}
+
+							if(statements.length){
+								try{
+									await env[`commerce_logis_${zoneRegion}_items`].batch(statements)
+
+									success = true
+								}catch(err){
+									console.log('member batch err', err)
+
+									results = []
+								}
+							}
+
+						}else if(req.query.text){
+>>>
+
+@@ fix-delete-tasks-db
+<<< find
+var { results, success, error } = await env[`commerce_logis_${zoneRegion}_items`].prepare(
+								`DELETE FROM tasks WHERE ref = "${ref}"`
+							).run()
+=== replace
+// fix-delete-tasks-db: tasks 는 지역 DB(env[logisRegion]) 에 있다. 값은 묶고, 자기 작업(from = 나 · to = 내 팀)만
+							var { results, success, error } = await env[logisRegion].prepare(
+								`DELETE FROM tasks WHERE "ref" = ?1 AND "from" = ?2 AND "to" = ?3`
+							).bind(ref, cookies.address, cookies.team).run()
+>>>
+
+=====================================================================================================================
+POST
+@@ fix-app-extraction
+<<< find
+}else if(request.method == 'POST') {
+				if(cookies.sender && created_at){
+=== replace
+}else if(request.method == 'POST') {
+				// fix-app-extraction: 앱의 추출 요청에는 created_at 이 없다 — 없으면 지금
+				var appHref, appFormat
+
+				if(typeof req.query.created_at == "undefined"){
+					created_at = now
+				}
+
+				if(cookies.sender && created_at){
+>>>
+
+@@ fix-app-extraction
+<<< find
+if(req.query.from == cookies.address && req.query.to == cookies.team){
+
+									task.from = cookies.address
+									task.to = cookies.team
+
+
+									var body = new TextDecoder('utf-8').decode(ungzip(buffer))
+
+
+									if(req.query.format){
+										task.body = body
+
+										task.scan = true
+									}else{
+										task.body = decodeURIComponent(body)
+									}
+
+
+
+									task.contentType = contentType
+=== replace
+// fix-app-cloud-search · fix-app-extraction: 앱은 from = 주소 · to = 팀 으로 JSON 본문을 보낸다 — { query, vector } 는 검색 갈래(else)로,
+								// { type: '*_extraction', body, link, … } 봉투는 풀어서 이 갈래로
+								var appBody = (contentType || '').indexOf('application/json') > -1 ? appJson(new TextDecoder('utf-8').decode(ungzip(buffer))) : null
+
+								var appEnvelope = appBody && typeof appBody.body == "string" && ['image_extraction', 'html_extraction', 'document_extraction'].indexOf(appBody.type) > -1 ? appBody : null
+
+								var appSearch = appBody && !appEnvelope && (appBody.query || appBody.vector) ? appBody : null
+
+								if(!appSearch && req.query.from == cookies.address && req.query.to == cookies.team){
+
+									task.from = cookies.address
+									task.to = cookies.team
+
+
+									var body = new TextDecoder('utf-8').decode(ungzip(buffer))
+
+
+									if(appEnvelope){
+										if(appEnvelope.type == 'document_extraction'){
+											// proxy 에는 문서 해석기가 없다 — 아무도 처리하지 못할 작업을 넣지 않는다
+											headers.set('Content-Type', 'application/json')
+
+											return new Response(JSON.stringify({
+												success : false,
+												results : [],
+												error : "document_extraction is not supported by the server",
+												session : cookies
+											}), {
+												headers : headers
+											})
+										}
+
+										// 봉투의 link 가 http(s) 주소면 그 페이지의 작업 (아니면 — 이미지의 "local" — 질의의 href)
+										try{
+											var appUrl = new URL(String(appEnvelope.link))
+
+											if(appUrl.protocol == 'http:' || appUrl.protocol == 'https:'){
+												appHref = appUrl.href.toLowerCase()
+											}
+										}catch(err){
+
+										}
+
+										task.cc = ccOfHost(new URL(appHref || cookies.href).host)
+
+										if(appEnvelope.type == 'image_extraction'){
+											// 질의 format 은 두 번 인코딩되어 온다 (image%2Fpng) — 풀어서 image/… 면 그것, 아니면 image/png. 본문은 data URL 의 base64 만
+											var appMime = decodeURIComponent(req.query.format || '')
+
+											appFormat = appMime.indexOf('image/') > -1 ? appMime : 'image/png'
+
+											task.body = appEnvelope.body.indexOf('data:') == 0 && appEnvelope.body.indexOf(',') > -1 ? appEnvelope.body.slice(appEnvelope.body.indexOf(',') + 1) : appEnvelope.body
+										}else{
+											task.body = appEnvelope.body
+										}
+
+										task.scan = true
+									}else if(req.query.format){
+										task.body = body
+
+										task.scan = true
+									}else{
+										task.body = decodeURIComponent(body)
+									}
+
+
+
+									task.contentType = appEnvelope ? (appFormat || 'text/html') : contentType
+>>>
+
+@@ fix-app-cloud-search
+<<< find
+if(data && !Array.isArray(data) && typeof data == "object" && (data.query || data.vector)){
+										if(Object.keys(page).length){
+											task.page = page
+											task.from = cookies.team
+											task.to = cookies.address
+											task.body = data.query ? String(data.query).trim() : ""
+											task.scan = null
+=== replace
+if(data && !Array.isArray(data) && typeof data == "object" && (data.query || data.vector)){
+										// fix-app-cloud-search: 앱의 검색은 logis.center 의 홈(/tracking)에서 온다. homeId 는 대문자 cc 로 만들어 pageId 와 늘 달라
+										// page 가 비었다 — logis.center 의 요청이면 home 을 쓴다
+										if(!Object.keys(page).length && cookies.cc == homeCc){
+											page = home
+										}
+
+										if(Object.keys(page).length){
+											task.page = page
+											task.from = cookies.team
+											task.to = cookies.address
+											task.body = data.query ? String(data.query).trim() : ""
+											task.scan = null
+											// proxy 는 task.contentType.indexOf 로 갈래를 고른다 — 없으면 TypeError 로 작업을 버린다
+											task.contentType = contentType
+>>>
+
+@@ fix-app-cloud-search
+<<< find
+task.body = data.trim()
+												task.scan = null
+=== replace
+task.body = data.trim()
+												task.scan = null
+												task.contentType = contentType
+>>>
+
+@@ fix-sql-bind
+<<< find
+condition += `("to" = "${cookies.team}" AND
+=== replace
+condition += `("to" = ?1 AND
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM items WHERE ${condition} ORDER BY created_at DESC LIMIT 1000`
+												).all()
+=== replace
+`SELECT * FROM items WHERE ${condition} ORDER BY created_at DESC LIMIT 1000`
+												).bind(cookies.team).all()
+>>>
+
+@@ fix-app-extraction
+<<< find
+var url = new URL(cookies.href)
+
+							task.origin = url.origin
+=== replace
+var url = new URL(appHref || cookies.href)
+
+							task.origin = url.origin
+>>>
+
+@@ fix-app-extraction
+<<< find
+task.href = cookies.href
+=== replace
+task.href = appHref || cookies.href
+>>>
+
+@@ fix-app-extraction
+<<< find
+if(req.query.format){
+								if(req.query.format.indexOf("image/") > -1){
+									task.type = "tracking"
+
+									task.bcc = hashId(task.type+task.cc.toUpperCase())
+
+									task.contentType = decodeURIComponent(req.query.format)
+								}
+							}
+=== replace
+var taskFormat = appFormat || req.query.format
+
+							if(taskFormat){
+								if(taskFormat.indexOf("image/") > -1){
+									task.type = "tracking"
+
+									task.bcc = hashId(task.type+task.cc.toUpperCase())
+
+									task.contentType = decodeURIComponent(taskFormat)
+								}
+							}
+>>>
+
+@@ fix-sql-bind
+<<< find
+.prepare(`SELECT * FROM items WHERE "type" = 'invoice' AND "from" = '${cookies.address}' AND "to" = '${$to}' AND "created_at" < ${now} LIMIT 1`).all()
+=== replace
+.prepare(`SELECT * FROM items WHERE "type" = 'invoice' AND "from" = ?1 AND "to" = ?2 AND "created_at" < ${now} LIMIT 1`).bind(cookies.address, $to).all()
+>>>
+
+fix-task-column: ?error= 는 실패한 작업을 다시 넣으라는 뜻인데, ON CONFLICT 가 없는 "task" 열을 써서 그 INSERT 가 늘 D1 오류(418)였고,
+같은 id 의 작업이 있으면 2359 가 먼저 돌려줘 다시 넣기에 닿지도 않았다 → 진짜 열(type · from · to · data)을 쓰고, error 면 다시 넣는다
+@@ fix-task-column
+<<< find
+if(results.length){
+									if(contentEncoding == "gzip"){
+=== replace
+if(results.length && !req.query.error){
+									if(contentEncoding == "gzip"){
+>>>
+
+@@ fix-task-column
+<<< find
+"task" = EXCLUDED."task",
+=== replace
+"type" = EXCLUDED."type",
+											"from" = EXCLUDED."from",
+											"to" = EXCLUDED."to",
+											"data" = EXCLUDED."data",
+>>>
+
+=====================================================================================================================
+GET
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM items WHERE "cc" = '${cookies.cc}' AND "to" = '${cookies.team}' ${condition} AND "updated_at" > 0 ORDER BY created_at DESC LIMIT 100`
+						).all()
+=== replace
+`SELECT * FROM items WHERE "cc" = ?1 AND "to" = ?2 ${condition} AND "updated_at" > 0 ORDER BY created_at DESC LIMIT 100`
+						).bind(cookies.cc, cookies.team).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM items WHERE "cc" != '${cookies.cc}' AND "to" = '${cookies.team}' ${condition}  AND "updated_at" > 0 ORDER BY created_at DESC LIMIT 100`
+						).all()
+=== replace
+`SELECT * FROM items WHERE "cc" != ?1 AND "to" = ?2 ${condition}  AND "updated_at" > 0 ORDER BY created_at DESC LIMIT 100`
+						).bind(cookies.cc, cookies.team).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM items WHERE "to" = '${cookies.team}' ${condition} AND "updated_at" = 0 ORDER BY created_at DESC LIMIT 100`
+						).all()
+=== replace
+`SELECT * FROM items WHERE "to" = ?1 ${condition} AND "updated_at" = 0 ORDER BY created_at DESC LIMIT 100`
+						).bind(cookies.team).all()
+>>>
+
+@@ fix-draft-count
+<<< find
+cookies.draft[draft.ref]++
+=== replace
+cookies.draft[draft.ref] = (cookies.draft[draft.ref] || 0) + 1
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM tasks WHERE "from" = '${cookies.address}' AND "cc" = '${cookies.cc}' ${condition} ORDER BY created_at DESC LIMIT 10`
+						).all()
+=== replace
+`SELECT * FROM tasks WHERE "from" = ?1 AND "cc" = ?2 ${condition} ORDER BY created_at DESC LIMIT 10`
+						).bind(cookies.address, cookies.cc).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM talks WHERE "cc" = '${cookies.cc}' AND "data" IS NOT NULL AND "ref" = '${itemId}' ${conditions[page.type] ? conditions[page.type] : condition} ORDER BY created_at DESC LIMIT 10`
+						).all()
+=== replace
+`SELECT * FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2 ${conditions[page.type] ? conditions[page.type] : condition} ORDER BY created_at DESC LIMIT 10`
+						).bind(cookies.cc, itemId).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT COUNT(*) AS "talks" FROM talks WHERE "cc" = '${cookies.cc}' AND "data" IS NOT NULL AND "ref" = '${itemId}'`
+							).all()
+=== replace
+`SELECT COUNT(*) AS "talks" FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2`
+							).bind(cookies.cc, itemId).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM talks WHERE "from" = '${cookies.team}' AND "to" = '${cookies.address}' ${conditions[page.type] ? conditions[page.type] : condition} ORDER BY created_at DESC LIMIT 10`
+						).all()
+=== replace
+`SELECT * FROM talks WHERE "from" = ?1 AND "to" = ?2 ${conditions[page.type] ? conditions[page.type] : condition} ORDER BY created_at DESC LIMIT 10`
+						).bind(cookies.team, cookies.address).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM items WHERE "type" = '${page.type}' AND "digest" = '${detail.digest}' ${condition} ORDER BY created_at DESC LIMIT 1`
+								).all()
+=== replace
+`SELECT * FROM items WHERE "type" = ?1 AND "digest" = ?2 ${condition} ORDER BY created_at DESC LIMIT 1`
+								).bind(page.type, detail.digest).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+var hints_condition = ' OR '
+
+									for(var i = 0; i < results.length; i++){
+										var hint = results[i]
+
+										hints_condition += ` ("type" = '${page.type}' AND "id" = '${hint.id}' ${condition}) `
+									}
+
+									hints_condition = hints_condition.replace(' OR ', '')
+
+									var { results, success, error } = await env[`commerce_logis_${zoneRegion}_${type}`].prepare(
+										`SELECT * FROM ${type} WHERE ${hints_condition} ${condition} ORDER BY created_at DESC LIMIT 1`
+									).all()
+=== replace
+var hints_condition = ' OR '
+
+									var hints_params = [page.type]
+
+									for(var i = 0; i < results.length; i++){
+										var hint = results[i]
+
+										hints_params.push(hint.id)
+
+										hints_condition += ` ("type" = ?1 AND "id" = ?${hints_params.length} ${condition}) `
+									}
+
+									hints_condition = hints_condition.replace(' OR ', '')
+
+									var { results, success, error } = await env[`commerce_logis_${zoneRegion}_${type}`].prepare(
+										`SELECT * FROM ${type} WHERE ${hints_condition} ${condition} ORDER BY created_at DESC LIMIT 1`
+									).bind(...hints_params).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM ${type} WHERE "id" = '${detail.id}' ${condition} ORDER BY created_at DESC LIMIT 1`
+								).all()
+=== replace
+`SELECT * FROM ${type} WHERE "id" = ?1 ${condition} ORDER BY created_at DESC LIMIT 1`
+								).bind(detail.id).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM sales WHERE "goods" = ${$item.index} AND "cc" = '${cookies.cc}' AND "to" = '${cookies.team}' ${conditions[type] ? conditions[type] : condition} ORDER BY created_at DESC LIMIT 10000`
+										).all()
+=== replace
+`SELECT * FROM sales WHERE "goods" = ?1 AND "cc" = ?2 AND "to" = ?3 ${conditions[type] ? conditions[type] : condition} ORDER BY created_at DESC LIMIT 10000`
+										).bind($item.index, cookies.cc, cookies.team).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM tracking WHERE "order" = ${$item.index} AND "to" = '${cookies.team}' ${conditions[type] ? conditions[type] : condition} ORDER BY created_at DESC LIMIT 10000`
+											).all()
+=== replace
+`SELECT * FROM tracking WHERE "order" = ?1 AND "to" = ?2 ${conditions[type] ? conditions[type] : condition} ORDER BY created_at DESC LIMIT 10000`
+											).bind($item.index, cookies.team).all()
+>>>
+
+@@ fix-tracking-index
+<<< find
+`SELECT * FROM tracking WHERE "order" = ${item.index} AND "to" = '${cookies.team}' ${conditions[type] ? conditions[type] : condition} ORDER BY created_at DESC LIMIT 10000`
+											).all()
+=== replace
+`SELECT * FROM tracking WHERE "order" = ?1 AND "to" = ?2 ${conditions[type] ? conditions[type] : condition} ORDER BY created_at DESC LIMIT 10000`
+											).bind($item.index, cookies.team).all()
+>>>
+
+@@ fix-sql-bind
+<<< find
+`SELECT * FROM ${type} WHERE "to" = '${cookies.team}' AND "cc" = '${cookies.cc}' AND "bcc" = '${page.bcc}' ${conditions[page.type] ? conditions[page.type] : condition} ORDER BY created_at DESC LIMIT 100`
+								).all()
+=== replace
+`SELECT * FROM ${type} WHERE "to" = ?1 AND "cc" = ?2 AND "bcc" = ?3 ${conditions[page.type] ? conditions[page.type] : condition} ORDER BY created_at DESC LIMIT 100`
+								).bind(cookies.team, cookies.cc, page.bcc).all()
+>>>
+
+=====================================================================================================================
+fix-member-per-page: 팀 행(1108)이 늘 읽혀 팀원 모두가 모든 페이지의 멤버였고, member 는 GET 동기화만 막았다 → 팀장(팀 행의 from)은 모든 페이지,
+서비스 자신의 페이지(요청 href 의 도메인 cc == homeCc — 앱의 클라우드 검색 · 추출)는 팀 공통, 그 밖의 팀원은 페이지(bcc) · 사이트(cc) 멤버 행이
+있어야 멤버. 팀장이 아니면 cookies.pages 를 멤버인 것만, POST 와 PUT 대화는 멤버만, 멤버가 아닌 GET 에는 상세 아이템도 싣지 않는다.
+workers/commerce/src/resolve.rs · fixes.rs(member_pages) · post.rs · put_delete.rs · get.rs 와 1:1.
+@@ fix-member-per-page
+<<< find
+async function teamOwner(
+=== replace
+// fix-member-per-page: 팀장이 아닌 팀원의 cookies.pages — 팀 base.pages 는 { [사이트 cc]: { [페이지 type]: { draft, count } } }.
+// 그 사람의 멤버 행 bcc 로 거른다: cc 가 homeCc(팀 공통)이거나 사이트 멤버 행(bcc = cc)이 있으면 그 cc 통째로,
+// 아니면 페이지 멤버 행(bcc = hashId(type + cc), 상세면 hashId(type + 대문자 cc))이 있는 type 만. 남는 type 이 없는 cc 는 뺀다
+async function memberPages(env, zone, address, team, pages, homeCc){
+	var { results } = await env[`commerce_logis_${zone}_items`].prepare(`SELECT "bcc" FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 LIMIT 1000`).bind(address, team).all()
+	var bccs = results.map(row => row.bcc).filter(bcc => typeof bcc == "string")
+	var out = {}
+	var ccs = Object.keys(pages)
+	for(var c = 0; c < ccs.length; c++){
+		var cc = ccs[c]
+		if(cc == homeCc || bccs.indexOf(cc) > -1){
+			out[cc] = pages[cc]
+			continue
+		}
+		var types = pages[cc]
+		var kept = {}
+		var any = false
+		if(types && typeof types == "object" && !Array.isArray(types)){
+			var names = Object.keys(types)
+			for(var t = 0; t < names.length; t++){
+				if(bccs.indexOf(hashId(names[t] + cc)) > -1 || bccs.indexOf(hashId(names[t] + cc.toUpperCase())) > -1){
+					kept[names[t]] = types[names[t]]
+					any = true
+				}
+			}
+		}
+		if(any){
+			out[cc] = kept
+		}
+	}
+	return out
+}
+
+async function teamOwner(
+>>>
+
+@@ fix-member-per-page
+<<< find
+admin = user
+
+						member = true
+
+						cookies.pages = data.base.pages
+=== replace
+admin = user
+
+						// fix-member-per-page: 팀 행은 개수(와 base.pages)만 준다 — 멤버 판정은 아래 1561 에서
+
+						cookies.pages = data.base.pages
+>>>
+
+@@ fix-member-per-page
+<<< find
+cookies.bcc = ''
+
+			if(Object.keys(page).length){
+=== replace
+cookies.bcc = ''
+
+			// fix-member-per-page: 팀장은 모든 페이지의 멤버, 서비스 자신의 페이지(href 의 도메인 cc 가 homeCc)는 팀 공통,
+			// 그 밖의 팀원은 아래 멤버 행(페이지 bcc · 사이트 cc)이 있어야 멤버
+			var memberOwner = false
+
+			if(cookies.address && cookies.team){
+				memberOwner = cookies.address == await teamOwner(env, logisRegion, admin, cookies.team)
+
+				member = memberOwner || ccOfHost(url.host) == homeCc
+			}
+
+			if(Object.keys(page).length){
+>>>
+
+@@ fix-member-per-page
+<<< find
+if(results.length){
+							member = true
+						}
+					}
+				}
+			}
+
+
+			cookies.href = href
+=== replace
+if(results.length){
+							member = true
+						}
+					}
+				}
+			}
+
+			// fix-member-per-page: 팀장이 아니면 팀 base.pages 를 멤버인 것만
+			if(cookies.address && cookies.team && !memberOwner && cookies.pages && typeof cookies.pages == "object" && !Array.isArray(cookies.pages) && Object.keys(cookies.pages).length){
+				cookies.pages = await memberPages(env, zoneRegion, cookies.address, cookies.team, cookies.pages, homeCc)
+			}
+
+
+			cookies.href = href
+>>>
+
+@@ fix-member-per-page
+<<< find
+}else if(req.query.text){
+
+							var text = decodeURIComponent(req.query.text)
+=== replace
+}else if(req.query.text && !member){
+							// fix-member-per-page: 이 페이지의 멤버가 아니면 대화를 넣지 않는다
+							headers.set('Content-Type', 'application/json')
+
+							return new Response(JSON.stringify({ results : [], success : false, error : 'not a member of this page', session : cookies }), { headers : headers })
+						}else if(req.query.text){
+
+							var text = decodeURIComponent(req.query.text)
+>>>
+
+@@ fix-member-per-page
+<<< find
+if(cookies.sender && created_at){
+					var task = {
+=== replace
+// fix-member-per-page: 이 페이지의 멤버(팀장 · 페이지 멤버 행 · 팀 공통 페이지)만 작업을 넣는다
+				if(cookies.sender && created_at && !member){
+					headers.set('Content-Type', 'application/json')
+
+					return new Response(JSON.stringify({ success : false, results : [], error : 'not a member of this page', session : cookies }), { headers : headers })
+				}
+
+				if(cookies.sender && created_at){
+					var task = {
+>>>
+
+@@ fix-member-per-page
+<<< find
+var talks = []
+
+					if(member && cookies.address){
+=== replace
+var talks = []
+
+					// fix-member-per-page: 이 페이지의 멤버가 아닌 팀원에게는 팀 아이템(1132 의 상세 행)도 싣지 않는다
+					if(!member && cookies.address){
+						items = []
+					}
+
+					if(member && cookies.address){
+>>>
+
+=====================================================================================================================
+fix-member-sync-scope: member 이면 동기화(2494~2849)가 팀 · 사이트 단위 질의라 한 페이지의 멤버가 팀의 다른 페이지 아이템 · 작업 · 대화 · 초안 ·
+sales · event · tracking · 힌트까지 받았다 → 팀장이 아니면 모든 질의에 멤버 범위(cc ∈ 사이트 · bcc ∈ 페이지 · ref ∈ 페이지 작업/대화 ref)를 바인딩으로 붙인다.
+팀장은 질의 그대로. workers/commerce/src/fixes.rs(member_sync_scope · scope_sql · scope_params) · get.rs 와 1:1.
+@@ fix-member-sync-scope
+<<< find
+async function teamOwner(
+=== replace
+// fix-member-sync-scope: 팀장이 아닌 멤버의 동기화 범위. 행은 cc 가 ccs 에 있거나(사이트 통째 — homeCc 와 사이트 멤버 행의 bcc = cc),
+// bcc 가 bccs 에 있거나(페이지 — 멤버 행의 bcc 와 그 페이지 type 의 목록 · 상세 두 꼴), ref 가 refs 에 있으면(페이지 bcc 가 없는 작업 · 대화 —
+// 그 페이지 행의 id 와 hashId(팀 + cc + pathname) · hashId(팀 + 대문자 cc + pathname)) 범위 안이다
+async function memberSyncScope(env, zone, address, team, homeCc){
+	var db = env[`commerce_logis_${zone}_items`]
+	var add = (list, value) => {
+		if(list.indexOf(value) < 0){
+			list.push(value)
+		}
+	}
+	var { results } = await db.prepare(`SELECT "bcc" FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 LIMIT 1000`).bind(address, team).all()
+	var member = []
+	results.forEach(row => {
+		if(typeof row.bcc == "string" && row.bcc){
+			add(member, row.bcc)
+		}
+	})
+	var ccs = [homeCc]
+	member.forEach(bcc => add(ccs, bcc))
+	var text = (v) => typeof v == "string" ? v : null
+	var pages = (await db.prepare(`SELECT "id", "cc", "bcc", "data" FROM items WHERE "type" = 'pages' AND "to" = ?1 LIMIT 1000`).bind(team).all()).results.map(row => {
+		var data
+		try{
+			data = JSON.parse(new TextDecoder('utf-8').decode(ungzip(row.data)))
+		}catch(err){
+			data = undefined
+		}
+		var type = data && typeof data == "object" ? text(data.type) : null
+		var link = data && typeof data == "object" ? text(data.link) : null
+		return { id : text(row.id), cc : text(row.cc), bcc : text(row.bcc), type : type || '', link : link || '' }
+	})
+	// 아이템은 상세를 읽은 뒤 대문자 꼴 bcc 로 옮겨 가므로(proxy) 같은 type 의 두 꼴을 함께 둔다 — memberPages 와 같다
+	var bccs = member.slice()
+	pages.forEach(p => {
+		if(p.cc !== null && p.bcc !== null && member.indexOf(p.bcc) > -1 && p.type){
+			add(bccs, hashId(p.type + p.cc))
+			add(bccs, hashId(p.type + p.cc.toUpperCase()))
+		}
+	})
+	// 작업(prompt 의 bcc 는 '')과 그 대화는 ref = hashId(팀 + task.cc + pathname)(상세면 대문자 cc)로, 상세 대화는 ref = 상세 페이지 id 로 페이지에 딸린다
+	var refs = []
+	pages.forEach(p => {
+		if(p.bcc === null || bccs.indexOf(p.bcc) < 0){
+			return
+		}
+		if(p.id !== null){
+			add(refs, p.id)
+		}
+		if(p.cc !== null && p.link){
+			var path = p.link.split('?')[0].toLowerCase()
+			add(refs, hashId(team + p.cc + path))
+			add(refs, hashId(team + p.cc.toUpperCase() + path))
+		}
+	})
+	return { ccs : ccs, bccs : bccs, refs : refs }
+}
+
+// fix-member-sync-scope: 팀장(null)이면 빈 글. ?n · ?n+1 · ?n+2 는 scopeParams 의 JSON 배열 셋 (바인딩 수 한도 · 빈 목록을 피하려고 json_each)
+function scopeSql(scope, n){
+	return scope ? ` AND ("cc" IN (SELECT value FROM json_each(?${n})) OR "bcc" IN (SELECT value FROM json_each(?${n + 1})) OR "ref" IN (SELECT value FROM json_each(?${n + 2})))` : ''
+}
+
+function scopeParams(scope){
+	return scope ? [JSON.stringify(scope.ccs), JSON.stringify(scope.bccs), JSON.stringify(scope.refs)] : []
+}
+
+async function teamOwner(
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+if(member && cookies.address){
+						// relate update item
+=== replace
+if(member && cookies.address){
+						// fix-member-sync-scope: 팀장이 아니면 아래 모든 질의를 멤버 범위로 묶는다 (팀장은 null — 질의 그대로)
+						var memberScope = memberOwner ? null : await memberSyncScope(env, zoneRegion, cookies.address, cookies.team, homeCc)
+
+						// relate update item
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM items WHERE "cc" = ?1 AND "to" = ?2 ${condition} AND "updated_at" > 0 ORDER BY created_at DESC LIMIT 100`
+						).bind(cookies.cc, cookies.team).all()
+=== replace
+`SELECT * FROM items WHERE "cc" = ?1 AND "to" = ?2 ${condition} AND "updated_at" > 0${scopeSql(memberScope, 3)} ORDER BY created_at DESC LIMIT 100`
+						).bind(cookies.cc, cookies.team, ...scopeParams(memberScope)).all()
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM items WHERE "cc" != ?1 AND "to" = ?2 ${condition}  AND "updated_at" > 0 ORDER BY created_at DESC LIMIT 100`
+						).bind(cookies.cc, cookies.team).all()
+=== replace
+`SELECT * FROM items WHERE "cc" != ?1 AND "to" = ?2 ${condition}  AND "updated_at" > 0${scopeSql(memberScope, 3)} ORDER BY created_at DESC LIMIT 100`
+						).bind(cookies.cc, cookies.team, ...scopeParams(memberScope)).all()
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM items WHERE "to" = ?1 ${condition} AND "updated_at" = 0 ORDER BY created_at DESC LIMIT 100`
+						).bind(cookies.team).all()
+=== replace
+`SELECT * FROM items WHERE "to" = ?1 ${condition} AND "updated_at" = 0${scopeSql(memberScope, 2)} ORDER BY created_at DESC LIMIT 100`
+						).bind(cookies.team, ...scopeParams(memberScope)).all()
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM tasks WHERE "from" = ?1 AND "cc" = ?2 ${condition} ORDER BY created_at DESC LIMIT 10`
+						).bind(cookies.address, cookies.cc).all()
+=== replace
+`SELECT * FROM tasks WHERE "from" = ?1 AND "cc" = ?2 ${condition}${scopeSql(memberScope, 3)} ORDER BY created_at DESC LIMIT 10`
+						).bind(cookies.address, cookies.cc, ...scopeParams(memberScope)).all()
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2 ${conditions[page.type] ? conditions[page.type] : condition} ORDER BY created_at DESC LIMIT 10`
+						).bind(cookies.cc, itemId).all()
+=== replace
+`SELECT * FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2 ${conditions[page.type] ? conditions[page.type] : condition}${scopeSql(memberScope, 3)} ORDER BY created_at DESC LIMIT 10`
+						).bind(cookies.cc, itemId, ...scopeParams(memberScope)).all()
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT COUNT(*) AS "talks" FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2`
+							).bind(cookies.cc, itemId).all();
+=== replace
+`SELECT COUNT(*) AS "talks" FROM talks WHERE "cc" = ?1 AND "data" IS NOT NULL AND "ref" = ?2${scopeSql(memberScope, 3)}`
+							).bind(cookies.cc, itemId, ...scopeParams(memberScope)).all();
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM talks WHERE "from" = ?1 AND "to" = ?2 ${conditions[page.type] ? conditions[page.type] : condition} ORDER BY created_at DESC LIMIT 10`
+						).bind(cookies.team, cookies.address).all()
+=== replace
+`SELECT * FROM talks WHERE "from" = ?1 AND "to" = ?2 ${conditions[page.type] ? conditions[page.type] : condition}${scopeSql(memberScope, 3)} ORDER BY created_at DESC LIMIT 10`
+						).bind(cookies.team, cookies.address, ...scopeParams(memberScope)).all()
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM items WHERE "type" = ?1 AND "digest" = ?2 ${condition} ORDER BY created_at DESC LIMIT 1`
+								).bind(page.type, detail.digest).all()
+=== replace
+`SELECT * FROM items WHERE "type" = ?1 AND "digest" = ?2 ${condition}${scopeSql(memberScope, 3)} ORDER BY created_at DESC LIMIT 1`
+								).bind(page.type, detail.digest, ...scopeParams(memberScope)).all()
+>>>
+
+범위가 있으면 OR 로 이은 힌트 조각을 괄호로 묶고 그 뒤에 범위를 붙인다 (조각마다 condition 이 들어 있어 결과는 같다)
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM ${type} WHERE ${hints_condition} ${condition} ORDER BY created_at DESC LIMIT 1`
+									).bind(...hints_params).all()
+=== replace
+`SELECT * FROM ${type} WHERE ${memberScope ? '(' + hints_condition + ')' : hints_condition} ${condition}${scopeSql(memberScope, hints_params.length + 1)} ORDER BY created_at DESC LIMIT 1`
+									).bind(...hints_params, ...scopeParams(memberScope)).all()
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM ${type} WHERE "id" = ?1 ${condition} ORDER BY created_at DESC LIMIT 1`
+								).bind(detail.id).all()
+=== replace
+`SELECT * FROM ${type} WHERE "id" = ?1 ${condition}${scopeSql(memberScope, 2)} ORDER BY created_at DESC LIMIT 1`
+								).bind(detail.id, ...scopeParams(memberScope)).all()
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM sales WHERE "goods" = ?1 AND "cc" = ?2 AND "to" = ?3 ${conditions[type] ? conditions[type] : condition} ORDER BY created_at DESC LIMIT 10000`
+										).bind($item.index, cookies.cc, cookies.team).all()
+=== replace
+`SELECT * FROM sales WHERE "goods" = ?1 AND "cc" = ?2 AND "to" = ?3 ${conditions[type] ? conditions[type] : condition}${scopeSql(memberScope, 4)} ORDER BY created_at DESC LIMIT 10000`
+										).bind($item.index, cookies.cc, cookies.team, ...scopeParams(memberScope)).all()
+>>>
+
+@@ fix-member-sync-scope
+@@ count 2
+<<< find
+`SELECT * FROM tracking WHERE "order" = ?1 AND "to" = ?2 ${conditions[type] ? conditions[type] : condition} ORDER BY created_at DESC LIMIT 10000`
+											).bind($item.index, cookies.team).all()
+=== replace
+`SELECT * FROM tracking WHERE "order" = ?1 AND "to" = ?2 ${conditions[type] ? conditions[type] : condition}${scopeSql(memberScope, 3)} ORDER BY created_at DESC LIMIT 10000`
+											).bind($item.index, cookies.team, ...scopeParams(memberScope)).all()
+>>>
+
+@@ fix-member-sync-scope
+<<< find
+`SELECT * FROM ${type} WHERE "to" = ?1 AND "cc" = ?2 AND "bcc" = ?3 ${conditions[page.type] ? conditions[page.type] : condition} ORDER BY created_at DESC LIMIT 100`
+								).bind(cookies.team, cookies.cc, page.bcc).all()
+=== replace
+`SELECT * FROM ${type} WHERE "to" = ?1 AND "cc" = ?2 AND "bcc" = ?3 ${conditions[page.type] ? conditions[page.type] : condition}${scopeSql(memberScope, 4)} ORDER BY created_at DESC LIMIT 100`
+								).bind(cookies.team, cookies.cc, page.bcc, ...scopeParams(memberScope)).all()
+>>>
+
+=====================================================================================================================
+fix-member-app-link: 앱 추출의 요청 href 는 proxy_fetch 의 기본값(console.logis.center — 팀 공통)이라 봉투의 link 가 가리키는 가게 페이지에
+팀원 누구나 작업을 넣을 수 있었다 → 봉투 link 가 http(s) 주소면 그 페이지(resolve 와 같은 방법으로 찾은 cc · 페이지 bcc)로 판정한다. "local" 은 그대로.
+팀 공통도 homeCc 의 아무 호스트가 아니라 서비스 자신의 호스트(logis.center · commerce · console)만. workers/commerce/src/fixes.rs
+(team_common_host · app_extraction_link · link_member) · resolve.rs · post.rs 와 1:1. fix-member-per-page 위에 덧댄다(그것을 빼면 이것도 빼야 한다).
+@@ fix-member-app-link
+<<< find
+async function teamOwner(
+=== replace
+// fix-member-app-link: 팀 공통 페이지 = 서비스 자신의 호스트(데스크톱 앱이 href 로 보내는 commerce · console, 그리고 logis.center)
+function teamCommonHost(hostname){
+	return ['logis.center', 'commerce.logis.center', 'console.logis.center'].indexOf(hostname) > -1
+}
+
+// fix-member-app-link: 앱 추출 봉투(fix-app-extraction 이 푸는 꼴)의 link 가 http(s) 주소면 그 주소(소문자 — appHref 와 같은 값), 아니면 null
+async function appExtractionLink(request, contentEncoding, contentType){
+	try{
+		if(contentEncoding != 'gzip' || (contentType || '').indexOf('application/json') < 0){
+			return null
+		}
+		var buffer = await request.arrayBuffer()
+		if(!buffer.byteLength){
+			return null
+		}
+		var b = appJson(new TextDecoder('utf-8').decode(ungzip(buffer)))
+		if(!b || typeof b.body != "string" || ['image_extraction', 'html_extraction', 'document_extraction'].indexOf(b.type) < 0){
+			return null
+		}
+		var url = new URL(String(b.link))
+		return url.protocol == 'http:' || url.protocol == 'https:' ? url.href.toLowerCase() : null
+	}catch(err){
+		return null
+	}
+}
+
+// fix-member-app-link: link 의 페이지 멤버인지 — resolve(1132 · 1145 · 1256 · 1561)와 같은 방법: 서비스 호스트면 팀 공통. 아니면 cc = 그 호스트의 cc,
+// 그 주소의 아이템(ref = hashId(팀 + cc + link))이 있으면 bcc 가 같은 페이지(상세), 없으면 id = hashId(cc + pathname) 인 페이지 — 팀 페이지에서,
+// 없으면 그 cc 의 페이지에서. 페이지가 없으면 멤버가 아니다. 페이지 bcc = hashId(type + cc)(상세면 대문자 cc), 멤버 행의 bcc 가 그것이거나 cc 면 멤버
+async function linkMember(env, zone, address, team, link){
+	var url
+	try{
+		url = new URL(link)
+	}catch(err){
+		return false
+	}
+	if(teamCommonHost(url.hostname)){
+		return true
+	}
+	var db = env[`commerce_logis_${zone}_items`]
+	var cc = ccOfHost(url.host)
+	var pageId = hashId(cc + url.pathname.toLowerCase())
+	var itemId = hashId(team + cc + (url.pathname + url.search).toLowerCase())
+	var { results } = await db.prepare(`SELECT "bcc" FROM items WHERE "to" = ?1 AND "ref" = ?2 LIMIT 1`).bind(team, itemId).all()
+	var detail = results.length ? results[0] : null
+	var page = null
+	var lists = [
+		[`SELECT * FROM items WHERE "type" = 'pages' AND "to" = ?1 LIMIT 100`, team],
+		[`SELECT * FROM items WHERE "type" = 'pages' AND "cc" = ?1 LIMIT 100`, cc],
+	]
+	for(var l = 0; l < lists.length && !page; l++){
+		var { results } = await db.prepare(lists[l][0]).bind(lists[l][1]).all()
+		for(var i = 0; i < results.length; i++){
+			var data
+			try{
+				data = JSON.parse(new TextDecoder('utf-8').decode(ungzip(results[i].data)))
+			}catch(err){
+				data = undefined
+			}
+			var type = data && typeof data == "object" ? data.type : undefined
+			if(detail){
+				if(detail.bcc == results[i].bcc){
+					page = { type : type, detail : true }
+				}
+			}else if(pageId == results[i].id){
+				page = { type : type, detail : !!(data && typeof data == "object" && data.detail) }
+			}
+		}
+	}
+	if(!page){
+		return false
+	}
+	var checks = [hashId(page.type + (page.detail ? cc.toUpperCase() : cc)), cc]
+	for(var c = 0; c < checks.length; c++){
+		var { results } = await db.prepare(`SELECT * FROM items WHERE "type" = 'member' AND "from" = ?1 AND "to" = ?2 AND "bcc" = ?3 LIMIT 1`).bind(address, team, checks[c]).all()
+		if(results.length){
+			return true
+		}
+	}
+	return false
+}
+
+async function teamOwner(
+>>>
+
+@@ fix-member-app-link
+<<< find
+member = memberOwner || ccOfHost(url.host) == homeCc
+=== replace
+// fix-member-app-link: 팀 공통은 서비스 자신의 호스트만
+				member = memberOwner || teamCommonHost(url.hostname)
+>>>
+
+@@ fix-member-app-link
+<<< find
+// fix-member-per-page: 이 페이지의 멤버(팀장 · 페이지 멤버 행 · 팀 공통 페이지)만 작업을 넣는다
+				if(cookies.sender && created_at && !member){
+=== replace
+// fix-member-app-link: 앱 추출의 요청 href 는 console(팀 공통)이지만 봉투 link 가 http(s) 주소면 작업은 그 가게 페이지의 것 → 그 페이지로 판정
+				if(cookies.sender && created_at && cookies.address && cookies.team){
+					var appLink = await appExtractionLink(request.clone(), contentEncoding, contentType)
+
+					if(appLink){
+						member = memberOwner || await linkMember(env, zoneRegion, cookies.address, cookies.team, appLink)
+					}
+				}
+
+				// fix-member-per-page: 이 페이지의 멤버(팀장 · 페이지 멤버 행 · 팀 공통 페이지)만 작업을 넣는다
+				if(cookies.sender && created_at && !member){
+>>>

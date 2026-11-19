@@ -59,9 +59,11 @@ All inference, embedding, and storage are performed **locally on the client**, w
 ```
 
 cron-logis-center/
-├── Cargo.toml                          # Root Cargo workspace (crates/logis-* + commerce/app + commerce/src-tauri), candle fork + PD pins
-├── .cargo/config.toml                  # target-cpu=native, build output kept in commerce/src-tauri/target
+├── Cargo.toml                          # Root Cargo workspace (crates/* + apps/core + apps/desktop), candle fork + PD pins
+├── .cargo/config.toml                  # target-cpu=native, build output in target/
 ├── crates/                             # Domain and engine libraries (no Tauri · LanceDB; only logis-llm · logis-vision-doc use candle)
+│   ├── embed-cpu-kernels/              # CPU kernels for the embedding encoder (GLU · matmul)
+│   ├── ggml-kquant/                    # GGUF k-quant blocks (Q4_K · Q8_0 …)
 │   ├── logis-schema/                   # canonical (field normalization), logic (trade groups · 28 forms · hub fields), hash, text, embed_space,
 │   │                                   # app data paths (tmp · kv · task data · logs · extraction stop signal), json_order (sorted JSON key
 │   │                                   # order: lancedb 0.41 turns on serde_json preserve_order, outputs stay as before)
@@ -78,18 +80,8 @@ cron-logis-center/
 │   └── logis-vision-doc/               # Document vision: siglip2/ (SigLIP2 towers · GGUF · quantize-on-use + precision fingerprint,
 │                                       # vision_encoder heatmap/classification, vision_crop + nms_arena, legibility, value_grounding,
 │                                       # layout/phrase caches, tokenizer, NaFlex preprocessor)
-├── commerce/                           # Desktop client (Tauri v2 + Vite/TS)
-│   ├── src/                            # Frontend (TypeScript)
-│   ├── mobile/                         # Mobile companion app (Tauri)
-│   ├── landing/                        # Landing page
-│   ├── build_cargo*.bat / dev_cargo*.bat / test_cargo*.bat  # CUDA / ROCm / Vulkan scripts
-│   ├── test_linux.sh                   # Linux integration tests (vulkan|cuda|rocm)
-│   ├── crates/
-│   │   ├── boa-engine/                 # Boa JS engine (local build)
-│   │   ├── onnxruntime/                # ONNX Runtime bindings (local build)
-│   │   ├── onnxruntime-sys/            # ONNX Runtime FFI
-│   │   └── direct-storage/             # DirectStorage (Windows)
-│   ├── app/                            # Headless core (crate logis-app, no Tauri): model residency, LanceDB store, scheduler, search
+├── apps/                               # Rust applications
+│   ├── core/                           # Headless core (crate logis-app, no Tauri): model residency, LanceDB store, scheduler, search
 │   │   ├── Cargo.toml                  # GPU features only forward to logis-llm / logis-vision-doc (the core code has no #[cfg(feature)])
 │   │   ├── tests/it/                   # Integration tests + synthetic eval, no Tauri (cargo test -p logis-center -p logis-app --test it)
 │   │   └── src/
@@ -115,7 +107,7 @@ cron-logis-center/
 │   │       │   ├── research.rs         # Research flow
 │   │       │   └── query_{commerce,shipping}.rs  # Domain search queries
 │   │       ├── store.rs                # LanceDB vector store (envelope schema)
-│   │       ├── stanza.rs               # Stanza NLP (tokenization/POS/lemma/syntax)
+│   │       ├── stanza.rs               # Stanza NLP adapter over premium-discount-nlp (model folder rule, query language, downloads)
 │   │       ├── search_fusion.rs / search_relation.rs  # Search fusion + relation steps (rules in crates/logis-search)
 │   │       ├── sink.rs                 # EventSink · Sink · NoopSink (TauriSink lives in the shell)
 │   │       ├── browser_state.rs        # Active browser tab state (written by the shell's automation, read by url_utils)
@@ -131,7 +123,7 @@ cron-logis-center/
 │   │           └── ...                 # (bias_schema · canonical · hash · time_guide · lang_utils · json_* · nl_convert · pug_utils:
 │   │                                   #  crates/logis-*; device_utils · resources · tensor_utils · crypto · img_utils · direct_loader ·
 │   │                                   #  misc_utils: crates/logis-llm; paths: crates/logis-schema)
-│   └── src-tauri/                      # Thin Tauri shell (crate tauri_app_lib)
+│   ├── desktop/                        # Thin Tauri shell (crate tauri_app_lib), tauri.conf.json · icons · models
 │       ├── Cargo.toml                  # Tauri + feature flags (cuda/rocm/vulkan/metal/flash-attn/turbo-quant/full-bias → logis-app)
 │       └── src/
 │           ├── lib.rs                  # Tauri entry: thin #[tauri::command] wrappers over logis_app::commands / query (State +
@@ -139,8 +131,19 @@ cron-logis-center/
 │           ├── automation.rs           # Chromium browser automation
 │           ├── sink.rs                 # TauriSink (AppHandle::emit) + re-export of the core sink
 │           └── main.rs
-├── apac/                               # Cloudflare Worker + D1 backend
-├── proxy/                              # Cloudflare Worker + D1 backend (proxy)
+│   └── mobile/                         # Mobile companion Tauri shell (outside the workspace)
+├── web/                                # Frontends (Vite + TypeScript)
+│   ├── desktop/                        # Desktop UI (src/, public/, vite · vitest; tauri.conf → ../../web/desktop/dist)
+│   ├── mobile/                         # Mobile UI (+ install_mobile.ps1)
+│   └── landing/                        # Landing page
+├── workers/                            # Cloudflare Workers in Rust (workers-rs → wasm): common · proxy · apac, shared D1
+│                                       # migrations; port of the TypeScript workers, same behaviour (docs/workers-rs.md)
+├── scripts/workers-diff/               # Miniflare harness: original TS vs Rust, same D1 / LLM / AI / Vectorize mocks
+├── vendor/                             # Third-party code with its own workspace
+│   ├── boa-engine/                     # Boa JS engine (local build)
+│   └── direct-storage/                 # DirectStorage (Windows)
+├── scripts/                            # build_cargo*.bat / dev_cargo*.bat / test_cargo*.bat (CUDA / ROCm / Vulkan), test_linux.sh
+├── tools/cpu-embed-bench/              # CPU embedding benchmark (own workspace)
 ├── SyntheticData/trading/              # Synthetic trade documents (YAML → PDF generators)
 ├── logic.md                            # Pipeline logic notes
 └── readme.md
@@ -502,11 +505,10 @@ model.load_kv_cache(path, device, expected_len, refill_len, kv_name).await?;
 
 ```bash
 # Frontend build
-cd commerce && npm install && npm run build
+cd web/desktop && npm install && npm run build
 
-# Rust Backend build (CUDA default)
-cd src-tauri
-cargo build --release
+# Rust build (CUDA default), from the repository root
+cargo build --release -p logis-center
 # Other backends
 cargo build --release --no-default-features --features rocm     # or vulkan / metal
 ```
@@ -514,26 +516,23 @@ cargo build --release --no-default-features --features rocm     # or vulkan / me
 ### Run
 
 ```bash
-cargo tauri dev      # Development mode
-or
-.\dev_cargo.bat      # .\dev_cargo_rocm.bat / .\dev_cargo_vulkan.bat
-
-cargo tauri build    # Production build
-or
-.\build_cargo.bat    # .\build_cargo_rocm.bat / .\build_cargo_vulkan.bat
+.\scripts\dev_cargo.bat      # .\scripts\dev_cargo_rocm.bat / dev_cargo_vulkan.bat (Development mode)
+.\scripts\build_cargo.bat    # .\scripts\build_cargo_rocm.bat / build_cargo_vulkan.bat (Production build)
+# The Tauri CLI finds the shell and the frontend through TAURI_APP_PATH=apps/desktop and
+# TAURI_FRONTEND_PATH=web/desktop (the scripts set both).
 ```
 
 ### Test
 
 ```bash
 # Windows
-.\test_cargo.bat     # .\test_cargo_rocm.bat / .\test_cargo_vulkan.bat
+.\scripts\test_cargo.bat     # .\scripts\test_cargo_rocm.bat / test_cargo_vulkan.bat
 
 # Linux (vulkan | cuda | rocm)
-./test_linux.sh vulkan
+./scripts/test_linux.sh vulkan
 
 # Frontend
-npm test
+cd web/desktop && npm test
 ```
 
 ### Model Download
@@ -545,6 +544,9 @@ Stanza models are the format 2 export of [stanza-onnx-export](https://github.com
 (raw text → tokens → MWT → POS → lemma → dependencies) against PyTorch Stanza for all 12 languages. The downloader reads `vocab.json` from
 `huggingface.co/Qntology/stanza-<lang>` first and fetches the files it lists; a format 1 repository is reported as an error instead of being installed.
 `LOGIS_STANZA_DIR=<folder>` makes the app read `<folder>/<lang>/` instead of the app data folder (evaluation, development).
+The runtime itself is `premium-discount-nlp`'s `stanza` (the same code this app had, byte-identical output on the 278 reference sentences); ONNX
+Runtime is loaded at run time by full path (`ORT_DYLIB_PATH`, next to the executable, `<app data>/models/onnxruntime/`, or the library the build
+prepared), never linked. The granite embedding encoder is `premium-discount-nlp`'s `granite::Encoder` (this app's forward pass, bit-identical).
 
 ### Domain Dictionary (`bias.json` / `full_bias.json`)
 
@@ -576,7 +578,7 @@ Apache License 2.0
 
 ### Open Source Libraries
 
-#### Rust (`commerce/src-tauri`)
+#### Rust (`apps/desktop`)
 
 | Library | License |
 | --- | --- |
@@ -613,7 +615,7 @@ Apache License 2.0
 | num | MIT OR Apache-2.0 |
 | nvml-wrapper | MIT OR Apache-2.0 |
 | once_cell | MIT OR Apache-2.0 |
-| onnxruntime (local build) | MIT OR Apache-2.0 |
+| onnxruntime (premium-discount copy, runtime-loaded) | MIT OR Apache-2.0 |
 | pdf-extract | MIT |
 | quick-xml | MIT |
 | rand / rand_chacha | MIT OR Apache-2.0 |
@@ -637,7 +639,24 @@ Apache License 2.0
 | windows / windows-sys | MIT OR Apache-2.0 |
 | zip | MIT |
 
-#### JavaScript / TypeScript (`commerce`, `commerce/mobile`, `apac`, `proxy`)
+#### Rust (`workers/` — Cloudflare Workers)
+
+| Library | License |
+| --- | --- |
+| worker (workers-rs) / worker-build | Apache-2.0 |
+| wasm-bindgen / wasm-bindgen-futures / js-sys | MIT OR Apache-2.0 |
+| getrandom | MIT OR Apache-2.0 |
+| selectors / cssparser | MPL-2.0 |
+| scraper | ISC |
+| serde_json / indexmap / url / regex | MIT OR Apache-2.0 |
+| fancy-regex | MIT |
+| ryu-js | Apache-2.0 OR BSL-1.0 |
+| flate2 / miniz_oxide | MIT OR Apache-2.0 (miniz_oxide: MIT OR Zlib OR Apache-2.0) |
+
+The HTML entity decode table in `workers/proxy/src/dom/entity_tree.rs` is generated from the `entities` package (BSD-2-Clause);
+the tokenizer follows htmlparser2 (MIT).
+
+#### JavaScript / TypeScript (`web/desktop`, `web/mobile`, `scripts/workers-diff`)
 
 | Library | License |
 | --- | --- |
@@ -647,9 +666,11 @@ Apache License 2.0
 | happy-dom | MIT |
 | typescript | Apache-2.0 |
 | wrangler | MIT OR Apache-2.0 |
-| ethers | MIT |
-| linkedom | ISC |
-| pako | MIT AND Zlib |
+| miniflare | MIT |
+| esbuild | MIT |
+| ethers (test harness only) | MIT |
+| linkedom (test harness only) | ISC |
+| pako (test harness only) | MIT AND Zlib |
 
 ### GPU Notices
 
@@ -669,7 +690,7 @@ Licensed under the MIT License and/or Apache License 2.0.
 #### Microsoft DirectStorage
 
 This application uses Microsoft DirectStorage 1.3.0 on Windows for fast KV cache block I/O.
-See `commerce/src-tauri/dstorage.license.txt` for license terms.
+See `apps/desktop/dstorage.license.txt` for license terms.
 
 ---
 

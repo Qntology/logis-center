@@ -1,0 +1,4448 @@
+{
+ "aws": [
+  {
+   "name": "commerce head hash",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/0123456789abcdef0123456789abcdef01234567",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/0123456789abcdef0123456789abcdef01234567",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=2a1df3815ecd11b0e8ce3eb681020a1d6e9e3ef0742bdd3b4c868f491bd527d8"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "commerce head address",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/address/0x56d67386939607c11bd60bb009eb02f4dd29c318",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/address/0x56d67386939607c11bd60bb009eb02f4dd29c318",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ed851dae7812c87e908b179704ef4ddc73cbecabb6052a682e82a64c74b122a0"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "commerce put bootstrap",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/aa",
+   "init": {
+    "method": "PUT",
+    "headers": [
+     [
+      "Content-Type",
+      "text/plain"
+     ],
+     [
+      "x-amz-meta-balance",
+      "1000"
+     ],
+     [
+      "x-amz-meta-host",
+      "logis.center"
+     ],
+     [
+      "x-amz-meta-token",
+      "abababababababababababababababababababababababababababababababab"
+     ],
+     [
+      "x-amz-meta-email",
+      ""
+     ],
+     [
+      "x-amz-meta-ip",
+      "203.0.113.7"
+     ],
+     [
+      "x-amz-meta-phone",
+      ""
+     ],
+     [
+      "x-amz-meta-address",
+      ""
+     ]
+    ],
+    "body": {
+     "str": ""
+    },
+    "aws": {
+     "service": "s3",
+     "region": "ap-northeast-2"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/aa",
+    "method": "PUT",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-address;x-amz-meta-balance;x-amz-meta-email;x-amz-meta-host;x-amz-meta-ip;x-amz-meta-phone;x-amz-meta-token, Signature=2e1966bc044f7478c02906aa98591acc445a2f83acea3acd630605ab1c98a1ac"
+     ],
+     [
+      "content-type",
+      "text/plain"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-meta-address",
+      ""
+     ],
+     [
+      "x-amz-meta-balance",
+      "1000"
+     ],
+     [
+      "x-amz-meta-email",
+      ""
+     ],
+     [
+      "x-amz-meta-host",
+      "logis.center"
+     ],
+     [
+      "x-amz-meta-ip",
+      "203.0.113.7"
+     ],
+     [
+      "x-amz-meta-phone",
+      ""
+     ],
+     [
+      "x-amz-meta-token",
+      "abababababababababababababababababababababababababababababababab"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "trading put bootstrap",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/bb",
+   "init": {
+    "method": "PUT",
+    "headers": [
+     [
+      "Content-Type",
+      "text/plain"
+     ],
+     [
+      "x-amz-meta-balance",
+      "1000"
+     ],
+     [
+      "x-amz-meta-host",
+      "trading.logis.center"
+     ],
+     [
+      "x-amz-meta-token",
+      "abababababababababababababababababababababababababababababababab"
+     ],
+     [
+      "x-amz-meta-email",
+      ""
+     ],
+     [
+      "x-amz-meta-ip",
+      "203.0.113.7"
+     ],
+     [
+      "x-amz-meta-phone",
+      ""
+     ],
+     [
+      "x-amz-meta-address",
+      ""
+     ]
+    ],
+    "body": {
+     "str": ""
+    },
+    "aws": {
+     "service": "s3",
+     "region": "ap-northeast-2"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/bb",
+    "method": "PUT",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-address;x-amz-meta-balance;x-amz-meta-email;x-amz-meta-host;x-amz-meta-ip;x-amz-meta-phone;x-amz-meta-token, Signature=17f9fb2afb80a5f18d7bfe78852cac40f29302f44708d15d939af53990275939"
+     ],
+     [
+      "content-type",
+      "text/plain"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-meta-address",
+      ""
+     ],
+     [
+      "x-amz-meta-balance",
+      "1000"
+     ],
+     [
+      "x-amz-meta-email",
+      ""
+     ],
+     [
+      "x-amz-meta-host",
+      "trading.logis.center"
+     ],
+     [
+      "x-amz-meta-ip",
+      "203.0.113.7"
+     ],
+     [
+      "x-amz-meta-phone",
+      ""
+     ],
+     [
+      "x-amz-meta-token",
+      "abababababababababababababababababababababababababababababababab"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "commerce delete",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/cc",
+   "init": {
+    "method": "DELETE"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/cc",
+    "method": "DELETE",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=52f2b2d14b057564c6129ba6da0ec22b2dce5b1a82b139b8dc1ebbf2d784628c"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "undefined region head",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3"
+   },
+   "url": "https://undefined.s3.undefined.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://undefined.s3.undefined.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/undefined/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ceb954ae84d2fa06afd8e85c0470b52ada7727783eb2b90e90f8e7e7f68f5e57"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "undefined region put",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3"
+   },
+   "url": "https://logis-bucket.s3.undefined.amazonaws.com/hash/x",
+   "init": {
+    "method": "PUT",
+    "headers": [
+     [
+      "Content-Type",
+      "text/plain"
+     ],
+     [
+      "x-amz-meta-balance",
+      "1000"
+     ],
+     [
+      "x-amz-meta-host",
+      "logis.center"
+     ],
+     [
+      "x-amz-meta-token",
+      "abababababababababababababababababababababababababababababababab"
+     ],
+     [
+      "x-amz-meta-email",
+      ""
+     ],
+     [
+      "x-amz-meta-ip",
+      "203.0.113.7"
+     ],
+     [
+      "x-amz-meta-phone",
+      ""
+     ],
+     [
+      "x-amz-meta-address",
+      ""
+     ]
+    ],
+    "body": {
+     "str": ""
+    },
+    "aws": {
+     "service": "s3"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.undefined.amazonaws.com/hash/x",
+    "method": "PUT",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/undefined/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-address;x-amz-meta-balance;x-amz-meta-email;x-amz-meta-host;x-amz-meta-ip;x-amz-meta-phone;x-amz-meta-token, Signature=ccaf6a28282ca01cad51d2d7d4d39d92985d86f5a71255cd64326f010acd4eb6"
+     ],
+     [
+      "content-type",
+      "text/plain"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-meta-address",
+      ""
+     ],
+     [
+      "x-amz-meta-balance",
+      "1000"
+     ],
+     [
+      "x-amz-meta-email",
+      ""
+     ],
+     [
+      "x-amz-meta-host",
+      "logis.center"
+     ],
+     [
+      "x-amz-meta-ip",
+      "203.0.113.7"
+     ],
+     [
+      "x-amz-meta-phone",
+      ""
+     ],
+     [
+      "x-amz-meta-token",
+      "abababababababababababababababababababababababababababababababab"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "undefined region delete",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3"
+   },
+   "url": "https://logis-bucket.s3.undefined.amazonaws.com/hash/x",
+   "init": {
+    "method": "DELETE"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.undefined.amazonaws.com/hash/x",
+    "method": "DELETE",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/undefined/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=1fdc2f9e5e8a71317a18e024bdb6863ba5789f13077e91be2f8582ce350cd6c1"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "empty region",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": ""
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=9f7e74e0745998caca7c2c1e356afa152e84e228f79c4a34b3ba94f007328749"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "undefined key",
+   "client": {
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "ctor_throws": {
+    "name": "TypeError",
+    "message": "accessKeyId is a required option"
+   }
+  },
+  {
+   "name": "undefined secret",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "ctor_throws": {
+    "name": "TypeError",
+    "message": "secretAccessKey is a required option"
+   }
+  },
+  {
+   "name": "null key",
+   "client": {
+    "accessKeyId": null,
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "ctor_throws": {
+    "name": "TypeError",
+    "message": "accessKeyId is a required option"
+   }
+  },
+  {
+   "name": "number key",
+   "client": {
+    "accessKeyId": 12345,
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=12345/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=9f7e74e0745998caca7c2c1e356afa152e84e228f79c4a34b3ba94f007328749"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "unicode secret",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "비밀/키+é",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=c16f60c857d2045c86520d61314d869544587def59101da886f5da1823f0a2ed"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "undefined service s3 host",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=9f7e74e0745998caca7c2c1e356afa152e84e228f79c4a34b3ba94f007328749"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "undefined service r2",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://acc.r2.cloudflarestorage.com/b/k",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://acc.r2.cloudflarestorage.com/b/k",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/auto/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=26df33b87e3d68fa2c10dc7670ea9bfe30bd3760a0022b46c9f95387f3615268"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path space",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a b  c",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a%20b%20%20c",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=141e3fa80a96bd53e39d2ad135532a55fc21e288e7d7d2fc3d891a49a02cc147"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path unicode",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/한글키/é",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/%ED%95%9C%EA%B8%80%ED%82%A4/%C3%A9",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=c6b325814b9a6ae5a57fa1e7304244f45b27ba45d503118e702115e5beb8dd06"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path plus",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a+b+c",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a+b+c",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=7a82930c2f3a537ae6024650f21377c4cc62ae800589165b142f2e39b2140b8c"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path percent lone",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/100%",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/100%",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=45c45f2d82f5de7047fd4e56a390d3e1a5e53a03571fad87485693510dbae7ac"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path percent bad hex",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a%zzb",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a%zzb",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=c94a49629c864c38b22049c1024df29e53bfebf1f6a6c988e0abef90e96404fb"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path encoded slash",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a%2Fb%2fc",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a%2Fb%2fc",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=cd70ef25605d9b129c4f6b4b97d8aa8cf242154e5949b8ecdb26241e71fc15e3"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path encoded letters",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/%41%62%7e%2a",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/%41%62%7e%2a",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=5bea319ee92858480fba8efcb020b05cf4eb7b6be0e70538acf6a4dde2569f0c"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path rfc3986 marks",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a!b'c(d)e*f~g",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a!b'c(d)e*f~g",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=68532580ac08a06cc5826df31c61e8bba312a4eedaa2ff46c057f43726e1fef7"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path double slash",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash//a///b",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash//a///b",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=bfe78d1444aad24e0a2a85201b666d826ff796085946f9ad25a96ae0de41aa85"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path dot segments",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a/./b/../c",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a/c",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=6acd162aea74e7d680e85955b5cd3202424a3b6f420c111f96ba3056e7666123"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path emoji",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/😀/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/%F0%9F%98%80/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0e9f07607f9b9ffcd2fa0a3784ee353bd3a7b0156d806df389bcf0840a163e4a"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path bad utf8",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/%C3%28",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/%C3%28",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=3958476df001ed84e2f6b45e41162c99833ccb4508b4cfe7ed6c62b9ff3f2648"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path truncated utf8",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/%E0%A4%A",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/%E0%A4%A",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ce010c67e70c03db2515f806364bd1789c6cbb3d9bd5e744e77d94d2da6bf328"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path encoded plus",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a%2Bb",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a%2Bb",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ad3a44d9c7ce31844c3d73f07b98fb86467bc32193b7696fb04aec5b5c9bb185"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path encoded space",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a%20b",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a%20b",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=b17c4ca3be7dcd7044662da33ac26050768cc38243ff6ef97879d3148f594213"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path reserved",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a:b@c$d&e=f,g;h",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/a:b@c$d&e=f,g;h",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=9090852ac3b90e9974b5a01cacae488cc1b19cd08502f6f63c1cb521ab161aae"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path empty path",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=c8215bc09698cfc5a6d82f2e7f20e5ad6933a0994e073b6d47d9622120df9ba0"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 path trailing slash",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=66c056e24f88553196363595074316cf0d5a796389f6a47f70e86609e195809a"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "non-s3 path double encode",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "execute-api",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://abc.execute-api.us-east-1.amazonaws.com//prod//a b/%41/é+x",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://abc.execute-api.us-east-1.amazonaws.com//prod//a%20b/%41/%C3%A9+x",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/execute-api/aws4_request, SignedHeaders=host;x-amz-date, Signature=2766ff486c58ba234072937d704f012ae979aee3916d240605e488fcc55e2e36"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 query sorted",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?b=2&a=1&a=0&c",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?b=2&a=1&a=0&c",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=6cc9a6a9eded0619e2677f54c49c5417b165b77506941e2d69229f7c8df1ee2b"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 query empty key",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?=x&a=&&b=1",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?=x&a=&&b=1",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ec3c7c568107d95ebc6a069f6c08bc69b36234de6c9f6b3dcb6784418b5586e6"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 query plus and space",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?q=a+b%20c&r=%2B",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?q=a+b%20c&r=%2B",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=b5340a6a186ad76978bcb7dfd4e2b795dde6c05c9ee64fe16b183524833013eb"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 query unicode",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?이름=값&é=ü",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?%EC%9D%B4%EB%A6%84=%EA%B0%92&%C3%A9=%C3%BC",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=d5b8a6171d119a968b9d419fb530ddb3b61cb6c0dec096173010180012cf8b6d"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 query dup keys",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?a=2&a=1&b=1&a=3",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?a=2&a=1&b=1&a=3",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=86ee2c3693fff31102bf6e8fc39fbbaf0a52102787175d7b126f372308a1a3e8"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 query marks",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?k=!'()*~&x=a/b",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?k=!%27()*~&x=a/b",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=d0397440c172ee3d5d5d1c36d92d174eff33ac7643562a6a38a86405bf2c2a19"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 query eq in value",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?a=b=c&d",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?a=b=c&d",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=2eac4409ed4635a7af96226492e47ee8850a9a02d6990e027965c11a69c5be8c"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 query bad percent",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?a=%zz&b=%",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?a=%zz&b=%",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=6e45a6db0105328e4cb904270067e16170fd3f5c3d903a6eab9d91554df39b87"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "s3 query fragment",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?a=1#frag",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x?a=1#frag",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=74c5e9d790641afc440de92c9924718adbc82e6c3445687d634d02e5683bd528"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "non-s3 query dup keys",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "execute-api",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://abc.execute-api.us-east-1.amazonaws.com/p?a=2&a=1",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://abc.execute-api.us-east-1.amazonaws.com/p?a=2&a=1",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/execute-api/aws4_request, SignedHeaders=host;x-amz-date, Signature=453e0ef3b76fb4999000c167794b1d71bcadc1a509fe39b5c39cba00ca02b5f3"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "port",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com:8443/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com:8443/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=83c294ee050104c66531a41e1af1c7424b98fb32cf59ed295a8d6db44d38da66"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "default port",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com:443/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=9f7e74e0745998caca7c2c1e356afa152e84e228f79c4a34b3ba94f007328749"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "upper host",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://LOGIS-Bucket.S3.ap-northeast-2.AmazonAWS.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=9f7e74e0745998caca7c2c1e356afa152e84e228f79c4a34b3ba94f007328749"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "invalid url",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "not a url",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "throws": {
+    "name": "TypeError",
+    "message": "Invalid URL"
+   }
+  },
+  {
+   "name": "credentials url",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://user:pw@logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "throws": {
+    "name": "TypeError",
+    "message": "Request cannot be constructed from a URL that includes credentials: https://user:pw@logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x"
+   }
+  },
+  {
+   "name": "spaces around url",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "  https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x  ",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=9f7e74e0745998caca7c2c1e356afa152e84e228f79c4a34b3ba94f007328749"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "get no body",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0c5b6da2861dc22f7039264f0096f83a6bb39e29e0b0defc69634366a09d6746"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "get empty body",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "GET",
+    "body": {
+     "str": ""
+    }
+   },
+   "now": 1795091696789,
+   "throws": {
+    "name": "TypeError",
+    "message": "Request with GET/HEAD method cannot have body."
+   }
+  },
+  {
+   "name": "head body",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "body": {
+     "str": "x"
+    }
+   },
+   "now": 1795091696789,
+   "throws": {
+    "name": "TypeError",
+    "message": "Request with GET/HEAD method cannot have body."
+   }
+  },
+  {
+   "name": "post string body",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "POST",
+    "body": {
+     "str": "{\"a\":1}"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "POST",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=71ff7f2e1c91de4423bee46409825614dc42d7af425a60f20fccab0b63bff520"
+     ],
+     [
+      "content-type",
+      "text/plain;charset=UTF-8"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": "eyJhIjoxfQ=="
+   }
+  },
+  {
+   "name": "post bytes body",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "POST",
+    "body": {
+     "b64": "AQID+g=="
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "POST",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=71ff7f2e1c91de4423bee46409825614dc42d7af425a60f20fccab0b63bff520"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": "AQID+g=="
+   }
+  },
+  {
+   "name": "put empty no type",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "PUT",
+    "body": {
+     "str": ""
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "PUT",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=39894ba52216cc44d4a79b8d20f8396fbbcf795e6b38108ede1c2aa410fa0580"
+     ],
+     [
+      "content-type",
+      "text/plain;charset=UTF-8"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "put empty bytes",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "PUT",
+    "body": {
+     "b64": ""
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "PUT",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=39894ba52216cc44d4a79b8d20f8396fbbcf795e6b38108ede1c2aa410fa0580"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "no method body",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "body": {
+     "str": "x"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "POST",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=71ff7f2e1c91de4423bee46409825614dc42d7af425a60f20fccab0b63bff520"
+     ],
+     [
+      "content-type",
+      "text/plain;charset=UTF-8"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": "eA=="
+   }
+  },
+  {
+   "name": "no method no body",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {},
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0c5b6da2861dc22f7039264f0096f83a6bb39e29e0b0defc69634366a09d6746"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "no method empty body",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "body": {
+     "str": ""
+    }
+   },
+   "now": 1795091696789,
+   "throws": {
+    "name": "TypeError",
+    "message": "Request with GET/HEAD method cannot have body."
+   }
+  },
+  {
+   "name": "lower put",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "put",
+    "body": {
+     "str": ""
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "PUT",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=39894ba52216cc44d4a79b8d20f8396fbbcf795e6b38108ede1c2aa410fa0580"
+     ],
+     [
+      "content-type",
+      "text/plain;charset=UTF-8"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "lower delete",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "delete"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "DELETE",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=ff6aea9c4ee107db53f3ace47e3fee04f776626be118fe7785142180caf33bde"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "patch lower",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "patch",
+    "body": {
+     "str": "p"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "patch",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=a678e978a1fe89c2df127e3ebdaf5fbba95a4e3d5d43014f9ce225741affeb64"
+     ],
+     [
+      "content-type",
+      "text/plain;charset=UTF-8"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": "cA=="
+   }
+  },
+  {
+   "name": "custom method",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "Purge"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "Purge",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=76e944639eb3736a43e01039064728cc385e58f25d5860afc7ee593793cf9316"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "trace method",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "TRACE"
+   },
+   "now": 1795091696789,
+   "throws": {
+    "name": "TypeError",
+    "message": "'TRACE' HTTP method is unsupported."
+   }
+  },
+  {
+   "name": "bad method",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "BAD METHOD"
+   },
+   "now": 1795091696789,
+   "throws": {
+    "name": "TypeError",
+    "message": "'BAD METHOD' is not a valid HTTP method."
+   }
+  },
+  {
+   "name": "whitespace values",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "PUT",
+    "headers": [
+     [
+      "Content-Type",
+      "text/plain"
+     ],
+     [
+      "x-amz-meta-a",
+      "  a   b  "
+     ],
+     [
+      "x-amz-meta-b",
+      "x\ty\t\tz"
+     ],
+     [
+      "X-Amz-Meta-C",
+      "\t lead"
+     ]
+    ],
+    "body": {
+     "str": ""
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "PUT",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-a;x-amz-meta-b;x-amz-meta-c, Signature=604569958dd88a80e770eef17d57aef87ae131211507cea8a0b491eff81afc65"
+     ],
+     [
+      "content-type",
+      "text/plain"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-meta-a",
+      "a   b"
+     ],
+     [
+      "x-amz-meta-b",
+      "x\ty\t\tz"
+     ],
+     [
+      "x-amz-meta-c",
+      "lead"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "latin1 spaces",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "headers": [
+     [
+      "x-amz-meta-a",
+      "a  b"
+     ],
+     [
+      "x-amz-meta-b",
+      "a\u000bb\fc"
+     ],
+     [
+      "x-amz-meta-c",
+      "é"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-a;x-amz-meta-b;x-amz-meta-c, Signature=e371ca12198a04ab8bafbc31fa970ae12f6b5e412664368d37f56c94d9ef07fc"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-meta-a",
+      "a  b"
+     ],
+     [
+      "x-amz-meta-b",
+      "a\u000bb\fc"
+     ],
+     [
+      "x-amz-meta-c",
+      "é"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "user content sha",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "PUT",
+    "headers": [
+     [
+      "X-Amz-Content-Sha256",
+      "deadbeef"
+     ]
+    ],
+    "body": {
+     "str": "abc"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "PUT",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=e5c7ce1a153046ecb1d7d173488fb3af9b2d8f3a02a00b55eb1bf5a859bc303a"
+     ],
+     [
+      "content-type",
+      "text/plain;charset=UTF-8"
+     ],
+     [
+      "x-amz-content-sha256",
+      "deadbeef"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": "YWJj"
+   }
+  },
+  {
+   "name": "empty content sha",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "PUT",
+    "headers": [
+     [
+      "X-Amz-Content-Sha256",
+      ""
+     ]
+    ],
+    "body": {
+     "str": "abc"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "PUT",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=913c38de6ac5c41a81ac0ad4f59ff3de5aa6dd7eceb5dfae332287bf16fa6fde"
+     ],
+     [
+      "content-type",
+      "text/plain;charset=UTF-8"
+     ],
+     [
+      "x-amz-content-sha256",
+      ""
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": "YWJj"
+   }
+  },
+  {
+   "name": "user date",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "headers": [
+     [
+      "X-Amz-Date",
+      "19990101T000000Z"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=9f7e74e0745998caca7c2c1e356afa152e84e228f79c4a34b3ba94f007328749"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "host header",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "headers": [
+     [
+      "Host",
+      "evil.example"
+     ],
+     [
+      "x-amz-meta-z",
+      "1"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-z, Signature=0a84efa3b66e2a102a35b01dbe64bcb98e094dd745d7743d031060997bf468aa"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-meta-z",
+      "1"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "unsignable",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "GET",
+    "headers": [
+     [
+      "Range",
+      "bytes=0-9"
+     ],
+     [
+      "User-Agent",
+      "ua"
+     ],
+     [
+      "Expect",
+      "100-continue"
+     ],
+     [
+      "X-Amzn-Trace-Id",
+      "t"
+     ],
+     [
+      "Authorization",
+      "old"
+     ],
+     [
+      "Presigned-Expires",
+      "1"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0c5b6da2861dc22f7039264f0096f83a6bb39e29e0b0defc69634366a09d6746"
+     ],
+     [
+      "expect",
+      "100-continue"
+     ],
+     [
+      "presigned-expires",
+      "1"
+     ],
+     [
+      "range",
+      "bytes=0-9"
+     ],
+     [
+      "user-agent",
+      "ua"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amzn-trace-id",
+      "t"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "combined dup",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "headers": [
+     [
+      "X-Amz-Meta-A",
+      "1"
+     ],
+     [
+      "x-amz-meta-a",
+      "2"
+     ],
+     [
+      "x-AMZ-meta-A",
+      "3"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-a, Signature=adaefef02557310d622e3f4f63d5946f123b7f08dca9823e76a4b338bcc95f05"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-meta-a",
+      "1, 2, 3"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "set-cookie dup",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "headers": [
+     [
+      "Set-Cookie",
+      "a=1"
+     ],
+     [
+      "set-cookie",
+      "b=2"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;set-cookie;set-cookie;x-amz-content-sha256;x-amz-date, Signature=b58e1c05b69b8fa84bd15b57b2ec8fd1d5da93ffcd5d1bc4e79610e249a43d91"
+     ],
+     [
+      "set-cookie",
+      "a=1"
+     ],
+     [
+      "set-cookie",
+      "b=2"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "session-like header",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "headers": [
+     [
+      "X-Amz-Security-Token",
+      "tok"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token, Signature=42797b493aac708f4384cf5bc76b577cf84449e354684013f92bdda0af5a1aa5"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-security-token",
+      "tok"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "non latin1 value",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "headers": [
+     [
+      "x-amz-meta-a",
+      "한"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "throws": {
+    "name": "TypeError",
+    "message": "Cannot convert argument to a ByteString because the character at index 0 has a value of 54620 which is greater than 255."
+   }
+  },
+  {
+   "name": "bad header name",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "headers": [
+     [
+      "bad name",
+      "1"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "throws": {
+    "name": "TypeError",
+    "message": "Headers.append: \"bad name\" is an invalid header name."
+   }
+  },
+  {
+   "name": "newline value",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "headers": [
+     [
+      "x-amz-meta-a",
+      "a\nb"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "throws": {
+    "name": "TypeError",
+    "message": "Headers.append: \"a\nb\" is an invalid header value."
+   }
+  },
+  {
+   "name": "edge newline value",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "headers": [
+     [
+      "x-amz-meta-a",
+      "\r\nab\n"
+     ]
+    ]
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-meta-a, Signature=e95ef2ebd301fa4d831a9f9f3fb649c5e95891d7e50c3240b5774e32b7a65b34"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-meta-a",
+      "ab"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess dynamodb",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://dynamodb.us-west-2.amazonaws.com/",
+   "init": {
+    "method": "POST",
+    "headers": [
+     [
+      "Content-Type",
+      "application/x-amz-json-1.0"
+     ],
+     [
+      "X-Amz-Target",
+      "DynamoDB_20120810.ListTables"
+     ]
+    ],
+    "body": {
+     "str": "{\"TableName\":\"t\"}"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://dynamodb.us-west-2.amazonaws.com/",
+    "method": "POST",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-west-2/dynamodb/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=295fb23808549a010679264f5140c0f471c932523350cc0da0ca69bdc76c6df8"
+     ],
+     [
+      "content-type",
+      "application/x-amz-json-1.0"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-target",
+      "DynamoDB_20120810.ListTables"
+     ]
+    ],
+    "body": "eyJUYWJsZU5hbWUiOiJ0In0="
+   }
+  },
+  {
+   "name": "guess lambda url",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://abcdef.lambda-url.eu-west-1.on.aws/path",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://abcdef.lambda-url.eu-west-1.on.aws/path",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/eu-west-1/lambda/aws4_request, SignedHeaders=host;x-amz-date, Signature=059bcbcf778528afb3c263321e6db98ebb2f33e69756b58012321f7dc8f4abcf"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess bad on.aws",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://foo.on.aws/",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://foo.on.aws/",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-east-1//aws4_request, SignedHeaders=host;x-amz-date, Signature=7fed717f37ea3908dc1181b3eeb5d6ddccc7b5bf93eee55fe80427aab51ec12b"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess backblaze",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://s3.us-west-004.backblazeb2.com/b/k",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://s3.us-west-004.backblazeb2.com/b/k",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-west-004/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=dc47115cc1d44205c67a6e5fdbe53909b0391738c4a8a11c6d9cc72e6b73f597"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess s3 global",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://bucket.s3.amazonaws.com/k",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://bucket.s3.amazonaws.com/k",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=208e979923dfba5ae3068f34e841c8d1721c530e19e3fffe8a792d5c38a55069"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess s3 accelerate",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://bucket.s3-accelerate.amazonaws.com/k",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://bucket.s3-accelerate.amazonaws.com/k",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=739c6e42e8632e51e251c46052adc609f2186e496c1b3559f0e6b5fd4d780abc"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess s3 dualstack",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://bucket.s3.dualstack.eu-central-1.amazonaws.com/k",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://bucket.s3.dualstack.eu-central-1.amazonaws.com/k",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/eu-central-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=f9c0c73c030aaa72f5acecfe80398470de805f83b3afbed99be9762b41eb4514"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess s3 legacy dash",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://s3-us-west-2.amazonaws.com/b/k",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://s3-us-west-2.amazonaws.com/b/k",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-west-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=580cd4bbf8ff233385e9107c6d5090ba6e5efee50407e9774385e3a21f0b22e6"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess s3 external",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://s3-external-1.amazonaws.com/b/k",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://s3-external-1.amazonaws.com/b/k",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=fe1bf7a2dd8c1fe727266302c52d1628daa6efbcdefdcba23e980b0d83c6ae5e"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess us-gov",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://ec2.us-gov.amazonaws.com/",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://ec2.us-gov.amazonaws.com/",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-gov-west-1/ec2/aws4_request, SignedHeaders=host;x-amz-date, Signature=c46862a79853e7c32a063a851989ee3763c9b308445d4aa96b3a216da21a6c2c"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess iot",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://iot.us-east-1.amazonaws.com/things",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://iot.us-east-1.amazonaws.com/things",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-east-1/execute-api/aws4_request, SignedHeaders=host;x-amz-date, Signature=ae2d1aca14b32daf25f64b472e338d781eca5bee12fb139d3ff2f69b70792e8f"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess iot data",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://abc.iot.us-east-1.amazonaws.com/mqtt",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://abc.iot.us-east-1.amazonaws.com/mqtt",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-east-1/iotdevicegateway/aws4_request, SignedHeaders=host;x-amz-date, Signature=941991ed5b2a0d8890bad59064a28f7edd1869f1d06fe4f9c60b095d52ce38a0"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess fips",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://sqs-fips.us-east-1.amazonaws.com/",
+   "init": {
+    "method": "POST",
+    "body": {
+     "str": "Action=ListQueues"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://sqs-fips.us-east-1.amazonaws.com/",
+    "method": "POST",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-east-1/sqs/aws4_request, SignedHeaders=host;x-amz-date, Signature=93800242aa096a429310d43a413db0a3440d3b6c3c9dca77600433d044001369"
+     ],
+     [
+      "content-type",
+      "text/plain;charset=UTF-8"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": "QWN0aW9uPUxpc3RRdWV1ZXM="
+   }
+  },
+  {
+   "name": "guess swapped",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://us-east-1.s3-2.amazonaws.com/",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://us-east-1.s3-2.amazonaws.com/",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/s3-2/us-east-1/aws4_request, SignedHeaders=host;x-amz-date, Signature=f4f1de8440b6ce5b050e106e2e361e13c16fe1592dc9ca188bdccd4d8f75ea05"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess queue",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://queue.amazonaws.com/",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://queue.amazonaws.com/",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-east-1/sqs/aws4_request, SignedHeaders=host;x-amz-date, Signature=8ac5388eeb886b6c5a7ac4bd26714a6155b7c503b93a66321926587fed0db1c0"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess china",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://ec2.cn-north-1.amazonaws.com.cn/",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://ec2.cn-north-1.amazonaws.com.cn/",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/cn-north-1/ec2/aws4_request, SignedHeaders=host;x-amz-date, Signature=cfa9452d7505942031c92a94067fceaa372010e811ffa2f490e2cf3f4a5dc055"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "guess autoscaling",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://autoscaling.us-east-1.amazonaws.com/",
+   "init": {
+    "method": "POST",
+    "headers": [
+     [
+      "X-Amz-Target",
+      "AnyScaleFrontendService.Describe"
+     ]
+    ],
+    "body": {
+     "str": "{}"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://autoscaling.us-east-1.amazonaws.com/",
+    "method": "POST",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-east-1/application-autoscaling/aws4_request, SignedHeaders=host;x-amz-date;x-amz-target, Signature=62d17c95be6357fd88b89fef27fe46fb5f2477c96860195c5571055da0871b25"
+     ],
+     [
+      "content-type",
+      "text/plain;charset=UTF-8"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ],
+     [
+      "x-amz-target",
+      "AnyScaleFrontendService.Describe"
+     ]
+    ],
+    "body": "e30="
+   }
+  },
+  {
+   "name": "guess other host",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+   },
+   "url": "https://example.com/a",
+   "init": {
+    "method": "GET"
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://example.com/a",
+    "method": "GET",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/us-east-1//aws4_request, SignedHeaders=host;x-amz-date, Signature=5bbe5453d99ad8cf0aa08a97b12a3f227e88d97db8ea913aa466da42ff79d0cf"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "non-s3 bytes body",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "execute-api",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://abc.execute-api.us-east-1.amazonaws.com/p",
+   "init": {
+    "method": "POST",
+    "body": {
+     "b64": "AP8H"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://abc.execute-api.us-east-1.amazonaws.com/p",
+    "method": "POST",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/execute-api/aws4_request, SignedHeaders=host;x-amz-date, Signature=43ef8377a57cc125d57422462ed542d4fa2edbb489011fc879e4b8b2921d7105"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": "AP8H"
+   }
+  },
+  {
+   "name": "aws override region",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "aws": {
+     "region": "eu-west-1"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/eu-west-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=80eb8578ab019776b104fd77e5b1cc1cf29b0b37c88b38b0d3bbb0a57a659355"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "aws override service",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD",
+    "aws": {
+     "service": "sts"
+    }
+   },
+   "now": 1795091696789,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261119/ap-northeast-2/sts/aws4_request, SignedHeaders=host;x-amz-date, Signature=8c8817a3d9ff85fd906783c2a1f3796e03d8b986adf465bc010a5a9862d4061b"
+     ],
+     [
+      "x-amz-date",
+      "20261119T123456Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "date epoch2000",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 946684800000,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20000101/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=47ce3c0f9ec6178b3ab0d9e7ef835e713f6ebab9453991c191cf512d5504023a"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20000101T000000Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "date leap day",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1709251199999,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240229/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=18433ae7d37369b038e7eb2e89ac25226ae21304b10c26de5804e35858b9aa36"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20240229T235959Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "date year end",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1798761599000,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261231/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=05be912c2e519f0d721b87ba1f53d1b9adbd53b226358509dd9d7273f3fc9d94"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20261231T235959Z"
+     ]
+    ],
+    "body": ""
+   }
+  },
+  {
+   "name": "date fraction",
+   "client": {
+    "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+    "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "service": "s3",
+    "region": "ap-northeast-2"
+   },
+   "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+   "init": {
+    "method": "HEAD"
+   },
+   "now": 1767323045006.75,
+   "out": {
+    "url": "https://logis-bucket.s3.ap-northeast-2.amazonaws.com/hash/x",
+    "method": "HEAD",
+    "headers": [
+     [
+      "authorization",
+      "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260102/ap-northeast-2/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=733ca1d523cc9003a41c11d04c333ab8f408a5848c2546cfebed51be2f7642fb"
+     ],
+     [
+      "x-amz-content-sha256",
+      "UNSIGNED-PAYLOAD"
+     ],
+     [
+      "x-amz-date",
+      "20260102T030405Z"
+     ]
+    ],
+    "body": ""
+   }
+  }
+ ],
+ "is_address": [
+  {
+   "v": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+   "ok": true
+  },
+  {
+   "v": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+   "ok": true
+  },
+  {
+   "v": "0x7E5F4552091A69125D5DFCB7B8C2659029395BDF",
+   "ok": true
+  },
+  {
+   "v": "7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+   "ok": true
+  },
+  {
+   "v": "7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+   "ok": true
+  },
+  {
+   "v": "0x7e5F4552091A69125d5DfCb7b8C2659029395Bdf",
+   "ok": false
+  },
+  {
+   "v": "XE21ERF4STLB4CJC4UJJTZHGOOGJLHSGKIN",
+   "ok": true
+  },
+  {
+   "v": "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF",
+   "ok": true
+  },
+  {
+   "v": "0x2b5ad5c4795c026514f8317c7a215e218dccd6cf",
+   "ok": true
+  },
+  {
+   "v": "0x2B5AD5C4795C026514F8317C7A215E218DCCD6CF",
+   "ok": true
+  },
+  {
+   "v": "2B5AD5c4795c026514f8317c7a215E218DcCD6cF",
+   "ok": true
+  },
+  {
+   "v": "2b5ad5c4795c026514f8317c7a215e218dccd6cf",
+   "ok": true
+  },
+  {
+   "v": "0x2b5AD5c4795c026514f8317c7a215E218DcCD6cF",
+   "ok": false
+  },
+  {
+   "v": "XE3252BD8TW0Q491VQROO35VV6MPMBJ4IQ7",
+   "ok": true
+  },
+  {
+   "v": "0x80C0dbf239224071c59dD8970ab9d542E3414aB2",
+   "ok": true
+  },
+  {
+   "v": "0x80c0dbf239224071c59dd8970ab9d542e3414ab2",
+   "ok": true
+  },
+  {
+   "v": "0x80C0DBF239224071C59DD8970AB9D542E3414AB2",
+   "ok": true
+  },
+  {
+   "v": "80C0dbf239224071c59dD8970ab9d542E3414aB2",
+   "ok": true
+  },
+  {
+   "v": "80c0dbf239224071c59dd8970ab9d542e3414ab2",
+   "ok": true
+  },
+  {
+   "v": "0x80c0dbf239224071c59dD8970ab9d542E3414aB2",
+   "ok": false
+  },
+  {
+   "v": "XE79F1FM84PS56483LOAEVTX2S6PG43KHWY",
+   "ok": true
+  },
+  {
+   "v": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23",
+   "ok": true
+  },
+  {
+   "v": "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+   "ok": true
+  },
+  {
+   "v": "0x2C7536E3605D9C16A7A3D7B1898E529396A65C23",
+   "ok": true
+  },
+  {
+   "v": "2c7536E3605D9C16a7a3D7b1898e529396a65c23",
+   "ok": true
+  },
+  {
+   "v": "2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+   "ok": true
+  },
+  {
+   "v": "0x2C7536E3605D9C16a7a3D7b1898e529396a65c23",
+   "ok": false
+  },
+  {
+   "v": "XE0556YCRTEZ9JALZBSCXOK4UJ5F3HN03DV",
+   "ok": true
+  },
+  {
+   "v": "0x98af76f8D3C6C14a218cf72a21804201211e143B",
+   "ok": true
+  },
+  {
+   "v": "0x98af76f8d3c6c14a218cf72a21804201211e143b",
+   "ok": true
+  },
+  {
+   "v": "0x98AF76F8D3C6C14A218CF72A21804201211E143B",
+   "ok": true
+  },
+  {
+   "v": "98af76f8D3C6C14a218cf72a21804201211e143B",
+   "ok": true
+  },
+  {
+   "v": "98af76f8d3c6c14a218cf72a21804201211e143b",
+   "ok": true
+  },
+  {
+   "v": "0x98Af76f8D3C6C14a218cf72a21804201211e143B",
+   "ok": false
+  },
+  {
+   "v": "XE77HU2MIB5K9IQUHW5LAV8WLYD5BYGBNLN",
+   "ok": true
+  },
+  {
+   "v": "0x961Bd32f9504734acD9A567f0cF7E9586933CCAD",
+   "ok": true
+  },
+  {
+   "v": "0x961bd32f9504734acd9a567f0cf7e9586933ccad",
+   "ok": true
+  },
+  {
+   "v": "0x961BD32F9504734ACD9A567F0CF7E9586933CCAD",
+   "ok": true
+  },
+  {
+   "v": "961Bd32f9504734acD9A567f0cF7E9586933CCAD",
+   "ok": true
+  },
+  {
+   "v": "961bd32f9504734acd9a567f0cf7e9586933ccad",
+   "ok": true
+  },
+  {
+   "v": "0x961bd32f9504734acD9A567f0cF7E9586933CCAD",
+   "ok": false
+  },
+  {
+   "v": "XE32HJ8JJPAO4OAF4REOY3P9UD4QK6B37OT",
+   "ok": true
+  },
+  {
+   "v": "0x98A519a1DF2aaBAFb491261e482445D62D6cE1Cd",
+   "ok": true
+  },
+  {
+   "v": "0x98a519a1df2aabafb491261e482445d62d6ce1cd",
+   "ok": true
+  },
+  {
+   "v": "0x98A519A1DF2AABAFB491261E482445D62D6CE1CD",
+   "ok": true
+  },
+  {
+   "v": "98A519a1DF2aaBAFb491261e482445D62D6cE1Cd",
+   "ok": true
+  },
+  {
+   "v": "98a519a1df2aabafb491261e482445d62d6ce1cd",
+   "ok": true
+  },
+  {
+   "v": "0x98a519a1DF2aaBAFb491261e482445D62D6cE1Cd",
+   "ok": false
+  },
+  {
+   "v": "XE49HTWHUW80D34AH3C5S3H8R00GH3XFNIL",
+   "ok": true
+  },
+  {
+   "v": "0x56D67386939607C11BD60bB009eB02F4DD29C318",
+   "ok": true
+  },
+  {
+   "v": "0x56d67386939607c11bd60bb009eb02f4dd29c318",
+   "ok": true
+  },
+  {
+   "v": "0x56D67386939607C11BD60BB009EB02F4DD29C318",
+   "ok": true
+  },
+  {
+   "v": "56D67386939607C11BD60bB009eB02F4DD29C318",
+   "ok": true
+  },
+  {
+   "v": "56d67386939607c11bd60bb009eb02f4dd29c318",
+   "ok": true
+  },
+  {
+   "v": "0x56d67386939607C11BD60bB009eB02F4DD29C318",
+   "ok": false
+  },
+  {
+   "v": "XE35A564D47EBATK1F4HYRBCX07UG0XBY8O",
+   "ok": true
+  },
+  {
+   "v": "0x8ba1f109551bD432803012645Ac136ddd64DBA72",
+   "ok": true
+  },
+  {
+   "v": "0x8Ba1f109551bD432803012645Ac136ddd64DBA72",
+   "ok": false
+  },
+  {
+   "v": "0x8ba1f109551bd432803012645ac136ddd64dba72",
+   "ok": true
+  },
+  {
+   "v": "0X8ba1f109551bd432803012645ac136ddd64dba72",
+   "ok": false
+  },
+  {
+   "v": "0x8ba1f109551bd432803012645ac136ddd64dba7",
+   "ok": false
+  },
+  {
+   "v": "0x8ba1f109551bd432803012645ac136ddd64dba723",
+   "ok": false
+  },
+  {
+   "v": "0x8ba1f109551bd432803012645ac136ddd64dba7g",
+   "ok": false
+  },
+  {
+   "v": "0x8ba1f109551bd432803012645ac136ddd64dba72 ",
+   "ok": false
+  },
+  {
+   "v": " 0x8ba1f109551bd432803012645ac136ddd64dba72",
+   "ok": false
+  },
+  {
+   "v": "0x8ba1f109551bd432803012645ac136ddd64dba72\n",
+   "ok": false
+  },
+  {
+   "v": "0x0000000000000000000000000000000000000000",
+   "ok": true
+  },
+  {
+   "v": "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+   "ok": true
+  },
+  {
+   "v": "0xffffffffffffffffffffffffffffffffffffffff",
+   "ok": true
+  },
+  {
+   "v": "0x",
+   "ok": false
+  },
+  {
+   "v": "",
+   "ok": false
+  },
+  {
+   "v": "0",
+   "ok": false
+  },
+  {
+   "v": "xx8ba1f109551bd432803012645ac136ddd64dba72",
+   "ok": false
+  },
+  {
+   "v": "0x0x8ba1f109551bd432803012645ac136ddd64dba",
+   "ok": false
+  },
+  {
+   "v": "0x８ba1f109551bd432803012645ac136ddd64dba72",
+   "ok": false
+  },
+  {
+   "v": "XE65GB6LDNXYOFTX0NSV3FUWKOWIXAMJK36",
+   "ok": true
+  },
+  {
+   "v": "XE65GB6LDNXYOFTX0NSV3FUWKOWIXAMJK37",
+   "ok": false
+  },
+  {
+   "v": "XE65gb6ldnxyoftx0nsv3fuwkowixamjk36",
+   "ok": true
+  },
+  {
+   "v": "xe65GB6LDNXYOFTX0NSV3FUWKOWIXAMJK36",
+   "ok": false
+  },
+  {
+   "v": "XE65GB6LDNXYOFTX0NSV3FUWKOWIXAMJK3",
+   "ok": false
+  },
+  {
+   "v": "XE65GB6LDNXYOFTX0NSV3FUWKOWIXAMJK36A",
+   "ok": false
+  },
+  {
+   "v": "XE6GB6LDNXYOFTX0NSV3FUWKOWIXAMJK36",
+   "ok": false
+  },
+  {
+   "v": "XE65GB6LDNXYOFTX0NSV3FUWKOWIXAMJK3!",
+   "ok": false
+  },
+  {
+   "v": "XE00",
+   "ok": false
+  },
+  {
+   "v": "undefined",
+   "ok": false
+  },
+  {
+   "v": "null",
+   "ok": false
+  },
+  {
+   "v": "XE23000000000000000000000000000001",
+   "ok": true
+  },
+  {
+   "v": "XE24000000000000000000000000000001",
+   "ok": false
+  },
+  {
+   "v": "XE54ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+   "ok": true
+  },
+  {
+   "v": "XE55ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+   "ok": false
+  },
+  {
+   "v": "XE43zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+   "ok": true
+  },
+  {
+   "v": "XE44zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+   "ok": false
+  },
+  {
+   "v": "XE88123456789ABCDEFGHIJKLMNOPQRSTUV",
+   "ok": true
+  },
+  {
+   "v": "XE89123456789ABCDEFGHIJKLMNOPQRSTUV",
+   "ok": false
+  },
+  {
+   "v": "XE500000000000000000000000000000000",
+   "ok": true
+  },
+  {
+   "v": "XE510000000000000000000000000000000",
+   "ok": false
+  },
+  {
+   "v": null,
+   "ok": false
+  },
+  {
+   "v": 0,
+   "ok": false
+  },
+  {
+   "v": 1,
+   "ok": false
+  },
+  {
+   "v": true,
+   "ok": false
+  },
+  {
+   "v": false,
+   "ok": false
+  },
+  {
+   "v": [
+    "0x8ba1f109551bd432803012645ac136ddd64dba72"
+   ],
+   "ok": false
+  },
+  {
+   "v": {
+    "address": "0x8ba1f109551bd432803012645ac136ddd64dba72"
+   },
+   "ok": false
+  },
+  {
+   "v": 1.5e+48,
+   "ok": false
+  },
+  {
+   "undef": true,
+   "ok": false
+  }
+ ],
+ "compute_address": [
+  {
+   "key": "0x0000000000000000000000000000000000000000000000000000000000000001",
+   "address": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+  },
+  {
+   "key": "0x0000000000000000000000000000000000000000000000000000000000000002",
+   "address": "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF"
+  },
+  {
+   "key": "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140",
+   "address": "0x80C0dbf239224071c59dD8970ab9d542E3414aB2"
+  },
+  {
+   "key": "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+   "address": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+  },
+  {
+   "key": "0xdaa822da4c8fbe07d1e1a2754f28de91f59b4c0edd4996b1095673973d9816ea",
+   "address": "0x98af76f8D3C6C14a218cf72a21804201211e143B"
+  },
+  {
+   "key": "0xc8e23aeebca17e3a0105ef3cc925481e93cf949a429718e846a37db4f5a07618",
+   "address": "0x961Bd32f9504734acD9A567f0cF7E9586933CCAD"
+  },
+  {
+   "key": "0x7c13c718f2166ffb5a40117ed95c445804369557a818bab5f163c7a0a95a4de5",
+   "address": "0x98A519a1DF2aaBAFb491261e482445D62D6cE1Cd"
+  },
+  {
+   "key": "0x50b2c43fd39106bafbba0da34fc430e1f91e3c96ea2acee2bc34119f92b37750",
+   "address": "0x56D67386939607C11BD60bB009eB02F4DD29C318"
+  }
+ ],
+ "checksum": [
+  {
+   "v": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+   "address": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+  },
+  {
+   "v": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+   "address": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+  },
+  {
+   "v": "0x7E5F4552091A69125D5DFCB7B8C2659029395BDF",
+   "address": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+  },
+  {
+   "v": "7E5F4552091A69125d5DfCb7b8C2659029395Bdf",
+   "address": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+  },
+  {
+   "v": "7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+   "address": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+  },
+  {
+   "v": "XE21ERF4STLB4CJC4UJJTZHGOOGJLHSGKIN",
+   "address": "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+  },
+  {
+   "v": "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF",
+   "address": "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF"
+  },
+  {
+   "v": "0x2b5ad5c4795c026514f8317c7a215e218dccd6cf",
+   "address": "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF"
+  },
+  {
+   "v": "0x2B5AD5C4795C026514F8317C7A215E218DCCD6CF",
+   "address": "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF"
+  },
+  {
+   "v": "2B5AD5c4795c026514f8317c7a215E218DcCD6cF",
+   "address": "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF"
+  },
+  {
+   "v": "2b5ad5c4795c026514f8317c7a215e218dccd6cf",
+   "address": "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF"
+  },
+  {
+   "v": "XE3252BD8TW0Q491VQROO35VV6MPMBJ4IQ7",
+   "address": "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF"
+  },
+  {
+   "v": "0x80C0dbf239224071c59dD8970ab9d542E3414aB2",
+   "address": "0x80C0dbf239224071c59dD8970ab9d542E3414aB2"
+  },
+  {
+   "v": "0x80c0dbf239224071c59dd8970ab9d542e3414ab2",
+   "address": "0x80C0dbf239224071c59dD8970ab9d542E3414aB2"
+  },
+  {
+   "v": "0x80C0DBF239224071C59DD8970AB9D542E3414AB2",
+   "address": "0x80C0dbf239224071c59dD8970ab9d542E3414aB2"
+  },
+  {
+   "v": "80C0dbf239224071c59dD8970ab9d542E3414aB2",
+   "address": "0x80C0dbf239224071c59dD8970ab9d542E3414aB2"
+  },
+  {
+   "v": "80c0dbf239224071c59dd8970ab9d542e3414ab2",
+   "address": "0x80C0dbf239224071c59dD8970ab9d542E3414aB2"
+  },
+  {
+   "v": "XE79F1FM84PS56483LOAEVTX2S6PG43KHWY",
+   "address": "0x80C0dbf239224071c59dD8970ab9d542E3414aB2"
+  },
+  {
+   "v": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23",
+   "address": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+  },
+  {
+   "v": "0x2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+   "address": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+  },
+  {
+   "v": "0x2C7536E3605D9C16A7A3D7B1898E529396A65C23",
+   "address": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+  },
+  {
+   "v": "2c7536E3605D9C16a7a3D7b1898e529396a65c23",
+   "address": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+  },
+  {
+   "v": "2c7536e3605d9c16a7a3d7b1898e529396a65c23",
+   "address": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+  },
+  {
+   "v": "XE0556YCRTEZ9JALZBSCXOK4UJ5F3HN03DV",
+   "address": "0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"
+  },
+  {
+   "v": "0x98af76f8D3C6C14a218cf72a21804201211e143B",
+   "address": "0x98af76f8D3C6C14a218cf72a21804201211e143B"
+  },
+  {
+   "v": "0x98af76f8d3c6c14a218cf72a21804201211e143b",
+   "address": "0x98af76f8D3C6C14a218cf72a21804201211e143B"
+  },
+  {
+   "v": "0x98AF76F8D3C6C14A218CF72A21804201211E143B",
+   "address": "0x98af76f8D3C6C14a218cf72a21804201211e143B"
+  },
+  {
+   "v": "98af76f8D3C6C14a218cf72a21804201211e143B",
+   "address": "0x98af76f8D3C6C14a218cf72a21804201211e143B"
+  },
+  {
+   "v": "98af76f8d3c6c14a218cf72a21804201211e143b",
+   "address": "0x98af76f8D3C6C14a218cf72a21804201211e143B"
+  },
+  {
+   "v": "XE77HU2MIB5K9IQUHW5LAV8WLYD5BYGBNLN",
+   "address": "0x98af76f8D3C6C14a218cf72a21804201211e143B"
+  },
+  {
+   "v": "0x961Bd32f9504734acD9A567f0cF7E9586933CCAD",
+   "address": "0x961Bd32f9504734acD9A567f0cF7E9586933CCAD"
+  },
+  {
+   "v": "0x961bd32f9504734acd9a567f0cf7e9586933ccad",
+   "address": "0x961Bd32f9504734acD9A567f0cF7E9586933CCAD"
+  },
+  {
+   "v": "0x961BD32F9504734ACD9A567F0CF7E9586933CCAD",
+   "address": "0x961Bd32f9504734acD9A567f0cF7E9586933CCAD"
+  },
+  {
+   "v": "961Bd32f9504734acD9A567f0cF7E9586933CCAD",
+   "address": "0x961Bd32f9504734acD9A567f0cF7E9586933CCAD"
+  },
+  {
+   "v": "961bd32f9504734acd9a567f0cf7e9586933ccad",
+   "address": "0x961Bd32f9504734acD9A567f0cF7E9586933CCAD"
+  },
+  {
+   "v": "XE32HJ8JJPAO4OAF4REOY3P9UD4QK6B37OT",
+   "address": "0x961Bd32f9504734acD9A567f0cF7E9586933CCAD"
+  },
+  {
+   "v": "0x98A519a1DF2aaBAFb491261e482445D62D6cE1Cd",
+   "address": "0x98A519a1DF2aaBAFb491261e482445D62D6cE1Cd"
+  },
+  {
+   "v": "0x98a519a1df2aabafb491261e482445d62d6ce1cd",
+   "address": "0x98A519a1DF2aaBAFb491261e482445D62D6cE1Cd"
+  },
+  {
+   "v": "0x98A519A1DF2AABAFB491261E482445D62D6CE1CD",
+   "address": "0x98A519a1DF2aaBAFb491261e482445D62D6cE1Cd"
+  },
+  {
+   "v": "98A519a1DF2aaBAFb491261e482445D62D6cE1Cd",
+   "address": "0x98A519a1DF2aaBAFb491261e482445D62D6cE1Cd"
+  },
+  {
+   "v": "98a519a1df2aabafb491261e482445d62d6ce1cd",
+   "address": "0x98A519a1DF2aaBAFb491261e482445D62D6cE1Cd"
+  },
+  {
+   "v": "XE49HTWHUW80D34AH3C5S3H8R00GH3XFNIL",
+   "address": "0x98A519a1DF2aaBAFb491261e482445D62D6cE1Cd"
+  },
+  {
+   "v": "0x56D67386939607C11BD60bB009eB02F4DD29C318",
+   "address": "0x56D67386939607C11BD60bB009eB02F4DD29C318"
+  },
+  {
+   "v": "0x56d67386939607c11bd60bb009eb02f4dd29c318",
+   "address": "0x56D67386939607C11BD60bB009eB02F4DD29C318"
+  },
+  {
+   "v": "0x56D67386939607C11BD60BB009EB02F4DD29C318",
+   "address": "0x56D67386939607C11BD60bB009eB02F4DD29C318"
+  },
+  {
+   "v": "56D67386939607C11BD60bB009eB02F4DD29C318",
+   "address": "0x56D67386939607C11BD60bB009eB02F4DD29C318"
+  },
+  {
+   "v": "56d67386939607c11bd60bb009eb02f4dd29c318",
+   "address": "0x56D67386939607C11BD60bB009eB02F4DD29C318"
+  },
+  {
+   "v": "XE35A564D47EBATK1F4HYRBCX07UG0XBY8O",
+   "address": "0x56D67386939607C11BD60bB009eB02F4DD29C318"
+  },
+  {
+   "v": "0x8ba1f109551bD432803012645Ac136ddd64DBA72",
+   "address": "0x8ba1f109551bD432803012645Ac136ddd64DBA72"
+  },
+  {
+   "v": "0x8ba1f109551bd432803012645ac136ddd64dba72",
+   "address": "0x8ba1f109551bD432803012645Ac136ddd64DBA72"
+  },
+  {
+   "v": "0x0000000000000000000000000000000000000000",
+   "address": "0x0000000000000000000000000000000000000000"
+  },
+  {
+   "v": "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+   "address": "0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF"
+  },
+  {
+   "v": "0xffffffffffffffffffffffffffffffffffffffff",
+   "address": "0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF"
+  },
+  {
+   "v": "XE65GB6LDNXYOFTX0NSV3FUWKOWIXAMJK36",
+   "address": "0x8ba1f109551bD432803012645Ac136ddd64DBA72"
+  },
+  {
+   "v": "XE65gb6ldnxyoftx0nsv3fuwkowixamjk36",
+   "address": "0x8ba1f109551bD432803012645Ac136ddd64DBA72"
+  },
+  {
+   "v": "XE23000000000000000000000000000001",
+   "address": "0x0000000000000000000000000000000000000001"
+  },
+  {
+   "v": "XE54ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+   "address": "0x1343093195196b9fCCa7C68CE3fFFfffFffFFffff"
+  },
+  {
+   "v": "XE43zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+   "address": "0x088f924eeCeEDA7Fe92e1f5B0FfFFfFFFfffFFFF"
+  },
+  {
+   "v": "XE88123456789ABCDEFGHIJKLMNOPQRSTUV",
+   "address": "0x090e97dCCCb0a0F2526fe854A3368b2e2f3AB927"
+  },
+  {
+   "v": "XE500000000000000000000000000000000",
+   "address": "0x0000000000000000000000000000000000000000"
+  }
+ ]
+}

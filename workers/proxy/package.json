@@ -1,0 +1,16 @@
+{
+  "name": "proxy-commerce-logis-center",
+  "private": true,
+  "description": "workers-rs (Rust → wasm). 원본 TypeScript 는 커밋 801b0ce0 의 src/index.ts",
+  "scripts": {
+    "build": "worker-build --release",
+    "check": "cargo check --target wasm32-unknown-unknown && wrangler deploy --dry-run",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev --remote",
+    "predeploy": "wrangler d1 migrations apply DB --remote",
+    "seedLocalD1": "wrangler d1 migrations apply DB --local"
+  },
+  "devDependencies": {
+    "wrangler": "^4.54.0"
+  }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "logis-worker-apac"
+description = "commerce-apac-logis-center: 1분마다 tasks 대기열을 돌며 proxy-commerce-logis-center 를 부르는 cron 워커 (원본 apac/src/index.ts 를 workers-rs 로)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+logis-worker-common.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker.workspace = true
+wasm-bindgen.workspace = true
