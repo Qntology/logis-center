@@ -13,6 +13,7 @@ pub mod gguf;
 pub mod kv_turbo;
 // 🌟 [ACCEL-CHECK] GPU 가속 커널(FlashAttention / TurboQuant) 자가 검증과 실측 정확도 감시
 pub mod accel_check;
+pub mod vision_prune;
 pub mod vocab_trim;
 
 use crate::{
@@ -179,13 +180,65 @@ pub fn turbo_kv_step(
     Ok(TurboStep { out, plain_kv: None })
 }
 
-#[derive(Debug, Clone)]
+/// Part 2 (Pack D): 소형 생성 LLM CPU 패킹 GEMM + 융합 RMSNorm / SiLU·up + 스트리밍 어텐션 스위치.
+/// `LOGIS_LLM_CPU_PACKED=off|0|false` 로 끌 수 있으며, CPU 장치에서 기본 활성화됩니다.
+pub fn llm_cpu_packed_enabled(device: &candle_core::Device) -> bool {
+    if !device.is_cpu() {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("LOGIS_LLM_CPU_PACKED")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        !matches!(v.as_str(), "0" | "off" | "false" | "no")
+    })
+}
+
+/// CPU F32 1-pass RMSNorm (단일 패스 `embed_cpu_kernels::rms_norm` 직결).
+pub fn fast_cpu_rms_norm(norm: &RmsNorm, x: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
+    if !llm_cpu_packed_enabled(x.device()) || x.dtype() != candle_core::DType::F32 {
+        return norm.forward(x);
+    }
+    let dims = x.dims().to_vec();
+    let h = *dims.last().unwrap_or(&0);
+    if h == 0 {
+        return norm.forward(x);
+    }
+    let xv = x.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+    let wv = norm
+        .weight()
+        .to_dtype(candle_core::DType::F32)?
+        .contiguous()?
+        .to_vec1::<f32>()?;
+    let mut out = vec![0.0f32; xv.len()];
+    embed_cpu_kernels::rms_norm(&xv, h, &wv, eps, &mut out);
+    Tensor::from_vec(out, dims.as_slice(), x.device())
+}
+
+#[derive(Clone)]
 pub struct GateUpDownMLP {
     // 🌟 [W8A16] dense Linear(safetensors·기존 경로) 또는 정확 양자화 선형층(Qwen3 Q8_0 상주)
     gate_proj: gguf::ProjKind,
     up_proj: gguf::ProjKind,
     down_proj: gguf::ProjKind,
+    /// Part 2 (Pack D): CPU F32 + SiLU 무편향 MLP 용 (gate | up) 교차 패킹 패널.
+    /// 중간 `[M, 2I]` 텐서 할당 없이 에필로그에서 `silu(gate) * up` 을 직기록합니다.
+    cpu_glu: Option<std::sync::Arc<embed_cpu_kernels::PackedW>>,
     act_fn: Activation,
+}
+
+impl std::fmt::Debug for GateUpDownMLP {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GateUpDownMLP")
+            .field("gate_proj", &self.gate_proj)
+            .field("up_proj", &self.up_proj)
+            .field("down_proj", &self.down_proj)
+            .field("has_cpu_glu", &self.cpu_glu.is_some())
+            .field("act_fn", &self.act_fn)
+            .finish()
+    }
 }
 
 impl GateUpDownMLP {
@@ -202,13 +255,44 @@ impl GateUpDownMLP {
         let gate_pp_name = gate_pp_name.unwrap_or("gate_proj");
         let up_pp_name = up_pp_name.unwrap_or("up_proj");
         let down_pp_name = down_pp_name.unwrap_or("down_proj");
-        let gate_proj = linear_b(hidden_size, intermediate_size, bias, vb.pp(gate_pp_name))?;
-        let up_proj = linear_b(hidden_size, intermediate_size, bias, vb.pp(up_pp_name))?;
-        let down_proj = linear_b(intermediate_size, hidden_size, bias, vb.pp(down_pp_name))?;
+        let gate_lin = linear_b(hidden_size, intermediate_size, bias, vb.pp(gate_pp_name))?;
+        let up_lin = linear_b(hidden_size, intermediate_size, bias, vb.pp(up_pp_name))?;
+        let down_lin = linear_b(intermediate_size, hidden_size, bias, vb.pp(down_pp_name))?;
+
+        let cpu_glu = if !bias
+            && matches!(act_fn, Activation::Silu)
+            && llm_cpu_packed_enabled(vb.device())
+            && gate_lin.weight().dtype() == candle_core::DType::F32
+        {
+            let gw = gate_lin.weight().contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let uw = up_lin.weight().contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            Some(std::sync::Arc::new(embed_cpu_kernels::PackedW::pack_glu_pair(
+                &gw,
+                &uw,
+                intermediate_size,
+                hidden_size,
+            )))
+        } else {
+            None
+        };
+
+        let gate_proj = if cpu_glu.is_some() {
+            gguf::ProjKind::LinearProj(gate_lin)
+        } else {
+            gguf::ProjKind::from_linear_maybe_cpu_packed(gate_lin)?
+        };
+        let up_proj = if cpu_glu.is_some() {
+            gguf::ProjKind::LinearProj(up_lin)
+        } else {
+            gguf::ProjKind::from_linear_maybe_cpu_packed(up_lin)?
+        };
+        let down_proj = gguf::ProjKind::from_linear_maybe_cpu_packed(down_lin)?;
+
         Ok(Self {
-            gate_proj: gguf::ProjKind::LinearProj(gate_proj),
-            up_proj: gguf::ProjKind::LinearProj(up_proj),
-            down_proj: gguf::ProjKind::LinearProj(down_proj),
+            gate_proj,
+            up_proj,
+            down_proj,
+            cpu_glu,
             act_fn,
         })
     }
@@ -220,15 +304,57 @@ impl GateUpDownMLP {
         down_proj: gguf::ProjKind,
         act_fn: Activation,
     ) -> Self {
-        Self { gate_proj, up_proj, down_proj, act_fn }
+        Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            cpu_glu: None,
+            act_fn,
+        }
     }
 }
 
 impl Module for GateUpDownMLP {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        if let Some(ref glu_w) = self.cpu_glu {
+            if xs.device().is_cpu() && xs.dtype() == candle_core::DType::F32 {
+                let mut dims = xs.dims().to_vec();
+                let k = *dims.last().unwrap_or(&0);
+                let inter = glu_w.n_valid / 2;
+                let m = xs.elem_count() / k.max(1);
+                let xv = xs.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                let mut mid = vec![0.0f32; m * inter];
+                embed_cpu_kernels::gemm(
+                    &xv,
+                    m,
+                    glu_w,
+                    &mut mid,
+                    embed_cpu_kernels::Blocking::default(),
+                    embed_cpu_kernels::Epilogue::SiluMul,
+                    rayon::current_num_threads().max(1),
+                );
+                if let Some(last) = dims.last_mut() {
+                    *last = inter;
+                }
+                let mid_t = Tensor::from_vec(mid, dims.as_slice(), xs.device())?;
+                return mid_t.apply(&self.down_proj);
+            }
+        }
+        let gate = xs.apply(&self.gate_proj)?;
+        let up = xs.apply(&self.up_proj)?;
+        if matches!(self.act_fn, Activation::Silu) {
+            let inter = *gate.dims().last().unwrap_or(&0);
+            if accel_check::fused_op_ok(
+                gate.device(),
+                accel_check::FusedOpKind::SiluMul,
+                gate.dtype(),
+                inter,
+            ) {
+                let mid = candle_core::decoder_ops::silu_mul(&gate, &up)?;
+                return mid.apply(&self.down_proj);
+            }
+        }
+        (gate.apply(&self.act_fn)? * up)?.apply(&self.down_proj)
     }
 }
 
@@ -591,6 +717,28 @@ impl QKVCatAttention {
     }
 }
 
+/// Part 5 (Pack C): 중복된 `[.., rot_dim]` (cat(half, half)) RoPE cos/sin 표를
+/// `candle_core::decoder_ops::rope_kv_write` 가 요구하는 `[T, rot_dim/2]` 또는 `[B, T, rot_dim/2]` 로 변환합니다.
+pub fn rope_half_table(t: &Tensor) -> candle_core::Result<Tensor> {
+    let squeezed = match t.rank() {
+        4 if t.dim(1)? == 1 => t.squeeze(1)?,
+        _ => t.clone(),
+    };
+    let rd = squeezed.dim(D::Minus1)?;
+    let half = rd / 2;
+    match squeezed.rank() {
+        2 => squeezed.narrow(1, 0, half)?.contiguous(),
+        3 => {
+            if squeezed.dim(0)? == 1 {
+                squeezed.squeeze(0)?.narrow(1, 0, half)?.contiguous()
+            } else {
+                squeezed.narrow(2, 0, half)?.contiguous()
+            }
+        }
+        _ => Ok(squeezed),
+    }
+}
+
 pub struct QKNormAttention {
     // 🌟 [W8A16] dense Linear(기존 경로) 또는 정확 양자화 선형층(Qwen3 Q8_0 상주)
     q_proj: gguf::ProjKind,
@@ -599,6 +747,7 @@ pub struct QKNormAttention {
     o_proj: gguf::ProjKind,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
+    rms_norm_eps: f32,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     num_kv_groups: usize,
@@ -663,16 +812,17 @@ impl QKNormAttention {
         let q_norm = rms_norm(head_dim, rms_norm_eps, vb.pp(q_norm_pp_name))?;
         let k_norm = rms_norm(head_dim, rms_norm_eps, vb.pp(k_norm_pp_name))?;
         Ok(Self::from_parts(
-            gguf::ProjKind::LinearProj(q_proj),
-            gguf::ProjKind::LinearProj(k_proj),
-            gguf::ProjKind::LinearProj(v_proj),
-            gguf::ProjKind::LinearProj(o_proj),
+            gguf::ProjKind::from_linear_maybe_cpu_packed(q_proj)?,
+            gguf::ProjKind::from_linear_maybe_cpu_packed(k_proj)?,
+            gguf::ProjKind::from_linear_maybe_cpu_packed(v_proj)?,
+            gguf::ProjKind::from_linear_maybe_cpu_packed(o_proj)?,
             q_norm,
             k_norm,
             num_attention_heads,
             num_key_value_heads,
             head_dim,
-        ))
+        )
+        .with_eps(rms_norm_eps))
     }
 
     /// 🌟 [W8A16] 이미 만든 프로젝션·노름으로 조립합니다. (Qwen3 Q8_0 상주 로더)
@@ -695,6 +845,7 @@ impl QKNormAttention {
             o_proj,
             q_norm,
             k_norm,
+            rms_norm_eps: 1e-6,
             num_attention_heads,
             num_key_value_heads,
             num_kv_groups: num_attention_heads / num_key_value_heads.max(1),
@@ -707,6 +858,11 @@ impl QKNormAttention {
         }
     }
 
+    pub fn with_eps(mut self, eps: f64) -> Self {
+        self.rms_norm_eps = eps as f32;
+        self
+    }
+
     pub fn forward(
         &mut self,
         xs: &Tensor,
@@ -715,26 +871,69 @@ impl QKNormAttention {
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
-        let query_states = self.q_proj.forward(xs)?.reshape((
+        let q_raw = self.q_proj.forward(xs)?.reshape((
             b_sz,
             q_len,
             self.num_attention_heads,
             self.head_dim,
         ))?;
-        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?;
-        let key_states = self.k_proj.forward(xs)?.reshape((
+        let k_raw = self.k_proj.forward(xs)?.reshape((
             b_sz,
             q_len,
             self.num_key_value_heads,
             self.head_dim,
         ))?;
-        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?;
-        let value_states = self.v_proj.forward(xs)?;
-        let value_states = value_states
-            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let (query_states, key_states) =
-            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+        let v_raw = self.v_proj.forward(xs)?.reshape((
+            b_sz,
+            q_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        ))?;
+
+        let (query_states, key_states, value_states) = if accel_check::fused_op_ok(
+            q_raw.device(),
+            accel_check::FusedOpKind::RopeKvWrite,
+            q_raw.dtype(),
+            self.head_dim,
+        ) {
+            let cos_h = rope_half_table(cos)?;
+            let sin_h = rope_half_table(sin)?;
+            let k_out = Tensor::zeros(
+                (b_sz, self.num_key_value_heads, q_len, self.head_dim),
+                k_raw.dtype(),
+                k_raw.device(),
+            )?;
+            let v_out = Tensor::zeros(
+                (b_sz, self.num_key_value_heads, q_len, self.head_dim),
+                v_raw.dtype(),
+                v_raw.device(),
+            )?;
+            let q_out = candle_core::decoder_ops::rope_kv_write(
+                &q_raw,
+                &k_raw,
+                &v_raw,
+                candle_core::accel::decoder_ops::HeadLayout::Bshd,
+                candle_core::accel::decoder_ops::HeadLayout::Bhsd,
+                Some(self.q_norm.weight()),
+                Some(self.k_norm.weight()),
+                &cos_h,
+                &sin_h,
+                &k_out,
+                &v_out,
+                0,
+                self.rms_norm_eps,
+                candle_core::accel::decoder_ops::RopeMode::NeoX,
+                false,
+            )?;
+            (q_out, k_out, v_out)
+        } else {
+            let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
+            let key_states = self.k_norm.forward(&k_raw)?.transpose(1, 2)?;
+            let value_states = v_raw.transpose(1, 2)?;
+            let (query_states, key_states) =
+                apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
+            (query_states, key_states, value_states)
+        };
 
         // 🌟 [TURBO-KV] GPU + turbo-quant 빌드에서는 새 K/V 를 TurboQuant 압축 캐시에 붙이고
         //    압축된 캐시로 어텐션을 계산합니다. (FP8 재압축/전체 복원 왕복이 사라집니다)
@@ -1119,6 +1318,43 @@ pub fn eager_attention_forward(
             )?;
 
             return Ok(attn_output.to_dtype(orig_dtype)?.contiguous()?);
+        }
+    }
+
+    // Part 2 (Pack D): CPU F32 64-Key 패널 스트리밍 어텐션 (N×N 점수 행렬 할당 0, GQA + causal 지원).
+    if dev.is_cpu() && orig_dtype == candle_core::DType::F32 && llm_cpu_packed_enabled(dev) {
+        let (q_b, q_h, q_l, q_d) = query_states.dims4()?;
+        let (_, kv_h, kv_l, _) = key_states.dims4()?;
+        if kv_h > 0 && q_h % kv_h == 0 && q_l <= kv_l {
+            let q_bshd = query_states.transpose(1, 2)?.contiguous()?;
+            let k_bshd = key_states.transpose(1, 2)?.contiguous()?;
+            let v_bshd = value_states.transpose(1, 2)?.contiguous()?;
+            let qv = q_bshd.flatten_all()?.to_vec1::<f32>()?;
+            let kv = k_bshd.flatten_all()?.to_vec1::<f32>()?;
+            let vv = v_bshd.flatten_all()?.to_vec1::<f32>()?;
+            let q_stride = q_l * q_h * q_d;
+            let kv_stride = kv_l * kv_h * q_d;
+            let mut out = vec![0.0f32; q_b * q_stride];
+            let cfg = embed_cpu_kernels::attn::CpuStreamAttnCfg {
+                num_heads: q_h,
+                num_kv_heads: kv_h,
+                head_dim: q_d,
+                scale: scaling as f32,
+                causal: attention_mask.is_some(),
+                past_offset: kv_l.saturating_sub(q_l),
+            };
+            for bi in 0..q_b {
+                embed_cpu_kernels::attn::stream_attention_f32(
+                    &qv[bi * q_stride..(bi + 1) * q_stride],
+                    &kv[bi * kv_stride..(bi + 1) * kv_stride],
+                    &vv[bi * kv_stride..(bi + 1) * kv_stride],
+                    q_l,
+                    kv_l,
+                    &cfg,
+                    &mut out[bi * q_stride..(bi + 1) * q_stride],
+                );
+            }
+            return Ok(Tensor::from_vec(out, (q_b, q_l, q_h, q_d), dev)?);
         }
     }
 
@@ -1872,6 +2108,32 @@ pub fn gdn_fused_enabled(device: &candle_core::Device, cfg: &candle_core::delta_
         _ => gdn_fused_env(),
     };
     want && candle_core::delta_rule::fused_gdn_supported_for(device, cfg)
+}
+
+/// 🌟 [GDN-FUSED + ACCEL-CHECK] Part 5: 장치·dtype·형상 조합에 대해 `accel_check` 자가 검증 및
+/// `LOGIS_FUSED_OPS` 스위치까지 통과했는지 확인합니다.
+pub fn gdn_fused_ready(
+    device: &candle_core::Device,
+    dtype: candle_core::DType,
+    cfg: &candle_core::delta_rule::GdnConfig,
+) -> bool {
+    if !gdn_fused_enabled(device, cfg) {
+        return false;
+    }
+    if matches!(
+        device,
+        candle_core::Device::Cuda(_) | candle_core::Device::Rocm(_) | candle_core::Device::Metal(_)
+    ) {
+        accel_check::fused_op_ok(
+            device,
+            accel_check::FusedOpKind::GatedDeltaRule,
+            dtype,
+            cfg.head_v_dim,
+        )
+    } else {
+        // CPU / Vulkan host-shared 경로에서도 LOGIS_FUSED_OPS=off 또는 고장 주입 시 폴백
+        accel_check::fused_op_allowed_cpu(accel_check::FusedOpKind::GatedDeltaRule, device, dtype, cfg.head_v_dim)
+    }
 }
 
 /// 🌟 [WS-TRIM] 생성 호출·프리필 청크마다 하던 프로세스 작업 집합(working set) 강제 반환.

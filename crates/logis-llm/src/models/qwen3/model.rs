@@ -8,7 +8,7 @@ use candle_nn::{
 use crate::{
     models::{
         common::{
-            GateUpDownMLP, QKNormAttention, eager_attention_forward,
+            GateUpDownMLP, QKNormAttention, eager_attention_forward, fast_cpu_rms_norm,
             gguf::{ExactQLinear, ProjKind, qtensor_from_bytes},
         },
         qwen3::config::Qwen3Config,
@@ -32,6 +32,7 @@ pub struct Qwen3DecoderLayer {
     mlp: GateUpDownMLP,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
+    rms_norm_eps: f32,
     pub fp8_cache: Option<Fp8VramKVCache>, // 🌟 [FP8 Compression] RAM으로 내리지 않고 VRAM 내에서 FP8로 압축하여 상주
     // 🌟 [KV RESIDENCY] 디코딩 진입 시 1회 결정된 목표 배치 위치.
     //    기본값은 기존 동작과 100% 동일한 Vram 입니다.
@@ -83,6 +84,7 @@ impl Qwen3DecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
+            rms_norm_eps: config.rms_norm_eps as f32,
             fp8_cache: None,
             kv_residency: crate::utils::resources::KvResidency::Vram,
             kv_exact: false,
@@ -113,13 +115,15 @@ impl Qwen3DecoderLayer {
             config.num_attention_heads,
             config.num_key_value_heads,
             config.head_dim,
-        );
+        )
+        .with_eps(config.rms_norm_eps);
         let mlp = GateUpDownMLP::from_projs(proj("ffn_gate")?, proj("ffn_up")?, proj("ffn_down")?, config.hidden_act);
         Ok(Self {
             self_attn,
             mlp,
             input_layernorm: norm("attn_norm")?,
             post_attention_layernorm: norm("ffn_norm")?,
+            rms_norm_eps: config.rms_norm_eps as f32,
             fp8_cache: None,
             kv_residency: crate::utils::resources::KvResidency::Vram,
             kv_exact: false,
@@ -138,7 +142,11 @@ impl Qwen3DecoderLayer {
         if self.self_attn.kv_cache.is_none() {
             if let Some(cache) = self.fp8_cache.take() {
                 let dev = xs.device();
-                let target_dtype = if dev.is_cuda_or_rocm() { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+                let target_dtype = if dev.is_cuda_or_rocm() {
+                    self.input_layernorm.weight().dtype()
+                } else {
+                    candle_core::DType::F32
+                };
 
                 // 🌟 [KV RESIDENCY] RAM 에 대피해 있던 캐시라면 연산 직전에만 GPU 로 올립니다.
                 //    PCIe 4.0 x16 기준 28레이어 × 28KB/token ≈ 784KB → 0.03ms 로 무시 가능한 비용입니다.
@@ -161,19 +169,47 @@ impl Qwen3DecoderLayer {
             }
         }
 
+        let hidden_dim = *xs.dims().last().unwrap_or(&0);
+        let use_fused_rms = crate::models::common::accel_check::fused_op_ok(
+            xs.device(),
+            crate::models::common::accel_check::FusedOpKind::ResidualRmsNorm,
+            xs.dtype(),
+            hidden_dim,
+        );
         let residual = xs.clone();
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, cos, sin, attention_mask)?;
+        let normed = if use_fused_rms {
+            candle_core::decoder_ops::rmsnorm_fused(
+                xs,
+                self.input_layernorm.weight(),
+                self.rms_norm_eps,
+                false,
+            )?
+        } else {
+            fast_cpu_rms_norm(&self.input_layernorm, xs, self.rms_norm_eps)?
+        };
+        let attn_out = self.self_attn.forward(&normed, cos, sin, attention_mask)?;
         
         // 🌟 [FP8 KV Cache] 레이어 연산이 끝나는 즉시, VRAM 코어를 사용해 초고속 FP8 압축 상태로 VRAM에 보존합니다.
         // RAM-VRAM 스왑 없이 순수 VRAM 내에서 용량을 50% 절약합니다.
         self.compress_kv_in_vram()?;
         
-        let xs = residual.add(&xs)?;
-        let residual = xs.clone();
-        let xs = self.post_attention_layernorm.forward(&xs)?;
-        let xs = self.mlp.forward(&xs)?;
-        let xs = residual.add(&xs)?;
+        // DeepStack 시각 주입은 Qwen3VLTextModel::forward 의 레이어 경계 밖에서 일어나므로
+        // 레이어 내부 post-attention residual + RMSNorm 융합은 Qwen3 / Qwen3VL 모두 안전합니다.
+        let (residual, normed_post) = if use_fused_rms {
+            candle_core::decoder_ops::residual_rmsnorm_inplace(
+                residual,
+                Some(&attn_out),
+                self.post_attention_layernorm.weight(),
+                self.rms_norm_eps,
+                false,
+            )?
+        } else {
+            let r = residual.add(&attn_out)?;
+            let n = fast_cpu_rms_norm(&self.post_attention_layernorm, &r, self.rms_norm_eps)?;
+            (r, n)
+        };
+        let mlp_out = self.mlp.forward(&normed_post)?;
+        let xs = residual.add(&mlp_out)?;
         Ok(xs)
     }
 
@@ -460,6 +496,17 @@ impl Qwen3Model {
         inputs_embeds: Option<&Tensor>,
         seqlen_offset: usize,
     ) -> Result<Tensor> {
+        let last = self.forward_last_hidden(input_ids, inputs_embeds, seqlen_offset)?;
+        self.logits_from_hidden(&last)
+    }
+
+    /// 마지막 토큰 위치의 정규화된 은닉 벡터 `[B, 1, H]` 만 계산합니다 (`lm_head` 생략).
+    pub fn forward_last_hidden(
+        &mut self,
+        input_ids: Option<&Tensor>,
+        inputs_embeds: Option<&Tensor>,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
         if input_ids.is_none() && inputs_embeds.is_none() {
             return Err(anyhow::anyhow!(
                 "You must specify exactly one of input_ids or inputs_embeds"
@@ -472,10 +519,10 @@ impl Qwen3Model {
             self.embedding_token_id(input_ids)?
         };
 
-        // 🌟 [VRAM 최적화] CUDA 환경일 때 입력 임베딩을 BF16으로 강제 캐스팅하여 전체 파이프라인의 VRAM 2배 폭식을 방어합니다.
+        // 🌟 [VRAM 최적화] CUDA/ROCm 환경일 때 모델 가중치 dtype(기본 BF16, 테스트 F32)에 입력 임베딩을 맞춥니다.
         let target_dtype = match self.q8_act_dtype {
             Some(dt) => dt,
-            None if inputs_embeds.device().is_cuda_or_rocm() => candle_core::DType::BF16,
+            None if inputs_embeds.device().is_cuda_or_rocm() => self.norm.weight().dtype(),
             None => candle_core::DType::F32,
         };
         let inputs_embeds = if inputs_embeds.dtype() != target_dtype { inputs_embeds.to_dtype(target_dtype)? } else { inputs_embeds };
@@ -513,7 +560,15 @@ impl Qwen3Model {
         if self.q8_act_dtype.is_some() {
             // 🌟 [Q8-RESIDENT] 마지막 행만 F32 로 올려 F32 노름 → 정확 mat-vec lm_head → F32 logits.
             let last = hidden_states.narrow(1, seq_len - 1, 1)?.to_dtype(candle_core::DType::F32)?;
-            let last = self.norm.forward(&last)?;
+            return Ok(self.norm.forward(&last)?);
+        }
+        let last = hidden_states.narrow(1, seq_len - 1, 1)?;
+        Ok(self.norm.forward(&last)?)
+    }
+
+    /// 정규화된 마지막 은닉 벡터 `[B, 1, H]` → 전체 어휘 로짓 `[B, 1, V]`.
+    pub fn logits_from_hidden(&mut self, last: &Tensor) -> Result<Tensor> {
+        if self.q8_act_dtype.is_some() {
             // 🌟 [VOCAB TRIM] 남긴 행만 곱하고 장치에서 전체 어휘 길이로 펼칩니다 (잘린 행 −∞).
             if self.trim_head.is_none() {
                 if let Some(src) = self.embed_tokens.mapped_source().cloned() {
@@ -522,14 +577,52 @@ impl Qwen3Model {
                 }
             }
             if let Some(head) = &self.trim_head {
-                return Ok(head.logits(&last)?);
+                return Ok(head.logits(last)?);
             }
-            return Ok(self.lm_head.forward(&last)?);
         }
-        hidden_states = self.norm.forward(&hidden_states)?;
-        let hidden_state = hidden_states.narrow(1, seq_len - 1, 1)?;
-        let logits = self.lm_head.forward(&hidden_state)?;
-        Ok(logits)
+        Ok(self.lm_head.forward(last)?)
+    }
+
+    /// Part 5 (Pack A·C): 100% 무손실 Greedy 토큰 선택 (Mode B `TrimmedHead::greedy_next_token` 또는 Mode A `fused_linear_argmax_cs`).
+    pub fn greedy_from_hidden(&mut self, last: &Tensor) -> Result<u32> {
+        if self.q8_act_dtype.is_some() {
+            if self.trim_head.is_none() {
+                if let Some(src) = self.embed_tokens.mapped_source().cloned() {
+                    self.trim_head = Some(crate::models::common::vocab_trim::all_rows(&src, last.device())?);
+                }
+            }
+            if let Some(head) = &self.trim_head {
+                return Ok(head.greedy_next_token(last)?[0]);
+            }
+        }
+        if let ProjKind::LinearProj(lin) = &self.lm_head {
+            let dev = last.device();
+            let dt = last.dtype();
+            let h_dim = *last.dims().last().unwrap_or(&0);
+            if crate::models::common::accel_check::fused_op_ok(
+                dev,
+                crate::models::common::accel_check::FusedOpKind::LmHeadArgmaxCs,
+                dt,
+                h_dim,
+            ) {
+                let out = candle_core::lm_head::fused_linear_argmax_cs(
+                    last,
+                    lin.weight(),
+                    lin.bias(),
+                    None,
+                    None,
+                )?;
+                return Ok(out.ids.to_device(&candle_core::Device::Cpu)?.to_vec1::<u32>()?[0]);
+            }
+        }
+        let logits = self.logits_from_hidden(last)?;
+        let id = logits
+            .to_dtype(candle_core::DType::F32)?
+            .argmax(candle_core::D::Minus1)?
+            .to_device(&candle_core::Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<u32>()?[0];
+        Ok(id)
     }
 
     pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {

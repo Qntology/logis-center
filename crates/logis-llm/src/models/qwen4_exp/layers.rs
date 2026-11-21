@@ -30,13 +30,40 @@ impl RmsNorm1p {
         Ok(Self { w1p, group, eps })
     }
 
+    pub fn weight_1p(&self) -> &Tensor {
+        &self.w1p
+    }
+
+    pub fn eps(&self) -> f64 {
+        self.eps
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let dt = x.dtype();
+        let last = x.dim(D::Minus1)?;
+        let is_ungrouped = match self.group {
+            Some(g) => g == last,
+            None => true,
+        };
+        if is_ungrouped
+            && crate::models::common::accel_check::fused_op_ok(
+                x.device(),
+                crate::models::common::accel_check::FusedOpKind::ResidualRmsNorm,
+                dt,
+                last,
+            )
+        {
+            return Ok(candle_core::decoder_ops::rmsnorm_fused(
+                x,
+                &self.w1p,
+                self.eps as f32,
+                false,
+            )?);
+        }
         let xf = x.to_dtype(DType::F32)?;
         let normed = match self.group {
-            Some(g) if g != x.dim(D::Minus1)? => {
+            Some(g) if g != last => {
                 let dims = xf.dims().to_vec();
-                let last = dims[dims.len() - 1];
                 let mut gshape = dims[..dims.len() - 1].to_vec();
                 gshape.push(last / g);
                 gshape.push(g);
@@ -73,6 +100,17 @@ impl GatedRmsNorm {
     /// x, z: `[.., Dv]`
     pub fn forward(&self, x: &Tensor, z: &Tensor) -> Result<Tensor> {
         let dt = x.dtype();
+        let dv = x.dim(D::Minus1)?;
+        if matches!(self.act, GateAct::Silu)
+            && crate::models::common::accel_check::fused_op_ok(
+                x.device(),
+                crate::models::common::accel_check::FusedOpKind::GatedDeltaRule,
+                dt,
+                dv,
+            )
+        {
+            return Ok(candle_core::delta_rule::fused_gated_rms_norm(x, z, &self.w, self.eps)?);
+        }
         let n = rms_core(&x.to_dtype(DType::F32)?, self.eps)?.to_dtype(dt)?;
         let n = n.broadcast_mul(&self.w.to_dtype(dt)?)?;
         let zf = z.to_dtype(DType::F32)?;

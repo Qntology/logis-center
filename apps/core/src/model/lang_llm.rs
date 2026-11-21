@@ -1784,6 +1784,25 @@ pub fn synthesis_entry(engine_resident: bool, route_probe: bool, probe_axis: &st
     }
 }
 
+/// 모델 적재(`HoldGate::hold()` / VRAM 전환) 이전에 SDS 폐기율 게이트를 조기 평가합니다.
+/// 반환값이 `Some((SynthesisEntry::Skip, ..))` 이면 호출부는 모델을 적재하지 않고 즉시 반환해야 합니다.
+pub fn evaluate_sds_preload_gate(
+    routed_lang: bool,
+    step: &str,
+    skip_drop: f32,
+    engine_resident: bool,
+    route_probe: bool,
+) -> Option<(SynthesisEntry, u64, f32, u64)> {
+    let axis = synthesis_drop_axis(routed_lang);
+    let (recent, _, n) = crate::utils::score_dynamics::adaptive_recent(axis)?;
+    if recent < skip_drop {
+        return None;
+    }
+    let probe_axis = format!("{axis}|{step}");
+    let (entry, left) = synthesis_entry(engine_resident, route_probe, &probe_axis);
+    Some((entry, left, recent, n))
+}
+
 pub struct LangSession {
     code: String,
     _binding: TranslitBinding,

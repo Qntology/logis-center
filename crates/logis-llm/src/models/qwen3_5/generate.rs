@@ -79,19 +79,10 @@ impl Qwen3_5GenerateModel {
     pub fn set_vision_active(&mut self, active: bool) -> Result<()> {
         self.qwen3_5.set_vision_active(active)?;
 
-        // 비전을 뗀 직후 OS 레벨 메모리 반환을 즉시 트리거합니다.
+        // 비전을 뗀 직후 핫패스 워킹셋 트림은 페이지 폴트 스래싱을 유발하므로
+        // `legacy_working_set_trim()` 계약(기본 무동작)으로 일원화합니다.
         if !active {
-            if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
-            #[cfg(target_os = "windows")]
-            unsafe {
-                use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-            }
-            #[cfg(target_os = "linux")]
-            unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-            #[cfg(target_os = "macos")]
-            unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+            crate::models::common::legacy_working_set_trim();
         }
         Ok(())
     }
@@ -232,17 +223,7 @@ impl Qwen3_5GenerateModel {
             .unwrap_or("qwen3.5");
             
         
-        // OS 할당자가 붙잡고 있는 수 기가바이트의 찌꺼기 램을 OS 커널 레벨에서 강제로 토해내게 만듭니다.
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-        #[cfg(target_os = "macos")]
-        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+        crate::models::common::legacy_working_set_trim();
 
         // 구조체 반환 부분은 그대로 유지
         Ok(Self {
@@ -440,17 +421,63 @@ impl Qwen3_5GenerateModel {
             }
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
 
-            let logits = self.qwen3_5.forward(
-                &input_ids,
-                cur_pixel_values,
-                image_grid_thw,
-                cur_pixel_values_video,
-                video_grid_thw,
-                None, 
-                seqlen_offset,
-                session_id.clone(), 
-                kv_name.clone()     
-            ).await?;
+            let pure_greedy_step = i > 0
+                && mes.temperature.unwrap_or(0.0) <= 0.0
+                && semantic_prejudice_tensor.is_none()
+                && ignore_list.is_none();
+            let fast_hidden = if pure_greedy_step {
+                let h = self
+                    .qwen3_5
+                    .forward_last_hidden(
+                        &input_ids,
+                        cur_pixel_values,
+                        image_grid_thw,
+                        cur_pixel_values_video,
+                        video_grid_thw,
+                        None,
+                        seqlen_offset,
+                        session_id.clone(),
+                        kv_name.clone(),
+                    )
+                    .await?;
+                let cand = self.qwen3_5.greedy_from_hidden(&h)?;
+                let start_at = generate.len().saturating_sub(self.repeat_last_n);
+                let hit_banned = (self.repeat_penalty > 1.0 && generate[start_at..].contains(&cand))
+                    || (is_strict_json
+                        && (cand == think_token_id
+                            || cand == lt_id
+                            || cand == slash_id
+                            || cand == double_slash_id
+                            || cand == space_double_slash_id));
+                if !hit_banned {
+                    Ok(Some(cand))
+                } else {
+                    Err(h)
+                }
+            } else {
+                Ok(None)
+            };
+            let mut next_token = match fast_hidden {
+                Ok(Some(tok)) => tok,
+                other => {
+                    let logits = match other {
+                        Err(h) => self.qwen3_5.logits_from_hidden(&h)?,
+                        Ok(_) => {
+                            self.qwen3_5
+                                .forward(
+                                    &input_ids,
+                                    cur_pixel_values,
+                                    image_grid_thw,
+                                    cur_pixel_values_video,
+                                    video_grid_thw,
+                                    None,
+                                    seqlen_offset,
+                                    session_id.clone(),
+                                    kv_name.clone(),
+                                )
+                                .await?
+                        }
+                    };
             
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?.contiguous()?;
 
@@ -571,7 +598,9 @@ impl Qwen3_5GenerateModel {
             }
             
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
-            let mut next_token = logit_processor.sample(&logits)?;
+            logit_processor.sample(&logits)?
+                }
+            };
             
             if i == 0 {
                 if is_strict_json {
@@ -881,17 +910,63 @@ impl Qwen3_5GenerateModel {
 
             crate::models::qwen::generate::wait_for_global_io().await;
 
-            let logits = self.qwen3_5.forward(
-                &input_ids,
-                cur_pixel_values.as_ref(),
-                cur_image_thw.as_ref(),
-                cur_pixel_values_video.as_ref(),
-                cur_video_thw.as_ref(),
-                None, 
-                seqlen_offset,
-                session_id.clone(),
-                kv_name.clone()
-            ).await?;
+            let pure_greedy_step = i > 0
+                && mes.temperature.unwrap_or(0.0) <= 0.0
+                && semantic_prejudice_tensor.is_none()
+                && ignore_list.is_none();
+            let fast_hidden = if pure_greedy_step {
+                let h = self
+                    .qwen3_5
+                    .forward_last_hidden(
+                        &input_ids,
+                        cur_pixel_values.as_ref(),
+                        cur_image_thw.as_ref(),
+                        cur_pixel_values_video.as_ref(),
+                        cur_video_thw.as_ref(),
+                        None,
+                        seqlen_offset,
+                        session_id.clone(),
+                        kv_name.clone(),
+                    )
+                    .await?;
+                let cand = self.qwen3_5.greedy_from_hidden(&h)?;
+                let start_at = generate.len().saturating_sub(self.repeat_last_n);
+                let hit_banned = (self.repeat_penalty > 1.0 && generate[start_at..].contains(&cand))
+                    || (is_strict_json
+                        && (cand == think_token_id
+                            || cand == lt_id
+                            || cand == slash_id
+                            || cand == double_slash_id
+                            || cand == space_double_slash_id));
+                if !hit_banned {
+                    Ok(Some(cand))
+                } else {
+                    Err(h)
+                }
+            } else {
+                Ok(None)
+            };
+            let mut next_token = match fast_hidden {
+                Ok(Some(tok)) => tok,
+                other => {
+                    let logits = match other {
+                        Err(h) => self.qwen3_5.logits_from_hidden(&h)?,
+                        Ok(_) => {
+                            self.qwen3_5
+                                .forward(
+                                    &input_ids,
+                                    cur_pixel_values.as_ref(),
+                                    cur_image_thw.as_ref(),
+                                    cur_pixel_values_video.as_ref(),
+                                    cur_video_thw.as_ref(),
+                                    None,
+                                    seqlen_offset,
+                                    session_id.clone(),
+                                    kv_name.clone(),
+                                )
+                                .await?
+                        }
+                    };
             
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
@@ -1012,7 +1087,9 @@ impl Qwen3_5GenerateModel {
             }
 
             let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
-            let mut next_token = logit_processor.sample(&logits)?;
+            logit_processor.sample(&logits)?
+                }
+            };
             
             if i == 0 {
                 if is_strict_json {

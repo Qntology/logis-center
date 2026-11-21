@@ -1087,17 +1087,34 @@ fn vision_cache_key_is_deterministic_and_input_sensitive() -> R {
 }
 
 #[test]
-#[ignore = "BUG(13): compute_key hashes only every (len/4096)-th value, so an image edited between samples hits a stale embedding"]
 fn vision_cache_key_changes_when_any_pixel_changes() -> R {
+    use logis_app::models::common::vision_prune::PruneMode;
+    use logis_app::models::vision_cache::validate_embed_shape_for_mode;
+
     let dev = Device::Cpu;
-    let n = 3 * 64 * 64; // stride = 3
+    let n = 3 * 64 * 64;
     let base: Vec<f32> = (0..n).map(|i| (i % 251) as f32 / 251.0).collect();
     let mut edited = base.clone();
     edited[1] += 0.5; // 샘플 사이의 픽셀 하나 (문서 이미지의 글자 한 획 정도)
     let thw = Tensor::new(&[[1u32, 4, 4]], &dev)?;
-    let ka = VisionEmbedCache::compute_key(&Tensor::from_vec(base, (3, 64, 64), &dev)?, &thw)?;
-    let kb = VisionEmbedCache::compute_key(&Tensor::from_vec(edited, (3, 64, 64), &dev)?, &thw)?;
+    let t_base = Tensor::from_vec(base, (3, 64, 64), &dev)?;
+    let t_edit = Tensor::from_vec(edited, (3, 64, 64), &dev)?;
+    let ka = VisionEmbedCache::compute_key(&t_base, &thw)?;
+    let kb = VisionEmbedCache::compute_key(&t_edit, &thw)?;
     assert_ne!(ka, kb, "different pixels must not share a cache entry");
+
+    // prune_mode 및 (orig_w, orig_h) 메타데이터가 키를 분리해야 함
+    let k_off = VisionEmbedCache::compute_key_with_context(&t_base, &thw, Some((280, 280)), PruneMode::Off)?;
+    let k_scat = VisionEmbedCache::compute_key_with_context(&t_base, &thw, Some((280, 280)), PruneMode::Halo1HopScatter)?;
+    let k_drop = VisionEmbedCache::compute_key_with_context(&t_base, &thw, Some((280, 280)), PruneMode::Halo1HopDrop)?;
+    let k_dim2 = VisionEmbedCache::compute_key_with_context(&t_base, &thw, Some((308, 280)), PruneMode::Halo1HopScatter)?;
+    assert_ne!(k_off, k_scat);
+    assert_ne!(k_scat, k_drop);
+    assert_ne!(k_scat, k_dim2);
+
+    let pruned_emb = Tensor::zeros((10, 8), DType::F32, &dev)?;
+    assert!(validate_embed_shape_for_mode(&pruned_emb, 16, PruneMode::Halo1HopDrop).is_ok());
+    assert!(validate_embed_shape_for_mode(&pruned_emb, 16, PruneMode::Off).is_err());
     Ok(())
 }
 

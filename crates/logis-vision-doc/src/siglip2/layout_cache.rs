@@ -168,7 +168,9 @@ pub struct LayoutHit {
     pub detected_type: String,
     verdict: Option<CachedVerdict>,
     heatmaps: Vec<CachedHeatmap>,
+    grid_rows: usize,
     grid_cols: usize,
+    legible: Vec<bool>,
 }
 
 impl LayoutHit {
@@ -185,6 +187,74 @@ impl LayoutHit {
             return None;
         }
         Some(self.heatmaps.iter().map(restore).collect())
+    }
+
+    /// 2차 VLM 크롭 다이어트 보조용: 신뢰(`trusted`, `agreements >= TRUST_AGREEMENTS`, `AGREE_FLOOR = 0.85`)
+    /// 마스터 서식 템플릿의 판독 가능(잉크) 마스크를 `crop_bbox` 로컬 좌표로 투영하고 `dilation_px`(기본 3px)
+    /// 만큼 팽창한 결정론적 외곽 경계 `(x0, y0, x1, y1)` 를 돌려줍니다.
+    /// 1차 SigLIP2 탐색 및 `LAYOUT_RECIPE` 에는 일절 관여하지 않습니다.
+    pub fn trusted_dilated_crop_bounds(
+        &self,
+        crop_bbox: (u32, u32, u32, u32),
+        orig_w: u32,
+        orig_h: u32,
+        dilation_px: u32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        if !self.trusted || self.legible.is_empty() || self.grid_rows == 0 || self.grid_cols == 0 {
+            return None;
+        }
+        let (cx0, cy0, cx1, cy1) = crop_bbox;
+        let cw = cx1.saturating_sub(cx0);
+        let ch = cy1.saturating_sub(cy0);
+        if cw == 0 || ch == 0 || orig_w == 0 || orig_h == 0 {
+            return None;
+        }
+        let cell_w = orig_w as f32 / self.grid_cols as f32;
+        let cell_h = orig_h as f32 / self.grid_rows as f32;
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        let mut found = false;
+
+        for r in 0..self.grid_rows {
+            let py0 = (r as f32 * cell_h).floor() as u32;
+            let py1 = (((r + 1) as f32) * cell_h).ceil() as u32;
+            if py1 <= cy0 || py0 >= cy1 {
+                continue;
+            }
+            for c in 0..self.grid_cols {
+                let idx = r * self.grid_cols + c;
+                if !self.legible.get(idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                let px0 = (c as f32 * cell_w).floor() as u32;
+                let px1 = (((c + 1) as f32) * cell_w).ceil() as u32;
+                if px1 <= cx0 || px0 >= cx1 {
+                    continue;
+                }
+                let lx0 = px0.saturating_sub(cx0);
+                let ly0 = py0.saturating_sub(cy0);
+                let lx1 = px1.min(cx1).saturating_sub(cx0);
+                let ly1 = py1.min(cy1).saturating_sub(cy0);
+                if lx1 > lx0 && ly1 > ly0 {
+                    min_x = min_x.min(lx0);
+                    min_y = min_y.min(ly0);
+                    max_x = max_x.max(lx1);
+                    max_y = max_y.max(ly1);
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+        Some((
+            min_x.saturating_sub(dilation_px),
+            min_y.saturating_sub(dilation_px),
+            max_x.saturating_add(dilation_px).min(cw),
+            max_y.saturating_add(dilation_px).min(ch),
+        ))
     }
 }
 
@@ -536,7 +606,9 @@ impl LayoutCache {
             detected_type: t.detected_type.clone(),
             verdict: t.verdict.clone(),
             heatmaps: t.heatmaps.clone(),
+            grid_rows: t.grid_rows,
             grid_cols: t.grid_cols,
+            legible: t.legible.clone(),
         };
         let mode = if hit.reuse() {
             "재사용 — 서식 판정·열 히트맵 계산을 건너뜁니다"

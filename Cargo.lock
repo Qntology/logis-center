@@ -1096,7 +1096,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=ebaf93db065f22be67a9a4a250eec5a212e143fe#ebaf93db065f22be67a9a4a250eec5a212e143fe"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=0207e7a7818ce7f81e542d0918098dd45b32427e#0207e7a7818ce7f81e542d0918098dd45b32427e"
 dependencies = [
  "ash",
  "byteorder",
@@ -1131,7 +1131,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.11.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=ebaf93db065f22be67a9a4a250eec5a212e143fe#ebaf93db065f22be67a9a4a250eec5a212e143fe"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=0207e7a7818ce7f81e542d0918098dd45b32427e#0207e7a7818ce7f81e542d0918098dd45b32427e"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -1165,7 +1165,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=ebaf93db065f22be67a9a4a250eec5a212e143fe#ebaf93db065f22be67a9a4a250eec5a212e143fe"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=0207e7a7818ce7f81e542d0918098dd45b32427e#0207e7a7818ce7f81e542d0918098dd45b32427e"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -1182,7 +1182,7 @@ dependencies = [
 [[package]]
 name = "candle-rocm"
 version = "0.2.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=ebaf93db065f22be67a9a4a250eec5a212e143fe#ebaf93db065f22be67a9a4a250eec5a212e143fe"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=0207e7a7818ce7f81e542d0918098dd45b32427e#0207e7a7818ce7f81e542d0918098dd45b32427e"
 dependencies = [
  "candle-core",
 ]
@@ -4296,7 +4296,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hip-runtime"
 version = "0.2.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=ebaf93db065f22be67a9a4a250eec5a212e143fe#ebaf93db065f22be67a9a4a250eec5a212e143fe"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=0207e7a7818ce7f81e542d0918098dd45b32427e#0207e7a7818ce7f81e542d0918098dd45b32427e"
 dependencies = [
  "hip-sys",
 ]
@@ -4304,7 +4304,7 @@ dependencies = [
 [[package]]
 name = "hip-sys"
 version = "0.2.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=ebaf93db065f22be67a9a4a250eec5a212e143fe#ebaf93db065f22be67a9a4a250eec5a212e143fe"
+source = "git+https://github.com/sungu-che/candle-rocm-vulkan?rev=0207e7a7818ce7f81e542d0918098dd45b32427e#0207e7a7818ce7f81e542d0918098dd45b32427e"
 
 [[package]]
 name = "hmac"
@@ -6245,6 +6245,7 @@ dependencies = [
  "safetensors 0.4.5",
  "serde",
  "serde_json",
+ "smallvec",
  "sysinfo",
  "tokenizers",
  "tokio",

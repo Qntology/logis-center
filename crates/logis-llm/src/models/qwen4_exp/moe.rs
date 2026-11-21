@@ -112,6 +112,12 @@ impl SparseMoe {
                 per[e].1.push(w);
             }
         }
+        let use_fused_silu = crate::models::common::accel_check::fused_op_ok(
+            dev,
+            crate::models::common::accel_check::FusedOpKind::SiluMul,
+            dt,
+            self.inter,
+        );
         let mut out = Tensor::zeros((b * t, h), dt, dev)?;
         for (e, (toks, ws)) in per.iter().enumerate() {
             if toks.is_empty() {
@@ -123,7 +129,11 @@ impl SparseMoe {
             let gu = xe.matmul(&self.gate_up[e].t()?)?; // [n, 2I]
             let g = gu.narrow(D::Minus1, 0, self.inter)?;
             let u = gu.narrow(D::Minus1, self.inter, self.inter)?;
-            let hdn = (g.silu()? * u)?;
+            let hdn = if use_fused_silu {
+                candle_core::decoder_ops::silu_mul(&g, &u)?
+            } else {
+                (g.silu()? * u)?
+            };
             let ye = hdn.matmul(&self.down[e].t()?)?; // [n, H]
             // HF: routing weight 를 모델 dtype 으로 캐스팅한 뒤 곱합니다.
             let w = Tensor::from_slice(ws.as_slice(), (n, 1), dev)?.to_dtype(dt)?;
@@ -131,9 +141,14 @@ impl SparseMoe {
             out = out.index_add(&idx, &ye, 0)?;
         }
 
-        let shared = self
-            .shared_down_proj
-            .forward(&(self.shared_gate_proj.forward(&x2)?.silu()? * self.shared_up_proj.forward(&x2)?)?)?;
+        let shared_g = self.shared_gate_proj.forward(&x2)?;
+        let shared_u = self.shared_up_proj.forward(&x2)?;
+        let shared_mid = if use_fused_silu {
+            candle_core::decoder_ops::silu_mul(&shared_g, &shared_u)?
+        } else {
+            (shared_g.silu()? * shared_u)?
+        };
+        let shared = self.shared_down_proj.forward(&shared_mid)?;
         let sg = sigmoid(&self.shared_expert_gate.forward(&x2)?)?; // [N, 1]
         let y = (out + shared.broadcast_mul(&sg)?)?;
         Ok(y.reshape((b, t, h))?)

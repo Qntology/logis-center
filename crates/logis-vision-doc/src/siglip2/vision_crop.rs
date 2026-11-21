@@ -2967,3 +2967,586 @@ pub fn decide_tile_count(
 
     (count, reason)
 }
+
+// =============================================================================
+// Part 1 (Pack B): 2차 VLM 크롭 다이어트 (고DPI 다운스케일 · 28px 여백 스냅 · LPT 정렬)
+// - 1차 SigLIP2 전체 페이지 스캔 / LAYOUT_CACHE / LegibilityMap 에는 일절 개입하지 않습니다.
+// =============================================================================
+
+#[derive(Debug, Clone)]
+pub struct CropDietConfig {
+    /// 목표 글자 몸통 높이 (기본 14.0px; 고DPI 문단/표 크롭에 한해 0.50x 하한 개방)
+    pub target_text_px: f32,
+    pub min_scale_factor: f32,
+    pub max_scale_factor: f32,
+    /// VLM 병합 패치 격자 단위 (Qwen-VL 계열: 14px * 2 = 28px)
+    pub grid_snap_px: u32,
+    /// 여백 절단 손익분기 게이트 (64패치 이상 & 절감률 5% 이상일 때만 적용)
+    pub min_patches_for_trim: usize,
+    pub min_saving_ratio: f32,
+    /// 스캔 배경/노이즈 판정 파라미터 (minion margin_crop 규약 이식)
+    pub min_paper_luma: u8,
+    pub bg_tol: u8,
+    pub noise_k: u8,
+    pub pad_px: u32,
+    pub pad_faint_px: u32,
+}
+
+impl Default for CropDietConfig {
+    fn default() -> Self {
+        Self {
+            target_text_px: 14.0,
+            min_scale_factor: 0.50,
+            max_scale_factor: 4.0,
+            grid_snap_px: 28,
+            min_patches_for_trim: 64,
+            min_saving_ratio: 0.05,
+            min_paper_luma: 150,
+            bg_tol: 6,
+            noise_k: 3,
+            pad_px: 8,
+            pad_faint_px: 2,
+        }
+    }
+}
+
+/// `LOGIS_CROP_DIET=off|0|false` 로 런타임 비활성화 가능 (기본 활성화).
+pub fn crop_diet_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("LOGIS_CROP_DIET")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        !matches!(v.as_str(), "0" | "off" | "false" | "no")
+    })
+}
+
+#[inline]
+fn rgb_luma(r: u8, g: u8, b: u8) -> u8 {
+    ((77u32 * r as u32 + 150u32 * g as u32 + 29u32 * b as u32) >> 8) as u8
+}
+
+/// 테두리 1px 에서 종이 배경 밝기·RGB 와 적응형 노이즈 폭을 추정합니다.
+fn estimate_paper_background(rgb: &image::RgbImage) -> (u8, [u8; 3], u8) {
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return (255, [255, 255, 255], 6);
+    }
+    let mut border_lumas: Vec<u8> = Vec::with_capacity(((w + h) as usize) * 2);
+    let mut border_pixels: Vec<[u8; 3]> = Vec::with_capacity(((w + h) as usize) * 2);
+    for x in 0..w {
+        let top = rgb.get_pixel(x, 0).0;
+        border_lumas.push(rgb_luma(top[0], top[1], top[2]));
+        border_pixels.push(top);
+        if h > 1 {
+            let bot = rgb.get_pixel(x, h - 1).0;
+            border_lumas.push(rgb_luma(bot[0], bot[1], bot[2]));
+            border_pixels.push(bot);
+        }
+    }
+    for y in 1..h.saturating_sub(1) {
+        let left = rgb.get_pixel(0, y).0;
+        border_lumas.push(rgb_luma(left[0], left[1], left[2]));
+        border_pixels.push(left);
+        if w > 1 {
+            let right = rgb.get_pixel(w - 1, y).0;
+            border_lumas.push(rgb_luma(right[0], right[1], right[2]));
+            border_pixels.push(right);
+        }
+    }
+    if border_lumas.is_empty() {
+        return (255, [255, 255, 255], 6);
+    }
+    border_lumas.sort_unstable();
+    // 상위 사분위(75%)를 종이 배경으로 잡아 테두리 괘선·스캔 그림자에 강건하게 만듭니다.
+    let paper_luma = border_lumas[(border_lumas.len() * 3) / 4];
+
+    // 종이 밝기 근처 픽셀들의 중앙 RGB 를 채움색으로 선택
+    let mut rs: Vec<u8> = Vec::new();
+    let mut gs: Vec<u8> = Vec::new();
+    let mut bs: Vec<u8> = Vec::new();
+    let mut devs: Vec<u8> = Vec::new();
+    for p in &border_pixels {
+        let l = rgb_luma(p[0], p[1], p[2]);
+        let diff = l.abs_diff(paper_luma);
+        if diff <= 20 {
+            rs.push(p[0]);
+            gs.push(p[1]);
+            bs.push(p[2]);
+            devs.push(diff);
+        }
+    }
+    if rs.is_empty() {
+        return (paper_luma, [paper_luma, paper_luma, paper_luma], 6);
+    }
+    rs.sort_unstable();
+    gs.sort_unstable();
+    bs.sort_unstable();
+    devs.sort_unstable();
+    let mid = rs.len() / 2;
+    let mad = devs[devs.len() / 2];
+    (paper_luma, [rs[mid], gs[mid], bs[mid]], mad)
+}
+
+/// 픽셀 리샘플링 없이 종이 배경색으로 우측/하단만 `grid_snap_px`(28px) 배수로 패딩합니다.
+pub fn snap_canvas_pad_only(img: DynamicImage, grid_snap_px: u32) -> DynamicImage {
+    let snap = grid_snap_px.max(1);
+    let rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    let sw = ((w.max(1) + snap - 1) / snap) * snap;
+    let sh = ((h.max(1) + snap - 1) / snap) * snap;
+    if sw == w && sh == h {
+        return DynamicImage::ImageRgb8(rgb);
+    }
+    let (_, paper_rgb, _) = estimate_paper_background(&rgb);
+    let mut canvas = image::RgbImage::from_pixel(sw, sh, image::Rgb(paper_rgb));
+    image::imageops::replace(&mut canvas, &rgb, 0, 0);
+    DynamicImage::ImageRgb8(canvas)
+}
+
+/// 잉크 바운딩 박스를 노이즈 필터링(`noise_k`) + 미세 획 보호(`pad_px`, `pad_faint_px`)로
+/// 검출하고 손익분기(`min_patches_for_trim`, `min_saving_ratio`)를 넘을 때만 여백 절단 후 28px Pad 스냅합니다.
+fn tighten_ink_bbox_and_snap_pad(
+    img: DynamicImage,
+    master_bounds: Option<(u32, u32, u32, u32)>,
+    cfg: &CropDietConfig,
+) -> DynamicImage {
+    let snap = cfg.grid_snap_px.max(1);
+    let rgb = img.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    if w < snap || h < snap {
+        return snap_canvas_pad_only(DynamicImage::ImageRgb8(rgb), snap);
+    }
+
+    let orig_patches = (((w + snap - 1) / snap) as usize) * (((h + snap - 1) / snap) as usize);
+    if orig_patches < cfg.min_patches_for_trim {
+        return snap_canvas_pad_only(DynamicImage::ImageRgb8(rgb), snap);
+    }
+
+    let (paper_luma, paper_rgb, mad) = estimate_paper_background(&rgb);
+    if paper_luma < cfg.min_paper_luma {
+        return snap_canvas_pad_only(DynamicImage::ImageRgb8(rgb), snap);
+    }
+
+    let tol = cfg
+        .bg_tol
+        .max(mad.saturating_mul(3))
+        .clamp(3, 20) as i16;
+    let strong_tol = (tol * 2).max(24);
+    let wu = w as usize;
+    let hu = h as usize;
+    let mut ink = vec![0u8; wu * hu];
+    let mut strong = vec![0u8; wu * hu];
+    let raw = rgb.as_raw();
+    for i in 0..(wu * hu) {
+        let base = i * 3;
+        let l = rgb_luma(raw[base], raw[base + 1], raw[base + 2]) as i16;
+        let diff = paper_luma as i16 - l;
+        if diff > tol {
+            ink[i] = 1;
+            if diff > strong_tol {
+                strong[i] = 1;
+            }
+        }
+    }
+
+    // 3x3 근방에서 noise_k 개 이상의 잉크가 모인 픽셀(글자·표 괘선·2x2 소수점)을 확정 잉크로,
+    // 대비가 뚜렷한 미세 점(1x2 등)도 5x5 근방 2픽셀 이상이면 보호해 콘텐츠 탈락 0건을 유지합니다.
+    let nk = cfg.noise_k.max(1);
+    let mut min_x = u32::MAX;
+    let mut min_y = u32::MAX;
+    let mut max_x = 0u32;
+    let mut max_y = 0u32;
+    let mut any_ink = false;
+
+    for y in 0..hu {
+        let y0 = y.saturating_sub(1);
+        let y1 = (y + 1).min(hu - 1);
+        for x in 0..wu {
+            let idx = y * wu + x;
+            if ink[idx] == 0 {
+                continue;
+            }
+            let x0 = x.saturating_sub(1);
+            let x1 = (x + 1).min(wu - 1);
+            let mut cnt = 0u8;
+            'nbr: for ny in y0..=y1 {
+                let row_off = ny * wu;
+                for nx in x0..=x1 {
+                    cnt += ink[row_off + nx];
+                    if cnt >= nk {
+                        break 'nbr;
+                    }
+                }
+            }
+            let keep = if cnt >= nk {
+                true
+            } else if strong[idx] != 0 {
+                let fy0 = y.saturating_sub(2);
+                let fy1 = (y + 2).min(hu - 1);
+                let fx0 = x.saturating_sub(2);
+                let fx1 = (x + 2).min(wu - 1);
+                let mut scnt = 0u8;
+                'fnbr: for ny in fy0..=fy1 {
+                    let row_off = ny * wu;
+                    for nx in fx0..=fx1 {
+                        scnt += ink[row_off + nx];
+                        if scnt >= 2 {
+                            break 'fnbr;
+                        }
+                    }
+                }
+                scnt >= 2
+            } else {
+                false
+            };
+
+            if keep {
+                let xu = x as u32;
+                let yu = y as u32;
+                min_x = min_x.min(xu);
+                min_y = min_y.min(yu);
+                max_x = max_x.max(xu + 1);
+                max_y = max_y.max(yu + 1);
+                any_ink = true;
+            }
+        }
+    }
+
+    // 신뢰 마스터 서식 3px 팽창 경계가 있으면 합집합으로 병합해 결정론적 잉크 경계를 보존합니다.
+    if let Some((mx0, my0, mx1, my1)) = master_bounds {
+        let mx0 = mx0.min(w);
+        let my0 = my0.min(h);
+        let mx1 = mx1.min(w);
+        let my1 = my1.min(h);
+        if mx1 > mx0 && my1 > my0 {
+            if any_ink {
+                min_x = min_x.min(mx0);
+                min_y = min_y.min(my0);
+                max_x = max_x.max(mx1);
+                max_y = max_y.max(my1);
+            } else {
+                min_x = mx0;
+                min_y = my0;
+                max_x = mx1;
+                max_y = my1;
+                any_ink = true;
+            }
+        }
+    }
+
+    if !any_ink || max_x <= min_x || max_y <= min_y {
+        return snap_canvas_pad_only(DynamicImage::ImageRgb8(rgb), snap);
+    }
+
+    let total_pad = cfg.pad_px.saturating_add(cfg.pad_faint_px);
+    let bx0 = min_x.saturating_sub(total_pad);
+    let by0 = min_y.saturating_sub(total_pad);
+    let bx1 = max_x.saturating_add(total_pad).min(w);
+    let by1 = max_y.saturating_add(total_pad).min(h);
+    let cw = bx1.saturating_sub(bx0).max(1);
+    let ch = by1.saturating_sub(by0).max(1);
+
+    let new_patches = (((cw + snap - 1) / snap) as usize) * (((ch + snap - 1) / snap) as usize);
+    let saving = 1.0 - (new_patches as f32 / orig_patches.max(1) as f32);
+    if saving < cfg.min_saving_ratio {
+        return snap_canvas_pad_only(DynamicImage::ImageRgb8(rgb), snap);
+    }
+
+    let sw = ((cw + snap - 1) / snap) * snap;
+    let sh = ((ch + snap - 1) / snap) * snap;
+    let mut canvas = image::RgbImage::from_pixel(sw, sh, image::Rgb(paper_rgb));
+    let sub = image::imageops::crop_imm(&rgb, bx0, by0, cw, ch).to_image();
+    image::imageops::replace(&mut canvas, &sub, 0, 0);
+    DynamicImage::ImageRgb8(canvas)
+}
+
+/// 1차 SigLIP2 스캔 종료 후 `MEM_IMAGES` 등록 직전의 2차 VLM 개별 크롭에만 호출합니다.
+/// 1) 고DPI 글자 몸통 다운스케일 판정(0.50x 개방, 보호 영역 1.0 고정)
+/// 2) 노이즈 제거 잉크 BBox 검출 (+ 선택적 신뢰 마스터 서식 3px 팽창 경계 합집합)
+/// 3) 종이색 28px 배수 Pad 스냅 (리샘플링 왜곡 0)
+pub fn tighten_and_snap_crop_for_vlm(
+    raw_crop: DynamicImage,
+    category: &str,
+    est_text_h: Option<f32>,
+    height_baseline: Option<(f32, f32)>,
+    master_bounds: Option<(u32, u32, u32, u32)>,
+    cfg: &CropDietConfig,
+    emit: &dyn Fn(&str),
+) -> DynamicImage {
+    if !crop_diet_enabled() {
+        return raw_crop;
+    }
+
+    let cat_lc = category.to_ascii_lowercase();
+    let is_protected = matches!(
+        cat_lc.as_str(),
+        "title" | "signature" | "stamp" | "seal" | "formula"
+    );
+    let min_scale = if is_protected { 1.0 } else { cfg.min_scale_factor };
+
+    let measured_h = est_text_h
+        .filter(|&h| h > 0.5)
+        .or_else(|| estimate_text_height(&raw_crop))
+        .map(|h| clamp_text_height(h, height_baseline, category, emit));
+
+    let mut scale = measured_h
+        .filter(|&h| h > 0.5)
+        .map(|h| (cfg.target_text_px / h).clamp(min_scale, cfg.max_scale_factor))
+        .unwrap_or(1.0);
+
+    // 긴 변 상한(CROP_MAX_SIDE_PX) 보존
+    let (rw, rh) = (raw_crop.width().max(1), raw_crop.height().max(1));
+    let cap = (CROP_MAX_SIDE_PX as f32 / rw as f32).min(CROP_MAX_SIDE_PX as f32 / rh as f32);
+    if cap > 0.0 && scale > cap && scale > 1.0 {
+        scale = cap.max(1.0);
+    }
+
+    let orig_snap_patches = (((rw + cfg.grid_snap_px - 1) / cfg.grid_snap_px) as usize)
+        * (((rh + cfg.grid_snap_px - 1) / cfg.grid_snap_px) as usize);
+
+    let (scaled, scaled_master) = if (scale - 1.0).abs() > 0.04 {
+        let nw = ((rw as f32 * scale).round() as u32).max(cfg.grid_snap_px);
+        let nh = ((rh as f32 * scale).round() as u32).max(cfg.grid_snap_px);
+        let filter = if scale < 1.0 {
+            image::imageops::FilterType::Triangle
+        } else {
+            image::imageops::FilterType::Lanczos3
+        };
+        let mb = master_bounds.map(|(x0, y0, x1, y1)| {
+            let sx = nw as f32 / rw as f32;
+            let sy = nh as f32 / rh as f32;
+            (
+                ((x0 as f32) * sx).floor() as u32,
+                ((y0 as f32) * sy).floor() as u32,
+                ((x1 as f32) * sx).ceil().min(nw as f32) as u32,
+                ((y1 as f32) * sy).ceil().min(nh as f32) as u32,
+            )
+        });
+        (raw_crop.resize_exact(nw, nh, filter), mb)
+    } else {
+        (raw_crop, master_bounds)
+    };
+
+    let out = if is_protected {
+        snap_canvas_pad_only(scaled, cfg.grid_snap_px)
+    } else {
+        tighten_ink_bbox_and_snap_pad(scaled, scaled_master, cfg)
+    };
+
+    let new_patches = (((out.width() + cfg.grid_snap_px - 1) / cfg.grid_snap_px) as usize)
+        * (((out.height() + cfg.grid_snap_px - 1) / cfg.grid_snap_px) as usize);
+    if new_patches < orig_snap_patches {
+        let saved_pct = (1.0 - new_patches as f32 / orig_snap_patches.max(1) as f32) * 100.0;
+        emit(&format!(
+            "    ✂️ [CROP DIET] '{}' {}x{} ({}패치) → {}x{} ({}패치, -{:.1}%, scale={:.2}x)",
+            category,
+            rw,
+            rh,
+            orig_snap_patches,
+            out.width(),
+            out.height(),
+            new_patches,
+            saved_pct,
+            scale
+        ));
+    }
+    out
+}
+
+/// 다중 크롭 LPT 카테고리 가중치:
+/// 3 = 품목 표/배열, 2 = 당사자·운송·결제 조건 블록, 1 = 단답 식별자·코드·일자
+pub fn crop_lpt_category_weight(category: &str, table_categories: &[&str]) -> u8 {
+    if table_categories.iter().any(|c| *c == category) {
+        return 3;
+    }
+    let lc = category.to_ascii_lowercase();
+    if matches!(
+        lc.as_str(),
+        "parties"
+            | "party"
+            | "transport"
+            | "shipping"
+            | "shipment"
+            | "payment"
+            | "terms"
+            | "conditions"
+            | "charges"
+            | "totals"
+            | "financial"
+            | "bank"
+            | "insurance"
+            | "customs"
+            | "packaging"
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+/// 28px 스냅 격자 기준 패치 수 및 버킷 `(grid_h, grid_w)` 계산.
+#[inline]
+pub fn snapped_grid_metrics(bbox: (u32, u32, u32, u32), grid_snap_px: u32) -> (usize, (u32, u32)) {
+    let snap = grid_snap_px.max(1);
+    let gw = (bbox.2.saturating_sub(bbox.0).max(1) + snap - 1) / snap;
+    let gh = (bbox.3.saturating_sub(bbox.1).max(1) + snap - 1) / snap;
+    ((gw as usize) * (gh as usize), (gh, gw))
+}
+
+/// `IDENTITY FIRST ORDER`(문서 기본키 선두 → 표 → 스칼라) 의미 계약을 100% 보존하면서
+/// 각 티어 내부를 `(category_weight 내림차순, snapped_patch_count 내림차순, grid_bucket)` LPT 순으로 정렬합니다.
+pub fn sort_plans_lpt(
+    plans: &mut [CropPlan],
+    table_categories: &[&str],
+    identity_category: &str,
+    identity_field: &str,
+) {
+    plans.sort_by_key(|p| {
+        let semantic_tier: u8 = if !identity_category.is_empty()
+            && p.category == identity_category
+            && p.top_field == identity_field
+        {
+            0
+        } else if !identity_category.is_empty() && p.category == identity_category {
+            1
+        } else if table_categories.iter().any(|c| *c == p.category.as_str()) {
+            2
+        } else {
+            3
+        };
+        let cat_weight = crop_lpt_category_weight(&p.category, table_categories);
+        let (patches, bucket) = snapped_grid_metrics(p.bbox, 28);
+        (
+            semantic_tier,
+            std::cmp::Reverse(cat_weight),
+            std::cmp::Reverse(patches),
+            bucket,
+        )
+    });
+}
+
+#[cfg(test)]
+mod crop_diet_tests {
+    use super::*;
+
+    #[test]
+    fn crop_diet_trims_blank_margins_and_snaps_to_28px_without_clipping_ink() {
+        // 560x560 흰 종이 중앙 (200..340, 220..300) 에 검정 글자/소수점 패턴 배치
+        let mut rgb = image::RgbImage::from_pixel(560, 560, image::Rgb([250, 250, 250]));
+        for y in 230..290 {
+            for x in 210..330 {
+                if (y % 14) < 6 && (x % 10) < 6 {
+                    rgb.put_pixel(x, y, image::Rgb([20, 20, 20]));
+                }
+            }
+        }
+        // 고립 스캔 먼지 1px (noise_k=3 에 걸러져야 함)
+        rgb.put_pixel(5, 5, image::Rgb([10, 10, 10]));
+        // 2x2 소수점 (보호되어야 함)
+        for dy in 0..2 {
+            for dx in 0..2 {
+                rgb.put_pixel(340 + dx, 288 + dy, image::Rgb([20, 20, 20]));
+            }
+        }
+
+        let cfg = CropDietConfig::default();
+        let out = tighten_and_snap_crop_for_vlm(
+            DynamicImage::ImageRgb8(rgb),
+            "items",
+            Some(14.0),
+            None,
+            None,
+            &cfg,
+            &|_| {},
+        );
+        assert_eq!(out.width() % 28, 0);
+        assert_eq!(out.height() % 28, 0);
+        let orig_patches = (560 / 28) * (560 / 28); // 400
+        let new_patches = (out.width() / 28) * (out.height() / 28);
+        assert!(
+            new_patches * 100 <= orig_patches * 40,
+            "expected >=60% patch reduction on wide-margin crop, got {new_patches} vs {orig_patches}"
+        );
+        // 출력 안에 소수점 포함 어두운 잉크 픽셀이 손실 없이 살아있는지 확인
+        let dark_out = out
+            .to_rgb8()
+            .pixels()
+            .filter(|p| rgb_luma(p.0[0], p.0[1], p.0[2]) < 100)
+            .count();
+        assert!(dark_out > 500, "ink pixels must not be clipped (got {dark_out})");
+    }
+
+    #[test]
+    fn crop_diet_high_dpi_downscales_non_protected_and_protects_signature() {
+        let mut rgb = image::RgbImage::from_pixel(560, 280, image::Rgb([255, 255, 255]));
+        for y in 20..260 {
+            for x in 20..540 {
+                if (y % 28) < 14 && (x % 16) < 10 {
+                    rgb.put_pixel(x, y, image::Rgb([15, 15, 15]));
+                }
+            }
+        }
+        let cfg = CropDietConfig::default();
+        // 고DPI (글자 높이 28px -> 목표 14px -> 0.50x 다운스케일)
+        let shrunk = tighten_and_snap_crop_for_vlm(
+            DynamicImage::ImageRgb8(rgb.clone()),
+            "items",
+            Some(28.0),
+            None,
+            None,
+            &cfg,
+            &|_| {},
+        );
+        assert!(shrunk.width() <= 308 && shrunk.height() <= 168);
+
+        // 보호 영역(signature)은 다운스케일 금지(>= 560x280) + 28px 스냅 유지
+        let prot = tighten_and_snap_crop_for_vlm(
+            DynamicImage::ImageRgb8(rgb),
+            "signature",
+            Some(28.0),
+            None,
+            None,
+            &cfg,
+            &|_| {},
+        );
+        assert_eq!(prot.width(), 560);
+        assert_eq!(prot.height(), 280);
+    }
+
+    #[test]
+    fn lpt_sort_preserves_identity_and_orders_heavy_tables_and_blocks_first() {
+        let mk = |cat: &str, tf: &str, w: u32, h: u32| CropPlan {
+            category: cat.to_string(),
+            bbox: (0, 0, w, h),
+            score: 1.0,
+            margin: 0.5,
+            patch_count: 0,
+            top_field: tf.to_string(),
+            owned_patches: 1,
+            twin_of: String::new(),
+        };
+        let mut plans = vec![
+            mk("dates", "issue_date", 140, 56),
+            mk("parties", "buyer", 280, 140),
+            mk("items", "item_desc", 280, 140),
+            mk("items", "item_qty", 560, 420),
+            mk("header", "doc_number", 280, 56),
+            mk("transport", "port_of_loading", 420, 140),
+        ];
+        sort_plans_lpt(&mut plans, &["items"], "header", "doc_number");
+        let order: Vec<(&str, u32)> = plans.iter().map(|p| (p.category.as_str(), p.bbox.2)).collect();
+        assert_eq!(
+            order,
+            vec![
+                ("header", 280),
+                ("items", 560),     // heavier table first (LPT)
+                ("items", 280),
+                ("transport", 420), // weight 2 heavier first
+                ("parties", 280),   // weight 2
+                ("dates", 140),     // weight 1 last
+            ]
+        );
+    }
+}

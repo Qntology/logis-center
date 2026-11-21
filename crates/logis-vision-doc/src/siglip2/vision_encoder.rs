@@ -185,9 +185,11 @@ fn encode_phrase_rows_with(
     for chunk in phrases.chunks(PHRASE_BATCH_ROWS) {
         let mut batch = tok.encode_batch(chunk)?;
         let g = batch.len();
-        // 마지막 토큰 풀링 뒤 프로젝션 헤드는 [행, D] 행렬곱입니다. 1행이면 CPU gemm · Metal GEMM 이
-        // gemv 경로를 타 다른 비트가 나오므로(M=1 만 다름 — macos-15 · 리눅스 M-불변성 실측) 최소 2행으로 계산합니다.
-        let rows = if fixed_shape { PHRASE_BATCH_ROWS } else { 2 };
+        // 마지막 토큰 풀링 뒤 프로젝션 헤드는 [행, D] 행렬곱입니다. 레거시 CPU gemm · Metal GEMM 은
+        // M=1 gemv 분기로 비트가 달라지므로 최소 2행으로 계산하지만, Part 2 `CpuPacked` 경로는
+        // M=1 특수 분기가 없는 단일 FMA 체인이므로 더미 2행 복제 없이 1행 그대로 비트 동일 실행합니다.
+        let min_rows = if super::quant::cpu_packed_active(&model.device) { 1 } else { 2 };
+        let rows = if fixed_shape { PHRASE_BATCH_ROWS } else { min_rows };
         if g < rows {
             let first = batch[0].clone();
             batch.resize(rows, first);
@@ -293,9 +295,23 @@ pub fn encode_image(
             "SigLIP2 vision encoder is not loaded. Call ensure_siglip2 with needs_vision=true."
         ))?;
 
-    let pre: PreprocessedImage = preprocess_image(image, &model.config, &model.device)?;
-    let px = pre.pixel_values.to_dtype(model.dtype)?;
-    let out = vision.forward(&px, pre.grid_rows, pre.grid_cols)?;
+    let (pre, out) = if super::quant::cpu_packed_active(&model.device) {
+        let pre = super::preprocessor::preprocess_image_patches_1pass(
+            image,
+            &model.config,
+            &model.device,
+        )?;
+        let px = pre.pixel_values.to_dtype(model.dtype)?;
+        let out = vision.forward_patches(&px, pre.grid_rows, pre.grid_cols)?;
+        drop(px);
+        (pre, out)
+    } else {
+        let pre: PreprocessedImage = preprocess_image(image, &model.config, &model.device)?;
+        let px = pre.pixel_values.to_dtype(model.dtype)?;
+        let out = vision.forward(&px, pre.grid_rows, pre.grid_cols)?;
+        drop(px);
+        (pre, out)
+    };
 
     let shared = out.patch_shared.squeeze(0)?.to_dtype(DType::F32)?; // (N, D)
     let mut patches: Vec<Vec<f32>> = shared.to_vec2::<f32>()?;
@@ -310,7 +326,6 @@ pub fn encode_image(
     drop(out);
     drop(shared);
     drop(pooled_t);
-    drop(px);
 
     Ok(PatchGrid {
         patches,
@@ -336,11 +351,23 @@ pub fn encode_image_pooled(
             "SigLIP2 vision encoder is not loaded. Call ensure_siglip2 with needs_vision=true."
         ))?;
 
-    let pre = preprocess_image(image, &model.config, &model.device)?;
-    let px = pre.pixel_values.to_dtype(model.dtype)?;
-    let pooled_t = vision
-        .forward_pooled(&px, pre.grid_rows, pre.grid_cols)?
-        .to_dtype(DType::F32)?;
+    let pooled_t = if super::quant::cpu_packed_active(&model.device) {
+        let pre = super::preprocessor::preprocess_image_patches_1pass(
+            image,
+            &model.config,
+            &model.device,
+        )?;
+        let px = pre.pixel_values.to_dtype(model.dtype)?;
+        vision
+            .forward_pooled_patches(&px, pre.grid_rows, pre.grid_cols)?
+            .to_dtype(DType::F32)?
+    } else {
+        let pre = preprocess_image(image, &model.config, &model.device)?;
+        let px = pre.pixel_values.to_dtype(model.dtype)?;
+        vision
+            .forward_pooled(&px, pre.grid_rows, pre.grid_cols)?
+            .to_dtype(DType::F32)?
+    };
 
     let mut pooled: Vec<f32> = pooled_t.squeeze(0)?.to_vec1::<f32>()?;
     l2_normalize(&mut pooled);

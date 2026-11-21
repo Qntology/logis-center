@@ -9,6 +9,22 @@
 //! or the ISA (FMA is exactly rounded on x86 FMA3 / AVX-512 and AArch64 alike; the scalar fallback
 //! uses `f32::mul_add`).
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub mod attn;
+pub mod image;
+
+static FORCE_SCALAR: AtomicBool = AtomicBool::new(false);
+
+/// Forces scalar FMA path (for Gate 2-A ISA invariance verification against AVX-512 / AVX2).
+pub fn set_force_scalar(force: bool) {
+    FORCE_SCALAR.store(force, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn is_force_scalar() -> bool {
+    FORCE_SCALAR.load(Ordering::Relaxed)
+}
 
 /// Register tile: MR rows × NR columns of accumulators. NR is the packed panel width; MR is
 /// picked per ISA so the accumulators fit the register file (AVX-512: 6×32 = 12 zmm;
@@ -18,6 +34,9 @@ pub const MR_MAX: usize = 6;
 
 /// Rows per register tile on this CPU.
 pub fn mr() -> usize {
+    if is_force_scalar() {
+        return 3;
+    }
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx512f") {
@@ -44,10 +63,13 @@ impl Default for Blocking {
     }
 }
 
-/// W [N, K] repacked once at load into panels of NR output columns, k-major inside a panel:
-/// panel p = [K][NR] with element (k, j) = W[p*NR + j][k].
+/// W [N_valid, K] repacked once at load into panels of NR output columns, k-major inside a panel:
+/// panel p = [K][NR] with element (k, j) = W[p*NR + j][k] (or 0.0 when p*NR + j >= n_valid).
 pub struct PackedW {
+    /// Padded column count (always a multiple of `NR = 32`).
     pub n: usize,
+    /// Logical unpadded output column count (e.g. SigLIP2 MLP 4304 -> padded `n = 4320`).
+    pub n_valid: usize,
     pub k: usize,
     pub panels: Vec<f32>,
 }
@@ -56,30 +78,54 @@ impl PackedW {
     pub fn pack(w: &[f32], n: usize, k: usize) -> Self {
         assert_eq!(w.len(), n * k);
         assert!(n % NR == 0, "N={n} must be a multiple of NR={NR}");
+        Self::pack_padded(w, n, k)
+    }
+
+    /// General-purpose packer allowing arbitrary `n_valid` (e.g. SigLIP2 `4304` -> `4320` with
+    /// 16 zero-padded columns). Zero-padded tail columns never affect valid columns.
+    pub fn pack_padded(w: &[f32], n_valid: usize, k: usize) -> Self {
+        assert_eq!(w.len(), n_valid * k);
+        let n_panels = n_valid.div_ceil(NR);
+        let n = n_panels * NR;
         let mut panels = vec![0f32; n * k];
-        for p in 0..n / NR {
+        for p in 0..n_panels {
             let base = p * k * NR;
+            let col0 = p * NR;
+            let cols = NR.min(n_valid - col0);
             for kk in 0..k {
-                for j in 0..NR {
-                    panels[base + kk * NR + j] = w[(p * NR + j) * k + kk];
+                let dst = &mut panels[base + kk * NR..base + kk * NR + cols];
+                for j in 0..cols {
+                    dst[j] = w[(col0 + j) * k + kk];
                 }
             }
         }
-        Self { n, k, panels }
+        Self { n, n_valid, k, panels }
     }
 
-    /// Interleave two [N, K] weights (gate | up of a GLU) so one tile computes the matching gate
+    /// Interleave two [I, K] weights (gate | up of a GLU) so one tile computes the matching gate
     /// and up columns together: panel 2p = gate cols, panel 2p+1 = up cols.
     pub fn pack_glu(w: &[f32], i: usize, k: usize) -> Self {
         // w = Wi [2I, K]: rows 0..I gate, I..2I up (embedding.rs Mlp narrow order).
-        let gate = Self::pack(&w[..i * k], i, k);
-        let up = Self::pack(&w[i * k..], i, k);
-        let mut panels = Vec::with_capacity(2 * i * k);
-        for p in 0..i / NR {
+        assert_eq!(w.len(), 2 * i * k);
+        Self::pack_glu_pair(&w[..i * k], &w[i * k..], i, k)
+    }
+
+    /// Interleaves separate `gate [i_valid, k]` and `up [i_valid, k]` weights with `NR = 32` zero-pad.
+    pub fn pack_glu_pair(gate_w: &[f32], up_w: &[f32], i_valid: usize, k: usize) -> Self {
+        let gate = Self::pack_padded(gate_w, i_valid, k);
+        let up = Self::pack_padded(up_w, i_valid, k);
+        let n_panels_each = gate.n / NR;
+        let mut panels = Vec::with_capacity(2 * gate.n * k);
+        for p in 0..n_panels_each {
             panels.extend_from_slice(&gate.panels[p * k * NR..(p + 1) * k * NR]);
             panels.extend_from_slice(&up.panels[p * k * NR..(p + 1) * k * NR]);
         }
-        Self { n: 2 * i, k, panels }
+        Self {
+            n: 2 * gate.n,
+            n_valid: 2 * i_valid,
+            k,
+            panels,
+        }
     }
 
     fn panel(&self, p: usize) -> &[f32] {
@@ -134,43 +180,80 @@ unsafe fn tile_avx512(a: &[f32], lda: usize, rows: usize, w: &[f32], k0: usize, 
 
 #[inline]
 fn run_tile(a: &[f32], lda: usize, rows: usize, w: &[f32], k0: usize, k1: usize, acc: &mut [[f32; NR]; MR_MAX]) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx512f") {
-            return unsafe { tile_avx512(a, lda, rows, w, k0, k1, acc) };
-        }
-        if std::is_x86_feature_detected!("fma") && std::is_x86_feature_detected!("avx2") {
-            return unsafe { tile_fma(a, lda, rows, w, k0, k1, acc) };
+    if !is_force_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx512f") {
+                return unsafe { tile_avx512(a, lda, rows, w, k0, k1, acc) };
+            }
+            if std::is_x86_feature_detected!("fma") && std::is_x86_feature_detected!("avx2") {
+                return unsafe { tile_fma(a, lda, rows, w, k0, k1, acc) };
+            }
         }
     }
     tile::<3>(a, lda, rows, w, k0, k1, acc)
 }
 
 /// Epilogue applied to a finished MR×NR tile.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Epilogue {
-    /// out[r, col] = acc
+    /// out[r, col] = acc (+ bias)
     Store,
-    /// Paired panels (gate, up): out[r, col] = silu(gate) * up, out has N/2 columns.
+    /// Paired panels (gate, up): out[r, col] = silu(gate) * up, out has n_valid/2 columns.
     SiluMul,
+    /// out[r, col] = gelu_pytorch_tanh(acc (+ bias))
+    Gelu,
 }
 
-/// out[M, N] (or [M, N/2] for SiluMul) = a[M, K] · Wᵀ. `threads == 1` runs on the caller.
+#[inline(always)]
+fn gelu_tanh(x: f32) -> f32 {
+    // PyTorch / candle exact gelu() tanh approximation:
+    // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    const SQRT_2_OVER_PI: f32 = 0.7978845608028654;
+    0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)).tanh())
+}
+
+/// out[M, N_valid] (or [M, N_valid/2] for SiluMul) = a[M, K] · Wᵀ. `threads == 1` runs on the caller.
 pub fn gemm(a: &[f32], m: usize, w: &PackedW, out: &mut [f32], blk: Blocking, epi: Epilogue, threads: usize) {
-    let (k, n) = (w.k, w.n);
+    gemm_bias(a, m, w, None, out, blk, epi, threads);
+}
+
+/// Generalized packed GEMM with optional `+ bias` epilogue, arbitrary `n_valid` (zero-padded to
+/// `NR=32`), and `Store` / `SiluMul` / `Gelu` fused epilogues. Preserves exact ascending FMA chain.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_bias(
+    a: &[f32],
+    m: usize,
+    w: &PackedW,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+    blk: Blocking,
+    epi: Epilogue,
+    threads: usize,
+) {
+    let (k, n_padded, n_valid) = (w.k, w.n, w.n_valid);
     assert_eq!(a.len(), m * k);
     let out_cols = match epi {
-        Epilogue::Store => n,
-        Epilogue::SiluMul => n / 2,
+        Epilogue::Store | Epilogue::Gelu => n_valid,
+        Epilogue::SiluMul => n_valid / 2,
     };
     assert_eq!(out.len(), m * out_cols);
-    let n_panels = n / NR;
+    if let Some(b) = bias {
+        assert_eq!(b.len(), out_cols);
+    }
+    if m == 0 || out_cols == 0 {
+        return;
+    }
+    let n_panels = n_padded / NR;
     // Task = a group of whole panels (for SiluMul an even number: gate/up pairs stay together).
     let mut per_task = (blk.nc / NR).max(1);
     if matches!(epi, Epilogue::SiluMul) && per_task % 2 == 1 {
         per_task += 1;
     }
-    let tasks: Vec<(usize, usize)> = (0..n_panels).step_by(per_task).map(|p| (p, (p + per_task).min(n_panels))).collect();
+    let tasks: Vec<(usize, usize)> = (0..n_panels)
+        .step_by(per_task)
+        .map(|p| (p, (p + per_task).min(n_panels)))
+        .collect();
     let out_ptr = SendPtr(out.as_mut_ptr());
     let mr = mr();
     let body = |&(p0, p1): &(usize, usize)| {
@@ -186,7 +269,7 @@ pub fn gemm(a: &[f32], m: usize, w: &PackedW, out: &mut [f32], blk: Blocking, ep
                 let mut p = p0;
                 while p < p1 {
                     match epi {
-                        Epilogue::Store => {
+                        Epilogue::Store | Epilogue::Gelu => {
                             let mut acc = [[0f32; NR]; MR_MAX];
                             let mut k0 = 0;
                             while k0 < k {
@@ -194,9 +277,36 @@ pub fn gemm(a: &[f32], m: usize, w: &PackedW, out: &mut [f32], blk: Blocking, ep
                                 run_tile(a_blk, k, rows, w.panel(p), k0, k1, &mut acc);
                                 k0 = k1;
                             }
+                            let col0 = p * NR;
+                            let valid = NR.min(out_cols.saturating_sub(col0));
+                            let is_gelu = matches!(epi, Epilogue::Gelu);
                             for r in 0..rows {
-                                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr.0.add((r0 + r) * out_cols + p * NR), NR) };
-                                dst.copy_from_slice(&acc[r]);
+                                let dst = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        out_ptr.0.add((r0 + r) * out_cols + col0),
+                                        valid,
+                                    )
+                                };
+                                match (bias, is_gelu) {
+                                    (None, false) => dst.copy_from_slice(&acc[r][..valid]),
+                                    (Some(b), false) => {
+                                        let bs = &b[col0..col0 + valid];
+                                        for j in 0..valid {
+                                            dst[j] = acc[r][j] + bs[j];
+                                        }
+                                    }
+                                    (None, true) => {
+                                        for j in 0..valid {
+                                            dst[j] = gelu_tanh(acc[r][j]);
+                                        }
+                                    }
+                                    (Some(b), true) => {
+                                        let bs = &b[col0..col0 + valid];
+                                        for j in 0..valid {
+                                            dst[j] = gelu_tanh(acc[r][j] + bs[j]);
+                                        }
+                                    }
+                                }
                             }
                             p += 1;
                         }
@@ -210,10 +320,16 @@ pub fn gemm(a: &[f32], m: usize, w: &PackedW, out: &mut [f32], blk: Blocking, ep
                                 run_tile(a_blk, k, rows, w.panel(p + 1), k0, k1, &mut u);
                                 k0 = k1;
                             }
-                            let col = (p / 2) * NR;
+                            let col0 = (p / 2) * NR;
+                            let valid = NR.min(out_cols.saturating_sub(col0));
                             for r in 0..rows {
-                                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr.0.add((r0 + r) * out_cols + col), NR) };
-                                for j in 0..NR {
+                                let dst = unsafe {
+                                    std::slice::from_raw_parts_mut(
+                                        out_ptr.0.add((r0 + r) * out_cols + col0),
+                                        valid,
+                                    )
+                                };
+                                for j in 0..valid {
                                     let x = g[r][j];
                                     dst[j] = x / (1.0 + (-x).exp()) * u[r][j];
                                 }
@@ -240,7 +356,7 @@ unsafe impl Send for SendPtr {}
 
 /// RMSNorm of each row (embedding.rs RmsNorm in F32: x / sqrt(mean(x²) + eps) * w), in one pass.
 pub fn rms_norm(x: &[f32], h: usize, w: &[f32], eps: f32, out: &mut [f32]) {
-    for (row, o) in x.chunks_exact(h).zip(out.chunks_exact_mut(h)) {
+    let f = |(row, o): (&[f32], &mut [f32])| {
         let mut ss = 0f32;
         for v in row {
             ss += v * v;
@@ -249,6 +365,171 @@ pub fn rms_norm(x: &[f32], h: usize, w: &[f32], eps: f32, out: &mut [f32]) {
         for j in 0..h {
             o[j] = row[j] / d * w[j];
         }
+    };
+    if x.len() < PAR_MIN_ELEMS {
+        x.chunks_exact(h).zip(out.chunks_exact_mut(h)).for_each(f);
+    } else {
+        x.par_chunks_exact(h).zip(out.par_chunks_exact_mut(h)).for_each(f);
+    }
+}
+
+/// 1-pass RMSNorm with `(1 + w)` offset weight (Qwen3.5 / Qwen4-Exp).
+pub fn rms_norm_1p(x: &[f32], h: usize, w: &[f32], eps: f32, out: &mut [f32]) {
+    let f = |(row, o): (&[f32], &mut [f32])| {
+        let mut ss = 0f32;
+        for v in row {
+            ss += v * v;
+        }
+        let inv = 1.0 / (ss / h as f32 + eps).sqrt();
+        for j in 0..h {
+            o[j] = row[j] * inv * (1.0 + w[j]);
+        }
+    };
+    if x.len() < PAR_MIN_ELEMS {
+        x.chunks_exact(h).zip(out.chunks_exact_mut(h)).for_each(f);
+    } else {
+        x.par_chunks_exact(h).zip(out.par_chunks_exact_mut(h)).for_each(f);
+    }
+}
+
+/// 1-pass per-row LayerNorm (`(x - mean) / sqrt(var + eps) * w + bias`) for SigLIP2 CPU path.
+pub fn layer_norm(x: &[f32], h: usize, w: &[f32], bias: Option<&[f32]>, eps: f32, out: &mut [f32]) {
+    assert_eq!(w.len(), h);
+    if let Some(b) = bias {
+        assert_eq!(b.len(), h);
+    }
+    let inv_h = 1.0 / h as f32;
+    let f = |(row, o): (&[f32], &mut [f32])| {
+        let mut sum = 0f32;
+        for &v in row {
+            sum += v;
+        }
+        let mean = sum * inv_h;
+        let mut var = 0f32;
+        for &v in row {
+            let d = v - mean;
+            var = d.mul_add(d, var);
+        }
+        let inv_std = 1.0 / (var * inv_h + eps).sqrt();
+        match bias {
+            Some(b) => {
+                for j in 0..h {
+                    o[j] = ((row[j] - mean) * inv_std).mul_add(w[j], b[j]);
+                }
+            }
+            None => {
+                for j in 0..h {
+                    o[j] = ((row[j] - mean) * inv_std) * w[j];
+                }
+            }
+        }
+    };
+    if x.len() < PAR_MIN_ELEMS {
+        x.chunks_exact(h).zip(out.chunks_exact_mut(h)).for_each(f);
+    } else {
+        x.par_chunks_exact(h).zip(out.par_chunks_exact_mut(h)).for_each(f);
+    }
+}
+
+/// 1-pass PyTorch tanh-approximation GELU in place.
+pub fn gelu_tanh_inplace(x: &mut [f32]) {
+    if x.len() < PAR_MIN_ELEMS {
+        for v in x.iter_mut() {
+            *v = gelu_tanh(*v);
+        }
+    } else {
+        x.par_chunks_mut(PAR_CHUNK).for_each(|c| {
+            for v in c.iter_mut() {
+                *v = gelu_tanh(*v);
+            }
+        });
+    }
+}
+
+/// Fast SIMD dot product for host-side REST vocabulary rescue (`TrimmedHead::RestRescueGuard`).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32_avx2(a: *const f32, b: *const f32, n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut s0 = _mm256_setzero_ps();
+    let mut s1 = _mm256_setzero_ps();
+    let mut s2 = _mm256_setzero_ps();
+    let mut s3 = _mm256_setzero_ps();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i)), s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 8)), _mm256_loadu_ps(b.add(i + 8)), s1);
+        s2 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 16)), _mm256_loadu_ps(b.add(i + 16)), s2);
+        s3 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i + 24)), _mm256_loadu_ps(b.add(i + 24)), s3);
+        i += 32;
+    }
+    let mut s = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
+    while i + 8 <= n {
+        s = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i)), s);
+        i += 8;
+    }
+    let lo = _mm256_castps256_ps128(s);
+    let hi = _mm256_extractf128_ps(s, 1);
+    let sum4 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(sum4);
+    let sums = _mm_add_ps(sum4, shuf);
+    let shuf2 = _mm_movehl_ps(shuf, sums);
+    let mut total = _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+    while i < n {
+        total = (*a.add(i)).mul_add(*b.add(i), total);
+        i += 1;
+    }
+    total
+}
+
+#[inline]
+pub fn dot_f32_simd(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !is_force_scalar()
+            && std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("fma")
+        {
+            return unsafe { dot_f32_avx2(a.as_ptr(), b.as_ptr(), n) };
+        }
+    }
+    let mut s = 0.0f32;
+    for i in 0..n {
+        s = a[i].mul_add(b[i], s);
+    }
+    s
+}
+
+/// Parallel SIMD dot + deterministic tie-break argmax over dense host rows `[n_rows, d]`.
+/// Used by Part 5 `TrimmedHead::RestRescueGuard` when `rescue_mask == 1` triggers.
+pub fn dot_argmax_rows_f32(x: &[f32], rows: &[f32], n_rows: usize, d: usize) -> Option<(usize, f32)> {
+    if n_rows == 0 || d == 0 {
+        return None;
+    }
+    assert_eq!(x.len(), d);
+    assert_eq!(rows.len(), n_rows * d);
+    let better = |a: (usize, f32), b: (usize, f32)| -> (usize, f32) {
+        if a.1 > b.1 || (a.1 == b.1 && a.0 < b.0) {
+            a
+        } else {
+            b
+        }
+    };
+    if n_rows < 256 {
+        let mut best = (usize::MAX, f32::NEG_INFINITY);
+        for i in 0..n_rows {
+            let v = dot_f32_simd(x, &rows[i * d..(i + 1) * d]);
+            best = better((i, v), best);
+        }
+        Some(best)
+    } else {
+        Some(
+            (0..n_rows)
+                .into_par_iter()
+                .map(|i| (i, dot_f32_simd(x, &rows[i * d..(i + 1) * d])))
+                .reduce(|| (usize::MAX, f32::NEG_INFINITY), better),
+        )
     }
 }
 
@@ -480,5 +761,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn non_aligned_4304_padded_gemm_and_isa_bit_exactness() {
+        // Gate 2-A & 2-B: SigLIP2 MLP 1152 -> 4304 (4304 = 32*134 + 16 -> 4320 zero-pad)
+        // Verify M=1 vs M=5, threads=1 vs threads=4, SIMD vs FORCE_SCALAR are 100% bit-identical!
+        let (k, n_valid) = (64usize, 4304usize);
+        let a = det(5 * k, 41);
+        let w = det(n_valid * k, 42);
+        let b = det(n_valid, 43);
+        let pw = PackedW::pack_padded(&w, n_valid, k);
+        assert_eq!(pw.n, 4320);
+        assert_eq!(pw.n_valid, 4304);
+
+        let mut out_simd = vec![0f32; 5 * n_valid];
+        gemm_bias(&a, 5, &pw, Some(&b), &mut out_simd, Blocking::default(), Epilogue::Store, 4);
+
+        // M=1 single row must match row 0 of M=5 bit-for-bit
+        let mut out_m1 = vec![0f32; n_valid];
+        gemm_bias(&a[..k], 1, &pw, Some(&b), &mut out_m1, Blocking::default(), Epilogue::Store, 1);
+        assert_eq!(bits(&out_m1), bits(&out_simd[..n_valid]));
+
+        // FORCE_SCALAR must match AVX2/AVX-512 bit-for-bit!
+        set_force_scalar(true);
+        let mut out_scalar = vec![0f32; 5 * n_valid];
+        gemm_bias(&a, 5, &pw, Some(&b), &mut out_scalar, Blocking::default(), Epilogue::Store, 1);
+        set_force_scalar(false);
+        assert_eq!(bits(&out_simd), bits(&out_scalar));
+
+        // Fused Gelu epilogue matches Store + gelu_tanh_inplace bit-for-bit
+        let mut out_gelu = vec![0f32; 5 * n_valid];
+        gemm_bias(&a, 5, &pw, Some(&b), &mut out_gelu, Blocking::default(), Epilogue::Gelu, 4);
+        let mut ref_gelu = out_simd.clone();
+        gelu_tanh_inplace(&mut ref_gelu);
+        assert_eq!(bits(&out_gelu), bits(&ref_gelu));
+    }
+
+    #[test]
+    fn layer_norm_and_dot_argmax_rows() {
+        let (rows, h) = (4usize, 1152usize);
+        let x = det(rows * h, 50);
+        let w = det(h, 51);
+        let b = det(h, 52);
+        let mut out = vec![0f32; rows * h];
+        layer_norm(&x, h, &w, Some(&b), 1e-6, &mut out);
+        // Check row 0 vs standalone
+        let mut one = vec![0f32; h];
+        layer_norm(&x[..h], h, &w, Some(&b), 1e-6, &mut one);
+        assert_eq!(bits(&one), bits(&out[..h]));
+
+        // dot_argmax_rows_f32 deterministic tie-break
+        let q = vec![1.0f32; 64];
+        let mut mat = vec![0.0f32; 512 * 64];
+        for &win in &[17usize, 200, 499] {
+            for j in 0..64 {
+                mat[win * 64 + j] = 2.0;
+            }
+        }
+        let (idx, val) = dot_argmax_rows_f32(&q, &mat, 512, 64).unwrap();
+        assert_eq!(idx, 17);
+        assert!((val - 128.0).abs() < 1e-5);
     }
 }

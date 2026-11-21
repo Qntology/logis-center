@@ -242,21 +242,51 @@ impl QsaAttention {
         let sel = self.indexer.select(m, rope, offset)?;
 
         let qg = self.q_proj.forward(m)?.reshape((bsz, t, self.n_heads, 2 * self.hd))?;
-        let q = qg.narrow(3, 0, self.hd)?;
+        let q_raw = qg.narrow(3, 0, self.hd)?;
         let gate = qg.narrow(3, self.hd, self.hd)?.reshape((bsz, t, self.n_heads * self.hd))?;
-        let q = self.q_norm.forward(&q.contiguous()?)?.transpose(1, 2)?; // [B, nH, T, hd]
-        let k = self
-            .k_norm
-            .forward(&self.k_proj.forward(m)?.reshape((bsz, t, self.n_kv, self.hd))?)?
-            .transpose(1, 2)?;
-        let v = self.v_proj.forward(m)?.reshape((bsz, t, self.n_kv, self.hd))?.transpose(1, 2)?;
+        let k_raw = self.k_proj.forward(m)?.reshape((bsz, t, self.n_kv, self.hd))?;
+        let v_raw = self.v_proj.forward(m)?.reshape((bsz, t, self.n_kv, self.hd))?;
 
         let (cos, sin) = rope.slice(offset, t)?;
         let rd = cos.dim(1)?;
-        let (c4, s4) = (cos.reshape((1, 1, t, rd))?, sin.reshape((1, 1, t, rd))?);
-        let q = apply_rope(&q, &c4, &s4)?.contiguous()?;
-        let k = apply_rope(&k, &c4, &s4)?.contiguous()?;
-        let v = v.contiguous()?;
+        let (q, k, v) = if crate::models::common::accel_check::fused_op_ok(
+            q_raw.device(),
+            crate::models::common::accel_check::FusedOpKind::RopeKvWrite,
+            q_raw.dtype(),
+            self.hd,
+        ) {
+            let cos_h = cos.narrow(1, 0, rd / 2)?.contiguous()?;
+            let sin_h = sin.narrow(1, 0, rd / 2)?.contiguous()?;
+            let k_out = Tensor::zeros((bsz, self.n_kv, t, self.hd), k_raw.dtype(), k_raw.device())?;
+            let v_out = Tensor::zeros((bsz, self.n_kv, t, self.hd), v_raw.dtype(), v_raw.device())?;
+            let q_out = candle_core::decoder_ops::rope_kv_write(
+                &q_raw.contiguous()?,
+                &k_raw,
+                &v_raw,
+                candle_core::accel::decoder_ops::HeadLayout::Bshd,
+                candle_core::accel::decoder_ops::HeadLayout::Bhsd,
+                Some(self.q_norm.weight_1p()),
+                Some(self.k_norm.weight_1p()),
+                &cos_h,
+                &sin_h,
+                &k_out,
+                &v_out,
+                0,
+                self.q_norm.eps() as f32,
+                candle_core::accel::decoder_ops::RopeMode::NeoX,
+                false,
+            )?;
+            (q_out, k_out, v_out)
+        } else {
+            let q = self.q_norm.forward(&q_raw.contiguous()?)?.transpose(1, 2)?; // [B, nH, T, hd]
+            let k = self.k_norm.forward(&k_raw)?.transpose(1, 2)?;
+            let v = v_raw.transpose(1, 2)?;
+            let (c4, s4) = (cos.reshape((1, 1, t, rd))?, sin.reshape((1, 1, t, rd))?);
+            let q = apply_rope(&q, &c4, &s4)?.contiguous()?;
+            let k = apply_rope(&k, &c4, &s4)?.contiguous()?;
+            let v = v.contiguous()?;
+            (q, k, v)
+        };
 
         ensure!(
             self.kv.current_seq_len() == offset,

@@ -65,6 +65,8 @@ mod p2b_models;
 mod vocab_trim;
 // FlashAttention / TurboQuant 정확도 teacher-forcing (목업 Qwen3, FA on/off × TQ KV on/off, CPU + GPU)
 mod accel_accuracy;
+// Part 5 & Part 6: 5종 융합 커널 고장 주입 폴백 · Qwen 패밀리 패리티 · 무손실 TrimmedHead CS Guard · Shadow Top-3
+mod fused_gates;
 // 원본에서 한 번 양자화하는 블록 인코더(ggml-kquant) · SigLIP2 정밀도 계획과 지문 (CPU)
 mod pyramid_quant;
 // GPU 메모리 보고 · 반환 · KV 계층 강제 (장치 공통: Metal · Vulkan · CUDA · ROCm)

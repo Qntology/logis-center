@@ -93,7 +93,7 @@ pub fn gdn_forward(
             GdnHeadOrder::Tiled => candle_core::delta_rule::GdnHeadOrder::Tiled,
         },
     };
-    if crate::models::common::gdn_fused_enabled(dev, &fused_cfg) {
+    if crate::models::common::gdn_fused_ready(dev, in_dt, &fused_cfg) {
         let o = candle_core::delta_rule::fused_gated_delta_rule(
             mixed_qkv,
             conv_weight,

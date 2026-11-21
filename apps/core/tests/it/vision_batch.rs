@@ -566,4 +566,176 @@ fn name_residue_trims_only_signature_strokes() {
     assert_eq!(trim_name_residue("doc_number", "-INV-001"), None);
 }
 
+/// Part 2 (Pack D): `SLinear::CpuPacked` + 1-pass patchify + 2-tier streaming attention 검증.
+/// - `weights_tag` 격리 (`cpu-f32-packed` vs 기본 `f32`)
+/// - 텍스트 인코더: M=1 더미 복제 없이도 묶음 vs 1건 비트 동일, 레거시 대비 정밀도 일치
+/// - 비전 인코더(4304 비정렬 폭 · head_dim=72): 1-pass patchify + CpuPacked 결과가 레거시와 일치
+#[test]
+fn siglip2_cpu_packed_invariance_and_tag_isolation() -> anyhow::Result<()> {
+    use candle_nn::{VarBuilder, VarMap};
+    use logis_app::models::siglip2::{
+        quant::{set_cpu_packed_override, weights_tag},
+        text::{Siglip2TextModel, TokenSource},
+        tokenizer::Siglip2Tokenizer,
+        vision::Siglip2VisionModel,
+        vision_encoder::encode_image,
+    };
+
+    struct ResetGuard;
+    impl Drop for ResetGuard {
+        fn drop(&mut self) {
+            set_cpu_packed_override(None);
+        }
+    }
+    let _guard = ResetGuard;
+
+    // 1) weights_tag 격리 확인
+    set_cpu_packed_override(Some(false));
+    assert_eq!(weights_tag(&Device::Cpu), "f32");
+    set_cpu_packed_override(Some(true));
+    assert_eq!(weights_tag(&Device::Cpu), "cpu-f32-packed");
+
+    // 2) 텍스트 인코더: 레거시 vs CpuPacked 정밀도 + M=1 묶음 불변성
+    let dir = TempDir::new("siglip_cpu_packed_tok");
+    write_tokenizer(&dir.0);
+    let cfg = mock_config();
+    let varmap = VarMap::new();
+    let vb_init = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
+    set_cpu_packed_override(Some(false));
+    let _ = Siglip2TextModel::new(&cfg, vb_init, TokenSource::Inline)?;
+    let tensors: std::collections::HashMap<String, Tensor> = varmap
+        .data()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_tensor().clone()))
+        .collect();
+
+    let make_text_model = |packed: bool| -> anyhow::Result<Siglip2Model> {
+        set_cpu_packed_override(Some(packed));
+        let vb = VarBuilder::from_tensors(tensors.clone(), DType::F32, &Device::Cpu);
+        let text = Siglip2TextModel::new(&cfg, vb, TokenSource::Inline)?;
+        let tok = Siglip2Tokenizer::from_dir(&dir.0, cfg.text_pad_token_id, cfg.text_max_positions)?;
+        Ok(Siglip2Model {
+            vision: None,
+            text: Some(text),
+            tokenizer: Some(tok),
+            logit_scale: 0.0,
+            logit_bias: 0.0,
+            device: Device::Cpu,
+            dtype: DType::F32,
+            config: cfg.clone(),
+        })
+    };
+
+    let m_legacy = make_text_model(false)?;
+    let m_packed = make_text_model(true)?;
+    let phrases = mock_phrases(10);
+
+    set_cpu_packed_override(Some(false));
+    let ref_vecs = encode_phrase_rows(&m_legacy, &phrases, false)?;
+
+    set_cpu_packed_override(Some(true));
+    let packed_batch = encode_phrase_rows(&m_packed, &phrases, false)?;
+    let mut max_diff = 0.0f32;
+    for (a, b) in ref_vecs.iter().zip(packed_batch.iter()) {
+        for (x, y) in a.iter().zip(b.iter()) {
+            max_diff = max_diff.max((x - y).abs());
+        }
+    }
+    assert!(max_diff < 1e-4, "text CpuPacked vs legacy max_diff={max_diff}");
+    // M=1 vs batch 비트 동일 (더미 행 복제 제거 검증)
+    for (i, p) in phrases.iter().enumerate() {
+        let single = encode_phrase_rows(&m_packed, std::slice::from_ref(p), false)?.remove(0);
+        let differ = single
+            .iter()
+            .zip(packed_batch[i].iter())
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        assert_eq!(differ, 0, "CpuPacked text M=1 vs batch bit mismatch at row {i}");
+    }
+
+    // 3) 비전 인코더: head_dim=72 (hidden=144, heads=2) + 비정렬 intermediate=272 (32 미배수)
+    let vcfg = Siglip2Config {
+        vision_hidden_size: 144,
+        vision_intermediate_size: 272,
+        vision_num_layers: 1,
+        vision_num_heads: 2,
+        patch_size: 16,
+        max_num_patches: 16,
+        vision_layer_norm_eps: 1e-6,
+        ..cfg
+    };
+    let vvarmap = VarMap::new();
+    let vvb_init = VarBuilder::from_varmap(&vvarmap, DType::F32, &Device::Cpu);
+    set_cpu_packed_override(Some(false));
+    let _ = Siglip2VisionModel::new(&vcfg, vvb_init)?;
+    let vtensors: std::collections::HashMap<String, Tensor> = vvarmap
+        .data()
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_tensor().clone()))
+        .collect();
+
+    set_cpu_packed_override(Some(false));
+    let v_legacy = Siglip2VisionModel::new(&vcfg, VarBuilder::from_tensors(vtensors.clone(), DType::F32, &Device::Cpu))?;
+    let mv_legacy = Siglip2Model {
+        vision: Some(v_legacy),
+        text: None,
+        tokenizer: None,
+        logit_scale: 0.0,
+        logit_bias: 0.0,
+        device: Device::Cpu,
+        dtype: DType::F32,
+        config: vcfg.clone(),
+    };
+
+    set_cpu_packed_override(Some(true));
+    let v_packed = Siglip2VisionModel::new(&vcfg, VarBuilder::from_tensors(vtensors, DType::F32, &Device::Cpu))?;
+    let mv_packed = Siglip2Model {
+        vision: Some(v_packed),
+        text: None,
+        tokenizer: None,
+        logit_scale: 0.0,
+        logit_bias: 0.0,
+        device: Device::Cpu,
+        dtype: DType::F32,
+        config: vcfg,
+    };
+
+    let mut rgb = image::RgbImage::new(64, 64);
+    for (x, y, p) in rgb.enumerate_pixels_mut() {
+        *p = image::Rgb([
+            ((x * 17 + y * 31) % 256) as u8,
+            ((x * 23 + y * 13) % 256) as u8,
+            ((x * 7 + y * 41) % 256) as u8,
+        ]);
+    }
+    let img = image::DynamicImage::ImageRgb8(rgb);
+
+    set_cpu_packed_override(Some(false));
+    let grid_ref = encode_image(&mv_legacy, &img)?;
+    set_cpu_packed_override(Some(true));
+    let grid_packed = encode_image(&mv_packed, &img)?;
+
+    assert_eq!(grid_ref.grid_rows, grid_packed.grid_rows);
+    assert_eq!(grid_ref.grid_cols, grid_packed.grid_cols);
+    assert_eq!(grid_ref.patches.len(), grid_packed.patches.len());
+    let mut vmax = 0.0f32;
+    for (a, b) in grid_ref.patches.iter().zip(grid_packed.patches.iter()) {
+        for (x, y) in a.iter().zip(b.iter()) {
+            vmax = vmax.max((x - y).abs());
+        }
+    }
+    for (x, y) in grid_ref.pooled.iter().zip(grid_packed.pooled.iter()) {
+        vmax = vmax.max((x - y).abs());
+    }
+    println!(
+        "[VISION-PACKED] text max_diff={max_diff:.2e}, vision(head_dim=72, inter=272) max_diff={vmax:.2e}"
+    );
+    assert!(vmax < 1e-4, "vision CpuPacked vs legacy max_diff={vmax}");
+    Ok(())
+}
+
 
