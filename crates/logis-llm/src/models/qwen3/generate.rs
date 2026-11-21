@@ -644,6 +644,70 @@ impl Qwen3GenerateModel {
             }
 
             let single_input = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+            let pure_greedy = mes.temperature.unwrap_or(0.0) <= 0.0
+                && semantic_prejudice_tensor.is_none()
+                && ignore_list.is_none();
+            let fast_tok = if pure_greedy {
+                let last_hidden = self.qwen3.forward_last_hidden(Some(&single_input), None, seqlen_offset)?;
+                let cand = self.qwen3.greedy_from_hidden(&last_hidden)?;
+                let penalty = self.generation_config.repetition_penalty;
+                let recent_start = generate.len().saturating_sub(512);
+                let hit_banned = cand == think_token_id
+                    || (is_strict_json
+                        && (cand == slash_id || cand == double_slash_id || cand == space_double_slash_id))
+                    || (penalty > 1.0 && generate[recent_start..].contains(&cand));
+                if !hit_banned {
+                    Some(cand)
+                } else {
+                    // 희귀 억제/반복 토큰 충돌 시 이미 계산된 last_hidden 으로만 전체 로짓 계산
+                    let logits = self.qwen3.logits_from_hidden(&last_hidden)?;
+                    let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                    let mut logits_vec = logits.to_vec1::<f32>()?;
+                    let len = logits_vec.len();
+                    if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+                    if is_strict_json {
+                        let is_url_single = gen_text.ends_with("http:/") || gen_text.ends_with("https:/");
+                        let is_url_double = gen_text.ends_with("http:") || gen_text.ends_with("https:");
+                        if !is_url_single && gen_text.ends_with('/') && (slash_id as usize) < len {
+                            logits_vec[slash_id as usize] -= 10000.0;
+                        }
+                        if !is_url_double {
+                            if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                            if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                        }
+                    }
+                    if penalty > 1.0 {
+                        for &t in &generate[recent_start..] {
+                            let t_idx = t as usize;
+                            if t_idx < len {
+                                let mut apply_rep_penalty = true;
+                                if is_strict_json {
+                                    if let Ok(piece) = self.tokenizer.token_decode(vec![t]) {
+                                        let p = piece.trim();
+                                        if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                            apply_rep_penalty = false;
+                                        }
+                                    }
+                                }
+                                if apply_rep_penalty {
+                                    if logits_vec[t_idx] <= 0.0 {
+                                        logits_vec[t_idx] *= penalty;
+                                    } else {
+                                        logits_vec[t_idx] /= penalty;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
+                    Some(logit_processor.sample(&logits_tensor)?)
+                }
+            } else {
+                None
+            };
+            if let Some(tok) = fast_tok {
+                next_token = tok;
+            } else {
             let logits = self.qwen3.forward(Some(&single_input), None, seqlen_offset)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
@@ -752,6 +816,7 @@ impl Qwen3GenerateModel {
 
             let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
             next_token = logit_processor.sample(&logits_tensor)?;
+            }
 
             generate.push(next_token);
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
@@ -919,6 +984,70 @@ impl Qwen3GenerateModel {
             }
 
             let single_input = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+            let pure_greedy = mes.temperature.unwrap_or(0.0) <= 0.0
+                && semantic_prejudice_tensor.is_none()
+                && ignore_list.is_none();
+            let fast_tok = if pure_greedy {
+                let last_hidden = self.qwen3.forward_last_hidden(Some(&single_input), None, seqlen_offset)?;
+                let cand = self.qwen3.greedy_from_hidden(&last_hidden)?;
+                let penalty = self.generation_config.repetition_penalty;
+                let recent_start = generate.len().saturating_sub(512);
+                let hit_banned = cand == think_token_id
+                    || (is_strict_json
+                        && (cand == slash_id || cand == double_slash_id || cand == space_double_slash_id))
+                    || (penalty > 1.0 && generate[recent_start..].contains(&cand));
+                if !hit_banned {
+                    Some(cand)
+                } else {
+                    // 희귀 억제/반복 토큰 충돌 시 이미 계산된 last_hidden 으로만 전체 로짓 계산
+                    let logits = self.qwen3.logits_from_hidden(&last_hidden)?;
+                    let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+                    let mut logits_vec = logits.to_vec1::<f32>()?;
+                    let len = logits_vec.len();
+                    if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+                    if is_strict_json {
+                        let is_url_single = gen_text.ends_with("http:/") || gen_text.ends_with("https:/");
+                        let is_url_double = gen_text.ends_with("http:") || gen_text.ends_with("https:");
+                        if !is_url_single && gen_text.ends_with('/') && (slash_id as usize) < len {
+                            logits_vec[slash_id as usize] -= 10000.0;
+                        }
+                        if !is_url_double {
+                            if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                            if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                        }
+                    }
+                    if penalty > 1.0 {
+                        for &t in &generate[recent_start..] {
+                            let t_idx = t as usize;
+                            if t_idx < len {
+                                let mut apply_rep_penalty = true;
+                                if is_strict_json {
+                                    if let Ok(piece) = self.tokenizer.token_decode(vec![t]) {
+                                        let p = piece.trim();
+                                        if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
+                                            apply_rep_penalty = false;
+                                        }
+                                    }
+                                }
+                                if apply_rep_penalty {
+                                    if logits_vec[t_idx] <= 0.0 {
+                                        logits_vec[t_idx] *= penalty;
+                                    } else {
+                                        logits_vec[t_idx] /= penalty;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
+                    Some(logit_processor.sample(&logits_tensor)?)
+                }
+            } else {
+                None
+            };
+            if let Some(tok) = fast_tok {
+                next_token = tok;
+            } else {
             let logits = self.qwen3.forward(Some(&single_input), None, seqlen_offset)?;
             let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
@@ -1028,6 +1157,7 @@ impl Qwen3GenerateModel {
 
             let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
             next_token = logit_processor.sample(&logits_tensor)?;
+            }
             
             generate.push(next_token);
             if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {

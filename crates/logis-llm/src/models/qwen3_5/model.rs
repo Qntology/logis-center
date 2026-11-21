@@ -198,10 +198,26 @@ impl Qwen3_5RMSNorm {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let d = *xs.dims().last().unwrap_or(&0);
+        if crate::models::common::accel_check::fused_op_ok(
+            xs.device(),
+            crate::models::common::accel_check::FusedOpKind::ResidualRmsNorm,
+            xs.dtype(),
+            d,
+        ) {
+            return Ok(candle_core::decoder_ops::rmsnorm_fused(
+                xs,
+                &self.weight,
+                self.eps as f32,
+                false,
+            )?);
+        }
         // F32로 저장된 가중치를 xs(BF16) 타입에 맞춰준 뒤 네이티브 커널 실행!
         let w = self.weight.to_dtype(xs.dtype())?;
         Ok(candle_nn::ops::rms_norm(xs, &w, self.eps as f32)?)
     }
+
+    pub fn weight(&self) -> &Tensor { &self.weight }
 
     pub fn clear(&mut self) {
         self.weight = Tensor::zeros((1,), candle_core::DType::F32, &candle_core::Device::Cpu).unwrap();
@@ -721,7 +737,7 @@ impl Qwen3_5GatedDeltaNet {
 
         // 🌟 [GDN-FUSED] 포크의 융합 커널이 있으면 혼합기 전체(conv·SiLU·L2 norm·게이트·스캔)를 한 번에 계산합니다.
         let gdn_cfg = self.gdn_config();
-        if crate::models::common::gdn_fused_enabled(dev, &gdn_cfg) {
+        if crate::models::common::gdn_fused_ready(dev, dtype, &gdn_cfg) {
             return self.forward_fused(xs, &gdn_cfg);
         }
 
@@ -1119,34 +1135,72 @@ impl Qwen3_5Attention {
             .chunk(2, D::Minus1)?;
             
         
-        let query_states = query_chunk[0].contiguous()?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
+        let q_raw = query_chunk[0].contiguous()?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
         let gate = query_chunk[1].contiguous()?.reshape((b_sz, q_len, ()))?;
-
-        
-        let query_states = self.q_norm.forward(&query_states)?.transpose(1, 2)?.contiguous()?;
-        let key_states = self.k_proj.forward(xs)?
+        let k_raw = self.k_proj.forward(xs)?
             .to_dtype(target_dtype)?
             .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
-        let key_states = self.k_norm.forward(&key_states)?.transpose(1, 2)?.contiguous()?;
-        let value_states = self.v_proj.forward(xs)?
+        let v_raw = self.v_proj.forward(xs)?
             .to_dtype(target_dtype)?
-            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
-        
-        
-        // 전체 차원(256) 중 RoPE 차원(64)만 잘라내서 회전시킨 뒤, 나머지 차원과 다시 결합합니다!
-        let rot_dim = cos.dim(D::Minus1)?;
-        let (query_states, key_states) = if rot_dim < self.head_dim {
-            let q_rot = query_states.narrow(D::Minus1, 0, rot_dim)?;
-            let q_pass = query_states.narrow(D::Minus1, rot_dim, self.head_dim - rot_dim)?;
-            let k_rot = key_states.narrow(D::Minus1, 0, rot_dim)?;
-            let k_pass = key_states.narrow(D::Minus1, rot_dim, self.head_dim - rot_dim)?;
-            
-            let (q_rot, k_rot) = apply_rotary_pos_emb(&q_rot, &k_rot, cos, sin, false)?;
-            
-            (Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?, Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?)
+            .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
+
+        let (query_states, key_states, value_states) = if crate::models::common::accel_check::fused_op_ok(
+            q_raw.device(),
+            crate::models::common::accel_check::FusedOpKind::RopeKvWrite,
+            q_raw.dtype(),
+            self.head_dim,
+        ) {
+            let cos_h = crate::models::common::rope_half_table(cos)?;
+            let sin_h = crate::models::common::rope_half_table(sin)?;
+            let k_out = Tensor::zeros(
+                (b_sz, self.num_key_value_heads, q_len, self.head_dim),
+                target_dtype,
+                q_raw.device(),
+            )?;
+            let v_out = Tensor::zeros(
+                (b_sz, self.num_key_value_heads, q_len, self.head_dim),
+                target_dtype,
+                q_raw.device(),
+            )?;
+            // Qwen3_5RMSNorm.weight 는 이미 (1 + w) 로 사전 가산되어 있으므로 norm_plus_one = false.
+            let q_out = candle_core::decoder_ops::rope_kv_write(
+                &q_raw,
+                &k_raw,
+                &v_raw,
+                candle_core::accel::decoder_ops::HeadLayout::Bshd,
+                candle_core::accel::decoder_ops::HeadLayout::Bhsd,
+                Some(self.q_norm.weight()),
+                Some(self.k_norm.weight()),
+                &cos_h,
+                &sin_h,
+                &k_out,
+                &v_out,
+                0,
+                self.q_norm.eps() as f32,
+                candle_core::accel::decoder_ops::RopeMode::NeoX,
+                false,
+            )?;
+            (q_out, k_out, v_out)
         } else {
-            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?
+            let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?.contiguous()?;
+            let key_states = self.k_norm.forward(&k_raw)?.transpose(1, 2)?.contiguous()?;
+            let value_states = v_raw.transpose(1, 2)?.contiguous()?;
+
+            // 전체 차원(256) 중 RoPE 차원(64)만 잘라내서 회전시킨 뒤, 나머지 차원과 다시 결합합니다!
+            let rot_dim = cos.dim(D::Minus1)?;
+            let (query_states, key_states) = if rot_dim < self.head_dim {
+                let q_rot = query_states.narrow(D::Minus1, 0, rot_dim)?;
+                let q_pass = query_states.narrow(D::Minus1, rot_dim, self.head_dim - rot_dim)?;
+                let k_rot = key_states.narrow(D::Minus1, 0, rot_dim)?;
+                let k_pass = key_states.narrow(D::Minus1, rot_dim, self.head_dim - rot_dim)?;
+
+                let (q_rot, k_rot) = apply_rotary_pos_emb(&q_rot, &k_rot, cos, sin, false)?;
+
+                (Tensor::cat(&[&q_rot, &q_pass], D::Minus1)?, Tensor::cat(&[&k_rot, &k_pass], D::Minus1)?)
+            } else {
+                apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?
+            };
+            (query_states, key_states, value_states)
         };
         
         let dev = xs.device();
@@ -1925,15 +1979,36 @@ impl Qwen3_5DecoderLayer {
         let residual = xs.clone(); // xs는 BF16
         let mut xs = self.input_layernorm.forward(xs)?;
         xs = self.attn.forward(&xs, cos, sin, attention_mask, seqlen_offset)?;
-        
-        // 💡 attn 출력이 F32로 오염되었을 경우를 대비해 BF16으로 내린 뒤 더함
-        let residual = xs.to_dtype(residual.dtype())?.add(&residual)?; 
-        
-        let mut xs = self.post_attention_layernorm.forward(&residual)?;
-        xs = self.mlp.forward(&xs)?;
-        
+
+        let hidden_dim = *residual.dims().last().unwrap_or(&0);
+        let (residual, normed_post) = if crate::models::common::accel_check::fused_op_ok(
+            residual.device(),
+            crate::models::common::accel_check::FusedOpKind::ResidualRmsNorm,
+            residual.dtype(),
+            hidden_dim,
+        ) {
+            let delta = if xs.dtype() != residual.dtype() {
+                xs.to_dtype(residual.dtype())?
+            } else {
+                xs
+            };
+            candle_core::decoder_ops::residual_rmsnorm_inplace(
+                residual,
+                Some(&delta),
+                self.post_attention_layernorm.weight(),
+                self.post_attention_layernorm.eps() as f32,
+                false,
+            )?
+        } else {
+            // 💡 attn 출력이 F32로 오염되었을 경우를 대비해 BF16으로 내린 뒤 더함
+            let r = xs.to_dtype(residual.dtype())?.add(&residual)?;
+            let n = self.post_attention_layernorm.forward(&r)?;
+            (r, n)
+        };
+
+        let mlp_out = self.mlp.forward(&normed_post)?;
         // 💡 mlp 출력(F32 가능성 높음)을 BF16으로 내린 뒤 최종 더하기
-        let xs = xs.to_dtype(residual.dtype())?.add(&residual)?;
+        let xs = mlp_out.to_dtype(residual.dtype())?.add(&residual)?;
         Ok(xs)
     }
 
@@ -2251,22 +2326,7 @@ impl Qwen3_5TextModel {
         };
         
         
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe {
-            extern "C" { fn malloc_trim(pad: usize) -> i32; }
-            malloc_trim(0);
-        }
-        #[cfg(target_os = "macos")]
-        unsafe {
-            extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; }
-            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-        }
+        crate::models::common::legacy_working_set_trim();
 
         let registry = KVRegistry {
             entries: std::sync::Arc::new(std::sync::RwLock::new(
@@ -4134,6 +4194,35 @@ impl Qwen3_5Model {
         session_id: Option<String>,
         kv_name: Option<String>,
     ) -> Result<Tensor> {
+        let hidden_state_aligned = self
+            .forward_last_hidden(
+                input_ids,
+                pixel_values,
+                image_grid_thw,
+                pixel_values_video,
+                video_grid_thw,
+                cache_position,
+                seqlen_offset,
+                session_id,
+                kv_name,
+            )
+            .await?;
+        self.logits_from_hidden(&hidden_state_aligned)
+    }
+
+    /// 마지막 토큰 위치의 F32 정규화 은닉 벡터 `[B, 1, H]` 만 반환합니다 (`lm_head` 생략).
+    pub async fn forward_last_hidden(
+        &mut self,
+        input_ids: &Tensor,
+        pixel_values: Option<&Tensor>,
+        image_grid_thw: Option<&Tensor>,
+        pixel_values_video: Option<&Tensor>,
+        video_grid_thw: Option<&Tensor>,
+        cache_position: Option<&Tensor>,
+        seqlen_offset: usize,
+        session_id: Option<String>,
+        kv_name: Option<String>,
+    ) -> Result<Tensor> {
         let input_ids_cpu = input_ids.to_device(&Device::Cpu)?;
 
         // 🌟 [VISION-JIT + CACHE] 여기서 무조건 mmproj 를 붙이면
@@ -4362,9 +4451,11 @@ impl Qwen3_5Model {
         }
 
         let hidden_state = final_hidden_state.unwrap();
-        
-        
-        let hidden_state_aligned = hidden_state.contiguous()?.to_dtype(DType::F32)?;
+        Ok(hidden_state.contiguous()?.to_dtype(DType::F32)?)
+    }
+
+    /// 정규화된 마지막 은닉 벡터 `[B, 1, H]` → 전체 어휘 로짓 `[B, 1, V]` (CPU).
+    pub fn logits_from_hidden(&mut self, hidden_state_aligned: &Tensor) -> Result<Tensor> {
         // 🌟 [VOCAB TRIM] 남긴 행만 곱하고 장치에서 전체 어휘 길이로 펼칩니다 (잘린 행 −∞). 전체 어휘 경로처럼 CPU 로 돌려줍니다.
         if self.trim_head.is_none() {
             if let Some(src) = self.language_model.embed_tokens.mapped_source().cloned() {
@@ -4373,12 +4464,49 @@ impl Qwen3_5Model {
             }
         }
         if let Some(head) = &self.trim_head {
-            return Ok(head.logits(&hidden_state_aligned)?.to_device(&Device::Cpu)?);
+            return Ok(head.logits(hidden_state_aligned)?.to_device(&Device::Cpu)?);
         }
-        let logits_gpu = self.lm_head.forward(&hidden_state_aligned)?;
-        
-        
+        let logits_gpu = self.lm_head.forward(hidden_state_aligned)?;
         Ok(logits_gpu.to_device(&Device::Cpu)?)
+    }
+
+    /// Part 5 (Pack A·C): 100% 무손실 Greedy 토큰 선택 (Mode B `TrimmedHead::greedy_next_token` 또는 Mode A `fused_linear_argmax_cs`).
+    pub fn greedy_from_hidden(&mut self, hidden_state_aligned: &Tensor) -> Result<u32> {
+        if self.trim_head.is_none() {
+            if let Some(src) = self.language_model.embed_tokens.mapped_source().cloned() {
+                self.trim_head = Some(crate::models::common::vocab_trim::all_rows(&src, hidden_state_aligned.device())?);
+            }
+        }
+        if let Some(head) = &self.trim_head {
+            return Ok(head.greedy_next_token(hidden_state_aligned)?[0]);
+        }
+        if let ProjKind::LinearProj(lin) = &self.lm_head {
+            let dev = hidden_state_aligned.device();
+            let dt = hidden_state_aligned.dtype();
+            let h_dim = *hidden_state_aligned.dims().last().unwrap_or(&0);
+            if crate::models::common::accel_check::fused_op_ok(
+                dev,
+                crate::models::common::accel_check::FusedOpKind::LmHeadArgmaxCs,
+                dt,
+                h_dim,
+            ) {
+                let out = candle_core::lm_head::fused_linear_argmax_cs(
+                    hidden_state_aligned,
+                    lin.weight(),
+                    lin.bias(),
+                    None,
+                    None,
+                )?;
+                return Ok(out.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?[0]);
+            }
+        }
+        let logits = self.logits_from_hidden(hidden_state_aligned)?;
+        let id = logits
+            .to_dtype(DType::F32)?
+            .argmax(D::Minus1)?
+            .flatten_all()?
+            .to_vec1::<u32>()?[0];
+        Ok(id)
     }
 
     /// 매핑된 출력 투영 표 (잘라 내기가 켜진 경우)

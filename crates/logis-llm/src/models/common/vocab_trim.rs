@@ -407,6 +407,314 @@ impl TableSource {
     }
 }
 
+/// Part 5 (Pack A·C): 잘린 REST 어휘의 평균 중심화 Cauchy-Schwarz(CS) 상한 가드 + 호스트 mmap SIMD 구출기.
+///
+/// - GPU 추가 상주: `mu_rest` (~14 KB) + `kept_gpu` (~120-240 KB) 뿐, REST 가중치는 GPU/RAM 에 올리지 않음.
+/// - 호스트 구출: `rescue_mask == 1` 인 희귀 행에서만 이미 열린 `TableSource` mmap 을 스캔해
+///   `embed_cpu_kernels::dot_f32_simd` / `dot_argmax_rows_f32` 로 정확한 REST argmax 를 계산 → 100% 무손실.
+pub struct RestRescueGuard {
+    src: TableSource,
+    pub rest_ids: Arc<Vec<u32>>,
+    pub kept_gpu: Tensor,
+    pub cs_guard: candle_core::lm_head::CsGuardParams,
+}
+
+#[inline]
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x03ff) as u32;
+    let out = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            let mut m = mant;
+            let mut e = 127u32 - 14;
+            while (m & 0x0400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x03ff;
+            sign | (e << 23) | (m << 13)
+        }
+    } else if exp == 0x1f {
+        sign | 0x7f80_0000 | (mant << 13)
+    } else {
+        sign | ((exp + (127 - 15)) << 23) | (mant << 13)
+    };
+    f32::from_bits(out)
+}
+
+#[inline]
+fn decode_q8_0_row(raw: &[u8], out: &mut [f32]) {
+    debug_assert_eq!(raw.len(), (out.len() / 32) * 34);
+    for (blk, dst) in raw.chunks_exact(34).zip(out.chunks_exact_mut(32)) {
+        let d = f16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        for i in 0..32 {
+            dst[i] = (blk[2 + i] as i8) as f32 * d;
+        }
+    }
+}
+
+impl RestRescueGuard {
+    /// `TableSource` mmap 에서 잘린 REST 행을 청크 스트리밍해 `mu_rest` 와 `w_rest_bound` 를 1회 사전 계산합니다.
+    pub fn build(src: &TableSource, kept: &[u32], device: &Device) -> Result<Option<Self>> {
+        if kept.len() >= src.rows {
+            return Ok(None);
+        }
+        let mut is_kept = vec![false; src.rows];
+        for &id in kept {
+            if (id as usize) < src.rows {
+                is_kept[id as usize] = true;
+            }
+        }
+        let rest_ids: Vec<u32> = (0..src.rows as u32)
+            .filter(|&id| !is_kept[id as usize])
+            .collect();
+        if rest_ids.is_empty() {
+            return Ok(None);
+        }
+        let cols = src.cols;
+        let rb = src.row_bytes();
+
+        // Pass 1: mu_rest [cols] (f64 누산 → f32)
+        let sum_f64: Vec<f64> = if src.dtype == GgmlDType::Q8_0 {
+            rest_ids
+                .par_chunks(512)
+                .map(|chunk| {
+                    let mut acc = vec![0.0f64; cols];
+                    let mut row_buf = vec![0.0f32; cols];
+                    for &rid in chunk {
+                        let off = src.start + (rid as usize) * rb;
+                        decode_q8_0_row(&src.map[off..off + rb], &mut row_buf);
+                        for c in 0..cols {
+                            acc[c] += row_buf[c] as f64;
+                        }
+                    }
+                    acc
+                })
+                .reduce(
+                    || vec![0.0f64; cols],
+                    |mut a, b| {
+                        for c in 0..cols {
+                            a[c] += b[c];
+                        }
+                        a
+                    },
+                )
+        } else {
+            let mut acc = vec![0.0f64; cols];
+            for chunk in rest_ids.chunks(512) {
+                let deq = src.gather(chunk, &Device::Cpu)?.dequantize(&Device::Cpu)?;
+                let vals = deq.flatten_all()?.to_vec1::<f32>()?;
+                for row in vals.chunks_exact(cols) {
+                    for c in 0..cols {
+                        acc[c] += row[c] as f64;
+                    }
+                }
+            }
+            acc
+        };
+        let inv_n = 1.0 / (rest_ids.len() as f64);
+        let mu_vec: Vec<f32> = sum_f64.into_iter().map(|s| (s * inv_n) as f32).collect();
+
+        // Pass 2: max_{r in REST} ||w_r - mu_rest||_2
+        let max_norm_sq: f32 = if src.dtype == GgmlDType::Q8_0 {
+            rest_ids
+                .par_chunks(512)
+                .map(|chunk| {
+                    let mut local_max = 0.0f32;
+                    let mut row_buf = vec![0.0f32; cols];
+                    for &rid in chunk {
+                        let off = src.start + (rid as usize) * rb;
+                        decode_q8_0_row(&src.map[off..off + rb], &mut row_buf);
+                        let mut sq = 0.0f32;
+                        for c in 0..cols {
+                            let diff = row_buf[c] - mu_vec[c];
+                            sq = diff.mul_add(diff, sq);
+                        }
+                        if sq > local_max {
+                            local_max = sq;
+                        }
+                    }
+                    local_max
+                })
+                .reduce(|| 0.0f32, f32::max)
+        } else {
+            let mut msq = 0.0f32;
+            for chunk in rest_ids.chunks(512) {
+                let deq = src.gather(chunk, &Device::Cpu)?.dequantize(&Device::Cpu)?;
+                let vals = deq.flatten_all()?.to_vec1::<f32>()?;
+                for row in vals.chunks_exact(cols) {
+                    let mut sq = 0.0f32;
+                    for c in 0..cols {
+                        let diff = row[c] - mu_vec[c];
+                        sq = diff.mul_add(diff, sq);
+                    }
+                    if sq > msq {
+                        msq = sq;
+                    }
+                }
+            }
+            msq
+        };
+
+        let w_rest_bound = max_norm_sq.sqrt() * (1.0 + 1e-3);
+        let mu_rest = Tensor::from_vec(mu_vec, (cols,), device)?;
+        let kept_gpu = Tensor::from_vec(kept.to_vec(), (kept.len(),), device)?;
+        let cs_guard = candle_core::lm_head::CsGuardParams {
+            mu_rest,
+            w_rest_bound,
+            b_rest_max: 0.0,
+        };
+        Ok(Some(Self {
+            src: src.clone(),
+            rest_ids: Arc::new(rest_ids),
+            kept_gpu,
+            cs_guard,
+        }))
+    }
+
+    /// 희귀 구출(`rescue_mask == 1`): 호스트 mmap 의 REST 행을 SIMD(`embed_cpu_kernels`) 로 평가해
+    /// `(best_vocab_id, best_logit)` 을 반환합니다.
+    pub fn eval_rest_best(&self, h_row: &[f32]) -> Result<(u32, f32)> {
+        let cols = self.src.cols;
+        anyhow::ensure!(h_row.len() == cols, "RestRescueGuard: hidden len {} != cols {}", h_row.len(), cols);
+        let rb = self.src.row_bytes();
+        let better = |(i1, v1): (u32, f32), (i2, v2): (u32, f32)| -> (u32, f32) {
+            if v2 > v1 || (v2 == v1 && i2 < i1) { (i2, v2) } else { (i1, v1) }
+        };
+        if self.src.dtype == GgmlDType::Q8_0 {
+            let best = self
+                .rest_ids
+                .par_chunks(512)
+                .map(|chunk| {
+                    let mut best_id = u32::MAX;
+                    let mut best_val = f32::NEG_INFINITY;
+                    let mut row_buf = vec![0.0f32; cols];
+                    for &rid in chunk {
+                        let off = self.src.start + (rid as usize) * rb;
+                        decode_q8_0_row(&self.src.map[off..off + rb], &mut row_buf);
+                        let v = embed_cpu_kernels::dot_f32_simd(h_row, &row_buf);
+                        if v > best_val || (v == best_val && rid < best_id) {
+                            best_val = v;
+                            best_id = rid;
+                        }
+                    }
+                    (best_id, best_val)
+                })
+                .reduce(|| (u32::MAX, f32::NEG_INFINITY), better);
+            Ok(best)
+        } else {
+            let mut best = (u32::MAX, f32::NEG_INFINITY);
+            for chunk in self.rest_ids.chunks(512) {
+                let deq = self.src.gather(chunk, &Device::Cpu)?.dequantize(&Device::Cpu)?;
+                let vals = deq.flatten_all()?.to_vec1::<f32>()?;
+                if let Some((local_idx, local_val)) =
+                    embed_cpu_kernels::dot_argmax_rows_f32(h_row, &vals, chunk.len(), cols)
+                {
+                    if local_idx < chunk.len() {
+                        best = better(best, (chunk[local_idx], local_val));
+                    }
+                }
+            }
+            Ok(best)
+        }
+    }
+}
+
+/// Gate 1-C: Greedy 디코드 스텝의 그림자 Top-3 후보.
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowCandidate {
+    pub token_id: u32,
+    pub logit: f32,
+    pub prob: f32,
+}
+
+/// Gate 1-C: Greedy 디코드 1스텝 결과 (100% 무손실 top-1 + 그림자 top-3 + top-1 확신도).
+#[derive(Debug, Clone)]
+pub struct GreedyShadowStep {
+    pub token_id: u32,
+    pub confidence: f32,
+    pub top3: [Option<ShadowCandidate>; 3],
+    pub rescued: bool,
+}
+
+/// 스택 할당 `SmallVec<[u8; 16]>` 기반 경량 바이트 편집 거리 (최대 허용 거리 `max_dist` 초과 시 조기 종료).
+fn bounded_edit_distance(a: &[u8], b: &[u8], max_dist: usize) -> usize {
+    let n = a.len();
+    let m = b.len();
+    if n.abs_diff(m) > max_dist {
+        return max_dist + 1;
+    }
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut prev: smallvec::SmallVec<[u8; 32]> = (0..=m as u8).collect();
+    let mut curr: smallvec::SmallVec<[u8; 32]> = smallvec::smallvec![0u8; m + 1];
+    for (i, &ac) in a.iter().enumerate() {
+        curr[0] = (i + 1) as u8;
+        let mut row_min = curr[0] as usize;
+        for (j, &bc) in b.iter().enumerate() {
+            let cost = u8::from(ac != bc);
+            let del = prev[j + 1].saturating_add(1);
+            let ins = curr[j].saturating_add(1);
+            let sub = prev[j].saturating_add(cost);
+            let v = del.min(ins).min(sub);
+            curr[j + 1] = v;
+            row_min = row_min.min(v as usize);
+        }
+        if row_min > max_dist {
+            return max_dist + 1;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[m] as usize
+}
+
+/// Gate 1-C: `SmallVec<[u8; 16]>` 무할당 슬라이스 비교로 그림자 Top-3 후보 중
+/// 문서 앵커(`anchor_bytes`)와 편집 거리 1~2 이내로 일치하는 대체 토큰을 고릅니다.
+///
+/// 발동 조건:
+/// - `step.confidence < 0.95` (고확신 스텝은 즉시 건너뜀)
+/// - top-1 자체가 앵커와 정확히 일치하지 않음
+/// - 후보(top-2/top-3) 확률 `>= 0.08`, 바이트 편집 거리 `1..=2`
+pub fn match_shadow_anchor_candidate(
+    step: &GreedyShadowStep,
+    tok: &tokenizers::Tokenizer,
+    anchor_bytes: &[u8],
+) -> Option<u32> {
+    if step.confidence >= 0.95 || anchor_bytes.is_empty() {
+        return None;
+    }
+    let decode_small = |id: u32| -> smallvec::SmallVec<[u8; 16]> {
+        let raw = token_bytes(tok, id);
+        let mut sv = smallvec::SmallVec::<[u8; 16]>::with_capacity(raw.len());
+        sv.extend_from_slice(&raw);
+        sv
+    };
+    let top1_bytes = decode_small(step.token_id);
+    let top1_trimmed = top1_bytes.as_slice();
+    if top1_trimmed == anchor_bytes {
+        return None;
+    }
+    let top1_dist = bounded_edit_distance(top1_trimmed, anchor_bytes, 2);
+    for cand in step.top3.iter().skip(1).flatten() {
+        if cand.prob < 0.08 {
+            continue;
+        }
+        let cand_bytes = decode_small(cand.token_id);
+        let dist = bounded_edit_distance(cand_bytes.as_slice(), anchor_bytes, 2);
+        if dist < top1_dist && (dist == 0 || dist <= 2) {
+            return Some(cand.token_id);
+        }
+    }
+    None
+}
+
 /// 남긴 행만의 출력 투영. 로짓은 전체 어휘 길이로 펼쳐 CPU 에 돌려줍니다 (잘린 행은 −∞).
 /// 복제는 장치의 행렬을 함께 씁니다 (`QMatMul` 의 Arc).
 #[derive(Clone)]
@@ -422,6 +730,8 @@ pub struct TrimmedHead {
     host_inv: Arc<Vec<u32>>,
     /// 덧붙일 −∞ 한 칸 [1, 1]
     pad: Tensor,
+    /// Part 5 (Pack A·C): 무손실 Greedy 디코딩을 위한 REST CS 가드 + 호스트 mmap 구출기.
+    rescue: Option<Arc<RestRescueGuard>>,
 }
 
 impl TrimmedHead {
@@ -435,9 +745,16 @@ impl TrimmedHead {
         let host_inv = Arc::new(inv.clone());
         let inv = Tensor::from_vec(inv, src.rows, device)?;
         let pad = Tensor::full(f32::NEG_INFINITY, (1, 1), device)?;
+        let rescue = RestRescueGuard::build(src, &kept, device)?.map(Arc::new);
         let mb = (kept.len() * src.row_bytes()) as f64 / 1e6;
-        println!("[VOCAB-TRIM] 출력 투영 {} → {} 행 ({mb:.0} MB, {label}) · {:.0} ms", src.rows, kept.len(), t0.elapsed().as_secs_f64() * 1e3);
-        Ok(Self { w: QMatMul::from_qtensor(q)?, kept, vocab: src.rows, label, inv, host_inv, pad })
+        println!(
+            "[VOCAB-TRIM] 출력 투영 {} → {} 행 ({mb:.0} MB, {label}, cs_guard={}) · {:.0} ms",
+            src.rows,
+            kept.len(),
+            if rescue.is_some() { "on" } else { "full" },
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(Self { w: QMatMul::from_qtensor(q)?, kept, vocab: src.rows, label, inv, host_inv, pad, rescue })
     }
 
     /// 입력 임베딩 행: 묶인 표라 남긴 행의 출력 투영과 같은 바이트입니다. `ids` 가 모두 남긴 행에 있을 때만 (아니면 `None`) 장치의
@@ -478,6 +795,170 @@ impl TrimmedHead {
             *last = self.vocab;
         }
         full.reshape(dims)
+    }
+
+    /// Part 5 (Pack A·C): 100% 무손실 Greedy 토큰 선택 (Mode B `logits_argmax_cs` + 희귀 호스트 SIMD 구출).
+    ///
+    /// `[M, V_full]` 로짓 확장 없이 `[M, K]` 서브 로짓에서 즉시 argmax + CS 상한 검증을 수행하고,
+    /// `rescue_mask[r] == 1` 인 행에 한해서만 호스트 mmap REST 행을 SIMD 로 평가해
+    /// 전체 어휘 Greedy 와 100% 동일한 토큰 ID 를 반환합니다.
+    pub fn greedy_next_token(&self, last_hidden: &Tensor) -> Result<Vec<u32>> {
+        self.greedy_next_token_with_stats(last_hidden).map(|(ids, _)| ids)
+    }
+
+    /// [`Self::greedy_next_token`] + `(token_ids, rescued_row_count)` 반환 (검증/관측용).
+    pub fn greedy_next_token_with_stats(&self, last_hidden: &Tensor) -> Result<(Vec<u32>, usize)> {
+        let k_dim = *last_hidden.dims().last().unwrap_or(&0);
+        let m = last_hidden.elem_count() / k_dim.max(1);
+        let h_2d = last_hidden.reshape((m, k_dim))?.contiguous()?;
+        let sub_logits = self.w.forward(&h_2d)?.to_dtype(candle_core::DType::F32)?;
+
+        let use_fused = crate::models::common::accel_check::fused_op_ok(
+            h_2d.device(),
+            crate::models::common::accel_check::FusedOpKind::LmHeadArgmaxCs,
+            h_2d.dtype(),
+            k_dim,
+        );
+        let out = if let Some(guard) = &self.rescue {
+            if use_fused || h_2d.device().is_cpu() {
+                candle_core::lm_head::logits_argmax_cs(
+                    &sub_logits,
+                    Some(&h_2d),
+                    Some(&guard.kept_gpu),
+                    Some(&guard.cs_guard),
+                )?
+            } else {
+                // GPU 융합 커널 비활성 시 CPU 폴백 (무손실 계약 유지)
+                let sub_cpu = sub_logits.to_device(&Device::Cpu)?;
+                let h_cpu = h_2d.to_device(&Device::Cpu)?;
+                let kept_cpu = Tensor::from_vec(self.kept.as_ref().clone(), (self.kept.len(),), &Device::Cpu)?;
+                let guard_cpu = candle_core::lm_head::CsGuardParams {
+                    mu_rest: guard.cs_guard.mu_rest.to_device(&Device::Cpu)?,
+                    w_rest_bound: guard.cs_guard.w_rest_bound,
+                    b_rest_max: guard.cs_guard.b_rest_max,
+                };
+                candle_core::lm_head::logits_argmax_cs(
+                    &sub_cpu,
+                    Some(&h_cpu),
+                    Some(&kept_cpu),
+                    Some(&guard_cpu),
+                )?
+            }
+        } else {
+            candle_core::lm_head::logits_argmax_cs(&sub_logits, None, None, None)?
+        };
+
+        let mut ids = out.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+        let mut rescued = 0usize;
+        if let (Some(guard), Some(mask_t), Some(vals_t)) = (&self.rescue, out.rescue_mask, out.max_vals) {
+            let masks = mask_t.to_device(&Device::Cpu)?.to_vec1::<u8>()?;
+            if masks.iter().any(|&f| f != 0) {
+                let core_vals = vals_t.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+                let h_host = h_2d
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(candle_core::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                for r in 0..m {
+                    if masks[r] != 0 {
+                        rescued += 1;
+                        let h_row = &h_host[r * k_dim..(r + 1) * k_dim];
+                        let (rest_id, rest_val) = guard.eval_rest_best(h_row)?;
+                        let core_id = ids[r];
+                        let core_val = core_vals[r];
+                        if rest_val > core_val || (rest_val == core_val && rest_id < core_id) {
+                            ids[r] = rest_id;
+                        }
+                    }
+                }
+            }
+        }
+        Ok((ids, rescued))
+    }
+
+    /// Gate 1-C: 1스텝 무손실 Greedy + 그림자 Top-3 후보 + 확신도(confidence) 추출.
+    pub fn greedy_with_shadow_top3(&self, last_hidden: &Tensor) -> Result<GreedyShadowStep> {
+        let k_dim = *last_hidden.dims().last().unwrap_or(&0);
+        let h_2d = last_hidden.reshape((1, k_dim))?.contiguous()?;
+        let sub_logits = self.w.forward(&h_2d)?.to_dtype(candle_core::DType::F32)?;
+        let sub_vec = sub_logits.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+
+        // Top-3 CORE 후보 + softmax 정규화 분모 계산
+        let mut top: [(u32, f32); 3] = [(u32::MAX, f32::NEG_INFINITY); 3];
+        let mut max_l = f32::NEG_INFINITY;
+        for (idx, &v) in sub_vec.iter().enumerate() {
+            let vid = self.kept.get(idx).copied().unwrap_or(idx as u32);
+            if v > max_l {
+                max_l = v;
+            }
+            if v > top[0].1 || (v == top[0].1 && vid < top[0].0) {
+                top[2] = top[1];
+                top[1] = top[0];
+                top[0] = (vid, v);
+            } else if v > top[1].1 || (v == top[1].1 && vid < top[1].0) {
+                top[2] = top[1];
+                top[1] = (vid, v);
+            } else if v > top[2].1 || (v == top[2].1 && vid < top[2].0) {
+                top[2] = (vid, v);
+            }
+        }
+
+        // CS Guard 검사 및 희귀 구출
+        let mut rescued = false;
+        if let Some(guard) = &self.rescue {
+            let h_host = h_2d
+                .to_device(&Device::Cpu)?
+                .to_dtype(candle_core::DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let mu_host = guard.cs_guard.mu_rest.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+            let xx = embed_cpu_kernels::dot_f32_simd(&h_host, &h_host);
+            let xm = embed_cpu_kernels::dot_f32_simd(&h_host, &mu_host);
+            let upper = xx.sqrt().mul_add(guard.cs_guard.w_rest_bound, xm) + guard.cs_guard.b_rest_max;
+            if top[0].1 < upper {
+                rescued = true;
+                let (rid, rv) = guard.eval_rest_best(&h_host)?;
+                if rv > max_l {
+                    max_l = rv;
+                }
+                if rv > top[0].1 || (rv == top[0].1 && rid < top[0].0) {
+                    top[2] = top[1];
+                    top[1] = top[0];
+                    top[0] = (rid, rv);
+                } else if rv > top[1].1 || (rv == top[1].1 && rid < top[1].0) {
+                    top[2] = top[1];
+                    top[1] = (rid, rv);
+                } else if rv > top[2].1 || (rv == top[2].1 && rid < top[2].0) {
+                    top[2] = (rid, rv);
+                }
+            }
+        }
+
+        let mut sum_exp = 0.0f64;
+        for &v in &sub_vec {
+            sum_exp += ((v - max_l) as f64).exp();
+        }
+        if rescued && top[0].0 != u32::MAX && self.row_of(top[0].0).is_none() {
+            sum_exp += ((top[0].1 - max_l) as f64).exp();
+        }
+        let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
+
+        let mk = |(id, logit): (u32, f32)| -> Option<ShadowCandidate> {
+            if id == u32::MAX || !logit.is_finite() {
+                None
+            } else {
+                let prob = (((logit - max_l) as f64).exp() * inv_sum) as f32;
+                Some(ShadowCandidate { token_id: id, logit, prob })
+            }
+        };
+        let top3 = [mk(top[0]), mk(top[1]), mk(top[2])];
+        let confidence = top3[0].map_or(0.0, |c| c.prob);
+        Ok(GreedyShadowStep {
+            token_id: top[0].0,
+            confidence,
+            top3,
+            rescued,
+        })
     }
 }
 

@@ -141,18 +141,22 @@ async fn run_synthesis_pass(
             .filter(|(recent, _, _)| *recent >= skip_drop)
             .map(|(recent, _, n)| (recent, n))
     };
-    // 🌟 [SYNTHESIS PRE-LOAD GATE] 게이트는 엔진을 올리기 전에 봅니다 (`lang_llm::SynthesisEntry`).
+    // 🌟 [SYNTHESIS PRE-LOAD GATE] 게이트는 엔진을 올리기 전에 조기 평가합니다 (`evaluate_sds_preload_gate`).
     let routed_lang = verdict.code.is_some();
-    if let Some((recent, n)) = sds_gate(routed_lang) {
-        use crate::model::lang_llm::{synthesis_entry, SynthesisEntry};
+    let resident = model.generation_engine_resident(verdict.code.as_deref()).await;
+    if let Some((entry, left, recent, n)) = crate::model::lang_llm::evaluate_sds_preload_gate(
+        routed_lang,
+        step,
+        skip_drop,
+        resident,
+        verdict.probe,
+    ) {
+        use crate::model::lang_llm::SynthesisEntry;
         let engine = verdict
             .code
             .as_deref()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "Qwen3".to_string());
-        let resident = model.generation_engine_resident(verdict.code.as_deref()).await;
-        let probe_axis = format!("{}|{}", crate::model::lang_llm::synthesis_drop_axis(routed_lang), step);
-        let (entry, left) = synthesis_entry(resident, verdict.probe, &probe_axis);
         if entry == SynthesisEntry::Skip {
             emit_term(&format!(
                 "  ⏭️ [SYNTHESIS PASS / SDS PRE-LOAD] {} 의 최근 요약 문장 {:.0}% 가 원문 대조에서 폐기되었습니다 (관측 {}건, 기준 {:.0}%). {} 는 지금 올라와 있지 않아 요약 {}건을 모델을 올리지 않고 비워 둡니다 — 예전에는 관측용 요약 한 건을 위해 엔진을 올리고(임베딩 반환 · 적재) 나머지를 비웠습니다. 관측용 적재는 {}번 뒤입니다.",

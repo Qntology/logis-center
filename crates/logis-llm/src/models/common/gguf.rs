@@ -355,12 +355,57 @@ impl Module for ExactQLinear {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum ProjKind {
     QuantizedProj(QuantizedLinear),
     LinearProj(Linear),
     /// 🌟 [W8A16] 정확 양자화 선형층 (활성 양자화 없음)
     Exact(ExactQLinear),
+    /// 🌟 [CPU-PACKED] Part 2 CPU F32 패킹 선형층 (NR=32 zero-pad, 단일 오름차순 FMA 체인)
+    CpuPacked {
+        w: std::sync::Arc<embed_cpu_kernels::PackedW>,
+        bias: Option<std::sync::Arc<[f32]>>,
+    },
+}
+
+impl std::fmt::Debug for ProjKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProjKind::QuantizedProj(q) => f.debug_tuple("QuantizedProj").field(q).finish(),
+            ProjKind::LinearProj(l) => f.debug_tuple("LinearProj").field(l).finish(),
+            ProjKind::Exact(e) => f.debug_tuple("Exact").field(e).finish(),
+            ProjKind::CpuPacked { w, .. } => f
+                .debug_struct("CpuPacked")
+                .field("n_valid", &w.n_valid)
+                .field("k", &w.k)
+                .finish(),
+        }
+    }
+}
+
+impl ProjKind {
+    /// `LOGIS_LLM_CPU_PACKED=1` (또는 CPU F32 `Linear`) 일 때 `Linear` 를 `CpuPacked` 로 패킹합니다.
+    pub fn from_linear_maybe_cpu_packed(l: Linear) -> candle_core::Result<Self> {
+        if crate::models::common::llm_cpu_packed_enabled(l.weight().device())
+            && l.weight().dtype() == DType::F32
+        {
+            let w_t = l.weight().contiguous()?;
+            let (out_dim, in_dim) = w_t.dims2()?;
+            let w_vec = w_t.flatten_all()?.to_vec1::<f32>()?;
+            let packed = embed_cpu_kernels::PackedW::pack_padded(&w_vec, out_dim, in_dim);
+            let bias = match l.bias() {
+                Some(b) => Some(std::sync::Arc::<[f32]>::from(
+                    b.to_dtype(DType::F32)?.contiguous()?.to_vec1::<f32>()?,
+                )),
+                None => None,
+            };
+            return Ok(ProjKind::CpuPacked {
+                w: std::sync::Arc::new(packed),
+                bias,
+            });
+        }
+        Ok(ProjKind::LinearProj(l))
+    }
 }
 
 impl Module for ProjKind {
@@ -369,6 +414,34 @@ impl Module for ProjKind {
             ProjKind::QuantizedProj(q) => q.forward(xs),
             ProjKind::LinearProj(l) => l.forward(xs),
             ProjKind::Exact(e) => e.forward(xs),
+            ProjKind::CpuPacked { w, bias } => {
+                let mut dims = xs.dims().to_vec();
+                let k = *dims.last().unwrap_or(&0);
+                if k != w.k {
+                    candle_core::bail!("ProjKind::CpuPacked input dim {k} != {}", w.k);
+                }
+                let m = xs.elem_count() / k.max(1);
+                let x_vec = xs
+                    .to_dtype(DType::F32)?
+                    .contiguous()?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let mut out = vec![0.0f32; m * w.n_valid];
+                embed_cpu_kernels::gemm_bias(
+                    &x_vec,
+                    m,
+                    w,
+                    bias.as_deref(),
+                    &mut out,
+                    embed_cpu_kernels::Blocking::default(),
+                    embed_cpu_kernels::Epilogue::Store,
+                    rayon::current_num_threads().max(1),
+                );
+                if let Some(last) = dims.last_mut() {
+                    *last = w.n_valid;
+                }
+                Tensor::from_vec(out, dims.as_slice(), xs.device())?.to_dtype(xs.dtype())
+            }
         }
     }
 }
@@ -487,9 +560,22 @@ impl GateUpDownMLPGguf {
 
 impl Module for GateUpDownMLPGguf {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let w1 = self.gate_proj.forward(xs)?.apply(&self.act)?;
-        let w3 = self.up_proj.forward(xs)?;
-        self.down_proj.forward(&(w1 * w3)?)
+        let gate = self.gate_proj.forward(xs)?;
+        let up = self.up_proj.forward(xs)?;
+        if matches!(self.act, Activation::Silu) {
+            let inter = *gate.dims().last().unwrap_or(&0);
+            if crate::models::common::accel_check::fused_op_ok(
+                gate.device(),
+                crate::models::common::accel_check::FusedOpKind::SiluMul,
+                gate.dtype(),
+                inter,
+            ) {
+                let mid = candle_core::decoder_ops::silu_mul(&gate, &up)?;
+                return self.down_proj.forward(&mid);
+            }
+        }
+        let w1 = gate.apply(&self.act)?;
+        self.down_proj.forward(&(w1 * up)?)
     }
 }
 

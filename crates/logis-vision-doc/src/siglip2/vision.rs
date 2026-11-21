@@ -2,18 +2,18 @@ use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 
 use super::gguf::MappedGguf;
-use super::quant::{linear, SLinear};
+use super::quant::{cpu_packed_active, fast_layer_norm, linear, SLinear};
 use super::Siglip2Config;
 
 pub struct Siglip2PatchEmbedding {
-    projection: Linear,
+    projection: SLinear,
     patch_size: usize,
 }
 
 impl Siglip2PatchEmbedding {
     pub fn new(config: &Siglip2Config, vb: VarBuilder) -> Result<Self> {
         let in_dim = config.patch_size * config.patch_size * 3;
-        let projection = candle_nn::linear(in_dim, config.vision_hidden_size, vb)?;
+        let projection = linear(&vb, None, in_dim, config.vision_hidden_size)?;
         Ok(Self {
             projection,
             patch_size: config.patch_size,
@@ -36,6 +36,11 @@ impl Siglip2PatchEmbedding {
         let x = x.reshape((b, nh * nw, p * p * c))?;
 
         self.projection.forward(&x)
+    }
+
+    /// 1-Pass SIMD `preprocess_image_patches_1pass` 출력 `(b, N, p*p*3)` 을 reshape/permute 없이 바로 투영합니다.
+    pub fn forward_patches(&self, flat_patches: &Tensor) -> Result<Tensor> {
+        self.projection.forward(flat_patches)
     }
 }
 
@@ -70,13 +75,44 @@ impl Siglip2Attention {
         })
     }
 
-    /// 입력: (1, seq_len, hidden_size) → 출력: (1, seq_len, hidden_size)
+    /// 입력: (b, seq_len, hidden_size) → 출력: (b, seq_len, hidden_size)
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, seq_len, _hidden) = x.dims3()?;
+        let (b, seq_len, hidden) = x.dims3()?;
 
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
+
+        // Part 2 (Pack D): CPU F32 패킹 모드에서는 N×N 점수 행렬과 4회 transpose 복사 없이
+        // 64-Key 패널 스트리밍 어텐션(head_dim=72 64+8 2단 SIMD)으로 직결합니다.
+        if cpu_packed_active(x.device()) && x.dtype() == DType::F32 {
+            let qv = q.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let kv = k.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let vv = v.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let stride = seq_len * hidden;
+            let mut out = vec![0.0f32; b * stride];
+            let cfg = embed_cpu_kernels::attn::CpuStreamAttnCfg {
+                num_heads: self.num_heads,
+                num_kv_heads: self.num_heads,
+                head_dim: self.head_dim,
+                scale: 1.0 / (self.head_dim as f32).sqrt(),
+                causal: false,
+                past_offset: 0,
+            };
+            for bi in 0..b {
+                embed_cpu_kernels::attn::stream_attention_f32(
+                    &qv[bi * stride..(bi + 1) * stride],
+                    &kv[bi * stride..(bi + 1) * stride],
+                    &vv[bi * stride..(bi + 1) * stride],
+                    seq_len,
+                    seq_len,
+                    &cfg,
+                    &mut out[bi * stride..(bi + 1) * stride],
+                );
+            }
+            let attn_output = Tensor::from_vec(out, (b, seq_len, hidden), x.device())?;
+            return self.out_proj.forward(&attn_output);
+        }
 
         // 멀티헤드 분할: (1, seq, hidden) → (1, num_heads, seq, head_dim)
         let q = q
@@ -132,8 +168,7 @@ impl Siglip2MLP {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.fc1.forward(x)?;
-        let x = x.gelu()?;
+        let x = self.fc1.forward_gelu(x)?;
         self.fc2.forward(&x)
     }
 }
@@ -170,13 +205,13 @@ impl Siglip2EncoderLayer {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Self-Attention + 잔차 연결
         let residual = x;
-        let x = self.layer_norm1.forward(x)?;
+        let x = fast_layer_norm(&self.layer_norm1, x, 1e-6)?;
         let x = self.self_attn.forward(&x)?;
         let x = (x + residual)?;
 
         // MLP + 잔차 연결
         let residual = &x;
-        let x = self.layer_norm2.forward(&x)?;
+        let x = fast_layer_norm(&self.layer_norm2, &x, 1e-6)?;
         let x = self.mlp.forward(&x)?;
         let x = (x + residual)?;
 
@@ -234,10 +269,15 @@ impl Siglip2AttentionPoolingHead {
             let in_proj_weight = attn_vb.get((3 * hidden, hidden), "in_proj_weight")?;
             let in_proj_bias = attn_vb.get(3 * hidden, "in_proj_bias")?;
             let slot = |s: usize| -> Result<SLinear> {
-                Ok(SLinear::Dense(Linear::new(
+                let lin = Linear::new(
                     in_proj_weight.narrow(0, s * hidden, hidden)?.contiguous()?,
                     Some(in_proj_bias.narrow(0, s * hidden, hidden)?.contiguous()?),
-                )))
+                );
+                if cpu_packed_active(vb.device()) {
+                    SLinear::from_linear_cpu_packed(&lin)
+                } else {
+                    Ok(SLinear::Dense(lin))
+                }
             };
             [slot(0)?, slot(1)?, slot(2)?]
         };
@@ -267,7 +307,7 @@ impl Siglip2AttentionPoolingHead {
     /// 헤드의 잔차 블록. (attention 이후 / 패치 투영 이후 공통)
     fn residual_block(&self, x: &Tensor) -> Result<Tensor> {
         let residual = x.clone();
-        let h = self.layernorm.forward(x)?;
+        let h = fast_layer_norm(&self.layernorm, x, 1e-6)?;
         residual + self.mlp.forward(&h)?
     }
 
@@ -478,15 +518,12 @@ impl Siglip2VisionModel {
 
     /// 🌟 [TRUNK] 패치 임베딩 → 위치 보간 → 27층 → post LayerNorm.
     ///    forward 와 forward_pooled 가 공유하는 공통 경로입니다.
-    fn trunk(
+    fn trunk_from_embedded(
         &self,
-        pixel_values: &Tensor,
+        mut x: Tensor,
         grid_rows: usize,
         grid_cols: usize,
     ) -> Result<Tensor> {
-        // 1. 패치 임베딩 (Linear)
-        let mut x = self.patch_embedding.forward(pixel_values)?;
-
         // 2. 위치 임베딩 bilinear 보간 후 덧셈 (격자별로 한 번 보간)
         let pos = self.pos_for(grid_rows, grid_cols)?;
         x = (x + pos)?;
@@ -497,7 +534,47 @@ impl Siglip2VisionModel {
         }
 
         // 4. post LayerNorm
-        self.post_layernorm.forward(&x)
+        fast_layer_norm(&self.post_layernorm, &x, 1e-6)
+    }
+
+    fn trunk(
+        &self,
+        pixel_values: &Tensor,
+        grid_rows: usize,
+        grid_cols: usize,
+    ) -> Result<Tensor> {
+        let x = self.patch_embedding.forward(pixel_values)?;
+        self.trunk_from_embedded(x, grid_rows, grid_cols)
+    }
+
+    /// 1-Pass SIMD 패치 `(1, N, p*p*3)` 을 받아 전체 비전 순전파를 수행합니다.
+    pub fn forward_patches(
+        &self,
+        flat_patches: &Tensor,
+        grid_rows: usize,
+        grid_cols: usize,
+    ) -> Result<VisionForward> {
+        let x = self.patch_embedding.forward_patches(flat_patches)?;
+        let patch_hidden = self.trunk_from_embedded(x, grid_rows, grid_cols)?;
+        let pooled = self.head.pool(&patch_hidden)?;
+        let patch_shared = self.head.project_patches(&patch_hidden)?;
+        Ok(VisionForward {
+            patch_hidden,
+            patch_shared,
+            pooled,
+        })
+    }
+
+    /// 1-Pass SIMD 패치 `(1, N, p*p*3)` 에서 풀링 벡터만 산출합니다.
+    pub fn forward_pooled_patches(
+        &self,
+        flat_patches: &Tensor,
+        grid_rows: usize,
+        grid_cols: usize,
+    ) -> Result<Tensor> {
+        let x = self.patch_embedding.forward_patches(flat_patches)?;
+        let patch_hidden = self.trunk_from_embedded(x, grid_rows, grid_cols)?;
+        self.head.pool(&patch_hidden)
     }
 
     /// 핵심 순전파.

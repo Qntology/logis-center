@@ -2,7 +2,7 @@ use candle_core::{Result, Tensor};
 use candle_nn::{Embedding, Module, VarBuilder};
 
 use super::gguf::MappedGguf;
-use super::quant::{linear, SLinear};
+use super::quant::{cpu_packed_active, fast_layer_norm, linear, SLinear};
 use super::Siglip2Config;
 
 /// 토큰 임베딩 표를 어디에 둘지
@@ -184,7 +184,7 @@ impl Siglip2TextModel {
         }
 
         // 5. 최종 LayerNorm
-        let x = self.final_layernorm.forward(&x)?;
+        let x = fast_layer_norm(&self.final_layernorm, &x, 1e-6)?;
 
         // 6. 마지막 토큰 풀링
         let pooled = x.narrow(1, seq_len - 1, 1)?.squeeze(1)?.contiguous()?; // (b, D)
@@ -253,12 +253,12 @@ impl TextEncoderLayer {
 
     pub fn forward(&self, x: &Tensor, additive_mask: Option<&Tensor>) -> Result<Tensor> {
         let residual = x;
-        let h = self.layer_norm1.forward(x)?;
+        let h = fast_layer_norm(&self.layer_norm1, x, 1e-6)?;
         let h = self.self_attn.forward(&h, additive_mask)?;
         let x = (h + residual)?;
 
         let residual = &x;
-        let h = self.layer_norm2.forward(&x)?;
+        let h = fast_layer_norm(&self.layer_norm2, &x, 1e-6)?;
         let h = self.mlp.forward(&h)?;
         let x = (h + residual)?;
 
@@ -283,22 +283,58 @@ impl TextAttention {
     }
 
     pub fn forward(&self, x: &Tensor, additive_mask: Option<&Tensor>) -> Result<Tensor> {
-        let (b, seq_len, _) = x.dims3()?;
-        let q = self
-            .q_proj
-            .forward(x)?
+        let (b, seq_len, hidden) = x.dims3()?;
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+
+        // Part 2 (Pack D): CPU F32 패킹 모드에서 64-Key 스트리밍 어텐션 직결 (N×N 할당 · 4회 transpose 제거)
+        if cpu_packed_active(x.device()) && x.dtype() == candle_core::DType::F32 {
+            let qv = q.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let kv = k.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let vv = v.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let mask_vec: Option<Vec<f32>> = match additive_mask {
+                Some(m) => Some(m.contiguous()?.flatten_all()?.to_vec1::<f32>()?),
+                None => None,
+            };
+            let stride = seq_len * hidden;
+            let mut out = vec![0.0f32; b * stride];
+            let cfg = embed_cpu_kernels::attn::CpuStreamAttnCfg {
+                num_heads: self.num_heads,
+                num_kv_heads: self.num_heads,
+                head_dim: self.head_dim,
+                scale: 1.0 / (self.head_dim as f32).sqrt(),
+                causal: false,
+                past_offset: 0,
+            };
+            for bi in 0..b {
+                let km = mask_vec
+                    .as_deref()
+                    .map(|mv| &mv[bi * seq_len..(bi + 1) * seq_len]);
+                embed_cpu_kernels::attn::stream_attention_f32_masked(
+                    &qv[bi * stride..(bi + 1) * stride],
+                    &kv[bi * stride..(bi + 1) * stride],
+                    &vv[bi * stride..(bi + 1) * stride],
+                    seq_len,
+                    seq_len,
+                    &cfg,
+                    km,
+                    &mut out[bi * stride..(bi + 1) * stride],
+                );
+            }
+            let out_t = Tensor::from_vec(out, (b, seq_len, hidden), x.device())?;
+            return self.out_proj.forward(&out_t);
+        }
+
+        let q = q
             .reshape((b, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        let k = self
-            .k_proj
-            .forward(x)?
+        let k = k
             .reshape((b, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        let v = self
-            .v_proj
-            .forward(x)?
+        let v = v
             .reshape((b, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
@@ -331,9 +367,8 @@ impl TextMLP {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // 🌟 hidden_act = "gelu_pytorch_tanh" → candle 의 gelu() (tanh 근사)
-        let x = self.fc1.forward(x)?;
-        let x = x.gelu()?;
+        // 🌟 hidden_act = "gelu_pytorch_tanh" → CpuPacked 시 1-pass GEMM+bias+GELU 에필로그
+        let x = self.fc1.forward_gelu(x)?;
         self.fc2.forward(&x)
     }
 }

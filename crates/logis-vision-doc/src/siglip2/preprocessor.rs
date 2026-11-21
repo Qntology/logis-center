@@ -99,6 +99,81 @@ pub fn preprocess_image(
     })
 }
 
+/// Part 2 (Pack D): CPU 단일 패스 SIMD 패치 추출 및 정규화.
+/// 중간 `(1, 3, H, W)` CHW 버퍼와 6D permute/contiguous 복사 없이 곧바로
+/// `(1, grid_rows * grid_cols, patch_size * patch_size * 3)` F32 패치 텐서를 생성합니다.
+pub fn preprocess_image_patches_1pass(
+    image: &DynamicImage,
+    config: &Siglip2Config,
+    device: &Device,
+) -> Result<PreprocessedImage> {
+    let orig_width = image.width();
+    let orig_height = image.height();
+
+    let patch_size = config.patch_size;
+    let max_patches = config.max_num_patches;
+
+    let scaled_dim = |scale: f64, size: u32| -> usize {
+        let scaled = scale * size as f64;
+        let divisible = (scaled / patch_size as f64).ceil() as usize * patch_size;
+        divisible.max(patch_size)
+    };
+
+    let eps = 1e-5f64;
+    let mut scale_min = eps;
+    let mut scale_max = 100.0f64;
+    while (scale_max - scale_min) >= eps {
+        let scale = (scale_min + scale_max) / 2.0;
+        let th = scaled_dim(scale, orig_height);
+        let tw = scaled_dim(scale, orig_width);
+        let n = (th / patch_size) * (tw / patch_size);
+        if n <= max_patches {
+            scale_min = scale;
+        } else {
+            scale_max = scale;
+        }
+    }
+
+    let target_h = scaled_dim(scale_min, orig_height);
+    let target_w = scaled_dim(scale_min, orig_width);
+    let grid_rows = (target_h / patch_size).max(1);
+    let grid_cols = (target_w / patch_size).max(1);
+    let resized_w = grid_cols * patch_size;
+    let resized_h = grid_rows * patch_size;
+
+    let scale_x = orig_width as f64 / resized_w as f64;
+    let scale_y = orig_height as f64 / resized_h as f64;
+    let resized = image.resize_exact(
+        resized_w as u32,
+        resized_h as u32,
+        image::imageops::FilterType::Triangle,
+    );
+    let rgb = resized.to_rgb8();
+    let patch_dim = patch_size * patch_size * 3;
+    let num_patches = grid_rows * grid_cols;
+    let mut patches = vec![0.0f32; num_patches * patch_dim];
+    embed_cpu_kernels::image::patchify_norm_hwc_u8_f32(
+        rgb.as_raw(),
+        resized_w,
+        resized_h,
+        patch_size,
+        1,
+        [0.5, 0.5, 0.5],
+        [0.5, 0.5, 0.5],
+        &mut patches,
+    );
+    let pixel_values = Tensor::from_vec(patches, (1, num_patches, patch_dim), device)?;
+    Ok(PreprocessedImage {
+        pixel_values,
+        grid_cols,
+        grid_rows,
+        scale_x,
+        scale_y,
+        orig_width,
+        orig_height,
+    })
+}
+
 pub fn patch_index_to_bbox(
     patch_idx: usize,
     grid_cols: usize,

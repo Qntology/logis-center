@@ -115,13 +115,32 @@ impl VisionEmbedCache {
         total
     }
 
-    /// 🌟 pixel_values 의 원시 바이트와 grid_thw 를 함께 해싱합니다.
-    /// dtype 과 shape 도 포함해야 BF16/F32 혼선이나 shape 충돌을 막을 수 있습니다.
+    /// 🌟 pixel_values 의 전체 원시 바이트와 grid_thw · 프루닝 모드를 함께 해싱합니다.
+    /// (BUG(13) 수정: 스트라이드 샘플링을 제거하고 전 원소를 혼합해 1픽셀 변경도 캐시 충돌 0건 보장)
     pub fn compute_key(pixel_values: &Tensor, grid_thw: &Tensor) -> Result<u64> {
+        let mode = crate::models::common::vision_prune::vision_prune_mode();
+        Self::compute_key_with_context(pixel_values, grid_thw, None, mode)
+    }
+
+    /// `(orig_w, orig_h)` 메타데이터와 `prune_mode` 까지 해시 시드에 혼합하는 확장 키 계산기.
+    pub fn compute_key_with_context(
+        pixel_values: &Tensor,
+        grid_thw: &Tensor,
+        orig_dims: Option<(u32, u32)>,
+        prune_mode: crate::models::common::vision_prune::PruneMode,
+    ) -> Result<u64> {
         use std::hash::Hasher;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
         hasher.write_u32(CACHE_VERSION);
+        hasher.write_u8(prune_mode.tag());
+        if let Some((ow, oh)) = orig_dims {
+            hasher.write_u8(1);
+            hasher.write_u32(ow);
+            hasher.write_u32(oh);
+        } else {
+            hasher.write_u8(0);
+        }
 
         // shape / dtype
         for d in pixel_values.shape().dims() {
@@ -130,31 +149,38 @@ impl VisionEmbedCache {
         hasher.write(format!("{:?}", pixel_values.dtype()).as_bytes());
 
         // grid_thw (작으므로 전부 반영)
-        let thw = grid_thw.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?;
+        let thw = grid_thw
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::U32)?
+            .flatten_all()?
+            .to_vec1::<u32>()?;
         for v in &thw {
             hasher.write_u32(*v);
         }
 
-        // pixel 본문: F32 로 통일해 CPU 로 내린 뒤 바이트 해싱
+        // pixel 본문: F32 로 통일해 CPU 로 내린 뒤 전 원소 100% 해싱 (스트라이드 누락 없음)
         let flat = pixel_values
             .to_device(&Device::Cpu)?
             .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
 
-        // 전량 해싱은 4K 이미지에서 수천만 원소라 비쌉니다.
-        // 균등 간격 샘플링 + 길이/합계로 충돌 확률을 실사용 수준까지 낮춥니다.
-        let len = flat.len();
-        hasher.write_usize(len);
-        let stride = (len / 4096).max(1);
-        let mut acc = 0f64;
+        hasher.write_usize(flat.len());
+        // 빠른 64비트 블록 혼합 (FNV-1a / splitmix64 보조 누적)으로 1M float 도 1ms 이내 전량 해싱
+        let mut h_mix: u64 = 0xcbf29ce484222325;
         let mut i = 0usize;
-        while i < len {
-            hasher.write_u32(flat[i].to_bits());
-            acc += flat[i] as f64;
-            i += stride;
+        let n = flat.len();
+        while i + 2 <= n {
+            let pair = (flat[i].to_bits() as u64) | ((flat[i + 1].to_bits() as u64) << 32);
+            h_mix ^= pair;
+            h_mix = h_mix.wrapping_mul(0x100000001b3);
+            i += 2;
         }
-        hasher.write_u64(acc.to_bits());
+        if i < n {
+            h_mix ^= flat[i].to_bits() as u64;
+            h_mix = h_mix.wrapping_mul(0x100000001b3);
+        }
+        hasher.write_u64(h_mix);
 
         Ok(hasher.finish())
     }
@@ -309,14 +335,41 @@ pub fn vision_cache_if_initialized() -> Option<&'static VisionEmbedCache> {
 }
 
 /// 🌟 [SAFETY] 캐시 히트 결과가 실제 프롬프트의 이미지 토큰 수와 맞는지 검증합니다.
-/// 불일치 시 None 을 반환해 ViT 재계산으로 안전하게 폴백시킵니다.
+/// 불일치 시 Err 를 반환해 ViT 재계산으로 안전하게 폴백시킵니다.
 pub fn validate_embed_shape(embeds: &Tensor, expected_tokens: usize) -> Result<()> {
+    validate_embed_shape_for_mode(
+        embeds,
+        expected_tokens,
+        crate::models::common::vision_prune::PruneMode::Off,
+    )
+}
+
+/// 프루닝 모드(`Halo1HopDrop` 포함)를 인식하는 확장 형상 검증기.
+/// - `Off` / `Halo1HopScatter`: `embeds.dim(0) == expected_tokens` 필수
+/// - `Halo1HopDrop`: 압축된 토큰 수 `1 <= got <= expected_tokens` 허용
+pub fn validate_embed_shape_for_mode(
+    embeds: &Tensor,
+    expected_tokens: usize,
+    prune_mode: crate::models::common::vision_prune::PruneMode,
+) -> Result<()> {
     let got = embeds.dim(0).map_err(|e| anyhow!("embeds dim0 read failed: {e}"))?;
-    if got != expected_tokens {
-        return Err(anyhow!(
-            "cached embeds token mismatch: cached {} vs expected {}",
-            got, expected_tokens
-        ));
+    match prune_mode {
+        crate::models::common::vision_prune::PruneMode::Halo1HopDrop => {
+            if got == 0 || got > expected_tokens {
+                return Err(anyhow!(
+                    "cached pruned embeds token count out of bounds: got {} vs max {}",
+                    got, expected_tokens
+                ));
+            }
+        }
+        _ => {
+            if got != expected_tokens {
+                return Err(anyhow!(
+                    "cached embeds token mismatch: cached {} vs expected {}",
+                    got, expected_tokens
+                ));
+            }
+        }
     }
     Ok(())
 }

@@ -24,6 +24,53 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// 자가 검증·실측 감시를 끄는 환경 변수 (`off` / `0` / `false`)
 pub const CHECK_ENV: &str = "LOGIS_ACCEL_CHECK";
+/// Part 5 (Pack C): 융합 디코더·GDN·lm_head 커널 스위치 (`off` 또는 `-rope_kv,-silu_mul,...`)
+pub const FUSED_OPS_ENV: &str = "LOGIS_FUSED_OPS";
+
+/// Part 5 (Pack C): 자가 검증 및 자동 폴백 대상 융합 연산 5종.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FusedOpKind {
+    ResidualRmsNorm,
+    SiluMul,
+    RopeKvWrite,
+    GatedDeltaRule,
+    LmHeadArgmaxCs,
+}
+
+impl FusedOpKind {
+    pub const ALL: [FusedOpKind; 5] = [
+        FusedOpKind::ResidualRmsNorm,
+        FusedOpKind::SiluMul,
+        FusedOpKind::RopeKvWrite,
+        FusedOpKind::GatedDeltaRule,
+        FusedOpKind::LmHeadArgmaxCs,
+    ];
+
+    pub fn token(self) -> &'static str {
+        match self {
+            FusedOpKind::ResidualRmsNorm => "res_rmsnorm",
+            FusedOpKind::SiluMul => "silu_mul",
+            FusedOpKind::RopeKvWrite => "rope_kv",
+            FusedOpKind::GatedDeltaRule => "gdn",
+            FusedOpKind::LmHeadArgmaxCs => "lm_head",
+        }
+    }
+}
+
+/// Gate 5-A 테스트용 고장 주입 모드 (`set_fused_op_fault`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultMode {
+    ReturnError,
+    Panic,
+    BadOutput,
+}
+
+/// 프로세스 내 테스트용 `LOGIS_FUSED_OPS` 강제 스위치.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusedOpsOverride {
+    AllOff,
+    AllOn,
+}
 /// 실측 감시: 압축 캐시 어텐션의 상대오차가 이 값을 넘으면 커널 오동작 수준으로 보고 TurboQuant 를 끕니다.
 /// (참고: Qwen 류 합성 데이터에서 FP8 ≈ 4–6%, 4bit(NVFP4 / TurboQuant 4bit) ≈ 17–27%, 커널 오류는 보통 50% 이상)
 pub const PROBE_BROKEN_REL: f32 = 0.5;
@@ -74,7 +121,88 @@ struct DeviceState {
     tq: HashMap<usize, bool>,
     /// 이 장치에서 TurboQuant 를 끈 이유
     tq_off: Option<String>,
+    /// Part 5: 융합 디코더/GDN/lm_head 5종 자가 검증 결과: (kind, dtype, dim) → 통과 여부
+    fused_ops: HashMap<(FusedOpKind, DType, usize), bool>,
     probe: ProbeStats,
+}
+
+static FUSED_OPS_OVERRIDE: OnceLock<Mutex<Option<FusedOpsOverride>>> = OnceLock::new();
+static FUSED_OP_FAULTS: OnceLock<Mutex<HashMap<FusedOpKind, FaultMode>>> = OnceLock::new();
+
+fn fused_override_lock() -> MutexGuard<'static, Option<FusedOpsOverride>> {
+    FUSED_OPS_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+fn fault_map_lock() -> MutexGuard<'static, HashMap<FusedOpKind, FaultMode>> {
+    FUSED_OP_FAULTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// 테스트용: `LOGIS_FUSED_OPS` 환경변수 대신 프로세스 내 강제값 설정 (`None` = 환경변수 사용).
+pub fn set_fused_ops_override(v: Option<FusedOpsOverride>) {
+    *fused_override_lock() = v;
+}
+
+/// Gate 5-A 테스트용: 특정 융합 커널 자가 검증에 고장을 주입합니다 (`None` = 해제).
+pub fn set_fused_op_fault(kind: FusedOpKind, mode: Option<FaultMode>) {
+    let mut g = fault_map_lock();
+    match mode {
+        Some(m) => {
+            g.insert(kind, m);
+        }
+        None => {
+            g.remove(&kind);
+        }
+    }
+}
+
+/// 테스트용: 융합 커널 자가 검증 캐시만 초기화합니다.
+pub fn reset_fused_op_cache() {
+    let mut g = states();
+    for st in g.values_mut() {
+        st.fused_ops.clear();
+    }
+}
+
+fn fused_op_env_allowed(kind: FusedOpKind) -> bool {
+    if let Some(ov) = *fused_override_lock() {
+        return matches!(ov, FusedOpsOverride::AllOn);
+    }
+    static PARSED: OnceLock<(bool, Vec<String>)> = OnceLock::new();
+    let (all_off, excluded) = PARSED.get_or_init(|| {
+        let raw = std::env::var(FUSED_OPS_ENV).unwrap_or_default();
+        let trimmed = raw.trim().to_ascii_lowercase();
+        if matches!(trimmed.as_str(), "0" | "off" | "false" | "no" | "disable" | "disabled") {
+            return (true, Vec::new());
+        }
+        let mut excl = Vec::new();
+        for part in trimmed.split([',', ';', ' ']).map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(rest) = part.strip_prefix('-') {
+                excl.push(rest.to_string());
+            }
+        }
+        (false, excl)
+    });
+    if *all_off {
+        return false;
+    }
+    !excluded.iter().any(|e| e == kind.token())
+}
+
+/// CPU/Vulkan host-shared GDN 경로에서 `LOGIS_FUSED_OPS=off` 및 고장 주입을 일관되게 존중하기 위한 헬퍼.
+pub fn fused_op_allowed_cpu(kind: FusedOpKind, device: &Device, dtype: DType, dim: usize) -> bool {
+    if !fused_op_env_allowed(kind) {
+        return false;
+    }
+    if fault_map_lock().contains_key(&kind) {
+        return fused_op_ok(device, kind, dtype, dim);
+    }
+    true
 }
 
 fn states() -> MutexGuard<'static, HashMap<DeviceLocation, DeviceState>> {
@@ -116,6 +244,7 @@ fn disable_flash_attn_backend(device: &Device) {
         Device::Cuda(_) => c.flash_attn.backends.cuda = false,
         Device::Rocm(_) => c.flash_attn.backends.rocm = false,
         Device::Vulkan(_) => c.flash_attn.backends.vulkan = false,
+        Device::Metal(_) => c.flash_attn.backends.metal = false,
         _ => {}
     });
 }
@@ -126,6 +255,7 @@ fn disable_turbo_quant_kernels(device: &Device) {
         Device::Cuda(_) => c.turbo_quant.backends.cuda = false,
         Device::Rocm(_) => c.turbo_quant.backends.rocm = false,
         Device::Vulkan(_) => c.turbo_quant.backends.vulkan = false,
+        Device::Metal(_) => c.turbo_quant.backends.metal = false,
         _ => {}
     });
 }
@@ -363,6 +493,110 @@ pub fn flush_probe_report(device: &Device) {
     p.pending_max = 0.0;
 }
 
+/// Part 5 (Pack C): 융합 디코더/GDN/lm_head 커널을 이 장치·dtype·차원에서 써도 되는지.
+///
+/// - CUDA/ROCm GPU 에서만 활성화됩니다 (CPU 는 `embed-cpu-kernels` 패킹 경로를, Vulkan/Metal 은
+///   기존 경로를 유지 — 단 Gate 5-A 고장 주입 테스트가 활성화된 경우 CPU 에서도 자가 검증 + 폴백을 실행).
+/// - `LOGIS_FUSED_OPS=off` 또는 `-<kind>` 로 비활성화할 수 있습니다.
+/// - `(kind, dtype, dim)` 조합마다 최초 1회 CPU FP32 기준 대비 자가 검증을 `catch_unwind` 로 감싸
+///   실행하며, 실패·패닉·오차 초과 시 해당 키를 영구 `false` 로 캐시해 기존 텐서 경로로 안전 폴백합니다.
+pub fn fused_op_ok(device: &Device, kind: FusedOpKind, dtype: DType, dim: usize) -> bool {
+    if !fused_op_env_allowed(kind) {
+        return false;
+    }
+    let has_fault = fault_map_lock().contains_key(&kind);
+    let supported_dev = match kind {
+        FusedOpKind::GatedDeltaRule => {
+            matches!(device, Device::Cuda(_) | Device::Rocm(_) | Device::Metal(_))
+        }
+        _ => matches!(device, Device::Cuda(_) | Device::Rocm(_)),
+    };
+    if !supported_dev && !has_fault {
+        return false;
+    }
+    if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+        return false;
+    }
+    if !checks_enabled() && !has_fault {
+        return true;
+    }
+
+    let key = (kind, dtype, dim);
+    {
+        let g = states();
+        if let Some(ok) = g.get(&device.location()).and_then(|st| st.fused_ops.get(&key)) {
+            return *ok;
+        }
+    }
+
+    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        check_fused_op(device, kind, dtype, dim)
+    }));
+    let tol = fused_op_tol(kind, dtype);
+    let ok = match res {
+        Ok(Ok(err)) if err <= tol => {
+            println!(
+                "[ACCEL-CHECK] {} {} · fused-op {} {:?} d{}: 통과 (최대 상대오차 {:.1e})",
+                backend_name(device),
+                arch(device),
+                kind.token(),
+                dtype,
+                dim,
+                err
+            );
+            true
+        }
+        Ok(Ok(err)) => {
+            println!(
+                "[ACCEL-CHECK] ❌ {} {} · fused-op {} {:?} d{}: 오차 초과 ({:.2e} > {:.0e}) → 기존 경로로 폴백합니다",
+                backend_name(device),
+                arch(device),
+                kind.token(),
+                dtype,
+                dim,
+                err,
+                tol
+            );
+            false
+        }
+        Ok(Err(e)) => {
+            println!(
+                "[ACCEL-CHECK] ❌ {} {} · fused-op {} {:?} d{}: 검증 실행 실패 ({e}) → 기존 경로로 폴백합니다",
+                backend_name(device),
+                arch(device),
+                kind.token(),
+                dtype,
+                dim
+            );
+            false
+        }
+        Err(_) => {
+            println!(
+                "[ACCEL-CHECK] ❌ {} {} · fused-op {} {:?} d{}: 검증 중 패닉 → 기존 경로로 폴백합니다",
+                backend_name(device),
+                arch(device),
+                kind.token(),
+                dtype,
+                dim
+            );
+            false
+        }
+    };
+    let mut g = states();
+    g.entry(device.location()).or_default().fused_ops.insert(key, ok);
+    ok
+}
+
+fn fused_op_tol(kind: FusedOpKind, dtype: DType) -> f32 {
+    match (kind, dtype) {
+        (FusedOpKind::LmHeadArgmaxCs, _) => 0.0, // argmax + CS rescue mask must be exact (0 mismatches)
+        (_, DType::F32) => 1e-4,
+        (_, DType::F16) => 1.5e-2,
+        (_, DType::BF16) => 2.5e-2,
+        _ => 1e-4,
+    }
+}
+
 /// 이 장치에서 TurboQuant 를 끈 이유 (켜져 있으면 None)
 pub fn turbo_quant_off_reason(device: &Device) -> Option<String> {
     states().get(&device.location()).and_then(|st| st.tq_off.clone())
@@ -387,7 +621,20 @@ pub fn diagnose(device: &Device, dtype: DType, head_dim: usize) -> String {
         ),
         Err(e) => format!("turbo-quant d{head_dim}: 실행 실패 ({e})"),
     };
-    format!("{fa} | {tq}")
+    let mut fused_parts = Vec::with_capacity(FusedOpKind::ALL.len());
+    for kind in FusedOpKind::ALL {
+        let d = match kind {
+            FusedOpKind::RopeKvWrite | FusedOpKind::GatedDeltaRule => head_dim.max(32),
+            _ => 128,
+        };
+        let s = match std::panic::catch_unwind(AssertUnwindSafe(|| check_fused_op(device, kind, dtype, d))) {
+            Ok(Ok(e)) => format!("{}={:.1e}", kind.token(), e),
+            Ok(Err(err)) => format!("{}=ERR({err})", kind.token()),
+            Err(_) => format!("{}=PANIC", kind.token()),
+        };
+        fused_parts.push(s);
+    }
+    format!("{fa} | {tq} | fused-ops: {}", fused_parts.join(", "))
 }
 
 /// `a` 와 기준값 `b` 의 상대 오차 ‖a-b‖/‖b‖ (f32, 어느 장치든). NaN/Inf 가 섞이면 Inf.
@@ -581,4 +828,286 @@ fn tq_check(device: &Device, d: usize) -> Result<TqReport> {
 #[cfg(not(feature = "turbo-quant"))]
 fn tq_check(_device: &Device, _d: usize) -> Result<TqReport> {
     Ok(TqReport { quant_ok: true, attn_ok: true, quant_err: 0.0, dequant_err: 0.0, attn_err: 0.0 })
+}
+
+// ---------------------------------------------------------------------------
+// Part 5 (Pack C): 융합 커널 5종 자가 검증
+// ---------------------------------------------------------------------------
+
+fn check_fused_op(device: &Device, kind: FusedOpKind, dtype: DType, dim: usize) -> Result<f32> {
+    if let Some(mode) = fault_map_lock().get(&kind).copied() {
+        match mode {
+            FaultMode::ReturnError => bail!("injected fault (ReturnError) for {}", kind.token()),
+            FaultMode::Panic => panic!("injected fault (Panic) for {}", kind.token()),
+            FaultMode::BadOutput => return Ok(f32::INFINITY),
+        }
+    }
+    match kind {
+        FusedOpKind::ResidualRmsNorm => check_residual_rmsnorm(device, dtype, dim),
+        FusedOpKind::SiluMul => check_silu_mul(device, dtype, dim),
+        FusedOpKind::RopeKvWrite => check_rope_kv_write(device, dtype, dim),
+        FusedOpKind::GatedDeltaRule => check_gated_delta_rule(device, dtype, dim),
+        FusedOpKind::LmHeadArgmaxCs => check_lm_head_argmax_cs(device, dtype, dim),
+    }
+}
+
+fn check_residual_rmsnorm(device: &Device, dtype: DType, dim: usize) -> Result<f32> {
+    let d = dim.clamp(16, 512);
+    let rows = 4usize;
+    let x_cpu = sample(&[rows, d], 0x5101, 1.0, false)?.to_dtype(dtype)?;
+    let dl_cpu = sample(&[rows, d], 0x5102, 0.5, false)?.to_dtype(dtype)?;
+    let w_cpu = sample(&[d], 0x5103, 0.3, false)?;
+    let x_dev = x_cpu.to_device(device)?;
+    let dl_dev = dl_cpu.to_device(device)?;
+    let w_dev = w_cpu.to_device(device)?;
+
+    let mut worst = 0.0f32;
+    for plus_one in [false, true] {
+        let (ref_r, ref_y) = candle_core::decoder_ops::residual_rmsnorm(
+            &x_cpu.to_dtype(DType::F32)?,
+            Some(&dl_cpu.to_dtype(DType::F32)?),
+            &w_cpu,
+            1e-6,
+            plus_one,
+        )?;
+        let (got_r, got_y) = candle_core::decoder_ops::residual_rmsnorm(
+            &x_dev,
+            Some(&dl_dev),
+            &w_dev,
+            1e-6,
+            plus_one,
+        )?;
+        worst = worst.max(rel_err(&got_r.to_device(&Device::Cpu)?, &ref_r)?);
+        worst = worst.max(rel_err(&got_y.to_device(&Device::Cpu)?, &ref_y)?);
+    }
+    Ok(worst)
+}
+
+fn check_silu_mul(device: &Device, dtype: DType, dim: usize) -> Result<f32> {
+    let inter = dim.clamp(16, 512);
+    let gu_cpu = sample(&[1, 3, 2 * inter], 0x5201, 1.0, false)?.to_dtype(dtype)?;
+    let gu_dev = gu_cpu.to_device(device)?;
+    // Zero-copy strided gate_up view 검증
+    let got = candle_core::decoder_ops::silu_mul(
+        &gu_dev.narrow(2, 0, inter)?,
+        &gu_dev.narrow(2, inter, inter)?,
+    )?;
+    let gu_f32 = gu_cpu.to_dtype(DType::F32)?;
+    let reference = candle_core::decoder_ops::silu_mul(
+        &gu_f32.narrow(2, 0, inter)?,
+        &gu_f32.narrow(2, inter, inter)?,
+    )?;
+    rel_err(&got.to_device(&Device::Cpu)?, &reference)
+}
+
+fn check_rope_kv_write(device: &Device, dtype: DType, dim: usize) -> Result<f32> {
+    use candle_core::accel::decoder_ops::{HeadLayout, RopeMode};
+    let hd = (dim.clamp(16, 256) / 2) * 2;
+    let rot = ((hd / 2) / 2) * 2;
+    let (b, hq, hkv, t, past, max_seq) = (1usize, 4usize, 2usize, 2usize, 3usize, 8usize);
+    let q_cpu = sample(&[b, t, hq, hd], 0x5301, 1.0, false)?.to_dtype(dtype)?;
+    let k_cpu = sample(&[b, t, hkv, hd], 0x5302, 1.0, false)?.to_dtype(dtype)?;
+    let v_cpu = sample(&[b, t, hkv, hd], 0x5303, 1.0, false)?.to_dtype(dtype)?;
+    let qnw = sample(&[hd], 0x5304, 0.2, false)?;
+    let knw = sample(&[hd], 0x5305, 0.2, false)?;
+    let cos = sample(&[t, rot / 2], 0x5306, 0.5, false)?;
+    let sin = sample(&[t, rot / 2], 0x5307, 0.5, false)?;
+
+    let kc_ref = Tensor::zeros((b, hkv, max_seq, hd), DType::F32, &Device::Cpu)?;
+    let vc_ref = Tensor::zeros((b, hkv, max_seq, hd), DType::F32, &Device::Cpu)?;
+    let q_ref = candle_core::decoder_ops::rope_kv_write(
+        &q_cpu.to_dtype(DType::F32)?,
+        &k_cpu.to_dtype(DType::F32)?,
+        &v_cpu.to_dtype(DType::F32)?,
+        HeadLayout::Bshd,
+        HeadLayout::Bhsd,
+        Some(&qnw),
+        Some(&knw),
+        &cos,
+        &sin,
+        &kc_ref,
+        &vc_ref,
+        past,
+        1e-6,
+        RopeMode::NeoX,
+        true,
+    )?;
+
+    let kc_dev = Tensor::zeros((b, hkv, max_seq, hd), dtype, device)?;
+    let vc_dev = Tensor::zeros((b, hkv, max_seq, hd), dtype, device)?;
+    let q_got = candle_core::decoder_ops::rope_kv_write(
+        &q_cpu.to_device(device)?,
+        &k_cpu.to_device(device)?,
+        &v_cpu.to_device(device)?,
+        HeadLayout::Bshd,
+        HeadLayout::Bhsd,
+        Some(&qnw.to_device(device)?),
+        Some(&knw.to_device(device)?),
+        &cos.to_device(device)?,
+        &sin.to_device(device)?,
+        &kc_dev,
+        &vc_dev,
+        past,
+        1e-6,
+        RopeMode::NeoX,
+        true,
+    )?;
+
+    let kc_host = kc_dev.to_device(&Device::Cpu)?;
+    let vc_host = vc_dev.to_device(&Device::Cpu)?;
+    // 슬롯 격리 확인: 0..past 및 past+t..max_seq 는 0 이어야 함
+    let untouched_k = kc_host.narrow(2, 0, past)?.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+    let untouched_k2 = kc_host.narrow(2, past + t, max_seq - past - t)?.to_dtype(DType::F32)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+    if untouched_k != 0.0 || untouched_k2 != 0.0 {
+        bail!("rope_kv_write corrupted untouched KV cache slots ({untouched_k}, {untouched_k2})");
+    }
+    let mut worst = rel_err(&q_got.to_device(&Device::Cpu)?, &q_ref)?;
+    worst = worst.max(rel_err(&kc_host, &kc_ref)?);
+    worst = worst.max(rel_err(&vc_host, &vc_ref)?);
+    Ok(worst)
+}
+
+fn check_gated_delta_rule(device: &Device, dtype: DType, dim: usize) -> Result<f32> {
+    use candle_core::delta_rule::{fused_gated_delta_rule, fused_gated_rms_norm, GdnConfig};
+    let d = dim.clamp(16, 64);
+    let cfg = GdnConfig::new(2, 4, d, d);
+    let (b, t) = (1usize, 3usize);
+    let c = cfg.conv_dim();
+    let mixed = sample(&[b, t, c], 0x5401, 0.4, false)?.to_dtype(dtype)?;
+    let cw = sample(&[c, cfg.conv_kernel], 0x5402, 0.2, false)?.to_dtype(dtype)?;
+    let a = sample(&[b, t, cfg.num_v_heads], 0x5403, 0.3, false)?.to_dtype(dtype)?;
+    let bv = sample(&[b, t, cfg.num_v_heads], 0x5404, 0.3, false)?.to_dtype(dtype)?;
+    let neg_a = sample(&[cfg.num_v_heads], 0x5405, 0.1, false)?.abs()?.neg()?;
+    let dt_bias = sample(&[cfg.num_v_heads], 0x5406, 0.1, false)?;
+
+    let ref_o = fused_gated_delta_rule(
+        &mixed.to_dtype(DType::F32)?,
+        &cw.to_dtype(DType::F32)?,
+        None,
+        None,
+        &a.to_dtype(DType::F32)?,
+        &bv.to_dtype(DType::F32)?,
+        &neg_a,
+        &dt_bias,
+        None,
+        &cfg,
+    )?;
+    let got_o = fused_gated_delta_rule(
+        &mixed.to_device(device)?,
+        &cw.to_device(device)?,
+        None,
+        None,
+        &a.to_device(device)?,
+        &bv.to_device(device)?,
+        &neg_a.to_device(device)?,
+        &dt_bias.to_device(device)?,
+        None,
+        &cfg,
+    )?;
+    let mut worst = rel_err(&got_o.out.to_device(&Device::Cpu)?, &ref_o.out)?;
+    worst = worst.max(rel_err(&got_o.conv_state.to_device(&Device::Cpu)?, &ref_o.conv_state)?);
+    worst = worst.max(rel_err(&got_o.recurrent_state.to_device(&Device::Cpu)?, &ref_o.recurrent_state)?);
+
+    // Gated RMSNorm 도 함께 검증
+    let z = sample(&[b * t * cfg.num_v_heads, d], 0x5407, 0.5, false)?.to_dtype(dtype)?;
+    let nw = sample(&[d], 0x5408, 0.2, false)?.to_dtype(dtype)?;
+    let g_ref = fused_gated_rms_norm(
+        &ref_o.out.reshape(((), d))?,
+        &z.to_dtype(DType::F32)?,
+        &nw.to_dtype(DType::F32)?,
+        1e-6,
+    )?;
+    let g_got = fused_gated_rms_norm(
+        &got_o.out.reshape(((), d))?,
+        &z.to_device(device)?,
+        &nw.to_device(device)?,
+        1e-6,
+    )?;
+    worst = worst.max(rel_err(&g_got.to_device(&Device::Cpu)?, &g_ref)?);
+    Ok(worst)
+}
+
+fn check_lm_head_argmax_cs(device: &Device, dtype: DType, dim: usize) -> Result<f32> {
+    use candle_core::lm_head::{fused_linear_argmax_cs, logits_argmax_cs, CsGuardParams};
+    let k = dim.clamp(32, 128);
+    let (v_core, v_rest, m) = (64usize, 64usize, 4usize);
+    let mut w_core_v = randn(v_core * k, 0x5501);
+    for x in &mut w_core_v {
+        *x = *x * 0.1 + 0.2;
+    }
+    let mut w_rest_v = randn(v_rest * k, 0x5502);
+    for x in &mut w_rest_v {
+        *x = *x * 0.1 + 0.2;
+    }
+    // 행 0,1: CORE 고신뢰 승자 (rescue=0), 행 2,3: REST 스파이크 승자 (rescue=1)
+    let mut h_v = vec![0.0f32; m * k];
+    for kk in 0..k {
+        let spike_r = if (kk / 4) % 2 == 0 { 0.20 } else { -0.20 };
+        w_rest_v[7 * k + kk] = 0.2 + spike_r;
+        let spike_c = if kk % 2 == 0 { 0.45 } else { -0.45 };
+        w_core_v[3 * k + kk] = 0.2 + spike_c;
+        h_v[0 * k + kk] = spike_c * 4.0;
+        h_v[1 * k + kk] = spike_c * 3.5;
+        h_v[2 * k + kk] = spike_r * 5.0;
+        h_v[3 * k + kk] = spike_r * 6.0;
+    }
+
+    let w_core_cpu = Tensor::from_vec(w_core_v, (v_core, k), &Device::Cpu)?.to_dtype(dtype)?;
+    let w_rest_cpu = Tensor::from_vec(w_rest_v, (v_rest, k), &Device::Cpu)?.to_dtype(dtype)?;
+    let h_cpu = Tensor::from_vec(h_v, (m, k), &Device::Cpu)?.to_dtype(dtype)?;
+    let core_ids_v: Vec<u32> = (0..v_core as u32).map(|i| i * 2).collect();
+    let core_ids_cpu = Tensor::from_vec(core_ids_v, (v_core,), &Device::Cpu)?;
+
+    let guard_cpu = CsGuardParams::from_rest_weight(&w_rest_cpu, None, 1e-3)?;
+    let guard_dev = CsGuardParams {
+        mu_rest: guard_cpu.mu_rest.to_device(device)?,
+        w_rest_bound: guard_cpu.w_rest_bound,
+        b_rest_max: guard_cpu.b_rest_max,
+    };
+
+    let ref_a = fused_linear_argmax_cs(
+        &h_cpu.to_dtype(DType::F32)?,
+        &w_core_cpu.to_dtype(DType::F32)?,
+        None,
+        Some(&core_ids_cpu),
+        Some(&guard_cpu),
+    )?;
+    let got_a = fused_linear_argmax_cs(
+        &h_cpu.to_device(device)?,
+        &w_core_cpu.to_device(device)?,
+        None,
+        Some(&core_ids_cpu.to_device(device)?),
+        Some(&guard_dev),
+    )?;
+
+    let ref_ids = ref_a.ids.to_vec1::<u32>()?;
+    let got_ids = got_a.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+    let got_mask = got_a.rescue_mask.unwrap().to_device(&Device::Cpu)?.to_vec1::<u8>()?;
+    if ref_ids != got_ids {
+        bail!("lm_head Mode A ids mismatch: got {got_ids:?} != ref {ref_ids:?}");
+    }
+    if got_mask[2] != 1 || got_mask[3] != 1 {
+        bail!("lm_head Mode A CS guard false negative on REST spike rows: {got_mask:?}");
+    }
+
+    // Mode B (F32 sub_logits + dtype hidden)
+    let sub_logits = h_cpu
+        .to_dtype(DType::F32)?
+        .matmul(&w_core_cpu.to_dtype(DType::F32)?.t()?)?
+        .to_device(device)?;
+    let got_b = logits_argmax_cs(
+        &sub_logits,
+        Some(&h_cpu.to_device(device)?),
+        Some(&core_ids_cpu.to_device(device)?),
+        Some(&guard_dev),
+    )?;
+    let got_b_ids = got_b.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+    let got_b_mask = got_b.rescue_mask.unwrap().to_device(&Device::Cpu)?.to_vec1::<u8>()?;
+    if got_b_ids != ref_ids {
+        bail!("lm_head Mode B ids mismatch: got {got_b_ids:?} != ref {ref_ids:?}");
+    }
+    if got_b_mask[2] != 1 || got_b_mask[3] != 1 {
+        bail!("lm_head Mode B CS guard false negative: {got_b_mask:?}");
+    }
+    Ok(0.0)
 }

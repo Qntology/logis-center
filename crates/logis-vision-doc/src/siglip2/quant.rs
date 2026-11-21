@@ -311,8 +311,46 @@ pub fn dtype_for(device: &Device) -> DType {
     plan_for(device).dense
 }
 
-/// 🌟 [WEIGHTS FINGERPRINT] 이 장치의 SigLIP2 벡터가 어떤 가중치 · 정밀도에서 나왔는지 (`bf16`, `f32`, `q8-<해시>` …).
+/// 🌟 [CPU-PACKED] SigLIP2 CPU 패킹 GEMM + 64-Key 스트리밍 어텐션 + 1-Pass 패치화 opt-in 환경변수.
+/// `LOGIS_SIGLIP2_CPU_PACKED=1|on|true|packed` 일 때 활성화되며, 캐시/SDS 이름공간은 `"cpu-f32-packed"` 로 분리됩니다.
+pub const CPU_PACKED_ENV: &str = "LOGIS_SIGLIP2_CPU_PACKED";
+
+static CPU_PACKED_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 테스트에서 동일 프로세스 내 SigLIP2 CPU 패킹 경로를 강제 전환합니다 (`None` = 환경변수 복원).
+pub fn set_cpu_packed_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    CPU_PACKED_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn cpu_packed_enabled() -> bool {
+    match CPU_PACKED_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var(CPU_PACKED_ENV)
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "packed"))
+            .unwrap_or(false)
+    })
+}
+
+/// 이 장치에서 SigLIP2 CPU 패킹 · 스트리밍 어텐션 경로를 사용할지 여부.
+pub fn cpu_packed_active(device: &Device) -> bool {
+    device.is_cpu() && cpu_packed_enabled()
+}
+
+/// 🌟 [WEIGHTS FINGERPRINT] 이 장치의 SigLIP2 벡터가 어떤 가중치 · 정밀도에서 나왔는지 (`bf16`, `f32`, `cpu-f32-packed`, `q8-<해시>` …).
 pub fn weights_tag(device: &Device) -> String {
+    if cpu_packed_active(device) {
+        return "cpu-f32-packed".to_string();
+    }
     let p = plan_for(device);
     if p.is_quantized() {
         format!("{}-{:08x}", p.tag, p.hash() as u32)
@@ -323,6 +361,9 @@ pub fn weights_tag(device: &Device) -> String {
 
 /// 예전 키를 쓰는 정밀도인가 (이 변경 전의 장치 기본: GPU BF16 · CPU 와 Vulkan F32). 그 캐시 · SDS 키는 그대로 둡니다.
 fn is_legacy_precision(device: &Device) -> bool {
+    if cpu_packed_active(device) {
+        return false;
+    }
     let p = plan_for(device);
     !p.is_quantized() && p.dense == if device.is_cpu() || device.is_vulkan() { DType::F32 } else { DType::BF16 }
 }
@@ -356,11 +397,93 @@ pub fn fingerprint_suffix() -> Option<String> {
     }
 }
 
-/// 🌟 [PYRAMID-QUANT] 선형층: 밀집(F32 · BF16) 또는 블록 형식 그대로(장치의 양자화 행렬곱, F32 누산 `forward_exact`).
+/// 🌟 [PYRAMID-QUANT / CPU-PACKED] 선형층:
+/// - `Dense`: GPU BF16/F32 또는 레거시 CPU F32
+/// - `Quant`: 블록 양자화 행렬곱 (`forward_exact`)
+/// - `CpuPacked`: CPU F32 고속 경로 (로드 시 `NR=32` 패널 패킹, 예: 4304 -> 4320 zero-pad,
+///   단일 오름차순 FMA 체인 M·스레드 비트 동일)
 pub enum SLinear {
     Dense(candle_nn::Linear),
     /// `cols` 는 저장한 입력 폭(0 으로 채운 폭). 활성이 더 좁으면 0 을 채워 곱합니다.
     Quant { w: candle_core::quantized::QMatMul, b: Option<Tensor>, cols: usize },
+    CpuPacked {
+        w: std::sync::Arc<embed_cpu_kernels::PackedW>,
+        bias: Option<std::sync::Arc<[f32]>>,
+        in_dim: usize,
+        out_dim: usize,
+    },
+}
+
+impl SLinear {
+    /// CPU F32 `candle_nn::Linear` 를 `SLinear::CpuPacked` 로 패킹합니다 (비정렬 폭 `NR=32` zero-pad).
+    pub fn from_linear_cpu_packed(l: &candle_nn::Linear) -> candle_core::Result<Self> {
+        let w_t = l.weight().to_dtype(DType::F32)?.contiguous()?;
+        let (out_dim, in_dim) = w_t.dims2()?;
+        let w_vec = w_t.flatten_all()?.to_vec1::<f32>()?;
+        let packed = embed_cpu_kernels::PackedW::pack_padded(&w_vec, out_dim, in_dim);
+        let bias = match l.bias() {
+            Some(b) => {
+                let bv = b.to_dtype(DType::F32)?.contiguous()?.to_vec1::<f32>()?;
+                Some(std::sync::Arc::<[f32]>::from(bv))
+            }
+            None => None,
+        };
+        Ok(Self::CpuPacked {
+            w: std::sync::Arc::new(packed),
+            bias,
+            in_dim,
+            out_dim,
+        })
+    }
+
+    fn forward_with_epilogue(
+        &self,
+        x: &Tensor,
+        epi: embed_cpu_kernels::Epilogue,
+    ) -> candle_core::Result<Tensor> {
+        match self {
+            SLinear::CpuPacked { w, bias, in_dim, out_dim }
+                if x.device().is_cpu() && x.dtype() == DType::F32 =>
+            {
+                let mut out_dims = x.dims().to_vec();
+                let k = *out_dims.last().unwrap_or(&0);
+                if k != *in_dim {
+                    candle_core::bail!("SLinear::CpuPacked input dim {k} != {in_dim}");
+                }
+                let m = x.elem_count() / k.max(1);
+                let x_c = x.contiguous()?;
+                let x_vec = x_c.flatten_all()?.to_vec1::<f32>()?;
+                let mut out = vec![0.0f32; m * out_dim];
+                let threads = rayon::current_num_threads().max(1);
+                embed_cpu_kernels::gemm_bias(
+                    &x_vec,
+                    m,
+                    w,
+                    bias.as_deref(),
+                    &mut out,
+                    embed_cpu_kernels::Blocking::default(),
+                    epi,
+                    threads,
+                );
+                if let Some(last) = out_dims.last_mut() {
+                    *last = *out_dim;
+                }
+                Tensor::from_vec(out, out_dims.as_slice(), x.device())
+            }
+            other => {
+                let y = candle_core::Module::forward(other, x)?;
+                match epi {
+                    embed_cpu_kernels::Epilogue::Gelu => y.gelu(),
+                    _ => Ok(y),
+                }
+            }
+        }
+    }
+
+    /// `CpuPacked` 경로에서 `Linear + bias + GELU` 를 1패스 에필로그로 융합 실행합니다.
+    pub fn forward_gelu(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        self.forward_with_epilogue(x, embed_cpu_kernels::Epilogue::Gelu)
+    }
 }
 
 impl candle_core::Module for SLinear {
@@ -382,12 +505,38 @@ impl candle_core::Module for SLinear {
                     None => Ok(y),
                 }
             }
+            SLinear::CpuPacked { .. } => {
+                self.forward_with_epilogue(x, embed_cpu_kernels::Epilogue::Store)
+            }
         }
     }
 }
 
+/// CPU F32 패킹 모드에서 1-Pass `embed_cpu_kernels::layer_norm` 으로 LayerNorm 을 수행합니다.
+pub fn fast_layer_norm(ln: &candle_nn::LayerNorm, x: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
+    use candle_core::Module;
+    if !cpu_packed_active(x.device()) || x.dtype() != DType::F32 {
+        return ln.forward(x);
+    }
+    let dims = x.dims().to_vec();
+    let h = *dims.last().unwrap_or(&0);
+    if h == 0 {
+        return ln.forward(x);
+    }
+    let x_c = x.contiguous()?;
+    let x_vec = x_c.flatten_all()?.to_vec1::<f32>()?;
+    let w_vec = ln.weight().to_dtype(DType::F32)?.contiguous()?.to_vec1::<f32>()?;
+    let b_vec = match ln.bias() {
+        Some(b) => Some(b.to_dtype(DType::F32)?.contiguous()?.to_vec1::<f32>()?),
+        None => None,
+    };
+    let mut out = vec![0.0f32; x_vec.len()];
+    embed_cpu_kernels::layer_norm(&x_vec, h, &w_vec, b_vec.as_deref(), eps, &mut out);
+    Tensor::from_vec(out, dims.as_slice(), x.device())
+}
+
 /// `<vb 접두>.weight` · `.bias` 선형층. 양자화 타워 GGUF(`q`)에 블록 형식으로 있으면 그것을 올리고, F32 로 있으면 저장 형상
-/// (0 으로 채운 형상일 수 있음)대로 읽습니다. GGUF 가 없으면 예전과 같은 `candle_nn::linear` 입니다.
+/// (0 으로 채운 형상일 수 있음)대로 읽습니다. CPU 패킹 opt-in 이 켜져 있으면 `SLinear::CpuPacked` 로 패킹합니다.
 pub fn linear(vb: &VarBuilder, q: Option<&super::gguf::MappedGguf>, in_dim: usize, out_dim: usize) -> candle_core::Result<SLinear> {
     if let Some(file) = q {
         let name = if vb.prefix().is_empty() { "weight".to_string() } else { format!("{}.weight", vb.prefix()) };
@@ -399,11 +548,19 @@ pub fn linear(vb: &VarBuilder, q: Option<&super::gguf::MappedGguf>, in_dim: usiz
                     return Ok(SLinear::Quant { w: candle_core::quantized::QMatMul::from_qtensor(w)?, b: Some(b), cols });
                 }
                 let w = vb.get((rows, cols), "weight")?;
-                return Ok(SLinear::Dense(candle_nn::Linear::new(w, Some(b))));
+                let lin = candle_nn::Linear::new(w, Some(b));
+                if cpu_packed_active(vb.device()) {
+                    return SLinear::from_linear_cpu_packed(&lin);
+                }
+                return Ok(SLinear::Dense(lin));
             }
         }
     }
-    Ok(SLinear::Dense(candle_nn::linear(in_dim, out_dim, vb.clone())?))
+    let lin = candle_nn::linear(in_dim, out_dim, vb.clone())?;
+    if cpu_packed_active(vb.device()) {
+        return SLinear::from_linear_cpu_packed(&lin);
+    }
+    Ok(SLinear::Dense(lin))
 }
 
 /// 한 타워를 계획대로 양자화했다가 F32 로 풀어 올립니다 (§ 모듈 설명: 민감도 측정 경로).

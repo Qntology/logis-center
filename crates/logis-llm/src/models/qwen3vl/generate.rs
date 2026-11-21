@@ -271,20 +271,10 @@ impl Qwen3VLGenerateModel {
             input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
             cache_position = Tensor::from_vec(vec![seqlen_offset as u32], 1, &self.device)?;
 
-            // 🌟 [VRAM/RAM 최적화] 15토큰마다 OS 시스템 RAM 스파이크 억제 및 반환
+            // 🌟 [WS-TRIM] 디코딩 루프 내 강제 워킹셋 트림은 페이지 폴트 스래싱을 유발하므로
+            //    `legacy_working_set_trim()` 계약(기본 무동작)으로 일원화합니다.
             if generate.len() % 15 == 0 {
-                if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
-
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-                #[cfg(target_os = "linux")]
-                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-                #[cfg(target_os = "macos")]
-                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+                crate::models::common::legacy_working_set_trim();
             }
         }
         let res = self.tokenizer.token_decode(generate)?;

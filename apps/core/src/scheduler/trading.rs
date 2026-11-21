@@ -4924,9 +4924,11 @@ pub async fn process_trading_task(
         }
     }
 
-    model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
+    // 🌟 [PART 1 / EARLY GATE + LPT] 모델 적재(`secure_vram_relay`) 이전에 실행 대상 카테고리를 먼저
+    //    선별하고, 품목 표(가중치 3) > 당사자/조건(가중치 2) > 단답 코드(가중치 1) LPT 순으로 정렬합니다.
+    //    모든 카테고리가 PLINKO/부재로 스킵되면 Qwen3.5 VRAM 전환 자체를 건너뜁니다.
+    let mut pending_cats: Vec<(&str, Vec<String>, Vec<String>, String)> = Vec::new();
     for cat in &categories {
-        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
         let cat_schema_fields: Vec<String> = trade_fields.iter()
             .map(|(f, _, _, _)| f.clone())
             .filter(|f| crate::logic::trade_field_category(f) == *cat)
@@ -4935,8 +4937,6 @@ pub async fn process_trading_task(
             .filter(|f| absent_fields.contains(*f))
             .cloned()
             .collect();
-        // 🌟 [PRESENCE-AWARE SCHEMA] 부재 필드를 뺀 스키마로 프롬프트를 만듭니다.
-        //    (PRESENCE GATE 결과를 사후 필터가 아니라 프롬프트 생성에 직접 연결)
         let absent_set: std::collections::HashSet<String> = absent_in_cat.iter().cloned().collect();
         let schema_prompt = crate::parsing::get_trade_category_schema_present(cat, &doc_type, &absent_set);
         if schema_prompt.contains("SCHEMA:\n{}") || schema_prompt.contains("SCHEMA:\n[ {} ]") {
@@ -4955,7 +4955,7 @@ pub async fn process_trading_task(
                 .and_then(|v| v.as_object())
                 .map(|o| o.iter().filter(|(k, _)| *k != "doc_type").count())
                 .unwrap_or(0);
-            
+
             let schema_field_count = schema_prompt.lines()
                 .filter(|l| l.trim_start().starts_with('"'))
                 .count();
@@ -4974,6 +4974,25 @@ pub async fn process_trading_task(
                 continue;
             }
         }
+        pending_cats.push((*cat, cat_schema_fields, absent_in_cat, schema_prompt));
+    }
+
+    pending_cats.sort_by_key(|(cat, fields, absent, _)| {
+        let weight = crate::models::siglip2::vision_crop::crop_lpt_category_weight(
+            cat,
+            crate::logic::TRADE_ARRAY_CATEGORIES,
+        );
+        let remaining = fields.len().saturating_sub(absent.len());
+        (std::cmp::Reverse(weight), std::cmp::Reverse(remaining))
+    });
+
+    if !pending_cats.is_empty() {
+        model.secure_vram_relay(crate::model::ModelSize::Qwen3_5, None, Some(cancellation_token.clone()), false, None).await?;
+    } else {
+        emit_term("  ⚡ [TRADING EARLY GATE] 모든 카테고리가 결정론/부재로 종결되어 Qwen3.5 적재·VRAM 전환을 생략합니다.");
+    }
+    for (cat, cat_schema_fields, absent_in_cat, schema_prompt) in pending_cats {
+        if cancellation_token.load(Ordering::Relaxed) { return Err(anyhow::anyhow!("Task cancelled")); }
 
         
         let claimed_ctx = if assigned_fields.is_empty() {

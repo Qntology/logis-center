@@ -138,6 +138,73 @@ impl Qwen4ExpGenerateModel {
         Ok(out)
     }
 
+    /// Part 5 (Pack A·C): 순수 Greedy (`temperature == 0.0`) 융합 `lm_head` 타일 argmax 경로.
+    ///
+    /// `[1, V]` 로짓 텐서를 VRAM 에 실체화하지 않고 4바이트 토큰 ID 만 받습니다.
+    /// `repeat_penalty > 1.0` 은 모든 토큰의 로짓을 단조 감소시키므로, 선택된 토큰이 최근
+    /// `repeat_last_n` 창에 없으면 수학적으로 100% 동일한 argmax 이며, 창에 걸린 희귀 스텝에서만
+    /// 이미 계산된 `last_hidden` 으로 `lm_head_forward` + repeat_penalty 를 적용합니다.
+    pub fn generate_ids_greedy(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        cancel_flag: Option<&AtomicBool>,
+    ) -> Result<Vec<u32>> {
+        anyhow::ensure!(!prompt.is_empty(), "[QWEN4-EXP] 빈 프롬프트");
+        self.model.clear_cache();
+        let mut last_hidden = None;
+        let mut pos = 0;
+        while pos < prompt.len() {
+            let n = (prompt.len() - pos).min(PREFILL_CHUNK);
+            let ids = Tensor::from_slice(&prompt[pos..pos + n], (1, n), &self.device)?;
+            last_hidden = Some(self.model.forward_last_hidden(&ids, pos)?);
+            pos += n;
+        }
+        let mut last_hidden = last_hidden.expect("non-empty prompt");
+        let mut out: Vec<u32> = Vec::new();
+        for _ in 0..max_new {
+            if cancel_flag.map(|f| f.load(Ordering::Relaxed)).unwrap_or(false) {
+                break;
+            }
+            let cand = self.model.lm_head_greedy_token(&last_hidden)?;
+            let recent_start = out.len().saturating_sub(self.repeat_last_n);
+            let hit_repeat = self.repeat_penalty > 1.0 && out[recent_start..].contains(&cand);
+            let next = if !hit_repeat {
+                cand
+            } else {
+                let logits = self.model.lm_head_forward(&last_hidden)?;
+                let mut lv = logits
+                    .squeeze(0)?
+                    .to_dtype(DType::F32)?
+                    .to_device(&Device::Cpu)?
+                    .to_vec1::<f32>()?;
+                let mut seen = std::collections::HashSet::new();
+                for &t in &out[recent_start..] {
+                    if seen.insert(t) && (t as usize) < lv.len() {
+                        let l = lv[t as usize];
+                        lv[t as usize] = if l < 0.0 { l * self.repeat_penalty } else { l / self.repeat_penalty };
+                    }
+                }
+                lv.iter()
+                    .enumerate()
+                    .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                        if v > bv { (i as u32, v) } else { (bi, bv) }
+                    })
+                    .0
+            };
+            if self.stop_token_ids.contains(&next) {
+                break;
+            }
+            out.push(next);
+            if prompt.len() + out.len() >= self.max_position_embeddings {
+                break;
+            }
+            let ids = Tensor::from_slice(&[next], (1, 1), &self.device)?;
+            last_hidden = self.model.forward_last_hidden(&ids, prompt.len() + out.len() - 1)?;
+        }
+        Ok(out)
+    }
+
     /// `Qwen3_5GenerateModel::generate` 와 같은 시그니처. 세션 KV/semantic prejudice/ignore_list 는 아직 쓰지 않습니다.
     pub async fn generate(
         &mut self,
@@ -151,12 +218,16 @@ impl Qwen4ExpGenerateModel {
         let seed = mes.seed.unwrap_or(32768) as u64;
         let temperature = mes.temperature.unwrap_or(0.0);
         let top_p = mes.top_p.unwrap_or(0.95);
-        let mut sampler = get_logit_processor(Some(temperature as f32), Some(top_p as f32), Some(80), seed);
         let rendered = self.chat_template.apply_chat_template(&mes)?;
         let ids = self.tokenizer.text_encode_vec(rendered, false)?;
         let max_new = mes.max_tokens.unwrap_or(1024) as usize;
         let started = std::time::Instant::now();
-        let out = self.generate_ids(&ids, max_new, &mut sampler, cancel_flag.as_deref())?;
+        let out = if temperature <= 0.0 {
+            self.generate_ids_greedy(&ids, max_new, cancel_flag.as_deref())?
+        } else {
+            let mut sampler = get_logit_processor(Some(temperature as f32), Some(top_p as f32), Some(80), seed);
+            self.generate_ids(&ids, max_new, &mut sampler, cancel_flag.as_deref())?
+        };
         let text = self
             .tokenizer
             .token_decode(out.clone())

@@ -340,10 +340,47 @@ impl Qwen4ExpForCausalLM {
 
     /// 마지막 위치의 logits `[B, V]` (생성용).
     pub fn forward_last(&mut self, ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let last = self.forward_last_hidden(ids, seqlen_offset)?;
+        Ok(self.lm_head.forward(&last)?)
+    }
+
+    /// 마지막 위치의 mixer 출력 hidden `[B, H]` (무손실 융합 `lm_head` argmax 용).
+    pub fn forward_last_hidden(&mut self, ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let h = self.forward_hidden(ids, seqlen_offset)?;
         let t = h.dim(1)?;
-        let last = h.narrow(1, t - 1, 1)?.squeeze(1)?;
-        Ok(self.lm_head.forward(&last)?)
+        Ok(h.narrow(1, t - 1, 1)?.squeeze(1)?.contiguous()?)
+    }
+
+    /// Part 5 (Pack A·C): Mode A 2-Stage Dense Fused Tile Argmax (0 bytes `[1, V]` VRAM 할당).
+    /// `accel_check` 통과 시 융합 커널을 쓰고, 아니면 일반 `lm_head + argmax` 로 폴백합니다.
+    pub fn lm_head_greedy_token(&self, last_hidden: &Tensor) -> Result<u32> {
+        let dev = last_hidden.device();
+        let dt = last_hidden.dtype();
+        let h_dim = *last_hidden.dims().last().unwrap_or(&0);
+        if crate::models::common::accel_check::fused_op_ok(
+            dev,
+            crate::models::common::accel_check::FusedOpKind::LmHeadArgmaxCs,
+            dt,
+            h_dim,
+        ) {
+            let out = candle_core::lm_head::fused_linear_argmax_cs(
+                last_hidden,
+                self.lm_head.weight(),
+                self.lm_head.bias(),
+                None,
+                None,
+            )?;
+            let ids = out.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+            return Ok(ids[0]);
+        }
+        let logits = self.lm_head.forward(last_hidden)?;
+        let id = logits
+            .to_dtype(DType::F32)?
+            .argmax(candle_core::D::Minus1)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<u32>()?[0];
+        Ok(id)
     }
 
     pub fn clear_cache(&mut self) {

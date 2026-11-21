@@ -445,6 +445,14 @@ impl crate::model::LogisModel {
                         ));
                         plans = crate::models::siglip2::vision_crop::whole_page_fallback(&cats, &grid);
                     }
+                    // 🌟 [PART 1 / LPT] IDENTITY FIRST 의미 계약을 보존하면서
+                    //    (카테고리 가중치, 28px 스냅 패치 면적) 내림차순 + 동일 격자 버킷으로 정렬합니다.
+                    crate::models::siglip2::vision_crop::sort_plans_lpt(
+                        &mut plans,
+                        crate::logic::TRADE_ARRAY_CATEGORIES,
+                        crate::logic::TRADE_IDENTITY_CATEGORY,
+                        crate::logic::TRADE_IDENTITY_FIELD,
+                    );
 
                     // ── STEP 5 : Qwen 3.5 2B 정제 추출 ──
                     // 🌟 [VRAM STAGE] STEP 1~4 완료. SigLIP2(비전 820MB + 텍스트 1.4GB) 전량 반환.
@@ -810,11 +818,42 @@ impl crate::model::LogisModel {
                         crate::utils::score_dynamics::record_baseline(
                             "vision.tile_count", tiles.len() as f32
                         );
-                        for tile in tiles.iter() {
-                            // 타일 bbox 로 임시 CropPlan 을 만들어 기존 crop_region 을 재사용합니다.
-                            let crop = crate::models::siglip2::vision_crop::crop_tile(
-                                &dynamic_image, plan, tile, 512
-                            );
+                        // 🌟 [PART 1 / CROP DIET & PREFETCH] 타일 크롭을 2차 VLM 진입 직전
+                        //    (고DPI 다운스케일 + 노이즈 제거 잉크 BBox + 28px 종이색 Pad 스냅) 으로 정규화합니다.
+                        let diet_cfg = crate::models::siglip2::vision_crop::CropDietConfig::default();
+                        let prepared_tiles: Vec<(&crate::models::siglip2::vision_crop::TilePlan, image::DynamicImage)> =
+                            tiles
+                                .iter()
+                                .map(|tile| {
+                                    let raw = crate::models::siglip2::vision_crop::crop_tile(
+                                        &dynamic_image, plan, tile, 512,
+                                    );
+                                    let master_bounds = if tile.header_band.is_none() {
+                                        layout_hit.as_ref().and_then(|h| {
+                                            h.trusted_dilated_crop_bounds(
+                                                tile.bbox,
+                                                grid.orig_width,
+                                                grid.orig_height,
+                                                3,
+                                            )
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    let est_h = if tile.text_h > 0.5 { Some(tile.text_h) } else { None };
+                                    let slim = crate::models::siglip2::vision_crop::tighten_and_snap_crop_for_vlm(
+                                        raw,
+                                        &plan.category,
+                                        est_h,
+                                        height_baseline,
+                                        master_bounds,
+                                        &diet_cfg,
+                                        &emit_term,
+                                    );
+                                    (tile, slim)
+                                })
+                                .collect();
+                        for (tile, crop) in prepared_tiles {
 
                             let tile_tag = if tile.total > 1 {
                                 format!(" | 타일 {}/{}", tile.index + 1, tile.total)
@@ -2760,8 +2799,20 @@ impl crate::model::LogisModel {
                                     owned_patches: 0,
                                     twin_of: String::new(),
                                 };
-                                let micro = crate::models::siglip2::vision_crop::crop_region_clamped(
+                                let raw_micro = crate::models::siglip2::vision_crop::crop_region_clamped(
                                     &dynamic_image, &micro_plan, 512, height_baseline, &emit_term,
+                                );
+                                let master_bounds = layout_hit.as_ref().and_then(|h| {
+                                    h.trusted_dilated_crop_bounds(bbox, grid.orig_width, grid.orig_height, 3)
+                                });
+                                let micro = crate::models::siglip2::vision_crop::tighten_and_snap_crop_for_vlm(
+                                    raw_micro,
+                                    &micro_plan.category,
+                                    None,
+                                    height_baseline,
+                                    master_bounds,
+                                    &crate::models::siglip2::vision_crop::CropDietConfig::default(),
+                                    &emit_term,
                                 );
                                 let micro_verify = micro.clone();
                                 let defs: Vec<(String, String)> = fields
@@ -3608,8 +3659,20 @@ impl crate::model::LogisModel {
                         }
                         crate::utils::score_dynamics::record_baseline("vision.empty_crop_skip", 0.0);
 
-                        let crop = crate::models::siglip2::vision_crop::crop_region_clamped(
+                        let raw_crop = crate::models::siglip2::vision_crop::crop_region_clamped(
                             &dynamic_image, plan, 512, commerce_height_baseline, &emit_term,
+                        );
+                        let master_bounds = layout_hit.as_ref().and_then(|h| {
+                            h.trusted_dilated_crop_bounds(plan.bbox, grid.orig_width, grid.orig_height, 3)
+                        });
+                        let crop = crate::models::siglip2::vision_crop::tighten_and_snap_crop_for_vlm(
+                            raw_crop,
+                            &plan.category,
+                            None,
+                            commerce_height_baseline,
+                            master_bounds,
+                            &crate::models::siglip2::vision_crop::CropDietConfig::default(),
+                            &emit_term,
                         );
 
                         emit_term(&format!(

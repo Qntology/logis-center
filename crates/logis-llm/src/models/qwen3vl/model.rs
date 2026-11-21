@@ -1078,18 +1078,9 @@ impl Qwen3VLVisionModel {
         Ok(())
     }
 
-    /// 🌟 [VISION-JIT] 기존 텍스트 모델과 동일한 OS 레벨 강제 메모리 반환 루틴
+    /// 🌟 [VISION-JIT] 핫패스 워킹셋 트림 방지 — `legacy_working_set_trim()` 계약으로 일원화합니다.
     fn force_memory_release() {
-        #[cfg(target_os = "windows")]
-        unsafe {
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-            let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-        #[cfg(target_os = "macos")]
-        unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+        crate::models::common::legacy_working_set_trim();
     }
 
     pub fn fast_pos_embed_interpolate(&self, grid_thw: &Tensor) -> Result<Tensor> {
@@ -1243,30 +1234,92 @@ impl Qwen3VLVisionModel {
         hidden_states: &Tensor,
         grid_thw: &Tensor,
     ) -> Result<(Tensor, Vec<Tensor>)> {
-        let hidden_states = self.patch_embed.forward(hidden_states)?;
-        let pos_embeds = self.fast_pos_embed_interpolate(grid_thw)?.to_dtype(hidden_states.dtype())?;
-        let hidden_states = hidden_states.broadcast_add(&pos_embeds)?;
-        let rotary_pos_emb = self.rot_pos_emb(grid_thw)?;
-        let seq_len = hidden_states.dim(0)?;
-        let mut hidden_states = hidden_states.reshape((seq_len, ()))?;
-        let rotary_pos_emb = rotary_pos_emb.reshape((seq_len, ()))?;
-        let emb = Tensor::cat(&[&rotary_pos_emb, &rotary_pos_emb], D::Minus1)?;
-        let cos = emb.cos()?.to_dtype(self.dtype)?;
-        let sin = emb.sin()?.to_dtype(self.dtype)?;
-        
+        let mode = crate::models::common::vision_prune::vision_prune_mode();
+        // 기본 forward 는 기존 프롬프트 플레이스홀더 개수(H_m * W_m) 계약을 지켜야 하므로
+        // Halo1HopDrop 요청 시에도 외부 호출자가 drop 계약을 명시하지 않았으면 Scatter 로 복원합니다.
+        let eff_mode = match mode {
+            crate::models::common::vision_prune::PruneMode::Halo1HopDrop => {
+                crate::models::common::vision_prune::PruneMode::Halo1HopScatter
+            }
+            other => other,
+        };
+        let (out, ds, _) = self.forward_with_prune(hidden_states, grid_thw, eff_mode)?;
+        Ok((out, ds))
+    }
+
+    pub fn forward_with_prune(
+        &mut self,
+        pixel_values: &Tensor,
+        grid_thw: &Tensor,
+        prune_mode: crate::models::common::vision_prune::PruneMode,
+    ) -> Result<(
+        Tensor,
+        Vec<Tensor>,
+        Option<crate::models::common::vision_prune::PrunedVisionPatches>,
+    )> {
+        use crate::models::common::vision_prune::{
+            DEFAULT_SPREAD_THRESH, PruneMode, prune_blank_merge_groups_1hop,
+            scatter_pruned_merge_groups,
+        };
+
         let grid_thw_cpu = grid_thw.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
-        let mut chunks = Vec::new();
-        for thw in grid_thw_cpu {
-            let (t, h, w) = (thw[0] as usize, thw[1] as usize, thw[2] as usize);
-            let hw = h * w;
-            for _ in 0..t { chunks.push(hw); }
-        }
+        let prune_plan = if prune_mode != PruneMode::Off && grid_thw_cpu.len() == 1 {
+            let thw = (grid_thw_cpu[0][0], grid_thw_cpu[0][1], grid_thw_cpu[0][2]);
+            prune_blank_merge_groups_1hop(
+                pixel_values,
+                thw,
+                self.spatial_merge_size,
+                DEFAULT_SPREAD_THRESH,
+            )?
+        } else {
+            None
+        };
+
+        // 1) 원본 2D 위치 임베딩과 3D RoPE (cos, sin) 은 항상 원본 격자 좌표에서 산출합니다.
+        let mut pos_embeds = self.fast_pos_embed_interpolate(grid_thw)?;
+        let rotary_pos_emb = self.rot_pos_emb(grid_thw)?;
+        let orig_seq_len = rotary_pos_emb.dim(0)?;
+        let rotary_pos_emb = rotary_pos_emb.reshape((orig_seq_len, ()))?;
+        let emb = Tensor::cat(&[&rotary_pos_emb, &rotary_pos_emb], D::Minus1)?;
+        let mut cos = emb.cos()?.to_dtype(self.dtype)?;
+        let mut sin = emb.sin()?.to_dtype(self.dtype)?;
+
+        // 2) 1-Hop Halo 프루닝 적용 시 살아남은 패치만 patch_embed + 원본 (pos_embed, cos, sin) 결합
+        let (hidden_states, chunks) = if let Some(ref plan) = prune_plan {
+            let kept_idx = &plan.kept_rotary_idx;
+            let pe = self.patch_embed.forward(&plan.kept_pixels)?;
+            pos_embeds = pos_embeds
+                .index_select(kept_idx, 0)?
+                .to_dtype(pe.dtype())?;
+            cos = cos.index_select(kept_idx, 0)?.contiguous()?;
+            sin = sin.index_select(kept_idx, 0)?.contiguous()?;
+            let hs = pe.broadcast_add(&pos_embeds)?;
+            let kept_seq = hs.dim(0)?;
+            let saved_pct =
+                (1.0 - plan.kept_merge_groups as f32 / plan.orig_merge_groups.max(1) as f32) * 100.0;
+            println!(
+                "[VISION-PRUNE] 1-Hop Halo: {}/{} merge groups kept (-{:.1}%, orig RoPE preserved)",
+                plan.kept_merge_groups, plan.orig_merge_groups, saved_pct
+            );
+            (hs.reshape((kept_seq, ()))?, vec![kept_seq])
+        } else {
+            let pe = self.patch_embed.forward(pixel_values)?;
+            pos_embeds = pos_embeds.to_dtype(pe.dtype())?;
+            let hs = pe.broadcast_add(&pos_embeds)?;
+            let seq_len = hs.dim(0)?;
+            let mut ch = Vec::new();
+            for thw in &grid_thw_cpu {
+                let (t, h, w) = (thw[0] as usize, thw[1] as usize, thw[2] as usize);
+                let hw = h * w;
+                for _ in 0..t {
+                    ch.push(hw);
+                }
+            }
+            (hs.reshape((seq_len, ()))?, ch)
+        };
+        let mut hidden_states = hidden_states;
 
         // 🌟 [VISION-STREAM] stream_blocks 가 꺼져 있으면 기존과 100% 동일한 경로입니다.
-        //    켜져 있으면 블록 하나를 mmap 에서 읽고 → 계산하고 → 즉시 껍데기로 되돌립니다.
-        //    상주 가중치가 27블록(약 337MB) → 1블록(약 12MB) 으로 줄지만,
-        //    이미지당 27회 PCIe 전송이 추가됩니다.
-        //    쿼리축 타일링으로 활성값 피크를 이미 잡았다면 대개 불필요한 트레이드오프입니다.
         let streaming = self.stream_blocks && self.is_jit_capable();
         let total_blocks = self.blocks.len();
         let ds_indexes = self.deepstack_visual_indexes.clone();
@@ -1280,12 +1333,16 @@ impl Qwen3VLVisionModel {
             hidden_states = self.blocks[layer_num].forward(&hidden_states, &chunks, &cos, &sin)?;
 
             if let Some(index) = ds_indexes.iter().position(|&x| x == layer_num) {
-                let deepstack_feature = self.deepstack_merger_list[index].forward(&hidden_states)?;
+                let mut deepstack_feature = self.deepstack_merger_list[index].forward(&hidden_states)?;
+                if prune_mode == PruneMode::Halo1HopScatter {
+                    if let Some(ref plan) = prune_plan {
+                        deepstack_feature = scatter_pruned_merge_groups(&deepstack_feature, plan)?;
+                    }
+                }
                 deepstack_feature_lists.push(deepstack_feature);
             }
 
             if streaming {
-                // 계산이 끝난 블록은 즉시 반환합니다. 다음 블록이 그 자리를 씁니다.
                 self.blocks[layer_num].clear_weights();
                 if self.device.is_cuda_or_rocm() {
                     let _ = self.device.synchronize();
@@ -1293,12 +1350,17 @@ impl Qwen3VLVisionModel {
             }
         }
         hidden_states = self.merger.forward(&hidden_states)?;
+        if prune_mode == PruneMode::Halo1HopScatter {
+            if let Some(ref plan) = prune_plan {
+                hidden_states = scatter_pruned_merge_groups(&hidden_states, plan)?;
+            }
+        }
 
         if streaming {
             println!("[VISION-STREAM] {} blocks streamed. Resident block weights: ~1 block.", total_blocks);
         }
 
-        Ok((hidden_states, deepstack_feature_lists))
+        Ok((hidden_states, deepstack_feature_lists, prune_plan))
     }
 }
 
@@ -1942,21 +2004,8 @@ impl Qwen3VLModel {
                     final_hidden_state = Some(outputs.narrow(1, seq_len - 1, 1)?.contiguous()?);
                 }
 
-                // 🌟 [VRAM/RAM 최적화]
-                if inputs_embeds.device().is_cuda_or_rocm() {
-                    let _ = inputs_embeds.device().synchronize();
-                }
-
-                #[cfg(target_os = "windows")]
-                unsafe {
-                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                    use windows_sys::Win32::System::Memory::{SetProcessWorkingSetSizeEx, QUOTA_LIMITS_HARDWS_MIN_DISABLE, QUOTA_LIMITS_HARDWS_MAX_DISABLE};
-                    let _ = SetProcessWorkingSetSizeEx(GetCurrentProcess(), usize::MAX, usize::MAX, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
-                }
-                #[cfg(target_os = "linux")]
-                unsafe { extern "C" { fn malloc_trim(pad: usize) -> i32; } malloc_trim(0); }
-                #[cfg(target_os = "macos")]
-                unsafe { extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; } malloc_zone_pressure_relief(std::ptr::null_mut(), 0); }
+                // 🌟 [VRAM/RAM 최적화] 핫패스 내 강제 워킹셋 트림 제거 (페이즈/태스크 경계 일괄 정착)
+                crate::models::common::legacy_working_set_trim();
 
                 processed += take;
                 current_offset += take;
