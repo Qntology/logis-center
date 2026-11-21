@@ -507,9 +507,12 @@ pub fn fused_op_ok(device: &Device, kind: FusedOpKind, dtype: DType, dim: usize)
     let has_fault = fault_map_lock().contains_key(&kind);
     let supported_dev = match kind {
         FusedOpKind::GatedDeltaRule => {
-            matches!(device, Device::Cuda(_) | Device::Rocm(_) | Device::Metal(_))
+            matches!(
+                device,
+                Device::Cuda(_) | Device::Rocm(_) | Device::Metal(_) | Device::Vulkan(_)
+            )
         }
-        _ => matches!(device, Device::Cuda(_) | Device::Rocm(_)),
+        _ => matches!(device, Device::Cuda(_) | Device::Rocm(_) | Device::Vulkan(_)),
     };
     if !supported_dev && !has_fault {
         return false;

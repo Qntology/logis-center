@@ -25,6 +25,16 @@ impl GpuDeviceExt for Device {
     }
 }
 
+/// Extracts the GPU ordinal from a Candle `Device` (`0` for CPU/Metal).
+pub fn device_ordinal(device: &Device) -> usize {
+    match device.location() {
+        candle_core::DeviceLocation::Cuda { gpu_id } => gpu_id,
+        candle_core::DeviceLocation::Rocm { gpu_id } => gpu_id,
+        candle_core::DeviceLocation::Vulkan { gpu_id } => gpu_id,
+        _ => 0,
+    }
+}
+
 pub fn new_gpu_device(id: usize) -> Option<Device> {
     #[cfg(feature = "cuda")]
     if let Ok(d) = Device::new_cuda(id) {
@@ -126,13 +136,15 @@ mod wddm {
     // DXGI 어댑터 질의는 스레드에 묶이지 않습니다(free-threaded). 호출은 Mutex 로 직렬화합니다.
     unsafe impl Send for Adapter {}
 
-    static ADAPTER: Mutex<Option<Option<Adapter>>> = Mutex::new(None);
+    static ADAPTERS: Mutex<Option<Vec<Adapter>>> = Mutex::new(None);
 
-    /// 전용 메모리가 가장 큰 AMD 어댑터.
-    fn find_amd_adapter() -> Option<Adapter> {
+    /// 전용 메모리 크기 내림차순으로 정렬된 AMD 어댑터 목록.
+    fn find_amd_adapters() -> Vec<Adapter> {
         unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-            let mut best: Option<(usize, IDXGIAdapter3)> = None;
+            let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
+                return Vec::new();
+            };
+            let mut found: Vec<(usize, IDXGIAdapter3)> = Vec::new();
             let mut i = 0;
             while let Ok(a) = factory.EnumAdapters1(i) {
                 i += 1;
@@ -141,21 +153,20 @@ mod wddm {
                     continue;
                 }
                 let Ok(a3) = a.cast::<IDXGIAdapter3>() else { continue };
-                if best.as_ref().map_or(true, |(m, _)| desc.DedicatedVideoMemory > *m) {
-                    best = Some((desc.DedicatedVideoMemory, a3));
-                }
+                found.push((desc.DedicatedVideoMemory, a3));
             }
-            best.map(|(_, a)| Adapter(a))
+            found.sort_by(|a, b| b.0.cmp(&a.0));
+            found.into_iter().map(|(_, a)| Adapter(a)).collect()
         }
     }
 
-    /// 이 프로세스가 더 쓸 수 있는 로컬(VRAM) 메모리 = Budget − CurrentUsage.
-    pub fn local_free_bytes() -> Option<u64> {
-        let mut g = ADAPTER.lock().ok()?;
+    /// `gpu_id` 번 AMD 어댑터에서 이 프로세스가 더 쓸 수 있는 로컬(VRAM) 메모리 = Budget − CurrentUsage.
+    pub fn local_free_bytes(gpu_id: usize) -> Option<u64> {
+        let mut g = ADAPTERS.lock().ok()?;
         if g.is_none() {
-            *g = Some(find_amd_adapter());
+            *g = Some(find_amd_adapters());
         }
-        let adapter = g.as_ref()?.as_ref()?;
+        let adapter = g.as_ref()?.get(gpu_id)?;
         let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         unsafe { adapter.0.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).ok()? };
         Some(info.Budget.saturating_sub(info.CurrentUsage))
@@ -168,8 +179,8 @@ fn clamp_free_to_os_budget(gpu_id: usize, is_rocm: bool, free: u64) -> u64 {
     {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let off = *OFF.get_or_init(|| std::env::var("LOGIS_VRAM_WDDM").map(|v| v.trim() == "0").unwrap_or(false));
-        if is_rocm && gpu_id == 0 && !off {
-            if let Some(budget_free) = wddm::local_free_bytes() {
+        if is_rocm && !off {
+            if let Some(budget_free) = wddm::local_free_bytes(gpu_id) {
                 return free.min(budget_free);
             }
         }
@@ -285,8 +296,8 @@ impl GpuMemProbe {
             return Some((clamp_free_to_os_budget(gpu_id, true, free as u64), total as u64));
         }
         #[cfg(feature = "vulkan")]
-        if gpu_id == 0 && *VULKAN_DEVICE_COUNT > 0 {
-            if let Device::Vulkan(d) = get_gpu_device(gpu_id) {
+        if gpu_id < *VULKAN_DEVICE_COUNT {
+            if let Ok(Device::Vulkan(d)) = Device::new_vulkan(gpu_id) {
                 if let Ok((free, total)) = d.mem_info() {
                     return Some((free as u64, total as u64));
                 }
@@ -500,7 +511,10 @@ pub fn trim_idle_gpu_pool(device: &Device) {
         }
         #[cfg(feature = "rocm")]
         Device::Rocm(d) => {
-            let _ = d.trim_memory_pool();
+            // 256 MiB 핫 풀을 유지해 매 스텝 hipMallocAsync/hipFreeAsync 재할당 스톨을 방지합니다.
+            if d.pool_idle_bytes().unwrap_or(0) >= (320 << 20) {
+                let _ = d.trim_memory_pool_to(256 << 20);
+            }
         }
         _ => {
             let _ = device;
@@ -581,13 +595,25 @@ pub fn get_best_device_info() -> (Device, usize) {
 
     #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), feature = "vulkan"))]
     {
-        let count = GpuMemProbe::new().device_count();
+        let probe = GpuMemProbe::new();
+        let count = probe.device_count();
         if count == 0 {
             println!("[GPU-CHECK] No Vulkan device found. Falling back to CPU.");
             return (Device::Cpu, 0);
         }
-        println!("[GPU-CHECK] Found {} Vulkan device(s). Selecting GPU 0.", count);
-        return (get_gpu_device(0), 0);
+        let mut best_id = 0usize;
+        let mut max_free = 0u64;
+        for i in 0..count {
+            if let Some((free, _)) = probe.mem_info(i) {
+                println!("[GPU-CHECK] Vulkan GPU {}: {:.2} GB Free VRAM", i, free as f64 / 1e9);
+                if free > max_free {
+                    max_free = free;
+                    best_id = i;
+                }
+            }
+        }
+        println!("[GPU-CHECK] Found {} Vulkan device(s). Selecting GPU {}.", count, best_id);
+        return (get_gpu_device(best_id), best_id);
     }
 
     #[cfg(all(not(feature = "cuda"), not(feature = "rocm"), not(feature = "vulkan"), feature = "metal"))]

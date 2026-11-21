@@ -294,6 +294,32 @@ impl TqBlockCodec {
         })
     }
 
+    /// 🌟 [PAGED-TURBO-ATTN] 페이지 블록 테이블(`KvBlockRef`)을 연결(`Tensor::cat`) 없이 직접 읽어
+    /// `tq_attnp*` 커널로 어텐션을 계산합니다.
+    #[cfg(feature = "turbo-quant")]
+    pub fn attend_packed_blocks(
+        &self,
+        q: &Tensor,
+        blocks: &[candle_nn::turbo_quant::KvBlockRef<'_>],
+        scaling: f64,
+    ) -> Result<Tensor> {
+        let dt = q.dtype();
+        let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scaling as f32).causal();
+        let q_in = if self.rot.is_some() {
+            self.rotate(q)?.to_dtype(dt)?.contiguous()?
+        } else {
+            q.contiguous()?
+        };
+        let o = candle_nn::turbo_quant::attention_packed_blocks(
+            &q_in, blocks, &self.kq, &self.vq, &cfg,
+        )?;
+        Ok(if self.rot.is_some() {
+            self.unrotate(&o)?.to_dtype(dt)?
+        } else {
+            o.to_dtype(dt)?
+        })
+    }
+
     #[cfg_attr(not(feature = "turbo-quant"), allow(dead_code))]
     fn words(&self, keys: bool) -> usize {
         if keys {
@@ -884,9 +910,9 @@ impl KvPart {
     }
 }
 
-/// 🌟 [OFFLOAD-ATTN] 디코딩(q_len 1): 모든 블록이 같은 TurboQuant 형식이면 압축 행을 그대로 이어 붙여
-/// fused 커널 한 번으로 계산합니다. (블록마다 복원 → matmul → 온라인 소프트맥스 병합을 반복하지 않습니다)
-/// RAM 에 있는 블록은 압축된 채로 올라옵니다. 조건이 맞지 않으면 `Ok(None)`.
+/// 🌟 [OFFLOAD-ATTN] 디코딩 및 소형 멀티토큰(`q_len <= 4`): 모든 블록이 같은 TurboQuant 형식이면
+/// CUDA/ROCm 에서는 `KvBlockRef` 로 `Tensor::cat` 없이 페이지드 커널(`tq_attnp*`)을 직접 실행하고,
+/// 그 외 백엔드/조건에서는 압축 행을 이어 붙여 fused 커널 한 번으로 계산합니다.
 pub fn fused_decode_attention(q: &Tensor, parts: &[KvPart], scaling: f64) -> Result<Option<Tensor>> {
     #[cfg(feature = "turbo-quant")]
     {
@@ -898,6 +924,20 @@ pub fn fused_decode_attention(q: &Tensor, parts: &[KvPart], scaling: f64) -> Res
         }
         let dev = q.device();
         let codec = codec_for(&meta, dev)?;
+        let can_paged = matches!(dev, Device::Cuda(_) | Device::Rocm(_))
+            && parts.len() <= candle_core::accel::attention::FA_MAX_PAGES
+            && parts.iter().all(|p| p.k.device().same_device(dev) && p.v.device().same_device(dev));
+        if can_paged {
+            let block_refs: Vec<candle_nn::turbo_quant::KvBlockRef<'_>> = parts
+                .iter()
+                .map(|p| candle_nn::turbo_quant::KvBlockRef {
+                    k: &p.k,
+                    v: &p.v,
+                    rows: p.len,
+                })
+                .collect();
+            return Ok(Some(codec.attend_packed_blocks(q, &block_refs, scaling)?));
+        }
         let total: usize = parts.iter().map(|p| p.len).sum();
         let rows = |pick: &dyn Fn(&KvPart) -> &Tensor| -> Result<Tensor> {
             let mut v = Vec::with_capacity(parts.len());

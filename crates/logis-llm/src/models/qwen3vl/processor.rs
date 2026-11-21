@@ -6,7 +6,6 @@ use crate::openai_types::{
 };
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Shape, Tensor};
-use crate::utils::GpuDeviceExt;
 #[cfg(feature = "ffmpeg")]
 use ffmpeg_next as ffmpeg;
 use image::DynamicImage;
@@ -102,7 +101,7 @@ impl Qwen3VLProcessor {
         let patch_area = (self.img_process_cfg.patch_size * self.img_process_cfg.patch_size) as u64;
         if patch_area == 0 { return config_max; }
 
-        let free_vram = match crate::utils::gpu_mem_info(0) {
+        let free_vram = match crate::utils::gpu_mem_info(crate::utils::device_ordinal(&self.device)) {
             Some((free, _)) => free,
             None => return config_max,
         };
@@ -374,53 +373,115 @@ impl Qwen3VLProcessor {
         Ok((img_tensor, grid_thw))
     }
 
+    fn process_img_patched_with_budget(
+        &self,
+        img: &DynamicImage,
+        budget_divisor: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let img_h = img.height();
+        let img_w = img.width();
+
+        let mut max_pixels = self.img_process_cfg.size.longest_edge as u32;
+        let min_pixels = self.img_process_cfg.size.shortest_edge as u32;
+        if max_pixels > 16_777_216 {
+            max_pixels = 16_777_216;
+        }
+        let adaptive = self.compute_adaptive_max_pixels(max_pixels);
+        if adaptive < max_pixels {
+            max_pixels = adaptive;
+        }
+        let divisor = budget_divisor.max(1);
+        if divisor > 1 {
+            let shared = max_pixels / divisor as u32;
+            let floor_px = 1_048_576u32;
+            let shared = shared.max(floor_px.min(max_pixels));
+            if shared < max_pixels {
+                println!(
+                    "[VISION-ADAPTIVE] Batch of {} images → per-image max_pixels {} (was {}).",
+                    divisor, shared, max_pixels
+                );
+                max_pixels = shared;
+            }
+        }
+        let min_pixels = if min_pixels > max_pixels { max_pixels } else { min_pixels };
+
+        let patch_size = self.img_process_cfg.patch_size;
+        let merge_size = self.img_process_cfg.merge_size;
+        let tp = self.img_process_cfg.temporal_patch_size.max(1);
+        let (resize_h, resize_w) = img_smart_resize(
+            img_h,
+            img_w,
+            (patch_size * merge_size) as u32,
+            min_pixels,
+            max_pixels,
+        )?;
+        let resized = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::Lanczos3);
+        let rgb = resized.to_rgb8().into_raw();
+        let grid_h = resize_h as usize / patch_size;
+        let grid_w = resize_w as usize / patch_size;
+        let patch_dim = 3 * tp * patch_size * patch_size;
+        let mean = [
+            self.img_process_cfg.image_mean.first().copied().unwrap_or(0.5),
+            self.img_process_cfg.image_mean.get(1).copied().unwrap_or(0.5),
+            self.img_process_cfg.image_mean.get(2).copied().unwrap_or(0.5),
+        ];
+        let std = [
+            self.img_process_cfg.image_std.first().copied().unwrap_or(0.5),
+            self.img_process_cfg.image_std.get(1).copied().unwrap_or(0.5),
+            self.img_process_cfg.image_std.get(2).copied().unwrap_or(0.5),
+        ];
+        let mut out = vec![0.0f32; grid_h * grid_w * patch_dim];
+        embed_cpu_kernels::image::patchify_norm_qwen_vl_u8_f32(
+            &rgb,
+            resize_w as usize,
+            resize_h as usize,
+            patch_size,
+            merge_size,
+            tp,
+            mean,
+            std,
+            &mut out,
+        );
+        let patched = Tensor::from_vec(out, (grid_h * grid_w, patch_dim), &self.device)?
+            .to_dtype(self.dtype)?;
+        let grid_thw = Tensor::from_vec(
+            vec![1u32, grid_h as u32, grid_w as u32],
+            (1, 3),
+            &self.device,
+        )?;
+        Ok((patched, grid_thw))
+    }
+
     pub fn process_images(
         &self,
         imgs: Vec<DynamicImage>,
-        img_mean: &Tensor,
-        img_std: &Tensor,
+        _img_mean: &Tensor,
+        _img_std: &Tensor,
     ) -> Result<VisionInput> {
-        let mut pixel_values_vec = Vec::new();
-        let mut vision_grid_thws_vec = Vec::new();
+        let mut pixel_values_vec = Vec::with_capacity(imgs.len());
+        let mut vision_grid_thws_vec = Vec::with_capacity(imgs.len());
 
-        // 🌟 [VRAM 역산] 결과 텐서들이 최종적으로 Tensor::cat 으로 전부 합쳐지므로,
-        //    이미지 장수를 예산 분모로 전달해야 실제 피크를 통제할 수 있습니다.
         let total = imgs.len().max(1);
         if total > 1 {
             println!("[VISION-ADAPTIVE] process_images: {} images will co-reside. Splitting VRAM budget.", total);
         }
 
         for img in imgs {
-            let img_tensor = self.process_img_with_budget(&img, img_mean, img_std, total)?;
-            let doubled = Tensor::cat(&[&img_tensor, &img_tensor], 0)?.contiguous()?;
-
-            // 🌟 [VRAM] 원본 img_tensor 는 doubled 로 복사가 끝났으므로 즉시 폐기합니다.
-            drop(img_tensor);
-
-            let (patched, grid_thw) = self.process_vision_tensor(&doubled)?;
-
-            // 🌟 [VRAM] reshape/permute 소스인 doubled 도 patched 확보 직후 폐기합니다.
-            //    고해상도 다중 이미지에서 이 두 drop 이 루프마다 수백 MB 를 회수합니다.
-            drop(doubled);
-
+            let (patched, grid_thw) = self.process_img_patched_with_budget(&img, total)?;
             pixel_values_vec.push(patched);
             vision_grid_thws_vec.push(grid_thw);
-
-            // 이미지 1장 처리가 끝날 때마다 GPU 큐를 비워 중간 버퍼가 실제로 반환되게 합니다.
-            if self.device.is_cuda_or_rocm() {
-                let _ = self.device.synchronize();
-            }
         }
 
-        let pixel_values = Tensor::cat(&pixel_values_vec, 0)?;
-        let vision_grid_thws = Tensor::cat(&vision_grid_thws_vec, 0)?;
-
-        // 🌟 [VRAM] 개별 조각들은 합쳐진 이후 불필요합니다.
-        drop(pixel_values_vec);
-        drop(vision_grid_thws_vec);
-        if self.device.is_cuda_or_rocm() {
-            let _ = self.device.synchronize();
-        }
+        let pixel_values = if pixel_values_vec.len() == 1 {
+            pixel_values_vec.remove(0)
+        } else {
+            Tensor::cat(&pixel_values_vec, 0)?
+        };
+        let vision_grid_thws = if vision_grid_thws_vec.len() == 1 {
+            vision_grid_thws_vec.remove(0)
+        } else {
+            Tensor::cat(&vision_grid_thws_vec, 0)?
+        };
 
         Ok(VisionInput {
             data: pixel_values,

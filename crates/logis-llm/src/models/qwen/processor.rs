@@ -12,9 +12,7 @@ use crate::{
 };
 use anyhow::Result;
 use candle_core::{DType, Device, Shape, Tensor};
-use crate::utils::GpuDeviceExt;
 use image::DynamicImage;
-use sysinfo::System;
 
 #[derive(Clone)]
 pub struct VisionInput {
@@ -103,7 +101,7 @@ impl QwenVLProcessor {
         let patch_area = (self.img_process_cfg.patch_size * self.img_process_cfg.patch_size) as u64;
         if patch_area == 0 { return config_max; }
 
-        let free_vram = match crate::utils::gpu_mem_info(0) {
+        let free_vram = match crate::utils::gpu_mem_info(crate::utils::device_ordinal(&self.device)) {
             Some((free, _)) => free,
             None => return config_max,
         };
@@ -165,10 +163,8 @@ impl QwenVLProcessor {
 
         if max_pixels > 16_777_216 { max_pixels = 16_777_216; }
 
-        // 1. System RAM Check (면적 기준으로 환산)
-        let mut sys = System::new_all();
-        sys.refresh_memory();
-        let free_ram = sys.available_memory();
+        // 1. System RAM Check (공유 SYSTEM_MONITOR 사용 — 매 크롭 System::new_all() 제거)
+        let free_ram = crate::utils::resources::free_ram_bytes();
         if free_ram < 2_000_000_000 {
             let cap = 3_145_728u32; // 약 1772x1772 의 '면적' (OCR 품질 보존을 위해 상향)
             if max_pixels > cap {
@@ -256,14 +252,96 @@ impl QwenVLProcessor {
         Ok((img_tensor, grid_thw))
     }
 
+    fn process_img_patched_with_budget(
+        &self,
+        img: &DynamicImage,
+        budget_divisor: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let img_h = img.height();
+        let img_w = img.width();
+        let mut max_pixels = self.img_process_cfg.size.longest_edge as u32;
+        let shortest_edge = self.img_process_cfg.size.shortest_edge as u32;
+        if max_pixels > 16_777_216 {
+            max_pixels = 16_777_216;
+        }
+        let free_ram = crate::utils::resources::free_ram_bytes();
+        if free_ram < 2_000_000_000 {
+            let cap = 3_145_728u32;
+            if max_pixels > cap {
+                println!("[PROCESSOR] Low RAM ({:.2} GB). Capping to {}px².", free_ram as f64 / 1e9, cap);
+                max_pixels = cap;
+            }
+        }
+        let adaptive = self.compute_adaptive_max_pixels(max_pixels);
+        if adaptive < max_pixels {
+            max_pixels = adaptive;
+        }
+        let divisor = budget_divisor.max(1);
+        if divisor > 1 {
+            let shared = max_pixels / divisor as u32;
+            let floor_px = 1_048_576u32;
+            let shared = shared.max(floor_px.min(max_pixels));
+            if shared < max_pixels {
+                println!("[PROCESSOR] Batch of {} images → per-image max_pixels {} (was {}).", divisor, shared, max_pixels);
+                max_pixels = shared;
+            }
+        }
+        let shortest_edge = if shortest_edge > max_pixels { max_pixels } else { shortest_edge };
+        let patch_size = self.img_process_cfg.patch_size;
+        let merge_size = self.img_process_cfg.merge_size;
+        let tp = self.img_process_cfg.temporal_patch_size.max(1);
+        let (resize_h, resize_w) = img_smart_resize(
+            img_h,
+            img_w,
+            (patch_size * merge_size) as u32,
+            shortest_edge,
+            max_pixels,
+        )?;
+        let resized = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::Lanczos3);
+        let rgb = resized.to_rgb8().into_raw();
+        let grid_h = resize_h as usize / patch_size;
+        let grid_w = resize_w as usize / patch_size;
+        let patch_dim = 3 * tp * patch_size * patch_size;
+        let mean = [
+            self.img_process_cfg.image_mean.first().copied().unwrap_or(0.5),
+            self.img_process_cfg.image_mean.get(1).copied().unwrap_or(0.5),
+            self.img_process_cfg.image_mean.get(2).copied().unwrap_or(0.5),
+        ];
+        let std = [
+            self.img_process_cfg.image_std.first().copied().unwrap_or(0.5),
+            self.img_process_cfg.image_std.get(1).copied().unwrap_or(0.5),
+            self.img_process_cfg.image_std.get(2).copied().unwrap_or(0.5),
+        ];
+        let mut out = vec![0.0f32; grid_h * grid_w * patch_dim];
+        embed_cpu_kernels::image::patchify_norm_qwen_vl_u8_f32(
+            &rgb,
+            resize_w as usize,
+            resize_h as usize,
+            patch_size,
+            merge_size,
+            tp,
+            mean,
+            std,
+            &mut out,
+        );
+        let patched = Tensor::from_vec(out, (grid_h * grid_w, patch_dim), &self.device)?
+            .to_dtype(self.dtype)?;
+        let grid_thw = Tensor::from_vec(
+            vec![1u32, grid_h as u32, grid_w as u32],
+            (1, 3),
+            &self.device,
+        )?;
+        Ok((patched, grid_thw))
+    }
+
     pub fn process_images(
         &self,
         imgs: Vec<DynamicImage>,
-        img_mean: &Tensor,
-        img_std: &Tensor,
+        _img_mean: &Tensor,
+        _img_std: &Tensor,
     ) -> Result<VisionInput> {
-        let mut pixel_values_vec = Vec::new();
-        let mut vision_grid_thws_vec = Vec::new();
+        let mut pixel_values_vec = Vec::with_capacity(imgs.len());
+        let mut vision_grid_thws_vec = Vec::with_capacity(imgs.len());
 
         // 🌟 [VRAM 역산] 결과가 최종적으로 Tensor::cat 으로 합쳐지므로 장수를 예산 분모로 넘깁니다.
         let total = imgs.len().max(1);
@@ -272,28 +350,21 @@ impl QwenVLProcessor {
         }
 
         for img in imgs {
-            let raw = self.process_img_with_budget(&img, img_mean, img_std, total)?;
-            let (patched, grid_thw) = self.process_vision_tensor(&raw)?;
-
-            // 🌟 [VRAM] reshape/permute 소스는 patched 확보 직후 폐기합니다.
-            drop(raw);
-
+            let (patched, grid_thw) = self.process_img_patched_with_budget(&img, total)?;
             pixel_values_vec.push(patched);
             vision_grid_thws_vec.push(grid_thw);
-
-            if self.device.is_cuda_or_rocm() {
-                let _ = self.device.synchronize();
-            }
         }
 
-        let pixel_values = Tensor::cat(&pixel_values_vec, 0)?;
-        let vision_grid_thws = Tensor::cat(&vision_grid_thws_vec, 0)?;
-
-        drop(pixel_values_vec);
-        drop(vision_grid_thws_vec);
-        if self.device.is_cuda_or_rocm() {
-            let _ = self.device.synchronize();
-        }
+        let pixel_values = if pixel_values_vec.len() == 1 {
+            pixel_values_vec.remove(0)
+        } else {
+            Tensor::cat(&pixel_values_vec, 0)?
+        };
+        let vision_grid_thws = if vision_grid_thws_vec.len() == 1 {
+            vision_grid_thws_vec.remove(0)
+        } else {
+            Tensor::cat(&vision_grid_thws_vec, 0)?
+        };
 
         Ok(VisionInput {
             data: pixel_values,

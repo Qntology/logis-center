@@ -2846,7 +2846,7 @@ impl QuantizedQwenVLTextModel {
                 let (kv_layers, kv_heads, kv_head_dim) = self.kv_plan_geometry();
                 let planned = seqlen_offset + seq_len + QWEN06B_DECODE_HEADROOM_TOKENS;
 
-                let plan = crate::utils::resources::plan_kv_residency(
+                let plan = crate::utils::resources::plan_kv_residency_ex(
                     &crate::utils::resources::KvPlanInput {
                         gpu_id: self.device_id as u32,
                         is_cpu_mode: self.is_forced_cpu,
@@ -2857,6 +2857,12 @@ impl QuantizedQwenVLTextModel {
                         bytes_per_elem: 1,
                         planned_tokens: planned,
                         label: "Qwen(0.6B)",
+                    },
+                    &crate::utils::resources::KvPlanExtra {
+                        already_tokens: seqlen_offset,
+                        decode_transient_bytes: 96 * 1024 * 1024,
+                        bytes_per_token: None,
+                        prev: self.kv_plan,
                     },
                 );
 
@@ -3193,7 +3199,18 @@ impl QuantizedQwenVLModel {
         baking_only: bool, 
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
-        let vision_dtype = if vision_device.is_cpu() || vision_device.is_vulkan() { DType::F32 } else { DType::F16 };
+        let vision_head_dim = v_config.hidden_size / v_config.num_heads.max(1);
+        let vision_dtype = if vision_device.is_cpu() {
+            DType::F32
+        } else if vision_device.is_vulkan() {
+            if crate::models::common::accel_check::flash_attn_ok(vision_device, DType::F16, vision_head_dim) {
+                DType::F16
+            } else {
+                DType::F32
+            }
+        } else {
+            DType::F16
+        };
         
         
         let visual = if baking_only {
@@ -3262,7 +3279,18 @@ impl QuantizedQwenVLModel {
         baking_only: bool, 
     ) -> Result<Self> {
         let v_config = config.vision_config.as_ref().ok_or(anyhow!("Missing vision_config"))?;
-        let vision_dtype = if vision_device.is_cpu() || vision_device.is_vulkan() { DType::F32 } else { DType::F16 };
+        let vision_head_dim = v_config.hidden_size / v_config.num_heads.max(1);
+        let vision_dtype = if vision_device.is_cpu() {
+            DType::F32
+        } else if vision_device.is_vulkan() {
+            if crate::models::common::accel_check::flash_attn_ok(vision_device, DType::F16, vision_head_dim) {
+                DType::F16
+            } else {
+                DType::F32
+            }
+        } else {
+            DType::F16
+        };
         
         let visual = if baking_only {
             None

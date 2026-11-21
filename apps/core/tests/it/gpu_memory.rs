@@ -21,12 +21,16 @@ use crate::common::mock_qwen3;
 type R = anyhow::Result<()>;
 const MB: f64 = 1e6;
 
-fn gpu() -> Option<Device> {
+fn gpu() -> anyhow::Result<Option<Device>> {
+    let require_gpu = std::env::var("LOGIS_REQUIRE_GPU").map(|v| v == "1").unwrap_or(false);
     let d = logis_app::utils::new_gpu_device(0);
     if d.is_none() {
+        if require_gpu {
+            anyhow::bail!("LOGIS_REQUIRE_GPU=1 set, but no GPU device is available");
+        }
         println!("[GPU-MEM] GPU 장치가 없어 건너뜁니다.");
     }
-    d
+    Ok(d)
 }
 
 /// CPU 형 Vulkan 장치(lavapipe, `CANDLE_VULKAN_ALLOW_CPU=1` 일 때만 열림)는 '장치 메모리' 가 곧 시스템 RAM 이라
@@ -50,14 +54,31 @@ fn free_total(dev: &Device) -> anyhow::Result<(u64, u64)> {
 #[test]
 #[ignore]
 fn gpu_memory_is_reported_and_returned() -> R {
-    let Some(dev) = gpu() else { return Ok(()) };
+    let Some(dev) = gpu()? else { return Ok(()) };
     let (free0, total) = free_total(&dev)?;
     assert!(total > 256 << 20 && free0 <= total, "{:?}: free {free0} / total {total}", dev.location());
+    // 외장 Vulkan(qgpu) 의 mem_info() 는 가중치가 올라가는 DEVICE_LOCAL VRAM 힙을 보고하고
+    // 일반 Tensor::zeros 는 HOST_VISIBLE 공유 힙에 잡히므로, Vulkan 에서는 실제 가중치와 같은
+    // Q8_0 GpuQuant 버퍼(약 256 MiB)를 올려 DEVICE_LOCAL VRAM 감소·반환까지 함께 검증합니다.
+    #[cfg(feature = "vulkan")]
+    let q_alloc = if let Device::Vulkan(vd) = &dev {
+        let blocks = (256usize << 20) / 34;
+        let raw = vec![0u8; blocks * 34];
+        Some(candle_core::quantized::vulkan::QVulkanStorage::from_bytes(
+            vd,
+            candle_core::quantized::GgmlDType::Q8_0,
+            &raw,
+        )?)
+    } else {
+        None
+    };
     let n = 64 << 20; // 64 Mi f32 = 256 MiB
     let t = Tensor::zeros(n, DType::F32, &dev)?;
     let _ = t.sum_all()?.to_scalar::<f32>()?;
     let (free1, _) = free_total(&dev)?;
     drop(t);
+    #[cfg(feature = "vulkan")]
+    drop(q_alloc);
     settle_gpu_memory(&dev, 0, true, "gpu_memory test")?;
     let (free2, _) = free_total(&dev)?;
     let used = free0 as f64 - free1 as f64;
@@ -90,7 +111,7 @@ fn gpu_memory_is_reported_and_returned() -> R {
 #[test]
 #[ignore]
 fn mock_qwen3_kv_tiers_match_cpu_on_gpu() -> R {
-    let Some(dev) = gpu() else { return Ok(()) };
+    let Some(dev) = gpu()? else { return Ok(()) };
     // 계층(VRAM 상주 / RAM 대피)만 비교합니다: TurboQuant KV(손실 압축, turbo-quant 빌드의 CUDA/ROCm/Vulkan)는 끕니다.
     let saved = candle_core::accel::config();
     candle_core::accel::update_config(|c| c.turbo_quant.enabled = false);
@@ -113,6 +134,15 @@ fn kv_tiers(dev: &Device) -> R {
         want.push(v(cpu.forward(Some(&ids(&[*t], &Device::Cpu)?), None, prompt.len() + i)?)?);
     }
     let mut report = Vec::new();
+    let mut tier_outputs: Vec<Vec<Vec<f32>>> = Vec::with_capacity(2);
+    let bf16_attn_backend = dev.is_cuda() || dev.is_rocm();
+    let argmax = |xs: &[f32]| -> usize {
+        xs.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
     for tier in [KvResidency::Vram, KvResidency::Ram] {
         let mut m = build(&dev)?;
         m.set_kv_residency(tier);
@@ -125,9 +155,32 @@ fn kv_tiers(dev: &Device) -> R {
             .zip(&want)
             .flat_map(|(g, w)| g.iter().zip(w).map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1.0)))
             .fold(0f32, f32::max);
-        report.push(format!("{tier:?} max rel {worst:.1e}"));
-        assert!(worst <= 1e-3, "{:?} {tier:?}: CPU 대비 {worst:.2e}", dev.location());
+        let top1_ok = got.iter().zip(&want).all(|(g, w)| argmax(g) == argmax(w));
+        report.push(format!("{tier:?} max rel {worst:.1e} (top1={top1_ok})"));
+        if bf16_attn_backend {
+            // CUDA/ROCm eager_attention_forward 는 F32 모델에서도 Q/K/V 를 BF16 으로 낮춰 실행하므로
+            // CPU F32 대비 오차 한도를 BF16 수준으로 두고, 대신 top-1 일치와 Vram↔Ram 동치성을 엄격 검증합니다.
+            assert!(
+                top1_ok && worst <= 0.5,
+                "{:?} {tier:?}: CPU(F32) 대비 BF16 어텐션 불일치 (top1={top1_ok}, worst={worst:.2e})",
+                dev.location()
+            );
+        } else {
+            assert!(worst <= 1e-3, "{:?} {tier:?}: CPU 대비 {worst:.2e}", dev.location());
+        }
+        tier_outputs.push(got);
     }
+    let tier_diff = tier_outputs[0]
+        .iter()
+        .zip(&tier_outputs[1])
+        .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1.0)))
+        .fold(0f32, f32::max);
+    report.push(format!("Vram↔Ram {tier_diff:.1e}"));
+    assert!(
+        tier_diff <= 1e-5,
+        "{:?}: Vram 과 Ram KV 계층 출력이 다릅니다 ({tier_diff:.2e})",
+        dev.location()
+    );
     println!("[GPU-MEM] KV 계층 강제 (목업 Qwen3, 프리필 7 + 디코드 3, TurboQuant KV off) {:?}: {}", dev.location(), report.join(" · "));
     Ok(())
 }
@@ -138,7 +191,7 @@ fn model_unload_returns_device_memory() -> R {
     // 앱과 같은 조건: 전역 할당기 mimalloc(tests/it/main.rs, 앱 main.rs 와 동일) + 앱의 반환 경로
     // (settle_gpu_memory → model::release_os_working_set). 첫 사이클의 잔여분은 런타임 1회 초기화
     // (Metal/MoltenVK 프레임워크 · 컴파일된 커널 · 스레드 풀)이고, 둘째 사이클에서 더 늘면 누수입니다.
-    let Some(dev) = gpu() else { return Ok(()) };
+    let Some(dev) = gpu()? else { return Ok(()) };
     settle_gpu_memory(&dev, 0, true, "unload test start")?;
     logis_app::model::release_os_working_set();
     let (free0, _) = free_total(&dev)?;

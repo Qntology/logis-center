@@ -720,6 +720,7 @@ pub fn match_shadow_anchor_candidate(
 #[derive(Clone)]
 pub struct TrimmedHead {
     w: QMatMul,
+    qweight: Arc<candle_core::quantized::QTensor>,
     pub kept: Arc<Vec<u32>>,
     pub vocab: usize,
     /// 남긴 행을 고른 규칙 · 언어 (같으면 다시 만들지 않음)
@@ -737,7 +738,7 @@ pub struct TrimmedHead {
 impl TrimmedHead {
     pub fn build(src: &TableSource, kept: Arc<Vec<u32>>, label: String, device: &Device) -> Result<Self> {
         let t0 = std::time::Instant::now();
-        let q = src.gather(&kept, device)?;
+        let qweight = Arc::new(src.gather(&kept, device)?);
         let mut inv = vec![kept.len() as u32; src.rows];
         for (i, &id) in kept.iter().enumerate() {
             inv[id as usize] = i as u32;
@@ -754,7 +755,7 @@ impl TrimmedHead {
             if rescue.is_some() { "on" } else { "full" },
             t0.elapsed().as_secs_f64() * 1e3
         );
-        Ok(Self { w: QMatMul::from_qtensor(q)?, kept, vocab: src.rows, label, inv, host_inv, pad, rescue })
+        Ok(Self { w: QMatMul::from_arc(Arc::clone(&qweight))?, qweight, kept, vocab: src.rows, label, inv, host_inv, pad, rescue })
     }
 
     /// 입력 임베딩 행: 묶인 표라 남긴 행의 출력 투영과 같은 바이트입니다. `ids` 가 모두 남긴 행에 있을 때만 (아니면 `None`) 장치의
@@ -811,7 +812,6 @@ impl TrimmedHead {
         let k_dim = *last_hidden.dims().last().unwrap_or(&0);
         let m = last_hidden.elem_count() / k_dim.max(1);
         let h_2d = last_hidden.reshape((m, k_dim))?.contiguous()?;
-        let sub_logits = self.w.forward(&h_2d)?.to_dtype(candle_core::DType::F32)?;
 
         let use_fused = crate::models::common::accel_check::fused_op_ok(
             h_2d.device(),
@@ -819,33 +819,56 @@ impl TrimmedHead {
             h_2d.dtype(),
             k_dim,
         );
-        let out = if let Some(guard) = &self.rescue {
-            if use_fused || h_2d.device().is_cpu() {
-                candle_core::lm_head::logits_argmax_cs(
-                    &sub_logits,
-                    Some(&h_2d),
+        // Quantized Mode A (0-byte [M, V_core] logits materialization on ROCm for M <= 8)
+        let quant_mode_a_ok = use_fused
+            && h_2d.device().is_rocm()
+            && m <= 8
+            && matches!(
+                self.qweight.dtype(),
+                GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
+            );
+        let out = if quant_mode_a_ok {
+            if let Some(guard) = &self.rescue {
+                candle_core::lm_head::fused_quant_argmax_cs(
+                    &h_2d,
+                    &self.qweight,
+                    None,
                     Some(&guard.kept_gpu),
                     Some(&guard.cs_guard),
                 )?
             } else {
-                // GPU 융합 커널 비활성 시 CPU 폴백 (무손실 계약 유지)
-                let sub_cpu = sub_logits.to_device(&Device::Cpu)?;
-                let h_cpu = h_2d.to_device(&Device::Cpu)?;
-                let kept_cpu = Tensor::from_vec(self.kept.as_ref().clone(), (self.kept.len(),), &Device::Cpu)?;
-                let guard_cpu = candle_core::lm_head::CsGuardParams {
-                    mu_rest: guard.cs_guard.mu_rest.to_device(&Device::Cpu)?,
-                    w_rest_bound: guard.cs_guard.w_rest_bound,
-                    b_rest_max: guard.cs_guard.b_rest_max,
-                };
-                candle_core::lm_head::logits_argmax_cs(
-                    &sub_cpu,
-                    Some(&h_cpu),
-                    Some(&kept_cpu),
-                    Some(&guard_cpu),
-                )?
+                candle_core::lm_head::fused_quant_argmax_cs(&h_2d, &self.qweight, None, None, None)?
             }
         } else {
-            candle_core::lm_head::logits_argmax_cs(&sub_logits, None, None, None)?
+            let sub_logits = self.w.forward(&h_2d)?.to_dtype(candle_core::DType::F32)?;
+            if let Some(guard) = &self.rescue {
+                if use_fused || h_2d.device().is_cpu() {
+                    candle_core::lm_head::logits_argmax_cs(
+                        &sub_logits,
+                        Some(&h_2d),
+                        Some(&guard.kept_gpu),
+                        Some(&guard.cs_guard),
+                    )?
+                } else {
+                    // GPU 융합 커널 비활성 시 CPU 폴백 (무손실 계약 유지)
+                    let sub_cpu = sub_logits.to_device(&Device::Cpu)?;
+                    let h_cpu = h_2d.to_device(&Device::Cpu)?;
+                    let kept_cpu = Tensor::from_vec(self.kept.as_ref().clone(), (self.kept.len(),), &Device::Cpu)?;
+                    let guard_cpu = candle_core::lm_head::CsGuardParams {
+                        mu_rest: guard.cs_guard.mu_rest.to_device(&Device::Cpu)?,
+                        w_rest_bound: guard.cs_guard.w_rest_bound,
+                        b_rest_max: guard.cs_guard.b_rest_max,
+                    };
+                    candle_core::lm_head::logits_argmax_cs(
+                        &sub_cpu,
+                        Some(&h_cpu),
+                        Some(&kept_cpu),
+                        Some(&guard_cpu),
+                    )?
+                }
+            } else {
+                candle_core::lm_head::logits_argmax_cs(&sub_logits, None, None, None)?
+            }
         };
 
         let mut ids = out.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
@@ -965,7 +988,7 @@ impl TrimmedHead {
 /// 잘라 내기를 켤 수 있으면(규칙이 `off` 가 아니고 GPU · 매핑 · Q8_0 류 블록 표) 입력 임베딩 · 출력 투영 표의 자리.
 /// 이때 입력 임베딩은 이 매핑에서 쓰는 행만 읽고(장치 0), 출력 투영은 남긴 행만 장치에 둡니다.
 pub fn mapped_table(device: &Device, map: Option<&Arc<memmap2::Mmap>>, content: Option<&candle_core::quantized::gguf_file::Content>) -> Option<TableSource> {
-    if rule_from_env() == TrimRule::Off || !(device.is_cuda() || device.is_rocm()) {
+    if rule_from_env() == TrimRule::Off || !(device.is_cuda() || device.is_rocm() || device.is_vulkan()) {
         return None;
     }
     let (map, content) = (map?, content?);

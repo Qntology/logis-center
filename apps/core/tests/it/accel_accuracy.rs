@@ -95,8 +95,11 @@ fn flash_attn_and_turbo_quant_teacher_forcing_accuracy() -> R {
         assert_eq!(reference.len(), DECODE);
         assert!(reference.iter().flatten().all(|x| x.is_finite()));
         let mut devices = vec![Device::Cpu];
+        let require_gpu = std::env::var("LOGIS_REQUIRE_GPU").map(|v| v == "1").unwrap_or(false);
         if let Some(d) = logis_app::utils::new_gpu_device(0) {
             devices.push(d);
+        } else if require_gpu {
+            anyhow::bail!("LOGIS_REQUIRE_GPU=1 set, but no GPU device is available");
         }
         for dev in &devices {
             let tq_active = logis_app::models::common::turbo_kv_active(dev);

@@ -5,6 +5,7 @@ pub mod device_utils;
 pub mod direct_loader;
 pub mod img_utils;
 pub mod misc_utils;
+pub mod prefetch;
 pub mod resources;
 pub mod tensor_utils;
 
