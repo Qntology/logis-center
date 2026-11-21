@@ -160,9 +160,9 @@ pub fn free_vram_bytes(gpu_id: u32) -> u64 {
         .unwrap_or(0)
 }
 
-/// 현재 여유 RAM(bytes).
+/// 현재 여유 RAM(bytes). 전역 `SYSTEM_MONITOR` 를 재사용해 매 호출 `System::new()` 생성 비용을 제거합니다.
 pub fn free_ram_bytes() -> u64 {
-    let mut sys = System::new();
+    let mut sys = SYSTEM_MONITOR.lock().unwrap_or_else(|p| p.into_inner());
     sys.refresh_memory();
     sys.available_memory()
 }
@@ -523,10 +523,9 @@ pub async fn wait_for_memory_release(baseline_ram: u64, baseline_vram: u64, time
 pub const RAM_PRESSURE_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub fn ram_snapshot() -> (u64, u64) {
-    let avail = free_ram_bytes() as u64;
-    let mut sys = sysinfo::System::new();
+    let mut sys = SYSTEM_MONITOR.lock().unwrap_or_else(|p| p.into_inner());
     sys.refresh_memory();
-    (avail, sys.total_memory())
+    (sys.available_memory(), sys.total_memory())
 }
 
 pub fn ram_used_pct(avail: u64, total: u64) -> f32 {

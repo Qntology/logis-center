@@ -156,7 +156,7 @@ fn embed_q8_env() -> Option<bool> {
 ///   teacher-forcing top-1 100 % · KLD 7e-6, 탐욕 생성 같음.
 /// 그래서 Vulkan 에 더해 ROCm 도 기본으로 Q8_0 를 씁니다. CUDA 는 재지 않아 그대로 F16 입니다 (`LOGIS_EMBED_Q8=1` 로 켬).
 fn use_quant_embed(device: &Device) -> bool {
-    embed_q8_env().unwrap_or_else(|| device.is_vulkan() || device.is_rocm())
+    embed_q8_env().unwrap_or_else(|| device.is_cuda() || device.is_vulkan() || device.is_rocm())
 }
 
 fn quant_embed_ok(dtype: candle_core::quantized::GgmlDType) -> bool {
@@ -1045,6 +1045,11 @@ pub fn half_kv_piece(x: &Tensor, prev: Option<DType>) -> Result<Tensor> {
         Some(DType::BF16) => Ok(x.to_dtype(DType::BF16)?),
         Some(_) => Ok(x.clamp(-lim, lim)?.to_dtype(DType::F16)?),
         None => {
+            if !x.device().is_cpu() {
+                // GPU 에서는 새 블록마다 호스트 동기화를 유발하는 `to_scalar::<f32>()` 를 생략하고
+                // 즉시 안전 범위 클램프 후 F16 으로 변환합니다.
+                return Ok(x.clamp(-lim, lim)?.to_dtype(DType::F16)?);
+            }
             let max_abs = x.abs()?.flatten_all()?.max(0)?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
             if max_abs.is_finite() && (max_abs as f64) <= lim {
                 Ok(x.to_dtype(DType::F16)?)
@@ -1633,7 +1638,7 @@ impl Qwen3_5Attention {
             let unfused_too_big = !fa_fused && q_len > 1 && score_bytes > OFFLOAD_ATTN_UNFUSED_BUDGET;
             if dense_bytes <= OFFLOAD_ATTN_GATHER_BUDGET && !unfused_too_big {
                 let fast = (|| -> Result<Tensor> {
-                    if q_len == 1 {
+                    if q_len <= 4 {
                         if let Some(o) = kv_turbo::fused_decode_attention(query_states, parts, self.scaling)? {
                             return Ok(o);
                         }

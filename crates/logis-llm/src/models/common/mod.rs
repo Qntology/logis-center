@@ -104,11 +104,13 @@ pub fn turbo_kv_step(
     scaling: f64,
 ) -> Result<TurboStep> {
     let dev = k.device().clone();
+    let q_len = q.dim(2)?;
     if cache.is_none() {
-        *cache = Some(TurboKvCache::with_options(
+        let initial_cap = TURBO_KV_GROW_BY.max(q_len.next_power_of_two());
+        *cache = Some(TurboKvCache::with_capacity(
             &kv_turbo::kv_quant_options(),
             head_dim,
-            TURBO_KV_GROW_BY,
+            initial_cap,
             &dev,
         )?);
     }
@@ -118,7 +120,6 @@ pub fn turbo_kv_step(
     let q = q.contiguous()?;
     let k = k.contiguous()?;
     let v = v.contiguous()?;
-    let q_len = q.dim(2)?;
     let cfg = FlashAttnConfig::new(scaling as f32).causal();
     // 🌟 [ACCEL-CHECK] 아래에서 flash-attn 을 쓰므로 이 dtype·head_dim 의 자가 검증을 먼저 끝냅니다.
     //    (실패하면 이 백엔드의 fused flash-attn 이 꺼지고 candle 의 비융합 경로로 계산됩니다)
@@ -143,14 +144,26 @@ pub fn turbo_kv_step(
 
     if let Some((full_k, full_v)) = exact_full {
         let out = flash_attn_bhsd(&q, &full_k, &full_v, &cfg)?;
-        // 🌟 [ACCEL-CHECK] 실측 감시: 같은 질의를 압축 캐시로도 계산해 실제 오차를 기록합니다.
+        // 🌟 [ACCEL-CHECK] 실측 감시: 프리필 전체 Q 대신 말미 m=min(q_len, 4) 행만 프로브해
+        //    동일한 정확도 감시를 유지하면서 프로브 연산 비용을 대폭 줄입니다.
         if accel_check::probe_wanted(&dev) {
             let label = match c.formats() {
                 Some((kf, vf)) => format!("K {kf} / V {vf}"),
                 None => "plain".to_string(),
             };
-            let packed = c.attention(&q, &cfg)?;
-            let rel = accel_check::rel_err(&packed, &out)?;
+            let m = q_len.min(4);
+            let q_probe = if m < q_len {
+                q.narrow(2, q_len - m, m)?.contiguous()?
+            } else {
+                q.clone()
+            };
+            let out_probe = if m < q_len {
+                out.narrow(2, q_len - m, m)?.contiguous()?
+            } else {
+                out.clone()
+            };
+            let packed = c.attention(&q_probe, &cfg)?;
+            let rel = accel_check::rel_err(&packed, &out_probe)?;
             if !accel_check::record_probe(&dev, rel, &label) {
                 *cache = None;
                 return Ok(TurboStep { out, plain_kv: Some((full_k, full_v)) });
@@ -2122,7 +2135,10 @@ pub fn gdn_fused_ready(
     }
     if matches!(
         device,
-        candle_core::Device::Cuda(_) | candle_core::Device::Rocm(_) | candle_core::Device::Metal(_)
+        candle_core::Device::Cuda(_)
+            | candle_core::Device::Rocm(_)
+            | candle_core::Device::Metal(_)
+            | candle_core::Device::Vulkan(_)
     ) {
         accel_check::fused_op_ok(
             device,

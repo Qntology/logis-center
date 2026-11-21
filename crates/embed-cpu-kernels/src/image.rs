@@ -198,6 +198,96 @@ pub fn patchify_norm_hwc_u8_f32(
     }
 }
 
+/// Converts a single RGB HWC `u8` image directly into Qwen-VL / Qwen3-VL patched `f32` layout
+/// `[grid_h * grid_w, 3 * temporal_patch_size * patch_size * patch_size]` in one host pass,
+/// replicating the single frame `temporal_patch_size` times along the temporal axis.
+///
+/// Exact layout order per patch:
+/// `(mr, mc, sr, sc, channel, temporal_idx, py, px)`, matching:
+/// `img_chw.repeat(temporal_patch_size).reshape((1, t_p, 3, gh/m, m, p, gw/m, m, p))
+///  .permute((0, 3, 6, 4, 7, 2, 1, 5, 8)).reshape((gh*gw, 3*t_p*p*p))`.
+#[allow(clippy::too_many_arguments)]
+pub fn patchify_norm_qwen_vl_u8_f32(
+    rgb_hwc: &[u8],
+    width: usize,
+    height: usize,
+    patch_size: usize,
+    merge_size: usize,
+    temporal_patch_size: usize,
+    mean: [f32; 3],
+    std: [f32; 3],
+    out: &mut [f32],
+) {
+    assert!(patch_size > 0 && merge_size > 0 && temporal_patch_size > 0);
+    assert!(width % (patch_size * merge_size) == 0);
+    assert!(height % (patch_size * merge_size) == 0);
+    assert_eq!(rgb_hwc.len(), width * height * 3);
+
+    let gh = height / patch_size;
+    let gw = width / patch_size;
+    let pp = patch_size * patch_size;
+    let chan_stride = temporal_patch_size * pp;
+    let patch_dim = 3 * chan_stride;
+    assert_eq!(out.len(), gh * gw * patch_dim);
+
+    let scale = [
+        1.0 / (255.0 * std[0]),
+        1.0 / (255.0 * std[1]),
+        1.0 / (255.0 * std[2]),
+    ];
+    let bias = [-mean[0] / std[0], -mean[1] / std[1], -mean[2] / std[2]];
+    let row_bytes = width * 3;
+    let hm = gh / merge_size;
+    let wm = gw / merge_size;
+    let group_floats = merge_size * merge_size * patch_dim;
+
+    let process_mr = |(mr, out_mr): (usize, &mut [f32])| {
+        for mc in 0..wm {
+            let dst_grp = &mut out_mr[mc * group_floats..(mc + 1) * group_floats];
+            let mut sub = 0usize;
+            for sr in 0..merge_size {
+                let y0 = (mr * merge_size + sr) * patch_size;
+                for sc in 0..merge_size {
+                    let x0 = (mc * merge_size + sc) * patch_size;
+                    let dst_patch = &mut dst_grp[sub * patch_dim..(sub + 1) * patch_dim];
+                    // Fill t=0 plane for R, G, B in a single L1-hot pass over the patch pixels.
+                    for py in 0..patch_size {
+                        let src_row = (y0 + py) * row_bytes + x0 * 3;
+                        let dst_row = py * patch_size;
+                        for px in 0..patch_size {
+                            let sb = src_row + px * 3;
+                            let r = (rgb_hwc[sb] as f32).mul_add(scale[0], bias[0]);
+                            let g = (rgb_hwc[sb + 1] as f32).mul_add(scale[1], bias[1]);
+                            let b = (rgb_hwc[sb + 2] as f32).mul_add(scale[2], bias[2]);
+                            dst_patch[dst_row + px] = r;
+                            dst_patch[chan_stride + dst_row + px] = g;
+                            dst_patch[2 * chan_stride + dst_row + px] = b;
+                        }
+                    }
+                    // Replicate t=0 plane to t=1..temporal_patch_size for each channel.
+                    for c in 0..3 {
+                        let c_base = c * chan_stride;
+                        for t in 1..temporal_patch_size {
+                            dst_patch.copy_within(c_base..c_base + pp, c_base + t * pp);
+                        }
+                    }
+                    sub += 1;
+                }
+            }
+        }
+    };
+
+    if hm * wm >= 16 {
+        out.par_chunks_mut(wm * group_floats)
+            .enumerate()
+            .for_each(process_mr);
+    } else {
+        out.chunks_mut(wm * group_floats)
+            .enumerate()
+            .for_each(process_mr);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +341,47 @@ mod tests {
 
         for (a, b) in out_simd.iter().zip(out_scalar.iter()) {
             assert_eq!(a.to_bits(), b.to_bits(), "AVX2 vs scalar patchify bit-exact");
+        }
+    }
+
+    #[test]
+    fn patchify_qwen_vl_matches_chwt_reference() {
+        let (w, h, p, m, tp) = (56usize, 28usize, 14usize, 2usize, 2usize);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| ((i * 29 + 11) % 256) as u8).collect();
+        let mean = [0.48145466f32, 0.4578275, 0.40821073];
+        let std = [0.26862954f32, 0.26130258, 0.27577711];
+        let gh = h / p;
+        let gw = w / p;
+        let mut out = vec![0.0f32; gh * gw * 3 * tp * p * p];
+        patchify_norm_qwen_vl_u8_f32(&rgb, w, h, p, m, tp, mean, std, &mut out);
+
+        // Reference in exact (mr, mc, sr, sc, c, t, py, px) order.
+        let mut idx = 0usize;
+        for mr in 0..(gh / m) {
+            for mc in 0..(gw / m) {
+                for sr in 0..m {
+                    for sc in 0..m {
+                        let y0 = (mr * m + sr) * p;
+                        let x0 = (mc * m + sc) * p;
+                        for c in 0..3 {
+                            for _t in 0..tp {
+                                for py in 0..p {
+                                    for px in 0..p {
+                                        let v = rgb[((y0 + py) * w + (x0 + px)) * 3 + c] as f32;
+                                        let want = (v / 255.0 - mean[c]) / std[c];
+                                        assert!(
+                                            (out[idx] - want).abs() < 1e-5,
+                                            "qwen_vl patchify mismatch at {idx}: {} vs {want}",
+                                            out[idx]
+                                        );
+                                        idx += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

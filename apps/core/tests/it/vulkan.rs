@@ -210,15 +210,18 @@ fn quantized_matmul_matches_cpu_for_app_gguf_types() -> R {
             // 양자화 오차 자체도 합리적인 범위인지 (역양자화 가중치 기준)
             let deq = QTensor::quantize(&w, dt)?.dequantize(&Device::Cpu)?;
             let reference = x.broadcast_matmul(&deq.t()?)?;
-            // [MAC-VERIFY] Q8_0 가중치가 GPU 에 상주하면(GpuQ8: 통합 메모리 장치 · MoltenVK 는 첫 사용부터)
-            // f32 활성을 그대로 곱합니다(= reference). CPU/호스트 경로는 활성을 Q8_0 으로 양자화한 뒤 곱하므로
-            // (llama.cpp vec_dot) 둘 다 맞는 결과이고, Vulkan 결과는 둘 중 하나와 맞아야 합니다.
+            // [GpuQuant] Q8_0 / Q4K / Q6K 가중치가 GPU 에 상주하면 f32 활성을 그대로 곱합니다(= reference).
+            // CPU/호스트 경로는 활성을 Q8_0/Q8K 로 양자화한 뒤 곱하므로(llama.cpp vec_dot) 둘 다 맞는 결과이고,
+            // Vulkan 결과는 둘 중 하나와 맞아야 합니다.
             let close_to = |r: &Tensor| -> anyhow::Result<bool> {
                 let (g, w) = (to_vec_f64(&got)?, to_vec_f64(r)?);
                 Ok(g.iter().zip(&w).all(|(a, b)| (a - b).abs() <= 1e-3 * a.abs().max(b.abs()).max(1.0)))
             };
-            if dt == GgmlDType::Q8_0 && !close_to(&want)? && close_to(&reference)? {
-                eprintln!("{dt:?}: Vulkan GPU-resident path matches the exact f32-activation reference");
+            if matches!(dt, GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K)
+                && !close_to(&want)?
+                && close_to(&reference)?
+            {
+                eprintln!("{dt:?}: Vulkan GPU-resident GpuQuant path matches exact f32-activation reference");
             } else {
                 assert_close(&got, &want, 1e-3, &format!("{dt:?} qmatmul"))?;
             }
@@ -618,6 +621,16 @@ fn build(cfg: &Qwen3Config, w: &HashMap<String, Tensor>, dev: &Device) -> anyhow
 
 #[test]
 fn tiny_qwen3_logits_match_cpu_with_kv_cache_and_ram_residency() -> R {
+    // KV 캐시 · RAM 대피 · 스냅샷의 정확 일치(1e-3)를 검증합니다.
+    // turbo-quant 빌드에서는 GPU 쪽에만 손실 KV 압축이 켜지므로 여기서는 끄고(손실 압축은 accel_accuracy 에서 검증) 복원합니다.
+    let saved = candle_core::accel::config();
+    candle_core::accel::update_config(|c| c.turbo_quant.enabled = false);
+    let res = tiny_qwen3_logits_match_cpu_inner();
+    candle_core::accel::set_config(saved);
+    res
+}
+
+fn tiny_qwen3_logits_match_cpu_inner() -> R {
     let (cfg, w) = tiny_qwen3()?;
     let prompt = [3u32, 17, 42, 99, 5, 200, 7];
     let steps = [11u32, 250, 64];

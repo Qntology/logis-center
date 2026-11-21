@@ -36,7 +36,7 @@ impl Drop for AccelGuard {
 
 fn gpu_device_opt() -> Option<Device> {
     let d = logis_app::utils::new_gpu_device(0)?;
-    if d.is_cuda() || d.is_rocm() {
+    if d.is_cuda() || d.is_rocm() || d.is_vulkan() {
         Some(d)
     } else {
         None
@@ -52,7 +52,7 @@ fn fused_ops_fault_injection_fallback() -> Result<()> {
     };
 
     for dev in &devices {
-        let dt = if dev.is_cpu() { DType::F32 } else { DType::BF16 };
+        let dt = if dev.is_cuda() || dev.is_rocm() { DType::BF16 } else { DType::F32 };
         for mode in [FaultMode::ReturnError, FaultMode::Panic, FaultMode::BadOutput] {
             for kind in FusedOpKind::ALL {
                 reset_fused_op_cache();
@@ -137,7 +137,8 @@ fn qwen_family_fused_teacher_forcing_parity() -> Result<()> {
     };
 
     // 1) Diagnose reports all 5 fused ops cleanly on live GPU
-    let diag = diagnose(&dev, DType::BF16, 64);
+    let diag_dt = if dev.is_vulkan() { DType::F32 } else { DType::BF16 };
+    let diag = diagnose(&dev, diag_dt, 64);
     println!("[GATE 5-B] diagnose({dev:?}): {diag}");
     assert!(diag.contains("fused-ops:"), "diagnose missing fused-ops summary: {diag}");
     for kind in FusedOpKind::ALL {
@@ -148,7 +149,7 @@ fn qwen_family_fused_teacher_forcing_parity() -> Result<()> {
         );
     }
 
-    // 2) Mock Qwen3 teacher-forcing parity (prefill 32 + decode 32) on both F32 and BF16 + Mode A greedy parity
+    // 2) Mock Qwen3 teacher-forcing parity (prefill 32 + decode 32) + Mode A greedy parity
     let (cfg, w) = mock_qwen3(256, 4, 64, 3)?;
     let seq: Vec<u32> = det(64, 909)
         .into_iter()
@@ -158,7 +159,12 @@ fn qwen_family_fused_teacher_forcing_parity() -> Result<()> {
     // Note: Qwen3 `eager_attention_forward` downcasts Q/K/V to BF16 on CUDA/ROCm, so a 1-ULP
     // F32 difference before a BF16 midpoint produces ~1e-2 logit delta across 3 layers while
     // keeping KLD ~1e-6 and top-1 == 100%. We verify mean KLD, top-1 agreement, and exact Mode-A greedy.
-    for (model_dt, max_tol, kld_tol) in [(DType::F32, 5e-2f32, 1e-6f64), (DType::BF16, 1.0f32, 1e-4f64)] {
+    let cases: &[(DType, f32, f64)] = if dev.is_vulkan() {
+        &[(DType::F32, 5e-2f32, 1e-6f64)]
+    } else {
+        &[(DType::F32, 5e-2f32, 1e-6f64), (DType::BF16, 1.0f32, 1e-4f64)]
+    };
+    for &(model_dt, max_tol, kld_tol) in cases {
         let w_dt: std::collections::HashMap<String, Tensor> = w
             .iter()
             .map(|(k, v)| Ok((k.clone(), v.to_dtype(model_dt)?.to_device(&dev)?)))
@@ -351,6 +357,10 @@ fn trimmed_head_lossless_cs_guard_and_shadow_top3() -> Result<()> {
         m
     );
     assert_eq!(got_ids, expected, "TrimmedHead + RestRescueGuard MUST match full-vocab greedy 100%");
+    // Also exercise M <= 8 decode batch (triggers Quantized Mode A fused_quant_argmax_cs on ROCm)
+    let (got_dec, rescued_dec) = head.greedy_next_token_with_stats(&h_dev.narrow(0, m / 2 - 2, 4)?)?;
+    assert_eq!(got_dec, expected[m / 2 - 2..m / 2 + 2], "Quantized Mode A M=4 decode must match 100%");
+    assert!(rescued_dec >= 2, "expected >= 2 REST rescues in M=4 mixed batch, got {rescued_dec}");
     for r in (m / 2)..m {
         assert_eq!(got_ids[r], rest_winner as u32, "adversarial REST row {r} must win rest_winner");
     }
