@@ -537,6 +537,13 @@ pub fn trim_idle_gpu_pool(device: &Device) {
                 let _ = d.trim_memory_pool_to(256 << 20);
             }
         }
+        #[cfg(feature = "cuda")]
+        Device::Cuda(d) => {
+            // 256 MiB 핫 풀을 유지해 매 스텝 cuMemPoolTrimTo 스톨을 방지하면서 4~8 GiB VRAM 압박을 완화합니다.
+            if d.pool_idle_bytes().unwrap_or(0) >= (320 << 20) {
+                let _ = d.trim_memory_pool(256 << 20);
+            }
+        }
         _ => {
             let _ = device;
         }
@@ -622,15 +629,35 @@ pub fn get_best_device_info() -> (Device, usize) {
             println!("[GPU-CHECK] No Vulkan device found. Falling back to CPU.");
             return (Device::Cpu, 0);
         }
+        // Prefer discrete > integrated > virtual > cpu/other, breaking ties by free VRAM.
+        // Without tier ranking, an integrated GPU's large shared host heap outranks a discrete GPU.
         let mut best_id = 0usize;
-        let mut max_free = 0u64;
+        let mut best_rank: (u8, u64) = (0, 0);
         for i in 0..count {
-            if let Some((free, _)) = probe.mem_info(i) {
-                println!("[GPU-CHECK] Vulkan GPU {}: {:.2} GB Free VRAM", i, free as f64 / 1e9);
-                if free > max_free {
-                    max_free = free;
-                    best_id = i;
+            let (tier, free) = match cached_gpu_device(i).or_else(|| Device::new_vulkan(i).ok()) {
+                Some(Device::Vulkan(vd)) => {
+                    let t = match vd.device_type() {
+                        "discrete" => 4,
+                        "integrated" => 3,
+                        "virtual" => 2,
+                        "other" => 1,
+                        _ => 0,
+                    };
+                    let f = vd.mem_info().map(|(f, _)| f as u64).unwrap_or(0);
+                    (t, f)
                 }
+                _ => (0, probe.mem_info(i).map(|(f, _)| f).unwrap_or(0)),
+            };
+            println!(
+                "[GPU-CHECK] Vulkan GPU {} (tier={}): {:.2} GB Free VRAM",
+                i,
+                tier,
+                free as f64 / 1e9
+            );
+            let rank = (tier, free);
+            if rank > best_rank {
+                best_rank = rank;
+                best_id = i;
             }
         }
         println!("[GPU-CHECK] Found {} Vulkan device(s). Selecting GPU {}.", count, best_id);

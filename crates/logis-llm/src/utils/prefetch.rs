@@ -69,8 +69,11 @@ pub struct OffloadPrefetcher {
     min_async_bytes: usize,
 }
 
-/// Borrows the raw contiguous host bytes of a CPU tensor without copying when already contiguous.
-fn cpu_tensor_raw_bytes(t: &Tensor) -> Result<Option<Vec<u8>>> {
+/// Borrows the raw contiguous host bytes of a CPU tensor without allocating an intermediate `Vec<u8>`.
+fn with_cpu_tensor_raw_bytes<R>(
+    t: &Tensor,
+    f: impl FnOnce(&[u8]) -> Result<R>,
+) -> Result<Option<R>> {
     if !t.device().is_cpu() {
         return Ok(None);
     }
@@ -81,38 +84,38 @@ fn cpu_tensor_raw_bytes(t: &Tensor) -> Result<Option<Vec<u8>>> {
     };
     let (st, layout) = t.storage_and_layout();
     let n = layout.shape().elem_count();
-    let bytes = match &*st {
+    let raw: &[u8] = match &*st {
         Storage::Cpu(cpu) => {
             use candle_core::CpuStorage;
             match cpu {
-                CpuStorage::U8(v) => v[..n].to_vec(),
+                CpuStorage::U8(v) => &v[..n],
                 CpuStorage::U32(v) => unsafe {
-                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 4).to_vec()
+                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 4)
                 },
                 CpuStorage::I64(v) => unsafe {
-                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 8).to_vec()
+                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 8)
                 },
                 CpuStorage::F32(v) => unsafe {
-                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 4).to_vec()
+                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 4)
                 },
                 CpuStorage::F16(v) => unsafe {
-                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 2).to_vec()
+                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 2)
                 },
                 CpuStorage::BF16(v) => unsafe {
-                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 2).to_vec()
+                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 2)
                 },
                 CpuStorage::F8E4M3(v) => unsafe {
-                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n).to_vec()
+                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n)
                 },
                 CpuStorage::F64(v) => unsafe {
-                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 8).to_vec()
+                    std::slice::from_raw_parts(v.as_ptr() as *const u8, n * 8)
                 },
                 _ => return Ok(None),
             }
         }
         _ => return Ok(None),
     };
-    Ok(Some(bytes))
+    Ok(Some(f(raw)?))
 }
 
 impl OffloadPrefetcher {
@@ -240,13 +243,15 @@ impl OffloadPrefetcher {
             && byte_len <= self.capacity_bytes()
             && host.device().is_cpu()
         {
-            if let Some(raw) = cpu_tensor_raw_bytes(host)? {
+            if let Some(prefetched) = with_cpu_tensor_raw_bytes(host, |raw| {
                 let dst = self.alloc_synced_dst(host.shape(), host.dtype())?;
-                let queued = self.prefetch_into(&raw, &dst, 0)?;
-                return Ok(PrefetchedTensor {
+                let queued = self.prefetch_into(raw, &dst, 0)?;
+                Ok(PrefetchedTensor {
                     tensor: dst,
                     queued_async: queued,
-                });
+                })
+            })? {
+                return Ok(prefetched);
             }
         }
         Ok(PrefetchedTensor {

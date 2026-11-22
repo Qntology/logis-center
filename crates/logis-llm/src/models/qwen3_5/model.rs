@@ -154,19 +154,19 @@ fn embed_q8_env() -> Option<bool> {
 /// ROCm(RX 6600) 실측 (tests/it/p2b_models.rs `p2b_qwen35_2b_lm_head_q8` · `p2b_lm_head_cost`):
 ///   2B 출력 헤드 한 토큰 F16 19.4 ms → Q8_0 8.4 ms, 디코드 45.4 → 35.4 ms/토큰, 상주 VRAM −508 MB,
 ///   teacher-forcing top-1 100 % · KLD 7e-6, 탐욕 생성 같음.
-/// 그래서 Vulkan 에 더해 ROCm 도 기본으로 Q8_0 를 씁니다. CUDA 는 재지 않아 그대로 F16 입니다 (`LOGIS_EMBED_Q8=1` 로 켬).
+/// CUDA(RTX 3050 sm_86)에서도 `get_rows_q8_0` 임베딩 + W8A16 `forward_exact` / Quantized Mode A 를 실기 검증했으며,
+/// 로드 시 [`quant_embed_self_check`] 로 자동 폴백 가드를 유지합니다 (`LOGIS_EMBED_Q8=0` 으로 끌 수 있음).
 fn use_quant_embed(device: &Device) -> bool {
-    // 실기 미검증인 CUDA 는 기본 OFF (`LOGIS_EMBED_Q8=1` 로만 활성 + 자가 검증 폴백, P4-F12).
-    embed_q8_env().unwrap_or_else(|| device.is_vulkan() || device.is_rocm())
+    embed_q8_env().unwrap_or_else(|| device.is_vulkan() || device.is_rocm() || device.is_cuda())
 }
 
 fn quant_embed_ok(dtype: candle_core::quantized::GgmlDType) -> bool {
     embed_q8_env() == Some(true) || dtype == candle_core::quantized::GgmlDType::Q8_0
 }
 
-/// `LOGIS_EMBED_Q8=1` 등으로 미검증 백엔드(CUDA 등)에서 양자화 임베딩/헤드를 켤 때
-/// 소형 자가 검증(첫 4행 역양자화 + 1행 matvec)이 CPU 기준과 일치하는지 확인합니다 (`P4-F12`).
-fn quant_embed_self_check(device: &Device, q: &candle_core::quantized::QTensor) -> bool {
+/// CUDA 등에서 양자화 임베딩/헤드를 켤 때 소형 자가 검증(첫 4행 역양자화 + `q.embedding` + 1행 `forward_exact`)이
+/// CPU 기준과 일치하는지 확인하고 불일치 시 Dense 표로 안전 폴백합니다 (`P4-F12`).
+pub fn quant_embed_self_check(device: &Device, q: &candle_core::quantized::QTensor) -> bool {
     if !device.is_cuda() {
         return true;
     }
@@ -181,6 +181,18 @@ fn quant_embed_self_check(device: &Device, q: &candle_core::quantized::QTensor) 
         let vals = gpu_rows.flatten_all()?.to_vec1::<f32>()?;
         if !vals.iter().all(|v| v.is_finite()) {
             return Ok(false);
+        }
+        // Verify `QTensor::embedding` (`get_rows_*` CUDA kernel) matches dequantized rows.
+        let ids = Tensor::arange(0u32, rows as u32, device)?;
+        let emb = q.embedding(&ids)?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let emb_vals = emb.flatten_all()?.to_vec1::<f32>()?;
+        if emb_vals.len() != vals.len() {
+            return Ok(false);
+        }
+        for (a, b) in emb_vals.iter().zip(vals.iter()) {
+            if !a.is_finite() || (a - b).abs() > 1e-4 * b.abs().max(1.0) {
+                return Ok(false);
+            }
         }
         let probe_x = Tensor::ones((1, cols), DType::F32, device)?;
         let gpu_y = q.forward_exact(&probe_x)?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
