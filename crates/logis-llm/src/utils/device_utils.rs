@@ -132,19 +132,22 @@ mod wddm {
         DXGI_QUERY_VIDEO_MEMORY_INFO,
     };
 
-    struct Adapter(IDXGIAdapter3);
+    struct Adapter {
+        dedicated_bytes: u64,
+        adapter: IDXGIAdapter3,
+    }
     // DXGI 어댑터 질의는 스레드에 묶이지 않습니다(free-threaded). 호출은 Mutex 로 직렬화합니다.
     unsafe impl Send for Adapter {}
 
     static ADAPTERS: Mutex<Option<Vec<Adapter>>> = Mutex::new(None);
 
-    /// 전용 메모리 크기 내림차순으로 정렬된 AMD 어댑터 목록.
+    /// AMD 어댑터 목록 (전용 VRAM 크기와 함께 보관해 HIP ordinal 과 용량 매칭).
     fn find_amd_adapters() -> Vec<Adapter> {
         unsafe {
             let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
                 return Vec::new();
             };
-            let mut found: Vec<(usize, IDXGIAdapter3)> = Vec::new();
+            let mut found: Vec<Adapter> = Vec::new();
             let mut i = 0;
             while let Ok(a) = factory.EnumAdapters1(i) {
                 i += 1;
@@ -153,22 +156,40 @@ mod wddm {
                     continue;
                 }
                 let Ok(a3) = a.cast::<IDXGIAdapter3>() else { continue };
-                found.push((desc.DedicatedVideoMemory, a3));
+                found.push(Adapter {
+                    dedicated_bytes: desc.DedicatedVideoMemory as u64,
+                    adapter: a3,
+                });
             }
-            found.sort_by(|a, b| b.0.cmp(&a.0));
-            found.into_iter().map(|(_, a)| Adapter(a)).collect()
+            found.sort_by(|a, b| b.dedicated_bytes.cmp(&a.dedicated_bytes));
+            found
         }
     }
 
     /// `gpu_id` 번 AMD 어댑터에서 이 프로세스가 더 쓸 수 있는 로컬(VRAM) 메모리 = Budget − CurrentUsage.
+    /// 다중 AMD GPU(예: dGPU + iGPU)에서 DXGI 정렬 순서와 HIP ordinal 이 다를 수 있으므로
+    /// HIP `mem_info(gpu_id)` 총 용량에 가장 가까운 DXGI 어댑터를 우선 매칭합니다 (`P4-F07`).
     pub fn local_free_bytes(gpu_id: usize) -> Option<u64> {
         let mut g = ADAPTERS.lock().ok()?;
         if g.is_none() {
             *g = Some(find_amd_adapters());
         }
-        let adapter = g.as_ref()?.get(gpu_id)?;
+        let list = g.as_ref()?;
+        if list.is_empty() {
+            return None;
+        }
+        let adapter = if list.len() == 1 {
+            &list[0]
+        } else if let Ok((_, hip_total)) = candle_rocm::mem_info(gpu_id) {
+            let target = hip_total as u64;
+            list.iter()
+                .min_by_key(|a| a.dedicated_bytes.abs_diff(target))
+                .or_else(|| list.get(gpu_id))?
+        } else {
+            list.get(gpu_id)?
+        };
         let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
-        unsafe { adapter.0.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).ok()? };
+        unsafe { adapter.adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).ok()? };
         Some(info.Budget.saturating_sub(info.CurrentUsage))
     }
 }

@@ -156,11 +156,60 @@ fn embed_q8_env() -> Option<bool> {
 ///   teacher-forcing top-1 100 % · KLD 7e-6, 탐욕 생성 같음.
 /// 그래서 Vulkan 에 더해 ROCm 도 기본으로 Q8_0 를 씁니다. CUDA 는 재지 않아 그대로 F16 입니다 (`LOGIS_EMBED_Q8=1` 로 켬).
 fn use_quant_embed(device: &Device) -> bool {
-    embed_q8_env().unwrap_or_else(|| device.is_cuda() || device.is_vulkan() || device.is_rocm())
+    // 실기 미검증인 CUDA 는 기본 OFF (`LOGIS_EMBED_Q8=1` 로만 활성 + 자가 검증 폴백, P4-F12).
+    embed_q8_env().unwrap_or_else(|| device.is_vulkan() || device.is_rocm())
 }
 
 fn quant_embed_ok(dtype: candle_core::quantized::GgmlDType) -> bool {
     embed_q8_env() == Some(true) || dtype == candle_core::quantized::GgmlDType::Q8_0
+}
+
+/// `LOGIS_EMBED_Q8=1` 등으로 미검증 백엔드(CUDA 등)에서 양자화 임베딩/헤드를 켤 때
+/// 소형 자가 검증(첫 4행 역양자화 + 1행 matvec)이 CPU 기준과 일치하는지 확인합니다 (`P4-F12`).
+fn quant_embed_self_check(device: &Device, q: &candle_core::quantized::QTensor) -> bool {
+    if !device.is_cuda() {
+        return true;
+    }
+    let check = (|| -> Result<bool> {
+        let dims = q.shape().dims();
+        if dims.len() != 2 || dims[0] == 0 || dims[1] == 0 {
+            return Ok(false);
+        }
+        let rows = dims[0].min(4);
+        let cols = dims[1];
+        let gpu_rows = q.dequantize_rows_to(0, rows, DType::F32, &Device::Cpu)?;
+        let vals = gpu_rows.flatten_all()?.to_vec1::<f32>()?;
+        if !vals.iter().all(|v| v.is_finite()) {
+            return Ok(false);
+        }
+        let probe_x = Tensor::ones((1, cols), DType::F32, device)?;
+        let gpu_y = q.forward_exact(&probe_x)?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let gy = gpu_y.flatten_all()?.to_vec1::<f32>()?;
+        if gy.len() != dims[0] || !gy.iter().all(|v| v.is_finite()) {
+            return Ok(false);
+        }
+        // Check first `rows` dot products against row sums of dequantized rows.
+        for r in 0..rows {
+            let want: f32 = vals[r * cols..(r + 1) * cols].iter().sum();
+            let diff = (gy[r] - want).abs();
+            let tol = 1e-2 * want.abs().max(1.0);
+            if diff > tol {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })();
+    match check {
+        Ok(true) => true,
+        Ok(false) => {
+            println!("[MODEL] ⚠️ CUDA Q8 embed self-check mismatch → falling back to Dense embed table.");
+            false
+        }
+        Err(e) => {
+            println!("[MODEL] ⚠️ CUDA Q8 embed self-check error ({e}) → falling back to Dense embed table.");
+            false
+        }
+    }
 }
 
 use crate::{
@@ -1024,30 +1073,38 @@ pub struct Qwen3_5Attention {
     // 🌟 [KV RESIDENCY] 디코딩 진입 시 1회 결정된 KV 블록 배치 위치.
     //    기본값 Ssd 는 기존 동작(VRAM→RAM→SSD 연속 강등)과 100% 동일합니다.
     pub kv_residency: crate::utils::resources::KvResidency,
-    
-    
-    pub vram_merged_k: Option<Tensor>,
-    pub vram_merged_v: Option<Tensor>,
-    pub merged_vram_block_count: usize,
+    /// 🌟 [P1-2 / P4-O01] RAM 대피 KV 블록을 계산 스트림과 중첩 업로드하는 비동기 프리페처
+    pub prefetcher: Option<crate::utils::prefetch::OffloadPrefetcher>,
+    /// 다음 레이어 진입 전에 선제 업로드를 시작한 블록 (블록 인덱스, 전송 핸들, TurboQuant 메타)
+    pub prefetched_block: Option<(usize, crate::utils::prefetch::PrefetchedKv, Option<crate::models::common::kv_turbo::TqMeta>)>,
     // 🌟 [KV-PRECISION] true 면 새 블록을 압축(TurboQuant·FP8)하지 않고 모델 dtype 으로 둡니다.
     //    문맥 시작 시 VRAM 여유로 정합니다. RAM/SSD 로 내릴 때는 기존처럼 FP8 로 줄여 내립니다.
     pub kv_exact: bool,
-    /// 🌟 [KV-HALF] 원본 KV 를 F16(넘치면 BF16) 으로 보관합니다 (F32 모델에서 원본 KV 를 고른 경우, kv_turbo::kv_half_mode).
+    /// 🌟 [KV-HALF] 원본 KV 를 반정밀도(BF16 지원 GPU 는 BF16, 그 외 F16/CPU 는 넘치면 BF16)로 보관합니다.
     pub kv_half: bool,
 }
 
 /// 🌟 [KV-HALF] 원본 KV 조각을 반정밀도로 바꿉니다.
 /// - `prev` 가 있으면(기존 블록에 이어 붙임) 그 dtype 을 따릅니다. F16 블록에 붙는 값은 F16 범위로 잘라 inf 를 막습니다.
-/// - 새 블록이면 |x| 최댓값을 한 번 재서 F16 범위를 넘으면 BF16 으로 보관합니다.
+/// - 새 블록(`prev == None`):
+///   - BF16 지원 GPU(CUDA/ROCm): `to_scalar` 호스트 동기화와 ±60000 포화 클램핑 없이 곧바로 BF16 으로 보관합니다 (`P4-F04`).
+///   - 그 외 GPU(Vulkan/Metal): 안전 범위 클램프 후 F16 으로 보관합니다.
+///   - CPU: `|x|` 최댓값을 재어 F16 범위 이내면 F16, 넘으면 BF16 으로 보관합니다.
 pub fn half_kv_piece(x: &Tensor, prev: Option<DType>) -> Result<Tensor> {
     let lim = crate::models::common::kv_turbo::F16_SAFE_MAX as f64;
     match prev {
+        Some(dt) if x.dtype() == dt => Ok(x.clone()),
         Some(DType::BF16) => Ok(x.to_dtype(DType::BF16)?),
         Some(_) => Ok(x.clamp(-lim, lim)?.to_dtype(DType::F16)?),
         None => {
+            if matches!(x.dtype(), DType::F16 | DType::BF16) {
+                return Ok(x.clone());
+            }
+            if x.device().is_cuda_or_rocm() {
+                // F32 -> BF16: F32 와 동일한 지수 범위(±3.4e38)라 클램프나 호스트 동기화 없이 오버플로 안전합니다.
+                return Ok(x.to_dtype(DType::BF16)?);
+            }
             if !x.device().is_cpu() {
-                // GPU 에서는 새 블록마다 호스트 동기화를 유발하는 `to_scalar::<f32>()` 를 생략하고
-                // 즉시 안전 범위 클램프 후 F16 으로 변환합니다.
                 return Ok(x.clamp(-lim, lim)?.to_dtype(DType::F16)?);
             }
             let max_abs = x.abs()?.flatten_all()?.max(0)?.to_dtype(DType::F32)?.to_scalar::<f32>()?;
@@ -1087,9 +1144,8 @@ impl Qwen3_5Attention {
             active_session_id: None,
             active_kv_name: None,
             kv_residency: crate::utils::resources::KvResidency::Ssd,
-            vram_merged_k: None,
-            vram_merged_v: None,
-            merged_vram_block_count: 0,
+            prefetcher: None,
+            prefetched_block: None,
             kv_exact: false,
             kv_half: false,
         })
@@ -1122,9 +1178,8 @@ impl Qwen3_5Attention {
             active_session_id: None,
             active_kv_name: None,
             kv_residency: crate::utils::resources::KvResidency::Ssd,
-            vram_merged_k: None,
-            vram_merged_v: None,
-            merged_vram_block_count: 0,
+            prefetcher: None,
+            prefetched_block: None,
             kv_exact: false,
             kv_half: false,
         })
@@ -1340,7 +1395,23 @@ impl Qwen3_5Attention {
             self.kv_residency == crate::utils::resources::KvResidency::Vram && !dev.is_cpu();
         let mut parts: Vec<crate::models::common::kv_turbo::KvPart> = Vec::with_capacity(self.kv_blocks.len());
 
-        for block in &self.kv_blocks {
+        let num_blocks = self.kv_blocks.len();
+        for bi in 0..num_blocks {
+            // 🌟 [P1-2 / P4-O01] 이 블록을 소비하기 전에 먼저 프리페치 핸들을 꺼내고, 다음 RAM 블록을 비동기 선제 업로드합니다.
+            let prefetched_here = if self.prefetched_block.as_ref().is_some_and(|(idx, _, _)| *idx == bi) {
+                self.prefetched_block.take().and_then(|(_, pf, tq)| {
+                    self.prefetcher
+                        .as_mut()
+                        .and_then(|p| pf.wait_and_take(p).ok())
+                        .map(|(kd, vd)| (kd, vd, tq))
+                })
+            } else {
+                None
+            };
+            if bi + 1 < num_blocks {
+                self.prefetch_ram_block(bi + 1, dev);
+            }
+            let block = &self.kv_blocks[bi];
             let (index, b_off, b_len) = {
                 let inner = block.inner.read().unwrap();
                 (inner.index, inner.offset, inner.len)
@@ -1351,7 +1422,24 @@ impl Qwen3_5Attention {
             // (k, v, tq): tq 가 Some 이면 k / v 는 TurboQuant 압축 u32 행이고 복원은 누산기가 합니다.
             let (k_block, v_block, block_tq) = {
                 let mut inner = block.inner.write().unwrap(); 
-                if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                if let Some((k_raw, v_raw, loaded_tq)) = prefetched_here {
+                    inner.tq = loaded_tq;
+                    let (k_gpu, v_gpu) = if loaded_tq.is_some() {
+                        (k_raw.clone(), v_raw.clone())
+                    } else {
+                        (k_raw.to_dtype(target_dtype)?, v_raw.to_dtype(target_dtype)?)
+                    };
+                    if promote_to_vram && inner.location != KVLocation::VRAM {
+                        inner.k_cache = Some(k_raw);
+                        inner.v_cache = Some(v_raw);
+                        inner.location = KVLocation::VRAM;
+                        let mut reg = self.registry.entries.write().unwrap();
+                        if index < reg.len() && self.layer_idx < reg[index].location.len() {
+                            reg[index].location[self.layer_idx] = KVLocation::VRAM;
+                        }
+                    }
+                    (k_gpu, v_gpu, loaded_tq)
+                } else if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
                     if inner.tq.is_some() {
                         // 🌟 [TURBO-KV-BLOCK] 압축 블록은 형 변환 없이 장치만 맞춥니다. (RAM 블록이면 압축된 채로 PCIe 전송)
                         let (kd, vd) = (k.to_device(dev)?, v.to_device(dev)?);
@@ -1695,12 +1783,88 @@ impl Qwen3_5Attention {
         block_attn.finish()?.ok_or_else(|| anyhow!("No KV data processed"))
     }
 
+    /// 🌟 [P1-2 / P4-O01] 이 어텐션 층의 지정 블록(또는 첫 RAM 상주 블록)을 계산 스트림과 겹쳐
+    /// 비동기 DMA(`OffloadPrefetcher`)로 미리 GPU 에 올립니다.
+    pub fn prefetch_ram_block(&mut self, block_idx: usize, dev: &Device) {
+        if dev.is_cpu() {
+            return;
+        }
+        if self.prefetched_block.as_ref().is_some_and(|(idx, _, _)| *idx == block_idx) {
+            return;
+        }
+        let Some(block) = self.kv_blocks.get(block_idx) else {
+            return;
+        };
+        let (host_kv, tq) = {
+            let Ok(inner) = block.inner.read() else { return };
+            if inner.location == KVLocation::VRAM {
+                return;
+            }
+            if let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) {
+                if k.device().is_cpu() && v.device().is_cpu() {
+                    (Some((k.clone(), v.clone())), inner.tq)
+                } else {
+                    (None, inner.tq)
+                }
+            } else {
+                let idx = inner.index;
+                drop(inner);
+                let Ok(reg) = self.registry.entries.read() else { return };
+                if idx >= reg.len() {
+                    return;
+                }
+                let Ok(cache) = reg[idx].bitkv_cache.read() else { return };
+                match cache.get(self.layer_idx).and_then(|o| o.as_ref()) {
+                    Some(m) if m.k_data.device().is_cpu() && m.v_data.device().is_cpu() => {
+                        (Some((m.k_data.clone(), m.v_data.clone())), m.tq)
+                    }
+                    _ => (None, None),
+                }
+            }
+        };
+        let Some((kh, vh)) = host_kv else {
+            return;
+        };
+        let need_bytes = (kh.elem_count() * kh.dtype().size_in_bytes())
+            .max(vh.elem_count() * vh.dtype().size_in_bytes())
+            .max(crate::utils::prefetch::ASYNC_DMA_MIN_BYTES);
+        let need_new = self
+            .prefetcher
+            .as_ref()
+            .is_none_or(|p| p.is_async_capable() && p.capacity_bytes() < need_bytes);
+        if need_new {
+            if let Ok(p) = crate::utils::prefetch::OffloadPrefetcher::new(dev, need_bytes) {
+                self.prefetcher = Some(p);
+            }
+        }
+        if let Some(p) = self.prefetcher.as_mut() {
+            if let Ok(pf) = p.prefetch_kv_pair(&kh, &vh) {
+                self.prefetched_block = Some((block_idx, pf, tq));
+            }
+        }
+    }
+
+    /// 이 층의 첫 번째 RAM 상주 블록을 선제 업로드합니다 (직전 레이어 계산과 DMA 중첩).
+    pub fn prefetch_first_ram_block(&mut self, dev: &Device) {
+        if dev.is_cpu() || self.kv_blocks.is_empty() {
+            return;
+        }
+        for bi in 0..self.kv_blocks.len() {
+            let is_ram = self.kv_blocks[bi]
+                .inner
+                .read()
+                .map(|g| g.location != KVLocation::VRAM)
+                .unwrap_or(false);
+            if is_ram {
+                self.prefetch_ram_block(bi, dev);
+                break;
+            }
+        }
+    }
+
     pub fn clear_kv_cache(&mut self) {
         self.kv_blocks.clear();
-
-        self.vram_merged_k = None;
-        self.vram_merged_v = None;
-        self.merged_vram_block_count = 0;
+        self.prefetched_block = None;
     }
 
     
@@ -1737,11 +1901,8 @@ impl Qwen3_5Attention {
         
         to_remove.sort_by(|a, b| b.cmp(a));
         for idx in to_remove { self.kv_blocks.remove(idx); }
+        self.prefetched_block = None;
 
-        self.vram_merged_k = None;
-        self.vram_merged_v = None;
-        self.merged_vram_block_count = 0;
-        
         Ok(())
     }
 
@@ -1753,11 +1914,7 @@ impl Qwen3_5Attention {
         self.o_proj = dummy;
         self.q_norm.clear();
         self.k_norm.clear();
-        
-        
-        self.vram_merged_k = None;
-        self.vram_merged_v = None;
-        self.merged_vram_block_count = 0;
+        self.prefetched_block = None;
     }
 
     pub fn load_weights_inplace(&mut self, ct: &candle_core::quantized::gguf_file::Content, data: &[u8], prefix: &str, device: &Device) -> Result<()> {
@@ -1928,7 +2085,7 @@ impl Qwen3_5DecoderLayer {
                 num_attention_heads, num_key_value_heads, num_kv_groups, head_dim, scaling,
                 kv_blocks: Vec::new(), registry, layer_idx, active_session_id: None, active_kv_name: None,
                 kv_residency: crate::utils::resources::KvResidency::Ssd,
-                vram_merged_k: None, vram_merged_v: None, merged_vram_block_count: 0,
+                prefetcher: None, prefetched_block: None,
                 kv_exact: false, kv_half: false,
             })
         };
@@ -2293,7 +2450,7 @@ impl Qwen3_5TextModel {
             None
         } else if use_quant_embed(device) {
             let q = gguf.tensor("token_embd.weight")?;
-            if quant_embed_ok(q.dtype()) {
+            if quant_embed_ok(q.dtype()) && quant_embed_self_check(device, &q) {
                 Some(q)
             } else {
                 None
@@ -2622,6 +2779,12 @@ impl Qwen3_5TextModel {
             // 🌟 [PREFETCH] 다음 층을 다시 읽어야 하면(스트리밍) 이 층을 계산하는 동안 OS 가 그 파일 페이지를 미리 읽게 합니다.
             if l_idx + 1 < total_layers && self.layers[l_idx + 1].is_cleared() {
                 self.prefetch_layer_pages(l_idx + 1);
+            }
+            // 🌟 [P1-2 / P4-O01] 다음 층이 SelfAttn 이고 RAM 상주 KV 블록을 가지고 있으면 이 층 계산과 중첩해 비동기 H2D 프리페치
+            if l_idx + 1 < total_layers {
+                if let AttnKind::SelfAttn(next_attn) = &mut self.layers[l_idx + 1].attn {
+                    next_attn.prefetch_first_ram_block(xs.device());
+                }
             }
             let layer = &mut self.layers[l_idx];
             if let AttnKind::SelfAttn(attn) = &mut layer.attn {
@@ -3605,10 +3768,7 @@ impl Qwen3_5TextModel {
 
         for (l_idx, layer) in self.layers.iter_mut().enumerate() {
             if let AttnKind::SelfAttn(attn) = &mut layer.attn {
-                
-                attn.vram_merged_k = None;
-                attn.vram_merged_v = None;
-                attn.merged_vram_block_count = 0;
+                attn.prefetched_block = None;
 
                 let mut gpu_k_list = Vec::new();
                 let mut gpu_v_list = Vec::new();

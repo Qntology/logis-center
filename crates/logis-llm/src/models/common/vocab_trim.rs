@@ -819,10 +819,9 @@ impl TrimmedHead {
             h_2d.dtype(),
             k_dim,
         );
-        // Quantized Mode A (0-byte [M, V_core] logits materialization on ROCm for M <= 8)
+        // Quantized Mode A (0-byte [M, V_core] logits materialization on ROCm; M > 8 chunked in 8-row batches)
         let quant_mode_a_ok = use_fused
             && h_2d.device().is_rocm()
-            && m <= 8
             && matches!(
                 self.qweight.dtype(),
                 GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
@@ -871,10 +870,9 @@ impl TrimmedHead {
             }
         };
 
-        let mut ids = out.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+        let (mut ids, masks_opt) = out.download_ids_and_mask()?;
         let mut rescued = 0usize;
-        if let (Some(guard), Some(mask_t), Some(vals_t)) = (&self.rescue, out.rescue_mask, out.max_vals) {
-            let masks = mask_t.to_device(&Device::Cpu)?.to_vec1::<u8>()?;
+        if let (Some(guard), Some(masks), Some(vals_t)) = (&self.rescue, masks_opt, out.max_vals) {
             if masks.iter().any(|&f| f != 0) {
                 let core_vals = vals_t.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
                 let h_host = h_2d

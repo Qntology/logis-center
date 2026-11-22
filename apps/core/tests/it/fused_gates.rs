@@ -46,9 +46,15 @@ fn gpu_device_opt() -> Option<Device> {
 #[test]
 fn fused_ops_fault_injection_fallback() -> Result<()> {
     let _guard = AccelGuard;
+    let require_gpu = std::env::var("LOGIS_REQUIRE_GPU").map(|v| v == "1").unwrap_or(false);
     let devices: Vec<Device> = match gpu_device_opt() {
         Some(g) => vec![Device::Cpu, g],
-        None => vec![Device::Cpu],
+        None => {
+            if require_gpu {
+                anyhow::bail!("LOGIS_REQUIRE_GPU=1 set, but no CUDA/ROCm/Vulkan GPU available");
+            }
+            vec![Device::Cpu]
+        }
     };
 
     for dev in &devices {
@@ -127,9 +133,9 @@ fn qwen_family_fused_teacher_forcing_parity() -> Result<()> {
         Some(d) => d,
         None => {
             if require_gpu {
-                anyhow::bail!("LOGIS_REQUIRE_GPU=1 set, but no CUDA/ROCm GPU available");
+                anyhow::bail!("LOGIS_REQUIRE_GPU=1 set, but no CUDA/ROCm/Vulkan GPU available");
             }
-            println!("[GATE 5-B] No CUDA/ROCm GPU built/available; running CPU diagnose check only.");
+            println!("[GATE 5-B] No CUDA/ROCm/Vulkan GPU built/available; running CPU diagnose check only.");
             let diag = diagnose(&Device::Cpu, DType::F32, 64);
             assert!(diag.contains("fused-ops:"), "diagnose missing fused-ops summary: {diag}");
             return Ok(());
@@ -424,5 +430,66 @@ fn trimmed_head_lossless_cs_guard_and_shadow_top3() -> Result<()> {
     drop(head);
     drop(table);
     drop(src);
+    Ok(())
+}
+
+/// Gate 4-B (`P4-F02` / `P4-F01` / `P4-O01`): Verifies `OffloadPrefetcher` performs real transfers
+/// on both small (<4 MiB sync) and large (>=4 MiB async DMA on ROCm/CUDA) payloads with exact bit
+/// parity against direct `to_device`.
+#[test]
+fn fused_gates_offload_prefetcher_parity() -> Result<()> {
+    use logis_app::utils::prefetch::{OffloadPrefetcher, ASYNC_DMA_MIN_BYTES};
+    let dev = gpu_device_opt().unwrap_or(Device::Cpu);
+    // Test small sync path (<4 MiB) + large async-capable path (4 MiB on ROCm/CUDA)
+    let cap = if dev.is_cuda() || dev.is_rocm() {
+        ASYNC_DMA_MIN_BYTES
+    } else {
+        64 * 1024
+    };
+    let mut prefetcher = OffloadPrefetcher::new(&dev, cap)?;
+
+    // 1) Small payload: must NOT be a silent no-op (P4-F02)
+    let k_small = Tensor::from_vec(det(1 * 2 * 16 * 32, 701), (1, 2, 16, 32), &Device::Cpu)?;
+    let v_small = Tensor::from_vec(det(1 * 2 * 16 * 32, 702), (1, 2, 16, 32), &Device::Cpu)?;
+    let pf_small = prefetcher.prefetch_kv_pair(&k_small, &v_small)?;
+    let (ks_dev, vs_dev) = pf_small.wait_and_take(&mut prefetcher)?;
+    assert_eq!(
+        ks_dev.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?,
+        k_small.flatten_all()?.to_vec1::<f32>()?,
+        "small prefetch K must match host bit-for-bit"
+    );
+    assert_eq!(
+        vs_dev.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?,
+        v_small.flatten_all()?.to_vec1::<f32>()?,
+        "small prefetch V must match host bit-for-bit"
+    );
+
+    // 2) Large payload (>= 4 MiB on CUDA/ROCm): exercises pinned CopyStream async DMA path
+    if dev.is_cuda() || dev.is_rocm() {
+        let elems = ASYNC_DMA_MIN_BYTES / 4; // 4 MiB of f32
+        let host_big: Vec<f32> = (0..elems).map(|i| ((i % 997) as f32 - 498.0) * 0.01).collect();
+        let t_host = Tensor::from_vec(host_big.clone(), (1, 1, 1024, elems / 1024), &Device::Cpu)?;
+        let pf = prefetcher.prefetch_tensor(&t_host)?;
+        assert!(pf.is_async(), "expected >=4 MiB upload on {:?} to use async DMA", dev.location());
+        let t_dev = pf.wait_and_take(&mut prefetcher)?;
+        let got = t_dev.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(got.len(), host_big.len());
+        assert_eq!(got[0], host_big[0]);
+        assert_eq!(got[elems / 2], host_big[elems / 2]);
+        assert_eq!(got[elems - 1], host_big[elems - 1]);
+    }
+    Ok(())
+}
+
+/// Verifies `accel_check::record_probe` rejects broken TurboQuant error (`> PROBE_BROKEN_REL`)
+/// and switches back to plain KV cleanly (`P4-F06` / `P5-33`).
+#[test]
+fn fused_gates_turbo_probe_rejects_broken_error() -> Result<()> {
+    use logis_app::models::common::accel_check::record_probe;
+    // Use CPU device location so we don't poison live GPU state for other tests in the process.
+    let ok_small = record_probe(&Device::Cpu, 0.03, "test-fp8");
+    assert!(ok_small, "normal 3% FP8 probe error should keep TurboQuant active");
+    let ok_broken = record_probe(&Device::Cpu, 0.85, "test-broken");
+    assert!(!ok_broken, "85% error must trip PROBE_BROKEN_REL and return false for plain KV fallback");
     Ok(())
 }

@@ -464,10 +464,12 @@ pub fn get_optimal_thread_config(is_cpu_mode: bool) -> ThreadConfig {
 
 /// Returns (RAM used in bytes, VRAM used in bytes)
 pub fn get_memory_usage() -> (u64, u64) {
-    let mut sys = SYSTEM_MONITOR.lock().unwrap();
-    sys.refresh_memory();
-    let ram_used = sys.used_memory(); 
-    
+    let ram_used = {
+        let mut sys = SYSTEM_MONITOR.lock().unwrap_or_else(|e| e.into_inner());
+        sys.refresh_memory();
+        sys.used_memory()
+    };
+
     let mut vram_used = 0;
     let probe = crate::utils::GpuMemProbe::new();
     for i in 0..probe.device_count() {

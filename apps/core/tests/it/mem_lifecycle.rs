@@ -213,6 +213,16 @@ fn half_kv_storage_error_is_small() -> anyhow::Result<()> {
     // F16 블록에 이어 붙이는 값은 범위로 잘려 inf 가 되지 않습니다
     let clipped = half_kv_piece(&big, Some(DType::F16))?.to_dtype(DType::F32)?;
     assert!(clipped.flatten_all()?.to_vec1::<f32>()?.iter().all(|x| x.is_finite()));
+    // GPU(CUDA/ROCm)에서는 BF16 직접 변환으로 ±60000 포화 손실 없이 1.0e5 를 보존합니다 (P4-F04)
+    if let Some(gdev) = logis_app::utils::new_gpu_device(0) {
+        if gdev.is_cuda() || gdev.is_rocm() {
+            let big_gpu = big.to_device(&gdev)?;
+            let out_gpu = half_kv_piece(&big_gpu, None)?;
+            assert_eq!(out_gpu.dtype(), DType::BF16, "CUDA/ROCm half_kv_piece(None) must preserve BF16 range");
+            let vals = out_gpu.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            assert!(vals.iter().all(|&v| v > 9.0e4), "BF16 must not clamp 1e5 down to 60000: {vals:?}");
+        }
+    }
     Ok(())
 }
 
