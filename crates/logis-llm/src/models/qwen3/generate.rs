@@ -331,18 +331,30 @@ impl Qwen3GenerateModel {
         //    예전에는 그 판정이 다음 호출의 프리필까지 남아 청크마다 층마다 KV 를 CPU 로 내렸다 올렸습니다.
         //    VRAM 이 빠듯하면 아래 정밀도 판정이 압축 KV 를 고르고, 디코딩 진입 계획(plan_decode_kv)이 다시 정합니다.
         self.qwen3.set_kv_residency(KvResidency::Vram);
+        self.qwen3.set_planned_kv_tokens(planned_tokens);
         let (layers, heads, head_dim) = self.qwen3.kv_geometry();
         let elem = if self.device.is_cuda_or_rocm() { 2 } else { 4 };
         let exact_bytes = (layers * heads * head_dim * 2 * elem * planned_tokens) as u64;
-        let (exact, free) =
-            crate::models::common::kv_turbo::exact_kv_affordable(&self.device, exact_bytes, 0);
+        // 🌟 [P4-F15] 고정 640 MiB 마진 대신 Qwen3.5 와 동일한 비례 마진(`kv_vram_margin_bytes`) 사용
+        //    (`LOGIS_KV_PLAN=legacy` 일 때만 예전 640 MiB 고정값).
+        let margin = if crate::utils::resources::kv_plan_legacy() {
+            crate::utils::resources::KV_VRAM_SAFETY_MARGIN_BYTES
+        } else {
+            crate::utils::resources::kv_vram_margin_bytes(96 * 1024 * 1024)
+        };
+        let (exact, free) = crate::models::common::kv_turbo::exact_kv_affordable_with_margin(
+            &self.device,
+            exact_bytes,
+            0,
+            margin,
+        );
         self.qwen3.set_kv_exact(exact);
         if self.device.is_cuda_or_rocm() || self.device.is_vulkan() {
             println!(
                 "[KV-PRECISION] Qwen3(0.6B) | 토큰 {} · 원본 KV {:.0} MB + 여유 {:.0} MB vs VRAM free {} → {}",
                 planned_tokens,
                 exact_bytes as f64 / 1e6,
-                crate::utils::resources::KV_VRAM_SAFETY_MARGIN_BYTES as f64 / 1e6,
+                margin as f64 / 1e6,
                 free.map(|f| format!("{:.0} MB", f as f64 / 1e6)).unwrap_or_else(|| "?".to_string()),
                 if exact {
                     "원본 KV (압축하지 않음 · 정확도 우선)"

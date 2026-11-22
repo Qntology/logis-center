@@ -230,7 +230,19 @@ fn qwen35_kv_tiers_and_states() -> R {
         }
         if !dev.is_cpu() {
             assert!(vram.ssm_on_device && ram.ssm_on_device, "{label}: GDN 상태가 장치에 남지 않았습니다");
-            assert!(d_cpu <= 1e-3 * cpu_vram.logits.iter().flatten().fold(1f32, |m, x| m.max(x.abs())), "{label}: CPU 대비 {d_cpu:.2e}");
+            let scale = cpu_vram.logits.iter().flatten().fold(1f32, |m, x| m.max(x.abs()));
+            if fp8_path {
+                // CUDA/ROCm 은 `embed_tokens` · `lm_head` 를 F16 으로 올려 실행하므로(CPU 는 F32),
+                // F16 양자화 오차 범위(<= 5e-2 상대)와 전 스텝 top-1 일치를 함께 검증합니다.
+                let argmax = |v: &[f32]| v.iter().enumerate().fold((0, f32::NEG_INFINITY), |b, (i, x)| if *x > b.1 { (i, *x) } else { b }).0;
+                let top1 = vram.logits.iter().zip(&cpu_vram.logits).filter(|(a, b)| argmax(a) == argmax(b)).count();
+                assert!(
+                    top1 == DECODE && d_cpu <= 5e-2 * scale,
+                    "{label}: CPU(F32) 대비 F16 모델 불일치 (top-1 {top1}/{DECODE}, d_cpu {d_cpu:.2e}, scale {scale:.2e})"
+                );
+            } else {
+                assert!(d_cpu <= 1e-3 * scale, "{label}: CPU 대비 {d_cpu:.2e}");
+            }
         }
     }
     Ok(())

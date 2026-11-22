@@ -197,20 +197,37 @@ fn matmul_patterns_used_by_models() -> R {
 
 #[test]
 fn quantized_matmul_matches_cpu_for_app_gguf_types() -> R {
-    // GGUF 경로: Q8_0 (임베딩/ssm_beta·alpha), Q4K (대부분의 가중치), Q6K (출력 헤드)
+    // GGUF 경로: Q8_0 (임베딩/ssm_beta·alpha), Q4_0, Q4K (대부분의 가중치), Q5K, Q6K (출력 헤드)
     let w = (randn(&[64, 512])? * 0.05)?;
     let x = randn(&[1, 3, 512])?;
     with_modes(|dev| {
-        for dt in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::Q6K] {
+        let expect_native_gpu = dev
+            .as_vulkan_device()
+            .is_ok_and(|v| !v.is_cpu_device() && shaders::native_enabled(v));
+        for dt in [
+            GgmlDType::Q8_0,
+            GgmlDType::Q4_0,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
             let mm_cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dt)?)?;
             let mm_vk = QMatMul::from_qtensor(QTensor::quantize_onto(&w, dt, dev)?)?;
             let want = mm_cpu.forward(&x)?;
+            let exec0 = shaders::native_exec_count();
             let got = mm_vk.forward(&x.to_device(dev)?)?;
+            let exec_delta = shaders::native_exec_count() - exec0;
             assert!(got.device().is_vulkan(), "{dt:?}: result left the device");
+            if expect_native_gpu {
+                assert!(
+                    exec_delta > 0,
+                    "{dt:?}: expected Vulkan GpuQuant native GPU dispatch on discrete/iGPU (P5-F07)"
+                );
+            }
             // 양자화 오차 자체도 합리적인 범위인지 (역양자화 가중치 기준)
             let deq = QTensor::quantize(&w, dt)?.dequantize(&Device::Cpu)?;
             let reference = x.broadcast_matmul(&deq.t()?)?;
-            // [GpuQuant] Q8_0 / Q4K / Q6K 가중치가 GPU 에 상주하면 f32 활성을 그대로 곱합니다(= reference).
+            // [GpuQuant] Q8_0 / Q4_0 / Q4K / Q5K / Q6K 가중치가 GPU 에 상주하면 f32 활성을 그대로 곱합니다(= reference).
             // CPU/호스트 경로는 활성을 Q8_0/Q8K 로 양자화한 뒤 곱하므로(llama.cpp vec_dot) 둘 다 맞는 결과이고,
             // Vulkan 결과는 둘 중 하나와 맞아야 합니다.
             let close_to = |r: &Tensor| -> anyhow::Result<bool> {
@@ -221,7 +238,7 @@ fn quantized_matmul_matches_cpu_for_app_gguf_types() -> R {
                 && !close_to(&want)?
                 && close_to(&reference)?
             {
-                eprintln!("{dt:?}: Vulkan GPU-resident GpuQuant path matches exact f32-activation reference");
+                eprintln!("{dt:?}: Vulkan GPU-resident GpuQuant path matches exact f32-activation reference (dispatches={exec_delta})");
             } else {
                 assert_close(&got, &want, 1e-3, &format!("{dt:?} qmatmul"))?;
             }

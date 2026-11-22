@@ -11,6 +11,7 @@
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub use half;
 pub mod attn;
 pub mod image;
 

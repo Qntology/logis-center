@@ -495,8 +495,8 @@ pub fn flush_probe_report(device: &Device) {
 
 /// Part 5 (Pack C): 융합 디코더/GDN/lm_head 커널을 이 장치·dtype·차원에서 써도 되는지.
 ///
-/// - CUDA/ROCm GPU 에서만 활성화됩니다 (CPU 는 `embed-cpu-kernels` 패킹 경로를, Vulkan/Metal 은
-///   기존 경로를 유지 — 단 Gate 5-A 고장 주입 테스트가 활성화된 경우 CPU 에서도 자가 검증 + 폴백을 실행).
+/// - CUDA/ROCm/Vulkan GPU 에서 활성화됩니다 (GatedDeltaRule 은 Metal 포함; CPU 는 `embed-cpu-kernels`
+///   패킹 경로를 유지 — 단 Gate 5-A 고장 주입 테스트가 활성화된 경우 CPU 에서도 자가 검증 + 폴백을 실행).
 /// - `LOGIS_FUSED_OPS=off` 또는 `-<kind>` 로 비활성화할 수 있습니다.
 /// - `(kind, dtype, dim)` 조합마다 최초 1회 CPU FP32 기준 대비 자가 검증을 `catch_unwind` 로 감싸
 ///   실행하며, 실패·패닉·오차 초과 시 해당 키를 영구 `false` 로 캐시해 기존 텐서 경로로 안전 폴백합니다.

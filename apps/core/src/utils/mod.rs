@@ -19,7 +19,7 @@ pub mod time_guide;
 pub mod score_dynamics;
 // 🌟 [LOGIS-LLM] 장치 · 메모리 · KV 배치 · 텐서 · 이미지 · 직접 적재 · KV 암호화 도우미는 crates/logis-llm 으로,
 //    앱 데이터 폴더 경로(tmp · kv · 작업 폴더 · 중단 신호)는 crates/logis-schema 로 옮겼습니다. 예전 경로 그대로 재수출합니다.
-pub use logis_llm::utils::{crypto, device_utils, direct_loader, img_utils, misc_utils, resources, tensor_utils};
+pub use logis_llm::utils::{crypto, device_utils, direct_loader, img_utils, misc_utils, prefetch, resources, tensor_utils};
 pub use logis_schema::paths;
 pub use device_utils::*;
 pub use misc_utils::*;

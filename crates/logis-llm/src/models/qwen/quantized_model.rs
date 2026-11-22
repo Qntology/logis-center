@@ -2841,10 +2841,34 @@ impl QuantizedQwenVLTextModel {
         //    KV Cache 는 단조 증가하므로 "앞으로 자랄 최대치"를 기준으로 판정해야
         //    디코딩 도중 OOM 이 터지지 않습니다. 이후 토큰에서는 캐시된 계획을 그대로 씁니다.
         //    프리필 구간에서는 계획을 무효화하여 기존 SSD 오프로딩 경로를 100% 유지합니다.
+        let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) };
+        let target_dtype = if target_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
+
         if is_decoding {
             if self.kv_plan.is_none() {
                 let (kv_layers, kv_heads, kv_head_dim) = self.kv_plan_geometry();
                 let planned = seqlen_offset + seq_len + QWEN06B_DECODE_HEADROOM_TOKENS;
+                // 🌟 [P4-F05] 프리필 중 RAM/SSD 로 대피된 블록은 아직 VRAM 에 없으므로
+                //    `seqlen_offset` 전체가 아니라 실제로 VRAM 에 상주 중인 토큰만 `already_tokens` 로 셉니다.
+                let vram_already_tokens: usize = self
+                    .layers
+                    .first()
+                    .map(|l| {
+                        l.self_attn
+                            .kv_blocks
+                            .iter()
+                            .filter_map(|b| {
+                                let inner = b.inner.read().ok()?;
+                                (inner.location == KVLocation::VRAM && inner.k_cache.is_some())
+                                    .then_some(inner.len)
+                            })
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                // CUDA/ROCm 은 VRAM 에서 F8E4M3(1 B/elem)로 압축 보관, Vulkan/기타는 F32(4 B/elem)로 보관.
+                let bytes_per_elem = if target_device.is_cuda_or_rocm() { 1usize } else { 4usize };
+                let bytes_per_token =
+                    (kv_layers * kv_heads * kv_head_dim * 2 * bytes_per_elem) as u64;
 
                 let plan = crate::utils::resources::plan_kv_residency_ex(
                     &crate::utils::resources::KvPlanInput {
@@ -2853,15 +2877,14 @@ impl QuantizedQwenVLTextModel {
                         num_kv_layers: kv_layers,
                         num_kv_heads: kv_heads,
                         head_dim: kv_head_dim,
-                        // KV 블록은 VRAM 에서 F8E4M3(1바이트)로 압축 보관됩니다.
-                        bytes_per_elem: 1,
+                        bytes_per_elem,
                         planned_tokens: planned,
                         label: "Qwen(0.6B)",
                     },
                     &crate::utils::resources::KvPlanExtra {
-                        already_tokens: seqlen_offset,
+                        already_tokens: vram_already_tokens.min(seqlen_offset),
                         decode_transient_bytes: 96 * 1024 * 1024,
-                        bytes_per_token: None,
+                        bytes_per_token: Some(bytes_per_token),
                         prev: self.kv_plan,
                     },
                 );
@@ -2882,8 +2905,6 @@ impl QuantizedQwenVLTextModel {
             }
         }
 
-        let target_device = if self.is_forced_cpu { Device::Cpu } else { crate::utils::get_cuda_device(self.device_id) }; 
-        let target_dtype = if target_device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         let mut xs = inputs_embeds.to_device(&target_device)?.to_dtype(target_dtype)?;
 
         let position_ids = match position_ids_in {
@@ -3405,6 +3426,13 @@ impl QuantizedQwenVLModel {
     fn get_vision_features(&self, pixel_values: &Tensor, image_grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
         // 비전 모듈 호출 시 안전하게 체크
         let visual_model = self.visual.as_ref().ok_or_else(|| anyhow!("Vision model is disabled in baking mode!"))?;
+        let pixel_values = if !pixel_values.device().same_device(&self.vision_device)
+            || pixel_values.dtype() != self.vision_dtype
+        {
+            pixel_values.to_device(&self.vision_device)?.to_dtype(self.vision_dtype)?
+        } else {
+            pixel_values.clone()
+        };
         let image_grid_thw = if !image_grid_thw.device().same_device(&self.vision_device) { image_grid_thw.to_device(&self.vision_device)? } else { image_grid_thw.clone() };
         let (image_embeds, deepstack_image_embeds) = visual_model.forward(&pixel_values, &image_grid_thw)?;
         

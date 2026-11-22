@@ -92,6 +92,10 @@ impl QwenVLProcessor {
     /// 🌟 [VRAM 역산] Qwen3VL 프로세서와 동일한 이차식 모델을 사용합니다.
     ///   mem(N) = A·N + B·N²  →  B·N² + A·N - usable = 0 의 양근이 안전 패치 수입니다.
     fn compute_adaptive_max_pixels(&self, config_max: u32) -> u32 {
+        // 🌟 [P4-F08] 비전 장치가 CPU 이면 GPU 0 의 여유 VRAM 으로 해상도를 깎지 않습니다.
+        if self.device.is_cpu() {
+            return config_max;
+        }
         const A: f64 = 24_000.0;
         // 🌟 [VISION-TILE 반영] 쿼리축 타일링으로 어텐션 전이 버퍼에 상한이 걸렸으므로
         //   N² 계수를 32 → 4 로 낮춥니다. (qwen3vl/processor.rs 와 동일 근거)
@@ -252,11 +256,11 @@ impl QwenVLProcessor {
         Ok((img_tensor, grid_thw))
     }
 
-    fn process_img_patched_with_budget(
+    fn prepare_img_rgb_with_budget(
         &self,
         img: &DynamicImage,
         budget_divisor: usize,
-    ) -> Result<(Tensor, Tensor)> {
+    ) -> Result<(Vec<u8>, usize, usize, usize, usize)> {
         let img_h = img.height();
         let img_w = img.width();
         let mut max_pixels = self.img_process_cfg.size.longest_edge as u32;
@@ -289,7 +293,6 @@ impl QwenVLProcessor {
         let shortest_edge = if shortest_edge > max_pixels { max_pixels } else { shortest_edge };
         let patch_size = self.img_process_cfg.patch_size;
         let merge_size = self.img_process_cfg.merge_size;
-        let tp = self.img_process_cfg.temporal_patch_size.max(1);
         let (resize_h, resize_w) = img_smart_resize(
             img_h,
             img_w,
@@ -298,9 +301,26 @@ impl QwenVLProcessor {
             max_pixels,
         )?;
         let resized = img.resize_exact(resize_w, resize_h, image::imageops::FilterType::Lanczos3);
-        let rgb = resized.to_rgb8().into_raw();
+        let rgb = resized.into_rgb8().into_raw();
         let grid_h = resize_h as usize / patch_size;
         let grid_w = resize_w as usize / patch_size;
+        Ok((rgb, resize_w as usize, resize_h as usize, grid_h, grid_w))
+    }
+
+    pub fn process_images(
+        &self,
+        imgs: Vec<DynamicImage>,
+        _img_mean: &Tensor,
+        _img_std: &Tensor,
+    ) -> Result<VisionInput> {
+        let total = imgs.len().max(1);
+        if total > 1 {
+            println!("[PROCESSOR] process_images: {} images will co-reside. Splitting VRAM budget.", total);
+        }
+
+        let patch_size = self.img_process_cfg.patch_size;
+        let merge_size = self.img_process_cfg.merge_size;
+        let tp = self.img_process_cfg.temporal_patch_size.max(1);
         let patch_dim = 3 * tp * patch_size * patch_size;
         let mean = [
             self.img_process_cfg.image_mean.first().copied().unwrap_or(0.5),
@@ -312,59 +332,65 @@ impl QwenVLProcessor {
             self.img_process_cfg.image_std.get(1).copied().unwrap_or(0.5),
             self.img_process_cfg.image_std.get(2).copied().unwrap_or(0.5),
         ];
-        let mut out = vec![0.0f32; grid_h * grid_w * patch_dim];
-        embed_cpu_kernels::image::patchify_norm_qwen_vl_u8_f32(
-            &rgb,
-            resize_w as usize,
-            resize_h as usize,
-            patch_size,
-            merge_size,
-            tp,
-            mean,
-            std,
-            &mut out,
-        );
-        let patched = Tensor::from_vec(out, (grid_h * grid_w, patch_dim), &self.device)?
-            .to_dtype(self.dtype)?;
-        let grid_thw = Tensor::from_vec(
-            vec![1u32, grid_h as u32, grid_w as u32],
-            (1, 3),
-            &self.device,
-        )?;
-        Ok((patched, grid_thw))
-    }
 
-    pub fn process_images(
-        &self,
-        imgs: Vec<DynamicImage>,
-        _img_mean: &Tensor,
-        _img_std: &Tensor,
-    ) -> Result<VisionInput> {
-        let mut pixel_values_vec = Vec::with_capacity(imgs.len());
-        let mut vision_grid_thws_vec = Vec::with_capacity(imgs.len());
-
-        // 🌟 [VRAM 역산] 결과가 최종적으로 Tensor::cat 으로 합쳐지므로 장수를 예산 분모로 넘깁니다.
-        let total = imgs.len().max(1);
-        if total > 1 {
-            println!("[PROCESSOR] process_images: {} images will co-reside. Splitting VRAM budget.", total);
+        // 🌟 [P4-O04 / P4-O05 / P4-F17] 다중 크롭을 하나의 호스트 버퍼에 타깃 dtype(F16/BF16/F32)으로
+        //    직접 패치화한 뒤 1회 H2D 업로드합니다 (N회 업로드 + GPU cat 2~3x 피크 및 F32->F16 변환 제거).
+        let mut prepared = Vec::with_capacity(imgs.len());
+        let mut total_patches = 0usize;
+        let mut grid_thw_flat = Vec::with_capacity(imgs.len() * 3);
+        for img in &imgs {
+            let (rgb, rw, rh, gh, gw) = self.prepare_img_rgb_with_budget(img, total)?;
+            total_patches += gh * gw;
+            grid_thw_flat.push(1u32);
+            grid_thw_flat.push(gh as u32);
+            grid_thw_flat.push(gw as u32);
+            prepared.push((rgb, rw, rh, gh * gw));
         }
 
-        for img in imgs {
-            let (patched, grid_thw) = self.process_img_patched_with_budget(&img, total)?;
-            pixel_values_vec.push(patched);
-            vision_grid_thws_vec.push(grid_thw);
-        }
-
-        let pixel_values = if pixel_values_vec.len() == 1 {
-            pixel_values_vec.remove(0)
-        } else {
-            Tensor::cat(&pixel_values_vec, 0)?
+        let total_elems = total_patches * patch_dim;
+        let pixel_values = match self.dtype {
+            DType::F16 => {
+                let mut buf = vec![embed_cpu_kernels::half::f16::ZERO; total_elems];
+                let mut off = 0usize;
+                for (rgb, rw, rh, np) in &prepared {
+                    let len = np * patch_dim;
+                    embed_cpu_kernels::image::patchify_norm_qwen_vl_u8_f16(
+                        rgb, *rw, *rh, patch_size, merge_size, tp, mean, std,
+                        &mut buf[off..off + len],
+                    );
+                    off += len;
+                }
+                Tensor::from_vec(buf, (total_patches, patch_dim), &self.device)?
+            }
+            DType::BF16 => {
+                let mut buf = vec![embed_cpu_kernels::half::bf16::ZERO; total_elems];
+                let mut off = 0usize;
+                for (rgb, rw, rh, np) in &prepared {
+                    let len = np * patch_dim;
+                    embed_cpu_kernels::image::patchify_norm_qwen_vl_u8_bf16(
+                        rgb, *rw, *rh, patch_size, merge_size, tp, mean, std,
+                        &mut buf[off..off + len],
+                    );
+                    off += len;
+                }
+                Tensor::from_vec(buf, (total_patches, patch_dim), &self.device)?
+            }
+            _ => {
+                let mut buf = vec![0.0f32; total_elems];
+                let mut off = 0usize;
+                for (rgb, rw, rh, np) in &prepared {
+                    let len = np * patch_dim;
+                    embed_cpu_kernels::image::patchify_norm_qwen_vl_u8_f32(
+                        rgb, *rw, *rh, patch_size, merge_size, tp, mean, std,
+                        &mut buf[off..off + len],
+                    );
+                    off += len;
+                }
+                Tensor::from_vec(buf, (total_patches, patch_dim), &self.device)?
+                    .to_dtype(self.dtype)?
+            }
         };
-        let vision_grid_thws = if vision_grid_thws_vec.len() == 1 {
-            vision_grid_thws_vec.remove(0)
-        } else {
-            Tensor::cat(&vision_grid_thws_vec, 0)?
-        };
+        let vision_grid_thws = Tensor::from_vec(grid_thw_flat, (imgs.len(), 3), &self.device)?;
 
         Ok(VisionInput {
             data: pixel_values,

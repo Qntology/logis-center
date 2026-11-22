@@ -103,10 +103,30 @@ pub fn turbo_kv_step(
     head_dim: usize,
     scaling: f64,
 ) -> Result<TurboStep> {
+    turbo_kv_step_with_cap(cache, prev, q, k, v, head_dim, scaling, None)
+}
+
+/// [`turbo_kv_step`] with an explicit KV-PLAN `planned_tokens` reservation (`P4-F13` / `P4-O02`)
+/// and direct compressed attention for `q_len <= 4` and FP8 chunked prefill (`P4-F14` / `P4-O03`).
+#[cfg(feature = "turbo-quant")]
+#[allow(clippy::too_many_arguments)]
+pub fn turbo_kv_step_with_cap(
+    cache: &mut Option<TurboKvCache>,
+    prev: Option<(Tensor, Tensor)>,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    scaling: f64,
+    planned_tokens: Option<usize>,
+) -> Result<TurboStep> {
     let dev = k.device().clone();
     let q_len = q.dim(2)?;
     if cache.is_none() {
-        let initial_cap = TURBO_KV_GROW_BY.max(q_len.next_power_of_two());
+        let initial_cap = match planned_tokens {
+            Some(p) if p > 0 => p.max(q_len),
+            _ => TURBO_KV_GROW_BY.max(q_len.next_power_of_two()),
+        };
         *cache = Some(TurboKvCache::with_capacity(
             &kv_turbo::kv_quant_options(),
             head_dim,
@@ -172,8 +192,13 @@ pub fn turbo_kv_step(
         return Ok(TurboStep { out, plain_kv: None });
     }
 
-    if q_len > 1 {
-        // 청크 프리필: 과거 이력은 압축본을 풀어서, 이번 청크는 원본 그대로 계산합니다.
+    // 🌟 [P1-3 / P4-F14 / P4-O03]
+    // - 디코딩 및 소형 멀티토큰(q_len <= 4): 이력을 풀지 않고 압축 캐시 위에서 바로(fused) 계산합니다.
+    // - FP8 청크 프리필(CUDA/ROCm): `tq_tile` 타일 압축 어텐션으로 이력을 풀거나 `Tensor::cat` 하지 않고 직접 계산합니다.
+    // - 저비트(4bit) 청크 프리필 등: 현재 청크 정밀도를 보존하기 위해 과거 이력만 풀어 원본 청크와 결합합니다.
+    let direct_compressed = q_len <= candle_core::accel::attention::FA_DECODE_MAX_Q
+        || (!kv_turbo::kv_is_compact(&dev) && dev.is_cuda_or_rocm());
+    if !direct_compressed {
         let hist = c.keys_values()?;
         c.append(&k, &v)?;
         let out = match hist {
@@ -187,7 +212,7 @@ pub fn turbo_kv_step(
         return Ok(TurboStep { out, plain_kv: None });
     }
 
-    // 디코딩: 압축 캐시 위에서 바로(fused) 계산합니다.
+    // 압축 캐시 위에서 바로(fused / tq_tile) 계산합니다.
     c.append(&k, &v)?;
     let out = c.attention(&q, &cfg)?;
     Ok(TurboStep { out, plain_kv: None })
@@ -772,6 +797,8 @@ pub struct QKNormAttention {
     turbo_kv: Option<TurboKvCache>,
     // 🌟 [TURBO-KV] 레이어가 TurboQuant 경로를 써도 되는지. KV 를 RAM 으로 대피시키는 동안은 false.
     turbo_kv_allowed: bool,
+    // 🌟 [P4-F13 / P4-O02] KV-PLAN 이 산정한 planned_tokens (TurboKvCache 초기 용량 예약)
+    planned_kv_tokens: Option<usize>,
 }
 
 impl QKNormAttention {
@@ -868,7 +895,12 @@ impl QKNormAttention {
             #[cfg(feature = "turbo-quant")]
             turbo_kv: None,
             turbo_kv_allowed: true,
+            planned_kv_tokens: None,
         }
+    }
+
+    pub fn set_planned_kv_tokens(&mut self, planned: usize) {
+        self.planned_kv_tokens = (planned > 0).then_some(planned);
     }
 
     pub fn with_eps(mut self, eps: f64) -> Self {
@@ -959,7 +991,7 @@ impl QKNormAttention {
                 && turbo_kv_use(&dev, self.head_dim, q_len, self.has_turbo_kv())
             {
                 let prev = self.kv_cache.take();
-                let step = turbo_kv_step(
+                let step = turbo_kv_step_with_cap(
                     &mut self.turbo_kv,
                     prev,
                     &query_states,
@@ -967,6 +999,7 @@ impl QKNormAttention {
                     &value_states,
                     self.head_dim,
                     self.scaling,
+                    self.planned_kv_tokens,
                 )?;
                 if let Some(kv) = step.plain_kv {
                     // 실측 감시가 압축 캐시를 버렸습니다. 원본 K/V 로 기존 경로를 이어 갑니다.

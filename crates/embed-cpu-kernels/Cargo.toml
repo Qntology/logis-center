@@ -6,4 +6,5 @@ publish = false
 description = "Packed-weight, cache-blocked f32 GEMM + fused RMSNorm / SiLU·up for the granite embedding CPU forward ([EMBED-CPU-PACKED])"
 
 [dependencies]
+half = "2"
 rayon = "1.10"

@@ -682,6 +682,13 @@ impl Qwen3Model {
         }
     }
 
+    /// 🌟 [P4-F13 / P4-O02] KV-PLAN 의 `planned_tokens` 를 전 레이어의 `TurboKvCache` 예약 용량으로 전파합니다.
+    pub fn set_planned_kv_tokens(&mut self, planned: usize) {
+        for layer in self.layers.iter_mut() {
+            layer.self_attn.set_planned_kv_tokens(planned);
+        }
+    }
+
     pub fn get_kv_cache(&self) -> Vec<Option<(Tensor, Tensor)>> {
         self.layers.iter().map(|l| l.get_kv_cache()).collect()
     }
