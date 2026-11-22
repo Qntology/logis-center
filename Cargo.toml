@@ -74,16 +74,16 @@ premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", r
 # 원격에 아직 없는 로컬 포크(../candle-rocm-vulkan)로 빌드하려면 아래 git 4줄(candle-rocm 과 패치 3줄)을 path 줄로 바꾼다.
 # candle-rocm 은 crates/logis-llm(장치 수 · VRAM 조회)만 쓴다 (기능 rocm).
 # candle-rocm-vulkan PR 머지 전까지 포크 브랜치 커밋으로 고정 (머지 후 Qntology/candle-rocm-vulkan 동일 rev 로 전환).
-# candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "5f83cffde5c916fd6b4a54533b0475854dc621a3" }
-candle-rocm = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "5f83cffde5c916fd6b4a54533b0475854dc621a3" }
+# candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
+candle-rocm = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
 
 [patch.crates-io]
-# candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "5f83cffde5c916fd6b4a54533b0475854dc621a3" }
-# candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "5f83cffde5c916fd6b4a54533b0475854dc621a3" }
-# candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "5f83cffde5c916fd6b4a54533b0475854dc621a3" }
-candle-core = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "5f83cffde5c916fd6b4a54533b0475854dc621a3" }
-candle-nn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "5f83cffde5c916fd6b4a54533b0475854dc621a3" }
-candle-flash-attn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "5f83cffde5c916fd6b4a54533b0475854dc621a3" }
+# candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
+# candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
+# candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
+candle-core = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
+candle-nn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
+candle-flash-attn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
 
 # [patch."https://github.com/Qntology/premium-discount"]
 # premium-discount-identity = { path = "../premium-discount/crates/premium-discount-identity" }

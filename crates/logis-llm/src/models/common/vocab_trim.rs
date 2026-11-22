@@ -777,13 +777,39 @@ impl TrimmedHead {
         self.w.embedding(&Tensor::from_vec(rows.to_vec(), rows.len(), device)?)
     }
 
+    /// `PRC-03`: 출력 헤드 산술 단일화 — CUDA/ROCm 에서 지원 양자화 형식은 활성값 Q8_1 근사
+    /// (`QMatMul::forward`) 대신 정확 W8A16(`forward_exact`)을 사용하여 그리디 고속 경로(Mode A)와
+    /// 금지 토큰 폴백·제약 디코딩·샘플링 경로의 산술을 일치시킵니다. (`LOGIS_EXACT_LM_HEAD=0` 으로 끄기 가능)
+    fn project_rows(&self, h: &Tensor) -> candle_core::Result<Tensor> {
+        static EXACT_HEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let exact_on = *EXACT_HEAD.get_or_init(|| {
+            let v = std::env::var("LOGIS_EXACT_LM_HEAD")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no" | "legacy")
+        });
+        let use_exact = exact_on
+            && (h.device().is_cuda() || h.device().is_rocm())
+            && matches!(h.dtype(), candle_core::DType::F32 | candle_core::DType::F16 | candle_core::DType::BF16)
+            && matches!(
+                self.qweight.dtype(),
+                GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
+            );
+        if use_exact {
+            self.w.forward_exact(h)?.to_dtype(candle_core::DType::F32)
+        } else {
+            self.w.forward(h)?.to_dtype(candle_core::DType::F32)
+        }
+    }
+
     /// `h` `[.., hidden]` (F32) → `[.., vocab]` F32, `h` 와 같은 장치. 남긴 행 밖은 −∞.
     /// 펼치기는 장치의 모으기 하나입니다: 남긴 K 행의 로짓 뒤에 −∞ 한 칸을 붙이고 역표로 `index_select` (출력 원소마다 스레드 하나).
     /// (CPU 에서 어휘 길이의 배열을 채우면 dev 빌드 0.6B 디코드가 전체 어휘보다 1 ~ 8 % 느렸고, 포크의 `index_add` 는 이 모양에서
     /// 스레드 하나가 K 행을 모두 돌아 0.6B +138 % · 2B +129 % 였습니다.)
     pub fn logits(&self, h: &Tensor) -> candle_core::Result<Tensor> {
         let mut dims = h.dims().to_vec();
-        let k = self.w.forward(h)?.to_dtype(candle_core::DType::F32)?;
+        let k = self.project_rows(h)?;
         if self.kept.len() == self.vocab {
             // 전체 행(번호 순)은 펼칠 것이 없습니다
             return Ok(k);
@@ -840,7 +866,7 @@ impl TrimmedHead {
                 candle_core::lm_head::fused_quant_argmax_cs(&h_2d, &self.qweight, None, None, None)?
             }
         } else {
-            let sub_logits = self.w.forward(&h_2d)?.to_dtype(candle_core::DType::F32)?;
+            let sub_logits = self.project_rows(&h_2d)?;
             if let Some(guard) = &self.rescue {
                 if use_fused || h_2d.device().is_cpu() {
                     candle_core::lm_head::logits_argmax_cs(

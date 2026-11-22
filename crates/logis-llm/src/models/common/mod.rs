@@ -237,6 +237,10 @@ pub fn llm_cpu_packed_enabled(device: &candle_core::Device) -> bool {
 /// CPU F32 1-pass RMSNorm (단일 패스 `embed_cpu_kernels::rms_norm` 직결).
 pub fn fast_cpu_rms_norm(norm: &RmsNorm, x: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
     if !llm_cpu_packed_enabled(x.device()) || x.dtype() != candle_core::DType::F32 {
+        if norm.weight().dtype() != x.dtype() {
+            let x_w = x.to_dtype(norm.weight().dtype())?;
+            return norm.forward(&x_w)?.to_dtype(x.dtype());
+        }
         return norm.forward(x);
     }
     let dims = x.dims().to_vec();
@@ -255,11 +259,34 @@ pub fn fast_cpu_rms_norm(norm: &RmsNorm, x: &Tensor, eps: f32) -> candle_core::R
     Tensor::from_vec(out, dims.as_slice(), x.device())
 }
 
+fn fuse_proj_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let v = std::env::var("LOGIS_FUSE_PROJ")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        !matches!(v.as_str(), "0" | "off" | "false" | "no")
+    })
+}
+
+#[derive(Clone, Debug)]
+enum GateUpProj {
+    Split {
+        gate: gguf::ProjKind,
+        up: gguf::ProjKind,
+    },
+    /// SPD-08 / S5-SP03: Row-concatenated `[gate | up]` exact quantized projection (saves 1 mat-vec launch/layer, zero extra VRAM).
+    Fused {
+        gate_up: gguf::ExactQLinear,
+        inter_dim: usize,
+    },
+}
+
 #[derive(Clone)]
 pub struct GateUpDownMLP {
     // 🌟 [W8A16] dense Linear(safetensors·기존 경로) 또는 정확 양자화 선형층(Qwen3 Q8_0 상주)
-    gate_proj: gguf::ProjKind,
-    up_proj: gguf::ProjKind,
+    gate_up: GateUpProj,
     down_proj: gguf::ProjKind,
     /// Part 2 (Pack D): CPU F32 + SiLU 무편향 MLP 용 (gate | up) 교차 패킹 패널.
     /// 중간 `[M, 2I]` 텐서 할당 없이 에필로그에서 `silu(gate) * up` 을 직기록합니다.
@@ -270,8 +297,7 @@ pub struct GateUpDownMLP {
 impl std::fmt::Debug for GateUpDownMLP {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GateUpDownMLP")
-            .field("gate_proj", &self.gate_proj)
-            .field("up_proj", &self.up_proj)
+            .field("gate_up", &self.gate_up)
             .field("down_proj", &self.down_proj)
             .field("has_cpu_glu", &self.cpu_glu.is_some())
             .field("act_fn", &self.act_fn)
@@ -327,8 +353,10 @@ impl GateUpDownMLP {
         let down_proj = gguf::ProjKind::from_linear_maybe_cpu_packed(down_lin)?;
 
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up: GateUpProj::Split {
+                gate: gate_proj,
+                up: up_proj,
+            },
             down_proj,
             cpu_glu,
             act_fn,
@@ -336,15 +364,44 @@ impl GateUpDownMLP {
     }
 
     /// 🌟 [W8A16] 이미 만든 프로젝션으로 조립합니다. (Qwen3 Q8_0 상주 로더)
+    /// CUDA/ROCm ExactQLinear 쌍은 행 연결(`QTensor::cat_rows`)해 단일 mat-vec 으로 융합합니다 (`SPD-08`).
     pub fn from_projs(
         gate_proj: gguf::ProjKind,
         up_proj: gguf::ProjKind,
         down_proj: gguf::ProjKind,
         act_fn: Activation,
     ) -> Self {
+        let gate_up = if fuse_proj_enabled() {
+            match (&gate_proj, &up_proj) {
+                (gguf::ProjKind::Exact(g), gguf::ProjKind::Exact(u))
+                    if g.weight().device().is_cuda_or_rocm()
+                        && g.weight().dtype() == u.weight().dtype() =>
+                {
+                    let inter_dim = g.weight().shape().dims2().map(|(n, _)| n).unwrap_or(0);
+                    match candle_core::quantized::QTensor::cat_rows(&[g.weight(), u.weight()]) {
+                        Ok(cat) => GateUpProj::Fused {
+                            gate_up: gguf::ExactQLinear::new(std::sync::Arc::new(cat)),
+                            inter_dim,
+                        },
+                        Err(_) => GateUpProj::Split {
+                            gate: gate_proj,
+                            up: up_proj,
+                        },
+                    }
+                }
+                _ => GateUpProj::Split {
+                    gate: gate_proj,
+                    up: up_proj,
+                },
+            }
+        } else {
+            GateUpProj::Split {
+                gate: gate_proj,
+                up: up_proj,
+            }
+        };
         Self {
-            gate_proj,
-            up_proj,
+            gate_up,
             down_proj,
             cpu_glu: None,
             act_fn,
@@ -378,8 +435,15 @@ impl Module for GateUpDownMLP {
                 return mid_t.apply(&self.down_proj);
             }
         }
-        let gate = xs.apply(&self.gate_proj)?;
-        let up = xs.apply(&self.up_proj)?;
+        let (gate, up) = match &self.gate_up {
+            GateUpProj::Fused { gate_up, inter_dim } => {
+                let gu = gate_up.forward(xs)?;
+                let g = gu.narrow(D::Minus1, 0, *inter_dim)?;
+                let u = gu.narrow(D::Minus1, *inter_dim, *inter_dim)?;
+                (g, u)
+            }
+            GateUpProj::Split { gate, up } => (xs.apply(gate)?, xs.apply(up)?),
+        };
         if matches!(self.act_fn, Activation::Silu) {
             let inter = *gate.dims().last().unwrap_or(&0);
             if accel_check::fused_op_ok(
@@ -777,11 +841,23 @@ pub fn rope_half_table(t: &Tensor) -> candle_core::Result<Tensor> {
     }
 }
 
+enum QkvProj {
+    Split {
+        q: gguf::ProjKind,
+        k: gguf::ProjKind,
+        v: gguf::ProjKind,
+    },
+    /// SPD-08 / S5-SP03: Row-concatenated `[q | k | v]` exact quantized projection (saves 2 mat-vec launches/layer, zero extra VRAM).
+    Fused {
+        qkv: gguf::ExactQLinear,
+        q_dim: usize,
+        kv_dim: usize,
+    },
+}
+
 pub struct QKNormAttention {
     // 🌟 [W8A16] dense Linear(기존 경로) 또는 정확 양자화 선형층(Qwen3 Q8_0 상주)
-    q_proj: gguf::ProjKind,
-    k_proj: gguf::ProjKind,
-    v_proj: gguf::ProjKind,
+    qkv: QkvProj,
     o_proj: gguf::ProjKind,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -792,12 +868,17 @@ pub struct QKNormAttention {
     head_dim: usize,
     scaling: f64,
     pub kv_cache: Option<(Tensor, Tensor)>,
+    /// SPD-07: Preallocated BHSD exact KV buffer `(B, hkv, cap, head_dim)` on VRAM so `rope_kv_write`
+    /// writes directly at `past_len` without `Tensor::zeros` / `Tensor::cat` / `transpose.contiguous`.
+    kv_buf: Option<(Tensor, Tensor)>,
+    kv_len: usize,
+    kv_cap: usize,
     // 🌟 [TURBO-KV] TurboQuant 로 압축된 KV 캐시. 이 경로가 켜져 있으면 kv_cache(평문)는 비어 있습니다.
     #[cfg(feature = "turbo-quant")]
     turbo_kv: Option<TurboKvCache>,
     // 🌟 [TURBO-KV] 레이어가 TurboQuant 경로를 써도 되는지. KV 를 RAM 으로 대피시키는 동안은 false.
     turbo_kv_allowed: bool,
-    // 🌟 [P4-F13 / P4-O02] KV-PLAN 이 산정한 planned_tokens (TurboKvCache 초기 용량 예약)
+    // 🌟 [P4-F13 / P4-O02] KV-PLAN 이 산정한 planned_tokens (TurboKvCache 및 사전할당 KV 초기 용량 예약)
     planned_kv_tokens: Option<usize>,
 }
 
@@ -866,6 +947,7 @@ impl QKNormAttention {
     }
 
     /// 🌟 [W8A16] 이미 만든 프로젝션·노름으로 조립합니다. (Qwen3 Q8_0 상주 로더)
+    /// CUDA/ROCm ExactQLinear 3종은 행 연결(`QTensor::cat_rows`)해 단일 mat-vec 으로 융합합니다 (`SPD-08`).
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         q_proj: gguf::ProjKind,
@@ -878,10 +960,47 @@ impl QKNormAttention {
         num_key_value_heads: usize,
         head_dim: usize,
     ) -> Self {
+        let q_dim = num_attention_heads * head_dim;
+        let kv_dim = num_key_value_heads * head_dim;
+        let qkv = if fuse_proj_enabled() {
+            match (&q_proj, &k_proj, &v_proj) {
+                (gguf::ProjKind::Exact(q), gguf::ProjKind::Exact(k), gguf::ProjKind::Exact(v))
+                    if q.weight().device().is_cuda_or_rocm()
+                        && q.weight().dtype() == k.weight().dtype()
+                        && q.weight().dtype() == v.weight().dtype() =>
+                {
+                    match candle_core::quantized::QTensor::cat_rows(&[
+                        q.weight(),
+                        k.weight(),
+                        v.weight(),
+                    ]) {
+                        Ok(cat) => QkvProj::Fused {
+                            qkv: gguf::ExactQLinear::new(std::sync::Arc::new(cat)),
+                            q_dim,
+                            kv_dim,
+                        },
+                        Err(_) => QkvProj::Split {
+                            q: q_proj,
+                            k: k_proj,
+                            v: v_proj,
+                        },
+                    }
+                }
+                _ => QkvProj::Split {
+                    q: q_proj,
+                    k: k_proj,
+                    v: v_proj,
+                },
+            }
+        } else {
+            QkvProj::Split {
+                q: q_proj,
+                k: k_proj,
+                v: v_proj,
+            }
+        };
         Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv,
             o_proj,
             q_norm,
             k_norm,
@@ -892,6 +1011,9 @@ impl QKNormAttention {
             head_dim,
             scaling: 1f64 / f64::sqrt(head_dim as f64),
             kv_cache: None,
+            kv_buf: None,
+            kv_len: 0,
+            kv_cap: 0,
             #[cfg(feature = "turbo-quant")]
             turbo_kv: None,
             turbo_kv_allowed: true,
@@ -908,6 +1030,126 @@ impl QKNormAttention {
         self
     }
 
+    /// Returns whether any plain (uncompressed) KV cache is currently held (preallocated or legacy).
+    pub fn has_plain_kv(&self) -> bool {
+        self.kv_cache.is_some() || (self.kv_buf.is_some() && self.kv_len > 0)
+    }
+
+    /// Returns an independent contiguous `(k, v)` snapshot of the plain KV cache (`[B, hkv, len, d]`)
+    /// without disturbing the preallocated buffer. Safe for retry/prefix KV snapshots (`SPD-03`).
+    pub fn plain_kv_snapshot(&self) -> Result<Option<(Tensor, Tensor)>> {
+        if let Some((kb, vb)) = &self.kv_buf {
+            if self.kv_len > 0 {
+                let k = kb.narrow(2, 0, self.kv_len)?.contiguous()?;
+                let v = vb.narrow(2, 0, self.kv_len)?.contiguous()?;
+                return Ok(Some((k, v)));
+            }
+        }
+        Ok(self.kv_cache.clone())
+    }
+
+    /// Moves out the plain KV cache as exact-length `(k, v)` tensors and resets the preallocated buffer.
+    pub fn take_plain_kv(&mut self) -> Result<Option<(Tensor, Tensor)>> {
+        if let Some((kb, vb)) = self.kv_buf.take() {
+            let len = self.kv_len;
+            self.kv_len = 0;
+            self.kv_cap = 0;
+            if len > 0 {
+                let k = kb.narrow(2, 0, len)?.contiguous()?;
+                let v = vb.narrow(2, 0, len)?.contiguous()?;
+                return Ok(Some((k, v)));
+            }
+        }
+        Ok(self.kv_cache.take())
+    }
+
+    /// Replaces the plain KV cache (e.g. snapshot restore or RAM offload restore).
+    pub fn set_plain_kv(&mut self, cache: Option<(Tensor, Tensor)>) {
+        self.kv_buf = None;
+        self.kv_len = 0;
+        self.kv_cap = 0;
+        self.kv_cache = cache;
+    }
+
+    /// Ensures `self.kv_buf` can hold `needed` tokens on `dev` with `dtype` (B, hkv, cap, head_dim),
+    /// migrating any existing `kv_cache` or growing geometrically if required.
+    fn ensure_kv_buf(
+        &mut self,
+        b_sz: usize,
+        needed: usize,
+        dtype: candle_core::DType,
+        dev: &candle_core::Device,
+    ) -> Result<()> {
+        // Migrate legacy kv_cache (e.g. snapshot restore) into preallocated buffer once.
+        if self.kv_buf.is_none() {
+            if let Some((pk, pv)) = self.kv_cache.take() {
+                let pk = if !pk.device().same_device(dev) {
+                    pk.to_device(dev)?
+                } else {
+                    pk
+                };
+                let pv = if !pv.device().same_device(dev) {
+                    pv.to_device(dev)?
+                } else {
+                    pv
+                };
+                let pk = if pk.dtype() != dtype { pk.to_dtype(dtype)? } else { pk };
+                let pv = if pv.dtype() != dtype { pv.to_dtype(dtype)? } else { pv };
+                let prev_len = pk.dim(2)?;
+                let cap = self
+                    .planned_kv_tokens
+                    .unwrap_or(512)
+                    .max(prev_len + needed)
+                    .max(64);
+                let kb = Tensor::zeros((b_sz, self.num_key_value_heads, cap, self.head_dim), dtype, dev)?;
+                let vb = Tensor::zeros((b_sz, self.num_key_value_heads, cap, self.head_dim), dtype, dev)?;
+                if prev_len > 0 {
+                    kb.slice_set(&pk.contiguous()?, 2, 0)?;
+                    vb.slice_set(&pv.contiguous()?, 2, 0)?;
+                }
+                self.kv_buf = Some((kb, vb));
+                self.kv_len = prev_len;
+                self.kv_cap = cap;
+                return Ok(());
+            }
+        }
+        let target_len = self.kv_len + needed;
+        let need_alloc = match &self.kv_buf {
+            None => true,
+            Some((kb, _)) => {
+                self.kv_cap < target_len
+                    || kb.dim(0)? != b_sz
+                    || kb.dtype() != dtype
+                    || !kb.device().same_device(dev)
+            }
+        };
+        if need_alloc {
+            let new_cap = if self.kv_cap == 0 {
+                self.planned_kv_tokens
+                    .unwrap_or(512)
+                    .max(target_len)
+                    .max(64)
+            } else {
+                (self.kv_cap * 2).max(target_len + 256)
+            };
+            let new_k = Tensor::zeros((b_sz, self.num_key_value_heads, new_cap, self.head_dim), dtype, dev)?;
+            let new_v = Tensor::zeros((b_sz, self.num_key_value_heads, new_cap, self.head_dim), dtype, dev)?;
+            if let Some((old_k, old_v)) = self.kv_buf.take() {
+                if self.kv_len > 0 && old_k.dim(0)? == b_sz {
+                    let ok = old_k.narrow(2, 0, self.kv_len)?.to_device(dev)?.to_dtype(dtype)?.contiguous()?;
+                    let ov = old_v.narrow(2, 0, self.kv_len)?.to_device(dev)?.to_dtype(dtype)?.contiguous()?;
+                    new_k.slice_set(&ok, 2, 0)?;
+                    new_v.slice_set(&ov, 2, 0)?;
+                } else {
+                    self.kv_len = 0;
+                }
+            }
+            self.kv_buf = Some((new_k, new_v));
+            self.kv_cap = new_cap;
+        }
+        Ok(())
+    }
+
     pub fn forward(
         &mut self,
         xs: &Tensor,
@@ -915,34 +1157,141 @@ impl QKNormAttention {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
-        let q_raw = self.q_proj.forward(xs)?.reshape((
-            b_sz,
-            q_len,
-            self.num_attention_heads,
-            self.head_dim,
-        ))?;
-        let k_raw = self.k_proj.forward(xs)?.reshape((
-            b_sz,
-            q_len,
-            self.num_key_value_heads,
-            self.head_dim,
-        ))?;
-        let v_raw = self.v_proj.forward(xs)?.reshape((
-            b_sz,
-            q_len,
-            self.num_key_value_heads,
-            self.head_dim,
-        ))?;
+        self.forward_with_rope_half(xs, cos, sin, None, attention_mask)
+    }
 
-        let (query_states, key_states, value_states) = if accel_check::fused_op_ok(
-            q_raw.device(),
+    pub fn forward_with_rope_half(
+        &mut self,
+        xs: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        cos_sin_half: Option<(&Tensor, &Tensor)>,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b_sz, q_len, _) = xs.dims3()?;
+        let (q_raw, k_raw, v_raw) = match &self.qkv {
+            QkvProj::Fused { qkv, q_dim, kv_dim } => {
+                let packed = qkv.forward(xs)?;
+                let q = packed
+                    .narrow(2, 0, *q_dim)?
+                    .contiguous()?
+                    .reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?;
+                let k = packed
+                    .narrow(2, *q_dim, *kv_dim)?
+                    .contiguous()?
+                    .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
+                let v = packed
+                    .narrow(2, *q_dim + *kv_dim, *kv_dim)?
+                    .contiguous()?
+                    .reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?;
+                (q, k, v)
+            }
+            QkvProj::Split { q, k, v } => (
+                q.forward(xs)?.reshape((b_sz, q_len, self.num_attention_heads, self.head_dim))?,
+                k.forward(xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?,
+                v.forward(xs)?.reshape((b_sz, q_len, self.num_key_value_heads, self.head_dim))?,
+            ),
+        };
+
+        let dev = q_raw.device().clone();
+        let use_rope_fused = accel_check::fused_op_ok(
+            &dev,
             accel_check::FusedOpKind::RopeKvWrite,
             q_raw.dtype(),
             self.head_dim,
-        ) {
-            let cos_h = rope_half_table(cos)?;
-            let sin_h = rope_half_table(sin)?;
+        );
+
+        #[cfg(feature = "turbo-quant")]
+        let want_turbo = self.turbo_kv_allowed
+            && turbo_kv_use(&dev, self.head_dim, q_len, self.has_turbo_kv());
+        #[cfg(not(feature = "turbo-quant"))]
+        let want_turbo = false;
+
+        // SPD-07: In-place preallocated exact KV cache fast path (VRAM, non-TurboQuant, fused RoPE+KV write).
+        // Eliminates per-step Tensor::zeros (x2), Tensor::cat (x2), and eager_attention transpose+contiguous (x3).
+        if use_rope_fused && !want_turbo && dev.is_cuda_or_rocm() {
+            #[cfg(feature = "turbo-quant")]
+            if !self.has_plain_kv() && self.has_turbo_kv() {
+                if let Some(kv) = self.take_turbo_kv()? {
+                    self.set_plain_kv(Some(kv));
+                }
+            }
+            self.ensure_kv_buf(b_sz, q_len, k_raw.dtype(), &dev)?;
+            let owned_half;
+            let (cos_h, sin_h) = match cos_sin_half {
+                Some((c, s)) => (c, s),
+                None => {
+                    owned_half = (rope_half_table(cos)?, rope_half_table(sin)?);
+                    (&owned_half.0, &owned_half.1)
+                }
+            };
+            let past_len = self.kv_len;
+            let (k_buf, v_buf) = self.kv_buf.as_ref().unwrap();
+            let query_states = candle_core::decoder_ops::rope_kv_write(
+                &q_raw,
+                &k_raw,
+                &v_raw,
+                candle_core::accel::decoder_ops::HeadLayout::Bshd,
+                candle_core::accel::decoder_ops::HeadLayout::Bhsd,
+                Some(self.q_norm.weight()),
+                Some(self.k_norm.weight()),
+                cos_h,
+                sin_h,
+                k_buf,
+                v_buf,
+                past_len,
+                self.rms_norm_eps,
+                candle_core::accel::decoder_ops::RopeMode::NeoX,
+                false,
+            )?;
+            self.kv_len = past_len + q_len;
+            let k_view = k_buf.narrow(2, 0, self.kv_len)?;
+            let v_view = v_buf.narrow(2, 0, self.kv_len)?;
+
+            #[cfg(feature = "flash-attn")]
+            if accel_check::flash_attn_ok(&dev, query_states.dtype(), self.head_dim)
+                && (q_len == 1 || attention_mask.is_some())
+            {
+                let cfg = if q_len > 1 {
+                    candle_nn::flash_attn::FlashAttnConfig::new(self.scaling as f32).causal()
+                } else {
+                    candle_nn::flash_attn::FlashAttnConfig::new(self.scaling as f32)
+                };
+                // Zero-copy strided BHSD flash-attn directly over preallocated KV views!
+                let out_bhsd = candle_nn::flash_attn::flash_attn_bhsd(&query_states, &k_view, &v_view, &cfg)?;
+                let attn_output = if q_len == 1 {
+                    out_bhsd.reshape((b_sz, 1, self.num_attention_heads * self.head_dim))?
+                } else {
+                    out_bhsd
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?
+                };
+                return Ok(attn_output.apply(&self.o_proj)?);
+            }
+
+            let attn_output = eager_attention_forward(
+                &query_states,
+                &k_view,
+                &v_view,
+                Some(self.num_kv_groups),
+                attention_mask,
+                self.scaling,
+            )?;
+            let attn_output =
+                attn_output.reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
+            return Ok(attn_output.apply(&self.o_proj)?);
+        }
+
+        let (query_states, key_states, value_states) = if use_rope_fused {
+            let owned_half;
+            let (cos_h, sin_h) = match cos_sin_half {
+                Some((c, s)) => (c, s),
+                None => {
+                    owned_half = (rope_half_table(cos)?, rope_half_table(sin)?);
+                    (&owned_half.0, &owned_half.1)
+                }
+            };
             let k_out = Tensor::zeros(
                 (b_sz, self.num_key_value_heads, q_len, self.head_dim),
                 k_raw.dtype(),
@@ -961,8 +1310,8 @@ impl QKNormAttention {
                 candle_core::accel::decoder_ops::HeadLayout::Bhsd,
                 Some(self.q_norm.weight()),
                 Some(self.k_norm.weight()),
-                &cos_h,
-                &sin_h,
+                cos_h,
+                sin_h,
                 &k_out,
                 &v_out,
                 0,
@@ -972,8 +1321,8 @@ impl QKNormAttention {
             )?;
             (q_out, k_out, v_out)
         } else {
-            let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
-            let key_states = self.k_norm.forward(&k_raw)?.transpose(1, 2)?;
+            let query_states = fast_cpu_rms_norm(&self.q_norm, &q_raw, self.rms_norm_eps)?.transpose(1, 2)?;
+            let key_states = fast_cpu_rms_norm(&self.k_norm, &k_raw, self.rms_norm_eps)?.transpose(1, 2)?;
             let value_states = v_raw.transpose(1, 2)?;
             let (query_states, key_states) =
                 apply_rotary_pos_emb(&query_states, &key_states, cos, sin, false)?;
@@ -982,15 +1331,10 @@ impl QKNormAttention {
 
         // 🌟 [TURBO-KV] GPU + turbo-quant 빌드에서는 새 K/V 를 TurboQuant 압축 캐시에 붙이고
         //    압축된 캐시로 어텐션을 계산합니다. (FP8 재압축/전체 복원 왕복이 사라집니다)
-        //    attention_mask 는 Qwen3 의 표준 causal 마스크이므로 causal 설정으로 대체됩니다.
-        //    언제 압축 캐시를 쓰는지는 turbo_kv_use (형식 정책·GPU 자가 검증·실측 감시) 가 정합니다.
         #[cfg(feature = "turbo-quant")]
         {
-            let dev = query_states.device().clone();
-            if self.turbo_kv_allowed
-                && turbo_kv_use(&dev, self.head_dim, q_len, self.has_turbo_kv())
-            {
-                let prev = self.kv_cache.take();
+            if want_turbo {
+                let prev = self.take_plain_kv()?;
                 let step = turbo_kv_step_with_cap(
                     &mut self.turbo_kv,
                     prev,
@@ -1002,8 +1346,7 @@ impl QKNormAttention {
                     self.planned_kv_tokens,
                 )?;
                 if let Some(kv) = step.plain_kv {
-                    // 실측 감시가 압축 캐시를 버렸습니다. 원본 K/V 로 기존 경로를 이어 갑니다.
-                    self.kv_cache = Some(kv);
+                    self.set_plain_kv(Some(kv));
                 }
                 let attn_output = step
                     .out
@@ -1012,20 +1355,15 @@ impl QKNormAttention {
                     .reshape((b_sz, q_len, self.num_attention_heads * self.head_dim))?;
                 return Ok(attn_output.apply(&self.o_proj)?);
             }
-            // 압축 캐시를 더 쓰지 않는데 이력이 남아 있으면(자가 검증·실측 감시가 TurboQuant 를 끈 경우 등)
-            // 평문 캐시로 풀어 기존 경로로 이어 갑니다. 풀지 못하면 문맥 없이 계속하지 않도록 에러를 냅니다.
-            if self.kv_cache.is_none() && self.has_turbo_kv() {
-                self.kv_cache = self.take_turbo_kv()?;
+            if !self.has_plain_kv() && self.has_turbo_kv() {
+                self.set_plain_kv(self.take_turbo_kv()?);
             }
         }
 
-        // 🌟 [CRITICAL FIX] `&self.kv_cache`로 참조(Borrow)하면 이전 캐시와 새 캐시가 VRAM에 동시에 존재하여 2배 폭발이 일어납니다!
-        // `take()`로 소유권을 완전히 빼앗아 연산 직후 이전 캐시가 VRAM에서 즉시 소멸되도록 수정합니다.
-        let (key_states, value_states) = match self.kv_cache.take() {
+        let (key_states, value_states) = match self.take_plain_kv()? {
             None => (key_states.contiguous()?, value_states.contiguous()?),
             Some((prev_k, prev_v)) => {
                 let dev = key_states.device();
-                // CPU RAM에 대피해 있던 이전 캐시를 잠시 VRAM으로 가져와 병합 연산을 수행합니다.
                 let prev_k = if !prev_k.device().same_device(dev) { prev_k.to_device(dev)? } else { prev_k };
                 let prev_v = if !prev_v.device().same_device(dev) { prev_v.to_device(dev)? } else { prev_v };
                 let k = Tensor::cat(&[&prev_k, &key_states], 2)?.contiguous()?;
@@ -1033,9 +1371,7 @@ impl QKNormAttention {
                 (k, v)
             }
         };
-        
-        // 🌟 [JIT CPU Offload 방어] 여기서 즉시 CPU로 내리면 이후 FP8 압축이 CPU 연산으로 돌아가 엄청난 병목이 생깁니다.
-        // VRAM에 잠시 남겨두고, 레이어(Layer) 레벨에서 즉각 FP8 압축 후 대피시키도록 위임합니다.
+
         self.kv_cache = Some((key_states.clone(), value_states.clone()));
         let attn_output = eager_attention_forward(
             &query_states,
@@ -1053,6 +1389,9 @@ impl QKNormAttention {
 
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
+        self.kv_buf = None;
+        self.kv_len = 0;
+        self.kv_cap = 0;
         self.reset_turbo_kv();
     }
 

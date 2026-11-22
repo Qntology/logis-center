@@ -1,7 +1,11 @@
 @echo off
 rem =====================================================================
-rem  Synthetic data evaluation runner (ROCm). Build first with:
-rem    scripts\test_cargo_rocm.bat --no-run
+rem  Synthetic data evaluation runner (CUDA / ROCm).
+rem  Set LOGIS_EVAL_BACKEND=cuda or rocm (default: rocm, or auto-cuda if CUDA_PATH set and ROCm missing).
+rem  Set EVAL_PROFILE=release or debug (default: debug).
+rem  Build first with:
+rem    CUDA: scripts\test_cargo.bat --release --no-run   (or debug: scripts\test_cargo.bat --no-run)
+rem    ROCm: scripts\test_cargo_rocm.bat --no-run
 rem
 rem  Usage:
 rem    run_eval.bat <name> plan <plan.jsonl> <result.jsonl> <log>
@@ -19,8 +23,21 @@ rem =====================================================================
 setlocal
 chcp 65001 > nul
 set "ROOT=%~dp0..\.."
-call "%ROOT%\scripts\_env_rocm.bat" > nul
-if errorlevel 1 exit /b 1
+set "BACKEND=%LOGIS_EVAL_BACKEND%"
+if not defined BACKEND (
+    if exist "C:\Program Files\AMD\ROCm" (
+        set "BACKEND=rocm"
+    ) else (
+        set "BACKEND=cuda"
+    )
+)
+if /i "%BACKEND%"=="cuda" (
+    call "%ROOT%\scripts\_env_cuda.bat" > nul
+    if errorlevel 1 exit /b 1
+) else (
+    call "%ROOT%\scripts\_env_rocm.bat" > nul
+    if errorlevel 1 exit /b 1
+)
 set "PATH=%ROOT%\apps\desktop\dlls;%PATH%"
 set "RUST_BACKTRACE=1"
 
@@ -29,10 +46,18 @@ if not exist "%EVAL_ROOT%" mkdir "%EVAL_ROOT%"
 if not exist "%EVAL_ROOT%\models" mklink /J "%EVAL_ROOT%\models" "%LOCALAPPDATA%\logis-center\models" > nul
 set "LOGIS_APP_DIR=%EVAL_ROOT%"
 
+set "PROFILE=%EVAL_PROFILE%"
+if not defined PROFILE set "PROFILE=debug"
 set "EXE=%EVAL_EXE%"
-for /f "delims=" %%F in ('dir /b /o-d "%ROOT%\target\debug\deps\it-*.exe"') do if not defined EXE set "EXE=%ROOT%\target\debug\deps\%%F"
+for /f "delims=" %%F in ('dir /b /o-d "%ROOT%\target\%PROFILE%\deps\it-*.exe" 2^>nul') do if not defined EXE set "EXE=%ROOT%\target\%PROFILE%\deps\%%F"
 if not defined EXE (
-    echo No test binary. Run scripts\test_cargo_rocm.bat --no-run first.
+    for /f "delims=" %%F in ('dir /b /o-d "%ROOT%\target\release\deps\it-*.exe" 2^>nul') do if not defined EXE set "EXE=%ROOT%\target\release\deps\%%F"
+)
+if not defined EXE (
+    for /f "delims=" %%F in ('dir /b /o-d "%ROOT%\target\debug\deps\it-*.exe" 2^>nul') do if not defined EXE set "EXE=%ROOT%\target\debug\deps\%%F"
+)
+if not defined EXE (
+    echo No test binary. Run scripts\test_cargo.bat --no-run ^(CUDA^) or scripts\test_cargo_rocm.bat --no-run ^(ROCm^) first.
     exit /b 1
 )
 

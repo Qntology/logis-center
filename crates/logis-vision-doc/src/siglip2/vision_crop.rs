@@ -2245,12 +2245,26 @@ pub fn crop_tile(
     tile: &TilePlan,
     target_short: u32,
 ) -> DynamicImage {
+    crop_tile_with_scale(image, plan, tile, target_short).0
+}
+
+/// 🌟 [PRC-06] `crop_tile` 과 동일하게 합성/업스케일한 이미지와 실제 적용 배율(`applied_scale >= 1.0`)을 함께 반환합니다.
+/// 후속 `tighten_and_snap_crop_for_vlm` 에 `tile.text_h * applied_scale` 을 넘겨 이중 업스케일(4x 화소 팽창)을 막습니다.
+pub fn crop_tile_with_scale(
+    image: &DynamicImage,
+    plan: &CropPlan,
+    tile: &TilePlan,
+    target_short: u32,
+) -> (DynamicImage, f32) {
     let (hy0, hy1) = match tile.header_band {
         Some(h) => h,
         None => {
             let mut p = plan.clone();
             p.bbox = tile.bbox;
-            return crop_region(image, &p, target_short);
+            let orig_w = tile.bbox.2.saturating_sub(tile.bbox.0).max(1) as f32;
+            let cropped = crop_region(image, &p, target_short);
+            let applied = (cropped.width() as f32 / orig_w).max(1.0);
+            return (cropped, applied);
         }
     };
 
@@ -2302,11 +2316,11 @@ pub fn crop_tile(
     );
 
     if factor <= 1.01 {
-        return stitched;
+        return (stitched, 1.0);
     }
     let nw = ((w as f32 * factor).round() as u32).max(1);
     let nh = ((total_h as f32 * factor).round() as u32).max(1);
-    stitched.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3)
+    (stitched.resize_exact(nw, nh, image::imageops::FilterType::Lanczos3), factor)
 }
 
 pub fn whole_page_fallback(categories: &[&str], grid: &PatchGrid) -> Vec<CropPlan> {
@@ -3010,6 +3024,22 @@ impl Default for CropDietConfig {
     }
 }
 
+impl CropDietConfig {
+    /// 🌟 [SPD-10 / PRC-06] Qwen3.5-VL 병합 패치 격자(16px * 2 = 32px)에 맞춘 설정.
+    /// `LOGIS_CROP_SNAP_PX` 로 런타임 오버라이드 가능.
+    pub fn for_qwen3_5() -> Self {
+        let snap = std::env::var("LOGIS_CROP_SNAP_PX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&v| v >= 8 && v <= 128)
+            .unwrap_or(32);
+        Self {
+            grid_snap_px: snap,
+            ..Self::default()
+        }
+    }
+}
+
 /// `LOGIS_CROP_DIET=off|0|false` 로 런타임 비활성화 가능 (기본 활성화).
 pub fn crop_diet_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3548,5 +3578,40 @@ mod crop_diet_tests {
                 ("dates", 140),     // weight 1 last
             ]
         );
+    }
+
+    #[test]
+    fn crop_tile_with_scale_reports_applied_upscale_for_header_stitch() {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            600,
+            400,
+            image::Rgb([255, 255, 255]),
+        ));
+        let plan = CropPlan {
+            category: "items".to_string(),
+            bbox: (0, 0, 400, 300),
+            score: 1.0,
+            margin: 0.5,
+            patch_count: 10,
+            top_field: "item_desc".to_string(),
+            owned_patches: 10,
+            twin_of: String::new(),
+        };
+        let tile = TilePlan {
+            bbox: (0, 60, 400, 140),
+            index: 0,
+            total: 2,
+            header_band: Some((0, 40)),
+            text_h: 10.0,
+        };
+        let (stitched, scale) = crop_tile_with_scale(&img, &plan, &tile, 512);
+        assert!(scale > 2.0, "expected ~2.8x upscale for 10px text, got {scale}");
+        let expected_w = (400.0 * scale).round() as u32;
+        assert_eq!(stitched.width(), expected_w);
+        // Applying scaled text_h (10 * scale >= 28px) must NOT trigger another upscale in CropDietConfig::for_qwen3_5
+        let cfg = CropDietConfig::for_qwen3_5();
+        assert_eq!(cfg.grid_snap_px, 32);
+        let scaled_h = tile.text_h * scale;
+        assert!(scaled_h >= cfg.target_text_px);
     }
 }

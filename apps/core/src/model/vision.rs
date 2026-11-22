@@ -818,14 +818,16 @@ impl crate::model::LogisModel {
                         crate::utils::score_dynamics::record_baseline(
                             "vision.tile_count", tiles.len() as f32
                         );
-                        // 🌟 [PART 1 / CROP DIET & PREFETCH] 타일 크롭을 2차 VLM 진입 직전
-                        //    (고DPI 다운스케일 + 노이즈 제거 잉크 BBox + 28px 종이색 Pad 스냅) 으로 정규화합니다.
-                        let diet_cfg = crate::models::siglip2::vision_crop::CropDietConfig::default();
+                        // 🌟 [PART 1 / CROP DIET & PREFETCH / SPD-10] 타일 크롭을 2차 Qwen3.5-VL 진입 직전
+                        //    (고DPI 다운스케일 + 노이즈 제거 잉크 BBox + 32px 종이색 Pad 스냅) 으로 정규화합니다.
+                        let diet_cfg = crate::models::siglip2::vision_crop::CropDietConfig::for_qwen3_5();
                         let prepared_tiles: Vec<(&crate::models::siglip2::vision_crop::TilePlan, image::DynamicImage)> =
                             tiles
                                 .iter()
                                 .map(|tile| {
-                                    let raw = crate::models::siglip2::vision_crop::crop_tile(
+                                    // 🌟 [PRC-06] crop_tile 의 실제 업스케일 배율을 전달해 tighten_and_snap_crop_for_vlm 의
+                                    //    이중 업스케일(소형 행 타일 4x 팽창)을 방지합니다.
+                                    let (raw, applied_scale) = crate::models::siglip2::vision_crop::crop_tile_with_scale(
                                         &dynamic_image, plan, tile, 512,
                                     );
                                     let master_bounds = if tile.header_band.is_none() {
@@ -840,12 +842,18 @@ impl crate::model::LogisModel {
                                     } else {
                                         None
                                     };
-                                    let est_h = if tile.text_h > 0.5 { Some(tile.text_h) } else { None };
+                                    let est_h = if tile.text_h > 0.5 {
+                                        Some(tile.text_h * applied_scale)
+                                    } else {
+                                        None
+                                    };
+                                    let tile_baseline = height_baseline
+                                        .map(|(lo, hi)| (lo * applied_scale, hi * applied_scale));
                                     let slim = crate::models::siglip2::vision_crop::tighten_and_snap_crop_for_vlm(
                                         raw,
                                         &plan.category,
                                         est_h,
-                                        height_baseline,
+                                        tile_baseline,
                                         master_bounds,
                                         &diet_cfg,
                                         &emit_term,

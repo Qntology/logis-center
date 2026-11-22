@@ -558,3 +558,63 @@ fn fused_gates_cuda_quant_embed_and_mode_a() -> Result<()> {
     println!("[GATE QUANT-EMBED] ({dev:?}) Q8_0 embed + 5x W8A16 Quantized Mode A (M={m}, V={v}, BF16) OK");
     Ok(())
 }
+
+/// 🌟 [PRC-03 / PRC-13] CUDA K-quant(`Q4K`/`Q5K`/`Q6K`/`Q8_0`) 정확 W8A16 선형 경로와
+/// `Device::cuda_compute_capability()` 기반 SM 아키텍처 조회를 검증합니다.
+#[test]
+fn fused_gates_cuda_kquant_exact_and_sm_arch() -> Result<()> {
+    use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
+    use candle_nn::Module;
+    use logis_app::models::common::gguf::{set_kquant_exact_override, QuantizedLinear};
+
+    let Some(dev) = gpu_device_opt() else {
+        println!("[GATE KQUANT-EXACT] skipped: no GPU device");
+        return Ok(());
+    };
+    if !dev.is_cuda() {
+        println!("[GATE KQUANT-EXACT] skipped on non-CUDA device {:?}", dev.location());
+        return Ok(());
+    }
+
+    // 1) PRC-13: CUDA 드라이버 속성으로 SM 아키텍처 조회 (nvidia-smi 프로세스 기동 없음)
+    let (maj, min) = dev
+        .cuda_compute_capability()
+        .expect("CUDA device must report compute capability");
+    assert!(maj >= 7, "unexpected compute capability {maj}.{min}");
+    let sm = logis_app::utils::get_gpu_sm_arch()?;
+    let expected_sm = maj as f32 + (min as f32) * 0.1;
+    assert!(
+        (sm - expected_sm).abs() < 0.02,
+        "get_gpu_sm_arch ({sm}) must match Device::cuda_compute_capability() ({expected_sm})"
+    );
+
+    // 2) PRC-03: Q8_0 / Q4K / Q5K / Q6K 에서 F32/F16/BF16 입력 정확 경로 검증 (m=1 decode + m=4)
+    let (out_dim, in_dim) = (256usize, 512usize);
+    let w_f32 = Tensor::from_vec(det(out_dim * in_dim, 911), (out_dim, in_dim), &Device::Cpu)?;
+    let w_gpu = w_f32.to_device(&dev)?;
+    let x_f32 = Tensor::from_vec(det(4 * in_dim, 912), (1, 4, in_dim), &Device::Cpu)?;
+
+    set_kquant_exact_override(None);
+    for qt in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+        let q_cpu = QTensor::quantize(&w_f32, qt)?;
+        let w_dq = q_cpu.dequantize(&Device::Cpu)?;
+        let q_dev = QTensor::quantize(&w_gpu, qt)?;
+        let layer = QuantizedLinear::new(QMatMul::from_qtensor(q_dev)?, None);
+
+        for (dt, tol) in [(DType::F32, 1e-5f32), (DType::F16, 2e-3), (DType::BF16, 1.5e-2)] {
+            let x_q = x_f32.to_dtype(dt)?;
+            let x_ref = x_q.to_dtype(DType::F32)?;
+            let expected = x_ref.reshape((4, in_dim))?.matmul(&w_dq.t()?)?.reshape((1, 4, out_dim))?;
+            let got = layer.forward(&x_q.to_device(&dev)?)?.to_device(&Device::Cpu)?;
+            let rel = logis_app::models::common::accel_check::rel_err(&got, &expected)?;
+            assert!(
+                rel <= tol,
+                "QuantizedLinear exact path {qt:?} {dt:?} rel_err {rel:.2e} > {tol:.0e}"
+            );
+        }
+    }
+    println!(
+        "[GATE KQUANT-EXACT] ({dev:?} sm_{maj}{min}) Q8_0/Q4K/Q5K/Q6K x F32/F16/BF16 exact W8A16 OK"
+    );
+    Ok(())
+}
