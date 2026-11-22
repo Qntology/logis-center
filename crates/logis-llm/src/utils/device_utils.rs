@@ -390,7 +390,9 @@ fn device_mem_info(gpu_id: usize) -> Option<(u64, u64)> {
 pub fn device_mem_info_of(dev: &Device) -> Option<(u64, u64)> {
     let (free, total) = dev.mem_info().ok().flatten()?;
     let gpu_id = match dev.location() {
-        candle_core::DeviceLocation::Rocm { gpu_id } => gpu_id,
+        candle_core::DeviceLocation::Cuda { gpu_id }
+        | candle_core::DeviceLocation::Rocm { gpu_id }
+        | candle_core::DeviceLocation::Vulkan { gpu_id } => gpu_id,
         _ => 0,
     };
     let free = clamp_free_to_os_budget(gpu_id, dev.is_rocm(), free as u64);

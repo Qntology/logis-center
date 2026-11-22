@@ -10,9 +10,9 @@ use anyhow::Result;
 
 
 pub async fn wait_for_resources_settled(target_vram_mb: u64, target_ram_mb: u64, cancellation_token: Option<&Arc<AtomicBool>>, target_gpu_id: u32) -> Result<()> {
-    use sysinfo::System;
-
-    let mut sys = System::new_all();
+    let mut sys = System::new_with_specifics(
+        RefreshKind::new().with_memory(MemoryRefreshKind::everything()),
+    );
     let gpu_probe = crate::utils::GpuMemProbe::new();
     
     let target_vram_bytes = target_vram_mb * 1024 * 1024;
@@ -539,7 +539,8 @@ pub fn ram_used_pct(avail: u64, total: u64) -> f32 {
 
 pub fn process_rss_bytes() -> Option<u64> {
     let pid = sysinfo::get_current_pid().ok()?;
-    let sys = sysinfo::System::new_all();
+    let mut sys = SYSTEM_MONITOR.lock().unwrap_or_else(|p| p.into_inner());
+    sys.refresh_process_specifics(pid, sysinfo::ProcessRefreshKind::new());
     sys.process(pid).map(|p| p.memory())
 }
 

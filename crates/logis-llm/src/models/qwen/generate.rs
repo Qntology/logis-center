@@ -716,6 +716,7 @@ impl QwenVLGenerateModel {
 
         // 🌟 [종료 직후 메모리 즉각 강제 반환]
         if self.text_device.is_cuda_or_rocm() { let _ = self.text_device.synchronize(); }
+        crate::utils::trim_idle_gpu_pool(&self.text_device);
         crate::utils::legacy_working_set_trim(); // 🌟 [RAM-SAWTOOTH] 기본은 작업 집합을 내쫓지 않습니다 (LOGIS_MEM_TRIM=legacy)
 
         Ok(total_toks)
@@ -867,7 +868,14 @@ impl QwenVLGenerateModel {
 
         let is_strict_json = input.replace_text.contains("/no_think") || input.replace_text.contains("RETURN JSON ONLY");
 
-        for i in 0..mes.max_tokens.unwrap_or(2048) {
+        let sample_len = mes.max_tokens.unwrap_or(2048);
+        match &mut self.qwen {
+            ModelVariant::QuantizedVL(m) => m.language_model.set_planned_decode_tokens(sample_len as usize),
+            ModelVariant::QuantizedText(m) => m.language_model.set_planned_decode_tokens(sample_len as usize),
+            _ => {}
+        }
+
+        for i in 0..sample_len {
             if let Some(flag) = &cancel_flag { if flag.load(std::sync::atomic::Ordering::Relaxed) { break; } }
             
             let logits_squeezed = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
@@ -1023,6 +1031,7 @@ impl QwenVLGenerateModel {
         // 80% -> 65% 로 브라우저를 켤 때만 메모리가 OS로 반환되는 지연(Lazy Free) 현상을 타파합니다.
         // 생성이 종료된 직후에 GPU 동기화 및 OS 메모리 반환을 찔러 넣어 사용자가 즉각 65%를 볼 수 있게 합니다.
         if self.text_device.is_cuda_or_rocm() { let _ = self.text_device.synchronize(); }
+        crate::utils::trim_idle_gpu_pool(&self.text_device);
         crate::utils::legacy_working_set_trim(); // 🌟 [RAM-SAWTOOTH] 기본은 작업 집합을 내쫓지 않습니다 (LOGIS_MEM_TRIM=legacy)
 
         Ok(gen_text)

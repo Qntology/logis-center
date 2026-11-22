@@ -103,6 +103,7 @@ pub async fn upsert_alias_chunks(
         .unwrap_or_else(|_| vec![vec![0.0; 384]; batch_texts.len()]);
     if batch_embs.len() < pending_alias.len() * 3 { return 0; }
 
+    let mut bulk_rows: Vec<crate::store::ChunkUpsertRow> = Vec::with_capacity(pending_alias.len());
     for (vi, (suffix, alias_owned, localized)) in pending_alias.iter().enumerate() {
         let a = alias_owned.as_str();
         let embs = &batch_embs[vi * 3..vi * 3 + 3];
@@ -124,20 +125,20 @@ pub async fn upsert_alias_chunks(
         }
 
         let alias_chunk_id = format!("{}_{}", base_chunk_id, suffix);
-        let _ = store.upsert_chunk(
-            &alias_chunk_id,
-            item_id,
-            page_type,
-            a,
-            &chunk_meta.property,
-            &chunk_meta.property_format,
-            a,
-            Some(final_vec),
-            Some(cc),
-            Some(bcc),
-            Some(ref_val),
-            Some(search_mode),
-        ).await;
+        bulk_rows.push(crate::store::ChunkUpsertRow {
+            chunk_id: alias_chunk_id.clone(),
+            item_id: item_id.to_string(),
+            item_type: page_type.to_string(),
+            chunk_text: a.to_string(),
+            property: chunk_meta.property.clone(),
+            property_format: chunk_meta.property_format.clone(),
+            value_part: a.to_string(),
+            vector: Some(final_vec),
+            cc: Some(cc.to_string()),
+            bcc: Some(bcc.to_string()),
+            ref_val: Some(ref_val.to_string()),
+            mode: Some(search_mode.to_string()),
+        });
         saved += 1;
 
         // 🌟 [ALIAS INDEX LOG] 정방향 로그의 [ALIAS CHUNK HIT] 와 chunk_id 로 대조하기 위해
@@ -147,6 +148,9 @@ pub async fn upsert_alias_chunks(
             "      💾 [ALIAS INDEXED] chunk_id='{}' | property='{}' | alias='{}' | localized='{}'",
             alias_chunk_id, chunk_meta.property, a, localized
         );
+    }
+    if !bulk_rows.is_empty() {
+        let _ = store.upsert_chunks_bulk(&bulk_rows).await;
     }
 
     saved
@@ -565,6 +569,7 @@ pub async fn index_item_chunks(
     let _ = store.delete_chunks_by_item(item_id).await;
 
     let mut saved = 0usize;
+    let mut base_rows: Vec<crate::store::ChunkUpsertRow> = Vec::with_capacity(indexable_chunks.len());
 
     for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
         let chunk_id = format!("{}_{}", item_id, ci);
@@ -585,22 +590,27 @@ pub async fn index_item_chunks(
             for d in 0..384 { final_vec[d] /= norm; }
         }
 
-        let _ = store.upsert_chunk(
-            &chunk_id,
-            item_id,
-            page_type,
-            &chunk_meta.chunk_text,
-            &chunk_meta.property,
-            &chunk_meta.property_format,
-            &chunk_meta.value_part,
-            Some(final_vec),
-            Some(cc),
-            Some(bcc),
-            Some(ref_val),
-            Some(search_mode),
-        ).await;
+        base_rows.push(crate::store::ChunkUpsertRow {
+            chunk_id,
+            item_id: item_id.to_string(),
+            item_type: page_type.to_string(),
+            chunk_text: chunk_meta.chunk_text.clone(),
+            property: chunk_meta.property.clone(),
+            property_format: chunk_meta.property_format.clone(),
+            value_part: chunk_meta.value_part.clone(),
+            vector: Some(final_vec),
+            cc: Some(cc.to_string()),
+            bcc: Some(bcc.to_string()),
+            ref_val: Some(ref_val.to_string()),
+            mode: Some(search_mode.to_string()),
+        });
         saved += 1;
-
+    }
+    if !base_rows.is_empty() {
+        let _ = store.upsert_chunks_bulk(&base_rows).await;
+    }
+    for (ei, (ci, chunk_meta)) in indexable_chunks.iter().enumerate() {
+        let chunk_id = format!("{}_{}", item_id, ci);
         saved += upsert_alias_chunks(
             store, model, item_id, &chunk_id, page_type, doc_lang,
             chunk_meta, &alias_pairs[ei], cc, bcc, ref_val, search_mode,

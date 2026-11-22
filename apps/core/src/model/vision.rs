@@ -820,39 +820,87 @@ impl crate::model::LogisModel {
                         );
                         // 🌟 [PART 1 / CROP DIET & PREFETCH] 타일 크롭을 2차 VLM 진입 직전
                         //    (고DPI 다운스케일 + 노이즈 제거 잉크 BBox + 28px 종이색 Pad 스냅) 으로 정규화합니다.
+                        //    멀티 타일(tiles.len() > 1)은 Rayon 병렬로 전처리하되 로그는 타일 순서를 100% 결정적으로 출력합니다.
                         let diet_cfg = crate::models::siglip2::vision_crop::CropDietConfig::default();
                         let prepared_tiles: Vec<(&crate::models::siglip2::vision_crop::TilePlan, image::DynamicImage)> =
-                            tiles
-                                .iter()
-                                .map(|tile| {
-                                    let raw = crate::models::siglip2::vision_crop::crop_tile(
-                                        &dynamic_image, plan, tile, 512,
-                                    );
-                                    let master_bounds = if tile.header_band.is_none() {
-                                        layout_hit.as_ref().and_then(|h| {
-                                            h.trusted_dilated_crop_bounds(
-                                                tile.bbox,
-                                                grid.orig_width,
-                                                grid.orig_height,
-                                                3,
-                                            )
+                            if tiles.len() > 1 {
+                                use rayon::prelude::*;
+                                let results: Vec<(&crate::models::siglip2::vision_crop::TilePlan, image::DynamicImage, Vec<String>)> =
+                                    tiles
+                                        .par_iter()
+                                        .map(|tile| {
+                                            let tile_logs = std::cell::RefCell::new(Vec::<String>::new());
+                                            let emit_buf = |msg: &str| tile_logs.borrow_mut().push(msg.to_string());
+                                            let raw = crate::models::siglip2::vision_crop::crop_tile(
+                                                &dynamic_image, plan, tile, 512,
+                                            );
+                                            let master_bounds = if tile.header_band.is_none() {
+                                                layout_hit.as_ref().and_then(|h| {
+                                                    h.trusted_dilated_crop_bounds(
+                                                        tile.bbox,
+                                                        grid.orig_width,
+                                                        grid.orig_height,
+                                                        3,
+                                                    )
+                                                })
+                                            } else {
+                                                None
+                                            };
+                                            let est_h = if tile.text_h > 0.5 { Some(tile.text_h) } else { None };
+                                            let slim = crate::models::siglip2::vision_crop::tighten_and_snap_crop_for_vlm(
+                                                raw,
+                                                &plan.category,
+                                                est_h,
+                                                height_baseline,
+                                                master_bounds,
+                                                &diet_cfg,
+                                                &emit_buf,
+                                            );
+                                            (tile, slim, tile_logs.into_inner())
                                         })
-                                    } else {
-                                        None
-                                    };
-                                    let est_h = if tile.text_h > 0.5 { Some(tile.text_h) } else { None };
-                                    let slim = crate::models::siglip2::vision_crop::tighten_and_snap_crop_for_vlm(
-                                        raw,
-                                        &plan.category,
-                                        est_h,
-                                        height_baseline,
-                                        master_bounds,
-                                        &diet_cfg,
-                                        &emit_term,
-                                    );
-                                    (tile, slim)
-                                })
-                                .collect();
+                                        .collect();
+                                results
+                                    .into_iter()
+                                    .map(|(tile, slim, logs)| {
+                                        for line in logs {
+                                            emit_term(&line);
+                                        }
+                                        (tile, slim)
+                                    })
+                                    .collect()
+                            } else {
+                                tiles
+                                    .iter()
+                                    .map(|tile| {
+                                        let raw = crate::models::siglip2::vision_crop::crop_tile(
+                                            &dynamic_image, plan, tile, 512,
+                                        );
+                                        let master_bounds = if tile.header_band.is_none() {
+                                            layout_hit.as_ref().and_then(|h| {
+                                                h.trusted_dilated_crop_bounds(
+                                                    tile.bbox,
+                                                    grid.orig_width,
+                                                    grid.orig_height,
+                                                    3,
+                                                )
+                                            })
+                                        } else {
+                                            None
+                                        };
+                                        let est_h = if tile.text_h > 0.5 { Some(tile.text_h) } else { None };
+                                        let slim = crate::models::siglip2::vision_crop::tighten_and_snap_crop_for_vlm(
+                                            raw,
+                                            &plan.category,
+                                            est_h,
+                                            height_baseline,
+                                            master_bounds,
+                                            &diet_cfg,
+                                            &emit_term,
+                                        );
+                                        (tile, slim)
+                                    })
+                                    .collect()
+                            };
                         for (tile, crop) in prepared_tiles {
 
                             let tile_tag = if tile.total > 1 {

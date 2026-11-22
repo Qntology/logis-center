@@ -378,6 +378,11 @@ impl Module for GateUpDownMLP {
                 return mid_t.apply(&self.down_proj);
             }
         }
+        if matches!(self.act_fn, Activation::Silu) {
+            if let Some(mid) = gguf::ProjKind::try_fused_gate_up_silu(&self.gate_proj, &self.up_proj, xs)? {
+                return mid.apply(&self.down_proj);
+            }
+        }
         let gate = xs.apply(&self.gate_proj)?;
         let up = xs.apply(&self.up_proj)?;
         if matches!(self.act_fn, Activation::Silu) {

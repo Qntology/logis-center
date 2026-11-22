@@ -492,6 +492,7 @@ impl Qwen3GenerateModel {
         if let Some(session_id) = save_session_id {
             self.save_kv_cache(&session_id, cache_dir)?;
         }
+        crate::utils::trim_idle_gpu_pool(&self.device);
         Ok(())
     }
 
@@ -861,7 +862,8 @@ impl Qwen3GenerateModel {
 
         // BPE 디코딩 무결성을 보장하기 위해 최종 조립은 배열 기반으로 수행합니다.
         let res_text = self.tokenizer.token_decode(generate)?;
-        
+        crate::utils::trim_idle_gpu_pool(&self.device);
+
         Ok(res_text)
     }
 
@@ -1202,6 +1204,7 @@ impl Qwen3GenerateModel {
 
         let res = self.tokenizer.token_decode(generate)?;
         self.qwen3.clear_kv_cache();
+        crate::utils::trim_idle_gpu_pool(&self.device);
         Ok(res)
     }
 

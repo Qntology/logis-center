@@ -82,8 +82,18 @@ impl SparseMoe {
             .into_iter()
             .map(|row| {
                 let mut idx: Vec<usize> = (0..row.len()).collect();
-                idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
-                let mut sel: Vec<(usize, f32)> = idx[..self.top_k].iter().map(|&e| (e, row[e])).collect();
+                let k = self.top_k.min(row.len());
+                let cmp = |&a: &usize, &b: &usize| {
+                    row[b]
+                        .partial_cmp(&row[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.cmp(&b))
+                };
+                if k > 0 && k < idx.len() {
+                    idx.select_nth_unstable_by(k - 1, cmp);
+                }
+                idx[..k].sort_by(cmp);
+                let mut sel: Vec<(usize, f32)> = idx[..k].iter().map(|&e| (e, row[e])).collect();
                 if self.norm_topk {
                     let s: f32 = sel.iter().map(|(_, w)| *w).sum();
                     for (_, w) in sel.iter_mut() {
