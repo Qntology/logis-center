@@ -1084,13 +1084,46 @@ fn check_lm_head_argmax_cs(device: &Device, dtype: DType, dim: usize) -> Result<
     )?;
 
     let ref_ids = ref_a.ids.to_vec1::<u32>()?;
-    let got_ids = got_a.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
-    let got_mask = got_a.rescue_mask.unwrap().to_device(&Device::Cpu)?.to_vec1::<u8>()?;
+    let (got_ids, got_mask_opt) = got_a.download_ids_and_mask()?;
+    let got_mask = got_mask_opt.ok_or_else(|| anyhow::anyhow!("lm_head Mode A missing rescue_mask"))?;
     if ref_ids != got_ids {
         bail!("lm_head Mode A ids mismatch: got {got_ids:?} != ref {ref_ids:?}");
     }
     if got_mask[2] != 1 || got_mask[3] != 1 {
         bail!("lm_head Mode A CS guard false negative on REST spike rows: {got_mask:?}");
+    }
+
+    // Quantized Mode A (CUDA / ROCm W8A16 fused_quant_argmax_cs, 0-byte logits)
+    if (device.is_cuda() || device.is_rocm()) && k % 32 == 0 {
+        use candle_core::lm_head::fused_quant_argmax_cs;
+        use candle_core::quantized::{GgmlDType, QTensor};
+        let q_cpu = QTensor::quantize(&w_core_cpu.to_dtype(DType::F32)?, GgmlDType::Q8_0)?;
+        let q_dev = q_cpu.dequantize(&Device::Cpu)?;
+        let q_ref = fused_linear_argmax_cs(
+            &h_cpu.to_dtype(DType::F32)?,
+            &q_dev,
+            None,
+            Some(&core_ids_cpu),
+            Some(&guard_cpu),
+        )?;
+        let q_ref_ids = q_ref.ids.to_vec1::<u32>()?;
+        let q_gpu = QTensor::quantize(&w_core_cpu.to_dtype(DType::F32)?.to_device(device)?, GgmlDType::Q8_0)?;
+        let got_qa = fused_quant_argmax_cs(
+            &h_cpu.to_device(device)?,
+            &q_gpu,
+            None,
+            Some(&core_ids_cpu.to_device(device)?),
+            Some(&guard_dev),
+        )?;
+        let (got_qa_ids, got_qa_mask_opt) = got_qa.download_ids_and_mask()?;
+        let got_qa_mask = got_qa_mask_opt
+            .ok_or_else(|| anyhow::anyhow!("lm_head Quantized Mode A missing rescue_mask"))?;
+        if got_qa_ids != q_ref_ids {
+            bail!("lm_head Quantized Mode A ids mismatch: got {got_qa_ids:?} != ref {q_ref_ids:?}");
+        }
+        if got_qa_mask[2] != 1 || got_qa_mask[3] != 1 {
+            bail!("lm_head Quantized Mode A CS guard false negative: {got_qa_mask:?}");
+        }
     }
 
     // Mode B (F32 sub_logits + dtype hidden)
@@ -1104,8 +1137,8 @@ fn check_lm_head_argmax_cs(device: &Device, dtype: DType, dim: usize) -> Result<
         Some(&core_ids_cpu.to_device(device)?),
         Some(&guard_dev),
     )?;
-    let got_b_ids = got_b.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
-    let got_b_mask = got_b.rescue_mask.unwrap().to_device(&Device::Cpu)?.to_vec1::<u8>()?;
+    let (got_b_ids, got_b_mask_opt) = got_b.download_ids_and_mask()?;
+    let got_b_mask = got_b_mask_opt.ok_or_else(|| anyhow::anyhow!("lm_head Mode B missing rescue_mask"))?;
     if got_b_ids != ref_ids {
         bail!("lm_head Mode B ids mismatch: got {got_b_ids:?} != ref {ref_ids:?}");
     }

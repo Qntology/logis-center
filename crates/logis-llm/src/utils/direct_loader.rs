@@ -28,10 +28,22 @@ mod windows_impl {
 
     static CONTEXT: Lazy<Result<Arc<WinContext>>> = Lazy::new(|| {
         unsafe {
-            let factory: IDStorageFactory = DStorageGetFactory().map_err(|e| {
-                println!("[DirectLoader] DirectStorage factory init failed: {:?}. Falling back to fs::read/fs::write.", e);
-                e
-            })?;
+            // Load `dstorage.dll` dynamically at runtime (via `runtime_loaded`) so binaries
+            // linking `logis-llm` do not hard-import `dstorage.dll` at process startup and
+            // cleanly fall back to `fs::read`/`fs::write` when DirectStorage DLLs are absent.
+            let factory: IDStorageFactory = match std::panic::catch_unwind(|| {
+                direct_storage::runtime_loaded::DStorageGetFactory::<IDStorageFactory>()
+            }) {
+                Ok(Ok(f)) => f,
+                Ok(Err(e)) => {
+                    println!("[DirectLoader] DirectStorage factory init failed: {:?}. Falling back to fs::read/fs::write.", e);
+                    return Err(anyhow!("DirectStorage factory init failed: {:?}", e));
+                }
+                Err(_) => {
+                    println!("[DirectLoader] dstorage.dll not found at runtime. Falling back to fs::read/fs::write.");
+                    return Err(anyhow!("dstorage.dll not available"));
+                }
+            };
             let queue_desc = DSTORAGE_QUEUE_DESC {
                 SourceType: DSTORAGE_REQUEST_SOURCE_FILE,
                 Capacity: DSTORAGE_MAX_QUEUE_CAPACITY as u16,

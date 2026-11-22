@@ -819,9 +819,10 @@ impl TrimmedHead {
             h_2d.dtype(),
             k_dim,
         );
-        // Quantized Mode A (0-byte [M, V_core] logits materialization on ROCm; M > 8 chunked in 8-row batches)
+        // Quantized Mode A (0-byte [M, V_core] logits materialization on CUDA & ROCm; M > 8 chunked in 8-row batches)
         let quant_mode_a_ok = use_fused
-            && h_2d.device().is_rocm()
+            && (h_2d.device().is_cuda() || h_2d.device().is_rocm())
+            && k_dim % self.qweight.dtype().block_size() == 0
             && matches!(
                 self.qweight.dtype(),
                 GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K

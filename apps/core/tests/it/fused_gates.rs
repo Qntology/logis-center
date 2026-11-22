@@ -493,3 +493,68 @@ fn fused_gates_turbo_probe_rejects_broken_error() -> Result<()> {
     assert!(!ok_broken, "85% error must trip PROBE_BROKEN_REL and return false for plain KV fallback");
     Ok(())
 }
+
+/// Verifies CUDA/ROCm `quant_embed_self_check`, `EmbedTable::Quant` (`QTensor::embedding`),
+/// and W8A16 Quantized Mode A (`fused_quant_argmax_cs`) across all 5 formats & M=12 chunked prefill.
+#[test]
+fn fused_gates_cuda_quant_embed_and_mode_a() -> Result<()> {
+    use candle_core::lm_head::{fused_linear_argmax_cs, fused_quant_argmax_cs};
+    use candle_core::quantized::{GgmlDType, QTensor};
+    use logis_app::models::qwen3_5::model::{quant_embed_self_check, EmbedTable};
+    let Some(dev) = gpu_device_opt() else {
+        println!("[GATE QUANT-EMBED] skipped: no GPU device");
+        return Ok(());
+    };
+    if !(dev.is_cuda() || dev.is_rocm()) {
+        println!("[GATE QUANT-EMBED] skipped on non-CUDA/ROCm device {:?}", dev.location());
+        return Ok(());
+    }
+    let (v, k, m) = (97usize, 256usize, 12usize);
+    let w_f32 = Tensor::from_vec(det(v * k, 811), (v, k), &Device::Cpu)?;
+    let h_f32 = Tensor::from_vec(det(m * k, 812), (m, k), &Device::Cpu)?;
+    let w_gpu = w_f32.to_device(&dev)?;
+    let h_bf16 = h_f32.to_dtype(DType::BF16)?.to_device(&dev)?;
+
+    // 1) Q8_0 quantized embedding self-check + EmbedTable::Quant lookup parity
+    let q8 = QTensor::quantize(&w_gpu, GgmlDType::Q8_0)?;
+    assert!(
+        quant_embed_self_check(&dev, &q8),
+        "quant_embed_self_check must pass on {:?}",
+        dev.location()
+    );
+    let table = EmbedTable::Quant { q: std::sync::Arc::new(q8), hidden: k };
+    let ids = Tensor::new(&[[0u32, 13, 47, 96]], &dev)?;
+    let got_emb = table.forward(&ids)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    let ref_q8 = QTensor::quantize(&w_f32, GgmlDType::Q8_0)?.dequantize(&Device::Cpu)?;
+    let ref_emb = ref_q8
+        .index_select(&Tensor::new(&[0u32, 13, 47, 96], &Device::Cpu)?, 0)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let max_diff = got_emb
+        .iter()
+        .zip(&ref_emb)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_diff <= 1e-4, "Q8_0 EmbedTable::Quant mismatch: max_diff={max_diff}");
+
+    // 2) Quantized Mode A (M=12 chunked prefill + BF16) across all 5 W8A16 formats
+    for qt in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
+        let q_cpu = QTensor::quantize(&w_f32, qt)?;
+        let w_dq = q_cpu.dequantize(&Device::Cpu)?;
+        let ref_out = fused_linear_argmax_cs(&h_f32.to_dtype(DType::BF16)?.to_dtype(DType::F32)?, &w_dq, None, None, None)?;
+        let ref_ids = ref_out.ids.to_vec1::<u32>()?;
+
+        let q_dev = QTensor::quantize(&w_gpu, qt)?;
+        let got = fused_quant_argmax_cs(&h_bf16, &q_dev, None, None, None)?;
+        let (got_ids, _) = got.download_ids_and_mask()?;
+        assert_eq!(got_ids, ref_ids, "Quantized Mode A M={m} BF16 mismatch for {qt:?}");
+    }
+    println!("[GATE QUANT-EMBED] ({dev:?}) Q8_0 embed + 5x W8A16 Quantized Mode A (M={m}, V={v}, BF16) OK");
+    Ok(())
+}
