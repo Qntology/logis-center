@@ -702,10 +702,12 @@ fn fa_check(device: &Device, dtype: DType, d: usize) -> Result<(f32, String, usi
         FlashAttnConfig, flash_attn_bhsd, flash_attn_unfused, flash_attn_with_config,
     };
     // (이름, hq, hkv, lq, lk, causal, bshd 레이아웃)
-    let cases: [(&str, usize, usize, usize, usize, bool, bool); 5] = [
+    // 🌟 [PRC-11] 긴 문맥 split-KV 디코드(1x4096) 경로까지 자가 검증에 포함합니다.
+    let cases: [(&str, usize, usize, usize, usize, bool, bool); 6] = [
         ("prefill 64x64 causal (bshd)", 8, 2, 64, 64, true, true),
         ("chunk 16x80 causal", 8, 4, 16, 80, true, false),
         ("decode 1x300", 8, 2, 1, 300, true, false),
+        ("decode 1x4096 split-kv", 8, 2, 1, 4096, true, false),
         ("short 3x50 causal", 8, 4, 3, 50, true, false),
         ("vision 40x40 full", 4, 4, 40, 40, false, true),
     ];

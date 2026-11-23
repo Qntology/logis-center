@@ -102,8 +102,15 @@ impl Qwen3DecoderLayer {
     ) -> Result<Self> {
         let p = format!("blk.{idx}");
         let proj = |n: &str| -> Result<ProjKind> { q8_exact_proj(ct, data, &format!("{p}.{n}.weight"), device) };
+        // SPD-06: Load norm weights directly in F32 so fused `rmsnorm` / `rope_kv_write` kernels
+        // skip 4x28=112 per-token BF16->F32 cast launches (and eliminate BF16 weight rounding).
+        let norm_dt = if device.is_cuda_or_rocm() {
+            candle_core::DType::F32
+        } else {
+            act_dtype
+        };
         let norm = |n: &str| -> Result<RmsNorm> {
-            gguf_norm(ct, data, &format!("{p}.{n}.weight"), device, act_dtype, config.rms_norm_eps)
+            gguf_norm(ct, data, &format!("{p}.{n}.weight"), device, norm_dt, config.rms_norm_eps)
         };
         let self_attn = QKNormAttention::from_parts(
             proj("attn_q")?,
@@ -138,34 +145,56 @@ impl Qwen3DecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        // 🌟 [FP8 Compression] VRAM에 보관 중이던 FP8 텐서를 연산을 위해 즉시 BF16/F32로 압축 해제합니다.
-        if self.self_attn.kv_cache.is_none() {
+        let (res, mlp_out) = self.forward_residual_step(xs.clone(), None, cos, sin, None, attention_mask)?;
+        Ok(res.add(&mlp_out)?)
+    }
+
+    /// SPD-06 / SPD-08: Accepts owned `residual` + optional `prev_delta` (previous layer's MLP output)
+    /// so `residual_rmsnorm_inplace` absorbs the layer-boundary `add` with unique ownership (`is_sole_owner_contiguous`)
+    /// and receives precomputed F32 half-width RoPE `(cos_h, sin_h)` once per step.
+    /// Returns `(post_attn_residual, mlp_out)`.
+    pub fn forward_residual_step(
+        &mut self,
+        xs: Tensor,
+        prev_delta: Option<&Tensor>,
+        cos: &Tensor,
+        sin: &Tensor,
+        cos_sin_half: Option<(&Tensor, &Tensor)>,
+        attention_mask: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        // 🌟 [FP8 Compression / RAM offload] 보관 중이던 캐시를 연산을 위해 복원합니다.
+        if !self.self_attn.has_plain_kv() {
             if let Some(cache) = self.fp8_cache.take() {
                 let dev = xs.device();
                 let target_dtype = if dev.is_cuda_or_rocm() {
-                    self.input_layernorm.weight().dtype()
+                    xs.dtype()
                 } else {
                     candle_core::DType::F32
                 };
 
-                // 🌟 [KV RESIDENCY] RAM 에 대피해 있던 캐시라면 연산 직전에만 GPU 로 올립니다.
-                //    PCIe 4.0 x16 기준 28레이어 × 28KB/token ≈ 784KB → 0.03ms 로 무시 가능한 비용입니다.
                 let k_src = if cache.location == crate::utils::resources::KvResidency::Vram {
-                    cache.k_fp8.clone()
+                    cache.k_fp8
                 } else {
                     cache.k_fp8.to_device(dev).unwrap_or_else(|_| cache.k_fp8.clone())
                 };
                 let v_src = if cache.location == crate::utils::resources::KvResidency::Vram {
-                    cache.v_fp8.clone()
+                    cache.v_fp8
                 } else {
                     cache.v_fp8.to_device(dev).unwrap_or_else(|_| cache.v_fp8.clone())
                 };
 
-                // 🌟 [CRITICAL FIX] CUDA 환경에서 FP8(F8E4M3) 형변환 커널이 없을 경우 프로그램이 터지는 현상(CUDA_ERROR_NOT_FOUND)을 막기 위해 안전한 복구(Fallback) 로직을 적용합니다.
-                let k_restored = k_src.to_dtype(target_dtype).unwrap_or_else(|_| k_src.clone());
-                let v_restored = v_src.to_dtype(target_dtype).unwrap_or_else(|_| v_src.clone());
+                let k_restored = if k_src.dtype() != target_dtype {
+                    k_src.to_dtype(target_dtype).unwrap_or_else(|_| k_src.clone())
+                } else {
+                    k_src
+                };
+                let v_restored = if v_src.dtype() != target_dtype {
+                    v_src.to_dtype(target_dtype).unwrap_or_else(|_| v_src.clone())
+                } else {
+                    v_src
+                };
 
-                self.self_attn.kv_cache = Some((k_restored, v_restored));
+                self.self_attn.set_plain_kv(Some((k_restored, v_restored)));
             }
         }
 
@@ -176,25 +205,38 @@ impl Qwen3DecoderLayer {
             xs.dtype(),
             hidden_dim,
         );
-        let residual = xs.clone();
-        let normed = if use_fused_rms {
-            candle_core::decoder_ops::rmsnorm_fused(
-                xs,
-                self.input_layernorm.weight(),
-                self.rms_norm_eps,
-                false,
-            )?
+        let (residual, normed) = if use_fused_rms {
+            if prev_delta.is_some() {
+                candle_core::decoder_ops::residual_rmsnorm_inplace(
+                    xs,
+                    prev_delta,
+                    self.input_layernorm.weight(),
+                    self.rms_norm_eps,
+                    false,
+                )?
+            } else {
+                let n = candle_core::decoder_ops::rmsnorm_fused(
+                    &xs,
+                    self.input_layernorm.weight(),
+                    self.rms_norm_eps,
+                    false,
+                )?;
+                (xs, n)
+            }
         } else {
-            fast_cpu_rms_norm(&self.input_layernorm, xs, self.rms_norm_eps)?
+            let r = match prev_delta {
+                Some(d) => xs.add(d)?,
+                None => xs,
+            };
+            let n = fast_cpu_rms_norm(&self.input_layernorm, &r, self.rms_norm_eps)?;
+            (r, n)
         };
-        let attn_out = self.self_attn.forward(&normed, cos, sin, attention_mask)?;
-        
-        // 🌟 [FP8 KV Cache] 레이어 연산이 끝나는 즉시, VRAM 코어를 사용해 초고속 FP8 압축 상태로 VRAM에 보존합니다.
-        // RAM-VRAM 스왑 없이 순수 VRAM 내에서 용량을 50% 절약합니다.
+        let attn_out =
+            self.self_attn
+                .forward_with_rope_half(&normed, cos, sin, cos_sin_half, attention_mask)?;
+
         self.compress_kv_in_vram()?;
-        
-        // DeepStack 시각 주입은 Qwen3VLTextModel::forward 의 레이어 경계 밖에서 일어나므로
-        // 레이어 내부 post-attention residual + RMSNorm 융합은 Qwen3 / Qwen3VL 모두 안전합니다.
+
         let (residual, normed_post) = if use_fused_rms {
             candle_core::decoder_ops::residual_rmsnorm_inplace(
                 residual,
@@ -209,8 +251,7 @@ impl Qwen3DecoderLayer {
             (r, n)
         };
         let mlp_out = self.mlp.forward(&normed_post)?;
-        let xs = residual.add(&mlp_out)?;
-        Ok(xs)
+        Ok((residual, mlp_out))
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -230,7 +271,7 @@ impl Qwen3DecoderLayer {
         if !turbo_ok {
             match self.self_attn.take_turbo_kv() {
                 Ok(Some((k, v))) => {
-                    self.self_attn.kv_cache = Some((k, v));
+                    self.self_attn.set_plain_kv(Some((k, v)));
                     if let Err(e) = self.compress_kv_in_vram() {
                         eprintln!("[TURBO-KV] FP8 전환 실패: {e}");
                     }
@@ -241,6 +282,10 @@ impl Qwen3DecoderLayer {
                     eprintln!("[TURBO-KV] 압축 캐시 해제 실패, VRAM 에 유지합니다: {e}");
                     self.self_attn.set_turbo_kv_allowed(true);
                 }
+            }
+            // If residency moved off VRAM while plain KV is in preallocated buffer, flush to RAM now.
+            if residency != crate::utils::resources::KvResidency::Vram && self.self_attn.has_plain_kv() {
+                let _ = self.compress_kv_in_vram();
             }
         }
 
@@ -269,18 +314,33 @@ impl Qwen3DecoderLayer {
     }
 
     pub fn compress_kv_in_vram(&mut self) -> Result<()> {
-        // 🌟 [KV-PRECISION] 원본 KV 모드에서 VRAM 에 둘 때는 FP8 로 바꾸지 않고 그대로 둡니다.
-        if self.kv_exact && self.kv_residency == crate::utils::resources::KvResidency::Vram {
+        // 🌟 [KV-PRECISION / PRC-04] VRAM 상주 시 원본 KV 를 유지합니다.
+        // TurboQuant 코덱이 비활성/검증 실패로 빠진 폴백에서도 스케일 없는 FP8 강등을 기본 차단해
+        // 폴백이 더 낮은 정밀도로 떨어지지 않게 합니다 (`LOGIS_RAW_FP8_KV=1` 로만 예전 동작 선택).
+        let raw_fp8_opt_in = std::env::var("LOGIS_RAW_FP8_KV")
+            .map(|v| matches!(v.trim(), "1" | "true" | "on"))
+            .unwrap_or(false);
+        if self.kv_residency == crate::utils::resources::KvResidency::Vram
+            && (self.kv_exact || !raw_fp8_opt_in)
+        {
             return Ok(());
         }
-        if let Some((k, v)) = self.self_attn.kv_cache.take() {
+        if let Some((k, v)) = self.self_attn.take_plain_kv()? {
             let dev = k.device();
-            let k_fp8 = if dev.is_cuda_or_rocm() {
-                k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k.clone())
+            let use_raw_fp8 = dev.is_cuda_or_rocm() && !self.kv_exact && raw_fp8_opt_in;
+            let k_fp8 = if use_raw_fp8 {
+                match k.to_dtype(candle_core::DType::F8E4M3) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        static LOGGED: std::sync::Once = std::sync::Once::new();
+                        LOGGED.call_once(|| eprintln!("[KV-FALLBACK] F8E4M3 cast failed ({e}); keeping exact KV"));
+                        k.clone()
+                    }
+                }
             } else {
                 k.clone()
             };
-            let v_fp8 = if dev.is_cuda_or_rocm() {
+            let v_fp8 = if use_raw_fp8 {
                 v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v.clone())
             } else {
                 v.clone()
@@ -308,8 +368,8 @@ impl Qwen3DecoderLayer {
     }
 
     pub fn get_kv_cache(&self) -> Option<(Tensor, Tensor)> {
-        if let Some(cache) = &self.self_attn.kv_cache {
-            Some(cache.clone())
+        if let Ok(Some(cache)) = self.self_attn.plain_kv_snapshot() {
+            Some(cache)
         } else if self.self_attn.has_turbo_kv() {
             // 🌟 [TURBO-KV] 압축 캐시를 원래 dtype 으로 풀어 스냅샷으로 돌려줍니다. (캐시는 유지)
             match self.self_attn.turbo_kv_snapshot() {
@@ -339,7 +399,7 @@ impl Qwen3DecoderLayer {
         // 🌟 [TURBO-KV] 스냅샷이 전체 이력을 대체하므로 압축 캐시도 비웁니다.
         //    (TurboQuant 경로라면 다음 forward 에서 이 평문 캐시를 압축 캐시로 흡수합니다)
         self.self_attn.reset_turbo_kv();
-        self.self_attn.kv_cache = cache;
+        self.self_attn.set_plain_kv(cache);
         self.fp8_cache = None;
     }
 }
@@ -432,6 +492,19 @@ impl Qwen3Model {
         device: &candle_core::Device,
         act_dtype: candle_core::DType,
     ) -> Result<Self> {
+        Self::new_from_gguf_q8_with_mapped(config, ct, data, device, act_dtype, None)
+    }
+
+    /// 🌟 [Q8-RESIDENT / SPD-04 / S7-SP10] `mapped_table` 이 주어지면 `token_embd.weight`(~165 MB)를
+    /// VRAM 에 올렸다 바로 버리지 않고 처음부터 매핑 표로 구성합니다.
+    pub fn new_from_gguf_q8_with_mapped(
+        config: &Qwen3Config,
+        ct: &candle_core::quantized::gguf_file::Content,
+        data: &[u8],
+        device: &candle_core::Device,
+        act_dtype: candle_core::DType,
+        mapped_table: Option<crate::models::common::vocab_trim::TableSource>,
+    ) -> Result<Self> {
         if config.attention_bias {
             return Err(anyhow!("[QWEN3-Q8] attention_bias 가 있는 체크포인트는 Q8 상주 경로가 지원하지 않습니다"));
         }
@@ -442,8 +515,6 @@ impl Qwen3Model {
                 return Err(anyhow!("[QWEN3-Q8] {name} 형식 {:?} (Q8_0 아님)", info.ggml_dtype));
             }
         }
-        let embed_q = std::sync::Arc::new(qtensor_from_bytes(ct, data, "token_embd.weight", device)?);
-        let hidden = embed_q.shape().dims2()?.1;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for idx in 0..config.num_hidden_layers {
             layers.push(Qwen3DecoderLayer::new_from_gguf_q8(config, ct, data, idx, device, act_dtype)?);
@@ -451,13 +522,29 @@ impl Qwen3Model {
         // 마지막 노름은 F32 (logits 직전 1행이라 비용 없음, BF16 반올림 제거)
         let norm = gguf_norm(ct, data, "output_norm.weight", device, candle_core::DType::F32, config.rms_norm_eps)?;
         let rotary_emb = RoPE::new(config.head_dim, config.rope_theta, device)?;
-        let lm_head = if ct.tensor_infos.contains_key("output.weight") {
-            q8_exact_proj(ct, data, "output.weight", device)?
+        let (embed_tokens, lm_head) = if let Some(src) = mapped_table {
+            let cols = src.cols;
+            println!(
+                "[VOCAB-TRIM] 입력 임베딩 {} × {} 을 장치에 올리지 않고 매핑에서 행만 읽습니다 (적재 업로드 생략).",
+                src.rows, cols
+            );
+            let dummy = ProjKind::LinearProj(Linear::new(
+                Tensor::zeros((1, cols), candle_core::DType::F32, device)?,
+                None,
+            ));
+            (EmbedTable::Mapped { src, device: device.clone() }, dummy)
         } else {
-            ProjKind::Exact(ExactQLinear::new(embed_q.clone()))
+            let embed_q = std::sync::Arc::new(qtensor_from_bytes(ct, data, "token_embd.weight", device)?);
+            let hidden = embed_q.shape().dims2()?.1;
+            let lm_head = if ct.tensor_infos.contains_key("output.weight") {
+                q8_exact_proj(ct, data, "output.weight", device)?
+            } else {
+                ProjKind::Exact(ExactQLinear::new(embed_q.clone()))
+            };
+            (EmbedTable::Quant { q: embed_q, hidden }, lm_head)
         };
         Ok(Self {
-            embed_tokens: EmbedTable::Quant { q: embed_q, hidden },
+            embed_tokens,
             layers,
             norm,
             rotary_emb,
@@ -542,18 +629,52 @@ impl Qwen3Model {
             }
         };
 
-        let (cos, sin) = self
+        let (cos_f32, sin_f32) = self
             .rotary_emb
             .forward(seqlen_offset, seq_len, inputs_embeds.device())?;
-            
-        // 🌟 [VRAM 최적화] RoPE 테이블(F32)과 Mask가 Attention 연산에 섞여 들어가 전체 텐서를 F32로 강제 승격시키는 현상을 원천 차단합니다.
-        let cos = if cos.dtype() != target_dtype { cos.to_dtype(target_dtype)? } else { cos };
-        let sin = if sin.dtype() != target_dtype { sin.to_dtype(target_dtype)? } else { sin };
 
+        // SPD-06: Precompute F32 half-width RoPE tables ONCE per step instead of casting inside
+        // every one of 28 layers (saves 56 BF16->F32 cast launches/token on Qwen3-0.6B).
+        let cos_sin_half = if inputs_embeds.device().is_cuda_or_rocm() {
+            Some((
+                crate::models::common::rope_half_table(&cos_f32)?,
+                crate::models::common::rope_half_table(&sin_f32)?,
+            ))
+        } else {
+            None
+        };
+        let cos_sin_half_ref = cos_sin_half.as_ref().map(|(c, s)| (c, s));
+
+        // Non-fused fallback still expects target_dtype cos/sin.
+        let cos = if cos_f32.dtype() != target_dtype {
+            cos_f32.to_dtype(target_dtype)?
+        } else {
+            cos_f32
+        };
+        let sin = if sin_f32.dtype() != target_dtype {
+            sin_f32.to_dtype(target_dtype)?
+        } else {
+            sin_f32
+        };
+
+        // SPD-08: Carry `(residual, pending_mlp_delta)` across layer boundaries so each layer's
+        // `input_layernorm` absorbs the previous layer's MLP residual via `residual_rmsnorm_inplace`.
         let mut hidden_states = inputs_embeds;
+        let mut pending_delta: Option<Tensor> = None;
         for decode_layer in &mut self.layers {
-            hidden_states =
-                decode_layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+            let (res, mlp_out) = decode_layer.forward_residual_step(
+                hidden_states,
+                pending_delta.as_ref(),
+                &cos,
+                &sin,
+                cos_sin_half_ref,
+                attention_mask.as_ref(),
+            )?;
+            hidden_states = res;
+            pending_delta = Some(mlp_out);
+        }
+        if let Some(delta) = pending_delta {
+            hidden_states = hidden_states.add(&delta)?;
         }
         // 🌟 [ACCEL-CHECK] 이번 forward 에서 기록된 TurboQuant 실측 오차가 있으면 한 줄로 남깁니다.
         crate::models::common::accel_check::flush_probe_report(hidden_states.device());

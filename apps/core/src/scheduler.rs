@@ -5899,6 +5899,7 @@ pub async fn process_task(
                             let prejudice_target_for_closure = dynamic_prej_str.clone();
                             let task_q = task_question.clone();
                             let ignore_list_clone = ignore_list.clone();
+                            let literal_copy_field = !field_is_analytic[f_idx];
                             let res = tokio::task::spawn_blocking(move || {
                                 let mut gen_guard = q3_gen.blocking_lock();
                                 if let Some(gen) = gen_guard.as_mut() {
@@ -5915,8 +5916,15 @@ pub async fn process_task(
                                     };
 
                                     let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
-
-                                    gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                                    // 🌟 [PRC-05] 리터럴 복사 필드는 반복 페널티를 1.0 으로 설정해 숫자·날짜·코드 왜곡을 방지합니다.
+                                    if literal_copy_field {
+                                        gen.set_repetition_penalty_override(Some(1.0));
+                                    }
+                                    let out = gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e));
+                                    if literal_copy_field {
+                                        gen.set_repetition_penalty_override(None);
+                                    }
+                                    out
                                 } else {
                                     Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                                 }
@@ -5929,7 +5937,8 @@ pub async fn process_task(
                             };
                             let _ = tokio::task::spawn_blocking(move || {
                                 if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                                    gen.clear_kv_cache();
+                                    // 🌟 [SPD-03] 활성 KV 만 비우고 재시도용 프롬프트 프리필 스냅샷은 유지합니다.
+                                    gen.clear_kv_cache_keep_retry_snapshot();
                                 }
                                 if let Some(dev) = dev_for_sync {
                                     if dev.is_cuda_or_rocm() { let _ = dev.synchronize(); }
@@ -8836,6 +8845,7 @@ pub async fn process_task(
                         let prejudice_target_for_closure = if field_is_analytic[idx] { String::new() } else { dynamic_prej_str.clone() };
                         let task_q = task_question.clone();
                         let ignore_list_clone = ignore_list.clone();
+                        let literal_copy_field = !field_is_analytic[idx];
                         let res = tokio::task::spawn_blocking(move || {
                             let mut gen_guard = q3_gen.blocking_lock();
                             if let Some(gen) = gen_guard.as_mut() {
@@ -8854,8 +8864,15 @@ pub async fn process_task(
 
                                 let p_target = if prejudice_target_for_closure.is_empty() { None } else { Some(prejudice_target_for_closure.as_str()) };
 
-
-                                gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e))
+                                // 🌟 [PRC-05] 리터럴 복사 필드는 반복 페널티를 1.0 으로 설정해 숫자·날짜·코드 왜곡을 방지합니다.
+                                if literal_copy_field {
+                                    gen.set_repetition_penalty_override(Some(1.0));
+                                }
+                                let out = gen.generate(params, Some(cancel_clone), Some(&ignore_list_clone), p_target).map_err(|e| anyhow::anyhow!("Qwen 3 field extraction failed: {}", e));
+                                if literal_copy_field {
+                                    gen.set_repetition_penalty_override(None);
+                                }
+                                out
                             } else {
                                 Err(anyhow::anyhow!("Qwen 3 Generator not available"))
                             }
@@ -8863,7 +8880,8 @@ pub async fn process_task(
                         let q3_clear_arc = model.qwen3_generator.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             if let Some(gen) = q3_clear_arc.blocking_lock().as_mut() {
-                                gen.clear_kv_cache();
+                                // 🌟 [SPD-03] 활성 KV 만 비우고 재시도용 프롬프트 프리필 스냅샷은 유지합니다.
+                                gen.clear_kv_cache_keep_retry_snapshot();
                             }
                         }).await;
 

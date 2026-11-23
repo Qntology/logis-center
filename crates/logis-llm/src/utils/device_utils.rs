@@ -689,33 +689,31 @@ pub fn get_device(device: Option<&Device>) -> Device {
 pub fn get_gpu_sm_arch() -> Result<f32> {
     #[cfg(feature = "cuda")]
     {
-        let output = Command::new("nvidia-smi")
-            .arg("--query-gpu=compute_cap")
-            .arg("--format=csv,noheader")
-            .output()
-            .map_err(|e| anyhow::anyhow!(format!("Failed to execute nvidia-smi: {}", e)))?;
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(format!(
-                "nvidia-smi failed with status: {}
-Error: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        let output_str = output_str.trim();
-        
-        let first_line = output_str.lines().next().unwrap_or("0.0");
-        let sm_float = match first_line.parse::<f32>() {
-            Ok(num) => num,
-            Err(_) => {
-                return Err(anyhow::anyhow!(format!(
-                    "gpu sm arch: {} parse float32 error",
-                    first_line
-                )));
+        static CACHED_SM: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+        let sm = *CACHED_SM.get_or_init(|| {
+            // PRC-13: Query CUDA compute capability directly via cached driver attributes
+            // instead of spawning `nvidia-smi` on every `get_dtype` call.
+            if let Some((maj, min)) = get_best_device().cuda_compute_capability() {
+                return Some(maj as f32 + (min as f32) * 0.1);
             }
-        };
-        Ok(sm_float)
+            if let Ok(dev) = Device::new_cuda(0) {
+                if let Some((maj, min)) = dev.cuda_compute_capability() {
+                    return Some(maj as f32 + (min as f32) * 0.1);
+                }
+            }
+            // Last-resort fallback: `nvidia-smi` (cached once).
+            let output = Command::new("nvidia-smi")
+                .arg("--query-gpu=compute_cap")
+                .arg("--format=csv,noheader")
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&output.stdout);
+            s.trim().lines().next()?.trim().parse::<f32>().ok()
+        });
+        sm.ok_or_else(|| anyhow::anyhow!("failed to detect CUDA compute capability"))
     }
     #[cfg(not(feature = "cuda"))]
     {

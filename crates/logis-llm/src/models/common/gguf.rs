@@ -268,26 +268,49 @@ impl QuantizedLinear {
         Ok(self.inner.dequantize_f16()?)
     }
 
-    /// 🌟 [W8A16] F16/BF16 입력을 정확 경로(`forward_exact`)로 보낼지: CUDA/ROCm 에 상주한 Q8_0 가중치일 때만.
-    /// (K-quant 가중치·다른 장치는 기존 경로 그대로. ROCm 은 포크의 QRocmStorage 정확 경로를 씁니다. RX 6600 실측: Qwen3-0.6B top-1 100%, KLD 5.0e-4)
+    /// 🌟 [W8A16 / PRC-03] 활성값을 양자화하지 않는 정확 경로(`forward_exact`) 사용 조건:
+    /// - CUDA: Q8_0 및 K-quant(Q4_0/Q4K/Q5K/Q6K) 가중치 × F32/F16/BF16 입력 (`w8a16` mat-vec/tiled GEMM)
+    ///   (RTX 3050 실측: Q4K exact 28.2µs rel_err 7.3e-7 vs fast_mmvq 31.2µs rel_err 4.0e-3)
+    /// - ROCm: Q8_0 가중치 × F16/BF16 입력 (포크의 QRocmStorage 정확 경로)
     fn exact_ok(&self, xs: &Tensor) -> bool {
-        matches!(xs.dtype(), DType::F16 | DType::BF16)
-            && q8_exact_enabled()
-            && matches!(&self.inner, QMatMul::QTensor(t)
-                if t.dtype() == candle_core::quantized::GgmlDType::Q8_0 && (t.device().is_cuda() || t.device().is_rocm()))
+        use candle_core::quantized::GgmlDType;
+        if !q8_exact_enabled() {
+            return false;
+        }
+        let QMatMul::QTensor(t) = &self.inner else {
+            return false;
+        };
+        if t.device().is_cuda() {
+            if !matches!(xs.dtype(), DType::F32 | DType::F16 | DType::BF16) {
+                return false;
+            }
+            match t.dtype() {
+                GgmlDType::Q8_0 => true,
+                GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => {
+                    kquant_exact_enabled()
+                }
+                _ => false,
+            }
+        } else if t.device().is_rocm() {
+            matches!(xs.dtype(), DType::F16 | DType::BF16) && t.dtype() == GgmlDType::Q8_0
+        } else {
+            false
+        }
     }
 }
 
 // =====================================================================
-// 🌟 [W8A16] Q8_0 가중치 × F16/BF16 활성값의 정확 행렬곱
+// 🌟 [W8A16] Q8_0 · K-quant 가중치 × F32/F16/BF16 활성값의 정확 행렬곱
 // ---------------------------------------------------------------------
 //  기존: F16 입력은 `forward_via_f16` (호출마다 가중치 전체를 F16 으로 풀고 F16 matmul — 디코드 1토큰에도
-//        25MB 급 순간 버퍼), BF16 입력은 `forward` (MMVQ/MMQ: 활성값을 Q8_1 로 양자화).
-//  지금: `QMatMul::forward_exact` — 활성값을 양자화하지 않습니다. 디코드(≤8행)는 Q8_0 블록을 커널 안에서
+//        25MB 급 순간 버퍼), BF16/F32 입력은 `forward` (MMVQ/MMQ: 활성값을 Q8_1 로 양자화).
+//  지금: `QMatMul::forward_exact` — 활성값을 양자화하지 않습니다. 디코드(≤8행)는 블록을 커널 안에서
 //        f32 로 풀어 f32 누산, 프리필은 활성 dtype 타일로 풀어 f32 누산 GEMM. 정확도는 같거나 낫습니다.
-//  `LOGIS_Q8_EXACT=0` 이면 기존 경로. 테스트는 [`set_q8_exact_override`] 로 같은 프로세스에서 비교합니다.
+//  `LOGIS_Q8_EXACT=0` 이면 기존 경로, `LOGIS_KQUANT_EXACT=0` 이면 CUDA K-quant 만 기존 경로.
+//  테스트는 [`set_q8_exact_override`] / [`set_kquant_exact_override`] 로 같은 프로세스에서 비교합니다.
 // =====================================================================
 static Q8_EXACT_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static KQUANT_EXACT_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// 🌟 [W8A16] 테스트용 강제값. `None` = 환경변수 기본, `Some(true/false)` = 강제로 켜기/끄기.
 pub fn set_q8_exact_override(v: Option<bool>) {
@@ -297,6 +320,35 @@ pub fn set_q8_exact_override(v: Option<bool>) {
         Some(false) => 2,
     };
     Q8_EXACT_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 🌟 [PRC-03] CUDA K-quant 정확 경로(`Q4_0`/`Q4K`/`Q5K`/`Q6K`) 테스트용 A/B 강제 스위치.
+pub fn set_kquant_exact_override(v: Option<bool>) {
+    let code = match v {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    KQUANT_EXACT_OVERRIDE.store(code, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn kquant_exact_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    match KQUANT_EXACT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => *ON.get_or_init(|| {
+            let v = std::env::var("LOGIS_KQUANT_EXACT")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let on = !matches!(v.as_str(), "0" | "off" | "false" | "no" | "legacy");
+            if !on {
+                println!("[W8A16] LOGIS_KQUANT_EXACT={v} → CUDA K-quant 선형층을 기존 Q8_1 근사 경로로 계산합니다.");
+            }
+            on
+        }),
+    }
 }
 
 fn q8_exact_enabled() -> bool {

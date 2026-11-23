@@ -3,9 +3,24 @@ use std::sync::atomic::AtomicBool;
 use serde_json::{json, Value};
 use crate::utils::GpuDeviceExt;
 
+fn search_legacy_purge_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("LOGIS_SEARCH_PURGE")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
 impl crate::model::LogisModel {
 
     pub async fn parse_commerce_query(&self, task_id: &str, app_handle: &crate::sink::Sink, query: String, language: &str, metrics_json: &str, cancel_token: Arc<AtomicBool>) -> anyhow::Result<Value> {
+        let search_t0 = std::time::Instant::now();
 
         // 🌟 [신규] 터미널 로거 헬퍼 주입
         let emit_term = |msg: &str| {
@@ -21,16 +36,49 @@ impl crate::model::LogisModel {
             "",
         );
 
-        // 🌟 [최초 초기화] VRAM 확보 및 불필요한 제너레이터 선제적 언로드 (캔슬 개입 포함)
-        emit_term("[ENGINE] 🧹 Pre-purging memory before loading embedding model...");
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
             return Ok(json!({ "context": [], "cancelled": true }));
         }
-        
-        // 🌟 [VRAM 누수 픽스] KV 캐시를 정상적으로 삭제하기 위해 None 덮어쓰기 로직을 제거하고, deep_purge_resources에 전부 일임합니다.
-        self.deep_purge_resources().await;
-        self.wait_for_vram_settle(1200, 5, Some(cancel_token.clone())).await.ok();
+
+        // 🌟 [SPD-04] 예산 기반 상주 전환: 연속 검색에서 Embedding(granite) + Qwen3 를 매번 퍼지/재로딩하지 않습니다.
+        //    비전/대형 모델(SigLIP2 · Qwen2.5-VL · Qwen3.5 · Qwen4-Exp)이 VRAM 을 점유 중일 때만 내려놓고 정리합니다.
+        //    `LOGIS_SEARCH_PURGE=1` 이면 기존 무조건 전량 퍼지 경로로 동작합니다.
+        if search_legacy_purge_enabled() {
+            emit_term("[ENGINE] 🧹 Pre-purging memory before loading embedding model (legacy purge)...");
+            self.deep_purge_resources().await;
+            self.wait_for_vram_settle(1200, 5, Some(cancel_token.clone())).await.ok();
+        } else {
+            let mut dropped_any = false;
+            if self.siglip2_model.lock().await.take().is_some() {
+                dropped_any = true;
+            }
+            if let Some(mut g) = self.generator.lock().await.take() {
+                let _ = g.clear_kv_cache();
+                let _ = g.qwen.drop_kv_storage();
+                dropped_any = true;
+            }
+            if let Some(mut g) = self.qwen3_5_generator.lock().await.take() {
+                g.clear_kv_cache();
+                g.qwen3_5.language_model.release_resident_weights();
+                dropped_any = true;
+            }
+            if let Some(mut g) = self.qwen4_exp_generator.lock().await.take() {
+                g.clear_kv_cache();
+                dropped_any = true;
+            }
+            if let Some(g) = self.qwen3_generator.lock().await.as_mut() {
+                g.clear_kv_cache();
+            }
+            if dropped_any {
+                crate::model::lang_llm::set_resident_variant(None);
+                let has_q3 = self.qwen3_generator.lock().await.is_some();
+                *self.current_size.lock().await = if has_q3 { Some(crate::model::ModelSize::Qwen3) } else { None };
+                self.settle_device("search_prepare", crate::utils::phase_pool_keep_bytes(), false).await;
+                self.sync_crossover_phase().await;
+            }
+        }
+        let prep_ms = search_t0.elapsed().as_secs_f64() * 1e3;
 
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
@@ -40,7 +88,7 @@ impl crate::model::LogisModel {
         // ----------------------------------------------------
         // Stage 1: 세그먼트 분할 (Vector Cliff Detection) - Embedding 모델 사용
         // ----------------------------------------------------
-        emit_term("[STAGE-1] Loading Models (Embedding & Qwen3) for Commerce Pipeline...");
+        emit_term("[STAGE-1] Loading Embedding Model (Qwen3 lazy on demand) for Commerce Pipeline...");
         let payload = json!({ "task_id": task_id, "category": "Stage 1", "summary": "Segmenting semantic intents...", "spinner": "⠋" });
         let _ = app_handle.emit("extraction-progress", &payload);
         crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
@@ -51,8 +99,10 @@ impl crate::model::LogisModel {
         let route_verdict = self.lang_route("search", "commerce_verify", &route_lang, &query).await;
         emit_term(&format!("  {}", route_verdict.line));
         let _query_route = crate::model::lang_llm::QueryRoute::open(route_verdict.code);
-        self.ensure_query_engine().await?;
+        // 🌟 [SPD-04] Qwen3 는 실제 LLM 검증이 필요할 때 `call_qwen3_verification_model` 에서 지연 로드합니다.
+        let embed_t0 = std::time::Instant::now();
         self.ensure_embedding().await?;
+        let embed_load_ms = embed_t0.elapsed().as_secs_f64() * 1e3;
         if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
             emit_term("[ENGINE] 🛑 Task cancelled by user. Terminating safely.");
             return Ok(json!({ "context": [], "cancelled": true }));
@@ -4635,28 +4685,41 @@ impl crate::model::LogisModel {
             }
         }
 
+        let total_ms = search_t0.elapsed().as_secs_f64() * 1e3;
+        crate::utils::score_dynamics::record_baseline("search.prep_ms", prep_ms as f32);
+        crate::utils::score_dynamics::record_baseline("search.embed_load_ms", embed_load_ms as f32);
+        crate::utils::score_dynamics::record_baseline("search.total_ms", total_ms as f32);
+        emit_term(&format!(
+            "[SEARCH-PROF] prep={:.1}ms · embed_load={:.1}ms · total={:.1}ms",
+            prep_ms, embed_load_ms, total_ms
+        ));
+
         let payload = json!({ "task_id": task_id, "category": "Done", "summary": "Analysis complete.", "spinner": "✅" });
         let _ = app_handle.emit("extraction-progress", &payload);
         crate::utils::logger::log_task_progress(app_handle, task_id, &payload);
 
-        // 🌟 [VRAM 초기화 반영] 파이프라인 종료 직후 Embedding 및 Qwen3 모델을 메모리에서 완벽히 해제하여 VRAM을 0으로 떨어뜨립니다.
-        emit_term("[ENGINE] 🧹 Purging models from memory to free VRAM...");
-        
-        // 🌟 [VRAM 누수 픽스] KV 캐시를 정상적으로 삭제하기 위해 None 덮어쓰기 로직을 제거하고, deep_purge_resources에 전부 일임합니다.
-        self.deep_purge_resources().await;
+        // 🌟 [SPD-04] 연속 검색 질의에서는 Embedding(granite) + Qwen3 를 VRAM 에 따뜻하게 유지합니다.
+        //    `LOGIS_SEARCH_PURGE=1` 일 때만 기존처럼 매 질의 종료 시 전량 퍼지합니다.
+        if search_legacy_purge_enabled() {
+            emit_term("[ENGINE] 🧹 Purging models from memory to free VRAM (legacy purge)...");
+            self.deep_purge_resources().await;
 
-        // 🌟 [강화된 VRAM 초기화] CUDA 메모리 캐시 강제 비우기 (컴파일 에러 해결 적용)
-        if !self.is_cpu_mode {
-            if self.device_config.device.is_cuda_or_rocm() {
-                let _ = self.device_config.device.synchronize();
+            if !self.is_cpu_mode {
+                if self.device_config.device.is_cuda_or_rocm() {
+                    let _ = self.device_config.device.synchronize();
+                }
+                crate::utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
             }
-            // 새 컨텍스트를 할당하여 기존 메모리 풀을 OS로 반환시킵니다.
-            crate::utils::flush_gpu_memory_pool(self.device_config.gpu_id as usize);
-        }
 
-        // 🌟 [CRITICAL FIX] scheduler.rs의 함수 대신 model.rs에 내장된 강력한 VRAM 스마트 폴링 모니터(self.wait_for_vram_settle)를 호출합니다.
-        // 내부에서 OS 메모리 강제 반환을 폭격하여 VRAM을 0으로 만듭니다.
-        self.wait_for_vram_settle(1200, 10, Some(cancel_token.clone())).await.ok();
+            self.wait_for_vram_settle(1200, 10, Some(cancel_token.clone())).await.ok();
+        } else {
+            if let Some(g) = self.qwen3_generator.lock().await.as_mut() {
+                g.clear_kv_cache();
+            }
+            if !self.is_cpu_mode {
+                crate::utils::trim_idle_gpu_pool(&self.device_config.device);
+            }
+        }
 
         Ok(segments)
     }

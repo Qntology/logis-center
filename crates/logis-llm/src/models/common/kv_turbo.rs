@@ -973,16 +973,73 @@ pub fn flash_history_attention(
 ) -> Result<Tensor> {
     let dev = q.device();
     let dt = q.dtype();
+    let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scaling as f32).causal();
+
+    // SPD-07 / S5-SP02: When all history blocks are dense (non-TurboQuant) on CUDA/ROCm,
+    // use `flash_attn_blocks` directly without concatenating or copying historical KV blocks.
+    let hist_parts: Vec<(&KvPart, usize)> = parts
+        .iter()
+        .filter_map(|p| {
+            if p.off >= hist_end {
+                return None;
+            }
+            let take = p.len.min(hist_end - p.off);
+            (take > 0).then_some((p, take))
+        })
+        .collect();
+
+    if matches!(dev, Device::Cuda(_) | Device::Rocm(_))
+        && !hist_parts.is_empty()
+        && hist_parts.len() + 1 <= candle_core::accel::attention::FA_MAX_PAGES
+        && hist_parts.iter().all(|(p, _)| {
+            p.tq.is_none()
+                && p.k.device().same_device(dev)
+                && p.v.device().same_device(dev)
+                && p.k.dtype() == p.v.dtype()
+                && matches!(p.k.dtype(), DType::F32 | DType::F16 | DType::BF16)
+        })
+    {
+        let blk_dt = hist_parts[0].0.k.dtype();
+        let same_blk_dt = hist_parts
+            .iter()
+            .all(|(p, _)| p.k.dtype() == blk_dt && p.v.dtype() == blk_dt);
+        if same_blk_dt && (blk_dt == dt || (dt == DType::F32 && matches!(blk_dt, DType::F16 | DType::BF16))) {
+            let cur_len = k_cur.dim(2)?;
+            let kc = if k_cur.dtype() == blk_dt {
+                k_cur.contiguous()?
+            } else {
+                k_cur.to_dtype(blk_dt)?.contiguous()?
+            };
+            let vc = if v_cur.dtype() == blk_dt {
+                v_cur.contiguous()?
+            } else {
+                v_cur.to_dtype(blk_dt)?.contiguous()?
+            };
+            let mut block_refs: Vec<candle_nn::flash_attn::KvBlockRef<'_>> =
+                Vec::with_capacity(hist_parts.len() + 1);
+            for &(p, take) in &hist_parts {
+                block_refs.push(candle_nn::flash_attn::KvBlockRef {
+                    k: &p.k,
+                    v: &p.v,
+                    rows: take,
+                });
+            }
+            block_refs.push(candle_nn::flash_attn::KvBlockRef {
+                k: &kc,
+                v: &vc,
+                rows: cur_len,
+            });
+            return Ok(candle_nn::flash_attn::flash_attn_blocks(
+                &q.contiguous()?,
+                &block_refs,
+                &cfg,
+            )?);
+        }
+    }
+
     let mut ks: Vec<Tensor> = Vec::with_capacity(parts.len() + 1);
     let mut vs: Vec<Tensor> = Vec::with_capacity(parts.len() + 1);
-    for p in parts {
-        if p.off >= hist_end {
-            continue;
-        }
-        let take = p.len.min(hist_end - p.off);
-        if take == 0 {
-            continue;
-        }
+    for (p, take) in hist_parts {
         let k = p.k.narrow(2, 0, take)?.contiguous()?;
         let v = p.v.narrow(2, 0, take)?.contiguous()?;
         match p.tq {
@@ -1001,6 +1058,5 @@ pub fn flash_history_attention(
     vs.push(v_cur.to_dtype(dt)?);
     let k = if ks.len() == 1 { ks.remove(0) } else { Tensor::cat(&ks, 2)? }.contiguous()?;
     let v = if vs.len() == 1 { vs.remove(0) } else { Tensor::cat(&vs, 2)? }.contiguous()?;
-    let cfg = candle_nn::flash_attn::FlashAttnConfig::new(scaling as f32).causal();
     Ok(candle_nn::flash_attn::flash_attn_bhsd(&q.contiguous()?, &k, &v, &cfg)?)
 }

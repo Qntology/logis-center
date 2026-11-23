@@ -27,6 +27,64 @@ pub struct GenerationResult {
     pub last_token: u32,
 }
 
+fn build_json_protected_ids(tokenizer: &TokenizerModel) -> std::collections::HashSet<u32> {
+    let mut protected = std::collections::HashSet::new();
+    for (tok_str, &id) in tokenizer.tokenizer.get_vocab(true).iter() {
+        let maybe_punct = tok_str.len() <= 16
+            && (tok_str.starts_with("<0x")
+                || tok_str
+                    .bytes()
+                    .any(|b| matches!(b, b'"' | b'{' | b'[' | b'}' | b']' | b',' | b':')));
+        if !maybe_punct {
+            continue;
+        }
+        if let Ok(piece) = tokenizer.token_decode(vec![id]) {
+            let p = piece.trim();
+            if matches!(p, "\"" | "{" | "[" | "}" | "]" | "," | ":") {
+                protected.insert(id);
+            }
+        }
+    }
+    protected
+}
+
+fn pretokenize_ignore_list(
+    tokenizer: &TokenizerModel,
+    ignore_list: Option<&[String]>,
+    is_strict_json: bool,
+) -> Vec<Vec<u32>> {
+    let Some(ignores) = ignore_list else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for ign in ignores {
+        if is_strict_json && (ign.trim().starts_with('{') || ign.trim().starts_with('[')) {
+            continue;
+        }
+        let toks = tokenizer
+            .text_encode_vec(ign.to_string(), false)
+            .unwrap_or_default();
+        if !toks.is_empty() {
+            out.push(toks);
+        }
+    }
+    out
+}
+
+fn persist_oneshot_kv_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("LOGIS_PERSIST_ONESHOT_KV")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
 pub struct Qwen3_5GenerateModel {
     chat_template: ChatTemplate,
     pub tokenizer: TokenizerModel, 
@@ -37,7 +95,9 @@ pub struct Qwen3_5GenerateModel {
     model_name: String,
     repeat_penalty: f32,
     repeat_last_n: usize,
-    pub max_position_embeddings: usize, 
+    pub max_position_embeddings: usize,
+    /// 🌟 [SPD-02] JSON 문법 보호 토큰 ID 캐시
+    json_protected_ids: std::collections::HashSet<u32>,
 }
 
 impl Qwen3_5GenerateModel {
@@ -107,6 +167,8 @@ impl Qwen3_5GenerateModel {
         let max_pos = cfg.text_config.max_position_embeddings;
         let qwen3_5 = Qwen3_5Model::new_from_vb(vb, cfg)?;
 
+        let json_protected_ids = build_json_protected_ids(&tokenizer);
+
         Ok(Self {
             chat_template,
             tokenizer,
@@ -117,7 +179,8 @@ impl Qwen3_5GenerateModel {
             model_name: model_name.to_string(),
             repeat_penalty: 1.1,
             repeat_last_n: 64,
-            max_position_embeddings: max_pos, 
+            max_position_embeddings: max_pos,
+            json_protected_ids,
         })
     }
 
@@ -197,9 +260,9 @@ impl Qwen3_5GenerateModel {
             Some(mmap_arc.clone()),
             Some(ct_arc)
         )?;
-        // 🌟 [WEIGHT-RESIDENT] 텍스트 전용 생성기(4B 등)는 호출이 끝나도 VRAM 여유가 있으면 층 가중치를 남겨
-        //    다음 호출에서 다시 읽지 않습니다. 비전 타워를 붙였다 떼는 생성기(2B + mmproj)는 예전처럼 매번 내려놓습니다.
-        qwen3_5.language_model.keep_warm = target_mmproj.is_none();
+        // 🌟 [WEIGHT-RESIDENT / SPD-05] mmproj 스켈레톤은 스트리밍되고, `clear_cache()` 가 KV 해제 후
+        //    실제 VRAM 여유(`keep_warm_ok`)를 확인하므로 2B+mmproj 포함 모든 Qwen3.5 에서 가중치 웜 유지 허용.
+        qwen3_5.language_model.keep_warm = true;
 
         // 🌟 [VISION-SKELETON] 가중치 0바이트로 비전 구조만 붙입니다.
         //    실패하면 순수 텍스트 모드로 안전하게 강등됩니다.
@@ -225,6 +288,8 @@ impl Qwen3_5GenerateModel {
         
         crate::models::common::legacy_working_set_trim();
 
+        let json_protected_ids = build_json_protected_ids(&tokenizer);
+
         // 구조체 반환 부분은 그대로 유지
         Ok(Self {
             chat_template,
@@ -236,7 +301,8 @@ impl Qwen3_5GenerateModel {
             model_name: stem.to_string(),
             repeat_penalty: 1.1, 
             repeat_last_n: 64,
-            max_position_embeddings: max_pos, 
+            max_position_embeddings: max_pos,
+            json_protected_ids,
         })
     }
 
@@ -415,8 +481,19 @@ impl Qwen3_5GenerateModel {
             }
         }
 
+        let pretokenized_ignores = pretokenize_ignore_list(&self.tokenizer, ignore_list, is_strict_json);
+        let has_ignores = !pretokenized_ignores.is_empty();
+        // 🌟 [SPD-12] 일회성 `generate()` 는 종료 직후 `clear_cache()` 되므로 불필요한 프리필·종료 디스크 플러시를 생략합니다.
+        let prev_persist_kv = self.qwen3_5.language_model.persist_kv;
+        self.qwen3_5.language_model.persist_kv = persist_oneshot_kv_enabled();
+        let gen_t0 = std::time::Instant::now();
+        let mut prefill_ms = 0.0f64;
+        let mut decode_t0: Option<std::time::Instant> = None;
+
         for i in 0..sample_len {
             if i == 1 {
+                prefill_ms = gen_t0.elapsed().as_secs_f64() * 1e3;
+                decode_t0 = Some(std::time::Instant::now());
                 crate::utils::trim_idle_gpu_pool(&self.device);
             }
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
@@ -424,7 +501,7 @@ impl Qwen3_5GenerateModel {
             let pure_greedy_step = i > 0
                 && mes.temperature.unwrap_or(0.0) <= 0.0
                 && semantic_prejudice_tensor.is_none()
-                && ignore_list.is_none();
+                && !has_ignores;
             let fast_hidden = if pure_greedy_step {
                 let h = self
                     .qwen3_5
@@ -442,7 +519,8 @@ impl Qwen3_5GenerateModel {
                     .await?;
                 let cand = self.qwen3_5.greedy_from_hidden(&h)?;
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
-                let hit_banned = (self.repeat_penalty > 1.0 && generate[start_at..].contains(&cand))
+                let cand_rep_exempt = is_strict_json && self.json_protected_ids.contains(&cand);
+                let hit_banned = (self.repeat_penalty > 1.0 && !cand_rep_exempt && generate[start_at..].contains(&cand))
                     || (is_strict_json
                         && (cand == think_token_id
                             || cand == lt_id
@@ -499,22 +577,13 @@ impl Qwen3_5GenerateModel {
             let len = logits_vec.len();
             
             if !generate.is_empty() {
-                // 🌟 [CRITICAL FIX] 반복을 끊기 위해 페널티를 유지하되, JSON 필수 문법만 보호합니다.
+                // 🌟 [CRITICAL FIX / SPD-02] 반복 페널티 유지 + 캐시된 JSON 문법 토큰 ID 보호
                 let penalty = self.repeat_penalty; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 for &t in &generate[start_at..] {
                     if !set.contains(&t) && (t as usize) < len {
-                        // 🌟 JSON 필수 문법(따옴표, 괄호 등)이 페널티를 먹고 붕괴하는 현상 방어
-                        let mut apply_rep_penalty = true;
-                        if is_strict_json {
-                            if let Ok(piece) = self.tokenizer.token_decode(vec![t]) {
-                                let p = piece.trim();
-                                if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
-                                    apply_rep_penalty = false;
-                                }
-                            }
-                        }
+                        let apply_rep_penalty = !(is_strict_json && self.json_protected_ids.contains(&t));
 
                         if apply_rep_penalty {
                             let logit = logits_vec[t as usize];
@@ -541,17 +610,9 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            // 🌟 [CRITICAL FIX] Qwen 3.5에도 완성된 ignore_list 방어 로직을 100% 이식합니다.
-            if let Some(ignores) = ignore_list {
-                for ign in ignores {
-                    // 🌟 [최강 방어 로직 통일] 이전 실패 데이터의 JSON 구조 전체({ 등)가 장부에 들어온 경우, 문법 파괴 예방을 위해 스킵 처리합니다.
-                    if is_strict_json && (ign.trim().starts_with('{') || ign.trim().starts_with('[')) {
-                        continue;
-                    }
-
-                    let ign_toks = self.tokenizer.text_encode_vec(ign.to_string(), false).unwrap_or_default();
-                    if ign_toks.is_empty() { continue; }
-                    
+            // 🌟 [CRITICAL FIX / SPD-02] 사전 토크나이징된 ignore_list 방어 로직
+            if has_ignores {
+                for ign_toks in &pretokenized_ignores {
                     let mut overlap = 0;
                     for l in (1..=ign_toks.len().min(generate.len())).rev() {
                         if generate.ends_with(&ign_toks[..l]) {
@@ -570,14 +631,8 @@ impl Qwen3_5GenerateModel {
                                 apply_bias = true;
                             }
                             
-                            // 🌟 [최강 방어 로직] 필수 JSON 문법(따옴표 등) 강제 보호
-                            if apply_bias && is_strict_json {
-                                if let Ok(piece) = self.tokenizer.token_decode(vec![next_tok as u32]) {
-                                    let p = piece.trim();
-                                    if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
-                                        apply_bias = false;
-                                    }
-                                }
+                            if apply_bias && is_strict_json && self.json_protected_ids.contains(&(next_tok as u32)) {
+                                apply_bias = false;
                             }
 
                             if apply_bias {
@@ -597,7 +652,8 @@ impl Qwen3_5GenerateModel {
                 }
             }
             
-            let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
+            // 🌟 [SPD-02] CPU 샘플러에 넘길 로짓을 GPU 로 불필요하게 업로드하지 않고 CPU 텐서로 바로 전달합니다.
+            let logits = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
             logit_processor.sample(&logits)?
                 }
             };
@@ -702,12 +758,25 @@ impl Qwen3_5GenerateModel {
         println!(); 
         crate::utils::trim_idle_gpu_pool(&self.device);
 
-        let res = self.tokenizer.token_decode(generate)?;
-        
-        if let Some(s_id) = &session_id {
-            let _ = self.qwen3_5.language_model.force_flush_all_active_blocks(s_id, kv_name.as_deref()).await;
-            println!("[GEN-SAVE] Qwen 3.5 active KV blocks flushed to disk");
+        let decode_ms = decode_t0
+            .map(|t| t.elapsed().as_secs_f64() * 1e3)
+            .unwrap_or(0.0);
+        if prefill_ms == 0.0 {
+            prefill_ms = gen_t0.elapsed().as_secs_f64() * 1e3;
         }
+        crate::utils::score_dynamics::record_baseline("qwen35.prefill_ms", prefill_ms as f32);
+        crate::utils::score_dynamics::record_baseline("qwen35.decode_ms", decode_ms as f32);
+        crate::utils::score_dynamics::record_baseline("qwen35.decode_tokens", generate.len() as f32);
+
+        let res = self.tokenizer.token_decode(generate)?;
+
+        if self.qwen3_5.language_model.persist_kv {
+            if let Some(s_id) = &session_id {
+                let _ = self.qwen3_5.language_model.force_flush_all_active_blocks(s_id, kv_name.as_deref()).await;
+                println!("[GEN-SAVE] Qwen 3.5 active KV blocks flushed to disk");
+            }
+        }
+        self.qwen3_5.language_model.persist_kv = prev_persist_kv;
 
         self.qwen3_5.clear_cache();
 
@@ -738,6 +807,7 @@ impl Qwen3_5GenerateModel {
             mes.seed.unwrap_or(32768) as u64
         );
 
+        self.qwen3_5.language_model.persist_kv = true;
         self.refresh_vocab_for(&crate::models::common::vocab_trim::prompt_text(mes), mes.temperature.unwrap_or(0.0) > 1e-7)?;
         let mut generate = Vec::new();
         let sample_len = mes.max_tokens.unwrap_or(1024);
@@ -898,6 +968,9 @@ impl Qwen3_5GenerateModel {
             }
         }
 
+        let pretokenized_ignores = pretokenize_ignore_list(&self.tokenizer, ignore_list, is_strict_json);
+        let has_ignores = !pretokenized_ignores.is_empty();
+
         for i in 0..sample_len {
             if i == 1 {
                 crate::utils::trim_idle_gpu_pool(&self.device);
@@ -913,7 +986,7 @@ impl Qwen3_5GenerateModel {
             let pure_greedy_step = i > 0
                 && mes.temperature.unwrap_or(0.0) <= 0.0
                 && semantic_prejudice_tensor.is_none()
-                && ignore_list.is_none();
+                && !has_ignores;
             let fast_hidden = if pure_greedy_step {
                 let h = self
                     .qwen3_5
@@ -931,7 +1004,8 @@ impl Qwen3_5GenerateModel {
                     .await?;
                 let cand = self.qwen3_5.greedy_from_hidden(&h)?;
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
-                let hit_banned = (self.repeat_penalty > 1.0 && generate[start_at..].contains(&cand))
+                let cand_rep_exempt = is_strict_json && self.json_protected_ids.contains(&cand);
+                let hit_banned = (self.repeat_penalty > 1.0 && !cand_rep_exempt && generate[start_at..].contains(&cand))
                     || (is_strict_json
                         && (cand == think_token_id
                             || cand == lt_id
@@ -988,22 +1062,13 @@ impl Qwen3_5GenerateModel {
             let len = logits_vec.len();
 
             if !generate.is_empty() {
-                // 🌟 [CRITICAL FIX] 반복을 끊기 위해 페널티를 유지하되, JSON 필수 문법만 보호합니다.
+                // 🌟 [CRITICAL FIX / SPD-02] 반복 페널티 유지 + 캐시된 JSON 문법 토큰 ID 보호
                 let penalty = self.repeat_penalty; 
                 let mut set = std::collections::HashSet::new();
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 for &t in &generate[start_at..] {
                     if !set.contains(&t) && (t as usize) < len {
-                        // 🌟 JSON 필수 문법(따옴표, 괄호 등)이 페널티를 먹고 붕괴하는 현상 방어
-                        let mut apply_rep_penalty = true;
-                        if is_strict_json {
-                            if let Ok(piece) = self.tokenizer.token_decode(vec![t]) {
-                                let p = piece.trim();
-                                if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
-                                    apply_rep_penalty = false;
-                                }
-                            }
-                        }
+                        let apply_rep_penalty = !(is_strict_json && self.json_protected_ids.contains(&t));
 
                         if apply_rep_penalty {
                             let logit = logits_vec[t as usize];
@@ -1030,17 +1095,9 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            // 🌟 [CRITICAL FIX] Qwen 3.5에도 완성된 ignore_list 방어 로직을 100% 이식합니다.
-            if let Some(ignores) = ignore_list {
-                for ign in ignores {
-                    // 🌟 [최강 방어 로직 통일] 이전 실패 데이터의 JSON 구조 전체({ 등)가 장부에 들어온 경우, 문법 파괴 예방을 위해 스킵 처리합니다.
-                    if is_strict_json && (ign.trim().starts_with('{') || ign.trim().starts_with('[')) {
-                        continue;
-                    }
-
-                    let ign_toks = self.tokenizer.text_encode_vec(ign.to_string(), false).unwrap_or_default();
-                    if ign_toks.is_empty() { continue; }
-                    
+            // 🌟 [CRITICAL FIX / SPD-02] 사전 토크나이징된 ignore_list 방어 로직
+            if has_ignores {
+                for ign_toks in &pretokenized_ignores {
                     let mut overlap = 0;
                     for l in (1..=ign_toks.len().min(generate.len())).rev() {
                         if generate.ends_with(&ign_toks[..l]) {
@@ -1059,14 +1116,8 @@ impl Qwen3_5GenerateModel {
                                 apply_bias = true;
                             }
                             
-                            // 🌟 [최강 방어 로직] 필수 JSON 문법(따옴표 등) 강제 보호
-                            if apply_bias && is_strict_json {
-                                if let Ok(piece) = self.tokenizer.token_decode(vec![next_tok as u32]) {
-                                    let p = piece.trim();
-                                    if p == "\"" || p == "{" || p == "[" || p == "}" || p == "]" || p == "," || p == ":" {
-                                        apply_bias = false;
-                                    }
-                                }
+                            if apply_bias && is_strict_json && self.json_protected_ids.contains(&(next_tok as u32)) {
+                                apply_bias = false;
                             }
 
                             if apply_bias {
@@ -1086,7 +1137,7 @@ impl Qwen3_5GenerateModel {
                 }
             }
 
-            let logits = Tensor::from_vec(logits_vec, (len,), &self.device)?;
+            let logits = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
             logit_processor.sample(&logits)?
                 }
             };
@@ -1221,6 +1272,7 @@ impl Qwen3_5GenerateModel {
         kv_name: Option<String>
     ) -> Result<usize> {
         self.clear_kv_cache();
+        self.qwen3_5.language_model.persist_kv = true;
 
         let mut mes_render = String::new();
         for msg in &mes.messages {

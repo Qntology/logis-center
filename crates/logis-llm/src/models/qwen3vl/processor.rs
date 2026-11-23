@@ -94,10 +94,55 @@ pub fn vision_max_patches_from_vram(usable_bytes: u64) -> usize {
     if n <= 0.0 { 0 } else { n as usize }
 }
 
+/// 최소 OCR 해상도 하한 (1024x1024, PRC-06 단조성 보장)
+pub const VISION_ADAPTIVE_FLOOR_PX: u32 = 1_048_576;
+
+static PINNED_ADAPTIVE_MAX_PIXELS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 🌟 [PRC-06] 페이지/문서 단위 결정론적 해상도 고정 (`None` = 해제).
+pub fn pin_adaptive_max_pixels(px: Option<u32>) {
+    PINNED_ADAPTIVE_MAX_PIXELS.store(px.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn env_fixed_max_pixels() -> Option<u32> {
+    static VAL: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *VAL.get_or_init(|| {
+        std::env::var("LOGIS_VISION_MAX_PIXELS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&v| v > 0)
+    })
+}
+
+/// 🌟 [PRC-06] 가용 VRAM(`free_vram`)으로부터 단조 증가하는 `max_pixels` 를 계산합니다.
+/// 기존에는 `usable` 이 작아 `max_patches > 0` 이지만 `adaptive_px < floor_px` 인 구간에서
+/// `free_vram` 이 더 적을 때(floor_px)보다 오히려 해상도가 뚝 떨어지는 비단조 딥(dip)이 발생했습니다.
+pub fn adaptive_max_pixels_from_free_vram(free_vram: u64, patch_area: u64, config_max: u32) -> u32 {
+    if patch_area == 0 {
+        return config_max;
+    }
+    let floor_px = config_max.min(VISION_ADAPTIVE_FLOOR_PX);
+    let usable = free_vram.saturating_sub(VISION_VRAM_RESERVE);
+    let max_patches = vision_max_patches_from_vram(usable);
+    if max_patches == 0 {
+        return floor_px;
+    }
+    let raw_px = (max_patches as u64).saturating_mul(patch_area);
+    let clamped_u32 = raw_px.min(u32::MAX as u64) as u32;
+    clamped_u32.max(floor_px).min(config_max)
+}
+
 impl Qwen3VLProcessor {
-    /// 🌟 [VRAM 역산] NVML 로 현재 가용 VRAM 을 읽어 안전한 max_pixels 를 계산합니다.
-    /// NVML 이 없거나(CPU 모드) 조회에 실패하면 설정값을 그대로 존중합니다.
+    /// 🌟 [VRAM 역산 / PRC-06] NVML 로 현재 가용 VRAM 을 읽어 단조·결정론적인 `max_pixels` 를 계산합니다.
+    /// `LOGIS_VISION_MAX_PIXELS` 또는 `pin_adaptive_max_pixels` 가 지정되어 있으면 그 값을 우선합니다.
     fn compute_adaptive_max_pixels(&self, config_max: u32) -> u32 {
+        if let Some(fixed) = env_fixed_max_pixels() {
+            return fixed.min(config_max);
+        }
+        let pinned = PINNED_ADAPTIVE_MAX_PIXELS.load(std::sync::atomic::Ordering::Relaxed);
+        if pinned > 0 {
+            return pinned.min(config_max);
+        }
         // 🌟 [P4-F08] 비전 장치가 CPU 이면 GPU 0 의 여유 VRAM 으로 해상도를 깎지 않습니다.
         if self.device.is_cpu() {
             return config_max;
@@ -111,18 +156,15 @@ impl Qwen3VLProcessor {
         };
         let usable = free_vram.saturating_sub(VISION_VRAM_RESERVE);
         let max_patches = vision_max_patches_from_vram(usable);
+        let adaptive_px = adaptive_max_pixels_from_free_vram(free_vram, patch_area, config_max);
+
         if max_patches == 0 {
-            // VRAM 이 예약분조차 못 채우는 극한 상황. 최소 해상도로 강제합니다.
-            let floor_px = 1_048_576u32; // 1024x1024 (OCR 품질 보장)
             println!(
                 "[VISION-ADAPTIVE] Free VRAM {:.0}MB is below reserve. Forcing minimum {}px².",
-                free_vram as f64 / 1e6, floor_px
+                free_vram as f64 / 1e6, adaptive_px
             );
-            return config_max.min(floor_px);
+            return adaptive_px;
         }
-
-        let adaptive_px = (max_patches as u64).saturating_mul(patch_area);
-        let adaptive_px = if adaptive_px > u32::MAX as u64 { u32::MAX } else { adaptive_px as u32 };
 
         if adaptive_px < config_max {
             let side = (adaptive_px as f64).sqrt() as u32;
@@ -871,4 +913,30 @@ pub fn get_video_data(
         frame_indices,
     };
     Ok((frames_tensor, video_info))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_max_pixels_monotonic_around_reserve() {
+        let patch_area = 16u64 * 16u64;
+        let config_max = 4_194_304u32;
+        let mut prev = 0u32;
+        for mb in (0u64..=4096).step_by(32) {
+            let px = adaptive_max_pixels_from_free_vram(mb * 1_000_000, patch_area, config_max);
+            assert!(
+                px >= prev,
+                "non-monotonic dip at {mb} MB: prev={prev} > cur={px}"
+            );
+            assert!(px >= VISION_ADAPTIVE_FLOOR_PX);
+            assert!(px <= config_max);
+            prev = px;
+        }
+        // Specific regression check right above VISION_VRAM_RESERVE (800 MB -> 810 MB)
+        let at_800 = adaptive_max_pixels_from_free_vram(800_000_000, patch_area, config_max);
+        let at_810 = adaptive_max_pixels_from_free_vram(810_000_000, patch_area, config_max);
+        assert!(at_810 >= at_800, "dip at 810MB: {at_810} < {at_800}");
+    }
 }

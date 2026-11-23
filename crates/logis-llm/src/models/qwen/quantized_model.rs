@@ -733,8 +733,16 @@ impl QuantizedQwenVLTextAttention {
                         let cat_k = Tensor::cat(&[&pk_f, &k_piece], 2)?.contiguous()?;
                         let cat_v = Tensor::cat(&[&pv_f, &v_piece], 2)?.contiguous()?;
                         
-                        inner.k_cache = Some(if dev.is_cuda_or_rocm() { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
-                        inner.v_cache = Some(if dev.is_cuda_or_rocm() { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
+                        // PRC-04: 6만 토큰 초과 경로도 LOGIS_KV_PRECISION 정책을 존중합니다.
+                        // 스케일 없는 FP8 캐스트는 명시적 압축 모드 + LOGIS_RAW_FP8_KV=1 일 때만 허용합니다.
+                        let allow_raw_fp8 = dev.is_cuda_or_rocm()
+                            && crate::models::common::kv_turbo::kv_precision_policy()
+                                == crate::models::common::kv_turbo::KvPrecisionPolicy::Compressed
+                            && std::env::var("LOGIS_RAW_FP8_KV")
+                                .map(|v| matches!(v.trim(), "1" | "true" | "on"))
+                                .unwrap_or(false);
+                        inner.k_cache = Some(if allow_raw_fp8 { cat_k.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_k.clone()) } else { cat_k });
+                        inner.v_cache = Some(if allow_raw_fp8 { cat_v.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| cat_v.clone()) } else { cat_v });
                         
                         inner.len += take; tokens_to_process -= take; chunk_offset += take;
                         appended = true;
@@ -760,8 +768,14 @@ impl QuantizedQwenVLTextAttention {
                 let new_block = KVBlock::new(KVLocation::VRAM, index, take, current_total);
                 {
                     let mut inner = new_block.inner.write().unwrap();
-                    inner.k_cache = Some(if dev.is_cuda_or_rocm() { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece });
-                    inner.v_cache = Some(if dev.is_cuda_or_rocm() { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
+                    let allow_raw_fp8 = dev.is_cuda_or_rocm()
+                        && crate::models::common::kv_turbo::kv_precision_policy()
+                            == crate::models::common::kv_turbo::KvPrecisionPolicy::Compressed
+                        && std::env::var("LOGIS_RAW_FP8_KV")
+                            .map(|v| matches!(v.trim(), "1" | "true" | "on"))
+                            .unwrap_or(false);
+                    inner.k_cache = Some(if allow_raw_fp8 { k_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| k_piece.clone()) } else { k_piece });
+                    inner.v_cache = Some(if allow_raw_fp8 { v_piece.to_dtype(candle_core::DType::F8E4M3).unwrap_or_else(|_| v_piece.clone()) } else { v_piece });
                 }
                 
                 let mut reg = self.registry.entries.write().unwrap();
