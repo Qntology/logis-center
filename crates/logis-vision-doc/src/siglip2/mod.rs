@@ -166,18 +166,21 @@ fn text_builder(model_dir: &Path, device: &Device, dtype: DType) -> anyhow::Resu
     }
     let safetensors_path = model_dir.join("model.safetensors");
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, device)? };
-    // 🌟 [CPU EMBEDDING] 590MB 를 VRAM 에서 뺍니다.
-    let tokens = if device.is_cpu() {
-        text::TokenSource::Inline
-    } else {
-        match unsafe { VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, &Device::Cpu) } {
-            Ok(v) => text::TokenSource::Host(v.pp("text_model")),
-            Err(e) => {
-                println!(
-                    "[SigLIP2] CPU 임베딩 VarBuilder 생성 실패({}). token_embedding 을 VRAM 에 유지합니다.",
-                    e
-                );
+    // Phase 4-1 D2: Always try `MappedRows::from_safetensors` first (saves 1.18 GB RAM on CPU & Vulkan F32, 0 B VRAM/RAM).
+    let tokens = match gguf::MappedRows::from_safetensors(&safetensors_path, gguf::TOKEN_TABLE) {
+        Ok(rows) => {
+            println!("[SigLIP2] text token_embedding mapped directly from safetensors (0 B resident table RAM/VRAM).");
+            text::TokenSource::Mapped(rows)
+        }
+        Err(e) => {
+            println!("[SigLIP2] MappedRows 실패({e}) → 기존 경로로 폴백합니다.");
+            if device.is_cpu() {
                 text::TokenSource::Inline
+            } else {
+                match unsafe { VarBuilder::from_mmaped_safetensors(&[&safetensors_path], dtype, &Device::Cpu) } {
+                    Ok(v) => text::TokenSource::Host(v.pp("text_model")),
+                    Err(_) => text::TokenSource::Inline,
+                }
             }
         }
     };

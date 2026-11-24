@@ -59,9 +59,9 @@ async fn dexie_translit_lookup(
     app_handle: &crate::sink::Sink,
     word: &str,
     lang: &str,
-) -> Option<Vec<(String, String)>> {
+) -> Option<Vec<(String, String, String)>> {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(String, String)>>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(String, String, String)>>();
 
     {
         let mut map = crate::scheduler::TRANSLIT_PENDING.lock().unwrap();
@@ -110,11 +110,27 @@ async fn query_translit_cache(
 
     if let Ok(map) = TRANSLIT_MEM_CACHE.lock() {
         if let Some(hit) = map.get(&key) {
+            // Phase 3-2 D4: Allow 1-time upgrade of `"2B"`-generated cache entries once 4B is ready.
+            let prev_eng = crate::scheduler::TRANSLIT_ENGINE_CACHE
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&key).cloned())
+                .unwrap_or_default();
+            let can_upgrade = (prev_eng == "2B" || prev_eng.is_empty())
+                && crate::model::lang_llm::lang_engine_available(lang)
+                && first_recheck(word, lang, &crate::model::lang_llm::engine_tag(lang));
+            if !can_upgrade {
+                println!(
+                    "  💾 [TRANSLIT CACHE / MEM HIT] '{}' (lang='{}' engine='{}') → native='{}' | roman='{}'",
+                    word, canon, prev_eng, hit.0, hit.1
+                );
+                return Some(hit.clone());
+            }
             println!(
-                "  💾 [TRANSLIT CACHE / MEM HIT] '{}' (lang='{}') → native='{}' | roman='{}'",
-                word, canon, hit.0, hit.1
+                "  ⬆️ [TRANSLIT CACHE / 2B→4B UPGRADE] '{}' (lang='{}') — 4B 준비 완료로 1회 재평가합니다.",
+                word, canon
             );
-            return Some(hit.clone());
+            return None;
         }
     }
 
@@ -130,17 +146,31 @@ async fn query_translit_cache(
     }
     for (li, q_lang) in langs.iter().enumerate() {
         let candidates = dexie_translit_lookup(app_handle, word, q_lang).await?;
-        let hit = match candidates.first() {
+        let (nv, rm, eng) = match candidates.first() {
             Some(h) => h.clone(),
             None => continue,
         };
+        let can_upgrade = (eng == "2B" || eng.is_empty())
+            && crate::model::lang_llm::lang_engine_available(lang)
+            && first_recheck(word, lang, &crate::model::lang_llm::engine_tag(lang));
+        if can_upgrade {
+            println!(
+                "  ⬆️ [TRANSLIT CACHE / 2B→4B UPGRADE] '{}' (lang='{}' prev_engine='{}') — 4B 준비 완료로 1회 재평가합니다.",
+                word, canon, eng
+            );
+            return None;
+        }
+        let hit = (nv, rm);
         if let Ok(mut map) = TRANSLIT_MEM_CACHE.lock() {
             map.insert(key.clone(), hit.clone());
         }
+        if let Ok(mut emap) = crate::scheduler::TRANSLIT_ENGINE_CACHE.lock() {
+            emap.insert(key.clone(), eng.clone());
+        }
         if li == 0 {
             println!(
-                "  💾 [TRANSLIT CACHE / DEXIE HIT] '{}' (lang='{}') → native='{}' | roman='{}'",
-                word, canon, hit.0, hit.1
+                "  💾 [TRANSLIT CACHE / DEXIE HIT] '{}' (lang='{}' engine='{}') → native='{}' | roman='{}'",
+                word, canon, eng, hit.0, hit.1
             );
         } else {
             println!(
@@ -167,8 +197,12 @@ fn save_translit_cache(
 ) {
     let key = translit_cache_key(word, lang);
     let canon = translit_lang(lang);
+    let eng_tag = crate::model::lang_llm::engine_tag(lang);
     if let Ok(mut map) = TRANSLIT_MEM_CACHE.lock() {
-        map.insert(key, (native.to_string(), roman.to_string()));
+        map.insert(key.clone(), (native.to_string(), roman.to_string()));
+    }
+    if let Ok(mut emap) = crate::scheduler::TRANSLIT_ENGINE_CACHE.lock() {
+        emap.insert(key, eng_tag.clone());
     }
 
     if native.trim().is_empty() && roman.trim().is_empty() {

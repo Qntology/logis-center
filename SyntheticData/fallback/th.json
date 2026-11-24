@@ -1,0 +1,17 @@
+{
+  "lang": "th",
+  "tier": "extended",
+  "expected_script": "Thai",
+  "expected_can_transliterate_latin": true,
+  "expected_core12_fallback": "Base2B",
+  "samples": [
+    {
+      "id": "th-invoice-1",
+      "text": "ใบกำกับสินค้า CI-2026-5520 ผู้ส่งออก บริษัท สยามโลจิสติกส์ จำกัด สินค้า Microcontrollers 8471.30 จำนวน 1,200 กล่อง ท่าเรือแหลมฉบัง"
+    },
+    {
+      "id": "th-order-1",
+      "text": "หมายเลขคำสั่งซื้อ 20260701-9932 ผู้รับ สมชาย ใจดี ยอดรวม 4,590 บาท สถานะ จัดส่งแล้ว"
+    }
+  ]
+}

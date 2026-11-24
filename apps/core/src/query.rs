@@ -1420,7 +1420,7 @@ pub fn commerce_scope(cc: &str) -> String {
     }
 }
 
-/// 🌟 [WHOLE QUERY FUSION] 질의 전체의 벡터 · 청크 · 글자 일치 순위를 해석 결과의 순위와 합칩니다.
+/// 🌟 [WHOLE QUERY FUSION] 질의 전체의 벡터 · 청크 · 글자 일치 · FTS · Sparse 순위를 해석 결과의 순위와 합칩니다.
 pub async fn fuse_whole_query<E: Fn(&str)>(
     store: &VectorStore,
     model: &LogisModel,
@@ -1430,34 +1430,96 @@ pub async fn fuse_whole_query<E: Fn(&str)>(
     ranked: &mut Vec<Value>,
     emit: &E,
 ) -> Value {
+    fuse_whole_query_for_mode(store, model, query, language, cc, "commerce", ranked, emit).await
+}
+
+/// Phase 4-2 D3: 모드 중립 질의 전체 융합 (`commerce` · `shipping` · `all` 모두 FTS + Sparse + Dense + Literal RRF 융합).
+pub async fn fuse_whole_query_for_mode<E: Fn(&str)>(
+    store: &VectorStore,
+    model: &LogisModel,
+    query: &str,
+    language: &str,
+    cc: &str,
+    search_mode: &str,
+    ranked: &mut Vec<Value>,
+    emit: &E,
+) -> Value {
     use crate::search_fusion as sf;
     const TRACK_LIMIT: usize = 200;
     const CHUNK_LIMIT: usize = 50;
 
-    let scope = commerce_scope(cc);
+    let mode_filter_opt: Option<&str> = match search_mode {
+        "commerce" => Some("commerce"),
+        "shipping" => Some("shipping"),
+        _ => None,
+    };
+    let scope = match mode_filter_opt {
+        Some("commerce") => commerce_scope(cc),
+        Some(m) => {
+            if cc.trim().is_empty() {
+                format!("mode = '{}'", m)
+            } else {
+                format!("mode = '{}' AND cc = '{}'", m, cc.replace('\'', "''"))
+            }
+        }
+        None => {
+            if cc.trim().is_empty() {
+                "mode != 'analytic'".to_string()
+            } else {
+                format!("mode != 'analytic' AND cc = '{}'", cc.replace('\'', "''"))
+            }
+        }
+    };
+    let cc_opt = if cc.trim().is_empty() { None } else { Some(cc) };
+
+    let t_sparse = std::time::Instant::now();
     let emb = model.get_embedding(query.to_string()).await.unwrap_or_default();
     let vector_rows = store.rank_items_vector(query, &emb, TRACK_LIMIT, &scope).await.unwrap_or_default();
     let fts_rows = store.rank_items_fts(query, TRACK_LIMIT, &scope).await.unwrap_or_default();
-    let chunk_filter = if cc.trim().is_empty() {
-        "mode = 'commerce'".to_string()
+    let sparse_rows = store
+        .rank_items_sparse(query, TRACK_LIMIT, mode_filter_opt, cc_opt, None)
+        .await
+        .unwrap_or_default();
+    let sparse_ms = t_sparse.elapsed().as_secs_f32() * 1e3;
+    crate::utils::score_dynamics::record_baseline("search.sparse_ms", sparse_ms);
+
+    let chunk_rows = store.search_chunks(&emb, CHUNK_LIMIT, Some(&scope)).await.unwrap_or_default();
+    let domains = if search_mode == "commerce" {
+        sf::query_domains(query, &domain_vocabulary(language))
     } else {
-        format!("mode = 'commerce' AND cc = '{}'", cc.replace('\'', "''"))
+        Vec::new()
     };
-    let chunk_rows = store.search_chunks(&emb, CHUNK_LIMIT, Some(&chunk_filter)).await.unwrap_or_default();
-    let domains = sf::query_domains(query, &domain_vocabulary(language));
-    let type_list = domains.iter().map(|d| format!("'{}'", d.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
-    let typed_rows = store
-        .rank_items_vector(query, &emb, TRACK_LIMIT, &format!("{} AND type IN ({})", scope, type_list))
-        .await
-        .unwrap_or_default();
-    let typed_chunks = store
-        .search_chunks(&emb, CHUNK_LIMIT, Some(&format!("{} AND item_type IN ({})", chunk_filter, type_list)))
-        .await
-        .unwrap_or_default();
+    let (typed_rows, typed_chunks, typed_sparse_rows) = if !domains.is_empty() {
+        let type_list = domains.iter().map(|d| format!("'{}'", d.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+        let tr = store
+            .rank_items_vector(query, &emb, TRACK_LIMIT, &format!("{} AND type IN ({})", scope, type_list))
+            .await
+            .unwrap_or_default();
+        let tc = store
+            .search_chunks(&emb, CHUNK_LIMIT, Some(&format!("{} AND item_type IN ({})", scope, type_list)))
+            .await
+            .unwrap_or_default();
+        let ts = store
+            .rank_items_sparse(query, TRACK_LIMIT, mode_filter_opt, cc_opt, Some(&domains))
+            .await
+            .unwrap_or_default();
+        (tr, tc, ts)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
 
     let mut data_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut pool: Vec<(String, String)> = Vec::new();
-    for (id, data) in vector_rows.iter().chain(typed_rows.iter()).chain(fts_rows.iter()) {
+    for (id, data) in vector_rows
+        .iter()
+        .chain(typed_rows.iter())
+        .chain(fts_rows.iter())
+    {
+        if data_of.contains_key(id) { continue; }
+        data_of.insert(id.clone(), data.clone());
+        pool.push((id.clone(), sf::value_text(data)));
+    }
+    for (id, data, _) in sparse_rows.iter().chain(typed_sparse_rows.iter()) {
         if data_of.contains_key(id) { continue; }
         data_of.insert(id.clone(), data.clone());
         pool.push((id.clone(), sf::value_text(data)));
@@ -1465,32 +1527,43 @@ pub async fn fuse_whole_query<E: Fn(&str)>(
 
     let pipeline: Vec<String> = ranked.iter().filter_map(|r| r.get("id").and_then(|v| v.as_str()).map(str::to_string)).collect();
     let vector: Vec<String> = vector_rows.iter().map(|(id, _)| id.clone()).collect();
+    let fts: Vec<String> = fts_rows.iter().map(|(id, _)| id.clone()).collect();
+    let sparse: Vec<String> = sparse_rows.iter().map(|(id, _, _)| id.clone()).collect();
     let chunks: Vec<String> = chunk_rows.iter().map(|c| c.1.clone()).collect();
     let terms = sf::query_terms(query);
     let literal = sf::literal_ranking(&terms, &pool);
     let typed_vector: Vec<String> = typed_rows.iter().map(|(id, _)| id.clone()).collect();
     let typed_chunk_ids: Vec<String> = typed_chunks.iter().map(|c| c.1.clone()).collect();
-    let typed_literal: Vec<String> = literal
-        .iter()
-        .filter(|id| {
-            data_of
-                .get(*id)
-                .and_then(|d| serde_json::from_str::<Value>(d).map(logis_schema::json_order::sorted).ok())
-                .and_then(|d| d.get("type").and_then(|t| t.as_str()).map(|t| domains.iter().any(|x| x == t)))
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
-    let fused = sf::fuse(
-        &[
-            (pipeline.as_slice(), 1.0),
-            (vector.as_slice(), 1.0),
-            (chunks.as_slice(), 1.0),
-            (literal.as_slice(), sf::LITERAL_WEIGHT),
-            (typed_vector.as_slice(), 1.0),
-            (typed_chunk_ids.as_slice(), 1.0),
-            (typed_literal.as_slice(), 1.0),
-        ],
+    let typed_sparse: Vec<String> = typed_sparse_rows.iter().map(|(id, _, _)| id.clone()).collect();
+    let typed_literal: Vec<String> = if domains.is_empty() {
+        Vec::new()
+    } else {
+        literal
+            .iter()
+            .filter(|id| {
+                data_of
+                    .get(*id)
+                    .and_then(|d| serde_json::from_str::<Value>(d).map(logis_schema::json_order::sorted).ok())
+                    .and_then(|d| d.get("type").and_then(|t| t.as_str()).map(|t| domains.iter().any(|x| x == t)))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    };
+    let fused = sf::fuse_query_tracks(
+        &sf::FusionTracks {
+            pipeline: pipeline.as_slice(),
+            vector: vector.as_slice(),
+            chunks: chunks.as_slice(),
+            literal: literal.as_slice(),
+            fts: fts.as_slice(),
+            sparse: sparse.as_slice(),
+            typed_vector: typed_vector.as_slice(),
+            typed_chunks: typed_chunk_ids.as_slice(),
+            typed_literal: typed_literal.as_slice(),
+            typed_sparse: typed_sparse.as_slice(),
+            vision: &[],
+        },
         sf::FUSION_K,
     );
 
@@ -1519,12 +1592,14 @@ pub async fn fuse_whole_query<E: Fn(&str)>(
     }
     crate::utils::score_dynamics::record_baseline("search.fusion_added", added as f32);
     emit(&format!(
-        "[AI-SEARCH] 🧮 [WHOLE QUERY FUSION] 질의 유형 {:?} | 해석 {}건 · 질의 벡터 {}건 · 청크 {}건 · 글자 일치 {}건을 합쳐 {}건 (새로 들어온 문서 {}건)",
-        domains, pipeline.len(), vector.len(), chunks.len(), literal.len(), ranked.len(), added
+        "[AI-SEARCH] 🧮 [WHOLE QUERY FUSION/{}] 유형 {:?} | 해석 {} · 벡터 {} · 청크 {} · FTS {} · Sparse {} · 글자일치 {} → {}건 (+{}건)",
+        search_mode, domains, pipeline.len(), vector.len(), chunks.len(), fts.len(), sparse.len(), literal.len(), ranked.len(), added
     ));
     json!({
-        "pipeline": pipeline, "vector": vector, "chunks": chunks, "literal": literal,
-        "domains": domains, "typed_vector": typed_vector, "typed_chunks": typed_chunk_ids
+        "mode": search_mode, "pipeline": pipeline, "vector": vector, "chunks": chunks,
+        "fts": fts, "sparse": sparse, "literal": literal,
+        "domains": domains, "typed_vector": typed_vector, "typed_chunks": typed_chunk_ids,
+        "typed_sparse": typed_sparse
     })
 }
 
@@ -2489,11 +2564,9 @@ pub async fn ai_search_complex(
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            // ── 5-D2: 질의 전체 트랙과 합칩니다 (search_fusion 모듈 설명 참조) ──
-            if search_mode == "commerce" {
-                if let Some(store) = store_opt.as_ref() {
-                    fusion_trace = fuse_whole_query(store, &model, &query, &language, &cc, &mut ranked_results, &emit_term).await;
-                }
+            // ── 5-D2: 질의 전체 트랙과 합칩니다 (Phase 4-2 D3: commerce · shipping · all 모드 모두 적용) ──
+            if let Some(store) = store_opt.as_ref() {
+                fusion_trace = fuse_whole_query_for_mode(store, &model, &query, &language, &cc, &search_mode, &mut ranked_results, &emit_term).await;
             }
 
             // ── 5-E: 프론트엔드 응답 포맷 확정 ──

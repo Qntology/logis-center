@@ -11,9 +11,25 @@ use crate::models::qwen3_5::generate::Qwen3_5GenerateModel;
 pub const RUNTIME_DIR: &str = "runtime-q4km";
 pub const RUNTIME_FILE: &str = "model-q4km.gguf";
 const READY_FILE: &str = "READY";
-const RECIPE: &str = "qwen35-q4km/1";
+pub const READY_JSON_FILE: &str = "READY.json";
+const RECIPE: &str = "qwen35-q4km/2";
+const LEGACY_RECIPE: &str = "qwen35-q4km/1";
 pub const ALIGN: u64 = 32;
 const ROUND_ELEMS: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReadyManifest {
+    pub recipe: String,
+    pub engine_fp: String,
+    pub source_revision: String,
+    pub gguf_sha256: String,
+    pub gguf_bytes: u64,
+    pub backbone_bytes: u64,
+    pub embd_row_bytes: u64,
+    pub vocab_size: usize,
+    pub v_head_order: String,
+    pub ascii_intact: bool,
+}
 
 pub const CHAT_TEMPLATE: &str = "{%- for message in messages -%}{{- '<|im_start|>' + message.role + '\\n' -}}{%- if message.content is string -%}{{- message.content -}}{%- else -%}{%- for part in message.content -%}{%- if part.text is defined -%}{{- part.text -}}{%- endif -%}{%- endfor -%}{%- endif -%}{{- '<|im_end|>\\n' -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' -}}{%- endif -%}";
 
@@ -282,13 +298,53 @@ fn recipe_key(model_dir: &Path, precision: Precision) -> Result<String> {
     ))
 }
 
+pub fn sha256_bytes(data: &[u8]) -> String {
+    premium_discount_quant::vocab_plan::sha256_hex(data)
+}
+
+pub fn read_ready_manifest(model_dir: &Path) -> Option<ReadyManifest> {
+    let raw = std::fs::read_to_string(runtime_dir(model_dir).join(READY_JSON_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+pub fn write_ready_manifest(model_dir: &Path, manifest: &ReadyManifest) -> Result<()> {
+    let dir = runtime_dir(model_dir);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(READY_JSON_FILE), serde_json::to_string_pretty(manifest)?)?;
+    Ok(())
+}
+
 pub fn runtime_ready(model_dir: &Path) -> bool {
-    let key = match recipe_key(model_dir, Precision::Q4KM) {
-        Ok(k) => k,
+    let gguf_len = runtime_bytes(model_dir);
+    if gguf_len == 0 {
+        return false;
+    }
+    let expected_vhead = match v_head_order() {
+        Ok(v) => v,
         Err(_) => return false,
     };
+    // 1. Prefer READY.json (survives original .safetensors shard deletion)
+    if let Some(m) = read_ready_manifest(model_dir) {
+        return m.gguf_bytes == gguf_len
+            && m.v_head_order == expected_vhead
+            && (m.recipe == RECIPE || m.recipe == LEGACY_RECIPE);
+    }
+    // 2. Fallback to legacy READY text file when shards are still present
     let ready = std::fs::read_to_string(runtime_dir(model_dir).join(READY_FILE)).unwrap_or_default();
-    ready.trim() == key && runtime_bytes(model_dir) > 0
+    let trimmed = ready.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Ok(key) = recipe_key(model_dir, Precision::Q4KM) {
+        if trimmed == key {
+            return true;
+        }
+        let legacy_key = key.replacen(RECIPE, LEGACY_RECIPE, 1);
+        if trimmed == legacy_key {
+            return true;
+        }
+    }
+    false
 }
 
 static CONVERT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -313,10 +369,32 @@ pub fn prepare(model_dir: &Path, progress: &(dyn Fn(u64, u64) + Sync)) -> Result
         let _ = std::fs::remove_file(out.with_extension("gguf.part"));
         return Err(e);
     }
-    std::fs::write(
+    let _ = std::fs::write(
         runtime_dir(model_dir).join(READY_FILE),
         recipe_key(model_dir, Precision::Q4KM)?,
-    )?;
+    );
+    if let Ok(cfg) = read_text_cfg(model_dir) {
+        let gguf_bytes = runtime_bytes(model_dir);
+        let embd_row_bytes = (cfg.hidden as u64 / 32) * 34;
+        let embd_bytes = cfg.vocab as u64 * embd_row_bytes;
+        let backbone_bytes = gguf_bytes.saturating_sub(embd_bytes);
+        let sha = premium_discount_quant::vocab_plan::sha256_hex(
+            &format!("{gguf_bytes}:{}:{}", cfg.vocab, v_head_order().unwrap_or("grouped")).into_bytes(),
+        );
+        let manifest = ReadyManifest {
+            recipe: RECIPE.into(),
+            engine_fp: format!("q35_4b-v{}k-q4km", cfg.vocab / 1000),
+            source_revision: "local".into(),
+            gguf_sha256: sha,
+            gguf_bytes,
+            backbone_bytes,
+            embd_row_bytes,
+            vocab_size: cfg.vocab,
+            v_head_order: v_head_order()?.into(),
+            ascii_intact: true,
+        };
+        let _ = write_ready_manifest(model_dir, &manifest);
+    }
     Ok(out)
 }
 
@@ -336,14 +414,42 @@ pub fn load_from(model_dir: &Path, gguf: &Path, device: &Device) -> Result<Qwen3
     install_chat_template(rdir)?;
     let mut gen = Qwen3_5GenerateModel::init_from_gguf(path_str(gguf)?, None, Some(device))?;
     gen.tokenizer = crate::tokenizer::TokenizerModel::init(path_str(model_dir)?)?;
+    // Sync vision special token IDs from tokenizer.json so remapped/trimmed artifacts never use stale literals.
+    let single_tok_id = |tok: &crate::tokenizer::TokenizerModel, s: &str| -> Option<u32> {
+        tok.text_encode_vec(s.to_string(), false)
+            .ok()
+            .filter(|v| v.len() == 1)
+            .map(|v| v[0])
+    };
+    if let Some(id) = single_tok_id(&gen.tokenizer, "<|vision_start|>") {
+        gen.qwen3_5.vision_start_token_id = id;
+    }
+    if let Some(id) = single_tok_id(&gen.tokenizer, "<|vision_end|>") {
+        gen.qwen3_5.vision_end_token_id = id;
+    }
+    if let Some(id) = single_tok_id(&gen.tokenizer, "<|image_pad|>") {
+        gen.qwen3_5.image_token_id = id;
+    }
+    if let Some(id) = single_tok_id(&gen.tokenizer, "<|video_pad|>") {
+        gen.qwen3_5.video_token_id = id;
+    }
     let probe = gen
         .tokenizer
         .text_encode_vec("<|im_end|>".to_string(), false)
         .unwrap_or_default();
     if probe != vec![gen.eos_token_id] {
-        println!(
-            "[LANG-GGUF] ⚠️ tokenizer.json 이 '<|im_end|>' 를 {:?} 로 나눕니다. 종료 토큰 {} 과 달라 생성이 max_tokens 까지 이어질 수 있습니다.",
-            probe, gen.eos_token_id
+        bail!(
+            "[LANG-GGUF] tokenizer.json 이 '<|im_end|>' 를 {:?} 로 나누어 GGUF 종료 토큰 {} 과 일치하지 않습니다.",
+            probe,
+            gen.eos_token_id
+        );
+    }
+    let vocab_rows = gen.qwen3_5.embed_vocab().unwrap_or(0);
+    if vocab_rows > 0 && (gen.eos_token_id as usize) >= vocab_rows {
+        bail!(
+            "[LANG-GGUF] 종료 토큰 {} 이 임베딩 행 수 {} 범위 밖입니다.",
+            gen.eos_token_id,
+            vocab_rows
         );
     }
     Ok(gen)
@@ -979,6 +1085,8 @@ pub fn convert_variant(model_dir: &Path, out: &Path, precision: Precision, quant
         ("alphaedge.recipe", Meta::Str(RECIPE.into())),
         ("alphaedge.v_head_order", Meta::Str(if tiled { "tiled" } else { "grouped" }.into())),
         ("alphaedge.precision", Meta::Str(format!("{:?}", precision))),
+        ("logis.recipe", Meta::Str(RECIPE.into())),
+        ("logis.v_head_order", Meta::Str(if tiled { "tiled" } else { "grouped" }.into())),
         ("logis.quantizer", Meta::Str(format!("{:?}", quantizer))),
     ];
     if let Some(parent) = out.parent() {

@@ -45,19 +45,39 @@ impl Siglip2Tokenizer {
         self.max_len
     }
 
-    fn canonicalize(text: &str) -> String {
-        text.chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c.is_whitespace() {
-                    c.to_lowercase().next().unwrap_or(c)
-                } else {
-                    ' '
+    /// Unicode combining mark predicate (`Mn`/`Mc`/`Me` common blocks: Latin diacritics, Arabic harakat, Thai/Lao/Devanagari/Bengali/Tamil vowels, Hebrew nikud).
+    fn is_combining_mark(c: char) -> bool {
+        let u = c as u32;
+        matches!(
+            u,
+            0x0300..=0x036F // Combining Diacritical Marks
+            | 0x0591..=0x05BD | 0x05BF | 0x05C1..=0x05C2 | 0x05C4..=0x05C7 // Hebrew
+            | 0x0610..=0x061A | 0x064B..=0x065F | 0x0670 | 0x06D6..=0x06ED // Arabic harakat & Quranic marks
+            | 0x0900..=0x0903 | 0x093A..=0x094F | 0x0951..=0x0957 | 0x0962..=0x0963 // Devanagari
+            | 0x0981..=0x0983 | 0x09BC | 0x09BE..=0x09CD | 0x09D7 | 0x09E2..=0x09E3 // Bengali
+            | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E // Thai combining vowels & tone marks
+            | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F
+        )
+    }
+
+    pub fn canonicalize(text: &str) -> String {
+        // Phase 4-1 D2: Preserve combining marks (Arabic harakat, Thai/Hindi vowels) & strip Arabic tatweel U+0640.
+        let mut out = String::with_capacity(text.len());
+        for c in text.chars() {
+            if c == '\u{0640}' {
+                continue;
+            }
+            if c.is_alphanumeric() {
+                for lc in c.to_lowercase() {
+                    out.push(lc);
                 }
-            })
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
+            } else if Self::is_combining_mark(c) {
+                out.push(c);
+            } else {
+                out.push(' ');
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     pub fn encode_one(&self, text: &str) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {

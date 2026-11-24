@@ -13,6 +13,8 @@ pub mod gguf;
 pub mod kv_turbo;
 // 🌟 [ACCEL-CHECK] GPU 가속 커널(FlashAttention / TurboQuant) 자가 검증과 실측 정확도 감시
 pub mod accel_check;
+pub mod prejudice;
+pub mod reflection_gate;
 pub mod vision_prune;
 pub mod vocab_trim;
 
@@ -1356,7 +1358,8 @@ impl QKNormAttention {
                 return Ok(attn_output.apply(&self.o_proj)?);
             }
             if !self.has_plain_kv() && self.has_turbo_kv() {
-                self.set_plain_kv(self.take_turbo_kv()?);
+                let kv = self.take_turbo_kv()?;
+                self.set_plain_kv(kv);
             }
         }
 

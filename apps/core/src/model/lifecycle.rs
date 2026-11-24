@@ -1369,7 +1369,14 @@ impl LogisModel {
             Some(c) => c,
             None => return verdict,
         };
-        if matches!(step, "list_field" | "detail_field") && crate::utils::resources::free_ram_bytes() <= 6_000_000_000 {
+        // Phase 3-2 D2: Replace hardcoded 6 GB RAM blocker with `RAM_PRESSURE_MARGIN_BYTES` (1.5 GB) + VRAM + decode_resident_ratio check.
+        const RAM_PRESSURE_MARGIN_BYTES: u64 = 1_500_000_000;
+        let decode_res_ratio = crate::utils::score_dynamics::adaptive_recent("qwen35.decode_resident_ratio")
+            .map(|(r, _, _)| r)
+            .unwrap_or(1.0);
+        if matches!(step, "list_field" | "detail_field")
+            && (crate::utils::resources::free_ram_bytes() < RAM_PRESSURE_MARGIN_BYTES || decode_res_ratio < 0.95)
+        {
             let synthesis_note = match step {
                 "list_field" => "목록의 요약 필드는 목록 끝 요약 패스(commerce.list_synthesis)에서 엔진을 따로 판정합니다",
                 "detail_field" => "상세의 요약 필드는 상세 추출이 끝난 뒤 요약 패스(commerce.detail_synthesis)에서 엔진을 따로 판정합니다",
@@ -1380,9 +1387,9 @@ impl LogisModel {
                 step,
                 Some(&code),
                 &format!(
-                    "아이템마다 반복되는 필드 추출은 여유 RAM 6GB 초과일 때만 4B 로 보냅니다 (여유 RAM {:.1}GB). 디코딩 층 상주는 CUDA 에서 VRAM 기준으로 판정하도록 바뀌었지만([DECODE-RESIDENT] 줄), 이 라우팅은 그 판정이 Vram 으로 나오는 비율과 요약 호출 시간(commerce.synthesis_call_ms.lang4b)을 다음 실행에서 본 뒤에 옮깁니다. 4B 가 상주하지 못하면 토큰마다 층 가중치 약 {}MB 를 다시 읽어 호출당 시간이 Qwen3 0.6B 보다 여러 배 깁니다. 원문 값을 글자 그대로 옮기는 필드 추출은 다국어 Qwen3 로 둡니다. {}",
+                    "여유 RAM {:.2}GB (최소 1.5GB) 또는 4B 디코드 상주율 {:.2} (<0.95) 미달로 필드 추출은 Qwen3 로 둡니다. {}",
                     crate::utils::resources::free_ram_bytes() as f64 / 1_000_000_000.0,
-                    lang_llm::resident_estimate_mb(&code),
+                    decode_res_ratio,
                     synthesis_note
                 ),
             );

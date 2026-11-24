@@ -276,27 +276,31 @@ async fn context_step(ctx: &mut Ctx, env: &Env) -> R<()> {
 
     console_log!("context.text", context.g("text")?);
 
-    // Client App 이 보낸 질의 벡터를 먼저 쓴다
+    // Client App 이 보낸 질의 벡터를 먼저 쓴다 (Phase 4-1 D3: 384-dim granite-r2 유한 벡터 가드)
+    const EXPECTED_EMBED_DIM: usize = 384;
     let qv = task.g("queryVector")?;
-    if qv.truthy() && qv.is_arr() && qv.g("length")?.truthy() {
-        ctx.queryVector = task.g("queryVector")?;
-        console_log!("[EMBED-CLIENT] Using client-side query vector. dim =", ctx.queryVector.g("length")?);
+    if qv.truthy() && qv.is_arr() {
+        let dim = qv.g("length")?.to_f64() as usize;
+        let mut all_finite = dim == EXPECTED_EMBED_DIM;
+        if all_finite {
+            for idx in 0..dim {
+                if !qv.gi(idx)?.to_f64().is_finite() {
+                    all_finite = false;
+                    break;
+                }
+            }
+        }
+        if all_finite {
+            ctx.queryVector = qv;
+            console_log!("[EMBED-CLIENT] Using client-side query vector. dim =", dim);
+        } else {
+            console_log!("[WORKER-EMBED-GUARD] Rejecting invalid client queryVector (dim =", dim, ", expected 384 finite)");
+        }
     }
 
-    if !ctx.queryVector.truthy() && models.g("cloudflare")?.truthy() {
-        ctx.embeddings = env.ai_run("@cf/google/embeddinggemma-300m", &obj! { "text" => vec![context.g("text")?] }).await?;
-        ctx.queryVector = ctx.embeddings.g("data")?.gi(0)?;
-        models_dec(&models, &V::from("cloudflare"))?;
-    }
-
-    if !ctx.queryVector.truthy() && models.g("deepinfra")?.truthy() {
-        ctx.embeddings =
-            llm::deepinfra(&ctx.deepinfra, &V::from("google/embeddinggemma-300m"), &V::from(""), &context.g("text")?, &V::Undef, &V::Undef).await?;
-        ctx.queryVector = ctx.embeddings.clone();
-        models_dec(&models, &V::from("deepinfra"))?;
-    }
-
+    // Phase 4-1 D3: Do NOT fall back to 768-dim `embeddinggemma-300m` (incompatible with 384-dim granite-97m-r2 space).
     if !ctx.queryVector.truthy() {
+        console_log!("[WORKER-EMBED-GUARD] Missing/invalid 384-dim client queryVector -> overflow (skipping incompatible embeddinggemma-300m)");
         ctx.fallback = V::from("overflow");
         return Ok(());
     }

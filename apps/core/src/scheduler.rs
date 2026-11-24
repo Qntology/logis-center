@@ -37,10 +37,13 @@ pub use entity::{normalize_entity_key, entity_index, entity_id, entity_bcc, enti
 // 진행 채널은 모델(Qwen 생성 루프)도 보내므로 crates/logis-llm 에 있습니다. 여기서 처음 채웁니다(worker).
 pub use logis_llm::progress::PROGRESS_TX;
 
-pub static TRANSLIT_PENDING: Lazy<StdMutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<(String, String)>>>>> =
+pub static TRANSLIT_PENDING: Lazy<StdMutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<Vec<(String, String, String)>>>>> =
     Lazy::new(|| StdMutex::new(std::collections::HashMap::new()));
 
 pub static TRANSLIT_MEM_CACHE: Lazy<StdMutex<std::collections::HashMap<String, (String, String)>>> =
+    Lazy::new(|| StdMutex::new(std::collections::HashMap::new()));
+
+pub static TRANSLIT_ENGINE_CACHE: Lazy<StdMutex<std::collections::HashMap<String, String>>> =
     Lazy::new(|| StdMutex::new(std::collections::HashMap::new()));
 
 fn best_thead_th_dbg(sel: &str, html: &str) -> usize {
@@ -688,13 +691,12 @@ pub async fn process_task(
         let image_path = task_data.get("image_path").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if !image_path.is_empty() {
             println!("[Scheduler] Starting Image Extraction for {}", task.id);
-            if let Some(line) = crate::model::lang_llm::prefetch("korean", app_handle, &task.id) {
-                emit_term(&format!("[Scheduler] {}", line));
-            }
+            // Phase 3-2 D4: Removed hardcoded `prefetch("korean")` & `"korean"` override;
+            // language is auto-detected from first image reads in `vision.rs` and prefetched there.
             model.extract_from_image(
                 task.id.clone(),
                 image_path,
-                "korean".to_string(),
+                "auto".to_string(),
                 search_mode,
                 app_handle,
                 Some(cancellation_token.clone()),

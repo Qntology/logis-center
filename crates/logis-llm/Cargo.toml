@@ -45,8 +45,9 @@ minijinja = "2.12.0"
 nvml-wrapper = "0.9.0"
 once_cell.workspace = true
 # granite 임베딩의 ModernBERT 인코더(예전 ForwardMode::Exact 순전파, 연산 그대로)는 premium-discount-nlp 에 있습니다 (models/embedding.rs).
+premium-discount-manifest.workspace = true
 premium-discount-nlp = { workspace = true, features = ["granite"] }
-premium-discount-quant.workspace = true
+premium-discount-quant = { workspace = true, features = ["mine"] }
 rand = "0.8"
 rayon = "1.10"
 safetensors = "0.4"

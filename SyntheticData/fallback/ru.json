@@ -1,0 +1,17 @@
+{
+  "lang": "ru",
+  "tier": "extended",
+  "expected_script": "Cyrillic",
+  "expected_can_transliterate_latin": true,
+  "expected_core12_fallback": "Base2B",
+  "samples": [
+    {
+      "id": "ru-invoice-1",
+      "text": "Коммерческий счёт CI-2026-4410. Грузоотправитель: ООО Северная Логистика. Товар: T-Shirt Cotton 100%, 500 шт. Код ТН ВЭД 6109.10."
+    },
+    {
+      "id": "ru-order-1",
+      "text": "Заказ № 20260701-8821. Покупатель: Иван Петров. Сумма: 12 500 руб. Статус: Доставлено."
+    }
+  ]
+}

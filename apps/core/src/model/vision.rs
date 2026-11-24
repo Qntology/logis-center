@@ -27,6 +27,11 @@ impl crate::model::LogisModel {
         cancel_token: Option<Arc<AtomicBool>>,
         store_mutex: &Arc<tokio::sync::Mutex<Option<crate::store::VectorStore>>>,
     ) -> anyhow::Result<()> {
+        let mut language = if language.eq_ignore_ascii_case("auto") || language.trim().is_empty() {
+            "english".to_string()
+        } else {
+            language
+        };
         let app_handle_clone = app_handle.clone();
         let task_id_clone = task_id.clone();
         let emit_term = move |msg: &str| {
@@ -4062,6 +4067,15 @@ impl crate::model::LogisModel {
                         .map_or(true, |s| s.trim().is_empty());
                     if root_empty {
                         obj.insert("currency".to_string(), json!(c));
+                    }
+                }
+                // Phase 3-2 D4: Auto-detect document language from extracted values and defer 4B prefetch.
+                let extracted_sample = extracted_data.to_string();
+                let detected = crate::utils::lang_utils::detect_document_language(&extracted_sample);
+                if !detected.is_empty() && detected != "en" {
+                    language = detected.clone();
+                    if let Some(line) = crate::model::lang_llm::prefetch(&detected, app_handle, &task_id) {
+                        emit_term(&format!("[Vision] {}", line));
                     }
                 }
                 crate::scheduler::trading::normalize_trading_data(&mut extracted_data, &language);

@@ -1120,13 +1120,15 @@ pub fn can_transliterate(
 ) -> bool {
     let src_latin = is_latin_dominant(value);
     if src_latin {
-        // 라틴 원문 → 비라틴 문서 언어에서만 음차 가능
+        // 라틴 원문 → 비라틴 문서 언어에서만 음차 가능 (Phase 3-2 D1: static lang_spec 우선 → ru/th/ar/hi 정확 판정)
+        if let Some(spec) = crate::scripts::lang_spec(doc_lang) {
+            return !spec.latin_dominant;
+        }
         let sample = native_script_sample(doc_lang, "", "");
         if sample.trim().is_empty() { return false; }
         !is_latin_dominant(&sample)
     } else {
         // 비라틴 원문 → 로마자(라틴)는 항상 성립
-        // any_ascii 로 처리 가능 여부 확인 (실패해도 LLM 폴백이 있으므로 true)
         true
     }
 }

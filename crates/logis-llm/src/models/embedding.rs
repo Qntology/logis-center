@@ -65,24 +65,57 @@ pub fn batched_enabled(device: &Device) -> bool {
 
 
 
+/// Embedding table loading mode (`LOGIS_EMBED_TABLE=mapped|resident`, default `mapped` — saves 192 MB GPU VRAM / 384 MB CPU RAM, E0 bit-exact).
+pub fn embed_table_mapped() -> bool {
+    !matches!(
+        std::env::var("LOGIS_EMBED_TABLE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "resident" | "0" | "off" | "false"
+    )
+}
+
+/// Optional chunk overlap for long embedding inputs (`LOGIS_EMBED_CHUNK_OVERLAP`, default `0`, e.g. `64`).
+pub fn embed_chunk_overlap() -> usize {
+    std::env::var("LOGIS_EMBED_CHUNK_OVERLAP")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|v| v.min(256))
+        .unwrap_or(0)
+}
+
 /// EmbeddingModel::forward_pieces 의 본체(모델 없이 검증할 수 있게 떼어 냈습니다).
 pub(crate) fn split_forward_pieces(ids: &[u32], special_mask: &[u32], rewrap: bool) -> Vec<Vec<u32>> {
+    split_forward_pieces_with_overlap(ids, special_mask, rewrap, embed_chunk_overlap())
+}
+
+pub(crate) fn split_forward_pieces_with_overlap(ids: &[u32], special_mask: &[u32], rewrap: bool, overlap: usize) -> Vec<Vec<u32>> {
     let n = ids.len();
     let wrapped = n >= 2 && special_mask.first() == Some(&1) && special_mask.last() == Some(&1);
     if n <= EMBED_CHUNK_TOKENS || !rewrap || !wrapped {
         return ids.chunks(EMBED_CHUNK_TOKENS).map(|c| c.to_vec()).collect();
     }
     let (head, tail) = (ids[0], ids[n - 1]);
-    ids[1..n - 1]
-        .chunks(EMBED_CHUNK_TOKENS - 2)
-        .map(|body| {
-            let mut piece = Vec::with_capacity(body.len() + 2);
-            piece.push(head);
-            piece.extend_from_slice(body);
-            piece.push(tail);
-            piece
-        })
-        .collect()
+    let body_all = &ids[1..n - 1];
+    let max_body = EMBED_CHUNK_TOKENS - 2;
+    let step = max_body.saturating_sub(overlap).max(1);
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < body_all.len() {
+        let end = (pos + max_body).min(body_all.len());
+        let mut piece = Vec::with_capacity(end - pos + 2);
+        piece.push(head);
+        piece.extend_from_slice(&body_all[pos..end]);
+        piece.push(tail);
+        out.push(piece);
+        if end == body_all.len() {
+            break;
+        }
+        pos += step;
+    }
+    out
 }
 
 
@@ -326,10 +359,35 @@ impl FloatModel {
     }
 
     pub fn new_with_mode(cfg: &Config, vb: VarBuilder, device: &Device, mode: ForwardMode) -> candle_core::Result<Self> {
+        Self::new_with_mode_and_path(cfg, vb, None, device, mode)
+    }
+
+    pub fn new_with_mode_and_path(
+        cfg: &Config,
+        vb: VarBuilder,
+        weights_path: Option<&Path>,
+        device: &Device,
+        mode: ForwardMode,
+    ) -> candle_core::Result<Self> {
         if mode.is_exact() {
-            // MLP 의 silu(gate)·up 을 이 앱의 CPU 병렬 커널로 (candle 과 같은 비트, CPU 가 아니면 candle 연산)
+            // MLP 의 silu(gate)·up 을 이 앱의 CPU 병렬 커널로 (granite.rs 가 GPU 는 융합 silu_mul 로 라우팅)
             granite::set_glu_kernel(cpu_par::silu_mul_halves);
-            let encoder = granite::Encoder::load(&exact_encoder_config(cfg), vb, device)?;
+            let enc_cfg = exact_encoder_config(cfg);
+            let encoder = if embed_table_mapped() {
+                if let Some(wp) = weights_path {
+                    match granite::Encoder::load_mapped(&enc_cfg, vb.clone(), wp, device) {
+                        Ok(enc) => enc,
+                        Err(e) => {
+                            println!("[EMBED-LOAD] ⚠️ MappedTable 로드 실패 ({e}) → 상주 테이블로 폴백");
+                            granite::Encoder::load(&enc_cfg, vb, device)?
+                        }
+                    }
+                } else {
+                    granite::Encoder::load(&enc_cfg, vb, device)?
+                }
+            } else {
+                granite::Encoder::load(&enc_cfg, vb, device)?
+            };
             return Ok(Self { body: Body::Exact(encoder), mode });
         }
         // CPU 강제 할당을 제거하고 전달받은 디바이스(VRAM)와 데이터 타입(BF16)을 그대로 사용합니다.
@@ -549,11 +607,23 @@ impl EmbeddingModel {
     /// 🌟 [EMBED-FORWARD] 순전파 판본을 직접 고릅니다(검증 · 이관 실험용). 앱 경로는 new_with_device 를 씁니다.
     pub fn new_with_device_and_mode<P: AsRef<Path>>(model_path: P, device: &Device, mode: ForwardMode) -> Result<Self> {
         let model_path = model_path.as_ref();
-        let config_path = model_path.join("config.json");
-        let tokenizer_path = model_path.join("tokenizer.json");
-        let weights_path = model_path.join("model.safetensors");
+        let variant = std::env::var("LOGIS_EMBED_VARIANT").unwrap_or_default();
+        let variant_dir = if !variant.trim().is_empty() && !variant.trim().eq_ignore_ascii_case("full") {
+            let sub = model_path.join(variant.trim());
+            if sub.join("model.safetensors").exists() && sub.join("config.json").exists() {
+                sub
+            } else {
+                model_path.to_path_buf()
+            }
+        } else {
+            model_path.to_path_buf()
+        };
+        let config_path = variant_dir.join("config.json");
+        let tokenizer_path = variant_dir.join("tokenizer.json");
+        let weights_path = variant_dir.join("model.safetensors");
 
-        println!("[EmbeddingModel] Loading on {:?}...", device);
+        let t0 = std::time::Instant::now();
+        println!("[EmbeddingModel] Loading on {:?} (dir={:?})...", device, variant_dir);
 
         let config_str = std::fs::read_to_string(config_path)?;
         let config: Config = serde_json::from_str(&config_str)?;
@@ -564,13 +634,61 @@ impl EmbeddingModel {
         let model = if weights_path.exists() {
              println!("[EmbeddingModel] Loading Safetensors model from {:?}", weights_path);
              let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights_path.clone()], dtype, device).map_err(anyhow::Error::msg)? };
-             FloatModel::new_with_mode(&config, vb, device, mode).map_err(anyhow::Error::msg)?
+             FloatModel::new_with_mode_and_path(&config, vb, Some(&weights_path), device, mode).map_err(anyhow::Error::msg)?
         } else {
             return Err(anyhow!("No valid model found (looked for model.safetensors)"));
         };
+        let (is_mapped, mapped_bytes) = match &model.body {
+            Body::Exact(enc) => (enc.is_mapped(), enc.mapped_table_bytes()),
+            Body::Legacy(_) => (false, 0),
+        };
+        println!(
+            "[EMBED-LOAD] table={} mapped_mb={:.1} vocab={} hidden={} dtype={:?} load_ms={:.0}",
+            if is_mapped { "mapped" } else { "resident" },
+            mapped_bytes as f64 / 1e6,
+            config.vocab_size,
+            config.hidden_size,
+            dtype,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        if logis_schema::reflection::ReflectionLogMode::from_env() != logis_schema::reflection::ReflectionLogMode::Off {
+            let rec = logis_schema::reflection::ReflectionRecord {
+                ts_ms: logis_schema::reflection::current_ts_ms(),
+                run_id: logis_schema::reflection::current_run_id(),
+                task_id: "embedding".into(),
+                git_rev: option_env!("LOGIS_GIT_REV").unwrap_or("dev").into(),
+                build_profile: logis_schema::reflection::build_profile_label(),
+                features: Vec::new(),
+                backend: text_cache::device_class(device).into(),
+                device_name: format!("{:?}", device),
+                artifact: logis_schema::reflection::ArtifactReflection {
+                    slot: "granite_embed_97m_r2".into(),
+                    bytes: std::fs::metadata(&weights_path).map(|m| m.len()).unwrap_or(0),
+                    sha256_16: String::new(),
+                    recipe: format!("{dtype:?}"),
+                    vocab_v: config.vocab_size as u32,
+                    artifact_k: config.vocab_size as u32,
+                    plan_sha256: None,
+                    space_tag: Some(text_cache::FORWARD_TAG_BATCHED.into()),
+                },
+                load: Some(logis_schema::reflection::LoadReflection {
+                    load_ms: t0.elapsed().as_secs_f32() * 1e3,
+                    vram_before_mb: 0.0,
+                    vram_after_mb: 0.0,
+                    table_mode: if is_mapped { "mapped".into() } else { "resident".into() },
+                    resident_table_mb: if is_mapped { 0.0 } else { (config.vocab_size * config.hidden_size * dtype.size_in_bytes()) as f32 / 1e6 },
+                    mapped_table_mb: mapped_bytes as f32 / 1e6,
+                    env_overrides: Vec::new(),
+                    accel_fallbacks: crate::models::common::accel_check::recorded_fallbacks(device),
+                    route_block_reason: None,
+                }),
+                exec: None,
+            };
+            logis_schema::reflection::record(&rec);
+        }
 
         // 🌟 [EMBED-CACHE] 모델 파일이 바뀌었으면 캐시 공간을 새 지문으로 넘깁니다.
-        text_cache::refresh_fingerprint(model_path, text_cache::device_class(device));
+        text_cache::refresh_fingerprint(&variant_dir, text_cache::device_class(device));
 
         let pad_id = config.pad_token_id.unwrap_or(0) as u32;
         Ok(Self { model, tokenizer, device: device.clone(), dtype, pad_id })
@@ -642,6 +760,50 @@ impl EmbeddingModel {
 
         let refs: Vec<&[f32]> = chunk_vectors.iter().map(|v| v.as_slice()).collect();
         Ok(aggregate_chunk_vectors(&refs))
+    }
+
+    /// Phase 4-2 D2: Shared-backbone dense CLS embedding + optional neural/BM25 sparse weights.
+    /// Guarantees dense vector is bit-identical (`E0`) to `embed(text)`.
+    pub fn embed_with_sparse(
+        &self,
+        text: &str,
+        mlm_head: Option<&crate::models::sparse::SparseMlmHead>,
+        is_query: bool,
+    ) -> Result<(Vec<f32>, Vec<(u32, f32)>)> {
+        let tokens = self.tokenizer.encode(text, true).map_err(anyhow::Error::msg)?;
+        let token_ids = tokens.get_ids();
+        if token_ids.is_empty() {
+            return Ok((vec![0.0; EMBED_DIM], Vec::new()));
+        }
+        let sparse_cfg = crate::models::sparse::SparseConfig::default();
+        let top_k = if is_query { sparse_cfg.top_k_query } else { sparse_cfg.top_k_doc };
+
+        let mut chunk_vectors: Vec<Vec<f32>> = Vec::new();
+        let mut sparse_windows: Vec<Vec<(u32, f32)>> = Vec::new();
+        for chunk in self.forward_pieces(token_ids, tokens.get_special_tokens_mask()) {
+            let input_tensor = Tensor::new(chunk.as_slice(), &self.device).map_err(anyhow::Error::msg)?;
+            let hidden_states = self.model.forward(&input_tensor, &self.device).map_err(anyhow::Error::msg)?;
+            if let Some(head) = mlm_head {
+                if let Ok(sw) = head.project_top_k(&hidden_states, top_k) {
+                    sparse_windows.push(sw);
+                }
+            }
+            let take = self.pooled_len(chunk.len());
+            let pooled_hs = if take == chunk.len() {
+                hidden_states
+            } else {
+                hidden_states.narrow(1, 0, take).map_err(anyhow::Error::msg)?
+            };
+            let normalized = Self::pool_single(&pooled_hs)?;
+            let normalized_cpu = normalized.to_device(&Device::Cpu).map_err(anyhow::Error::msg)?;
+            let normalized_f32 = normalized_cpu.to_dtype(candle_core::DType::F32).map_err(anyhow::Error::msg)?;
+            let vec: Vec<f32> = normalized_f32.flatten_all().map_err(anyhow::Error::msg)?.to_vec1().map_err(anyhow::Error::msg)?;
+            chunk_vectors.push(vec);
+        }
+        let refs: Vec<&[f32]> = chunk_vectors.iter().map(|v| v.as_slice()).collect();
+        let dense = aggregate_chunk_vectors(&refs);
+        let sparse = crate::models::sparse::merge_sparse_windows(&sparse_windows, top_k);
+        Ok((dense, sparse))
     }
 
     /// [1, s, H] → 평균 풀링 + L2 정규화 [1, H] (기존 embed() 의 GPU 측 연산 그대로).

@@ -36,7 +36,7 @@ pub fn powf2(x: &Tensor) -> Result<Tensor> {
     }
 }
 
-/// MLP GLU: `silu(x[.., :I]) * x[.., I:]` — 같은 비트, gate/up 복사 없음.
+/// MLP GLU: `silu(x[.., :I]) * x[.., I:]` — CPU: multi-core SIMD kernel; CUDA/ROCm: fused `decoder_ops::silu_mul`.
 pub fn silu_mul_halves(x: &Tensor) -> Result<Tensor> {
     let last = x.dim(D::Minus1)?;
     let i = last / 2;
@@ -54,7 +54,13 @@ pub fn silu_mul_halves(x: &Tensor) -> Result<Tensor> {
         None => {
             let gate = x.narrow(D::Minus1, 0, i)?.contiguous()?;
             let up = x.narrow(D::Minus1, i, i)?.contiguous()?;
-            (candle_nn::ops::silu(&gate)? * up)?.contiguous()
+            if (x.device().is_cuda() || x.device().is_rocm())
+                && matches!(x.dtype(), DType::F32 | DType::F16 | DType::BF16)
+            {
+                candle_core::decoder_ops::silu_mul(&gate, &up)
+            } else {
+                (candle_nn::ops::silu(&gate)? * up)?.contiguous()
+            }
         }
     }
 }

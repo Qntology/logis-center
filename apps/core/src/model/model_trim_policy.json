@@ -1,0 +1,41 @@
+{
+  "Qwen3-0.6B": {
+    "policy": "StaticPlusRuntime",
+    "static_k": 65536,
+    "runtime_k_ko": 10240,
+    "artifact_tier": "E3",
+    "runtime_tier": "E1"
+  },
+  "Qwen3.5-2B": {
+    "policy": "StaticPlusRuntime",
+    "static_k": 65536,
+    "runtime_k_ko": 10240,
+    "artifact_tier": "E3",
+    "runtime_tier": "E1"
+  },
+  "Qwen3.5-4B": {
+    "policy": "StaticPlusRuntime",
+    "static_k": 65536,
+    "runtime_k_ko": 10240,
+    "artifact_tier": "E3",
+    "runtime_tier": "E1"
+  },
+  "granite-embedding-97m-multilingual-r2": {
+    "policy": "StaticOnly",
+    "static_k": 65536,
+    "artifact_tier": "E3"
+  },
+  "siglip2-so400m-patch16-naflex": {
+    "policy": "StaticOnly",
+    "static_k": 65536,
+    "artifact_tier": "E3"
+  },
+  "embeddinggemma-300m": {
+    "policy": "Forbidden",
+    "reason": "A4_dense_above_embedding"
+  },
+  "granite-4.0-h-350m": {
+    "policy": "Retire",
+    "reason": "unused_and_A7_sub300m"
+  }
+}
