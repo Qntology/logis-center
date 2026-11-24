@@ -1,5 +1,23 @@
 fn main() {
-    println!("cargo:rustc-env=NVCC_CCBIN=C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\BuildTools\\VC\\Tools\\MSVC\\14.29.30133\\bin\\Hostx64\\x64\\cl.exe");
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest_path = std::path::Path::new(&manifest_dir);
+
+    // `tauri.conf.json` bundles `dlls/*` as resources, while `dlls/` is gitignored.
+    // Ensure at least one placeholder file exists so `tauri_build::build()` never fails
+    // on a fresh clone or direct `cargo check/test/tauri dev` invocation.
+    let dlls_dir = manifest_path.join("dlls");
+    if std::fs::create_dir_all(&dlls_dir).is_ok() {
+        let is_empty = std::fs::read_dir(&dlls_dir)
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(true);
+        if is_empty {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(dlls_dir.join(".gitkeep"));
+        }
+    }
+
     if std::env::var("TARGET").map_or(false, |t| t.contains("windows")) {
         // Force-disable fPIC and enable standard-conforming preprocessor for MSVC
         std::env::set_var("CFLAGS", "/Zc:preprocessor");
@@ -7,9 +25,7 @@ fn main() {
         std::env::set_var("CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING", "1");
 
         // Link DirectStorage library
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let lib_path = std::path::Path::new(&manifest_dir)
-            .join("libs");
+        let lib_path = manifest_path.join("libs");
         println!("cargo:rustc-link-search=native={}", lib_path.display());
         println!("cargo:rustc-link-lib=dstorage");
         // (통합 시험은 apps/core 으로 옮겨 tauri::Builder 를 쓰지 않으므로, 시험 exe 에 comctl32 v6 매니페스트를 넣던
