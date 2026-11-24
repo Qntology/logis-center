@@ -11,6 +11,7 @@
 //! `crate::utils` 는 아래 crate 의 모듈(사전 · 경로 · SDS)도 같은 자리에 다시 내보냅니다. 앱은 예전 경로에서 이 crate 를 재수출합니다.
 
 pub mod chat_template;
+pub mod env_config;
 pub mod lang_gguf;
 pub mod lang_resident;
 pub mod models;

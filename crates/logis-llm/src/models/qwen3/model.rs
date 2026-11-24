@@ -704,8 +704,12 @@ impl Qwen3Model {
         Ok(self.lm_head.forward(last)?)
     }
 
-    /// Part 5 (Pack A·C): 100% 무손실 Greedy 토큰 선택 (Mode B `TrimmedHead::greedy_next_token` 또는 Mode A `fused_linear_argmax_cs`).
-    pub fn greedy_from_hidden(&mut self, last: &Tensor) -> Result<u32> {
+    /// Part 5 (Pack A·C) + Phase 3-1 D2/D4: 100% 무손실 Greedy 토큰 선택 + Guard 통계 반환.
+    pub fn greedy_from_hidden_with_stats(
+        &mut self,
+        last: &Tensor,
+    ) -> Result<(u32, crate::models::common::vocab_trim::StepGuardStats)> {
+        use crate::models::common::vocab_trim::StepGuardStats;
         if self.q8_act_dtype.is_some() {
             if self.trim_head.is_none() {
                 if let Some(src) = self.embed_tokens.mapped_source().cloned() {
@@ -713,19 +717,54 @@ impl Qwen3Model {
                 }
             }
             if let Some(head) = &self.trim_head {
-                return Ok(head.greedy_next_token(last)?[0]);
+                let (ids, st) = head.greedy_next_token_detailed(last)?;
+                return Ok((ids[0], st));
+            }
+        }
+        let dev = last.device();
+        let dt = last.dtype();
+        let h_dim = *last.dims().last().unwrap_or(&0);
+        let fused_ok = crate::models::common::accel_check::fused_op_ok(
+            dev,
+            crate::models::common::accel_check::FusedOpKind::LmHeadArgmaxCs,
+            dt,
+            h_dim,
+        );
+        if fused_ok && (dev.is_cuda() || dev.is_rocm()) {
+            let q_and_bias = match &self.lm_head {
+                ProjKind::Exact(ex) => Some((ex.weight(), None)),
+                ProjKind::QuantizedProj(ql) => ql.qtensor().map(|q| (q, ql.bias())),
+                _ => None,
+            };
+            if let Some((qw, bias)) = q_and_bias {
+                if h_dim % qw.dtype().block_size().max(1) == 0
+                    && matches!(
+                        qw.dtype(),
+                        candle_core::quantized::GgmlDType::Q8_0
+                            | candle_core::quantized::GgmlDType::Q4_0
+                            | candle_core::quantized::GgmlDType::Q4K
+                            | candle_core::quantized::GgmlDType::Q5K
+                            | candle_core::quantized::GgmlDType::Q6K
+                    )
+                {
+                    let m = last.elem_count() / h_dim.max(1);
+                    let h_2d = last.reshape((m, h_dim))?.contiguous()?;
+                    let out = candle_core::lm_head::fused_quant_argmax_cs(&h_2d, qw, bias, None, None)?;
+                    let (ids, _) = out.download_ids_and_mask()?;
+                    return Ok((
+                        ids[0],
+                        StepGuardStats {
+                            steps: 1,
+                            fast_steps: 1,
+                            quant_mode_a: true,
+                            ..Default::default()
+                        },
+                    ));
+                }
             }
         }
         if let ProjKind::LinearProj(lin) = &self.lm_head {
-            let dev = last.device();
-            let dt = last.dtype();
-            let h_dim = *last.dims().last().unwrap_or(&0);
-            if crate::models::common::accel_check::fused_op_ok(
-                dev,
-                crate::models::common::accel_check::FusedOpKind::LmHeadArgmaxCs,
-                dt,
-                h_dim,
-            ) {
+            if fused_ok {
                 let out = candle_core::lm_head::fused_linear_argmax_cs(
                     last,
                     lin.weight(),
@@ -733,7 +772,15 @@ impl Qwen3Model {
                     None,
                     None,
                 )?;
-                return Ok(out.ids.to_device(&candle_core::Device::Cpu)?.to_vec1::<u32>()?[0]);
+                let id = out.ids.to_device(&candle_core::Device::Cpu)?.to_vec1::<u32>()?[0];
+                return Ok((
+                    id,
+                    StepGuardStats {
+                        steps: 1,
+                        fast_steps: 1,
+                        ..Default::default()
+                    },
+                ));
             }
         }
         let logits = self.logits_from_hidden(last)?;
@@ -743,7 +790,55 @@ impl Qwen3Model {
             .to_device(&candle_core::Device::Cpu)?
             .flatten_all()?
             .to_vec1::<u32>()?[0];
-        Ok(id)
+        Ok((
+            id,
+            StepGuardStats {
+                steps: 1,
+                ..Default::default()
+            },
+        ))
+    }
+
+    /// Part 5 (Pack A·C): 100% 무손실 Greedy 토큰 선택 (Mode B `TrimmedHead::greedy_next_token` 또는 Mode A `fused_linear_argmax_cs`).
+    pub fn greedy_from_hidden(&mut self, last: &Tensor) -> Result<u32> {
+        self.greedy_from_hidden_with_stats(last).map(|(id, _)| id)
+    }
+
+    pub fn embed_kept_rows_f32(&self, off: usize, take: usize, device: &candle_core::Device) -> Result<Tensor> {
+        if let Some(head) = &self.trim_head {
+            Ok(head.kept_rows_f32(off, take, device)?)
+        } else {
+            Ok(self.embed_tokens.rows_f32(off, take)?)
+        }
+    }
+
+    pub fn validate_input_ids(&self, ids: &[u32]) -> Result<()> {
+        Ok(self.embed_tokens.validate_ids_slice(ids)?)
+    }
+
+    /// Estimate resident GPU weight bytes (backbone + active trim_head / embedding table).
+    pub fn resident_vram_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        // 28 layers Qwen3-0.6B backbone (Q8_0 ~460 MB or BF16 ~880 MB); estimate from norm + head + embed
+        let hidden = self.embed_tokens.hidden();
+        let per_layer_elems = hidden * hidden * 4 + hidden * (hidden * 3) * 3; // conservative attn+mlp
+        let bytes_per_elem = if self.q8_act_dtype.is_some() { 34usize } else { 64usize }; // per 32 elems
+        total += (self.layers.len() * per_layer_elems / 32 * bytes_per_elem) as u64;
+        match &self.embed_tokens {
+            EmbedTable::Mapped { .. } => {
+                if let Some(head) = &self.trim_head {
+                    total += head.head_bytes() as u64;
+                }
+            }
+            EmbedTable::Quant { q, .. } => {
+                let bs = q.dtype().block_size().max(1);
+                total += ((q.shape().elem_count() / bs) * q.dtype().type_size()) as u64;
+            }
+            EmbedTable::Dense(e) => {
+                total += (e.embeddings().elem_count() * e.embeddings().dtype().size_in_bytes()) as u64;
+            }
+        }
+        total
     }
 
     pub fn embedding_token_id(&self, input_ids: &Tensor) -> Result<Tensor> {

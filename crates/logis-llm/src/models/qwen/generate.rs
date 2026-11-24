@@ -821,22 +821,19 @@ impl QwenVLGenerateModel {
                         let len_tensor = Tensor::new(target_ids.len() as f32, &self.text_device)?;
                         let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
                         let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
-                        
-                        let all_embs = self.qwen.get_embed_tokens()?.to_dtype(DType::F32)?;
-                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
-                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
-                        
-                        let all_sqr = all_embs.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
-                        let all_norm = all_sqr.sqrt()?;
-                        let all_normalized = all_embs.broadcast_div(&all_norm)?;
-                        
-                        let sim = all_normalized.matmul(&target_normalized.unsqueeze(1)?)?.squeeze(1)?;
-                        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
-                        let threshold = Tensor::new(0.65f32, &self.text_device)?;
-                        let one = Tensor::new(1.0f32, &self.text_device)?;
-                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
-                        let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
-                        Ok(prejudice)
+
+                        // Phase 3-1 D3: chunked (16,384 rows) + 16-slot LRU PrejudiceCache (eliminates full-F32 OOM).
+                        let all_embs = self.qwen.get_embed_tokens()?;
+                        let vocab = all_embs.dim(0)?;
+                        let key = format!("qwenvl:v{vocab}:{target_text}");
+                        let cached = crate::models::common::prejudice::get_or_build(
+                            &key,
+                            &target_vec,
+                            vocab,
+                            &self.text_device,
+                            |off, take| Ok(all_embs.narrow(0, off, take)?),
+                        )?;
+                        Ok(cached.values)
                     };
                     match calc_prej() {
                         Ok(prej) => {

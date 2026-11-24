@@ -16,12 +16,23 @@ use std::collections::HashMap;
 pub const FUSION_K: f32 = 20.0;
 /// 글자가 그대로 일치한 근거는 벡터보다 틀릴 일이 적어 두 배로 셉니다.
 pub const LITERAL_WEIGHT: f32 = 2.0;
+/// FTS / Sparse / Vision 트랙 기본 가중치 (Phase 4-2 D3).
+pub const FTS_WEIGHT: f32 = 1.2;
+pub const SPARSE_WEIGHT: f32 = 1.4;
+pub const VISION_WEIGHT: f32 = 1.1;
 
-/// 공백으로 나눈 질의 낱말. 앞뒤 구두점만 벗기므로 '20260625-100159' 같은 번호는 그대로 남습니다.
+/// 공백으로 나눈 질의 낱말 + 다국어(CJK 바이그램 · 아랍어 발음기호 제거 · 구조화 번호) 확장.
 pub fn query_terms(query: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in query.split_whitespace() {
-        let term = raw.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        let cleaned: String = logis_schema::text::normalize_digits_ascii(raw)
+            .chars()
+            .filter(|&c| {
+                let u = c as u32;
+                c != '\u{0640}' && !(0x064B..=0x065F).contains(&u) && u != 0x0670
+            })
+            .collect();
+        let term = cleaned.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
         if term.chars().count() < 2 || out.contains(&term) {
             continue;
         }
@@ -31,9 +42,55 @@ pub fn query_terms(query: &str) -> Vec<String> {
         if digits.len() >= 4 && digits != term && !rest_has_digit && !out.contains(&digits) {
             out.push(digits);
         }
-        out.push(term);
+        out.push(term.clone());
+        // Add CJK 2-grams so unspaced Japanese/Chinese queries participate in literal ranking.
+        let chars: Vec<char> = term.chars().collect();
+        let has_cjk = chars.iter().any(|&c| {
+            let u = c as u32;
+            (0x4E00..=0x9FFF).contains(&u) || (0x3040..=0x30FF).contains(&u)
+        });
+        if has_cjk && chars.len() >= 3 {
+            for w in chars.windows(2) {
+                let bi: String = w.iter().collect();
+                if !out.contains(&bi) {
+                    out.push(bi);
+                }
+            }
+        }
     }
     out
+}
+
+/// 모드 중립 다중 트랙 RRF 융합 입력 (commerce · shipping · all 공용, Phase 4-2 D3).
+#[derive(Default)]
+pub struct FusionTracks<'a> {
+    pub pipeline: &'a [String],
+    pub vector: &'a [String],
+    pub chunks: &'a [String],
+    pub literal: &'a [String],
+    pub fts: &'a [String],
+    pub sparse: &'a [String],
+    pub typed_vector: &'a [String],
+    pub typed_chunks: &'a [String],
+    pub typed_literal: &'a [String],
+    pub typed_sparse: &'a [String],
+    pub vision: &'a [String],
+}
+
+pub fn fuse_query_tracks(t: &FusionTracks<'_>, k: f32) -> Vec<(String, f32)> {
+    let mut lists: Vec<(&[String], f32)> = Vec::with_capacity(11);
+    if !t.pipeline.is_empty() { lists.push((t.pipeline, 1.0)); }
+    if !t.vector.is_empty() { lists.push((t.vector, 1.0)); }
+    if !t.chunks.is_empty() { lists.push((t.chunks, 1.0)); }
+    if !t.literal.is_empty() { lists.push((t.literal, LITERAL_WEIGHT)); }
+    if !t.fts.is_empty() { lists.push((t.fts, FTS_WEIGHT)); }
+    if !t.sparse.is_empty() { lists.push((t.sparse, SPARSE_WEIGHT)); }
+    if !t.typed_vector.is_empty() { lists.push((t.typed_vector, 1.0)); }
+    if !t.typed_chunks.is_empty() { lists.push((t.typed_chunks, 1.0)); }
+    if !t.typed_literal.is_empty() { lists.push((t.typed_literal, 1.0)); }
+    if !t.typed_sparse.is_empty() { lists.push((t.typed_sparse, 1.0)); }
+    if !t.vision.is_empty() { lists.push((t.vision, VISION_WEIGHT)); }
+    fuse(&lists, k)
 }
 
 /// 저장 JSON 의 값만 모읍니다. 키 이름까지 대조하면 'status' 같은 낱말이 모든 문서에 걸립니다.

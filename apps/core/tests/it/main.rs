@@ -87,3 +87,5 @@ mod sds_ledger;
 mod relay_links;
 // 고정점 → 목표 유형 관계 단계 · 서식 질의 근거 · 숫자 식별자 · 날짜 구간 · 행동 종류
 mod search_relation;
+// Phase 5 정밀도 카나리: full_bias.json 12개 언어 빈 노드 0건, 아랍어/일본어/체코어/러시아어 스크립트, SigLIP2 결합문자, Sparse 검색
+mod precision_canaries;

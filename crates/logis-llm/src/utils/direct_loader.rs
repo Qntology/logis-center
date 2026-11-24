@@ -26,22 +26,37 @@ mod windows_impl {
 
     pub fn is_available() -> bool { CONTEXT.is_ok() }
 
+    fn dstorage_dll_present() -> bool {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                if dir.join("dstorage.dll").is_file() {
+                    return true;
+                }
+            }
+        }
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                if dir.join("dstorage.dll").is_file() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     static CONTEXT: Lazy<Result<Arc<WinContext>>> = Lazy::new(|| {
+        // Pre-check `dstorage.dll` before calling `DStorageGetFactory` so release builds
+        // compiled with `panic = "abort"` never abort when DirectStorage DLLs are absent.
+        if !dstorage_dll_present() {
+            println!("[DirectLoader] dstorage.dll not found in PATH or executable dir. Falling back to fs::read/fs::write.");
+            return Err(anyhow!("dstorage.dll not available"));
+        }
         unsafe {
-            // Load `dstorage.dll` dynamically at runtime (via `runtime_loaded`) so binaries
-            // linking `logis-llm` do not hard-import `dstorage.dll` at process startup and
-            // cleanly fall back to `fs::read`/`fs::write` when DirectStorage DLLs are absent.
-            let factory: IDStorageFactory = match std::panic::catch_unwind(|| {
-                direct_storage::runtime_loaded::DStorageGetFactory::<IDStorageFactory>()
-            }) {
-                Ok(Ok(f)) => f,
-                Ok(Err(e)) => {
+            let factory: IDStorageFactory = match direct_storage::runtime_loaded::DStorageGetFactory::<IDStorageFactory>() {
+                Ok(f) => f,
+                Err(e) => {
                     println!("[DirectLoader] DirectStorage factory init failed: {:?}. Falling back to fs::read/fs::write.", e);
                     return Err(anyhow!("DirectStorage factory init failed: {:?}", e));
-                }
-                Err(_) => {
-                    println!("[DirectLoader] dstorage.dll not found at runtime. Falling back to fs::read/fs::write.");
-                    return Err(anyhow!("dstorage.dll not available"));
                 }
             };
             let queue_desc = DSTORAGE_QUEUE_DESC {

@@ -43,21 +43,192 @@ pub fn langs_of_document(text: &str) -> Langs {
     Langs::of_doc_lang(&crate::utils::lang_utils::detect_document_language(text)).union(Langs::present(text))
 }
 
-/// `LOGIS_VOCAB_TRIM` (기본 `full`, 예전 `TrimRule::from_env`). 읽지 못한 값은 알리고 full 로 둡니다.
+/// `LOGIS_VOCAB_TRIM` (기본 `full`; `compact` 는 `TrimRule::Full` + 컴팩트 활성 K 로 동작). 읽지 못한 값은 알리고 full 로 둡니다.
 pub fn rule_from_env() -> TrimRule {
     match std::env::var(TRIM_ENV) {
-        Ok(v) => TrimRule::parse(&v).unwrap_or_else(|e| {
-            println!("[VOCAB-TRIM] {TRIM_ENV}={v:?}: {e} → full");
-            TrimRule::Full
-        }),
+        Ok(v) => {
+            if v.trim().eq_ignore_ascii_case("compact") {
+                return TrimRule::Full;
+            }
+            TrimRule::parse(&v).unwrap_or_else(|e| {
+                println!("[VOCAB-TRIM] {TRIM_ENV}={v:?}: {e} → full");
+                TrimRule::Full
+            })
+        }
         Err(_) => TrimRule::Full,
     }
 }
 
-/// 규칙 (`full` · `off`)
+/// 규칙 (`full` · `compact` · `off`)
 pub const TRIM_ENV: &str = "LOGIS_VOCAB_TRIM";
 /// 언어 (`auto` = 문서 언어, `all`, 또는 `ko,en` 처럼)
 pub const LANGS_ENV: &str = "LOGIS_VOCAB_LANGS";
+/// 가드 모드 (`clustered` · `single` · `off`)
+pub const GUARD_ENV: &str = "LOGIS_VOCAB_GUARD";
+/// 컴팩트 모드 목표 활성 행 수 (예: `12288`)
+pub const ACTIVE_K_ENV: &str = "LOGIS_VOCAB_ACTIVE_K";
+/// 사전 계산된 `VocabPlan` JSON 경로
+pub const PLAN_ENV: &str = "LOGIS_VOCAB_PLAN";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VocabExecMode {
+    ArtifactDirect,
+    RuntimeSliced,
+    FullUntrimmed,
+}
+
+impl VocabExecMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ArtifactDirect => "artifact_direct",
+            Self::RuntimeSliced => "runtime_sliced",
+            Self::FullUntrimmed => "full_untrimmed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardMode {
+    Clustered,
+    Single,
+    Off,
+}
+
+impl GuardMode {
+    pub fn from_env() -> Self {
+        match std::env::var(GUARD_ENV)
+            .unwrap_or_else(|_| "clustered".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "off" | "0" | "none" | "false" => Self::Off,
+            "single" | "sphere" => Self::Single,
+            _ => Self::Clustered,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clustered => "clustered",
+            Self::Single => "single",
+            Self::Off => "off",
+        }
+    }
+}
+
+pub fn guard_clusters_from_env() -> usize {
+    std::env::var("LOGIS_GUARD_CLUSTERS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|c| c.clamp(4, 256))
+        .unwrap_or(64)
+}
+
+/// Whether compact 3-tier ASCII active-head mode is enabled (`LOGIS_VOCAB_TRIM=compact` or `LOGIS_VOCAB_ACTIVE_K`).
+pub fn compact_active_k(vocab: usize, langs: Langs) -> Option<usize> {
+    if let Ok(v) = std::env::var(ACTIVE_K_ENV) {
+        if let Ok(k) = v.trim().parse::<usize>() {
+            if k >= ALIGN && k < vocab {
+                return Some(k.next_multiple_of(ALIGN).min(vocab));
+            }
+        }
+    }
+    let trim_val = std::env::var(TRIM_ENV).unwrap_or_default().trim().to_ascii_lowercase();
+    if trim_val == "compact" {
+        let base = if langs.cjk {
+            16_384
+        } else if langs.latin && !langs.hangul && !langs.arabic {
+            14_336
+        } else if langs.is_all() || langs == Langs::any() {
+            24_576
+        } else {
+            12_288
+        };
+        if base < vocab {
+            return Some(base.next_multiple_of(ALIGN).min(vocab));
+        }
+    }
+    None
+}
+
+/// Unified per-step & cumulative guard/rescue telemetry (Phase 1-1 D1/D4, Phase 1-2 D2, Phase 3-1 D2, Phase 5-2 D1).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct StepGuardStats {
+    pub steps: usize,
+    pub fast_steps: usize,
+    pub constrained_steps: usize,
+    pub skip_i0: bool,
+    pub flagged: usize,
+    pub clusters_checked: usize,
+    pub rows_scored: usize,
+    pub rest_wins: usize,
+    pub rescue_us: u64,
+    pub quant_mode_a: bool,
+}
+
+impl StepGuardStats {
+    pub fn merge(&mut self, other: &Self) {
+        self.steps += other.steps;
+        self.fast_steps += other.fast_steps;
+        self.constrained_steps += other.constrained_steps;
+        self.skip_i0 |= other.skip_i0;
+        self.flagged += other.flagged;
+        self.clusters_checked += other.clusters_checked;
+        self.rows_scored += other.rows_scored;
+        self.rest_wins += other.rest_wins;
+        self.rescue_us += other.rescue_us;
+        self.quant_mode_a |= other.quant_mode_a;
+    }
+
+    pub fn rescue_rate(&self) -> f64 {
+        if self.steps == 0 {
+            0.0
+        } else {
+            self.flagged as f64 / self.steps as f64
+        }
+    }
+
+    pub fn rescue_ms(&self) -> f64 {
+        self.rescue_us as f64 / 1000.0
+    }
+}
+
+/// Atomic cumulative counters attached to each `TrimmedHead`.
+#[derive(Default)]
+pub struct RescueCounters {
+    pub steps: std::sync::atomic::AtomicU64,
+    pub rescued: std::sync::atomic::AtomicU64,
+    pub rest_wins: std::sync::atomic::AtomicU64,
+    pub clusters_checked: std::sync::atomic::AtomicU64,
+    pub rows_scored: std::sync::atomic::AtomicU64,
+    pub rescue_us: std::sync::atomic::AtomicU64,
+}
+
+impl RescueCounters {
+    pub fn record(&self, st: &StepGuardStats) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.steps.fetch_add(st.steps as u64, Relaxed);
+        self.rescued.fetch_add(st.flagged as u64, Relaxed);
+        self.rest_wins.fetch_add(st.rest_wins as u64, Relaxed);
+        self.clusters_checked.fetch_add(st.clusters_checked as u64, Relaxed);
+        self.rows_scored.fetch_add(st.rows_scored as u64, Relaxed);
+        self.rescue_us.fetch_add(st.rescue_us, Relaxed);
+    }
+
+    pub fn snapshot(&self) -> StepGuardStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        StepGuardStats {
+            steps: self.steps.load(Relaxed) as usize,
+            flagged: self.rescued.load(Relaxed) as usize,
+            rest_wins: self.rest_wins.load(Relaxed) as usize,
+            clusters_checked: self.clusters_checked.load(Relaxed) as usize,
+            rows_scored: self.rows_scored.load(Relaxed) as usize,
+            rescue_us: self.rescue_us.load(Relaxed),
+            ..Default::default()
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // 토크나이저에서
@@ -120,40 +291,173 @@ pub fn corpus() -> &'static Vec<String> {
     &CORPUS
 }
 
-/// 토큰 종류와 도메인 글의 토큰 번호. 언어와 상관없으므로 토크나이저(어휘 크기)마다 한 번만 셉니다
-/// (언어마다 다시 세면 2B 어휘에서 한 번에 5 ~ 6 s 라, N:N 검색 96 질의에서 12 번 72 s 가 들었습니다).
-fn kinds_and_domain(tok: &tokenizers::Tokenizer, vocab: usize) -> Arc<(Vec<Kind>, BTreeSet<u32>)> {
-    static BASE: Lazy<Mutex<HashMap<(usize, usize), Arc<(Vec<Kind>, BTreeSet<u32>)>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// 토큰 종류 · 원본 바이트 조각. 어휘 크기마다 한 번만 계산합니다.
+fn kinds_and_pieces(tok: &tokenizers::Tokenizer, vocab: usize) -> Arc<(Vec<Kind>, Vec<Vec<u8>>)> {
+    static BASE: Lazy<Mutex<HashMap<(usize, usize), Arc<(Vec<Kind>, Vec<Vec<u8>>)>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
     let key = (vocab, tok.get_vocab_size(true));
     if let Some(b) = BASE.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Arc::clone(b);
     }
     let t0 = std::time::Instant::now();
     let added: std::collections::HashSet<u32> = tok.get_added_tokens_decoder().keys().copied().collect();
-    let kinds: Vec<Kind> = (0..vocab as u32).into_par_iter().map(|i| kind_of(&token_bytes(tok, i), added.contains(&i))).collect();
-    let domain: BTreeSet<u32> = corpus()
-        .par_iter()
-        .filter_map(|text| tok.encode(text.as_str(), false).ok().map(|e| e.get_ids().to_vec()))
-        .flatten_iter()
-        .collect::<Vec<u32>>()
-        .into_iter()
+    let pairs: Vec<(Kind, Vec<u8>)> = (0..vocab as u32)
+        .into_par_iter()
+        .map(|i| {
+            let bytes = token_bytes(tok, i);
+            let k = kind_of(&bytes, added.contains(&i));
+            (k, bytes)
+        })
         .collect();
-    println!("[VOCAB-TRIM] 어휘 {vocab}: 토큰 종류 · 도메인 글 토큰 {} 개 · {:.2} s (어휘마다 한 번)", domain.len(), t0.elapsed().as_secs_f64());
-    let b = Arc::new((kinds, domain));
+    let mut kinds = Vec::with_capacity(vocab);
+    let mut pieces = Vec::with_capacity(vocab);
+    for (k, p) in pairs {
+        kinds.push(k);
+        pieces.push(p);
+    }
+    println!("[VOCAB-TRIM] 어휘 {vocab}: 토큰 종류 분류 · {:.2} s (어휘마다 한 번)", t0.elapsed().as_secs_f64());
+    let b = Arc::new((kinds, pieces));
     BASE.lock().unwrap_or_else(|p| p.into_inner()).insert(key, Arc::clone(&b));
     b
 }
 
+/// 언어 묶음별 도메인 글 토큰 집합 (번들 격리, 캐시).
+fn domain_tokens_for(tok: &tokenizers::Tokenizer, vocab: usize, langs: Langs) -> Arc<BTreeSet<u32>> {
+    static DOM: Lazy<Mutex<HashMap<(usize, usize, String), Arc<BTreeSet<u32>>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+    let key = (vocab, tok.get_vocab_size(true), langs.label());
+    if let Some(d) = DOM.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return Arc::clone(d);
+    }
+    let texts = corpus_for_langs(langs);
+    let domain: BTreeSet<u32> = texts
+        .par_iter()
+        .filter_map(|text| tok.encode(text.as_str(), false).ok().map(|e| e.get_ids().to_vec()))
+        .flatten_iter()
+        .filter(|&id| (id as usize) < vocab)
+        .collect::<Vec<u32>>()
+        .into_iter()
+        .collect();
+    let d = Arc::new(domain);
+    DOM.lock().unwrap_or_else(|p| p.into_inner()).insert(key, Arc::clone(&d));
+    d
+}
+
+/// Optional pre-mined `VocabPlan` loaded from `LOGIS_VOCAB_PLAN`.
+fn load_env_vocab_plan(vocab: usize) -> Option<Arc<Vec<u32>>> {
+    static PLAN_CACHE: Lazy<Mutex<HashMap<(String, usize), Option<Arc<Vec<u32>>>>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    let path = std::env::var(PLAN_ENV).ok()?;
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return None;
+    }
+    let key = (path.clone(), vocab);
+    if let Some(cached) = PLAN_CACHE.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return cached.clone();
+    }
+    let loaded = match premium_discount_quant::vocab_plan::VocabPlan::load(std::path::Path::new(&path)) {
+        Ok(plan) => {
+            if let Err(e) = plan.verify() {
+                println!("[VOCAB-TRIM] ⚠️ {PLAN_ENV}={path} 검증 실패: {e}");
+                None
+            } else if plan.orig_vocab_size == vocab && plan.kept_ids.iter().all(|&id| (id as usize) < vocab) {
+                println!("[VOCAB-TRIM] {PLAN_ENV} 로드 완료: {} -> {} 행 (bundle={})", vocab, plan.kept_ids.len(), plan.bundle);
+                Some(Arc::new(plan.kept_ids))
+            } else {
+                println!(
+                    "[VOCAB-TRIM] {PLAN_ENV}={path} 어휘 크기 불일치 (plan={}, model={}) → 무시",
+                    plan.orig_vocab_size, vocab
+                );
+                None
+            }
+        }
+        Err(e) => {
+            println!("[VOCAB-TRIM] ⚠️ {PLAN_ENV}={path} 읽기 실패: {e}");
+            None
+        }
+    };
+    PLAN_CACHE.lock().unwrap_or_else(|p| p.into_inner()).insert(key, loaded.clone());
+    loaded
+}
+
+/// Optional explicit execution mode override (`LOGIS_VOCAB_EXEC_MODE=artifact_direct|runtime_sliced|auto`).
+pub fn exec_mode_override() -> Option<VocabExecMode> {
+    match std::env::var("LOGIS_VOCAB_EXEC_MODE")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "artifact_direct" | "direct" | "artifact" => Some(VocabExecMode::ArtifactDirect),
+        "runtime_sliced" | "sliced" => Some(VocabExecMode::RuntimeSliced),
+        "full" | "full_untrimmed" => Some(VocabExecMode::FullUntrimmed),
+        _ => None,
+    }
+}
+
 /// 토크나이저 · 규칙 · 언어로 남길 행 (오름차순). 어휘 크기 · 규칙 · 언어마다 한 번 계산하고 기억합니다.
 pub fn ids_for(tok: &tokenizers::Tokenizer, vocab: usize, rule: TrimRule, langs: Langs) -> Result<Arc<Vec<u32>>> {
+    ids_for_with_prompt(tok, vocab, rule, langs, "")
+}
+
+/// [`ids_for`] + 컴팩트 활성 K / `LOGIS_VOCAB_PLAN` / 프롬프트 토큰 합집합 지원.
+pub fn ids_for_with_prompt(
+    tok: &tokenizers::Tokenizer,
+    vocab: usize,
+    rule: TrimRule,
+    langs: Langs,
+    prompt: &str,
+) -> Result<Arc<Vec<u32>>> {
+    if let Some(plan_ids) = load_env_vocab_plan(vocab) {
+        if compact_active_k(vocab, langs).is_none() {
+            return Ok(plan_ids);
+        }
+    }
+    let compact_k = compact_active_k(vocab, langs);
+    let base = kinds_and_pieces(tok, vocab);
+    let domain = domain_tokens_for(tok, vocab, langs);
+
+    if let Some(target_k) = compact_k {
+        let prompt_ids: BTreeSet<u32> = if prompt.is_empty() {
+            BTreeSet::new()
+        } else {
+            tok.encode(prompt, false)
+                .map(|e| e.get_ids().iter().copied().filter(|&id| (id as usize) < vocab).collect())
+                .unwrap_or_default()
+        };
+        let ascii_core: BTreeSet<u32> = premium_discount_quant::mine::default_ascii_struct_corpus()
+            .iter()
+            .filter_map(|s| tok.encode(s.as_str(), false).ok())
+            .flat_map(|e| e.get_ids().to_vec())
+            .filter(|&id| (id as usize) < vocab)
+            .collect();
+        let t0 = std::time::Instant::now();
+        let (ids, tiers) = premium_discount_quant::trim::select_compact_ranked(
+            &base.0,
+            &domain,
+            &prompt_ids,
+            &ascii_core,
+            langs,
+            target_k,
+            None,
+        );
+        let t: Vec<String> = tiers.iter().map(|(n, k)| format!("{n} {k}")).collect();
+        println!(
+            "[VOCAB-TRIM] compact(k<={target_k}) · {}: 어휘 {vocab} → {} 행 ({}) · {:.2} s",
+            langs.label(),
+            ids.len(),
+            t.join(" · "),
+            t0.elapsed().as_secs_f64()
+        );
+        return Ok(Arc::new(ids));
+    }
+
     static CHOSEN: Lazy<Mutex<HashMap<(usize, usize, String), Arc<Vec<u32>>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
     let key = (vocab, tok.get_vocab_size(true), format!("{}:{}", rule.label(), langs.label()));
     if let Some(ids) = CHOSEN.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return Ok(Arc::clone(ids));
     }
-    let base = kinds_and_domain(tok, vocab);
     let t0 = std::time::Instant::now();
-    let (ids, tiers) = select_from(&base.0, &base.1, rule, langs);
+    let (ids, tiers) = select_from(&base.0, &domain, rule, langs);
     let t: Vec<String> = tiers.iter().map(|(n, k)| format!("{n} {k}")).collect();
     println!("[VOCAB-TRIM] {} · {}: 어휘 {vocab} → {} 행 ({}) · {:.2} s", rule.label(), langs.label(), ids.len(), t.join(" · "), t0.elapsed().as_secs_f64());
     let ids = Arc::new(ids);
@@ -266,9 +570,116 @@ impl DocLangScope {
     }
 }
 
-/// 생성 요청의 메시지 글 전부 (문자 체계만 보므로 JSON 그대로)
+/// 언어 묶음별로 격리된 도메인 글 (`en` 문서에 비ASCII 6,050행이 섞이지 않도록 분리, Phase 2-1 D1).
+pub fn corpus_for_langs(langs: Langs) -> Vec<String> {
+    fn script_allowed(s: &str, langs: Langs) -> bool {
+        if langs.is_all() || langs == Langs::any() || langs.other {
+            return true;
+        }
+        let sp = Langs::present(s);
+        (!sp.hangul || langs.hangul)
+            && (!sp.kana || langs.kana)
+            && (!sp.cjk || langs.cjk || langs.hanja)
+            && (!sp.arabic || langs.arabic)
+            && (!sp.other || langs.other)
+    }
+    fn walk(v: &serde_json::Value, langs: Langs, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => {
+                if script_allowed(s, langs) {
+                    out.push(s.clone());
+                }
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, langs, out)),
+            serde_json::Value::Object(o) => logis_schema::json_order::sorted_iter(o).for_each(|(k, x)| {
+                if script_allowed(k, langs) {
+                    out.push(k.clone());
+                }
+                walk(x, langs, out);
+            }),
+            serde_json::Value::Number(n) => out.push(n.to_string()),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    let dict = &crate::utils::bias_schema::BIAS_DICT;
+    if let Some(root) = dict.as_object() {
+        let mut include_keys: Vec<&str> = vec!["en"];
+        if langs.hangul { include_keys.push("ko"); }
+        if langs.kana { include_keys.push("ja"); }
+        if langs.cjk { include_keys.push("zh"); include_keys.push("ja"); }
+        if langs.arabic { include_keys.push("ar"); }
+        if langs.latin {
+            include_keys.extend(["de", "fr", "es", "it", "pt", "nl", "cs"]);
+        }
+        if langs.other || langs.is_all() || langs == Langs::any() {
+            for (k, v) in logis_schema::json_order::sorted_iter(root) {
+                out.push(k.clone());
+                walk(v, langs, &mut out);
+            }
+        } else {
+            for (k, v) in logis_schema::json_order::sorted_iter(root) {
+                // Keep shared structural sections (length > 3) + requested language sections only
+                let is_lang_section = k.len() <= 3 || k.contains('-');
+                if !is_lang_section || include_keys.contains(&k.as_str()) {
+                    walk(v, langs, &mut out);
+                }
+            }
+        }
+    }
+    for t in [
+        "<table>", "</table>", "<tr>", "</tr>", "<td>", "</td>", "<th>", "</th>",
+        "<thead>", "<tbody>", "<br>", "{\"", "\":", "\": \"", "\", \"", "\"}", "[{", "}]",
+        "null", "true", "false",
+    ] {
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// 생성 요청의 사용자·도구 메시지 글만 모읍니다 (시스템 프롬프트 지시어가 문자 체계를 팽창시키지 않게 제외, Phase 3-1 D5).
+pub fn user_prompt_text(mes: &crate::openai_types::ChatCompletionParameters) -> String {
+    use crate::openai_types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPart,
+        ChatCompletionRequestUserMessageContent,
+    };
+    let mut out = String::new();
+    for msg in &mes.messages {
+        match msg {
+            ChatCompletionRequestMessage::System(_) => {}
+            ChatCompletionRequestMessage::User(u) => match &u.content {
+                ChatCompletionRequestUserMessageContent::Text(t) => {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+                ChatCompletionRequestUserMessageContent::Array(parts) => {
+                    for p in parts {
+                        if let ChatCompletionRequestMessageContentPart::Text(tp) = p {
+                            out.push_str(&tp.text);
+                            out.push('\n');
+                        }
+                    }
+                }
+            },
+            ChatCompletionRequestMessage::Assistant(a) => {
+                if let Some(t) = &a.content {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+            }
+            ChatCompletionRequestMessage::Tool(t) => {
+                out.push_str(&t.content);
+                out.push('\n');
+            }
+            ChatCompletionRequestMessage::Function(_) => {}
+        }
+    }
+    out
+}
+
+/// 생성 요청의 메시지 글 (호환 별칭 — 시스템 프롬프트 제외 본문 반환)
 pub fn prompt_text(mes: &crate::openai_types::ChatCompletionParameters) -> String {
-    serde_json::to_string(&mes.messages).unwrap_or_default()
+    user_prompt_text(mes)
 }
 
 impl Drop for DocLangScope {
@@ -407,16 +818,15 @@ impl TableSource {
     }
 }
 
-/// Part 5 (Pack A·C): 잘린 REST 어휘의 평균 중심화 Cauchy-Schwarz(CS) 상한 가드 + 호스트 mmap SIMD 구출기.
-///
-/// - GPU 추가 상주: `mu_rest` (~14 KB) + `kept_gpu` (~120-240 KB) 뿐, REST 가중치는 GPU/RAM 에 올리지 않음.
-/// - 호스트 구출: `rescue_mask == 1` 인 희귀 행에서만 이미 열린 `TableSource` mmap 을 스캔해
-///   `embed_cpu_kernels::dot_f32_simd` / `dot_argmax_rows_f32` 로 정확한 REST argmax 를 계산 → 100% 무손실.
+/// Part 5 (Pack A·C) + Phase 3-1 D2: 잘린 REST 어휘의 평균 중심화 Cauchy-Schwarz(CS) 상한 가드 +
+/// 다중 군집(`ColdGuard`, C=64, `.cold_guard.bin` 캐시) 호스트 mmap SIMD 구출기.
 pub struct RestRescueGuard {
     src: TableSource,
     pub rest_ids: Arc<Vec<u32>>,
     pub kept_gpu: Tensor,
     pub cs_guard: candle_core::lm_head::CsGuardParams,
+    pub clustered: Option<Arc<premium_discount_quant::lmhead::ColdGuard>>,
+    pub cache_hit: bool,
 }
 
 #[inline]
@@ -567,12 +977,220 @@ impl RestRescueGuard {
             w_rest_bound,
             b_rest_max: 0.0,
         };
+
+        // Phase 3-1 D2: Optional 64-cluster ColdGuard with disk cache (`.cold_guard.bin`).
+        let guard_mode = GuardMode::from_env();
+        let mut cache_hit = false;
+        let clustered = if guard_mode == GuardMode::Clustered && rest_ids.len() >= 64 {
+            let clusters = guard_clusters_from_env();
+            let cache_path = Self::cold_guard_cache_path(src, kept, clusters);
+            if let Some(cg) = cache_path
+                .as_ref()
+                .and_then(|p| premium_discount_quant::lmhead::ColdGuard::load_from_file(p).ok())
+                .filter(|cg| cg.dim == cols && cg.members.len() == rest_ids.len())
+            {
+                cache_hit = true;
+                Some(Arc::new(cg))
+            } else {
+                // Decode cold rows in parallel chunks for Lloyd k-means (4 iters)
+                let mut cold_rows = vec![0.0f32; rest_ids.len() * cols];
+                if src.dtype == GgmlDType::Q8_0 {
+                    cold_rows
+                        .par_chunks_exact_mut(cols)
+                        .zip(rest_ids.par_iter())
+                        .for_each(|(dst, &rid)| {
+                            let off = src.start + (rid as usize) * rb;
+                            decode_q8_0_row(&src.map[off..off + rb], dst);
+                        });
+                } else {
+                    for (ci, chunk) in rest_ids.chunks(512).enumerate() {
+                        let deq = src.gather(chunk, &Device::Cpu)?.dequantize(&Device::Cpu)?;
+                        let vals = deq.flatten_all()?.to_vec1::<f32>()?;
+                        let base = ci * 512 * cols;
+                        cold_rows[base..base + vals.len()].copy_from_slice(&vals);
+                    }
+                }
+                let cg = premium_discount_quant::lmhead::build_cold_guard(
+                    &cold_rows,
+                    &rest_ids,
+                    cols,
+                    clusters,
+                    4,
+                );
+                if let Some(p) = &cache_path {
+                    let _ = cg.save_to_file(p);
+                }
+                Some(Arc::new(cg))
+            }
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             src: src.clone(),
             rest_ids: Arc::new(rest_ids),
             kept_gpu,
             cs_guard,
+            clustered,
+            cache_hit,
         }))
+    }
+
+    fn cold_guard_cache_path(src: &TableSource, kept: &[u32], clusters: usize) -> Option<std::path::PathBuf> {
+        // Skip caching for tiny unit-test synthetic tables
+        if src.rows < 4096 {
+            return None;
+        }
+        let mut h_in = Vec::with_capacity(32 + kept.len() * 4);
+        h_in.extend_from_slice(&(src.rows as u64).to_le_bytes());
+        h_in.extend_from_slice(&(src.cols as u64).to_le_bytes());
+        h_in.extend_from_slice(&(src.start as u64).to_le_bytes());
+        h_in.extend_from_slice(&(clusters as u64).to_le_bytes());
+        for &id in kept {
+            h_in.extend_from_slice(&id.to_le_bytes());
+        }
+        // Sample first 64 bytes of weight table to bind cache to exact model weights
+        let sample_end = (src.start + 64).min(src.map.len());
+        h_in.extend_from_slice(&src.map[src.start..sample_end]);
+        let sha = premium_discount_quant::vocab_plan::sha256_hex(&h_in);
+        Some(
+            logis_schema::paths::get_app_dir()
+                .join("cache")
+                .join("cold_guards")
+                .join(format!("v{}_k{}_c{}_{}.cold_guard.bin", src.rows, kept.len(), clusters, &sha[..16])),
+        )
+    }
+
+    /// Score one cold row `rid` directly from mmap (SIMD F32 dot product, optional nonnegative prejudice).
+    #[inline]
+    fn score_cold_row(&self, rid: u32, h_row: &[f32], target_norm_cpu: Option<&[f32]>, row_buf: &mut [f32]) -> Result<f32> {
+        let rb = self.src.row_bytes();
+        let v = if self.src.dtype == GgmlDType::Q8_0 {
+            let off = self.src.start + (rid as usize) * rb;
+            decode_q8_0_row(&self.src.map[off..off + rb], row_buf);
+            let raw = embed_cpu_kernels::dot_f32_simd(h_row, row_buf);
+            if let Some(tn) = target_norm_cpu {
+                raw - crate::models::common::prejudice::scalar_prejudice(row_buf, tn)
+            } else {
+                raw
+            }
+        } else {
+            let deq = self.src.gather(&[rid], &Device::Cpu)?.dequantize(&Device::Cpu)?;
+            let vals = deq.flatten_all()?.to_vec1::<f32>()?;
+            let raw = embed_cpu_kernels::dot_f32_simd(h_row, &vals);
+            if let Some(tn) = target_norm_cpu {
+                raw - crate::models::common::prejudice::scalar_prejudice(&vals, tn)
+            } else {
+                raw
+            }
+        };
+        Ok(v)
+    }
+
+    /// Stage-1 clustered rescue evaluation returning `(best_id, best_val, clusters_checked, rows_scored)`.
+    /// Guarantees 0 false negatives even with `target_norm_cpu` (since `prejudice >= 0`, `w·h - prej <= w·h <= ub_j`).
+    pub fn eval_rest_best_clustered(
+        &self,
+        h_row: &[f32],
+        mut best_id: u32,
+        mut best_val: f32,
+        target_norm_cpu: Option<&[f32]>,
+    ) -> Result<(u32, f32, usize, usize)> {
+        let cols = self.src.cols;
+        anyhow::ensure!(h_row.len() == cols, "RestRescueGuard: hidden len {} != cols {}", h_row.len(), cols);
+        let Some(cg) = &self.clustered else {
+            let (rid, rval) = if target_norm_cpu.is_none() {
+                self.eval_rest_best(h_row)?
+            } else {
+                let mut rb_buf = vec![0.0f32; cols];
+                let mut bid = u32::MAX;
+                let mut bval = f32::NEG_INFINITY;
+                for &rid in self.rest_ids.iter() {
+                    let v = self.score_cold_row(rid, h_row, target_norm_cpu, &mut rb_buf)?;
+                    if v > bval || (v == bval && rid < bid) {
+                        bval = v;
+                        bid = rid;
+                    }
+                }
+                (bid, bval)
+            };
+            if rval > best_val || (rval == best_val && rid < best_id) {
+                best_id = rid;
+                best_val = rval;
+            }
+            return Ok((best_id, best_val, 1, self.rest_ids.len()));
+        };
+
+        let hn = embed_cpu_kernels::dot_f32_simd(h_row, h_row).sqrt();
+        let c = cg.radius.len();
+        let mut bounds: Vec<(f32, usize)> = (0..c)
+            .map(|j| {
+                let ch = embed_cpu_kernels::dot_f32_simd(&cg.centers[j * cols..(j + 1) * cols], h_row);
+                let rh = cg.radius[j] * hn;
+                let ub = ch + rh + 1e-3 * (ch.abs() + rh) + 1e-4;
+                (ub, j)
+            })
+            .collect();
+        bounds.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        let mut clusters_checked = 0usize;
+        let mut rows_scored = 0usize;
+        let rb = self.src.row_bytes();
+        let better = |(i1, v1): (u32, f32), (i2, v2): (u32, f32)| -> (u32, f32) {
+            if v2 > v1 || (v2 == v1 && i2 < i1) { (i2, v2) } else { (i1, v1) }
+        };
+
+        for (ub, j) in bounds {
+            if ub < best_val {
+                break;
+            }
+            let members = &cg.members[cg.offsets[j] as usize..cg.offsets[j + 1] as usize];
+            if members.is_empty() {
+                continue;
+            }
+            clusters_checked += 1;
+            rows_scored += members.len();
+            let (cid, cval) = if self.src.dtype == GgmlDType::Q8_0 && members.len() >= 128 {
+                members
+                    .par_chunks(256)
+                    .map(|chunk| {
+                        let mut lid = u32::MAX;
+                        let mut lval = f32::NEG_INFINITY;
+                        let mut row_buf = vec![0.0f32; cols];
+                        for &rid in chunk {
+                            let off = self.src.start + (rid as usize) * rb;
+                            decode_q8_0_row(&self.src.map[off..off + rb], &mut row_buf);
+                            let mut v = embed_cpu_kernels::dot_f32_simd(h_row, &row_buf);
+                            if let Some(tn) = target_norm_cpu {
+                                v -= crate::models::common::prejudice::scalar_prejudice(&row_buf, tn);
+                            }
+                            if v > lval || (v == lval && rid < lid) {
+                                lval = v;
+                                lid = rid;
+                            }
+                        }
+                        (lid, lval)
+                    })
+                    .reduce(|| (u32::MAX, f32::NEG_INFINITY), better)
+            } else {
+                let mut lid = u32::MAX;
+                let mut lval = f32::NEG_INFINITY;
+                let mut row_buf = vec![0.0f32; cols];
+                for &rid in members {
+                    let v = self.score_cold_row(rid, h_row, target_norm_cpu, &mut row_buf)?;
+                    if v > lval || (v == lval && rid < lid) {
+                        lval = v;
+                        lid = rid;
+                    }
+                }
+                (lid, lval)
+            };
+            if cval > best_val || (cval == best_val && cid < best_id) {
+                best_val = cval;
+                best_id = cid;
+            }
+        }
+        Ok((best_id, best_val, clusters_checked, rows_scored))
     }
 
     /// 희귀 구출(`rescue_mask == 1`): 호스트 mmap 의 REST 행을 SIMD(`embed_cpu_kernels`) 로 평가해
@@ -731,8 +1349,11 @@ pub struct TrimmedHead {
     host_inv: Arc<Vec<u32>>,
     /// 덧붙일 −∞ 한 칸 [1, 1]
     pad: Tensor,
-    /// Part 5 (Pack A·C): 무손실 Greedy 디코딩을 위한 REST CS 가드 + 호스트 mmap 구출기.
+    /// Part 5 (Pack A·C) + Phase 3-1 D2: 무손실 Greedy 디코딩을 위한 REST CS 가드 + 다중 군집 호스트 구출기.
     rescue: Option<Arc<RestRescueGuard>>,
+    pub exec_mode: VocabExecMode,
+    pub guard_mode: GuardMode,
+    pub counters: Arc<RescueCounters>,
 }
 
 impl TrimmedHead {
@@ -746,16 +1367,61 @@ impl TrimmedHead {
         let host_inv = Arc::new(inv.clone());
         let inv = Tensor::from_vec(inv, src.rows, device)?;
         let pad = Tensor::full(f32::NEG_INFINITY, (1, 1), device)?;
-        let rescue = RestRescueGuard::build(src, &kept, device)?.map(Arc::new);
+        let guard_mode = GuardMode::from_env();
+        let is_trimmed = kept.len() < src.rows;
+        let rescue = if is_trimmed && guard_mode != GuardMode::Off {
+            RestRescueGuard::build(src, &kept, device)?.map(Arc::new)
+        } else {
+            None
+        };
+        let exec_mode = if is_trimmed {
+            VocabExecMode::RuntimeSliced
+        } else if src.rows <= 65_536 {
+            VocabExecMode::ArtifactDirect
+        } else {
+            VocabExecMode::FullUntrimmed
+        };
         let mb = (kept.len() * src.row_bytes()) as f64 / 1e6;
+        let guard_tag = match &rescue {
+            None => if is_trimmed { "off".to_string() } else { "full".to_string() },
+            Some(r) => match &r.clustered {
+                Some(cg) => format!("clustered(c={},cache={})", cg.radius.len(), if r.cache_hit { "hit" } else { "build" }),
+                None => "single".to_string(),
+            },
+        };
         println!(
-            "[VOCAB-TRIM] 출력 투영 {} → {} 행 ({mb:.0} MB, {label}, cs_guard={}) · {:.0} ms",
+            "[VOCAB-TRIM] HEAD v_art={} k={} mb={mb:.1} scope={label} mode={} guard={guard_tag} build_ms={:.0}",
             src.rows,
             kept.len(),
-            if rescue.is_some() { "on" } else { "full" },
+            exec_mode.as_str(),
             t0.elapsed().as_secs_f64() * 1e3
         );
-        Ok(Self { w: QMatMul::from_arc(Arc::clone(&qweight))?, qweight, kept, vocab: src.rows, label, inv, host_inv, pad, rescue })
+        Ok(Self {
+            w: QMatMul::from_arc(Arc::clone(&qweight))?,
+            qweight,
+            kept,
+            vocab: src.rows,
+            label,
+            inv,
+            host_inv,
+            pad,
+            rescue,
+            exec_mode,
+            guard_mode,
+            counters: Arc::new(RescueCounters::default()),
+        })
+    }
+
+    pub fn head_bytes(&self) -> usize {
+        self.kept.len() * (self.qweight.shape().dims().last().copied().unwrap_or(0) / self.qweight.dtype().block_size().max(1) * self.qweight.dtype().type_size())
+    }
+
+    pub fn guard_kind_label(&self) -> &'static str {
+        match &self.rescue {
+            None => if self.kept.len() < self.vocab { "off" } else { "none" },
+            Some(r) if r.clustered.is_some() => "clustered_cs",
+            Some(_) => "single_cs",
+        }
     }
 
     /// 입력 임베딩 행: 묶인 표라 남긴 행의 출력 투영과 같은 바이트입니다. `ids` 가 모두 남긴 행에 있을 때만 (아니면 `None`) 장치의
@@ -775,6 +1441,12 @@ impl TrimmedHead {
     /// 남긴 행 자리 `rows` 의 입력 임베딩 [n, hidden] F32 (장치의 `qembed`)
     pub fn embed_rows(&self, rows: &[u32], device: &Device) -> candle_core::Result<Tensor> {
         self.w.embedding(&Tensor::from_vec(rows.to_vec(), rows.len(), device)?)
+    }
+
+    /// 남긴 행 `off..off+take` (`0..kept.len()`) 의 입력 임베딩 [take, hidden] F32 (`PrejudiceCache` 용).
+    pub fn kept_rows_f32(&self, off: usize, take: usize, device: &Device) -> candle_core::Result<Tensor> {
+        let rows: Vec<u32> = (off as u32..(off + take) as u32).collect();
+        self.embed_rows(&rows, device)
     }
 
     /// `PRC-03`: 출력 헤드 산술 단일화 — CUDA/ROCm 에서 지원 양자화 형식은 활성값 Q8_1 근사
@@ -835,6 +1507,12 @@ impl TrimmedHead {
 
     /// [`Self::greedy_next_token`] + `(token_ids, rescued_row_count)` 반환 (검증/관측용).
     pub fn greedy_next_token_with_stats(&self, last_hidden: &Tensor) -> Result<(Vec<u32>, usize)> {
+        let (ids, st) = self.greedy_next_token_detailed(last_hidden)?;
+        Ok((ids, st.flagged))
+    }
+
+    /// Detailed 1-step greedy selection with full `StepGuardStats` (clusters, rows scored, rescue µs, Mode A).
+    pub fn greedy_next_token_detailed(&self, last_hidden: &Tensor) -> Result<(Vec<u32>, StepGuardStats)> {
         let k_dim = *last_hidden.dims().last().unwrap_or(&0);
         let m = last_hidden.elem_count() / k_dim.max(1);
         let h_2d = last_hidden.reshape((m, k_dim))?.contiguous()?;
@@ -845,7 +1523,6 @@ impl TrimmedHead {
             h_2d.dtype(),
             k_dim,
         );
-        // Quantized Mode A (0-byte [M, V_core] logits materialization on CUDA & ROCm; M > 8 chunked in 8-row batches)
         let quant_mode_a_ok = use_fused
             && (h_2d.device().is_cuda() || h_2d.device().is_rocm())
             && k_dim % self.qweight.dtype().block_size() == 0
@@ -876,7 +1553,6 @@ impl TrimmedHead {
                         Some(&guard.cs_guard),
                     )?
                 } else {
-                    // GPU 융합 커널 비활성 시 CPU 폴백 (무손실 계약 유지)
                     let sub_cpu = sub_logits.to_device(&Device::Cpu)?;
                     let h_cpu = h_2d.to_device(&Device::Cpu)?;
                     let kept_cpu = Tensor::from_vec(self.kept.as_ref().clone(), (self.kept.len(),), &Device::Cpu)?;
@@ -898,9 +1574,25 @@ impl TrimmedHead {
         };
 
         let (mut ids, masks_opt) = out.download_ids_and_mask()?;
-        let mut rescued = 0usize;
+        // Critical: when `self.rescue` is None (e.g. LOGIS_VOCAB_GUARD=off) and kept < vocab,
+        // kernel returns local indices 0..K-1; remap back to original vocab IDs!
+        if self.rescue.is_none() && self.kept.len() < self.vocab {
+            for id in &mut ids {
+                if let Some(&orig) = self.kept.get(*id as usize) {
+                    *id = orig;
+                }
+            }
+        }
+
+        let mut st = StepGuardStats {
+            steps: m,
+            fast_steps: m,
+            quant_mode_a: quant_mode_a_ok,
+            ..Default::default()
+        };
         if let (Some(guard), Some(masks), Some(vals_t)) = (&self.rescue, masks_opt, out.max_vals) {
             if masks.iter().any(|&f| f != 0) {
+                let t_rescue = std::time::Instant::now();
                 let core_vals = vals_t.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
                 let h_host = h_2d
                     .to_device(&Device::Cpu)?
@@ -909,19 +1601,87 @@ impl TrimmedHead {
                     .to_vec1::<f32>()?;
                 for r in 0..m {
                     if masks[r] != 0 {
-                        rescued += 1;
+                        st.flagged += 1;
                         let h_row = &h_host[r * k_dim..(r + 1) * k_dim];
-                        let (rest_id, rest_val) = guard.eval_rest_best(h_row)?;
                         let core_id = ids[r];
                         let core_val = core_vals[r];
-                        if rest_val > core_val || (rest_val == core_val && rest_id < core_id) {
-                            ids[r] = rest_id;
+                        let (best_id, _best_val, c_chk, r_scr) =
+                            guard.eval_rest_best_clustered(h_row, core_id, core_val, None)?;
+                        st.clusters_checked += c_chk;
+                        st.rows_scored += r_scr;
+                        if best_id != core_id {
+                            ids[r] = best_id;
+                            st.rest_wins += 1;
                         }
                     }
                 }
+                st.rescue_us = t_rescue.elapsed().as_micros() as u64;
             }
         }
-        Ok((ids, rescued))
+        self.counters.record(&st);
+        Ok((ids, st))
+    }
+
+    /// Phase 3-1 D3: Lossless constrained greedy decoding (supports `semantic_prejudice >= 0`,
+    /// `banned_ids`, and `repeat_penalty` without materializing `[1, V]` logits).
+    /// Because `prejudice >= 0`, `w_r · h - prej_r <= w_r · h <= ub_j`, preserving 0 false negatives!
+    pub fn greedy_constrained<F>(
+        &self,
+        last_hidden: &Tensor,
+        prej_kept: Option<&[f32]>,
+        target_norm_cpu: Option<&[f32]>,
+        mut adjust_kept: F,
+    ) -> Result<(u32, StepGuardStats)>
+    where
+        F: FnMut(u32, f32) -> f32,
+    {
+        let k_dim = *last_hidden.dims().last().unwrap_or(&0);
+        let h_2d = last_hidden.reshape((1, k_dim))?.contiguous()?;
+        let sub_logits = self.project_rows(&h_2d)?;
+        let sub_vec = sub_logits.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut best_id = u32::MAX;
+        let mut best_val = f32::NEG_INFINITY;
+        for (idx, &raw_v) in sub_vec.iter().enumerate() {
+            let vid = self.kept.get(idx).copied().unwrap_or(idx as u32);
+            let mut v = raw_v;
+            if let Some(pk) = prej_kept {
+                if let Some(&p) = pk.get(idx) {
+                    v -= p;
+                }
+            }
+            v = adjust_kept(vid, v);
+            if v > best_val || (v == best_val && vid < best_id) {
+                best_val = v;
+                best_id = vid;
+            }
+        }
+        let mut st = StepGuardStats {
+            steps: 1,
+            constrained_steps: 1,
+            ..Default::default()
+        };
+        if let Some(guard) = &self.rescue {
+            let t_rescue = std::time::Instant::now();
+            let h_host = h_2d
+                .to_device(&Device::Cpu)?
+                .to_dtype(candle_core::DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let (rid, _rval, c_chk, r_scr) =
+                guard.eval_rest_best_clustered(&h_host, best_id, best_val, target_norm_cpu)?;
+            st.clusters_checked = c_chk;
+            st.rows_scored = r_scr;
+            if c_chk > 0 {
+                st.flagged = 1;
+            }
+            if rid != best_id {
+                best_id = rid;
+                st.rest_wins = 1;
+            }
+            st.rescue_us = t_rescue.elapsed().as_micros() as u64;
+        }
+        self.counters.record(&st);
+        Ok((best_id, st))
     }
 
     /// Gate 1-C: 1스텝 무손실 Greedy + 그림자 Top-3 후보 + 확신도(confidence) 추출.
@@ -1010,15 +1770,14 @@ impl TrimmedHead {
     }
 }
 
-/// 잘라 내기를 켤 수 있으면(규칙이 `off` 가 아니고 GPU · 매핑 · Q8_0 류 블록 표) 입력 임베딩 · 출력 투영 표의 자리.
-/// 이때 입력 임베딩은 이 매핑에서 쓰는 행만 읽고(장치 0), 출력 투영은 남긴 행만 장치에 둡니다.
+/// 잘라 내기를 켤 수 있으면(규칙이 `off` 가 아니고 매핑 · Q8_0 류 블록 표 — GPU 3종 + CPU + Metal 전체 지원, Phase 3-1 D4)
+/// 입력 임베딩 · 출력 투영 표의 자리.
 pub fn mapped_table(device: &Device, map: Option<&Arc<memmap2::Mmap>>, content: Option<&candle_core::quantized::gguf_file::Content>) -> Option<TableSource> {
-    if rule_from_env() == TrimRule::Off || !(device.is_cuda() || device.is_rocm() || device.is_vulkan()) {
+    if rule_from_env() == TrimRule::Off {
         return None;
     }
+    let _ = device;
     let (map, content) = (map?, content?);
-    // 묶이지 않은 출력 투영(`output.weight`)이 따로 있으면 남긴 행을 임베딩 표에서 뽑을 수 없어 자르지 않습니다
-    // (Qwen3 0.6B · Qwen3.5 2B · 4B 는 모두 묶여 있습니다).
     if content.tensor_infos.contains_key("output.weight") {
         println!("[VOCAB-TRIM] 출력 투영이 임베딩 표와 묶여 있지 않아(output.weight) 자르지 않습니다.");
         return None;
@@ -1093,24 +1852,37 @@ pub fn refresh_for(slot: &mut Option<TrimmedHead>, src: &TableSource, tok: &toke
         *slot = None;
         return Ok(());
     }
-    if sampling {
-        if slot.as_ref().is_some_and(|h| h.label == all_rows_label()) {
+    let fixed = std::env::var(LANGS_ENV).is_ok_and(|v| !v.trim().is_empty() && !v.trim().eq_ignore_ascii_case("auto"));
+    let langs = if fixed { current_langs() } else { current_langs().union(Langs::present(prompt)) };
+    let compact_k = compact_active_k(src.rows, langs);
+
+    // Direct artifact execution: if explicitly requested (`LOGIS_VOCAB_EXEC_MODE=artifact_direct`),
+    // or if the artifact is already compact (`<= 16,384` rows) and no smaller compact_k is requested,
+    // or during sampling (`temperature > 0`), load all artifact rows directly without slicing.
+    let force_all = sampling
+        || exec_mode_override() == Some(VocabExecMode::ArtifactDirect)
+        || exec_mode_override() == Some(VocabExecMode::FullUntrimmed)
+        || (src.rows <= 16_384 && compact_k.is_none());
+    if force_all {
+        if slot.as_ref().is_some_and(|h| h.kept.len() == src.rows) {
             return Ok(());
         }
         *slot = None;
         *slot = Some(all_rows(src, device)?);
         return Ok(());
     }
-    let fixed = std::env::var(LANGS_ENV).is_ok_and(|v| !v.trim().is_empty() && !v.trim().eq_ignore_ascii_case("auto"));
-    let langs = if fixed { current_langs() } else { current_langs().union(Langs::present(prompt)) };
-    let label = format!("{}:{}", rule.label(), langs.label());
-    if slot.as_ref().is_some_and(|h| h.label == label) {
+
+    let label = match compact_k {
+        Some(k) => format!("compact({k}):{}", langs.label()),
+        None => format!("{}:{}", rule.label(), langs.label()),
+    };
+    // When compact_k is None, label match is sufficient; when compact_k is Some, we also ensure
+    // any prompt tokens are covered (checked via sorted_subset below).
+    if compact_k.is_none() && slot.as_ref().is_some_and(|h| h.label == label) {
         return Ok(());
     }
-    let ids = ids_for(tok, src.rows, rule, langs)?;
-    // 지금 올린 행이 이번에 남길 행을 모두 담고 많아야 10 % 더 크면 그대로 씁니다. 같은 문서 안에서 프롬프트의 문자 체계에 따라
-    // 이름표가 오가며(이미지 판독의 hangul+kana+cjk ↔ kana+cjk) 쪽마다 8 ~ 10 번(번에 0.3 s) 다시 모으던 것을 없앱니다.
-    // 행이 더 많으면 off 에 더 가깝기만 합니다: off 가 고르는 토큰이 작은 쪽에 있으면 큰 쪽에도 있습니다.
+    let ids = ids_for_with_prompt(tok, src.rows, rule, langs, prompt)?;
+    // 지금 올린 행이 이번에 남길 행을 모두 담고 많아야 10 % 더 크면 그대로 씁니다.
     if let Some(h) = slot.as_ref() {
         if h.kept.len() <= ids.len() + ids.len() / 10 && sorted_subset(&ids, &h.kept) {
             return Ok(());
@@ -1263,5 +2035,133 @@ mod tests {
         drop(head);
         let _ = std::fs::remove_file(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn clustered_guard_constrained_lossless_parity() -> Result<()> {
+        let dev = Device::Cpu;
+        let rows = 512usize;
+        let cols = 64usize;
+        let mut w = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                w.push(((r * 13 + c * 7) as f32 * 0.19).sin() * 0.6 + ((r % 17) as f32) * 0.03);
+            }
+        }
+        let q = candle_core::quantized::QTensor::quantize(&Tensor::from_vec(w, (rows, cols), &dev)?, GgmlDType::Q8_0)?;
+        let bytes = q.data()?.to_vec();
+        let path = std::env::temp_dir().join(format!("logis-vt-cg-{}", std::process::id()));
+        std::fs::write(&path, &bytes)?;
+        let map = Arc::new(unsafe { memmap2::Mmap::map(&std::fs::File::open(&path)?)? });
+        let src = TableSource { map, start: 0, rows, cols, dtype: GgmlDType::Q8_0 };
+        let kept: Vec<u32> = (0..128u32).collect();
+        let head = TrimmedHead::build(&src, Arc::new(kept.clone()), "cg-test".into(), &dev)?;
+        let full_w = q.dequantize(&dev)?.to_vec2::<f32>()?;
+
+        // Target vector for nonnegative prejudice test
+        let target_norm: Vec<f32> = {
+            let mut v: Vec<f32> = (0..cols).map(|c| ((c as f32) * 0.31).cos()).collect();
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in &mut v { *x /= n; }
+            v
+        };
+        let prej_kept: Vec<f32> = kept
+            .iter()
+            .map(|&r| crate::models::common::prejudice::scalar_prejudice(&full_w[r as usize], &target_norm))
+            .collect();
+
+        // Test 12 hidden vectors including vectors aligned directly with cold rows (>128)
+        for trial in 0..12usize {
+            let h_vec: Vec<f32> = if trial % 2 == 0 {
+                // Force cold-row win
+                full_w[150 + trial * 25].clone()
+            } else {
+                (0..cols).map(|c| ((trial * 29 + c * 5) as f32 * 0.23).cos()).collect()
+            };
+            let h_t = Tensor::from_vec(h_vec.clone(), (1, cols), &dev)?;
+
+            // 1. Pure greedy parity
+            let (got_ids, _st) = head.greedy_next_token_detailed(&h_t)?;
+            let mut want_id = 0u32;
+            let mut want_val = f32::NEG_INFINITY;
+            for (r, row) in full_w.iter().enumerate() {
+                let d: f32 = row.iter().zip(&h_vec).map(|(a, b)| a * b).sum();
+                if d > want_val {
+                    want_val = d;
+                    want_id = r as u32;
+                }
+            }
+            assert_eq!(got_ids[0], want_id, "pure greedy mismatch at trial {trial}");
+
+            // 2. Constrained greedy with nonnegative prejudice parity
+            let (got_c, _stc) = head.greedy_constrained(
+                &h_t,
+                Some(&prej_kept),
+                Some(&target_norm),
+                |_vid, v| v,
+            )?;
+            let mut want_cid = 0u32;
+            let mut want_cval = f32::NEG_INFINITY;
+            for (r, row) in full_w.iter().enumerate() {
+                let d: f32 = row.iter().zip(&h_vec).map(|(a, b)| a * b).sum();
+                let p = crate::models::common::prejudice::scalar_prejudice(row, &target_norm);
+                let adj = d - p;
+                if adj > want_cval {
+                    want_cval = adj;
+                    want_cid = r as u32;
+                }
+            }
+            assert_eq!(got_c, want_cid, "constrained greedy mismatch at trial {trial}");
+        }
+        drop(head);
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn domain_lexicon_bundle_isolation() {
+        let en_corpus = corpus_for_langs(Langs::of_doc_lang("en"));
+        let has_hangul = |v: &[String]| v.iter().any(|s| s.chars().any(|c| ('\u{AC00}'..='\u{D7A3}').contains(&c)));
+        let has_arabic = |v: &[String]| v.iter().any(|s| s.chars().any(|c| ('\u{0600}'..='\u{06FF}').contains(&c)));
+        assert!(!has_hangul(&en_corpus), "en bundle must not pull Korean bias entries");
+        assert!(!has_arabic(&en_corpus), "en bundle must not pull Arabic bias entries");
+
+        let ko_corpus = corpus_for_langs(Langs::of_doc_lang("ko"));
+        assert!(has_hangul(&ko_corpus), "ko bundle must include Korean bias entries");
+        assert!(!has_arabic(&ko_corpus), "ko bundle must not pull Arabic bias entries");
+
+        let ar_corpus = corpus_for_langs(Langs::of_doc_lang("ar"));
+        if crate::utils::bias_schema::BIAS_DICT.get("ar").is_some() {
+            assert!(has_arabic(&ar_corpus), "ar bundle must include Arabic bias entries when full-bias is loaded");
+        }
+        assert!(!has_hangul(&ar_corpus), "ar bundle must not pull Korean bias entries");
+    }
+
+    #[test]
+    fn user_prompt_text_excludes_system_prompt() {
+        use crate::openai_types::{
+            ChatCompletionParameters, ChatCompletionRequestMessage,
+            ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
+            ChatCompletionRequestUserMessageContent,
+        };
+        let params = ChatCompletionParameters {
+            messages: vec![
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: "한국어 시스템 안내 العربية".into(),
+                    name: None,
+                }),
+                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text("Invoice #12345 USD 99.50".into()),
+                    name: None,
+                }),
+            ],
+            ..Default::default()
+        };
+        let u = user_prompt_text(&params);
+        assert!(u.contains("Invoice #12345"));
+        assert!(!u.contains("한국어"));
+        assert!(!u.contains("العربية"));
+        let langs = Langs::present(&u);
+        assert!(!langs.hangul && !langs.arabic, "system scripts must not leak: {langs:?}");
     }
 }

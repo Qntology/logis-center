@@ -2,7 +2,7 @@
 rem =====================================================================
 rem  Synthetic data evaluation runner (CUDA / ROCm).
 rem  Set LOGIS_EVAL_BACKEND=cuda or rocm (default: rocm, or auto-cuda if CUDA_PATH set and ROCm missing).
-rem  Set EVAL_PROFILE=release or debug (default: debug).
+rem  Set EVAL_PROFILE=release or debug (default: release).
 rem  Build first with:
 rem    CUDA: scripts\test_cargo.bat --release --no-run   (or debug: scripts\test_cargo.bat --no-run)
 rem    ROCm: scripts\test_cargo_rocm.bat --no-run
@@ -47,7 +47,7 @@ if not exist "%EVAL_ROOT%\models" mklink /J "%EVAL_ROOT%\models" "%LOCALAPPDATA%
 set "LOGIS_APP_DIR=%EVAL_ROOT%"
 
 set "PROFILE=%EVAL_PROFILE%"
-if not defined PROFILE set "PROFILE=debug"
+if not defined PROFILE set "PROFILE=release"
 set "EXE=%EVAL_EXE%"
 for /f "delims=" %%F in ('dir /b /o-d "%ROOT%\target\%PROFILE%\deps\it-*.exe" 2^>nul') do if not defined EXE set "EXE=%ROOT%\target\%PROFILE%\deps\%%F"
 if not defined EXE (

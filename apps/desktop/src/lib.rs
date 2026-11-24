@@ -57,7 +57,7 @@ async fn unload_model(state: State<'_, AppState>) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn translit_cache_respond(request_id: String, results: Vec<(String, String)>) -> Result<(), String> {
+async fn translit_cache_respond(request_id: String, results: Vec<Vec<String>>) -> Result<(), String> {
     logis_app::commands::translit_cache_respond(request_id, results).await
 }
 
@@ -562,7 +562,6 @@ async fn check_model_status_body() -> Result<serde_json::Value, String> {
     
     let qwen3_dir = base_path.join("Qwen3-0.6B-Instruct-gguf");
     let qwen3_5_dir = base_path.join("Qwen3.5-2B-Instruct-gguf");
-    let granite_dir = base_path.join("granite-4.0-h-350m");
     let embed_dir = base_path.join("granite-embedding-97m-multilingual-r2");
 
     let siglip2_dir = base_path.join("siglip2-so400m-patch16-naflex");
@@ -570,7 +569,6 @@ async fn check_model_status_body() -> Result<serde_json::Value, String> {
     let mut status_map = serde_json::Map::new();
     status_map.insert("Qwen3".to_string(), serde_json::json!(has_valid_model(&qwen3_dir)));
     status_map.insert("Qwen3.5".to_string(), serde_json::json!(has_valid_model(&qwen3_5_dir)));
-    status_map.insert("Granite".to_string(), serde_json::json!(has_valid_model(&granite_dir)));
     status_map.insert("Embedding".to_string(), serde_json::json!(has_valid_model(&embed_dir)));
     status_map.insert("SigLIP2".to_string(), serde_json::json!(has_valid_model(&siglip2_dir)));
 

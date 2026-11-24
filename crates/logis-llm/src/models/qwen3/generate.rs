@@ -110,6 +110,35 @@ pub struct Qwen3GenerateModel {
     prompt_kv_snapshot: Option<PromptKvSnapshot>,
     /// 🌟 [SPD-01] 직전 generate 호출 프로파일링: `(prefill_ms, decode_ms, decode_steps, slow_path_steps, retry_kv_hit)`
     last_gen_stats: Option<(f64, f64, usize, usize, bool)>,
+    /// Phase 3-1 D2: 누적/직전 생성 가드 통계 (`StepGuardStats`)
+    last_guard_stats: Option<crate::models::common::vocab_trim::StepGuardStats>,
+}
+
+/// Resolve EOS token IDs dynamically from tokenizer & generation_config without hardcoded 151643/151645 literals.
+fn resolve_qwen3_eos(tokenizer: &TokenizerModel, cfg: &Qwen3GenerationConfig) -> (u32, u32) {
+    let vocab = tokenizer.tokenizer.get_vocab_size(true);
+    let tok_lookup = |name: &str| -> Option<u32> {
+        tokenizer.tokenizer.token_to_id(name).filter(|&id| (id as usize) < vocab)
+    };
+    let e1 = cfg
+        .eos_token_id
+        .first()
+        .copied()
+        .map(|v| v as u32)
+        .filter(|&id| (id as usize) < vocab)
+        .or_else(|| tok_lookup("<|endoftext|>"))
+        .or_else(|| tok_lookup("<|im_end|>"))
+        .unwrap_or(0);
+    let e2 = cfg
+        .eos_token_id
+        .get(1)
+        .copied()
+        .map(|v| v as u32)
+        .filter(|&id| (id as usize) < vocab)
+        .or_else(|| tok_lookup("<|im_end|>"))
+        .or_else(|| tok_lookup("<|endoftext|>"))
+        .unwrap_or(e1);
+    (e1, e2)
 }
 
 /// 🌟 [KV-PLAN v2] Qwen3-0.6B 디코딩 한 스텝의 활성값 순간치(대략).
@@ -189,14 +218,15 @@ impl Qwen3GenerateModel {
             serde_json::from_slice(&std::fs::read(generation_config_path)?)?;
 
         let json_protected_ids = build_json_protected_ids(&tokenizer);
+        let (eos_token_id1, eos_token_id2) = resolve_qwen3_eos(&tokenizer, &generation_config);
 
         Ok(Qwen3GenerateModel {
             chat_template,
             tokenizer,
             qwen3,
             device: device.clone(),
-            eos_token_id1: generation_config.eos_token_id[0] as u32,
-            eos_token_id2: generation_config.eos_token_id[1] as u32,
+            eos_token_id1,
+            eos_token_id2,
             generation_config,
             model_name: "qwen3".to_string(),
             last_kv_plan: None,
@@ -205,15 +235,16 @@ impl Qwen3GenerateModel {
             repetition_penalty_override: None,
             prompt_kv_snapshot: None,
             last_gen_stats: None,
+            last_guard_stats: None,
         })
     }
-    /// 🌟 [Q8-RESIDENT] CUDA/ROCm 에서는 Q8_0 가중치를 그대로 GPU 에 상주시키고(정확 W8A16), 그 외 장치나
+    /// 🌟 [Q8-RESIDENT] CUDA/ROCm/Vulkan 에서는 Q8_0 가중치를 그대로 GPU 에 상주시키고(정확 W8A16), 그 외 장치나
     /// `LOGIS_QWEN3_DENSE=1` 이면 기존처럼 BF16/F32 로 역양자화해 올립니다.
     pub fn init_from_gguf(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
         let dense_env = std::env::var("LOGIS_QWEN3_DENSE")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
             .unwrap_or(false);
-        let q8 = !dense_env && { let d = get_device(device); d.is_cuda() || d.is_rocm() };
+        let q8 = !dense_env && { let d = get_device(device); d.is_cuda() || d.is_rocm() || d.is_vulkan() };
         if dense_env {
             println!("[QWEN3-Q8] LOGIS_QWEN3_DENSE=1 → 기존 BF16 역양자화 경로로 로드합니다.");
         }
@@ -254,13 +285,14 @@ impl Qwen3GenerateModel {
                     let generation_config: Qwen3GenerationConfig =
                         serde_json::from_slice(&std::fs::read(&generation_config_path).unwrap_or_default()).unwrap_or_default();
                     let json_protected_ids = build_json_protected_ids(&tokenizer);
+                    let (eos_token_id1, eos_token_id2) = resolve_qwen3_eos(&tokenizer, &generation_config);
                     return Ok(Qwen3GenerateModel {
                         chat_template,
                         tokenizer,
                         qwen3,
                         device: device.clone(),
-                        eos_token_id1: generation_config.eos_token_id.get(0).cloned().unwrap_or(151643) as u32,
-                        eos_token_id2: generation_config.eos_token_id.get(1).cloned().unwrap_or(151645) as u32,
+                        eos_token_id1,
+                        eos_token_id2,
                         generation_config,
                         model_name: "qwen3".to_string(),
                         last_kv_plan: None,
@@ -269,6 +301,7 @@ impl Qwen3GenerateModel {
                         repetition_penalty_override: None,
                         prompt_kv_snapshot: None,
                         last_gen_stats: None,
+                        last_guard_stats: None,
                     });
                 }
                 Err(e) => println!("[QWEN3-Q8] ⚠️ Q8 상주 로드 실패 → 기존 BF16 역양자화 경로로 로드합니다: {e}"),
@@ -324,14 +357,15 @@ impl Qwen3GenerateModel {
             serde_json::from_slice(&std::fs::read(generation_config_path).unwrap_or_default()).unwrap_or_default();
 
         let json_protected_ids = build_json_protected_ids(&tokenizer);
+        let (eos_token_id1, eos_token_id2) = resolve_qwen3_eos(&tokenizer, &generation_config);
 
         Ok(Qwen3GenerateModel {
             chat_template,
             tokenizer,
             qwen3,
             device: device.clone(),
-            eos_token_id1: generation_config.eos_token_id.get(0).cloned().unwrap_or(151643) as u32,
-            eos_token_id2: generation_config.eos_token_id.get(1).cloned().unwrap_or(151645) as u32,
+            eos_token_id1,
+            eos_token_id2,
             generation_config,
             model_name: "qwen3".to_string(),
             last_kv_plan: None,
@@ -340,6 +374,7 @@ impl Qwen3GenerateModel {
             repetition_penalty_override: None,
             prompt_kv_snapshot: None,
             last_gen_stats: None,
+            last_guard_stats: None,
         })
     }
 
@@ -366,6 +401,48 @@ impl Qwen3GenerateModel {
     /// 🌟 [SPD-01] 직전 `generate` 호출의 타이밍 `(prefill_ms, decode_ms, decode_steps, slow_path_steps, retry_kv_hit)`.
     pub fn last_gen_stats(&self) -> Option<(f64, f64, usize, usize, bool)> {
         self.last_gen_stats
+    }
+
+    /// Phase 3-1 D2: 직전 생성의 가드/구출 통계 (`StepGuardStats`).
+    pub fn last_guard_stats(&self) -> Option<&crate::models::common::vocab_trim::StepGuardStats> {
+        self.last_guard_stats.as_ref()
+    }
+
+    pub fn resident_vram_bytes(&self) -> u64 {
+        self.qwen3.resident_vram_bytes()
+    }
+
+    fn prejudice_cached_active(&self, target_text: &str) -> Result<crate::models::common::prejudice::CachedPrejudice> {
+        let target_ids = self.tokenizer.text_encode_vec(target_text.to_string(), false)?;
+        if target_ids.is_empty() {
+            return Err(anyhow::anyhow!("empty target tokens"));
+        }
+        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
+        let target_emb = self.qwen3.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+        let target_emb_sum = target_emb.sum_keepdim(1)?;
+        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+        let target_vec = target_emb_sum.broadcast_div(&len_tensor)?.squeeze(0)?.squeeze(0)?;
+
+        let vocab_label = self
+            .qwen3
+            .trim_head
+            .as_ref()
+            .map(|h| format!("{}:{}", h.label, h.kept.len()))
+            .unwrap_or_else(|| "full".into());
+        let num_rows = self
+            .qwen3
+            .trim_head
+            .as_ref()
+            .map(|h| h.kept.len())
+            .unwrap_or(self.qwen3.embed_vocab()?);
+        let cache_key = format!("qwen3:k:{:016x}:{vocab_label}", hash_str_u64(target_text));
+        crate::models::common::prejudice::get_or_build(
+            &cache_key,
+            &target_vec,
+            num_rows,
+            &self.device,
+            |off, take| self.qwen3.embed_kept_rows_f32(off, take, &self.device),
+        )
     }
 
     // =====================================================================
@@ -728,7 +805,9 @@ impl Qwen3GenerateModel {
         let chunk_size = if self.qwen3.is_q8_resident() { 1024 } else { 256 };
         let mut next_token = 0;
         let mut current_chunk_offset = 0;
-        
+        let mut guard_stats = crate::models::common::vocab_trim::StepGuardStats::default();
+        self.qwen3.validate_input_ids(p_ids)?;
+
         while current_chunk_offset < prompt_seq_len {
             if let Some(flag) = &cancel_flag {
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -737,48 +816,51 @@ impl Qwen3GenerateModel {
             }
             let take = std::cmp::min(chunk_size, prompt_seq_len - current_chunk_offset);
             let chunk_ids = input_ids.narrow(1, current_chunk_offset, take)?;
-            
-            let logits = self.qwen3.forward(Some(&chunk_ids), None, seqlen_offset)?;
-            
-            // 🌟 [VRAM/RAM 최적화] 청크 연산 직후 GPU를 동기화하고 시스템 메모리(RAM)를 강제로 반환시킵니다.
-            if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
+            let is_last_chunk = current_chunk_offset + take == prompt_seq_len;
 
+            // Phase 3-1 D3: skip lm_head projection on non-last chunks AND on strict JSON greedy i==0.
+            let last_hidden = self.qwen3.forward_last_hidden(Some(&chunk_ids), None, seqlen_offset)?;
+
+            if self.device.is_cuda_or_rocm() { let _ = self.device.synchronize(); }
             crate::models::common::legacy_working_set_trim();
 
             seqlen_offset += take;
             current_chunk_offset += take;
-            
-            // 프리필이 완전히 끝나는 마지막 청크의 끝에서만 첫 번째 토큰을 샘플링합니다.
-            if current_chunk_offset == prompt_seq_len {
-                let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
-                // 🌟 오답 진영 억제력(Sub) 적용
-                let logits = if let Some(ref prej) = semantic_prejudice_tensor {
-                    logits.broadcast_sub(prej)?
+            if is_last_chunk {
+                if is_strict_json && temperature <= 0.0 {
+                    next_token = open_bracket_id;
+                    guard_stats.skip_i0 = true;
                 } else {
-                    logits
-                };
-                
-                let mut logits_vec = logits.to_vec1::<f32>()?;
-                let len = logits_vec.len();
+                    let logits = self.qwen3.logits_from_hidden(&last_hidden)?;
+                    let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
 
-                // 🌟 JSON 강제 룰 적용 (첫 토큰)
-                if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
-                if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; }
-                if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -10000.0; }
-                if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -10000.0; }
-                if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
+                    let logits = if let Some(ref prej) = semantic_prejudice_tensor {
+                        logits.broadcast_sub(prej)?
+                    } else {
+                        logits
+                    };
 
-                if is_strict_json {
-                    if (open_bracket_id as usize) < len { logits_vec[open_bracket_id as usize] += 10000.0; }
-                    if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
-                    if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                    let mut logits_vec = logits.to_vec1::<f32>()?;
+                    let len = logits_vec.len();
+
+                    if (think_token_id as usize) < len { logits_vec[think_token_id as usize] -= 1000.0; }
+                    if (lt_id as usize) < len { logits_vec[lt_id as usize] -= 10.0; }
+                    if (self.eos_token_id1 as usize) < len { logits_vec[self.eos_token_id1 as usize] = -10000.0; }
+                    if (self.eos_token_id2 as usize) < len { logits_vec[self.eos_token_id2 as usize] = -10000.0; }
+                    if (enter_id as usize) < len { logits_vec[enter_id as usize] -= 50.0; }
+
+                    if is_strict_json {
+                        if (open_bracket_id as usize) < len { logits_vec[open_bracket_id as usize] += 10000.0; }
+                        if (double_slash_id as usize) < len { logits_vec[double_slash_id as usize] -= 10000.0; }
+                        if (space_double_slash_id as usize) < len { logits_vec[space_double_slash_id as usize] -= 10000.0; }
+                    }
+
+                    let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
+                    next_token = logit_processor.sample(&logits_tensor)?;
+
+                    if is_strict_json { next_token = open_bracket_id; }
                 }
-
-                let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
-                next_token = logit_processor.sample(&logits_tensor)?;
-
-                if is_strict_json { next_token = open_bracket_id; }
 
                 generate.push(next_token);
                 if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) { gen_text.push_str(&piece); }
@@ -982,6 +1064,7 @@ impl Qwen3GenerateModel {
         }
 
         // BPE 디코딩 무결성을 보장하기 위해 최종 조립은 배열 기반으로 수행합니다.
+        self.last_guard_stats = Some(guard_stats);
         let res_text = self.tokenizer.token_decode(generate)?;
         
         Ok(res_text)
@@ -1169,6 +1252,20 @@ impl Qwen3GenerateModel {
         let decode_t0 = std::time::Instant::now();
         let mut decode_steps = 0usize;
         let mut slow_path_steps = 0usize;
+        let mut guard_stats = crate::models::common::vocab_trim::StepGuardStats {
+            skip_i0: is_strict_json && temperature <= 0.0,
+            ..Default::default()
+        };
+        let active_prej_cached: Option<(Vec<f32>, Vec<f32>)> = if temperature <= 0.0 && self.qwen3.trim_head.is_some() {
+            semantic_prejudice.and_then(|t| {
+                self.prejudice_cached_active(t).ok().and_then(|cp| {
+                    let pv = cp.values.to_device(&Device::Cpu).ok()?.flatten_all().ok()?.to_vec1::<f32>().ok()?;
+                    Some((pv, cp.target_norm_cpu))
+                })
+            })
+        } else {
+            None
+        };
 
         // 🌟 [Phase 2: Decoding] 첫 번째 토큰을 얻은 후 1글자씩 이어서 생성합니다.
         for i in 1..sample_len {
@@ -1186,9 +1283,14 @@ impl Qwen3GenerateModel {
             let pure_greedy = mes.temperature.unwrap_or(0.0) <= 0.0
                 && semantic_prejudice_tensor.is_none()
                 && !has_ignores;
+            let constrained_greedy = mes.temperature.unwrap_or(0.0) <= 0.0
+                && !pure_greedy
+                && self.qwen3.trim_head.is_some()
+                && !has_ignores;
             let fast_tok = if pure_greedy {
                 let last_hidden = self.qwen3.forward_last_hidden(Some(&single_input), None, seqlen_offset)?;
-                let cand = self.qwen3.greedy_from_hidden(&last_hidden)?;
+                let (cand, st) = self.qwen3.greedy_from_hidden_with_stats(&last_hidden)?;
+                guard_stats.merge(&st);
                 let recent_start = generate.len().saturating_sub(512);
                 let cand_rep_exempt = is_strict_json && self.json_protected_ids.contains(&cand);
                 let hit_banned = cand == think_token_id
@@ -1199,7 +1301,6 @@ impl Qwen3GenerateModel {
                     Some(cand)
                 } else {
                     slow_path_steps += 1;
-                    // 희귀 억제/반복 토큰 충돌 시 이미 계산된 last_hidden 으로만 전체 로짓 계산
                     let logits = self.qwen3.logits_from_hidden(&last_hidden)?;
                     let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
                     let mut logits_vec = logits.to_vec1::<f32>()?;
@@ -1235,6 +1336,42 @@ impl Qwen3GenerateModel {
                     }
                     let logits_tensor = Tensor::from_vec(logits_vec, (len,), &Device::Cpu)?;
                     Some(logit_processor.sample(&logits_tensor)?)
+                }
+            } else if constrained_greedy {
+                // Phase 3-1 D3: lossless constrained greedy over K rows + clustered cold guard (no [1,V] expansion).
+                let last_hidden = self.qwen3.forward_last_hidden(Some(&single_input), None, seqlen_offset)?;
+                let recent_start = generate.len().saturating_sub(512);
+                let recent_set: std::collections::HashSet<u32> = if penalty > 1.0 {
+                    generate[recent_start..].iter().copied().collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                let is_url_single = gen_text.ends_with("http:/") || gen_text.ends_with("https:/");
+                let is_url_double = gen_text.ends_with("http:") || gen_text.ends_with("https:");
+                let block_slash = is_strict_json && !is_url_single && gen_text.ends_with('/');
+                let block_double = is_strict_json && !is_url_double;
+                let prej_ref = active_prej_cached.as_ref().map(|(pv, _)| pv.as_slice());
+                let tnorm_ref = active_prej_cached.as_ref().map(|(_, tn)| tn.as_slice());
+                let head = self.qwen3.trim_head.as_ref().unwrap();
+                let (cand, st) = head.greedy_constrained(&last_hidden, prej_ref, tnorm_ref, |vid, mut v| {
+                    if vid == think_token_id { v -= 1000.0; }
+                    if block_slash && vid == slash_id { v -= 10000.0; }
+                    if block_double && (vid == double_slash_id || vid == space_double_slash_id) { v -= 10000.0; }
+                    if penalty > 1.0 && recent_set.contains(&vid) && !(is_strict_json && self.json_protected_ids.contains(&vid)) {
+                        if v <= 0.0 { v *= penalty; } else { v /= penalty; }
+                    }
+                    v
+                })?;
+                guard_stats.merge(&st);
+                let cold_conflict = st.rest_wins > 0
+                    && (cand == think_token_id
+                        || (block_slash && cand == slash_id)
+                        || (block_double && (cand == double_slash_id || cand == space_double_slash_id))
+                        || (penalty > 1.0 && recent_set.contains(&cand) && !(is_strict_json && self.json_protected_ids.contains(&cand))));
+                if !cold_conflict {
+                    Some(cand)
+                } else {
+                    None
                 }
             } else {
                 None
@@ -1363,10 +1500,80 @@ impl Qwen3GenerateModel {
 
         let decode_ms = decode_t0.elapsed().as_secs_f64() * 1e3;
         self.last_gen_stats = Some((prefill_ms, decode_ms, decode_steps, slow_path_steps, retry_kv_hit));
+        self.last_guard_stats = Some(guard_stats.clone());
         crate::utils::score_dynamics::record_baseline("qwen3.prefill_ms", prefill_ms as f32);
         crate::utils::score_dynamics::record_baseline("qwen3.decode_ms", decode_ms as f32);
         crate::utils::score_dynamics::record_baseline("qwen3.retry_kv_hit", if retry_kv_hit { 1.0 } else { 0.0 });
         crate::utils::score_dynamics::record_baseline("qwen3.slow_path_steps", slow_path_steps as f32);
+
+        if logis_schema::reflection::ReflectionLogMode::from_env() != logis_schema::reflection::ReflectionLogMode::Off {
+            let head = self.qwen3.trim_head.as_ref();
+            let vocab_v = self.qwen3.embed_vocab().unwrap_or(0) as u32;
+            let active_k = head.map(|h| h.kept.len() as u32).unwrap_or(vocab_v);
+            let scope_label = head.map(|h| h.label.clone()).unwrap_or_else(|| "full".into());
+            let head_path = if guard_stats.quant_mode_a {
+                "quant_mode_a".into()
+            } else if head.is_some() {
+                "trimmed_head".into()
+            } else {
+                "linear_proj".into()
+            };
+            let backend = if self.device.is_rocm() {
+                "rocm"
+            } else if self.device.is_cuda() {
+                "cuda"
+            } else if self.device.is_vulkan() {
+                "vulkan"
+            } else if self.device.is_metal() {
+                "metal"
+            } else {
+                "cpu"
+            };
+            let rec = logis_schema::reflection::ReflectionRecord {
+                ts_ms: logis_schema::reflection::current_ts_ms(),
+                run_id: logis_schema::reflection::current_run_id(),
+                task_id: self.model_name.clone(),
+                git_rev: option_env!("LOGIS_GIT_REV").unwrap_or("dev").into(),
+                build_profile: logis_schema::reflection::build_profile_label(),
+                features: Vec::new(),
+                backend: backend.into(),
+                device_name: format!("{:?}", self.device),
+                artifact: logis_schema::reflection::ArtifactReflection {
+                    slot: "qwen3_0_6b".into(),
+                    bytes: self.qwen3.resident_vram_bytes(),
+                    sha256_16: String::new(),
+                    recipe: if self.qwen3.is_q8_resident() { "Q8_0".into() } else { "BF16".into() },
+                    vocab_v,
+                    artifact_k: active_k,
+                    plan_sha256: None,
+                    space_tag: None,
+                },
+                load: None,
+                exec: Some(logis_schema::reflection::ExecReflection {
+                    step: "generate".into(),
+                    langs: [String::new(), String::new(), scope_label.clone()],
+                    scope_label,
+                    vocab_k: [vocab_v, active_k],
+                    head_path,
+                    guard_kind: head.map(|h| h.guard_kind_label().into()).unwrap_or_else(|| "none".into()),
+                    tokens: [prompt_seq_len as u32, decode_steps as u32],
+                    timing_ms: [prefill_ms as f32, decode_ms as f32, guard_stats.rescue_ms() as f32],
+                    steps: [
+                        guard_stats.fast_steps as u32,
+                        slow_path_steps as u32,
+                        guard_stats.constrained_steps as u32,
+                        guard_stats.flagged as u32,
+                        guard_stats.rest_wins as u32,
+                    ],
+                    sampling: temperature > 1e-7,
+                    trim_mode: head.map(|h| h.exec_mode.as_str().into()).unwrap_or_else(|| "full_untrimmed".into()),
+                    clusters_checked: guard_stats.clusters_checked as u32,
+                    rows_scored: guard_stats.rows_scored as u64,
+                    ..Default::default()
+                }),
+            };
+            logis_schema::reflection::record(&rec);
+        }
 
         let res = self.tokenizer.token_decode(generate)?;
         self.qwen3.clear_kv_cache();

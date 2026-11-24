@@ -134,8 +134,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { path: logis-center }
+      - name: resolve pinned candle-rocm-vulkan revision
+        id: pins
+        run: |
+          python3 logis-center/.github/scripts/verify-pins.py
+          REV="$(python3 logis-center/.github/scripts/verify-pins.py --print-candle-rev | tail -n 1)"
+          echo "candle_rev=$REV" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
-        with: { repository: sungu-che/candle-rocm-vulkan, ref: master, path: candle-rocm-vulkan, fetch-depth: 0 }
+        with: { repository: sungu-che/candle-rocm-vulkan, ref: "${{ steps.pins.outputs.candle_rev }}", path: candle-rocm-vulkan, fetch-depth: 0 }
       - name: apply fork patch series
         run: logis-center/.github/scripts/apply-fork-patches.sh
       - uses: dtolnay/rust-toolchain@stable
@@ -184,8 +190,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { path: logis-center }
+      - name: resolve pinned candle-rocm-vulkan revision
+        id: pins
+        run: |
+          python3 logis-center/.github/scripts/verify-pins.py
+          REV="$(python3 logis-center/.github/scripts/verify-pins.py --print-candle-rev | tail -n 1)"
+          echo "candle_rev=$REV" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
-        with: { repository: sungu-che/candle-rocm-vulkan, ref: master, path: candle-rocm-vulkan, fetch-depth: 0 }
+        with: { repository: sungu-che/candle-rocm-vulkan, ref: "${{ steps.pins.outputs.candle_rev }}", path: candle-rocm-vulkan, fetch-depth: 0 }
       - name: apply fork patch series + path dependencies (job only)
         run: |
           logis-center/.github/scripts/apply-fork-patches.sh

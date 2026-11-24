@@ -274,7 +274,7 @@ let isSearching = false;
 let isExtracting = false;
 let modelStatus: Record<string, boolean> = {};
 const TARGET_MODELS = [
-    'Qwen3', 'Qwen3.5', 'Embedding', 'Granite', 'SigLIP2',
+    'Qwen3', 'Qwen3.5', 'Embedding', 'SigLIP2',
     // stanza-onnx-export 변환본(format 2)이 있는 12개 언어 (apps/core/src/stanza.rs UI_LANGS 와 같음)
     'stanza_korean', 'stanza_english', 'stanza_japanese', 'stanza_chinese',
     'stanza_french', 'stanza_german', 'stanza_spanish', 'stanza_italian',
@@ -6287,8 +6287,7 @@ function renderModelStatusUI(status: any) {
     const models: Array<{ key: string; label: string }> = [
         { key: "Qwen3", label: "Qwen3 (0.6B)" },
         { key: "Qwen3.5", label: "Qwen3.5 (2B)" },
-        { key: "Granite", label: "Granite Embedding" },
-        { key: "Embedding", label: "Embedding Model" },
+        { key: "Embedding", label: "Granite Embedding (97m-r2)" },
         { key: "SigLIP2", label: "SigLIP2 Vision" },
     ];
     
@@ -7542,7 +7541,7 @@ initDevicePreference();
 listen("translit-cache-query", async (event: any) => {
     const { request_id, word, lang } = event.payload;
 
-    const respond = async (results: Array<[string, string]>) => {
+    const respond = async (results: Array<[string, string, string]>) => {
         try {
             await invoke("translit_cache_respond", { requestId: request_id, results });
         } catch (e) {
@@ -7578,10 +7577,11 @@ listen("translit-cache-query", async (event: any) => {
             const c = candidates[0];
             const nv = c.native || "";
             const rm = c.roman || "";
+            const eng = c.engine || "";
             console.log(
-                `[TRANSLIT CACHE] ${(!nv && !rm) ? "NEGATIVE HIT" : "HIT"} word='${word}' lang='${lang}' → native='${nv}' roman='${rm}'`
+                `[TRANSLIT CACHE] ${(!nv && !rm) ? "NEGATIVE HIT" : "HIT"} word='${word}' lang='${lang}' engine='${eng}' → native='${nv}' roman='${rm}'`
             );
-            await respond([[nv, rm]]);
+            await respond([[nv, rm, eng]]);
             return;
         }
 
@@ -7612,14 +7612,14 @@ listen("translit-cache-query", async (event: any) => {
             console.log(
                 `[TRANSLIT CACHE] HIT(cosine ${bestSim.toFixed(4)}, ${candidates.length} cands) word='${word}' lang='${lang}'`
             );
-            await respond([[best.native || "", best.roman || ""]]);
+            await respond([[best.native || "", best.roman || "", best.engine || ""]]);
         } catch (embErr) {
             // 임베딩 실패 시 최신 후보 폴백
             const sorted = [...candidates].sort((a: any, b: any) => (b.created_at || 0) - (a.created_at || 0));
             console.log(
                 `[TRANSLIT CACHE] HIT(latest fallback, ${candidates.length} cands) word='${word}' lang='${lang}'`
             );
-            await respond([[sorted[0].native || "", sorted[0].roman || ""]]);
+            await respond([[sorted[0].native || "", sorted[0].roman || "", sorted[0].engine || ""]]);
         }
     } catch (e) {
         console.warn("[TRANSLIT CACHE] query failed:", e);
@@ -7628,9 +7628,10 @@ listen("translit-cache-query", async (event: any) => {
 });
 
 listen("translit-cache-save", async (event: any) => {
-    const { word, lang, native, roman } = event.payload;
+    const { word, lang, native, roman, engine } = event.payload;
     const nv = native || "";
     const rm = roman || "";
+    const eng = engine || "";
     try {
         // 기존 동일 키 삭제 후 삽입 (upsert)
         const removed = await appDb.table("translit_cache")
@@ -7643,11 +7644,12 @@ listen("translit-cache-save", async (event: any) => {
             doc_lang: lang,
             native: nv,
             roman: rm,
+            engine: eng,
             created_at: Date.now()
         });
 
         console.log(
-            `[TRANSLIT CACHE] SAVED${(!nv && !rm) ? "(negative)" : ""} word='${word}' lang='${lang}' ` +
+            `[TRANSLIT CACHE] SAVED${(!nv && !rm) ? "(negative)" : ""} word='${word}' lang='${lang}' engine='${eng}' ` +
             `→ native='${nv}' roman='${rm}' (replaced ${removed})`
         );
     } catch (e) {

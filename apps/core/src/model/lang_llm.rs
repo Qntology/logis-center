@@ -47,16 +47,6 @@ const WAIT_TICK_MS: u64 = 1000;
 const WAIT_HEARTBEAT_SECS: u64 = 30;
 const WAIT_RETRIES: u32 = 3;
 
-const KNOWN_CODES: &[&str] = &[
-    "afr", "asm", "ast", "aze", "bak", "bel", "ben", "bos", "bul", "cat", "ceb", "ces",
-    "cym", "dan", "deu", "ell", "eng", "est", "eus", "fas", "fin", "fra", "gle", "glg",
-    "guj", "hat", "heb", "hin", "hrv", "hun", "hye", "ind", "isl", "ita", "jav", "jpn",
-    "kan", "kat", "kaz", "khm", "kor", "lao", "lit", "ltz", "lvs", "mal", "mar", "min",
-    "mkd", "mlt", "mya", "nep", "nld", "nno", "nob", "oci", "pan", "pol", "por", "ron",
-    "rus", "scn", "sin", "slk", "slv", "snd", "spa", "srp", "sun", "swe", "tam", "tat",
-    "tel", "tgk", "tgl", "tha", "tur", "ukr", "urd", "vie", "war", "ydd", "zho",
-];
-
 /// 언어 엔진 런타임 로더. config.json 으로 아키텍처를 판별해 Qwen3.5(Q4_K_M GGUF) 또는 Qwen4-Exp(safetensors) 생성기를
 /// 돌려줍니다 (`models::qwen4_exp::registry::load_lang_runtime`).
 pub type LangLlmLoader = fn(
@@ -74,42 +64,62 @@ pub fn loader() -> Option<LangLlmLoader> {
     LOADER.get().copied()
 }
 
-const ISO1_TO_ALPHAEDGE: &[(&str, &str)] = &[
-    ("ko", "kor"), ("en", "eng"), ("ja", "jpn"), ("zh", "zho"), ("fr", "fra"), ("de", "deu"),
-    ("es", "spa"), ("it", "ita"), ("pt", "por"), ("nl", "nld"), ("ru", "rus"), ("uk", "ukr"),
-    ("be", "bel"), ("bg", "bul"), ("sr", "srp"), ("mk", "mkd"), ("kk", "kaz"), ("th", "tha"),
-    ("el", "ell"), ("ta", "tam"), ("te", "tel"), ("hi", "hin"), ("mr", "mar"), ("ne", "nep"),
-    ("bn", "ben"), ("fa", "fas"), ("ur", "urd"), ("vi", "vie"), ("id", "ind"), ("tr", "tur"),
-    ("pl", "pol"), ("cs", "ces"), ("sk", "slk"), ("sl", "slv"), ("hr", "hrv"), ("bs", "bos"),
-    ("ro", "ron"), ("hu", "hun"), ("fi", "fin"), ("et", "est"), ("lv", "lvs"), ("lt", "lit"),
-    ("sv", "swe"), ("da", "dan"), ("no", "nob"), ("nb", "nob"), ("nn", "nno"), ("is", "isl"),
-    ("ga", "gle"), ("gl", "glg"), ("eu", "eus"), ("ca", "cat"), ("cy", "cym"), ("mt", "mlt"),
-    ("lb", "ltz"), ("oc", "oci"), ("ka", "kat"), ("hy", "hye"), ("az", "aze"), ("ba", "bak"),
-    ("tt", "tat"), ("tg", "tgk"), ("tl", "tgl"), ("fil", "tgl"), ("jv", "jav"), ("su", "sun"),
-    ("km", "khm"), ("lo", "lao"), ("my", "mya"), ("si", "sin"), ("pa", "pan"), ("gu", "guj"),
-    ("kn", "kan"), ("ml", "mal"), ("sd", "snd"), ("he", "heb"), ("iw", "heb"), ("ht", "hat"),
-    ("yi", "ydd"), ("af", "afr"), ("as", "asm"),
-];
+/// Phase 3-2 D1: Artifact variant & script coverage policy (`LOGIS_LANG_VARIANT`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngineVariant {
+    Full,
+    TrimmedCore12,
+    Custom(String),
+}
 
-/// 문서 언어의 3 글자 코드 (언어 엔진의 대상 언어 표, 예전 언어별 모델의 목록)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptCoverage {
+    Full,
+    Core12,
+}
+
+pub fn active_variant() -> EngineVariant {
+    match std::env::var("LOGIS_LANG_VARIANT")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "full" | "default" => EngineVariant::Full,
+        "core12" | "trimmed_core12" | "trimmed" => EngineVariant::TrimmedCore12,
+        other => EngineVariant::Custom(other.to_string()),
+    }
+}
+
+pub fn active_coverage() -> ScriptCoverage {
+    match active_variant() {
+        EngineVariant::TrimmedCore12 => ScriptCoverage::Core12,
+        EngineVariant::Full => ScriptCoverage::Full,
+        EngineVariant::Custom(ref s) if s.contains("core12") || s.contains("12") => ScriptCoverage::Core12,
+        EngineVariant::Custom(_) => ScriptCoverage::Full,
+    }
+}
+
+/// Deterministic short fingerprint of the currently active 4B engine artifact (for SDS pass-key isolation).
+pub fn engine_fp(code: &str) -> String {
+    let dir = model_dir(code);
+    let gguf = crate::model::lang_gguf::runtime_gguf(&dir);
+    let bytes = std::fs::metadata(&gguf).map(|m| m.len()).unwrap_or(0);
+    let var_tag = match active_variant() {
+        EngineVariant::Full => "full",
+        EngineVariant::TrimmedCore12 => "core12",
+        EngineVariant::Custom(_) => "custom",
+    };
+    format!("{var_tag}_{:x}", bytes ^ (LANG_LLM_REVISION.len() as u64 * 0x9e37_79b9))
+}
+
+/// 문서 언어의 3 글자 코드 (Phase 3-2 D1: `logis_pug::scripts::lang_spec` 단일 원천 사용 → `ar` 포함 12개 Core + Extended).
 pub fn lang3_code(doc_lang: &str) -> Option<&'static str> {
-    let lower = doc_lang.trim().to_lowercase();
-    if lower.is_empty() {
+    let spec = logis_pug::scripts::lang_spec(doc_lang)?;
+    if active_coverage() == ScriptCoverage::Core12 && spec.tier != logis_pug::scripts::LangTier::Core12 {
         return None;
     }
-    if let Some(c) = KNOWN_CODES.iter().find(|c| **c == lower.as_str()) {
-        return Some(*c);
-    }
-    let base = lower.split(|c: char| c == '-' || c == '_').next().unwrap_or("");
-    if let Some((_, code)) = ISO1_TO_ALPHAEDGE.iter().find(|(iso1, _)| *iso1 == base) {
-        return Some(*code);
-    }
-    let norm = crate::utils::bias_schema::lang_code_of(&lower);
-    let norm_base = norm.split(|c: char| c == '-' || c == '_').next().unwrap_or("");
-    ISO1_TO_ALPHAEDGE
-        .iter()
-        .find(|(iso1, _)| *iso1 == norm_base)
-        .map(|(_, code)| *code)
+    Some(spec.iso3)
 }
 
 /// 🌟 [SINGLE 4B] 이 문서 언어를 언어 엔진이 맡는가 → 맡으면 엔진 이름([`LANG_ENGINE`]). 모든 대상 언어가 같은 엔진입니다.
@@ -118,8 +128,10 @@ pub fn engine_code(doc_lang: &str) -> Option<&'static str> {
 }
 
 pub fn needs_lang_engine(doc_lang: &str) -> bool {
-    engine_code(doc_lang).is_some()
-        && !crate::nl_convert::is_latin_dominant(&crate::nl_convert::native_script_sample(doc_lang, "", ""))
+    let Some(spec) = logis_pug::scripts::lang_spec(doc_lang) else {
+        return false;
+    };
+    engine_code(doc_lang).is_some() && !spec.latin_dominant
 }
 
 pub fn repo_name(_code: &str) -> String {
@@ -167,6 +179,10 @@ pub fn files_ready(code: &str) -> bool {
     if !dir.is_dir() {
         return false;
     }
+    // Phase 2-2 D2: if READY.json + converted runtime GGUF is valid, shards may have been reclaimed (`LOGIS_KEEP_SAFETENSORS=0`).
+    if crate::model::lang_gguf::runtime_ready(&dir) {
+        return true;
+    }
     for f in LANG_LLM_REQUIRED.iter() {
         match std::fs::metadata(dir.join(f)) {
             Ok(m) if m.len() > 0 => {}
@@ -177,18 +193,48 @@ pub fn files_ready(code: &str) -> bool {
 }
 
 pub fn is_ready(code: &str) -> bool {
-    files_ready(code) && crate::model::lang_gguf::runtime_ready(&model_dir(code))
+    crate::model::lang_gguf::runtime_ready(&model_dir(code))
 }
 
+/// Phase 3-2 D2: Mapped-aware resident VRAM estimate (`backbone + active_k * embd_row_bytes`, excluding mmap-only cold rows).
 pub fn resident_estimate_mb(code: &str) -> u64 {
     let dir = model_dir(code);
     let runtime = crate::model::lang_gguf::runtime_bytes(&dir);
     let bytes = if runtime > 0 {
-        runtime as f64
+        // When `LOGIS_VOCAB_TRIM != off`, `token_embd.weight` (~670 MB for 248k Q8_0) is mmap-only (0 B GPU)
+        // and only active K (~32k–65k, ~130 MB) resides in VRAM. Subtract cold table share so VRAM gating isn't overly conservative.
+        let trim_on = logis_llm::models::common::vocab_trim::rule_from_env()
+            != logis_llm::models::common::vocab_trim::TrimRule::Off;
+        if trim_on && runtime > 2_000_000_000 {
+            let cold_saved = 520.0 * 1024.0 * 1024.0;
+            (runtime as f64 - cold_saved).max(1_800.0 * 1024.0 * 1024.0)
+        } else {
+            runtime as f64
+        }
     } else {
         weight_bytes(&dir) as f64 * LANG_LLM_RESIDENT_RATIO
     };
     (bytes / (1024.0 * 1024.0)).ceil() as u64
+}
+
+/// Reclaim legacy per-language AlphaEdge 4B directories and unused `granite-4.0-h-350m` directory.
+pub fn cleanup_legacy_models() -> Vec<String> {
+    let root = crate::utils::get_app_dir().join("models");
+    let mut removed = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&root) else { return removed };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_legacy = name == "granite-4.0-h-350m"
+            || (name.starts_with("Qwen3.5-4B-") && (name.contains("-16384") || name.contains("-32768")));
+        if is_legacy && std::fs::remove_dir_all(&path).is_ok() {
+            removed.push(name);
+        }
+    }
+    removed
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -709,6 +755,23 @@ pub async fn await_engine(
         );
     }
     let started = Instant::now();
+    // Phase 3-2 D4: Non-blocking default (`LOGIS_LANG4B_WAIT_SECS=0` → download in background, use Base2B now,
+    // upgrade 1-time via `translit_cache.engine` once 4B is ready).
+    let wait_budget_secs: u64 = std::env::var("LOGIS_LANG4B_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if wait_budget_secs == 0 {
+        let phase = request_download(code, app, task_id);
+        return (
+            TranslitEngine::Base2B,
+            format!(
+                "⚡ [TRANSLIT ENGINE / NON-BLOCKING] {} 가 아직 준비되지 않았습니다({:?}). 백그라운드로 받고 이번 태스크는 Qwen3.5-2B 로 즉시 진행하며, 4B 준비 후 캐시를 1회 업그레이드합니다.",
+                repo_id(code),
+                phase
+            ),
+        );
+    }
     let mut retries = 0u32;
     let mut last_beat = Instant::now();
     let _waiting = WaitGuard::new(task_id);
@@ -716,13 +779,24 @@ pub async fn await_engine(
         app,
         task_id,
         &format!(
-            "⏸️ [TRANSLIT ENGINE / WAIT] 음차 단계에 도달했지만 {} 이 아직 준비되지 않았습니다 (라틴 단어를 가진 값 {}개). 이 태스크는 여기서 멈추고 모델을 먼저 받은 뒤(필요하면 실행용 변환까지) 같은 자리에서 음차를 이어 갑니다. 그동안 Qwen3.5-2B 로 음차하지 않습니다 — 2B 결과가 캐시에 남으면 4B 가 준비된 뒤에도 그 값이 재사용되기 때문입니다.",
+            "⏸️ [TRANSLIT ENGINE / WAIT] 음차 단계에 도달했지만 {} 이 아직 준비되지 않았습니다 (라틴 단어를 가진 값 {}개 · 최대 대기 {}초).",
             repo_id(code),
-            demand
+            demand,
+            wait_budget_secs
         ),
     );
     progress_card(app, task_id, "Model Download", &format!("Waiting for {}...", repo_name(code)));
     loop {
+        if started.elapsed().as_secs() >= wait_budget_secs {
+            return (
+                TranslitEngine::Base2B,
+                format!(
+                    "⏱️ [TRANSLIT ENGINE / WAIT TIMEOUT] {}초 대기 상한 도달 → Qwen3.5-2B 로 즉시 진행합니다 ({} 백그라운드 계속).",
+                    wait_budget_secs,
+                    repo_id(code)
+                ),
+            );
+        }
         if cancel.load(Ordering::Relaxed) {
             return (
                 TranslitEngine::Base2B,
@@ -1248,6 +1322,21 @@ async fn finish_repo(code: &str, app: &crate::sink::Sink, task_id: &str) {
         return;
     }
     let dir = model_dir(code);
+    // Optional disk reclamation: when `LOGIS_KEEP_SAFETENSORS=0` and READY.json + runtime GGUF are verified,
+    // delete original BF16 `.safetensors` shards (~7.9 GB) to free disk space.
+    let keep_shards = std::env::var("LOGIS_KEEP_SAFETENSORS")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+        .unwrap_or(true);
+    if !keep_shards && crate::model::lang_gguf::runtime_ready(&dir) {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("safetensors") {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
     set_state(code, |s| {
         s.phase = DlPhase::Ready;
         s.error.clear();
@@ -1526,8 +1615,36 @@ pub fn token_fit_with(lang_tok: &tokenizers::Tokenizer, ref_tok: &tokenizers::To
     })
 }
 
+static TOK_SHA_CACHE: Lazy<Mutex<HashMap<PathBuf, Option<String>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn tokenizer_sha256(path: &Path) -> Option<String> {
+    if let Ok(m) = TOK_SHA_CACHE.lock() {
+        if let Some(v) = m.get(path) {
+            return v.clone();
+        }
+    }
+    let sha = std::fs::read(path)
+        .ok()
+        .map(|b| logis_llm::lang_gguf::sha256_bytes(&b));
+    if let Ok(mut m) = TOK_SHA_CACHE.lock() {
+        m.insert(path.to_path_buf(), sha.clone());
+    }
+    sha
+}
+
 pub fn token_fit(code: &str, sample: &str, reference: &Path) -> Result<TokenFit, String> {
     let lang_path = model_dir(code).join("tokenizer.json");
+    // Phase 3-2 D3: When 4B and reference share byte-identical tokenizer.json, skip BPE round-trip!
+    if let (Some(h1), Some(h2)) = (tokenizer_sha256(&lang_path), tokenizer_sha256(reference)) {
+        if h1 == h2 {
+            return Ok(TokenFit {
+                lang_tokens: 1,
+                ref_tokens: 1,
+                lost_chars: 0,
+            });
+        }
+    }
     let lang_tok = route_tokenizer(&lang_path)
         .ok_or_else(|| format!("{} 를 읽지 못했습니다", lang_path.display()))?;
     let ref_tok = route_tokenizer(reference)
@@ -1569,20 +1686,40 @@ pub fn closed_verdict(track: &str, step: &str, code: Option<&str>, why: &str) ->
     }
 }
 
+/// Phase 3-2 D3: Re-enable `search.commerce_verify` when ASCII identifiers are intact (full-vocab or verified Core12).
+/// Only blocks if explicitly opted out (`LOGIS_COMMERCE_VERIFY_4B=0`).
 pub fn step_contract_block(track: &str, step: &str) -> Option<&'static str> {
     match (track, step) {
-        ("search", "commerce_verify") => Some(
-            "이 단계의 답은 후보 목록에 있는 영문 이름(카테고리·속성)과 영문 JSON 키·연산자를 글자 그대로 옮겨야 합니다. 예전 언어별 4B(어휘 16,384)는 영문 식별자를 옮길 때 글자를 바꾸거나 줄였고(goods→good, transcription→trancription, condition→con), 원본 4B 는 이 단계를 아직 검증하지 않았습니다. 다국어 어휘의 Qwen3 로 둡니다",
-        ),
+        ("search", "commerce_verify") => {
+            let blocked = std::env::var("LOGIS_COMMERCE_VERIFY_4B")
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+                .unwrap_or(false);
+            if blocked {
+                Some("LOGIS_COMMERCE_VERIFY_4B=0 으로 닫혀 있습니다.")
+            } else {
+                None
+            }
+        }
         _ => None,
     }
+}
+
+fn latin_4b_synthesis_enabled() -> bool {
+    !matches!(
+        std::env::var("LOGIS_LATIN_4B_ROUTE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    )
 }
 
 pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, reference: &Path) -> RouteVerdict {
     let code = match engine_code(doc_lang) {
         Some(c) => c,
         None => {
-            return closed_verdict(track, step, None, &format!("문서 언어 '{}' 는 4B 언어 엔진의 대상 언어가 아닙니다", doc_lang))
+            return closed_verdict(track, step, None, &format!("문서 언어 '{}' 는 현재 4B 언어 엔진 커버리지({:?})의 대상 언어가 아닙니다", doc_lang, active_coverage()))
         }
     };
     if let Some(why) = step_contract_block(track, step) {
@@ -1590,15 +1727,24 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
     }
     let native = native_scripts(doc_lang);
     if native.is_empty() {
-        return closed_verdict(track, step, Some(code), "bias.json 에 이 언어의 문자 샘플이 없어 단일 언어를 판정할 수 없습니다");
+        return closed_verdict(track, step, Some(code), "이 언어의 문자 체계 정보를 찾을 수 없어 단일 언어를 판정할 수 없습니다");
     }
-    if native.contains(&ScriptKind::Latin) {
-        return closed_verdict(
-            track,
-            step,
-            Some(code),
-            &format!("문서 언어 '{}' 는 라틴 문자를 쓰므로 문자 비율로는 영어 등 다른 라틴 언어와 섞였는지 가를 수 없습니다. 단일 언어를 확인할 수 없는 문서는 기존 모델로 둡니다", doc_lang),
-        );
+    let is_latin = native.contains(&ScriptKind::Latin);
+    if is_latin {
+        // Phase 3-2 D1: Open `*_synthesis` on Latin Core12 languages when `LOGIS_LATIN_4B_ROUTE` is enabled
+        // and `whatlang` detects reliable Latin text.
+        let allow_latin_synth = step.ends_with("_synthesis")
+            && latin_4b_synthesis_enabled()
+            && logis_pug::scripts::lang_spec(doc_lang)
+                .is_some_and(|s| s.tier == logis_pug::scripts::LangTier::Core12);
+        if !allow_latin_synth {
+            return closed_verdict(
+                track,
+                step,
+                Some(code),
+                &format!("문서 언어 '{}' 는 라틴 문자를 쓰므로 non-synthesis 단계는 기존 모델로 둡니다", doc_lang),
+            );
+        }
     }
     if let Some(why) = runtime_failure(code) {
         return closed_verdict(track, step, Some(code), &format!("이번 세션에서 쓸 수 없는 모델입니다 ({})", why));
@@ -1621,7 +1767,7 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
             &format!("문서 언어도 라틴도 아닌 제3 문자 체계가 {:.1}% 섞였습니다 (기준 {:.1}%)", mix.other_share() * 100.0, ROUTE_MAX_OTHER * 100.0),
         );
     }
-    if mix.native_share() < ROUTE_MIN_NATIVE {
+    if !is_latin && mix.native_share() < ROUTE_MIN_NATIVE {
         return closed_verdict(
             track,
             step,
@@ -1668,7 +1814,9 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
             ),
         );
     }
-    let pass_axis = format!("{}.lang4b_pass.{}", track, step);
+    // Phase 3-2 D3: Isolate SDS pass keys by `engine_fp` so stale legacy AlphaEdge failures never poison the current engine.
+    let fp = engine_fp(code);
+    let pass_axis = format!("{}.lang4b@{}_pass.{}", track, fp, step);
     let base_axis = format!("{}.qwen3_pass.{}", track, step);
     let mut probe = String::new();
     if let Some((recent, _, n)) = crate::utils::score_dynamics::adaptive_recent(&pass_axis) {
@@ -1732,8 +1880,12 @@ pub fn route_verdict(track: &str, step: &str, doc_lang: &str, sample: &str, refe
 }
 
 pub fn record_engine_outcome(track: &str, step: &str, lang: bool, pass: bool) {
-    let engine = if lang { "lang4b" } else { "qwen3" };
-    crate::utils::score_dynamics::record_baseline(&format!("{}.{}_pass.{}", track, engine, step), if pass { 1.0 } else { 0.0 });
+    let key = if lang {
+        format!("{}.lang4b@{}_pass.{}", track, engine_fp(LANG_ENGINE), step)
+    } else {
+        format!("{}.qwen3_pass.{}", track, step)
+    };
+    crate::utils::score_dynamics::record_baseline(&key, if pass { 1.0 } else { 0.0 });
 }
 
 pub fn record_route_outcome(track: &str, step: &str, pass: bool) {

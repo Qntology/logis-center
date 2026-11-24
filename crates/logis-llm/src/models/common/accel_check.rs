@@ -600,6 +600,124 @@ fn fused_op_tol(kind: FusedOpKind, dtype: DType) -> f32 {
     }
 }
 
+/// Returns all acceleration checks that fell back on `device` (for `ReflectionRecord`).
+pub fn recorded_fallbacks(device: &Device) -> Vec<String> {
+    let mut out = Vec::new();
+    let g = states();
+    if let Some(st) = g.get(&device.location()) {
+        for ((dt, hd), &ok) in &st.fa {
+            if !ok {
+                out.push(format!("flash_attn:{dt:?}:d{hd}"));
+            }
+        }
+        if let Some(reason) = &st.tq_off {
+            out.push(format!("turbo_quant:{reason}"));
+        }
+        for ((kind, dt, dim), &ok) in &st.fused_ops {
+            if !ok {
+                out.push(format!("fused:{}:{dt:?}:d{dim}", kind.token()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AccelProbeCache {
+    pub binary_key: String,
+    pub backend: String,
+    pub arch: String,
+    pub passed_ops: Vec<String>,
+    pub failed_ops: Vec<String>,
+}
+
+fn accel_probe_cache_path() -> std::path::PathBuf {
+    logis_schema::paths::get_app_dir()
+        .join("cache")
+        .join("accel_check_v1.json")
+}
+
+fn binary_fingerprint() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return "unknown".into();
+    };
+    let Ok(meta) = std::fs::metadata(&exe) else {
+        return exe.to_string_lossy().into_owned();
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}:{}:{}", exe.file_name().and_then(|s| s.to_str()).unwrap_or("bin"), meta.len(), mtime)
+}
+
+pub fn load_probe_cache(backend: &str, arch_name: &str) -> Option<AccelProbeCache> {
+    let raw = std::fs::read_to_string(accel_probe_cache_path()).ok()?;
+    let cached: AccelProbeCache = serde_json::from_str(&raw).ok()?;
+    if cached.binary_key == binary_fingerprint()
+        && cached.backend == backend
+        && cached.arch == arch_name
+    {
+        Some(cached)
+    } else {
+        None
+    }
+}
+
+pub fn save_probe_cache(cache: &AccelProbeCache) {
+    let path = accel_probe_cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(cache) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Subprocess probe entrypoint (`--logis-accel-probe <backend> <gpu_id>`).
+/// Returns `Some(exit_code)` if the current process was launched as an isolated accel probe.
+pub fn maybe_run_cli_probe(args: &[String]) -> Option<i32> {
+    let pos = args.iter().position(|a| a == "--logis-accel-probe")?;
+    let backend = args.get(pos + 1).map(String::as_str).unwrap_or("cpu");
+    let dev = match backend {
+        "cpu" => Device::Cpu,
+        #[cfg(feature = "cuda")]
+        "cuda" => Device::new_cuda(0).unwrap_or(Device::Cpu),
+        #[cfg(feature = "rocm")]
+        "rocm" => crate::utils::new_gpu_device(0).unwrap_or(Device::Cpu),
+        #[cfg(feature = "vulkan")]
+        "vulkan" => Device::new_vulkan(0).unwrap_or(Device::Cpu),
+        _ => Device::Cpu,
+    };
+    let dt = model_dtype(&dev);
+    let mut passed_ops = Vec::new();
+    let mut failed_ops = Vec::new();
+    for kind in FusedOpKind::ALL {
+        let d = match kind {
+            FusedOpKind::RopeKvWrite | FusedOpKind::GatedDeltaRule => 128,
+            _ => 128,
+        };
+        let tol = fused_op_tol(kind, dt);
+        match check_fused_op(&dev, kind, dt, d) {
+            Ok(err) if err <= tol => passed_ops.push(kind.token().to_string()),
+            _ => failed_ops.push(kind.token().to_string()),
+        }
+    }
+    let cache = AccelProbeCache {
+        binary_key: binary_fingerprint(),
+        backend: backend_name(&dev).to_string(),
+        arch: arch(&dev),
+        passed_ops,
+        failed_ops: failed_ops.clone(),
+    };
+    save_probe_cache(&cache);
+    println!("[ACCEL-PROBE] backend={} passed={} failed={:?}", cache.backend, cache.passed_ops.len(), failed_ops);
+    Some(0)
+}
+
 /// 이 장치에서 TurboQuant 를 끈 이유 (켜져 있으면 None)
 pub fn turbo_quant_off_reason(device: &Device) -> Option<String> {
     states().get(&device.location()).and_then(|st| st.tq_off.clone())
@@ -843,7 +961,15 @@ fn check_fused_op(device: &Device, kind: FusedOpKind, dtype: DType, dim: usize) 
     if let Some(mode) = fault_map_lock().get(&kind).copied() {
         match mode {
             FaultMode::ReturnError => bail!("injected fault (ReturnError) for {}", kind.token()),
-            FaultMode::Panic => panic!("injected fault (Panic) for {}", kind.token()),
+            FaultMode::Panic => {
+                // Under `panic = "abort"` (release profile), panicking would abort the process
+                // instead of falling back cleanly; convert to Result::Err so fallback stays safe.
+                if cfg!(panic = "abort") {
+                    bail!("injected fault (Panic->Err under panic=abort) for {}", kind.token());
+                } else {
+                    panic!("injected fault (Panic) for {}", kind.token());
+                }
+            }
             FaultMode::BadOutput => return Ok(f32::INFINITY),
         }
     }

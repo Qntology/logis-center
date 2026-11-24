@@ -454,7 +454,7 @@ def report(rows):
     table_of("template", "틀")
     table_of(lambda r: f"{r['domain'][:4]}/{r['lang']}", "영역 × 질의 언어")
     table_of(lambda r: "같은 언어" if r["lang"] == r["data_lang"] else "다른 언어", "질의 언어 = 데이터 언어?")
-    for dom in ("commerce", "shipping", "analytic"):
+    for dom in ("commerce", "shipping"):
         sub = [r for r in rows if r["domain"] == dom]
         if not sub:
             continue

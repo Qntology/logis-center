@@ -11,7 +11,13 @@ pub fn bias_node(doc_lang: &str, page_type: &str, field_name: &str) -> Option<se
     let dict: &serde_json::Value = &crate::bias_schema::BIAS_DICT;
     let canon = crate::bias_schema::canonical_bias_type(page_type);
     let primary = crate::bias_schema::lang_code_of(doc_lang);
-    let lang_keys = [primary.as_str(), "en", "ko"];
+    // Phase 4-1 D3: `zh-tw` falls back to `zh` before `en` so Traditional Chinese doesn't drop Chinese bias nodes.
+    let mut lang_keys: Vec<&str> = vec![primary.as_str()];
+    if primary == "zh-tw" {
+        lang_keys.push("zh");
+    }
+    lang_keys.push("en");
+    lang_keys.push("ko");
     for lk in lang_keys {
         let lang_node = match dict.get(lk) { Some(v) => v, None => continue };
         if let Some(n) = lang_node.get(page_type).and_then(|p| p.get(field_name)) {
@@ -34,9 +40,18 @@ pub fn bias_node(doc_lang: &str, page_type: &str, field_name: &str) -> Option<se
 //    섞여 있습니다. 헤더는 라벨이므로 값 예시를 뱅크에 넣으면 "번호" 같은 헤더가
 //    "12345-67890" 에 끌려가는 오탐이 생깁니다. 숫자 비중과 길이로 값 예시를 배제합니다.
 pub fn is_value_example_phrase(p: &str) -> bool {
-    let compact: Vec<char> = p.chars().filter(|c| !c.is_whitespace()).collect();
+    let norm = logis_schema::text::normalize_digits_ascii(p);
+    let compact: Vec<char> = norm.chars().filter(|c| !c.is_whitespace()).collect();
     if compact.is_empty() { return true; }
-    if compact.len() > 24 { return true; }
+    // Phase 4-1 D3: 24 chars for CJK/Hangul/Kana scripts, 42 chars for Latin/Arabic/Cyrillic multi-word headers (fixes empty `cs` nodes).
+    let has_cjk = compact.iter().any(|&c| {
+        let u = c as u32;
+        (0x3040..=0x30FF).contains(&u)
+            || (0x3400..=0x9FFF).contains(&u)
+            || (0xAC00..=0xD7AF).contains(&u)
+    });
+    let max_len = if has_cjk { 24 } else { 42 };
+    if compact.len() > max_len { return true; }
     let digits = compact.iter().filter(|c| c.is_ascii_digit()).count();
     digits * 4 >= compact.len()
 }

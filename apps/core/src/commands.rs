@@ -162,9 +162,18 @@ pub async fn unload_model(state: &AppState) -> Result<String, String> {
 //  프론트엔드가 Dexie 를 조회한 뒤 invoke("translit_cache_respond") 로
 //  결과를 보내면, 여기서 oneshot sender 를 통해 scheduler 에 전달합니다.
 // =====================================================================
-pub async fn translit_cache_respond(request_id: String, results: Vec<(String, String)>) -> Result<(), String> {
+pub async fn translit_cache_respond(request_id: String, results: Vec<Vec<String>>) -> Result<(), String> {
     if let Some(sender) = crate::scheduler::TRANSLIT_PENDING.lock().unwrap().remove(&request_id) {
-        let _ = sender.send(results);
+        let triples: Vec<(String, String, String)> = results
+            .into_iter()
+            .map(|r| {
+                let n = r.first().cloned().unwrap_or_default();
+                let rm = r.get(1).cloned().unwrap_or_default();
+                let eng = r.get(2).cloned().unwrap_or_default();
+                (n, rm, eng)
+            })
+            .collect();
+        let _ = sender.send(triples);
     }
     Ok(())
 }
@@ -631,7 +640,8 @@ pub async fn search_documents(state: &AppState, query: String, limit: usize, off
 
     if let Some(store) = store_opt {
         
-        let search_result = store.search_items("items", &query, query_vec, None, limit, offset, scope, false).await.map_err(|e| e.to_string());
+        // Phase 4-2 D3: Enable FTS hybrid search in local DB search (`use_fts = true`).
+        let search_result = store.search_items("items", &query, query_vec, None, limit, offset, scope, true).await.map_err(|e| e.to_string());
         
         
         match &search_result {
@@ -817,7 +827,8 @@ pub async fn deep_research_command(state: &AppState, app_handle: crate::sink::Si
         // General search for context
         let emb = model.get_embedding(query.clone()).await.unwrap_or(vec![0.0; 384]);
         
-        if let Ok(results) = store.search_items("items", &query, emb, None, 3, 0, None, false).await {
+        // Phase 4-2 D3: Enable FTS hybrid retrieval in deep research context gathering (`use_fts = true`).
+        if let Ok(results) = store.search_items("items", &query, emb, None, 3, 0, None, true).await {
             let docs: Vec<String> = results.iter()
                 .map(|(_, text, _)| format!("- {}", text))
                 .collect();
@@ -1488,7 +1499,6 @@ pub async fn download_model(app_handle: crate::sink::Sink, model_name: String) -
                 "Qwen3" => "Qwen3-0.6B-Instruct-gguf".to_string(),
                 "Qwen3.5" => "Qwen3.5-2B-Instruct-gguf".to_string(),
                 "Embedding" => "granite-embedding-97m-multilingual-r2".to_string(),
-                "Granite" => "granite-4.0-h-350m".to_string(),
                 "SigLIP2"  => "siglip2-so400m-patch16-naflex".to_string(),
                 _ => "unknown".to_string()
             }
@@ -1533,9 +1543,6 @@ pub async fn download_model(app_handle: crate::sink::Sink, model_name: String) -
                 ],
                 "Embedding" => vec![
                     ("https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2/resolve/main/model.safetensors".to_string(), "model.safetensors".to_string())
-                ],
-                "Granite" => vec![
-                    ("https://huggingface.co/ibm-granite/granite-4.0-h-350m/resolve/main/model.safetensors".to_string(), "model.safetensors".to_string())
                 ],
                 "SigLIP2" => vec![
                     ("https://huggingface.co/google/siglip2-so400m-patch16-naflex/resolve/main/model.safetensors".to_string(), "model.safetensors".to_string()),

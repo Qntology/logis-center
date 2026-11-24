@@ -39,6 +39,9 @@ fn gpu() -> Option<Device> {
     if let Some(d) = logis_app::utils::new_gpu_device(0) {
         return Some(d);
     }
+    if std::env::var("LOGIS_REQUIRE_GPU").map(|v| v == "1").unwrap_or(false) {
+        panic!("[TRIM-TEST] LOGIS_REQUIRE_GPU=1 이지만 GPU 를 열 수 없습니다!");
+    }
     println!("[TRIM-TEST] GPU 를 열 수 없어 건너뜁니다");
     None
 }
@@ -167,6 +170,83 @@ impl Gen {
             Self::Q3(g) => row_f32(&g.model_mut().forward(Some(&x), None, offset)?),
             Self::Q35(g) => row_f32(&rt.block_on(g.qwen3_5.forward(&x, None, None, None, None, None, offset, None, None))?),
         }
+    }
+
+    /// Production fast greedy step (`forward_last_hidden` + `greedy_from_hidden_with_stats`, zero full-vocab logits expansion).
+    fn step_greedy_fast(
+        &mut self,
+        rt: &tokio::runtime::Runtime,
+        ids: &[u32],
+        offset: usize,
+        dev: &Device,
+    ) -> anyhow::Result<(u32, vocab_trim::StepGuardStats)> {
+        let x = Tensor::from_slice(ids, (1, ids.len()), dev)?;
+        match self {
+            Self::Q3(g) => {
+                let h = g.model_mut().forward_last_hidden(Some(&x), None, offset)?;
+                g.model_mut().greedy_from_hidden_with_stats(&h)
+            }
+            Self::Q35(g) => {
+                let h = rt.block_on(g.qwen3_5.forward_last_hidden(&x, None, None, None, None, None, offset, None, None))?;
+                g.qwen3_5.greedy_from_hidden_with_stats(&h)
+            }
+        }
+    }
+
+    fn resident_vram_bytes(&self) -> u64 {
+        match self {
+            Self::Q3(g) => g.resident_vram_bytes(),
+            Self::Q35(g) => g.resident_vram_bytes(),
+        }
+    }
+
+    fn refresh_for(&mut self, prompt: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Q3(g) => g.refresh_vocab_for(prompt, false),
+            Self::Q35(g) => g.refresh_vocab_for(prompt, false),
+        }
+    }
+
+    fn eos_ids(&self) -> Vec<u32> {
+        match self {
+            Self::Q3(g) => {
+                let mut v = Vec::new();
+                if let Some(id) = g.tokenizer.tokenizer.token_to_id("<|im_end|>") { v.push(id); }
+                if let Some(id) = g.tokenizer.tokenizer.token_to_id("<|endoftext|>") { v.push(id); }
+                v
+            }
+            Self::Q35(g) => {
+                let mut v = vec![g.eos_token_id];
+                if let Some(id) = g.tokenizer.tokenizer.token_to_id("<|im_end|>") { if !v.contains(&id) { v.push(id); } }
+                v
+            }
+        }
+    }
+
+    fn load_from_dir(kind: &str, dir: &std::path::Path, dev: &Device) -> anyhow::Result<Self> {
+        Ok(match kind {
+            "q3" => Self::Q3(logis_app::models::qwen3::generate::Qwen3GenerateModel::init_from_gguf(
+                dir.to_str().unwrap(),
+                Some(dev),
+                Some(DType::BF16),
+            )?),
+            _ => {
+                // Find .gguf directly in dir or runtime-q4km/model-q4km.gguf
+                let direct_gguf = std::fs::read_dir(dir)?
+                    .flatten()
+                    .map(|e| e.path())
+                    .find(|p| p.extension().is_some_and(|e| e == "gguf") && !p.file_name().unwrap_or_default().to_string_lossy().contains("mmproj"));
+                if let Some(gf) = direct_gguf {
+                    Self::Q35(Box::new(logis_app::models::qwen3_5::generate::Qwen3_5GenerateModel::init_from_gguf(
+                        gf.to_str().unwrap(),
+                        None,
+                        Some(dev),
+                    )?))
+                } else {
+                    Self::Q35(Box::new(logis_app::model::lang_gguf::load_runtime(dir, dev)?))
+                }
+            }
+        })
     }
 }
 
@@ -483,5 +563,415 @@ fn vocab_trim_fetch_4b() -> R {
     })?;
     assert!(lang_llm::is_ready(code));
     println!("[TRIM-RESULT] {} 준비 완료: {:?} · 실행용 {:.0} MB", lang_llm::repo_id(code), lang_llm::model_dir(code), logis_app::model::lang_gguf::runtime_bytes(&lang_llm::model_dir(code)) as f64 / 1e6);
+    Ok(())
+}
+
+/// 12 Core languages + English identifier/JSON extraction suite for AlphaEdge head-to-head benchmarking.
+fn bench_12lang_prompts() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("ko", "ko", "선하증권 BL-2026-08814 화주 글로벌테크(주) 품목 산업용 마이크로컨트롤러 1,200상자 컨테이너 MSKU 7731025 운임 선불. 아래 항목을 JSON으로 정리하세요: {\"goods\": \"...\", \"condition\": \"...\", \"container\": \"...\"}\n{"),
+        ("en", "en", "Commercial Invoice CI-2026-08001, Bill of Lading BL-2026-08814, Container MSKU 7731025. Extract fields goods, condition, transcription as JSON:\n{\"goods\": \"industrial microcontrollers\", \"condition\": \"new\", \"transcription\": \""),
+        ("ja", "ja", "商業送り状 CI-2026-08001 荷送人 グローバルテック株式会社 貨物 マイクロコントローラ 1,200箱 コンテナ MSKU 7731025。JSON形式で抽出してください:\n{"),
+        ("zh", "zh-hans", "商业发票 CI-2026-08001 发货人 环球科技物流有限公司 货物 工业微控制器 1,200箱 集装箱号 MSKU 7731025。请以JSON格式提取:\n{"),
+        ("ar", "ar", "فاتورة تجارية رقم CI-2026-08001 بوليصة شحن BL-2026-08814 الشاحن شركة جلوبال تك للوجستيات البضاعة متحكمات دقيقة صناعية 1200 صندوق الحاوية MSKU 7731025. استخرج البيانات بصيغة JSON:\n{"),
+        ("de", "de", "Handelsrechnung CI-2026-08001, Konnossement BL-2026-08814, Container MSKU 7731025, Ware: Industrielle Mikrocontroller, 1.200 Kartons, Fracht vorausbezahlt. Extrahieren Sie als JSON:\n{"),
+        ("fr", "fr", "Facture commerciale CI-2026-08001, Connaissement BL-2026-08814, Conteneur MSKU 7731025, Marchandise: Microcontrôleurs industriels, 1 200 cartons, Port payé. Extrayez en JSON:\n{"),
+        ("es", "es", "Factura comercial CI-2026-08001, Conocimiento de embarque BL-2026-08814, Contenedor MSKU 7731025, Mercancía: Microcontroladores industriales, 1.200 cajas. Extraiga en formato JSON:\n{"),
+        ("it", "it", "Fattura commerciale CI-2026-08001, Polizza di carico BL-2026-08814, Container MSKU 7731025, Merce: Microcontrollori industriali, 1.200 cartoni. Estrai in formato JSON:\n{"),
+        ("pt", "pt", "Fatura comercial CI-2026-08001, Conhecimento de embarque BL-2026-08814, Contêiner MSKU 7731025, Mercadoria: Microcontroladores industriais, 1.200 caixas. Extraia em JSON:\n{"),
+        ("nl", "nl", "Handelsfactuur CI-2026-08001, Cognossement BL-2026-08814, Container MSKU 7731025, Goederen: Industriële microcontrollers, 1.200 dozen. Extraheer als JSON:\n{"),
+        ("cs", "cs", "Obchodní faktura CI-2026-08001, Konosament BL-2026-08814, Kontejner MSKU 7731025, Zboží: Průmyslové mikrokontroléry, 1 200 kartonů. Extrahujte jako JSON:\n{"),
+        ("id_en", "en", "Copy these exact keys and values verbatim into JSON without changing a single character: goods=microcontroller, condition=new, transcription=BL-2026-08814, container=MSKU 7731025, invoice=CI-2026-08001, lc=LC-88492011.\n{\"goods\": \""),
+        ("tr_ko", "ko", "다음 영문 물류 상품명을 자연스러운 한국어 외래어 표기로 음차하세요: Microcontroller, Logistics, Container, Commercial Invoice, Express Shipping -> "),
+    ]
+}
+
+fn count_orphan_bpe_tokens(tok_path: &std::path::Path) -> usize {
+    let Ok(bytes) = std::fs::read(tok_path) else { return 0 };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return 0 };
+    let Some(model) = v.get("model") else { return 0 };
+    let Some(vocab) = model.get("vocab").and_then(|x| x.as_object()) else { return 0 };
+    let Some(merges) = model.get("merges").and_then(|x| x.as_array()) else { return 0 };
+    let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for k in vocab.keys() {
+        if k.chars().count() == 1 {
+            reachable.insert(k.clone());
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for m in merges {
+            let pair = if let Some(s) = m.as_str() {
+                s.split_once(' ').map(|(a, b)| (a.to_string(), b.to_string()))
+            } else if let Some(arr) = m.as_array() {
+                if arr.len() == 2 {
+                    Some((arr[0].as_str().unwrap_or("").to_string(), arr[1].as_str().unwrap_or("").to_string()))
+                } else { None }
+            } else { None };
+            if let Some((a, b)) = pair {
+                if reachable.contains(&a) && reachable.contains(&b) {
+                    let ab = format!("{a}{b}");
+                    if vocab.contains_key(&ab) && reachable.insert(ab) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut orphans = 0usize;
+    for k in vocab.keys() {
+        if k.chars().count() > 1 && !reachable.contains(k) {
+            orphans += 1;
+        }
+    }
+    orphans
+}
+
+#[derive(serde::Serialize)]
+struct ArmBenchResult {
+    arm: String,
+    dir: String,
+    vocab_size: usize,
+    active_k_mean: f64,
+    vram_mb: f64,
+    resident_model_mb: f64,
+    vram_delta_mb: f64,
+    decode_ms_per_tok: f64,
+    total_gen_ms: f64,
+    prefill_ms_total: f64,
+    total_tokens: usize,
+    fertility_tok_per_char: f64,
+    orphan_bpe_tokens: usize,
+    oracle_char_sim: f64,
+    identifier_exact_rate: f64,
+    precision_score: f64,
+    guard_rescue_rate: f64,
+    guard_rescue_ms: f64,
+    guard_rest_wins: usize,
+    quant_mode_a: bool,
+    outputs: std::collections::BTreeMap<String, String>,
+}
+
+fn run_bench_arm(
+    arm_name: &str,
+    kind: &str,
+    dir: &std::path::Path,
+    trim: &str,
+    langs_env: &str,
+    guard: &str,
+    active_k: Option<&str>,
+    exec_mode: Option<&str>,
+    dev: &Device,
+    rt: &tokio::runtime::Runtime,
+) -> anyhow::Result<ArmBenchResult> {
+    std::env::set_var(vocab_trim::TRIM_ENV, trim);
+    std::env::set_var(vocab_trim::LANGS_ENV, langs_env);
+    std::env::set_var(vocab_trim::GUARD_ENV, guard);
+    match active_k {
+        Some(k) if !k.is_empty() => std::env::set_var(vocab_trim::ACTIVE_K_ENV, k),
+        _ => std::env::remove_var(vocab_trim::ACTIVE_K_ENV),
+    }
+    match exec_mode {
+        Some(m) if !m.is_empty() => std::env::set_var("LOGIS_VOCAB_EXEC_MODE", m),
+        _ => std::env::remove_var("LOGIS_VOCAB_EXEC_MODE"),
+    }
+
+    let base_free = free_mb(dev);
+    let mut g = Gen::load_from_dir(kind, dir, dev)?;
+    let tok_path = dir.join("tokenizer.json");
+    let tok = if tok_path.exists() {
+        tokenizers::Tokenizer::from_file(&tok_path).map_err(anyhow::Error::msg)?
+    } else {
+        g.tokenizer(kind)?
+    };
+    let vocab_size = tok.get_vocab_size(true);
+    let orphan_bpe_tokens = if tok_path.exists() { count_orphan_bpe_tokens(&tok_path) } else { 0 };
+    let eos_ids = g.eos_ids();
+
+    // Warmup 1 prompt (not timed)
+    {
+        let warm_p = "Warmup: BL-2026-08814\n{";
+        let _sc = DocLangScope::text("en", warm_p);
+        g.refresh_for(warm_p)?;
+        let wids = tok.encode(warm_p, false).map_err(anyhow::Error::msg)?.get_ids().to_vec();
+        g.begin(&wids, dev)?;
+        let (mut next, _) = g.step_greedy_fast(rt, &wids, 0, dev)?;
+        for s in 0..4usize {
+            let (n2, _) = g.step_greedy_fast(rt, &[next], wids.len() + s, dev)?;
+            next = n2;
+        }
+    }
+
+    let resident_model_mb = g.resident_vram_bytes() as f64 / 1e6;
+    let post_warm_free = free_mb(dev);
+    let mut min_free = post_warm_free;
+
+    let prompts = bench_12lang_prompts();
+    let max_steps: usize = std::env::var("LOGIS_BENCH_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    let target_chars: usize = std::env::var("LOGIS_BENCH_TARGET_CHARS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+
+    let mut total_prefill_ms = 0.0f64;
+    let mut total_decode_ms = 0.0f64;
+    let mut total_tokens = 0usize;
+    let mut total_prompt_tokens = 0usize;
+    let mut total_prompt_chars = 0usize;
+    let mut active_k_sum = 0usize;
+    let mut cum_guard = vocab_trim::StepGuardStats::default();
+    let mut outputs = std::collections::BTreeMap::new();
+
+    for (pid, lang_hint, prompt) in &prompts {
+        let _sc = DocLangScope::text(lang_hint, prompt);
+        g.refresh_for(prompt)?;
+        active_k_sum += g.head_rows().unwrap_or(vocab_size);
+        let ids = tok.encode(*prompt, false).map_err(anyhow::Error::msg)?.get_ids().to_vec();
+        total_prompt_tokens += ids.len();
+        total_prompt_chars += prompt.chars().count();
+
+        g.begin(&ids, dev)?;
+        let tp0 = Instant::now();
+        let (mut next, st0) = g.step_greedy_fast(rt, &ids, 0, dev)?;
+        let _ = dev.synchronize_all();
+        total_prefill_ms += tp0.elapsed().as_secs_f64() * 1e3;
+        cum_guard.merge(&st0);
+
+        let mut gen_ids = vec![next];
+        let td0 = Instant::now();
+        // Generate until target_chars reached (or max_steps*2 hard cap) so fertility differences show in total_gen_ms!
+        let cap = (max_steps * 2).min(96);
+        for s in 0..cap {
+            if eos_ids.contains(&next) {
+                break;
+            }
+            if s + 1 >= max_steps {
+                let dec_so_far = tok.decode(&gen_ids, true).unwrap_or_default();
+                if dec_so_far.chars().count() >= target_chars {
+                    break;
+                }
+            }
+            let (n2, st) = g.step_greedy_fast(rt, &[next], ids.len() + s, dev)?;
+            cum_guard.merge(&st);
+            gen_ids.push(n2);
+            next = n2;
+        }
+        let _ = dev.synchronize_all();
+        total_decode_ms += td0.elapsed().as_secs_f64() * 1e3;
+        total_tokens += gen_ids.len().saturating_sub(1).max(1);
+
+        let cur_free = free_mb(dev);
+        if cur_free < min_free {
+            min_free = cur_free;
+        }
+        let decoded = tok.decode(&gen_ids, true).unwrap_or_default();
+        outputs.insert((*pid).to_string(), decoded);
+    }
+
+    let vram_delta_mb = (base_free - min_free).max(0.0);
+    // Use resident_model_mb as exact weight+head footprint (and verify vram_delta_mb alongside it)
+    let vram_mb = if resident_model_mb > 10.0 { resident_model_mb } else { vram_delta_mb };
+    let decode_ms_per_tok = total_decode_ms / total_tokens.max(1) as f64;
+    let fertility = total_prompt_tokens as f64 / total_prompt_chars.max(1) as f64;
+    let active_k_mean = active_k_sum as f64 / prompts.len().max(1) as f64;
+
+    drop(g);
+    let _ = free_mb(dev);
+
+    Ok(ArmBenchResult {
+        arm: arm_name.to_string(),
+        dir: dir.to_string_lossy().to_string(),
+        vocab_size,
+        active_k_mean,
+        vram_mb,
+        resident_model_mb,
+        vram_delta_mb,
+        decode_ms_per_tok,
+        total_gen_ms: total_decode_ms,
+        prefill_ms_total: total_prefill_ms,
+        total_tokens,
+        fertility_tok_per_char: fertility,
+        orphan_bpe_tokens,
+        oracle_char_sim: 1.0,
+        identifier_exact_rate: 1.0,
+        precision_score: 1.0,
+        guard_rescue_rate: cum_guard.rescue_rate(),
+        guard_rescue_ms: cum_guard.rescue_ms(),
+        guard_rest_wins: cum_guard.rest_wins,
+        quant_mode_a: cum_guard.quant_mode_a,
+        outputs,
+    })
+}
+
+fn score_arm_vs_oracle(arm: &mut ArmBenchResult, oracle: &ArmBenchResult) {
+    let mut sims = Vec::new();
+    for (k, ref_out) in &oracle.outputs {
+        let cand_out = arm.outputs.get(k).map(|s| s.as_str()).unwrap_or("");
+        let a: Vec<char> = ref_out.chars().take(64).collect();
+        let b: Vec<char> = cand_out.chars().take(64).collect();
+        let ed = edit_distance(&a, &b);
+        let denom = a.len().max(b.len()).max(1);
+        sims.push((1.0 - ed as f64 / denom as f64).clamp(0.0, 1.0));
+    }
+    arm.oracle_char_sim = sims.iter().sum::<f64>() / sims.len().max(1) as f64;
+
+    // Identifier exact preservation check across `en` and `id_en`
+    let id_text = format!(
+        "{}\n{}",
+        arm.outputs.get("en").map(|s| s.as_str()).unwrap_or(""),
+        arm.outputs.get("id_en").map(|s| s.as_str()).unwrap_or("")
+    );
+    let must_ids = ["microcontroller", "condition", "BL-2026-08814", "MSKU 7731025", "CI-2026-08001"];
+    let hits = must_ids.iter().filter(|m| id_text.contains(**m)).count();
+    arm.identifier_exact_rate = hits as f64 / must_ids.len() as f64;
+
+    let orphan_health = if arm.orphan_bpe_tokens == 0 {
+        1.0
+    } else {
+        (1.0 - arm.orphan_bpe_tokens as f64 / 3000.0).clamp(0.0, 0.9)
+    };
+    arm.precision_score = 0.50 * arm.oracle_char_sim + 0.25 * arm.identifier_exact_rate + 0.25 * orphan_health;
+}
+
+/// Real RX 6600 Head-to-Head Benchmark: Ours vs Matched AlphaEdge vs Full Untrimmed Oracle.
+/// Run with:
+///   LOGIS_TEST_MODELS=1 LOGIS_REQUIRE_GPU=1 LOGIS_BENCH_MODEL_KIND=q3|q35|4b
+///   LOGIS_BENCH_OURS_DIR=<path> LOGIS_BENCH_ALPHAEDGE_DIR=<path> LOGIS_BENCH_OUT_JSON=<out.json>
+#[test]
+#[ignore = "실모델 AlphaEdge 대조 벤치마크 (LOGIS_TEST_MODELS=1)"]
+fn alphaedge_head_to_head() -> R {
+    if !enabled() {
+        return Ok(());
+    }
+    let Some(dev) = gpu() else { return Ok(()) };
+    let kind = std::env::var("LOGIS_BENCH_MODEL_KIND").unwrap_or_else(|_| "q3".into());
+    let default_ref = match kind.as_str() {
+        "q3" => models_dir().join("Qwen3-0.6B-Instruct-gguf"),
+        "q35" => models_dir().join("Qwen3.5-2B-Instruct-gguf"),
+        _ => logis_app::model::lang_llm::model_dir(logis_app::model::lang_llm::LANG_ENGINE),
+    };
+    let ref_dir = std::env::var("LOGIS_BENCH_REF_DIR").map(PathBuf::from).unwrap_or(default_ref);
+    let ours_dir = std::env::var("LOGIS_BENCH_OURS_DIR").map(PathBuf::from).unwrap_or_else(|_| ref_dir.clone());
+    let ae_dir = std::env::var("LOGIS_BENCH_ALPHAEDGE_DIR").map(PathBuf::from)?;
+
+    let ours_trim = std::env::var("LOGIS_BENCH_OURS_TRIM").unwrap_or_else(|_| "compact".into());
+    let ours_langs = std::env::var("LOGIS_BENCH_OURS_LANGS").unwrap_or_else(|_| "auto".into());
+    let ours_guard = std::env::var("LOGIS_BENCH_OURS_GUARD").unwrap_or_else(|_| "clustered".into());
+    let ours_active_k = std::env::var("LOGIS_BENCH_OURS_ACTIVE_K").ok();
+    let ours_exec_mode = std::env::var("LOGIS_BENCH_OURS_EXEC_MODE").ok();
+
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // 1. Reference full untrimmed oracle
+    let oracle = run_bench_arm("ref_full", &kind, &ref_dir, "off", "all", "off", None, Some("full_untrimmed"), &dev, &rt)?;
+    // 2. AlphaEdge matched model (runs natively as artifact_direct, all of its 16384/32768 rows)
+    let mut ae = run_bench_arm("alphaedge", &kind, &ae_dir, "full", "all", "off", None, Some("artifact_direct"), &dev, &rt)?;
+    // 3. Ours (improved model/runtime)
+    let mut ours = run_bench_arm(
+        "ours",
+        &kind,
+        &ours_dir,
+        &ours_trim,
+        &ours_langs,
+        &ours_guard,
+        ours_active_k.as_deref(),
+        ours_exec_mode.as_deref(),
+        &dev,
+        &rt,
+    )?;
+
+    score_arm_vs_oracle(&mut ae, &oracle);
+    score_arm_vs_oracle(&mut ours, &oracle);
+
+    println!("\n========== [ALPHAEDGE HEAD-TO-HEAD: {kind}] ==========");
+    println!(
+        "  REF_FULL  : vocab={:6} | vram={:6.1}MB (delta {:6.1}MB) | {:6.2}ms/tok | total={:7.1}ms | fert={:.3} | orphans={}",
+        oracle.vocab_size, oracle.vram_mb, oracle.vram_delta_mb, oracle.decode_ms_per_tok, oracle.total_gen_ms, oracle.fertility_tok_per_char, oracle.orphan_bpe_tokens
+    );
+    println!(
+        "  ALPHAEDGE : vocab={:6} | vram={:6.1}MB (delta {:6.1}MB) | {:6.2}ms/tok | total={:7.1}ms | fert={:.3} | orphans={:4} | sim={:.4} | id={:.2} | prec={:.4}",
+        ae.vocab_size, ae.vram_mb, ae.vram_delta_mb, ae.decode_ms_per_tok, ae.total_gen_ms, ae.fertility_tok_per_char, ae.orphan_bpe_tokens, ae.oracle_char_sim, ae.identifier_exact_rate, ae.precision_score
+    );
+    println!(
+        "  OURS      : vocab={:6} (k={:.0}) | vram={:6.1}MB (delta {:6.1}MB) | {:6.2}ms/tok | total={:7.1}ms | fert={:.3} | orphans={:4} | sim={:.4} | id={:.2} | prec={:.4} | rescue={:.1}% ({:.1}ms, wins={})",
+        ours.vocab_size, ours.active_k_mean, ours.vram_mb, ours.vram_delta_mb, ours.decode_ms_per_tok, ours.total_gen_ms, ours.fertility_tok_per_char, ours.orphan_bpe_tokens, ours.oracle_char_sim, ours.identifier_exact_rate, ours.precision_score, ours.guard_rescue_rate * 100.0, ours.guard_rescue_ms, ours.guard_rest_wins
+    );
+
+    let report = serde_json::json!({
+        "model": kind,
+        "oracle": oracle,
+        "alphaedge": ae,
+        "ours": ours,
+        "beat_vram": ours.vram_mb < ae.vram_mb,
+        "beat_ms_per_tok": ours.decode_ms_per_tok < ae.decode_ms_per_tok,
+        "beat_total_gen_ms": ours.total_gen_ms < ae.total_gen_ms,
+        "beat_precision": ours.precision_score > ae.precision_score,
+    });
+    if let Ok(out_path) = std::env::var("LOGIS_BENCH_OUT_JSON") {
+        if let Some(p) = PathBuf::from(&out_path).parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        std::fs::write(&out_path, serde_json::to_string_pretty(&report)?)?;
+        println!("  Saved report -> {out_path}");
+    }
+    finish_gpu_test();
+    Ok(())
+}
+
+/// Real GPU verification for Granite-97m-r2 `MappedTable` E0 parity & VRAM reduction + GPU fused SwiGLU throughput.
+#[test]
+#[ignore = "실모델 임베딩 MappedTable + GPU SwiGLU 검증 (LOGIS_TEST_MODELS=1)"]
+fn embedding_mapped_and_glu_bench() -> R {
+    if !enabled() {
+        return Ok(());
+    }
+    let Some(dev) = gpu() else { return Ok(()) };
+    let embed_dir = models_dir().join("granite-embedding-97m-multilingual-r2");
+    if !embed_dir.join("model.safetensors").exists() {
+        anyhow::bail!("granite-embedding-97m-multilingual-r2 not found at {embed_dir:?}");
+    }
+    let samples: Vec<String> = bench_12lang_prompts().into_iter().map(|(_, _, p)| p.to_string()).collect();
+
+    // 1. Resident baseline
+    std::env::set_var("LOGIS_EMBED_TABLE", "resident");
+    let f0 = free_mb(&dev);
+    let m_res = logis_app::models::embedding::EmbeddingModel::new_with_device(&embed_dir, &dev)?;
+    let _ = m_res.embed(&samples[0])?; // warmup
+    let vram_res = f0 - free_mb(&dev);
+    let batch_opts = logis_app::models::embedding::BatchOpts::default();
+    let t0 = Instant::now();
+    let v_res = m_res.embed_many(&samples, &batch_opts)?;
+    let _ = dev.synchronize_all();
+    let ms_res = t0.elapsed().as_secs_f64() * 1e3;
+    drop(m_res);
+    let _ = free_mb(&dev);
+
+    // 2. MappedTable (default)
+    std::env::set_var("LOGIS_EMBED_TABLE", "mapped");
+    let f1 = free_mb(&dev);
+    let m_map = logis_app::models::embedding::EmbeddingModel::new_with_device(&embed_dir, &dev)?;
+    let _ = m_map.embed(&samples[0])?; // warmup
+    let vram_map = f1 - free_mb(&dev);
+    let t1 = Instant::now();
+    let v_map = m_map.embed_many(&samples, &batch_opts)?;
+    let _ = dev.synchronize_all();
+    let ms_map = t1.elapsed().as_secs_f64() * 1e3;
+    drop(m_map);
+
+    let mut max_abs = 0.0f32;
+    for (a, b) in v_res.iter().zip(&v_map) {
+        for (x, y) in a.iter().zip(b) {
+            max_abs = max_abs.max((x - y).abs());
+        }
+    }
+    println!(
+        "[EMBED-BENCH] resident: vram={vram_res:.1}MB, batch14={ms_res:.1}ms | mapped: vram={vram_map:.1}MB, batch14={ms_map:.1}ms | max_abs_err={max_abs:.2e}"
+    );
+    assert!(max_abs <= 1e-5, "MappedTable must match resident embeddings (E0/E1): max_abs={max_abs}");
+    finish_gpu_test();
     Ok(())
 }
