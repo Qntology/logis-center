@@ -98,9 +98,89 @@ pub struct Qwen3_5GenerateModel {
     pub max_position_embeddings: usize,
     /// 🌟 [SPD-02] JSON 문법 보호 토큰 ID 캐시
     json_protected_ids: std::collections::HashSet<u32>,
+    /// Phase 3-1 D2: 직전 생성의 가드/구출 통계 (`StepGuardStats`)
+    last_guard_stats: Option<crate::models::common::vocab_trim::StepGuardStats>,
+    /// 직전 생성 타이밍 `(prefill_ms, decode_ms, decode_steps)`
+    last_gen_stats: Option<(f64, f64, usize)>,
 }
 
 impl Qwen3_5GenerateModel {
+    pub fn last_guard_stats(&self) -> Option<&crate::models::common::vocab_trim::StepGuardStats> {
+        self.last_guard_stats.as_ref()
+    }
+
+    pub fn last_gen_stats(&self) -> Option<(f64, f64, usize)> {
+        self.last_gen_stats
+    }
+
+    pub fn resident_vram_bytes(&self) -> u64 {
+        self.qwen3_5.resident_vram_bytes()
+    }
+
+    fn prejudice_cached_active(&self, target_text: &str) -> Result<crate::models::common::prejudice::CachedPrejudice> {
+        let target_ids = self.tokenizer.text_encode_vec(target_text.to_string(), false)?;
+        if target_ids.is_empty() {
+            return Err(anyhow::anyhow!("empty target tokens"));
+        }
+        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
+        let target_emb = self.qwen3_5.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+        let target_emb_sum = target_emb.sum_keepdim(1)?;
+        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+        let target_vec = target_emb_sum.broadcast_div(&len_tensor)?.squeeze(0)?.squeeze(0)?;
+
+        let vocab_label = self
+            .qwen3_5
+            .trim_head
+            .as_ref()
+            .map(|h| format!("{}:{}", h.label, h.kept.len()))
+            .unwrap_or_else(|| "full".into());
+        let num_rows = self
+            .qwen3_5
+            .trim_head
+            .as_ref()
+            .map(|h| h.kept.len())
+            .unwrap_or(self.qwen3_5.embed_vocab()?);
+        let cache_key = format!("qwen35:k:{}:{vocab_label}", target_text);
+        crate::models::common::prejudice::get_or_build(
+            &cache_key,
+            &target_vec,
+            num_rows,
+            &self.device,
+            |off, take| self.qwen3_5.embed_kept_rows_f32(off, take, &self.device),
+        )
+    }
+
+    fn prejudice_full_tensor(&self, target_text: &str) -> Result<Tensor> {
+        let target_ids = self.tokenizer.text_encode_vec(target_text.to_string(), false)?;
+        if target_ids.is_empty() {
+            return Err(anyhow::anyhow!("empty target tokens"));
+        }
+        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
+        let target_emb = self.qwen3_5.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
+        let target_emb_sum = target_emb.sum_keepdim(1)?;
+        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
+        let target_vec = target_emb_sum.broadcast_div(&len_tensor)?.squeeze(0)?.squeeze(0)?;
+
+        let vocab = self.qwen3_5.embed_vocab()?;
+        let vocab_label = self
+            .qwen3_5
+            .trim_head
+            .as_ref()
+            .map(|h| h.label.as_str())
+            .unwrap_or("full");
+        let cache_key = format!("qwen35:v{vocab}:{vocab_label}:{target_text}");
+        let cached = crate::models::common::prejudice::get_or_build(
+            &cache_key,
+            &target_vec,
+            vocab,
+            &self.device,
+            |off, take| Ok(self.qwen3_5.embed_rows_f32(off, take)?),
+        )?;
+        Ok(crate::models::common::vocab_trim::exclude_dropped(
+            self.qwen3_5.trim_head.as_ref(),
+            cached.values,
+        )?)
+    }
     /// 🌟 [VOCAB TRIM] 지금 흐름의 문서 언어(`vocab_trim::DocLangScope`)로 출력 투영의 남긴 행을 맞춥니다. 생성마다 처음에 부릅니다.
     pub fn refresh_vocab(&mut self) -> Result<()> {
         self.refresh_vocab_for("", false)
@@ -181,6 +261,8 @@ impl Qwen3_5GenerateModel {
             repeat_last_n: 64,
             max_position_embeddings: max_pos,
             json_protected_ids,
+            last_guard_stats: None,
+            last_gen_stats: None,
         })
     }
 
@@ -303,6 +385,8 @@ impl Qwen3_5GenerateModel {
             repeat_last_n: 64,
             max_position_embeddings: max_pos,
             json_protected_ids,
+            last_guard_stats: None,
+            last_gen_stats: None,
         })
     }
 
@@ -349,15 +433,19 @@ impl Qwen3_5GenerateModel {
                 (mes_render, None, None, None, None)
             };
 
+        let v_start = self.qwen3_5.vision_start_token_id;
+        let v_end = self.qwen3_5.vision_end_token_id;
+        let v_img = self.qwen3_5.image_token_id;
+        let v_vid = self.qwen3_5.video_token_id;
         let mut ids_vec = Vec::new();
         for (i, p_start) in mes_text.split("<|vision_start|>").enumerate() {
-            if i > 0 { ids_vec.push(248053); } // vision_start_token_id
+            if i > 0 { ids_vec.push(v_start); }
             for (j, p_end) in p_start.split("<|vision_end|>").enumerate() {
-                if j > 0 { ids_vec.push(248054); } // vision_end_token_id
+                if j > 0 { ids_vec.push(v_end); }
                 for (k, p_img) in p_end.split("<|image_pad|>").enumerate() {
-                    if k > 0 { ids_vec.push(248056); } // image_token_id
+                    if k > 0 { ids_vec.push(v_img); }
                     for (l, p_vid) in p_img.split("<|video_pad|>").enumerate() {
-                        if l > 0 { ids_vec.push(248057); } // video_token_id
+                        if l > 0 { ids_vec.push(v_vid); }
                         if !p_vid.is_empty() {
                             let mut t_ids = self.tokenizer.text_encode_vec(p_vid.to_string(), false)?;
                             ids_vec.append(&mut t_ids);
@@ -367,6 +455,7 @@ impl Qwen3_5GenerateModel {
             }
         }
         
+        self.qwen3_5.validate_input_ids(&ids_vec)?;
         let total_toks = ids_vec.len();
         let kv_len = self.qwen3_5.language_model.current_kv_len;
 
@@ -414,70 +503,25 @@ impl Qwen3_5GenerateModel {
         // 🌟 [UTF8-STREAM] 표준출력에는 완성된 UTF-8 글자만 내보냅니다. (gen_text_buffer·최종 텍스트는 그대로)
         let mut utf8_stream = crate::tokenizer::Utf8TokenStream::new();
 
-        // 🌟 [Contrastive Semantic Steering] 오답 레이블 진영을 밀어내는 Prejudice 텐서 연산
+        // 🌟 [Contrastive Semantic Steering] 공용 16-슬롯 LRU PrejudiceCache (OOM 방지 + active K 지원)
         let mut semantic_prejudice_tensor: Option<Tensor> = None;
+        let active_prej_cached: Option<(Vec<f32>, Vec<f32>)> = if temperature <= 0.0 && self.qwen3_5.trim_head.is_some() {
+            semantic_prejudice.and_then(|t| {
+                self.prejudice_cached_active(t).ok().and_then(|cp| {
+                    let pv = cp.values.to_device(&Device::Cpu).ok()?.flatten_all().ok()?.to_vec1::<f32>().ok()?;
+                    Some((pv, cp.target_norm_cpu))
+                })
+            })
+        } else {
+            None
+        };
         if let Some(target_text) = semantic_prejudice {
-            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
-                if !target_ids.is_empty() {
-                    let calc_prej = || -> Result<Tensor> {
-                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
-                        let target_emb = self.qwen3_5.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
-                        let target_emb_sum = target_emb.sum_keepdim(1)?;
-                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
-                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
-                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
-                        
-                        // 🌟 [VOCAB CHUNK] 어휘 전체를 F32 로 승격하면 즉사합니다.
-                        //
-                        //  ── 실측 규모 ──
-                        //   token_embd = 248,320 × 2,048.
-                        //     all_embs(F32)        = 2,034MB
-                        //     all_normalized(F32)  = 2,034MB
-                        //   두 텐서가 동시에 살아 4GB 이상을 요구합니다.
-                        //   이 환경의 가용 VRAM 은 로드 후 약 1.8~2.0GB 이므로
-                        //   이 경로가 발화하는 순간(TRACKING fast-track 등) OOM 입니다.
-                        //
-                        //  ── 왜 청크로 나눠도 결과가 같은가 ──
-                        //   코사인 유사도는 어휘 행마다 완전히 독립입니다.
-                        //   행을 블록으로 잘라 각각 정규화·내적한 뒤 이어 붙이면
-                        //   전량 계산과 비트 단위로 동일한 벡터가 나옵니다.
-                        //   블록 16,384행 기준 전이 버퍼는 16,384 × 2,048 × 4B = 134MB 입니다.
-                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
-                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
-                        let target_col = target_normalized.unsqueeze(1)?.contiguous()?;
-
-                        const VOCAB_CHUNK: usize = 16_384;
-                        let vocab = self.qwen3_5.embed_vocab()?;
-                        let mut sim_parts: Vec<Tensor> = Vec::with_capacity(vocab / VOCAB_CHUNK + 1);
-                        let mut off = 0usize;
-                        while off < vocab {
-                            let take = (vocab - off).min(VOCAB_CHUNK);
-                            let blk = self.qwen3_5.embed_rows_f32(off, take)?;
-                            let blk_norm = blk.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
-                            let blk_normalized = blk.broadcast_div(&blk_norm)?;
-                            sim_parts.push(blk_normalized.matmul(&target_col)?.squeeze(1)?);
-                            drop(blk_normalized);
-                            drop(blk);
-                            off += take;
-                        }
-                        let sim = Tensor::cat(&sim_parts, 0)?;
-                        drop(sim_parts);
-                        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
-                        let threshold = Tensor::new(0.65f32, &self.device)?;
-                        let one = Tensor::new(1.0f32, &self.device)?;
-                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
-                        let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
-                        // 🌟 [VOCAB TRIM] 잘린 행 자리는 +∞ (빼면 −∞): 선입견 블록의 채움값이 로짓으로 새어 나가지 않게
-                        Ok(crate::models::common::vocab_trim::exclude_dropped(self.qwen3_5.trim_head.as_ref(), prejudice)?)
-                    };
-                    match calc_prej() {
-                        Ok(prej) => {
-                            semantic_prejudice_tensor = Some(prej);
-                            println!("[SEMANTIC-PREJUDICE] Generated Vector Prejudice for target: '{}'", target_text);
-                        }
-                        Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
-                    }
+            match self.prejudice_full_tensor(target_text) {
+                Ok(prej) => {
+                    semantic_prejudice_tensor = Some(prej);
+                    println!("[SEMANTIC-PREJUDICE] Cached Vector Prejudice for target ({} chars)", target_text.chars().count());
                 }
+                Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
             }
         }
 
@@ -489,6 +533,8 @@ impl Qwen3_5GenerateModel {
         let gen_t0 = std::time::Instant::now();
         let mut prefill_ms = 0.0f64;
         let mut decode_t0: Option<std::time::Instant> = None;
+        let mut guard_stats = crate::models::common::vocab_trim::StepGuardStats::default();
+        let mut slow_path_steps = 0usize;
 
         for i in 0..sample_len {
             if i == 1 {
@@ -498,9 +544,45 @@ impl Qwen3_5GenerateModel {
             }
             if let Some(flag) = &cancel_flag { if flag.load(Ordering::Relaxed) { break; } }
 
+            // Phase 3-1 D3: strict JSON i==0 skips lm_head matmul (forward_last_hidden only).
+            if i == 0 && is_strict_json && temperature <= 0.0 {
+                let _ = self
+                    .qwen3_5
+                    .forward_last_hidden(
+                        &input_ids,
+                        cur_pixel_values,
+                        image_grid_thw,
+                        cur_pixel_values_video,
+                        video_grid_thw,
+                        None,
+                        seqlen_offset,
+                        session_id.clone(),
+                        kv_name.clone(),
+                    )
+                    .await?;
+                guard_stats.skip_i0 = true;
+                let next_token = open_bracket_id;
+                generate.push(next_token);
+                if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
+                    print_buffer.push_str(&utf8_stream.push(&self.tokenizer, next_token));
+                    gen_text_buffer.push_str(&piece);
+                }
+                seqlen_offset += seq_len;
+                seq_len = 1;
+                input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+                cur_pixel_values = None;
+                cur_pixel_values_video = None;
+                continue;
+            }
+
             let pure_greedy_step = i > 0
                 && mes.temperature.unwrap_or(0.0) <= 0.0
                 && semantic_prejudice_tensor.is_none()
+                && !has_ignores;
+            let constrained_greedy_step = i > 0
+                && mes.temperature.unwrap_or(0.0) <= 0.0
+                && !pure_greedy_step
+                && self.qwen3_5.trim_head.is_some()
                 && !has_ignores;
             let fast_hidden = if pure_greedy_step {
                 let h = self
@@ -517,7 +599,8 @@ impl Qwen3_5GenerateModel {
                         kv_name.clone(),
                     )
                     .await?;
-                let cand = self.qwen3_5.greedy_from_hidden(&h)?;
+                let (cand, st) = self.qwen3_5.greedy_from_hidden_with_stats(&h)?;
+                guard_stats.merge(&st);
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 let cand_rep_exempt = is_strict_json && self.json_protected_ids.contains(&cand);
                 let hit_banned = (self.repeat_penalty > 1.0 && !cand_rep_exempt && generate[start_at..].contains(&cand))
@@ -530,9 +613,62 @@ impl Qwen3_5GenerateModel {
                 if !hit_banned {
                     Ok(Some(cand))
                 } else {
+                    slow_path_steps += 1;
+                    Err(h)
+                }
+            } else if constrained_greedy_step {
+                let h = self
+                    .qwen3_5
+                    .forward_last_hidden(
+                        &input_ids,
+                        cur_pixel_values,
+                        image_grid_thw,
+                        cur_pixel_values_video,
+                        video_grid_thw,
+                        None,
+                        seqlen_offset,
+                        session_id.clone(),
+                        kv_name.clone(),
+                    )
+                    .await?;
+                let start_at = generate.len().saturating_sub(self.repeat_last_n);
+                let recent_set: std::collections::HashSet<u32> = if self.repeat_penalty > 1.0 {
+                    generate[start_at..].iter().copied().collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                let is_url_single = gen_text_buffer.ends_with("http:/") || gen_text_buffer.ends_with("https:/");
+                let is_url_double = gen_text_buffer.ends_with("http:") || gen_text_buffer.ends_with("https:");
+                let block_slash = is_strict_json && !is_url_single && gen_text_buffer.ends_with('/');
+                let block_double = is_strict_json && !is_url_double;
+                let penalty = self.repeat_penalty;
+                let prej_ref = active_prej_cached.as_ref().map(|(pv, _)| pv.as_slice());
+                let tnorm_ref = active_prej_cached.as_ref().map(|(_, tn)| tn.as_slice());
+                let head = self.qwen3_5.trim_head.as_ref().unwrap();
+                let (cand, st) = head.greedy_constrained(&h, prej_ref, tnorm_ref, |vid, mut v| {
+                    if is_strict_json {
+                        if vid == think_token_id { v -= 10000.0; }
+                        if vid == lt_id { v -= 50.0; }
+                        if block_slash && vid == slash_id { v -= 10000.0; }
+                        if block_double && (vid == double_slash_id || vid == space_double_slash_id) { v -= 10000.0; }
+                    }
+                    if penalty > 1.0 && recent_set.contains(&vid) && !(is_strict_json && self.json_protected_ids.contains(&vid)) {
+                        if v < 0.0 { v *= penalty; } else { v /= penalty; }
+                    }
+                    v
+                })?;
+                guard_stats.merge(&st);
+                let cold_conflict = st.rest_wins > 0
+                    && ((is_strict_json && (cand == think_token_id || cand == lt_id || (block_slash && cand == slash_id) || (block_double && (cand == double_slash_id || cand == space_double_slash_id))))
+                        || (penalty > 1.0 && recent_set.contains(&cand) && !(is_strict_json && self.json_protected_ids.contains(&cand))));
+                if !cold_conflict {
+                    Ok(Some(cand))
+                } else {
+                    slow_path_steps += 1;
                     Err(h)
                 }
             } else {
+                if i > 0 { slow_path_steps += 1; }
                 Ok(None)
             };
             let mut next_token = match fast_hidden {
@@ -764,9 +900,81 @@ impl Qwen3_5GenerateModel {
         if prefill_ms == 0.0 {
             prefill_ms = gen_t0.elapsed().as_secs_f64() * 1e3;
         }
+        let decode_steps = generate.len().saturating_sub(1);
+        self.last_gen_stats = Some((prefill_ms, decode_ms, decode_steps));
+        self.last_guard_stats = Some(guard_stats.clone());
         crate::utils::score_dynamics::record_baseline("qwen35.prefill_ms", prefill_ms as f32);
         crate::utils::score_dynamics::record_baseline("qwen35.decode_ms", decode_ms as f32);
         crate::utils::score_dynamics::record_baseline("qwen35.decode_tokens", generate.len() as f32);
+
+        if logis_schema::reflection::ReflectionLogMode::from_env() != logis_schema::reflection::ReflectionLogMode::Off {
+            let head = self.qwen3_5.trim_head.as_ref();
+            let vocab_v = self.qwen3_5.embed_vocab().unwrap_or(0) as u32;
+            let active_k = head.map(|h| h.kept.len() as u32).unwrap_or(vocab_v);
+            let scope_label = head.map(|h| h.label.clone()).unwrap_or_else(|| "full".into());
+            let head_path = if guard_stats.quant_mode_a {
+                "quant_mode_a".into()
+            } else if head.is_some() {
+                "trimmed_head".into()
+            } else {
+                "linear_proj".into()
+            };
+            let backend = if self.device.is_rocm() {
+                "rocm"
+            } else if self.device.is_cuda() {
+                "cuda"
+            } else if self.device.is_vulkan() {
+                "vulkan"
+            } else if self.device.is_metal() {
+                "metal"
+            } else {
+                "cpu"
+            };
+            let rec = logis_schema::reflection::ReflectionRecord {
+                ts_ms: logis_schema::reflection::current_ts_ms(),
+                run_id: logis_schema::reflection::current_run_id(),
+                task_id: self.model_name.clone(),
+                git_rev: option_env!("LOGIS_GIT_REV").unwrap_or("dev").into(),
+                build_profile: logis_schema::reflection::build_profile_label(),
+                features: Vec::new(),
+                backend: backend.into(),
+                device_name: format!("{:?}", self.device),
+                artifact: logis_schema::reflection::ArtifactReflection {
+                    slot: self.model_name.clone(),
+                    bytes: self.qwen3_5.resident_vram_bytes(),
+                    sha256_16: String::new(),
+                    recipe: "gguf".into(),
+                    vocab_v,
+                    artifact_k: active_k,
+                    plan_sha256: None,
+                    space_tag: None,
+                },
+                load: None,
+                exec: Some(logis_schema::reflection::ExecReflection {
+                    step: "generate".into(),
+                    langs: [String::new(), String::new(), scope_label.clone()],
+                    scope_label,
+                    vocab_k: [vocab_v, active_k],
+                    head_path,
+                    guard_kind: head.map(|h| h.guard_kind_label().into()).unwrap_or_else(|| "none".into()),
+                    tokens: [total_toks as u32, decode_steps as u32],
+                    timing_ms: [prefill_ms as f32, decode_ms as f32, guard_stats.rescue_ms() as f32],
+                    steps: [
+                        guard_stats.fast_steps as u32,
+                        slow_path_steps as u32,
+                        guard_stats.constrained_steps as u32,
+                        guard_stats.flagged as u32,
+                        guard_stats.rest_wins as u32,
+                    ],
+                    sampling: temperature > 1e-7,
+                    trim_mode: head.map(|h| h.exec_mode.as_str().into()).unwrap_or_else(|| "full_untrimmed".into()),
+                    clusters_checked: guard_stats.clusters_checked as u32,
+                    rows_scored: guard_stats.rows_scored as u64,
+                    ..Default::default()
+                }),
+            };
+            logis_schema::reflection::record(&rec);
+        }
 
         let res = self.tokenizer.token_decode(generate)?;
 
@@ -833,15 +1041,19 @@ impl Qwen3_5GenerateModel {
                 (mes_render, None, None, None, None)
             };
             
+            let v_start = self.qwen3_5.vision_start_token_id;
+            let v_end = self.qwen3_5.vision_end_token_id;
+            let v_img = self.qwen3_5.image_token_id;
+            let v_vid = self.qwen3_5.video_token_id;
             let mut ids_vec = Vec::new();
             for (i, p_start) in text.split("<|vision_start|>").enumerate() {
-                if i > 0 { ids_vec.push(248053); } 
+                if i > 0 { ids_vec.push(v_start); }
                 for (j, p_end) in p_start.split("<|vision_end|>").enumerate() {
-                    if j > 0 { ids_vec.push(248054); } 
+                    if j > 0 { ids_vec.push(v_end); }
                     for (k, p_img) in p_end.split("<|image_pad|>").enumerate() {
-                        if k > 0 { ids_vec.push(248056); } 
+                        if k > 0 { ids_vec.push(v_img); }
                         for (l, p_vid) in p_img.split("<|video_pad|>").enumerate() {
-                            if l > 0 { ids_vec.push(248057); } 
+                            if l > 0 { ids_vec.push(v_vid); }
                             if !p_vid.is_empty() {
                                 let mut t_ids = self.tokenizer.text_encode_vec(p_vid.to_string(), false)?;
                                 ids_vec.append(&mut t_ids);
@@ -850,7 +1062,8 @@ impl Qwen3_5GenerateModel {
                     }
                 }
             }
-            let total_toks = ids_vec.len();
+            self.qwen3_5.validate_input_ids(&ids_vec)?;
+        let total_toks = ids_vec.len();
             let kv_len = self.qwen3_5.language_model.current_kv_len;
 
             if kv_len > 0 {
@@ -901,75 +1114,21 @@ impl Qwen3_5GenerateModel {
         // 🌟 [UTF8-STREAM] 표준출력에는 완성된 UTF-8 글자만 내보냅니다. (gen_text_buffer·최종 텍스트는 그대로)
         let mut utf8_stream = crate::tokenizer::Utf8TokenStream::new();
 
-        // 🌟 [Contrastive Semantic Steering] 오답 레이블 진영 밀어내기 (Prejudice)
+        // 🌟 [Contrastive Semantic Steering] 공용 16-슬롯 LRU PrejudiceCache
         let mut semantic_prejudice_tensor: Option<Tensor> = None;
         if let Some(target_text) = semantic_prejudice {
-            if let Ok(target_ids) = self.tokenizer.text_encode_vec(target_text.to_string(), false) {
-                if !target_ids.is_empty() {
-                    let calc_prej = || -> Result<Tensor> {
-                        let target_tensor = Tensor::from_vec(target_ids.clone(), (1, target_ids.len()), &self.device)?;
-                        let target_emb = self.qwen3_5.embedding_token_id(&target_tensor)?.to_dtype(DType::F32)?;
-                        let target_emb_sum = target_emb.sum_keepdim(1)?;
-                        let len_tensor = Tensor::new(target_ids.len() as f32, &self.device)?;
-                        let target_emb_avg = target_emb_sum.broadcast_div(&len_tensor)?;
-                        let target_vec = target_emb_avg.squeeze(0)?.squeeze(0)?;
-                        
-                        // 🌟 [VOCAB CHUNK] 어휘 전체를 F32 로 승격하면 즉사합니다.
-                        //
-                        //  ── 실측 규모 ──
-                        //   token_embd = 248,320 × 2,048.
-                        //     all_embs(F32)        = 2,034MB
-                        //     all_normalized(F32)  = 2,034MB
-                        //   두 텐서가 동시에 살아 4GB 이상을 요구합니다.
-                        //   이 환경의 가용 VRAM 은 로드 후 약 1.8~2.0GB 이므로
-                        //   이 경로가 발화하는 순간(TRACKING fast-track 등) OOM 입니다.
-                        //
-                        //  ── 왜 청크로 나눠도 결과가 같은가 ──
-                        //   코사인 유사도는 어휘 행마다 완전히 독립입니다.
-                        //   행을 블록으로 잘라 각각 정규화·내적한 뒤 이어 붙이면
-                        //   전량 계산과 비트 단위로 동일한 벡터가 나옵니다.
-                        //   블록 16,384행 기준 전이 버퍼는 16,384 × 2,048 × 4B = 134MB 입니다.
-                        let target_norm = target_vec.sqr()?.sum_all()?.sqrt()?;
-                        let target_normalized = target_vec.broadcast_div(&target_norm)?;
-                        let target_col = target_normalized.unsqueeze(1)?.contiguous()?;
-
-                        const VOCAB_CHUNK: usize = 16_384;
-                        let vocab = self.qwen3_5.embed_vocab()?;
-                        let mut sim_parts: Vec<Tensor> = Vec::with_capacity(vocab / VOCAB_CHUNK + 1);
-                        let mut off = 0usize;
-                        while off < vocab {
-                            let take = (vocab - off).min(VOCAB_CHUNK);
-                            let blk = self.qwen3_5.embed_rows_f32(off, take)?;
-                            let blk_norm = blk.sqr()?.sum_keepdim(candle_core::D::Minus1)?.sqrt()?;
-                            let blk_normalized = blk.broadcast_div(&blk_norm)?;
-                            sim_parts.push(blk_normalized.matmul(&target_col)?.squeeze(1)?);
-                            drop(blk_normalized);
-                            drop(blk);
-                            off += take;
-                        }
-                        let sim = Tensor::cat(&sim_parts, 0)?;
-                        drop(sim_parts);
-                        // 🌟 [방향 B: Threshold 노이즈 게이트 + Exponential 증폭]
-                        let threshold = Tensor::new(0.65f32, &self.device)?;
-                        let one = Tensor::new(1.0f32, &self.device)?;
-                        let sim_relu = sim.broadcast_sub(&threshold)?.relu()?;
-                        let prejudice = sim_relu.affine(15.0, 0.0)?.exp()?.broadcast_sub(&one)?;
-                        // 🌟 [VOCAB TRIM] 잘린 행 자리는 +∞ (빼면 −∞): 선입견 블록의 채움값이 로짓으로 새어 나가지 않게
-                        Ok(crate::models::common::vocab_trim::exclude_dropped(self.qwen3_5.trim_head.as_ref(), prejudice)?)
-                    };
-                    match calc_prej() {
-                        Ok(prej) => {
-                            semantic_prejudice_tensor = Some(prej);
-                            println!("[SEMANTIC-PREJUDICE] Generated Vector Prejudice for target: '{}'", target_text);
-                        }
-                        Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
-                    }
+            match self.prejudice_full_tensor(target_text) {
+                Ok(prej) => {
+                    semantic_prejudice_tensor = Some(prej);
+                    println!("[SEMANTIC-PREJUDICE] Cached Vector Prejudice for target ({} chars)", target_text.chars().count());
                 }
+                Err(e) => println!("[SEMANTIC-PREJUDICE] Failed to calculate prejudice: {}", e),
             }
         }
 
         let pretokenized_ignores = pretokenize_ignore_list(&self.tokenizer, ignore_list, is_strict_json);
         let has_ignores = !pretokenized_ignores.is_empty();
+        let mut guard_stats = crate::models::common::vocab_trim::StepGuardStats::default();
 
         for i in 0..sample_len {
             if i == 1 {
@@ -982,6 +1141,40 @@ impl Qwen3_5GenerateModel {
             }
 
             crate::models::qwen::generate::wait_for_global_io().await;
+
+            // Phase 3-1 D3: strict JSON i==0 skips lm_head matmul (forward_last_hidden only).
+            if i == 0 && is_strict_json && mes.temperature.unwrap_or(0.0) <= 0.0 {
+                let _ = self
+                    .qwen3_5
+                    .forward_last_hidden(
+                        &input_ids,
+                        cur_pixel_values.as_ref(),
+                        cur_image_thw.as_ref(),
+                        cur_pixel_values_video.as_ref(),
+                        cur_video_thw.as_ref(),
+                        None,
+                        seqlen_offset,
+                        session_id.clone(),
+                        kv_name.clone(),
+                    )
+                    .await?;
+                guard_stats.skip_i0 = true;
+                let next_token = open_bracket_id;
+                generate.push(next_token);
+                final_token = next_token;
+                if let Ok(piece) = self.tokenizer.token_decode(vec![next_token]) {
+                    print_buffer.push_str(&utf8_stream.push(&self.tokenizer, next_token));
+                    gen_text_buffer.push_str(&piece);
+                }
+                seqlen_offset += seq_len;
+                seq_len = 1;
+                input_ids = Tensor::from_vec(vec![next_token], (1, 1), &self.device)?;
+                cur_pixel_values = None;
+                cur_image_thw = None;
+                cur_pixel_values_video = None;
+                cur_video_thw = None;
+                continue;
+            }
 
             let pure_greedy_step = i > 0
                 && mes.temperature.unwrap_or(0.0) <= 0.0
@@ -1002,7 +1195,8 @@ impl Qwen3_5GenerateModel {
                         kv_name.clone(),
                     )
                     .await?;
-                let cand = self.qwen3_5.greedy_from_hidden(&h)?;
+                let (cand, st) = self.qwen3_5.greedy_from_hidden_with_stats(&h)?;
+                guard_stats.merge(&st);
                 let start_at = generate.len().saturating_sub(self.repeat_last_n);
                 let cand_rep_exempt = is_strict_json && self.json_protected_ids.contains(&cand);
                 let hit_banned = (self.repeat_penalty > 1.0 && !cand_rep_exempt && generate[start_at..].contains(&cand))

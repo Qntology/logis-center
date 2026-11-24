@@ -2845,7 +2845,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3152,7 +3152,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3949,7 +3949,7 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link 0.2.1",
+ "windows-link 0.1.3",
  "windows-result 0.4.1",
 ]
 
@@ -6239,6 +6239,7 @@ dependencies = [
  "minijinja",
  "nvml-wrapper",
  "once_cell",
+ "premium-discount-manifest",
  "premium-discount-nlp",
  "premium-discount-quant",
  "rand 0.8.8",
@@ -6321,11 +6322,14 @@ dependencies = [
 name = "logis-search"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "logis-bias",
  "logis-pug",
  "logis-schema",
+ "memmap2",
  "once_cell",
+ "serde",
  "serde_json",
 ]
 
@@ -6741,7 +6745,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6958,7 +6962,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7428,7 +7432,6 @@ dependencies = [
 [[package]]
 name = "onnxruntime"
 version = "0.0.14"
-source = "git+https://github.com/Qntology/premium-discount?rev=25497674a0b86756ba56a17d69a8c5173e95a6dd#25497674a0b86756ba56a17d69a8c5173e95a6dd"
 dependencies = [
  "lazy_static",
  "ndarray 0.15.6",
@@ -7440,7 +7443,6 @@ dependencies = [
 [[package]]
 name = "onnxruntime-sys"
 version = "0.0.14"
-source = "git+https://github.com/Qntology/premium-discount?rev=25497674a0b86756ba56a17d69a8c5173e95a6dd#25497674a0b86756ba56a17d69a8c5173e95a6dd"
 dependencies = [
  "flate2",
  "libloading 0.8.9",
@@ -7525,7 +7527,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.45.0",
 ]
 
 [[package]]
@@ -7900,9 +7902,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
+name = "premium-discount-cpu-kernels"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "premium-discount-identity"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=25497674a0b86756ba56a17d69a8c5173e95a6dd#25497674a0b86756ba56a17d69a8c5173e95a6dd"
 dependencies = [
  "getrandom 0.3.4",
  "hmac 0.12.1",
@@ -7914,13 +7922,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "premium-discount-manifest"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "premium-discount-nlp"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=25497674a0b86756ba56a17d69a8c5173e95a6dd#25497674a0b86756ba56a17d69a8c5173e95a6dd"
 dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
+ "half",
+ "memmap2",
  "ndarray 0.15.6",
  "once_cell",
  "onnxruntime",
@@ -7935,20 +7951,23 @@ dependencies = [
 [[package]]
 name = "premium-discount-quant"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=25497674a0b86756ba56a17d69a8c5173e95a6dd#25497674a0b86756ba56a17d69a8c5173e95a6dd"
 dependencies = [
  "anyhow",
  "half",
  "memmap2",
+ "premium-discount-cpu-kernels",
+ "premium-discount-manifest",
  "rayon",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tokenizers",
+ "unicode-normalization",
 ]
 
 [[package]]
 name = "premium-discount-sds"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=25497674a0b86756ba56a17d69a8c5173e95a6dd#25497674a0b86756ba56a17d69a8c5173e95a6dd"
 dependencies = [
  "anyhow",
  "serde",
@@ -8062,7 +8081,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -8259,7 +8278,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8836,7 +8855,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9496,7 +9515,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -9508,7 +9527,7 @@ version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "287f59010008f0d7cf5e3b03196d666c1acc46c8d3e9cf34c28a1a7157601e72"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -9531,7 +9550,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10229,7 +10248,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -10764,7 +10783,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.21",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -11452,7 +11471,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11473,7 +11492,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-quartz-core",
  "raw-window-handle",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "windows-version",
 ]
 
@@ -11971,7 +11990,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12384,3 +12403,7 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "premium-discount-nms"
+version = "0.1.0"

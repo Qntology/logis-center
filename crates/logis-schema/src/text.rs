@@ -26,7 +26,8 @@ pub fn split_phrase_list(raw: &str) -> Vec<String> {
     let mut cur = String::new();
     for (i, c) in chars.iter().enumerate() {
         let sep = match *c {
-            ',' | '\n' | '|' => true,
+            // Phase 4-1 D3: Multilingual separators (Arabic ، ؛, Japanese 、, CJK fullwidth ， ； ｜)
+            ',' | '\n' | '|' | '\u{060C}' | '\u{061B}' | '\u{3001}' | '\u{FF0C}' | '\u{FF1B}' | '\u{FF5C}' => true,
             '/' => !is_abbreviation_slash(&chars, i),
             _ => false,
         };

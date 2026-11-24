@@ -35,8 +35,8 @@ use std::sync::{Arc, Mutex};
 /// per-text 순전파(오늘의 embed()) 결과 공간의 태그.
 /// 순전파 수치가 바뀌는 변경을 하면 반드시 이 태그를 올려야 합니다.
 pub const FORWARD_TAG_PER_TEXT: &str = "granite-r2/fwd-pertext/v1";
-/// 배치 순전파(embed_many, 고정 모양 · CUDA/ROCm) 결과 공간의 태그.
-pub const FORWARD_TAG_BATCHED: &str = "granite-r2/fwd-batched/v1";
+/// 배치 순전파(embed_many, 고정 모양 · CUDA/ROCm) 결과 공간의 태그 (v2: fused GPU SwiGLU + mapped table).
+pub const FORWARD_TAG_BATCHED: &str = "granite-r2/fwd-batched/v2";
 /// 배치 순전파(embed_many, 동적 행 수 · CPU/Vulkan) 결과 공간의 태그.
 pub const FORWARD_TAG_BATCHED_DYN: &str = "granite-r2/fwd-batched-dyn/v1";
 

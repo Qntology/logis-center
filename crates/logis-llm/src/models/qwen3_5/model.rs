@@ -26,12 +26,33 @@ pub enum EmbedTable {
 }
 
 impl EmbedTable {
+    /// Bounds guard ensuring every token ID in `ids` is strictly `< vocab` (Phase 2-2 D3).
+    pub fn validate_ids_slice(&self, ids: &[u32]) -> candle_core::Result<()> {
+        let v = self.vocab()?;
+        if let Some(&bad) = ids.iter().find(|&&id| (id as usize) >= v) {
+            return Err(candle_core::Error::Msg(format!(
+                "EmbedTable token ID {bad} out of bounds for vocab size {v}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Tensor-level bounds guard (checks `max_id < vocab`).
+    pub fn validate_ids(&self, ids: &Tensor) -> candle_core::Result<()> {
+        if ids.elem_count() == 0 {
+            return Ok(());
+        }
+        let flat = ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+        self.validate_ids_slice(&flat)
+    }
+
     pub fn forward(&self, ids: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             Self::Dense(e) => e.forward(ids),
             Self::Quant { q, .. } => q.embedding(ids),
             Self::Mapped { src, device } => {
                 let flat = ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+                self.validate_ids_slice(&flat)?;
                 let mut dims = ids.dims().to_vec();
                 dims.push(src.cols);
                 Self::mapped_rows(src, &flat, device)?.reshape(dims)
@@ -59,6 +80,7 @@ impl EmbedTable {
             return self.forward(ids);
         };
         let flat = ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+        self.validate_ids_slice(&flat)?;
         let mut dims = ids.dims().to_vec();
         dims.push(src.cols);
         let (mut kept, mut miss, mut order) = (Vec::new(), Vec::new(), Vec::with_capacity(flat.len()));
@@ -377,10 +399,11 @@ pub struct Qwen3_5GatedDeltaNet {
     v_head_order: candle_core::delta_rule::GdnHeadOrder,
 }
 
-/// 🌟 [GDN-FUSED] GGUF 메타데이터 `alphaedge.v_head_order` ("grouped" / "tiled"). 없으면 Qwen3.5 기본값 Grouped.
+/// 🌟 [GDN-FUSED] GGUF 메타데이터 `logis.v_head_order` 우선, 구형 `alphaedge.v_head_order` 폴백 ("grouped" / "tiled").
 fn gguf_v_head_order<R: Read + Seek>(gguf: &Gguf<R>) -> candle_core::delta_rule::GdnHeadOrder {
     let v = gguf
-        .get_matedata("alphaedge.v_head_order")
+        .get_matedata("logis.v_head_order")
+        .or_else(|_| gguf.get_matedata("alphaedge.v_head_order"))
         .ok()
         .and_then(|v| v.to_string().ok().cloned())
         .unwrap_or_default();
@@ -4079,9 +4102,10 @@ pub static IGNORE_STOP_SIGNAL_FOR_TESTS: std::sync::atomic::AtomicBool = std::sy
 // ----------------------------------------------------------------------------------
 pub struct Qwen3_5Model {
     spatial_merge_size: usize,
-    image_token_id: u32,
-    video_token_id: u32,
-    vision_start_token_id: u32,
+    pub image_token_id: u32,
+    pub video_token_id: u32,
+    pub vision_start_token_id: u32,
+    pub vision_end_token_id: u32,
     visual: Option<Qwen3VLVisionModel>,
     pub language_model: Qwen3_5TextModel,
     lm_head: ProjKind,
@@ -4118,6 +4142,7 @@ impl Qwen3_5Model {
             image_token_id: config.image_token_id,
             video_token_id: config.video_token_id,
             vision_start_token_id: config.vision_start_token_id,
+            vision_end_token_id: config.vision_start_token_id.saturating_add(1),
             visual: Some(visual),
             language_model,
             lm_head: ProjKind::LinearProj(lm_head),
@@ -4135,9 +4160,23 @@ impl Qwen3_5Model {
         ct_handle: Option<std::sync::Arc<candle_core::quantized::gguf_file::Content>>
     ) -> Result<Self> {
         let spatial_merge_size = 2usize;
-        let image_token_id = 248056u32;
-        let video_token_id = 248057u32;
-        let vision_start_token_id = 248053u32;
+        let lookup_gguf_tok = |gguf: &Gguf<R1>, meta_key: &str, tok_str: &str, default_id: u32| -> u32 {
+            if let Ok(v) = gguf.get_matedata(meta_key) {
+                if let Ok(id) = v.to_u32() {
+                    return id;
+                }
+            }
+            if let Ok(arr) = gguf.get_matedata("tokenizer.ggml.tokens").and_then(|v| Ok(v.to_vec()?.clone())) {
+                if let Some(pos) = arr.iter().position(|x| x.to_string().ok().is_some_and(|s| s == tok_str)) {
+                    return pos as u32;
+                }
+            }
+            default_id
+        };
+        let vision_start_token_id = lookup_gguf_tok(gguf, "qwen35.vision_start_token_id", "<|vision_start|>", 248053);
+        let vision_end_token_id = lookup_gguf_tok(gguf, "qwen35.vision_end_token_id", "<|vision_end|>", 248054);
+        let image_token_id = lookup_gguf_tok(gguf, "qwen35.image_token_id", "<|image_pad|>", 248056);
+        let video_token_id = lookup_gguf_tok(gguf, "qwen35.video_token_id", "<|video_pad|>", 248057);
 
         // 🌟 [LOAD ORDER] 언어 모델을 먼저 세웁니다.
         //    레이어는 new_skeleton 이라 VRAM 을 쓰지 않고, 여기서 올라가는 것은
@@ -4204,6 +4243,7 @@ impl Qwen3_5Model {
             image_token_id,
             video_token_id,
             vision_start_token_id,
+            vision_end_token_id,
             visual,
             language_model,
 
@@ -4746,26 +4786,66 @@ impl Qwen3_5Model {
         Ok(logits_gpu.to_device(&Device::Cpu)?)
     }
 
-    /// Part 5 (Pack A·C): 100% 무손실 Greedy 토큰 선택 (Mode B `TrimmedHead::greedy_next_token` 또는 Mode A `fused_linear_argmax_cs`).
-    pub fn greedy_from_hidden(&mut self, hidden_state_aligned: &Tensor) -> Result<u32> {
+    /// Part 5 (Pack A·C) + Phase 3-1 D2/D4: 100% 무손실 Greedy 토큰 선택 + Guard 통계 반환.
+    /// `TrimmedHead`, `ProjKind::Exact`/`QuantizedProj` (Mode A `fused_quant_argmax_cs`), `LinearProj` 모두 지원.
+    pub fn greedy_from_hidden_with_stats(
+        &mut self,
+        hidden_state_aligned: &Tensor,
+    ) -> Result<(u32, crate::models::common::vocab_trim::StepGuardStats)> {
+        use crate::models::common::vocab_trim::StepGuardStats;
         if self.trim_head.is_none() {
             if let Some(src) = self.language_model.embed_tokens.mapped_source().cloned() {
                 self.trim_head = Some(crate::models::common::vocab_trim::all_rows(&src, hidden_state_aligned.device())?);
             }
         }
         if let Some(head) = &self.trim_head {
-            return Ok(head.greedy_next_token(hidden_state_aligned)?[0]);
+            let (ids, st) = head.greedy_next_token_detailed(hidden_state_aligned)?;
+            return Ok((ids[0], st));
+        }
+        let dev = hidden_state_aligned.device();
+        let dt = hidden_state_aligned.dtype();
+        let h_dim = *hidden_state_aligned.dims().last().unwrap_or(&0);
+        let fused_ok = crate::models::common::accel_check::fused_op_ok(
+            dev,
+            crate::models::common::accel_check::FusedOpKind::LmHeadArgmaxCs,
+            dt,
+            h_dim,
+        );
+        if fused_ok && (dev.is_cuda() || dev.is_rocm()) {
+            let q_and_bias = match &self.lm_head {
+                ProjKind::Exact(ex) => Some((ex.weight(), None)),
+                ProjKind::QuantizedProj(ql) => ql.qtensor().map(|q| (q, ql.bias())),
+                _ => None,
+            };
+            if let Some((qw, bias)) = q_and_bias {
+                if h_dim % qw.dtype().block_size().max(1) == 0
+                    && matches!(
+                        qw.dtype(),
+                        candle_core::quantized::GgmlDType::Q8_0
+                            | candle_core::quantized::GgmlDType::Q4_0
+                            | candle_core::quantized::GgmlDType::Q4K
+                            | candle_core::quantized::GgmlDType::Q5K
+                            | candle_core::quantized::GgmlDType::Q6K
+                    )
+                {
+                    let m = hidden_state_aligned.elem_count() / h_dim.max(1);
+                    let h_2d = hidden_state_aligned.reshape((m, h_dim))?.contiguous()?;
+                    let out = candle_core::lm_head::fused_quant_argmax_cs(&h_2d, qw, bias, None, None)?;
+                    let (ids, _) = out.download_ids_and_mask()?;
+                    return Ok((
+                        ids[0],
+                        StepGuardStats {
+                            steps: 1,
+                            fast_steps: 1,
+                            quant_mode_a: true,
+                            ..Default::default()
+                        },
+                    ));
+                }
+            }
         }
         if let ProjKind::LinearProj(lin) = &self.lm_head {
-            let dev = hidden_state_aligned.device();
-            let dt = hidden_state_aligned.dtype();
-            let h_dim = *hidden_state_aligned.dims().last().unwrap_or(&0);
-            if crate::models::common::accel_check::fused_op_ok(
-                dev,
-                crate::models::common::accel_check::FusedOpKind::LmHeadArgmaxCs,
-                dt,
-                h_dim,
-            ) {
+            if fused_ok {
                 let out = candle_core::lm_head::fused_linear_argmax_cs(
                     hidden_state_aligned,
                     lin.weight(),
@@ -4773,7 +4853,15 @@ impl Qwen3_5Model {
                     None,
                     None,
                 )?;
-                return Ok(out.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?[0]);
+                let id = out.ids.to_device(&Device::Cpu)?.to_vec1::<u32>()?[0];
+                return Ok((
+                    id,
+                    StepGuardStats {
+                        steps: 1,
+                        fast_steps: 1,
+                        ..Default::default()
+                    },
+                ));
             }
         }
         let logits = self.logits_from_hidden(hidden_state_aligned)?;
@@ -4782,12 +4870,81 @@ impl Qwen3_5Model {
             .argmax(D::Minus1)?
             .flatten_all()?
             .to_vec1::<u32>()?[0];
-        Ok(id)
+        Ok((
+            id,
+            StepGuardStats {
+                steps: 1,
+                ..Default::default()
+            },
+        ))
+    }
+
+    /// Part 5 (Pack A·C): 100% 무손실 Greedy 토큰 선택 (Mode B `TrimmedHead::greedy_next_token` 또는 Mode A `fused_linear_argmax_cs`).
+    pub fn greedy_from_hidden(&mut self, hidden_state_aligned: &Tensor) -> Result<u32> {
+        self.greedy_from_hidden_with_stats(hidden_state_aligned).map(|(id, _)| id)
     }
 
     /// 매핑된 출력 투영 표 (잘라 내기가 켜진 경우)
     pub fn vocab_table(&self) -> Option<crate::models::common::vocab_trim::TableSource> {
         self.language_model.embed_tokens.mapped_source().cloned()
+    }
+
+    /// Actual resident GPU weight + active LM head bytes (Phase 3-2 D2: reflects `EmbedTable::Mapped` 0 B table).
+    pub fn resident_vram_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        if let Some(ct) = &self.language_model.ct {
+            let resident_layers = if self.language_model.keep_weights_resident {
+                self.language_model.layers.len()
+            } else {
+                self.language_model.resident_prefix
+            };
+            for (name, info) in ct.tensor_infos.iter() {
+                if name == "token_embd.weight" || name == "output.weight" {
+                    continue;
+                }
+                if let Some(rest) = name.strip_prefix("blk.") {
+                    if let Some(idx_str) = rest.split('.').next() {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            if idx >= resident_layers {
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let bs = info.ggml_dtype.block_size().max(1);
+                let bytes = (info.shape.elem_count() / bs) * info.ggml_dtype.type_size();
+                total += bytes as u64;
+            }
+        }
+        match &self.language_model.embed_tokens {
+            EmbedTable::Mapped { .. } => {
+                // Input table VRAM = 0; only active trim_head is resident on GPU.
+                if let Some(head) = &self.trim_head {
+                    total += head.head_bytes() as u64;
+                }
+            }
+            EmbedTable::Quant { q, .. } => {
+                let bs = q.dtype().block_size().max(1);
+                total += ((q.shape().elem_count() / bs) * q.dtype().type_size()) as u64;
+            }
+            EmbedTable::Dense(e) => {
+                total += (e.embeddings().elem_count() * e.embeddings().dtype().size_in_bytes()) as u64;
+            }
+        }
+        total
+    }
+
+    /// Active-row embedding lookup for `PrejudiceCache`.
+    pub fn embed_kept_rows_f32(&self, off: usize, take: usize, device: &Device) -> Result<Tensor> {
+        if let Some(head) = &self.trim_head {
+            Ok(head.kept_rows_f32(off, take, device)?)
+        } else {
+            Ok(self.language_model.embed_tokens.rows_f32(off, take)?)
+        }
+    }
+
+    pub fn validate_input_ids(&self, ids: &[u32]) -> Result<()> {
+        Ok(self.language_model.embed_tokens.validate_ids_slice(ids)?)
     }
 
     pub fn clear_cache(&mut self) {

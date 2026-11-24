@@ -11,7 +11,7 @@
 - [Key Features](#key-features)
 - [Project Structure](#project-structure)
 - [AI Model Architecture](#ai-model-architecture)
-- [Language-Specialized Engine (AlphaEdge Qwen3.5-4B)](#language-specialized-engine-alphaedge-qwen35-4b)
+- [Language Engine (Single Qwen3.5-4B + Adaptive Vocab Trim)](#language-engine-single-qwen35-4b--adaptive-vocab-trim)
 - [Memory Management (RAM / SSD Offloading)](#memory-management-ram--ssd-offloading)
 - [Build & Run](#build--run)
 - [License](#license)
@@ -25,7 +25,7 @@
 | **Commerce** | Automatically structures order, goods, tracking, coupon, and review pages of shopping malls and indexes them into a local vector DB. |
 | **Trade & Logistics** | Extracts 55 types of trade forms (B/L, C/I, P/L, L/C, etc.) using SigLIP2 Vision + Qwen3.5 2B and builds a reference graph between documents. |
 
-All inference, embedding, and storage are performed **locally on the client**, with no external API calls. For non-Latin document languages, a **language-specialized Qwen3.5-4B engine from [alphaedge-ai](https://huggingface.co/alphaedge-ai)** is downloaded on demand, converted to a local Q4_K_M GGUF once, and routed into transliteration, synthesis, and field extraction steps when it is a better fit than the base models.
+All inference, embedding, and storage are performed **locally on the client**, with no external API calls. A **single multilingual Qwen3.5-4B engine (`Qwen/Qwen3.5-4B`)** is converted once in-process to Q4_K_M GGUF (with `Mapped` zero-VRAM input embeddings, Core-12/active-K vocab trimming, and 64-cluster lossless rescue guard) and routed into transliteration, synthesis, verification, and field extraction steps across all 12 core languages (including Arabic and Latin synthesis).
 
 ---
 
@@ -36,8 +36,8 @@ All inference, embedding, and storage are performed **locally on the client**, w
 - **List Extraction** — Boa engine DOM traversal → LLM field matching → mutually exclusive assignment (1:1) for column-value mapping.
 - **Detail Extraction** — Structural label-value pairs + field-by-field extraction using Qwen3 0.6B.
 - **Chunk Indexing** — Natural language segmentation → attribute tagging (PLINKO) → 384-dimensional tri-synthetic vectors → LanceDB `item_chunks`.
-- **Transliteration Aliases** — Additionally stores bidirectional transliteration vectors for multilingual cross-lingual search. Uses the AlphaEdge Qwen3.5-4B model of the document language when ready, otherwise Qwen3.5 2B + pronunciation gate.
-- **Language Routing** — Per-step router (`list_field / detail_field / list_synthesis / detail_synthesis`) decides between Qwen3 0.6B and the AlphaEdge 4B engine using script ratio, tokenizer fit, VRAM/RAM headroom, and observed pass rates.
+- **Transliteration Aliases** — Additionally stores bidirectional transliteration vectors for multilingual cross-lingual search. Uses the single Qwen3.5-4B engine when ready, otherwise Qwen3.5 2B + pronunciation gate (with one-time 4B cache upgrade).
+- **Language Routing** — Per-step router (`list_field / detail_field / list_synthesis / detail_synthesis / commerce_verify`) decides between Qwen3 0.6B and Qwen3.5-4B using `lang_spec`, script ratio, tokenizer fit, mapped-aware VRAM/RAM headroom, and engine-fingerprinted SDS pass rates.
 
 ### Trade & Logistics Pipeline
 - **Document Classification** — SigLIP2 patches × text anchor cosine → 2-depth judgment for groups (7 types) → codes (55 types).
@@ -99,7 +99,7 @@ cron-logis-center/
 │   │       ├── model.rs                # Model manager (ModelSize, residency budgets)
 │   │       ├── model/
 │   │       │   ├── lifecycle.rs        # Load/unload, VRAM crossover, lang_route()
-│   │       │   ├── lang_llm.rs         # AlphaEdge Qwen3.5-4B: language codes, download, routing
+│   │       │   ├── lang_llm.rs         # Single Qwen3.5-4B: lang_spec, download, engine_fp routing
 │   │       │   │                       # (lang_gguf: safetensors → Q4_K_M GGUF conversion, now in crates/logis-llm)
 │   │       │   ├── inference.rs        # Generation entry points
 │   │       │   ├── vision.rs           # Vision inference
@@ -114,7 +114,7 @@ cron-logis-center/
 │   │       ├── logic.rs / prompts.rs / js_templates.rs / parsers/  # re-exports of crates/logis-schema · logis-pug · logis-parsers
 │   │       ├── models/
 │   │       │   └── mod.rs              # re-exports crates/logis-llm models: common (GateUpDownMLP, Attention, GGUF), qwen (VL, KV
-│   │       │                           # offloading), qwen3 (0.6B), qwen3_5 (2B / AlphaEdge 4B), qwen3vl, qwen4_exp, granite, embedding,
+│   │       │                           # offloading), qwen3 (0.6B), qwen3_5 (2B / 4B), qwen3vl, qwen4_exp, embedding,
 │   │       │                           # vision_cache — and siglip2 from crates/logis-vision-doc
 │   │       └── utils/
 │   │           ├── parsing.rs / ai_utils.rs  # re-exports of crates/logis-pug + the helpers that need the embedding model
@@ -168,25 +168,22 @@ cron-logis-center/
 │   ├── config.json
 │   ├── tokenizer.json
 │   └── generation_config.json
-├── granite-embedding-97m-multilingual-r2/  # 384d Multilingual Embedding
+├── granite-embedding-97m-multilingual-r2/  # 384d Multilingual Embedding (mmap table + GPU fused SwiGLU)
 │   ├── model.safetensors
 │   ├── config.json
 │   └── tokenizer.json
-├── siglip2-so400m-patch16-naflex/   # Vision similarity encoder
+├── siglip2-so400m-patch16-naflex/   # Vision similarity encoder (mmap text table)
 │   ├── model.safetensors
 │   ├── config.json
 │   ├── preprocessor_config.json
 │   └── tokenizer.json
-├── granite-4.0-h-350m/             # Granite MoE (Optional)
-│   └── model.safetensors
-├── Qwen3.5-4B-{code}-16384/        # AlphaEdge language model (on demand, e.g. kor / jpn / zho / rus)
-│   ├── model.safetensors           # Original weights (~7.9GB, kept as-is)
+├── Qwen3.5-4B/                      # Single Qwen3.5-4B language engine (12 Core + Extended languages)
 │   ├── config.json
-│   ├── tokenizer.json              # 16,384-token language-specific vocab
-│   ├── tokenizer_config.json / chat_template.jinja / merges.txt / vocab.json
-│   └── runtime-q4km/               # Generated locally on first use
-│       ├── model-q4km.gguf         # Q4_K_M runtime weights
-│       └── READY                   # Conversion recipe key (re-converts if it changes)
+│   ├── tokenizer.json               # Full or Core-12 trimmed lossless BPE vocab (0 orphan tokens)
+│   ├── tokenizer_config.json / chat_template.jinja
+│   └── runtime-q4km/                # Generated locally once
+│       ├── model-q4km.gguf          # Q4_K_M runtime weights (Q8_0/Q6_K tied embeddings)
+│       └── READY.json               # Verified manifest (allows reclaiming BF16 shards via LOGIS_KEEP_SAFETENSORS=0)
 └── stanza/                          # NLP Pipeline (stanza-onnx-export format 2, 12 languages)
     ├── en/ de/ es/ fr/ it/ pt/ nl/ cs/ ar/ ko/ ja/ zh-hans/
     │   ├── vocab.json               # "format": 2, "files" lists every file below for this language
@@ -207,10 +204,10 @@ cron-logis-center/
 | Model | Size | Role | Inference Timing |
 |------|------|------|-----------|
 | **Qwen3 0.6B** | ~600MB (Q8) | List/detail field extraction, page classification, behavior structuring | Every task |
-| **Qwen3.5 2B** | ~2.1GB (Q8) | Precision extraction, transliteration fallback, document classification tie-breaks | As needed |
-| **AlphaEdge Qwen3.5-4B-{code}** | ~7.9GB download → Q4_K_M runtime | Language-specialized transliteration, list/detail synthesis and field extraction for non-Latin documents | On demand (routed) |
-| **granite-embedding-97m** | ~380MB | 384-dimensional multilingual embeddings (vector search) | Indexing/Search |
-| **SigLIP2** | ~2.2GB | Vision patch × text anchor cosine (Heatmap) | Trade documents |
+| **Qwen3.5 2B** | ~2.0GB (Q8 + mmap embed) | Precision extraction, transliteration fallback, document classification tie-breaks | As needed |
+| **Qwen3.5-4B (Single)** | ~2.3GB (Q4_K_M + mmap embed + active head) | Multilingual transliteration, synthesis, verification, and field extraction (12 Core + Extended languages) | On demand (routed) |
+| **granite-embedding-97m-r2** | ~75MB GPU (mmap table) | 384-dimensional multilingual dense + sparse MLM embeddings | Indexing/Search |
+| **SigLIP2** | ~1.0GB (mmap text table) | Vision patch × text anchor cosine (Heatmap) | Trade documents |
 | **Stanza** | 0.3–0.8GB/lang (CPU, ONNX Runtime) | Tokenization, MWT, POS, Lemma, Dependency syntax (12 languages) | Search query analysis (commerce · trade) |
 
 ### Inference Pipeline Flow
@@ -219,8 +216,8 @@ cron-logis-center/
 ```
 
 [Task Queue] → [Scheduler]
-├── Commerce: PUG conversion → Page classification → Field extraction → Synthesis → Translit → Chunk indexing
-│             (each LLM step: lang_route() → AlphaEdge 4B or Qwen3 0.6B / Qwen3.5 2B)
+├── Commerce: PUG conversion → Page classification → Field extraction → Synthesis → Translit → Chunk + Sparse indexing
+│             (each LLM step: lang_route() → Qwen3.5-4B or Qwen3 0.6B / Qwen3.5 2B)
 └── Trading:  PDF split → Document classification → Heatmap → Crop → Precision extraction → Grounding validation
 
 ```
@@ -250,17 +247,20 @@ cron-logis-center/
 
 ---
 
-## Language-Specialized Engine (AlphaEdge Qwen3.5-4B)
+## Language Engine (Single Qwen3.5-4B + Adaptive Vocab Trim)
 
-Base models (Qwen3 0.6B / Qwen3.5 2B) share a large multilingual vocabulary, so non-Latin text (Korean, Japanese, Thai, Cyrillic, Devanagari, …) is split into many tokens and transliteration quality drops. The project therefore uses **per-language Qwen3.5-4B models published by [alphaedge-ai](https://huggingface.co/alphaedge-ai)**, each with a compact **16,384-token vocabulary** tuned for one language.
+Rather than downloading separate per-language models (~7.9 GB each), Logis-Center uses a **single `Qwen/Qwen3.5-4B` model** converted once in-process to Q4_K_M GGUF, combined with:
+- **Zero-VRAM `Mapped` input embeddings** (`token_embd.weight` stays mmap-only; active head rows serve both embedding lookup and LM head),
+- **Document-scoped adaptive vocab trimming + 64-cluster lossless rescue guard** (`LOGIS_VOCAB_TRIM=full|compact|off`, `LOGIS_VOCAB_GUARD=clustered|single|off`, `LOGIS_VOCAB_ACTIVE_K`, `LOGIS_VOCAB_PLAN`, `LOGIS_LANG_VARIANT=full|core12`),
+- **Zero orphan BPE tokens & intact ASCII identifiers** across all 12 Core languages (`ko`, `en`, `ja`, `zh`, `fr`, `de`, `es`, `it`, `pt`, `nl`, `ar`, `cs`) + Extended fallback.
 
 | Item | Value | Code |
 |------|-------|------|
-| Repository | `alphaedge-ai/Qwen3.5-4B-{code}-16384` | `lang_llm::repo_id()` |
-| Language codes | 83 ISO 639-3 codes (`kor`, `jpn`, `zho`, `rus`, `tha`, `hin`, …); ISO 639-1 / locale tags are mapped automatically (`ko` → `kor`, `zh-hans` → `zho`) | `lang_llm::alphaedge_code()` |
-| Runtime format | safetensors → **Q4_K_M GGUF** (`runtime-q4km/model-q4km.gguf`), converted once in-process (no Python) | `lang_gguf::prepare()` |
-| Inference | Text-only, shares the Qwen3.5 runtime (`Qwen3_5GenerateModel::init_from_gguf`) with a no-think ChatML template | `lang_gguf::load_from()` |
-| Labels in logs | `[LANG-LLM]`, `[TRANSLIT ENGINE]`, `[LANG ROUTE]`, `[CROSSOVER]` | |
+| Repository | `Qwen/Qwen3.5-4B` (pinned rev) | `lang_llm::repo_id()` |
+| Language coverage | 12 Core languages (incl. `ar` & Latin synthesis) + Extended languages via `logis_pug::scripts::lang_spec` | `lang_llm::lang3_code()` |
+| Runtime format | safetensors → **Q4_K_M GGUF** (`runtime-q4km/model-q4km.gguf` + `READY.json`), optional shard reclamation via `LOGIS_KEEP_SAFETENSORS=0` | `lang_gguf::prepare()` |
+| Inference | Text-only, shares Qwen3.5 runtime (`Qwen3_5GenerateModel::init_from_gguf`) with lossless clustered CS guard & reflection audit | `lang_gguf::load_from()` |
+| Key env vars | `LOGIS_VOCAB_TRIM`, `LOGIS_VOCAB_GUARD`, `LOGIS_VOCAB_ACTIVE_K`, `LOGIS_VOCAB_PLAN`, `LOGIS_LANG_VARIANT`, `LOGIS_LANG4B_WAIT_SECS`, `LOGIS_KEEP_SAFETENSORS`, `LOGIS_LATIN_4B_ROUTE`, `LOGIS_EMBED_TABLE`, `LOGIS_SPARSE_MODE`, `LOGIS_REFLECTION_LOG` | `logis_llm::env_config` |
 
 ### Lifecycle
 
@@ -554,7 +554,7 @@ Debug builds (`tauri dev`, `cargo test`) embed `crates/logis-bias/src/bias.json`
 `crates/logis-bias/src/full_bias.json` (the same shared sections + every language section). Enable the `full-bias` Cargo feature to embed the full dictionary
 in a debug build. `tests/it/bias_source.rs` checks that the shared sections of the two files stay identical.
 
-AlphaEdge Qwen3.5-4B language models are **not** part of the initial download. They are fetched automatically in the background the first time a non-Latin document language needs them (about 7.9GB per language), then converted to `runtime-q4km/model-q4km.gguf`. To pre-install manually, download `alphaedge-ai/Qwen3.5-4B-{code}-16384` into `{AppData}/logis-center/models/Qwen3.5-4B-{code}-16384/`; the GGUF conversion runs on first use.
+`Qwen/Qwen3.5-4B` is fetched automatically in the background on demand, then converted once to `runtime-q4km/model-q4km.gguf` (`READY.json`). Tasks stay non-blocking on Qwen3.5 2B while downloading (`LOGIS_LANG4B_WAIT_SECS=0`) and upgrade cached transliterations once 4B is ready. Set `LOGIS_KEEP_SAFETENSORS=0` to reclaim the original BF16 shards after verified conversion.
 
 ---
 
@@ -568,9 +568,8 @@ Apache License 2.0
 | --- | --- | --- |
 | [Qwen/Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) | Multimodal | Apache-2.0 |
 | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Language Model | Apache-2.0 |
-| [alphaedge-ai/Qwen3.5-4B-{code}-16384](https://huggingface.co/alphaedge-ai) | Language-specialized Model (Qwen3.5-4B based) | See each model card (base model: Apache-2.0) |
-| [ibm-granite/granite-4.0-h-350m](https://huggingface.co/ibm-granite/granite-4.0-h-350m) | Language Model | Apache-2.0 |
-| [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) | Embedding | Apache-2.0 |
+| [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) | Language Engine (4B) | Apache-2.0 |
+| [ibm-granite/granite-embedding-97m-multilingual-r2](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2) | Embedding + Sparse MLM | Apache-2.0 |
 | [google/siglip2-so400m-patch16-naflex](https://huggingface.co/google/siglip2-so400m-patch16-naflex) | Vision Encoder | Apache-2.0 |
 | [stanfordnlp](https://huggingface.co/stanfordnlp) | NLP Model | Apache-2.0 |
 | [jhqxxx/aha](https://github.com/jhqxxx/aha) | Qwen Inference Engine | Apache-2.0 |

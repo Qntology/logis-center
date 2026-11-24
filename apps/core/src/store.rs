@@ -31,6 +31,7 @@ pub struct Task {
 pub struct VectorStore {
     conn: Connection,
     base_path: String,
+    sparse_index: Arc<std::sync::RwLock<logis_search::sparse::SparseIndex>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -249,7 +250,92 @@ where
 impl VectorStore {
     pub async fn new(base_path: &str) -> Result<Self> {
         let conn = connect(base_path).execute().await?;
-        Ok(Self { conn, base_path: base_path.to_string() })
+        let sparse_dir = std::path::Path::new(base_path).join("sparse_index");
+        let idx = logis_search::sparse::SparseIndex::open(&sparse_dir)
+            .unwrap_or_else(|_| logis_search::sparse::SparseIndex::new());
+        Ok(Self {
+            conn,
+            base_path: base_path.to_string(),
+            sparse_index: Arc::new(std::sync::RwLock::new(idx)),
+        })
+    }
+
+    fn sparse_dir(&self) -> std::path::PathBuf {
+        std::path::Path::new(&self.base_path).join("sparse_index")
+    }
+
+    /// Phase 4-2 D3: Rank items via Q8 sparse inverted index (`MaxScore` pruning).
+    /// Lazily hydrates from LanceDB `items` if index is empty on first search.
+    pub async fn rank_items_sparse(
+        &self,
+        query: &str,
+        limit: usize,
+        mode_filter: Option<&str>,
+        cc_filter: Option<&str>,
+        type_filter: Option<&[String]>,
+    ) -> Result<Vec<(String, String, f32)>> {
+        if query.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let empty = self
+            .sparse_index
+            .read()
+            .map(|g| g.active_doc_count() == 0)
+            .unwrap_or(true);
+        if empty {
+            if let Ok(rows) = self.get_all_items("items", 20_000, 0, None).await {
+                if !rows.is_empty() {
+                    if let Ok(mut g) = self.sparse_index.write() {
+                        for row in &rows {
+                            let val_txt = logis_search::fusion::value_text(&row.json_data);
+                            g.upsert_text(&row.id, &row.mode, &row.cc, &row.r#type, &val_txt);
+                        }
+                        let _ = g.save(&self.sparse_dir());
+                    }
+                }
+            }
+        }
+        let hits = self
+            .sparse_index
+            .read()
+            .map(|g| g.search_text(query, limit, mode_filter, cc_filter, type_filter))
+            .unwrap_or_default();
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Fetch JSON payloads for matched IDs in one batch
+        let mut out = Vec::with_capacity(hits.len());
+        let id_list = hits
+            .iter()
+            .map(|(id, _)| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut payload_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if let Ok(table) = self.conn.open_table("items").execute().await {
+            if let Ok(mut stream) = table
+                .query()
+                .only_if(format!("id IN ({id_list})"))
+                .limit(hits.len())
+                .execute()
+                .await
+            {
+                while let Ok(Some(batch)) = stream.try_next().await {
+                    let ids = batch.column_by_name("id").and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                    let datas = batch.column_by_name("data").and_then(|c| c.as_any().downcast_ref::<StringArray>());
+                    if let (Some(ids), Some(datas)) = (ids, datas) {
+                        for i in 0..batch.num_rows() {
+                            payload_map.insert(ids.value(i).to_string(), datas.value(i).to_string());
+                        }
+                    }
+                }
+            }
+        }
+        for (id, score) in hits {
+            if let Some(data) = payload_map.remove(&id) {
+                out.push((id, data, score));
+            }
+        }
+        Ok(out)
     }
 
     pub fn load_config(&self) -> AppConfig {
@@ -696,8 +782,12 @@ impl VectorStore {
         table.delete(&format!("id = '{}'", id)).await?;
         crate::utils::score_dynamics::presence_forget(id);
 
-        // 🌟 [PHASE D] 연관 청크 동시 삭제
+        // 🌟 [PHASE D] 연관 청크 동시 삭제 + Sparse 인덱스 tombstone
         let _ = self.delete_chunks_by_item(id).await;
+        if let Ok(mut g) = self.sparse_index.write() {
+            g.delete(id);
+            let _ = g.save(&self.sparse_dir());
+        }
 
         Ok(())
     }
@@ -713,9 +803,15 @@ impl VectorStore {
             crate::utils::score_dynamics::presence_forget(id);
         }
 
-        // 🌟 [PHASE D] 연관 청크 동시 삭제
+        // 🌟 [PHASE D] 연관 청크 동시 삭제 + Sparse 인덱스 tombstone
         for id in &ids {
             let _ = self.delete_chunks_by_item(id).await;
+        }
+        if let Ok(mut g) = self.sparse_index.write() {
+            for id in &ids {
+                g.delete(id);
+            }
+            let _ = g.save(&self.sparse_dir());
         }
 
         Ok(())
@@ -1434,6 +1530,14 @@ impl VectorStore {
         let final_data = Self::canonicalize_data(final_data, seed_defaults);
 
         let json_str = logis_schema::json_order::to_string_sorted(&final_data);
+        // Phase 4-2 D3: Keep sparse inverted index synchronized on item upsert.
+        if target == "items" {
+            let val_txt = logis_search::fusion::value_text(&json_str);
+            if let Ok(mut g) = self.sparse_index.write() {
+                g.upsert_text(&final_id, &mode_str, &env_cc, type_, &val_txt);
+                let _ = g.save(&self.sparse_dir());
+            }
+        }
         let text_content = final_data.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string();
         let masked_text_content = final_data.get("masked_text").and_then(|s| s.as_str()).unwrap_or(&text_content).to_string();
         let flag_str = final_data.get("flag").and_then(|v| v.as_str()).unwrap_or("").to_string();

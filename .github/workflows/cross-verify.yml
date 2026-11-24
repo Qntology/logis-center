@@ -109,8 +109,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { path: logis-center }
+      - name: resolve pinned candle-rocm-vulkan revision
+        id: pins
+        run: |
+          python3 logis-center/.github/scripts/verify-pins.py
+          REV="$(python3 logis-center/.github/scripts/verify-pins.py --print-candle-rev | tail -n 1)"
+          echo "candle_rev=$REV" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
-        with: { repository: sungu-che/candle-rocm-vulkan, ref: master, path: candle-rocm-vulkan, fetch-depth: 0 }
+        with: { repository: sungu-che/candle-rocm-vulkan, ref: "${{ steps.pins.outputs.candle_rev }}", path: candle-rocm-vulkan, fetch-depth: 0 }
       - name: environment report (runner, before setup)
         run: logis-center/.github/scripts/env-report.sh before-setup
       - name: apply fork patch series + path dependencies (job only)
@@ -314,13 +320,13 @@ jobs:
           notice_lines "suite result" "$RUNNER_TEMP/suite.log" '^test result'
       # The lib unit tests (src/**/mod tests of the app core apps/core and crates/logis-llm) are not in `--test it`. These need no GPU or model files:
       # vocab trim (row choice, per-flow language scopes, trimmed head = original rows), stable search ranking, store.
-      - name: "lib unit tests (vocab trim · stable search ranking · store)"
+      - name: "lib unit tests (logis-llm · logis-vision-doc · core)"
         if: matrix.name == 'linux-cpu' || matrix.name == 'windows-cpu'
         working-directory: logis-center/apps/desktop
         run: |
           . "$RUNNER_TEMP/annot.sh"; set +e; ort_path
           f="${{ matrix.features }}"
-          cargo test --lib -p logis-center -p logis-app -p logis-llm --no-default-features ${f:+--features $f} -- vocab_trim stable_rank store:: --test-threads 2 2>&1 | tee "$RUNNER_TEMP/lib.log" | tail -5
+          cargo test --lib -p logis-center -p logis-app -p logis-llm -p logis-vision-doc --no-default-features ${f:+--features $f} -- --test-threads 2 2>&1 | tee "$RUNNER_TEMP/lib.log" | tail -5
           rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { annot "$RUNNER_TEMP/lib.log"; exit 1; }
           notice_lines "lib unit tests" "$RUNNER_TEMP/lib.log" '^test result'
       # crates/logis-* : pure domain crates split out of the app (no Tauri, LanceDB, models or GPU).

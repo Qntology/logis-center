@@ -36,7 +36,116 @@ pub fn script_kind(c: char) -> Option<ScriptKind> {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LangTier {
+    /// Core 12 languages supported natively across bias, Stanza, vocab plans, and Core12 trimmed artifacts.
+    Core12,
+    /// Extended languages supported on full-vocab artifacts (fallback to Base2B on Core12-trimmed artifacts).
+    Extended,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LangSpec {
+    pub iso1: &'static str,
+    pub iso3: &'static str,
+    pub tier: LangTier,
+    pub scripts: &'static [ScriptKind],
+    pub latin_dominant: bool,
+}
+
+static LANG_SPECS: &[LangSpec] = &[
+    // Core 12
+    LangSpec { iso1: "ko", iso3: "kor", tier: LangTier::Core12, scripts: &[ScriptKind::Hangul], latin_dominant: false },
+    LangSpec { iso1: "en", iso3: "eng", tier: LangTier::Core12, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "ja", iso3: "jpn", tier: LangTier::Core12, scripts: &[ScriptKind::Kana, ScriptKind::Han], latin_dominant: false },
+    LangSpec { iso1: "zh", iso3: "zho", tier: LangTier::Core12, scripts: &[ScriptKind::Han], latin_dominant: false },
+    LangSpec { iso1: "fr", iso3: "fra", tier: LangTier::Core12, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "de", iso3: "deu", tier: LangTier::Core12, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "es", iso3: "spa", tier: LangTier::Core12, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "it", iso3: "ita", tier: LangTier::Core12, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "pt", iso3: "por", tier: LangTier::Core12, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "nl", iso3: "nld", tier: LangTier::Core12, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "ar", iso3: "ara", tier: LangTier::Core12, scripts: &[ScriptKind::Arabic], latin_dominant: false },
+    LangSpec { iso1: "cs", iso3: "ces", tier: LangTier::Core12, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    // Extended non-Latin & Latin
+    LangSpec { iso1: "ru", iso3: "rus", tier: LangTier::Extended, scripts: &[ScriptKind::Cyrillic], latin_dominant: false },
+    LangSpec { iso1: "uk", iso3: "ukr", tier: LangTier::Extended, scripts: &[ScriptKind::Cyrillic], latin_dominant: false },
+    LangSpec { iso1: "be", iso3: "bel", tier: LangTier::Extended, scripts: &[ScriptKind::Cyrillic], latin_dominant: false },
+    LangSpec { iso1: "bg", iso3: "bul", tier: LangTier::Extended, scripts: &[ScriptKind::Cyrillic], latin_dominant: false },
+    LangSpec { iso1: "sr", iso3: "srp", tier: LangTier::Extended, scripts: &[ScriptKind::Cyrillic, ScriptKind::Latin], latin_dominant: false },
+    LangSpec { iso1: "mk", iso3: "mkd", tier: LangTier::Extended, scripts: &[ScriptKind::Cyrillic], latin_dominant: false },
+    LangSpec { iso1: "kk", iso3: "kaz", tier: LangTier::Extended, scripts: &[ScriptKind::Cyrillic], latin_dominant: false },
+    LangSpec { iso1: "th", iso3: "tha", tier: LangTier::Extended, scripts: &[ScriptKind::Thai], latin_dominant: false },
+    LangSpec { iso1: "hi", iso3: "hin", tier: LangTier::Extended, scripts: &[ScriptKind::Devanagari], latin_dominant: false },
+    LangSpec { iso1: "mr", iso3: "mar", tier: LangTier::Extended, scripts: &[ScriptKind::Devanagari], latin_dominant: false },
+    LangSpec { iso1: "ne", iso3: "nep", tier: LangTier::Extended, scripts: &[ScriptKind::Devanagari], latin_dominant: false },
+    LangSpec { iso1: "bn", iso3: "ben", tier: LangTier::Extended, scripts: &[ScriptKind::Bengali], latin_dominant: false },
+    LangSpec { iso1: "el", iso3: "ell", tier: LangTier::Extended, scripts: &[ScriptKind::Greek], latin_dominant: false },
+    LangSpec { iso1: "he", iso3: "heb", tier: LangTier::Extended, scripts: &[ScriptKind::Hebrew], latin_dominant: false },
+    LangSpec { iso1: "fa", iso3: "fas", tier: LangTier::Extended, scripts: &[ScriptKind::Arabic], latin_dominant: false },
+    LangSpec { iso1: "ur", iso3: "urd", tier: LangTier::Extended, scripts: &[ScriptKind::Arabic], latin_dominant: false },
+    LangSpec { iso1: "vi", iso3: "vie", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "id", iso3: "ind", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "tr", iso3: "tur", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "pl", iso3: "pol", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "sk", iso3: "slk", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "sl", iso3: "slv", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "hr", iso3: "hrv", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "ro", iso3: "ron", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "hu", iso3: "hun", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "fi", iso3: "fin", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "sv", iso3: "swe", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "da", iso3: "dan", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "no", iso3: "nob", tier: LangTier::Extended, scripts: &[ScriptKind::Latin], latin_dominant: true },
+    LangSpec { iso1: "ta", iso3: "tam", tier: LangTier::Extended, scripts: &[ScriptKind::Other], latin_dominant: false },
+    LangSpec { iso1: "te", iso3: "tel", tier: LangTier::Extended, scripts: &[ScriptKind::Other], latin_dominant: false },
+];
+
+/// Static language specification lookup (replaces bias-derived script detection; fixes `ar` and `ru`/`th`/`hi`).
+pub fn lang_spec(doc_lang: &str) -> Option<&'static LangSpec> {
+    let lower = doc_lang.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let mapped = match lower.as_str() {
+        "korean" => "ko",
+        "english" => "en",
+        "japanese" => "ja",
+        "chinese" | "zh-cn" | "zh-tw" | "zh-hk" | "zh-hans" | "zh-hant" => "zh",
+        "french" => "fr",
+        "german" => "de",
+        "spanish" => "es",
+        "italian" => "it",
+        "portuguese" => "pt",
+        "dutch" => "nl",
+        "arabic" => "ar",
+        "czech" => "cs",
+        "russian" => "ru",
+        "ukrainian" => "uk",
+        "thai" => "th",
+        "hindi" => "hi",
+        "bengali" => "bn",
+        "greek" => "el",
+        "hebrew" | "iw" => "he",
+        "persian" | "farsi" => "fa",
+        "urdu" => "ur",
+        "vietnamese" => "vi",
+        "indonesian" => "id",
+        "turkish" => "tr",
+        "polish" => "pl",
+        "nb" | "nn" => "no",
+        other => other.split(|c: char| c == '-' || c == '_').next().unwrap_or(other),
+    };
+    LANG_SPECS
+        .iter()
+        .find(|s| s.iso1 == mapped || s.iso3 == mapped)
+}
+
 pub fn native_scripts(doc_lang: &str) -> std::collections::BTreeSet<ScriptKind> {
+    if let Some(spec) = lang_spec(doc_lang) {
+        return spec.scripts.iter().copied().collect();
+    }
     let sample = crate::nl_convert::native_script_sample(doc_lang, "", "");
     let mut set: std::collections::BTreeSet<ScriptKind> = sample.chars().filter_map(script_kind).collect();
     if set.contains(&ScriptKind::Kana) {

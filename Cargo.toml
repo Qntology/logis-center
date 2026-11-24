@@ -60,6 +60,7 @@ logis-app = { path = "apps/core" }
 # premium-discount 공용 라이브러리 (raon-zena 와 같은 리비전).
 # 로컬 ../premium-discount 로 같이 고칠 때는 아래 [patch."https://github.com/Qntology/premium-discount"] 의 주석을 푼다.
 premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "25497674a0b86756ba56a17d69a8c5173e95a6dd" }
+premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "25497674a0b86756ba56a17d69a8c5173e95a6dd" }
 premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "25497674a0b86756ba56a17d69a8c5173e95a6dd" }
 premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "25497674a0b86756ba56a17d69a8c5173e95a6dd" }
 # AI 엔진: Stanza (ONNX Runtime, 실행할 때 불러옴) · granite 임베딩 인코더 (candle). logis 쪽은 이 위의 얇은 층입니다.
@@ -85,11 +86,13 @@ candle-core = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "
 candle-nn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
 candle-flash-attn = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356" }
 
-# [patch."https://github.com/Qntology/premium-discount"]
-# premium-discount-identity = { path = "../premium-discount/crates/premium-discount-identity" }
-# premium-discount-sds = { path = "../premium-discount/crates/premium-discount-sds" }
-# premium-discount-quant = { path = "../premium-discount/crates/premium-discount-quant" }
-# premium-discount-nlp = { path = "../premium-discount/crates/premium-discount-nlp" }
+[patch."https://github.com/Qntology/premium-discount"]
+premium-discount-identity = { path = "../premium-discount/crates/premium-discount-identity" }
+premium-discount-manifest = { path = "../premium-discount/crates/premium-discount-manifest" }
+premium-discount-sds = { path = "../premium-discount/crates/premium-discount-sds" }
+premium-discount-quant = { path = "../premium-discount/crates/premium-discount-quant" }
+premium-discount-nlp = { path = "../premium-discount/crates/premium-discount-nlp" }
+premium-discount-nms = { path = "../premium-discount/crates/premium-discount-nms" }
 
 [profile.dev]
 opt-level = 0      # 기본값 0(최적화 없음). 무거운 crate 만 아래에서 3 으로 올린다.

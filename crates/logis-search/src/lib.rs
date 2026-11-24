@@ -9,3 +9,4 @@
 
 pub mod fusion;
 pub mod relation;
+pub mod sparse;

@@ -264,6 +264,17 @@ impl QuantizedLinear {
         Self { inner, bias }
     }
 
+    pub fn qtensor(&self) -> Option<&std::sync::Arc<QTensor>> {
+        match &self.inner {
+            QMatMul::QTensor(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
+    }
+
     pub fn inner_dequantize(&self) -> Result<Tensor> {
         Ok(self.inner.dequantize_f16()?)
     }
@@ -292,7 +303,16 @@ impl QuantizedLinear {
                 _ => false,
             }
         } else if t.device().is_rocm() {
-            matches!(xs.dtype(), DType::F16 | DType::BF16) && t.dtype() == GgmlDType::Q8_0
+            if !matches!(xs.dtype(), DType::F32 | DType::F16 | DType::BF16) {
+                return false;
+            }
+            match t.dtype() {
+                GgmlDType::Q8_0 => true,
+                GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K => {
+                    kquant_exact_enabled()
+                }
+                _ => false,
+            }
         } else {
             false
         }
