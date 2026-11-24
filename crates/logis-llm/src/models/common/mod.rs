@@ -1356,7 +1356,8 @@ impl QKNormAttention {
                 return Ok(attn_output.apply(&self.o_proj)?);
             }
             if !self.has_plain_kv() && self.has_turbo_kv() {
-                self.set_plain_kv(self.take_turbo_kv()?);
+                let kv = self.take_turbo_kv()?;
+                self.set_plain_kv(kv);
             }
         }
 

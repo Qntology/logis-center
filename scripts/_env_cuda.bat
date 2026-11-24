@@ -22,12 +22,10 @@ for %%P in (
     if not defined _VCVARS if exist %%~P set "_VCVARS=%%~P"
 )
 
-if not defined _VCVARS (
-    set "_VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-    if exist "%_VSWHERE%" (
-        for /f "usebackq delims=" %%I in (`"%_VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
-            if exist "%%I\VC\Auxiliary\Build\vcvars64.bat" set "_VCVARS=%%I\VC\Auxiliary\Build\vcvars64.bat"
-        )
+set "_VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not defined _VCVARS if exist "%_VSWHERE%" (
+    for /f "usebackq delims=" %%I in (`"%_VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+        if not defined _VCVARS if exist "%%I\VC\Auxiliary\Build\vcvars64.bat" set "_VCVARS=%%I\VC\Auxiliary\Build\vcvars64.bat"
     )
 )
 
@@ -40,7 +38,25 @@ call "%_VCVARS%" > nul
 if errorlevel 1 exit /b 1
 
 :have_msvc
+if defined NVCC_CCBIN if not exist "%NVCC_CCBIN%" set "NVCC_CCBIN="
 if not defined NVCC_CCBIN (
     for /f "delims=" %%C in ('where cl.exe 2^>nul') do if not defined NVCC_CCBIN set "NVCC_CCBIN=%%C"
 )
+
+where nvcc.exe >nul 2>&1
+if errorlevel 1 if defined CUDA_PATH if exist "%CUDA_PATH%\bin\nvcc.exe" (
+    set "PATH=%CUDA_PATH%\bin;%PATH%"
+)
+
+set "_DLLS_DIR=%~dp0..\apps\desktop\dlls"
+if not exist "%_DLLS_DIR%" mkdir "%_DLLS_DIR%"
+dir /b /a "%_DLLS_DIR%" 2>nul | findstr . >nul || type nul > "%_DLLS_DIR%\.gitkeep"
+set "_DLLS_DIR="
+
+set "PATH=%~dp0..\apps\desktop\dlls;%~dp0..\apps\desktop\microsoft.direct3d.directstorage.1.3.0\native\bin\x64;%PATH%"
+
+set "TAURI_APP_PATH=%~dp0..\apps\desktop"
+set "TAURI_FRONTEND_PATH=%~dp0..\web\desktop"
+set "TAURI_CLI=cargo tauri"
+if exist "%~dp0..\web\desktop\node_modules\.bin\tauri.cmd" set TAURI_CLI="%~dp0..\web\desktop\node_modules\.bin\tauri.cmd"
 exit /b 0

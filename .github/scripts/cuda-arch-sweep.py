@@ -70,8 +70,11 @@ def kernel_sources():
         for pkg in json.loads(r.stdout)["packages"]:
             if pkg["name"] == "candle-kernels":
                 return pkg["version"], pathlib.Path(pkg["manifest_path"]).parent
-    # last resort: the registry copy named in Cargo.lock
-    lock = pathlib.Path("Cargo.lock").read_text(encoding="utf-8", errors="replace")
+    # last resort: the registry copy named in Cargo.lock (workspace root or cwd)
+    lock_path = next((p for p in (pathlib.Path("Cargo.lock"), pathlib.Path("../../Cargo.lock")) if p.is_file()), None)
+    if lock_path is None:
+        die("Cargo.lock not found (cargo metadata failed)")
+    lock = lock_path.read_text(encoding="utf-8", errors="replace")
     m = re.search(r'name = "candle-kernels"\s*\nversion = "([^"]+)"', lock)
     if not m:
         die("candle-kernels is not in the dependency graph")

@@ -4,20 +4,38 @@ set "VS_SCRIPT="
 set "VS_ARGS="
 set "VS2022=%ProgramFiles%\Microsoft Visual Studio\2022"
 for %%E in (Community Professional Enterprise BuildTools) do call :probe_vs "%VS2022%\%%E"
+if not defined VS_SCRIPT call :probe_vs "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools"
 if not defined VS_SCRIPT call :probe_vswhere
 if not defined VS_SCRIPT (
     echo [MSVC] Visual Studio C++ Build Tools not found. Install the "Desktop development with C++" workload.
     exit /b 1
 )
-if not defined VCVARS_VER set "VCVARS_VER=14.44"
+set "_USER_VCVARS_VER=1"
+if not defined VCVARS_VER (
+    set "_USER_VCVARS_VER="
+    set "VCVARS_VER=14.44"
+)
 rem Per-call log folder: two consoles running this at once must not share one file.
 call :unique_tmp VCVARS_DIR
 set "VCVARS_LOG=%VCVARS_DIR%\vcvars_out.txt"
 call "%VS_SCRIPT%" %VS_ARGS% -vcvars_ver=%VCVARS_VER% > "%VCVARS_LOG%" 2>&1
+set "_VC_RC=%errorlevel%"
+if not "%_VC_RC%"=="0" if not defined _USER_VCVARS_VER (
+    echo [MSVC] default VCVARS_VER=%VCVARS_VER% unavailable; retrying with active VS toolset...
+    call "%VS_SCRIPT%" %VS_ARGS% > "%VCVARS_LOG%" 2>&1
+    set "_VC_RC=%errorlevel%"
+)
 echo [MSVC] requested=%VCVARS_VER% active=%VCToolsVersion%
 type "%VCVARS_LOG%"
 del "%VCVARS_LOG%" > nul 2>&1
 rmdir "%VCVARS_DIR%" > nul 2>&1
+set "_USER_VCVARS_VER="
+if not "%_VC_RC%"=="0" (
+    echo [MSVC] Failed to initialize Visual Studio environment ^(rc=%_VC_RC%^).
+    set "_VC_RC="
+    exit /b 1
+)
+set "_VC_RC="
 set "PYTHONIOENCODING=utf-8"
 
 rem ---------------------------------------------------------------------------------------------
@@ -83,7 +101,7 @@ echo        Set ROCM_VER, ROCM_PATH or ROCM_SEARCH_PATHS.
 exit /b 1
 
 :rocm_check
-if not exist "%ROCM_PATH%\bin\hipcc.exe" if not exist "%ROCM_PATH%\lib\llvm\bin\clang++.exe" (
+if not exist "%ROCM_PATH%\bin\hipcc.exe" if not exist "%ROCM_PATH%\lib\llvm\bin\clang++.exe" if not exist "%ROCM_PATH%\bin\clang++.exe" (
     echo [ROCm] HIP SDK %ROCM_VER% not found: %ROCM_PATH%
     echo        Installed versions:
     dir /b /ad "%ProgramFiles%\AMD\ROCm" 2>nul
@@ -100,10 +118,12 @@ set "PATH=%ROCM_PATH%\bin;%PATH%"
 if exist "%ROCM_PATH%\lib\llvm\bin" set "PATH=%PATH%;%ROCM_PATH%\lib\llvm\bin"
 echo [ROCm] %ROCM_TRACK% track: %ROCM_PATH% %ROCM_HIP_VER%
 
-if not exist "%~dp0..\apps\desktop\dlls" mkdir "%~dp0..\apps\desktop\dlls"
-if not exist "%~dp0..\apps\desktop\dlls\.gitkeep" type nul > "%~dp0..\apps\desktop\dlls\.gitkeep"
+set "_DLLS_DIR=%~dp0..\apps\desktop\dlls"
+if not exist "%_DLLS_DIR%" mkdir "%_DLLS_DIR%"
+dir /b /a "%_DLLS_DIR%" 2>nul | findstr . >nul || type nul > "%_DLLS_DIR%\.gitkeep"
+set "_DLLS_DIR="
 
-set "PATH=%~dp0..\apps\desktop\microsoft.direct3d.directstorage.1.3.0\native\bin\x64;%PATH%"
+set "PATH=%~dp0..\apps\desktop\dlls;%~dp0..\apps\desktop\microsoft.direct3d.directstorage.1.3.0\native\bin\x64;%PATH%"
 
 set "TAURI_APP_PATH=%~dp0..\apps\desktop"
 set "TAURI_FRONTEND_PATH=%~dp0..\web\desktop"

@@ -1,7 +1,11 @@
 
 import os
+import sys
 
-file_path = r'src-tauri/models/Qwen3VL-2B-Instruct-Q4_K_M.gguf'
+default_path = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "apps", "desktop", "models", "Qwen3VL-2B-Instruct-Q4_K_M.gguf")
+)
+file_path = sys.argv[1] if len(sys.argv) > 1 else default_path
 backup_path = file_path + '.bak'
 
 if not os.path.exists(file_path):
