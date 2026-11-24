@@ -72,8 +72,13 @@ exit /b 0
 
 rem ---------------------------------------------------------------------
 :stage_fork
+if not exist "%FORK%\Cargo.toml" (
+    echo [VERIFY] %time% fork: SKIP ^(not found: %FORK%^)
+    echo fork SKIP not found: %FORK% >> "%SUMMARY%"
+    exit /b 0
+)
 echo [VERIFY] %time% fork: candle-core / candle-nn ROCm tests...
-pushd "%FORK%"
+pushd "%FORK%" || exit /b 1
 cargo test -p candle-core --features rocm --no-fail-fast --test rocm_tests --test delta_rule_tests --test quantized_tests --test matmul_tests --test tensor_tests > "%LOGDIR%\03_fork_core_tests.log" 2>&1
 set "RC=%errorlevel%"
 call :record fork_core_tests %RC% 03_fork_core_tests.log

@@ -22,6 +22,10 @@ rem  app's model folder. DB and SDS ledgers start empty there, so the app's data
 rem =====================================================================
 setlocal
 chcp 65001 > nul
+if "%~1"=="" (
+    echo Usage: %~nx0 ^<name^> ^<plan^|census^|seedids^|embed^|gates^|names^|labels^|vision^> ...
+    exit /b 1
+)
 set "ROOT=%~dp0..\.."
 set "BACKEND=%LOGIS_EVAL_BACKEND%"
 if not defined BACKEND (
@@ -33,6 +37,9 @@ if not defined BACKEND (
 )
 if /i "%BACKEND%"=="cuda" (
     call "%ROOT%\scripts\_env_cuda.bat" > nul
+    if errorlevel 1 exit /b 1
+) else if /i "%BACKEND%"=="vulkan" (
+    call "%ROOT%\scripts\_env_vulkan.bat" > nul
     if errorlevel 1 exit /b 1
 ) else (
     call "%ROOT%\scripts\_env_rocm.bat" > nul

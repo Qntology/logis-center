@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# 리눅스에서 Rust 통합 테스트(app/tests/it, logis-app)와 프론트엔드 테스트(src/tests, vitest)를 실행합니다.
+# 리눅스에서 Rust 통합 테스트(apps/core/tests/it, logis-app)와 프론트엔드 테스트(web/desktop, vitest)를 실행합니다.
 #
-#   ./test_linux.sh [vulkan|cuda|rocm] [cargo test 추가 인자...]
-#   예) ./test_linux.sh vulkan                 # 기본 스위트
-#       ./test_linux.sh vulkan -- --ignored    # 알려진 버그(#[ignore = "BUG(..)"]) 재현
+#   ./scripts/test_linux.sh [vulkan|cuda|rocm] [cargo test 추가 인자...]
+#   예) ./scripts/test_linux.sh vulkan                 # 기본 스위트
+#       ./scripts/test_linux.sh vulkan -- --ignored    # 알려진 버그(#[ignore = "BUG(..)"]) 재현
 #
 # 필요 패키지(Ubuntu 24.04 기준):
 #   libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev
 #   protobuf-compiler clang libvulkan-dev mesa-vulkan-drivers
 # ONNX Runtime 을 직접 받아 둔 경우 ORT_LIB_LOCATION=<onnxruntime-linux-x64-1.28.0 경로> 를 지정하세요.
 set -euo pipefail
-cd "$(dirname "$0")"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
 
 BACKEND="${1:-vulkan}"
 [ $# -gt 0 ] && shift
@@ -33,13 +34,12 @@ if [ "$BACKEND" = vulkan ]; then export CANDLE_VULKAN_ALLOW_CPU="${CANDLE_VULKAN
 XDG_DATA_HOME="$(mktemp -d)"; export XDG_DATA_HOME
 trap 'rm -rf "$XDG_DATA_HOME"' EXIT
 
-# tauri::generate_context! 는 ../dist 가 있어야 컴파일됩니다 (프론트 빌드 전이면 빈 placeholder)
-[ -f dist/index.html ] || { mkdir -p dist; echo '<html></html>' > dist/index.html; }
+# tauri::generate_context! 는 ../../web/desktop/dist 가 있어야 컴파일됩니다 (프론트 빌드 전이면 빈 placeholder)
+[ -f web/desktop/dist/index.html ] || { mkdir -p web/desktop/dist; echo '<html></html>' > web/desktop/dist/index.html; }
 # tauri.conf.json 의 bundle.resources "dlls/*" 글롭이 최소 1개 파일과 매치되어야 합니다
-mkdir -p ../apps/desktop/dlls
-[ -n "$(ls -A ../apps/desktop/dlls)" ] || touch ../apps/desktop/dlls/.gitkeep
+mkdir -p apps/desktop/dlls
+[ -n "$(ls -A apps/desktop/dlls)" ] || touch apps/desktop/dlls/.gitkeep
 
-(cd ../apps/desktop && cargo test -p logis-center -p logis-app --test it "${FEATURE_ARGS[@]}" "$@")
+(cd apps/desktop && cargo test -p logis-center -p logis-app --test it "${FEATURE_ARGS[@]}" "$@")
 
-[ -d node_modules ] || npm install
-npm test
+(cd web/desktop && { [ -d node_modules ] || npm install; } && npm test)

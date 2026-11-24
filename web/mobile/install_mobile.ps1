@@ -1,4 +1,4 @@
-# ==========================================================================================
+﻿# ==========================================================================================
 # 안드로이드 하이브리드 빌드 및 자동 설정 스크립트
 # ==========================================================================================
 $ErrorActionPreference = "Continue" 
@@ -9,11 +9,16 @@ $projectRoot = (Resolve-Path "$PSScriptRoot\..\..").Path
 $mobilePath = "$projectRoot\web\mobile"
 $shellPath = "$projectRoot\apps\mobile"
 $appId = "com.logis.scanner.v111"
-$adbPath = "C:\Users\HP\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+$androidSdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } elseif ($env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT } else { "$env:LOCALAPPDATA\Android\Sdk" }
+$adbPath = "$androidSdk\platform-tools\adb.exe"
+
+# Tauri CLI 경로 환경 변수 (web/mobile 과 apps/mobile 이 분리된 구조)
+$env:TAURI_APP_PATH = $shellPath
+$env:TAURI_FRONTEND_PATH = $mobilePath
 
 # Node.js 경로 설정
 $env:PATH = "C:\Program Files\nodejs\;" + $env:PATH
-$env:PATH = "C:\Users\HP\AppData\Roaming\npm\;" + $env:PATH
+$env:PATH = "$env:APPDATA\npm\;" + $env:PATH
 
 # 0. 딥 클린 (Deep Clean) - 이전 빌드 결과물 삭제
 Write-Host "[0/5] 클린 작업 실행 중..." -ForegroundColor Yellow
@@ -26,9 +31,10 @@ if (Test-Path $distPath) { Remove-Item -Recurse -Force $distPath }
 if (Test-Path $androidAssetsPath) { Remove-Item -Recurse -Force $androidAssetsPath }
 
 # 0.1 안드로이드 SDK 경로 설정 (local.properties)
-if (!(Test-Path $localPropertiesPath)) {
+if ((Test-Path (Split-Path $localPropertiesPath)) -and !(Test-Path $localPropertiesPath)) {
     Write-Host "  - local.properties 복구 중..." -ForegroundColor Cyan
-    "sdk.dir=C\:/Users/HP/AppData/Local/Android/Sdk" | Out-File -FilePath $localPropertiesPath -Encoding ascii
+    $escapedSdk = $androidSdk.Replace('\', '/').Replace(':', '\:')
+    "sdk.dir=$escapedSdk" | Out-File -FilePath $localPropertiesPath -Encoding ascii
 }
 
 # 0.2 AndroidManifest.xml 권한 자동 복구 (카메라 권한 등)
@@ -60,8 +66,15 @@ npx tauri android build --debug
 Write-Host "[3/5] 자산 동기화 중..." -ForegroundColor Yellow
 $jniPath = "$shellPath\gen/android\app/src/main/jniLibs/arm64-v8a"
 if (!(Test-Path $jniPath)) { New-Item -ItemType Directory -Path $jniPath -Force | Out-Null }
-if (Test-Path "$shellPath\target\aarch64-linux-android\debug\libmobile_app_lib.so") {
-    Copy-Item -Force "$shellPath\target\aarch64-linux-android\debug\libmobile_app_lib.so" "$jniPath\libmobile_app_lib.so"
+$soCandidates = @(
+    "$projectRoot\target\aarch64-linux-android\debug\libmobile_app_lib.so",
+    "$shellPath\target\aarch64-linux-android\debug\libmobile_app_lib.so"
+)
+foreach ($so in $soCandidates) {
+    if (Test-Path $so) {
+        Copy-Item -Force $so "$jniPath\libmobile_app_lib.so"
+        break
+    }
 }
 
 if (!(Test-Path $androidAssetsPath)) { New-Item -ItemType Directory -Path $androidAssetsPath -Force | Out-Null }
