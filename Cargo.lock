@@ -7432,6 +7432,7 @@ dependencies = [
 [[package]]
 name = "onnxruntime"
 version = "0.0.14"
+source = "git+https://github.com/Qntology/premium-discount?rev=af95f0651bb25585d1cc6bbdd61e49e23bff3eeb#af95f0651bb25585d1cc6bbdd61e49e23bff3eeb"
 dependencies = [
  "lazy_static",
  "ndarray 0.15.6",
@@ -7443,6 +7444,7 @@ dependencies = [
 [[package]]
 name = "onnxruntime-sys"
 version = "0.0.14"
+source = "git+https://github.com/Qntology/premium-discount?rev=af95f0651bb25585d1cc6bbdd61e49e23bff3eeb#af95f0651bb25585d1cc6bbdd61e49e23bff3eeb"
 dependencies = [
  "flate2",
  "libloading 0.8.9",
@@ -7904,6 +7906,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 [[package]]
 name = "premium-discount-cpu-kernels"
 version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=af95f0651bb25585d1cc6bbdd61e49e23bff3eeb#af95f0651bb25585d1cc6bbdd61e49e23bff3eeb"
 dependencies = [
  "rayon",
 ]
@@ -7911,6 +7914,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-identity"
 version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=af95f0651bb25585d1cc6bbdd61e49e23bff3eeb#af95f0651bb25585d1cc6bbdd61e49e23bff3eeb"
 dependencies = [
  "getrandom 0.3.4",
  "hmac 0.12.1",
@@ -7924,6 +7928,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-manifest"
 version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=af95f0651bb25585d1cc6bbdd61e49e23bff3eeb#af95f0651bb25585d1cc6bbdd61e49e23bff3eeb"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -7931,6 +7936,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-nlp"
 version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=af95f0651bb25585d1cc6bbdd61e49e23bff3eeb#af95f0651bb25585d1cc6bbdd61e49e23bff3eeb"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -7951,6 +7957,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-quant"
 version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=af95f0651bb25585d1cc6bbdd61e49e23bff3eeb#af95f0651bb25585d1cc6bbdd61e49e23bff3eeb"
 dependencies = [
  "anyhow",
  "half",
@@ -7968,6 +7975,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-sds"
 version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=af95f0651bb25585d1cc6bbdd61e49e23bff3eeb#af95f0651bb25585d1cc6bbdd61e49e23bff3eeb"
 dependencies = [
  "anyhow",
  "serde",
@@ -12403,7 +12411,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "premium-discount-nms"
-version = "0.1.0"
