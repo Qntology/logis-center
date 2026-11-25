@@ -82,6 +82,7 @@ pub fn rocm_exit_now_if_used(code: u32) {
     #[cfg(all(windows, feature = "rocm"))]
     {
         use std::io::Write;
+        logis_schema::reflection::flush();
         if !ROCM_USED.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
@@ -192,6 +193,107 @@ mod wddm {
         unsafe { adapter.adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).ok()? };
         Some(info.Budget.saturating_sub(info.CurrentUsage))
     }
+
+    pub fn local_usage_and_budget(gpu_id: usize) -> Option<(u64, u64)> {
+        let mut g = ADAPTERS.lock().ok()?;
+        if g.is_none() {
+            *g = Some(find_amd_adapters());
+        }
+        let list = g.as_ref()?;
+        if list.is_empty() {
+            return None;
+        }
+        let adapter = if list.len() == 1 {
+            &list[0]
+        } else if let Ok((_, hip_total)) = candle_rocm::mem_info(gpu_id) {
+            let target = hip_total as u64;
+            list.iter()
+                .min_by_key(|a| a.dedicated_bytes.abs_diff(target))
+                .or_else(|| list.get(gpu_id))?
+        } else {
+            list.get(gpu_id)?
+        };
+        let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        unsafe { adapter.adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info).ok()? };
+        Some((info.CurrentUsage, info.Budget))
+    }
+}
+
+/// Process-isolated VRAM snapshot distinguishing shared effective free bytes from process resident bytes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeviceVramSnapshot {
+    pub driver_free_bytes: u64,
+    pub os_budget_free_bytes: u64,
+    pub pool_idle_bytes: u64,
+    pub proc_active_bytes: Option<u64>,
+    pub total_bytes: u64,
+}
+
+impl DeviceVramSnapshot {
+    #[inline]
+    pub fn effective_free_bytes(self) -> u64 {
+        let base_free = self.driver_free_bytes.min(self.os_budget_free_bytes);
+        base_free.saturating_add(self.pool_idle_bytes).min(self.total_bytes)
+    }
+
+    #[inline]
+    pub fn resident_used_bytes_for_load(self) -> u64 {
+        self.proc_active_bytes
+            .unwrap_or_else(|| self.total_bytes.saturating_sub(self.effective_free_bytes()))
+    }
+
+    #[inline]
+    pub fn resident_used_mb_f32(self) -> f32 {
+        (self.resident_used_bytes_for_load() as f64 / (1024.0 * 1024.0)) as f32
+    }
+}
+
+/// Query exact VRAM snapshot directly from `device` without touching unrelated GPU contexts.
+pub fn device_vram_snapshot(device: &Device) -> Option<DeviceVramSnapshot> {
+    if device.is_cpu() {
+        return None;
+    }
+    let (free_raw, total_raw) = device.mem_info().ok().flatten()?;
+    let driver_free_bytes = free_raw as u64;
+    let total_bytes = total_raw as u64;
+    let pool_idle_bytes = device.pool_idle_bytes().unwrap_or(0) as u64;
+
+    #[allow(unused_mut)]
+    let mut os_budget_free_bytes = driver_free_bytes;
+    #[allow(unused_mut)]
+    let mut proc_active_bytes = None;
+
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(d) = device {
+        if let Ok(Some(st)) = d.pool_stats() {
+            proc_active_bytes = Some(st.used);
+        }
+    }
+
+    #[cfg(all(windows, feature = "rocm"))]
+    if let Device::Rocm(d) = device {
+        let gpu_id = match device.location() {
+            candle_core::DeviceLocation::Rocm { gpu_id } => gpu_id,
+            _ => 0,
+        };
+        let _ = d;
+        static WDDM_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *WDDM_OFF.get_or_init(|| std::env::var("LOGIS_VRAM_WDDM").map(|v| v.trim() == "0").unwrap_or(false));
+        if !off {
+            if let Some((cur_usage, budget)) = wddm::local_usage_and_budget(gpu_id) {
+                os_budget_free_bytes = budget.saturating_sub(cur_usage);
+                proc_active_bytes = Some(cur_usage.saturating_sub(pool_idle_bytes));
+            }
+        }
+    }
+
+    Some(DeviceVramSnapshot {
+        driver_free_bytes,
+        os_budget_free_bytes,
+        pool_idle_bytes,
+        proc_active_bytes,
+        total_bytes,
+    })
 }
 
 /// ROCm(Windows) 의 드라이버 free 를 DXGI 예산으로 보정합니다(작은 쪽). 그 밖에는 그대로.
@@ -403,17 +505,33 @@ pub fn effective_free_vram_bytes(gpu_id: usize) -> Option<u64> {
     gpu_mem_info(gpu_id).map(|(free, _)| free)
 }
 
-/// 단계 사이(같은 작업 안) 퍼지에서 메모리 풀에 남겨 둘 양. 다음 단계가 드라이버를 거치지 않고 재사용합니다.
-/// `LOGIS_PHASE_POOL_KEEP_MB` 로 바꿀 수 있습니다(기본 256MB, 0 이면 매번 전부 반환).
+/// Default phase hot-pool retention in MiB scaled to total GPU VRAM (`<=6 GiB -> 64`, `<=10 GiB -> 128`, `>10 GiB -> 256`).
+pub fn default_pool_keep_mb_for_total(total_bytes: Option<u64>) -> usize {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    match total_bytes {
+        Some(t) if t <= 6 * GIB => 64,
+        Some(t) if t <= 10 * GIB => 128,
+        Some(_) => 256,
+        None => 128,
+    }
+}
+
+pub fn phase_pool_keep_bytes_for(dev: Option<&Device>) -> usize {
+    if let Ok(v) = std::env::var("LOGIS_PHASE_POOL_KEEP_MB") {
+        if let Ok(mb) = v.trim().parse::<usize>() {
+            return mb.min(2048) << 20;
+        }
+    }
+    let total = dev
+        .and_then(device_vram_snapshot)
+        .map(|s| s.total_bytes)
+        .or_else(|| crate::utils::resources::probe_runtime_device_summary().total_vram_bytes);
+    default_pool_keep_mb_for_total(total) << 20
+}
+
+/// 단계 사이(같은 작업 안) 퍼지에서 메모리 풀에 남겨 둘 양.
 pub fn phase_pool_keep_bytes() -> usize {
-    static KEEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *KEEP.get_or_init(|| {
-        std::env::var("LOGIS_PHASE_POOL_KEEP_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(256)
-            << 20
-    })
+    phase_pool_keep_bytes_for(None)
 }
 
 static DEFERRED_ERROR_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -522,32 +640,41 @@ pub fn legacy_working_set_trim() {
     }
 }
 
-pub fn trim_idle_gpu_pool(device: &Device) {
+/// Scoped GPU pool release:
+/// - `full_release == false` (`PurgeScope::Phase`): keep total-VRAM-scaled hot pool (`64/128/256 MiB`).
+/// - `full_release == true` (`PurgeScope::TaskEnd` / unload): trim pool to `0 B` (`unload_residual_mb <= 32 MB`).
+pub fn trim_gpu_pool_scoped(device: &Device, full_release: bool) {
+    let keep = if full_release { 0 } else { phase_pool_keep_bytes_for(Some(device)) };
+    let hysteresis = if full_release { 0 } else { (keep / 4).max(32 << 20) };
+    let trigger = keep.saturating_add(hysteresis);
     match device {
         #[cfg(feature = "vulkan")]
         Device::Vulkan(d) => {
-            if d.pooled_bytes() >= (64 << 20) {
+            if d.pooled_bytes() > trigger {
                 let _ = d.trim_memory_pool();
             }
         }
         #[cfg(feature = "rocm")]
         Device::Rocm(d) => {
-            // 256 MiB 핫 풀을 유지해 매 스텝 hipMallocAsync/hipFreeAsync 재할당 스톨을 방지합니다.
-            if d.pool_idle_bytes().unwrap_or(0) >= (320 << 20) {
-                let _ = d.trim_memory_pool_to(256 << 20);
+            if d.pool_idle_bytes().unwrap_or(0) > trigger {
+                let _ = d.trim_memory_pool_to(keep);
             }
         }
         #[cfg(feature = "cuda")]
         Device::Cuda(d) => {
-            // 256 MiB 핫 풀을 유지해 매 스텝 cuMemPoolTrimTo 스톨을 방지하면서 4~8 GiB VRAM 압박을 완화합니다.
-            if d.pool_idle_bytes().unwrap_or(0) >= (320 << 20) {
-                let _ = d.trim_memory_pool(256 << 20);
+            if d.pool_idle_bytes().unwrap_or(0) > trigger {
+                let _ = d.trim_memory_pool(keep);
             }
         }
         _ => {
-            let _ = device;
+            let _ = (device, trigger);
         }
     }
+}
+
+#[inline]
+pub fn trim_idle_gpu_pool(device: &Device) {
+    trim_gpu_pool_scoped(device, false);
 }
 
 pub fn get_gpu_device(id: usize) -> Device {

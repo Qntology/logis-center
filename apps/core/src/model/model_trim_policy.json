@@ -2,23 +2,32 @@
   "Qwen3-0.6B": {
     "policy": "StaticPlusRuntime",
     "static_k": 65536,
-    "runtime_k_ko": 10240,
+    "runtime_k_default": 10240,
+    "runtime_k_ko": 12288,
+    "runtime_k_cjk": 12288,
+    "runtime_k_all": 24576,
     "artifact_tier": "E3",
-    "runtime_tier": "E1"
+    "runtime_tier": "E2"
   },
   "Qwen3.5-2B": {
     "policy": "StaticPlusRuntime",
     "static_k": 65536,
-    "runtime_k_ko": 10240,
+    "runtime_k_default": 10240,
+    "runtime_k_ko": 12288,
+    "runtime_k_cjk": 12288,
+    "runtime_k_all": 24576,
     "artifact_tier": "E3",
-    "runtime_tier": "E1"
+    "runtime_tier": "E2"
   },
   "Qwen3.5-4B": {
     "policy": "StaticPlusRuntime",
     "static_k": 65536,
-    "runtime_k_ko": 10240,
+    "runtime_k_default": 10240,
+    "runtime_k_ko": 12288,
+    "runtime_k_cjk": 12288,
+    "runtime_k_all": 24576,
     "artifact_tier": "E3",
-    "runtime_tier": "E1"
+    "runtime_tier": "E2"
   },
   "granite-embedding-97m-multilingual-r2": {
     "policy": "StaticOnly",

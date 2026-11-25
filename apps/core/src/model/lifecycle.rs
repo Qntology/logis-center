@@ -119,16 +119,16 @@ impl LogisModel {
     async fn take_generation_slots(&self, tag: &str) {
         if let Some(mut g) = self.generator.lock().await.take() {
             println!("{} Dropping Qwen(0.6B) generator...", tag);
-            let _ = g.clear_kv_cache();
+            let _ = g.clear_all_caches();
             let _ = g.qwen.drop_kv_storage();
         }
         if let Some(mut g) = self.qwen3_generator.lock().await.take() {
             println!("{} Dropping Qwen3 generator...", tag);
-            g.clear_kv_cache();
+            g.clear_all_caches();
         }
         if let Some(mut g) = self.qwen3_5_generator.lock().await.take() {
             println!("{} Dropping Qwen3.5 generator (상주 층 포함)...", tag);
-            g.clear_kv_cache();
+            g.clear_all_caches();
             g.qwen3_5.language_model.release_resident_weights();
         }
         if let Some(mut g) = self.qwen4_exp_generator.lock().await.take() {
@@ -176,6 +176,7 @@ impl LogisModel {
     pub async fn end_task_cleanup(&self, reason: &str) {
         if purge_mode_legacy() || !task_end_release_enabled() {
             self.deep_purge_resources().await;
+            logis_schema::reflection::flush_and_sync();
             return;
         }
         println!("[TASK-END] 🧹 작업 종료 정리를 시작합니다. ({})", reason);
@@ -279,6 +280,7 @@ impl LogisModel {
         utils::release_heap();
         if self.is_cpu_mode || self.device_config.device.is_cpu() {
             println!("[VRAM-AUDIT] CPU 모드 | 지연 오류 누계 {}", utils::deferred_error_count());
+            logis_schema::reflection::flush_and_sync();
             return;
         }
         let dev = self.device_config.device.clone();
@@ -293,6 +295,7 @@ impl LogisModel {
             utils::deferred_error_count() + pending.is_some() as u64,
             pending.map(|e| format!(" | 방금 회수: {}", e)).unwrap_or_default()
         );
+        logis_schema::reflection::flush_and_sync();
     }
 
     /// [CLEANUP] 예전 퍼지 (LOGIS_PURGE_MODE=legacy)
@@ -1026,7 +1029,7 @@ impl LogisModel {
         let cancel_clone = cancel_token.clone();
         let prompt_string = prompt.to_string();
 
-        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let res = crate::utils::spawn_blocking_with_lang(move || -> anyhow::Result<String> {
             let mut gen_guard = gen_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
                 let params = crate::openai_types::ChatCompletionParameters {
@@ -1059,7 +1062,7 @@ impl LogisModel {
         let gen_arc = self.qwen3_generator.clone();
         let cancel_clone = cancel_token.clone();
         let prompt_string = prompt.to_string();
-        let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let res = crate::utils::spawn_blocking_with_lang(move || -> anyhow::Result<String> {
             let mut gen_guard = gen_arc.blocking_lock();
             if let Some(gen) = gen_guard.as_mut() {
                 let params = crate::openai_types::ChatCompletionParameters {
@@ -1371,7 +1374,7 @@ impl LogisModel {
         };
         // Phase 3-2 D2: Replace hardcoded 6 GB RAM blocker with `RAM_PRESSURE_MARGIN_BYTES` (1.5 GB) + VRAM + decode_resident_ratio check.
         const RAM_PRESSURE_MARGIN_BYTES: u64 = 1_500_000_000;
-        let decode_res_ratio = crate::utils::score_dynamics::adaptive_recent("qwen35.decode_resident_ratio")
+        let decode_res_ratio = crate::utils::score_dynamics::adaptive_recent("model.decode_resident_ratio.lang4b")
             .map(|(r, _, _)| r)
             .unwrap_or(1.0);
         if matches!(step, "list_field" | "detail_field")

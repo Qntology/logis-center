@@ -877,6 +877,7 @@ pub fn run() {
                 //    flush 는 dirty 일 때만 파일을 쓰므로 중복 호출이 무해합니다.
                 println!("[APP] {}", crate::utils::score_dynamics::report());
                 crate::utils::score_dynamics::flush();
+                logis_app::flush_reflection_logs();
                 // 1. 전역 브라우저 상태를 즉시 stopped으로 고정
                 if let Ok(mut state) = crate::CURRENT_BROWSER_STATE.write() {
                     *state = "stopped".to_string();

@@ -47,6 +47,7 @@ fn gpu() -> Option<Device> {
 }
 
 fn finish_gpu_test() {
+    logis_app::flush_reflection_logs();
     if std::env::var("LOGIS_TEST_FAST_EXIT").map(|v| v == "1").unwrap_or(false) {
         logis_app::utils::device_utils::rocm_exit_now_if_used(0);
     }
@@ -644,6 +645,7 @@ struct ArmBenchResult {
     fertility_tok_per_char: f64,
     orphan_bpe_tokens: usize,
     oracle_char_sim: f64,
+    per_lang_oracle_sim: std::collections::BTreeMap<String, f64>,
     identifier_exact_rate: f64,
     precision_score: f64,
     guard_rescue_rate: f64,
@@ -703,7 +705,7 @@ fn run_bench_arm(
         }
     }
 
-    let resident_model_mb = g.resident_vram_bytes() as f64 / 1e6;
+    let mut max_resident_model_mb = g.resident_vram_bytes() as f64 / 1e6;
     let post_warm_free = free_mb(dev);
     let mut min_free = post_warm_free;
 
@@ -729,6 +731,7 @@ fn run_bench_arm(
     for (pid, lang_hint, prompt) in &prompts {
         let _sc = DocLangScope::text(lang_hint, prompt);
         g.refresh_for(prompt)?;
+        max_resident_model_mb = max_resident_model_mb.max(g.resident_vram_bytes() as f64 / 1e6);
         active_k_sum += g.head_rows().unwrap_or(vocab_size);
         let ids = tok.encode(*prompt, false).map_err(anyhow::Error::msg)?.get_ids().to_vec();
         total_prompt_tokens += ids.len();
@@ -772,6 +775,7 @@ fn run_bench_arm(
         outputs.insert((*pid).to_string(), decoded);
     }
 
+    let resident_model_mb = max_resident_model_mb;
     let vram_delta_mb = (base_free - min_free).max(0.0);
     // Use resident_model_mb as exact weight+head footprint (and verify vram_delta_mb alongside it)
     let vram_mb = if resident_model_mb > 10.0 { resident_model_mb } else { vram_delta_mb };
@@ -797,6 +801,7 @@ fn run_bench_arm(
         fertility_tok_per_char: fertility,
         orphan_bpe_tokens,
         oracle_char_sim: 1.0,
+        per_lang_oracle_sim: std::collections::BTreeMap::new(),
         identifier_exact_rate: 1.0,
         precision_score: 1.0,
         guard_rescue_rate: cum_guard.rescue_rate(),
@@ -815,7 +820,9 @@ fn score_arm_vs_oracle(arm: &mut ArmBenchResult, oracle: &ArmBenchResult) {
         let b: Vec<char> = cand_out.chars().take(64).collect();
         let ed = edit_distance(&a, &b);
         let denom = a.len().max(b.len()).max(1);
-        sims.push((1.0 - ed as f64 / denom as f64).clamp(0.0, 1.0));
+        let sim = (1.0 - ed as f64 / denom as f64).clamp(0.0, 1.0);
+        arm.per_lang_oracle_sim.insert(k.clone(), sim);
+        sims.push(sim);
     }
     arm.oracle_char_sim = sims.iter().sum::<f64>() / sims.len().max(1) as f64;
 
@@ -860,7 +867,7 @@ fn alphaedge_head_to_head() -> R {
 
     let ours_trim = std::env::var("LOGIS_BENCH_OURS_TRIM").unwrap_or_else(|_| "compact".into());
     let ours_langs = std::env::var("LOGIS_BENCH_OURS_LANGS").unwrap_or_else(|_| "auto".into());
-    let ours_guard = std::env::var("LOGIS_BENCH_OURS_GUARD").unwrap_or_else(|_| "clustered".into());
+    let ours_guard = std::env::var("LOGIS_BENCH_OURS_GUARD").unwrap_or_else(|_| "off".into());
     let ours_active_k = std::env::var("LOGIS_BENCH_OURS_ACTIVE_K").ok();
     let ours_exec_mode = std::env::var("LOGIS_BENCH_OURS_EXEC_MODE").ok();
 

@@ -1666,7 +1666,7 @@ impl crate::model::LogisModel {
             let prompt = crate::parsing::extract_shipping_conditions(&query, language);
             let gen_arc = self.qwen3_generator.clone();
             let cancel_clone = cancel_token.clone();
-            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let res = crate::utils::spawn_blocking_with_lang(move || -> anyhow::Result<String> {
                 let mut gen_guard = gen_arc.blocking_lock();
                 if let Some(gen) = gen_guard.as_mut() {
                     let params = crate::openai_types::ChatCompletionParameters {

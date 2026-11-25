@@ -336,7 +336,12 @@ fn trimmed_head_lossless_cs_guard_and_shadow_top3() -> Result<()> {
     let map = Arc::new(unsafe { memmap2::Mmap::map(&std::fs::File::open(&path)?)? });
     let src = TableSource { map, start: 0, rows: vocab, cols, dtype: GgmlDType::Q8_0 };
 
-    let head = TrimmedHead::build(&src, Arc::new(kept.clone()), "test:en".into(), &dev)?;
+    let policy = logis_app::models::common::vocab_trim::GuardPolicyConfig::from_raw_vars(
+        Some("clustered"),
+        None,
+        Some("off"),
+    );
+    let head = TrimmedHead::build_with_policy(&src, Arc::new(kept.clone()), "test:en".into(), &dev, policy)?;
     let h_dev = Tensor::from_vec(h_data, (m, cols), &Device::Cpu)?.to_device(&dev)?;
 
     // Ground truth full-vocab Q8_0 argmax (computed on CPU from exact dequantized rows)

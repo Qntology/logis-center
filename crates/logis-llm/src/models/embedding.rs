@@ -630,6 +630,7 @@ impl EmbeddingModel {
         let tokenizer = shared_tokenizer(&tokenizer_path)?;
 
         let dtype = if device.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
+        let vram_snap_before = crate::utils::device_utils::device_vram_snapshot(device);
 
         let model = if weights_path.exists() {
              println!("[EmbeddingModel] Loading Safetensors model from {:?}", weights_path);
@@ -638,6 +639,8 @@ impl EmbeddingModel {
         } else {
             return Err(anyhow!("No valid model found (looked for model.safetensors)"));
         };
+        let _ = device.synchronize();
+        let vram_snap_after = crate::utils::device_utils::device_vram_snapshot(device);
         let (is_mapped, mapped_bytes) = match &model.body {
             Body::Exact(enc) => (enc.is_mapped(), enc.mapped_table_bytes()),
             Body::Legacy(_) => (false, 0),
@@ -673,8 +676,8 @@ impl EmbeddingModel {
                 },
                 load: Some(logis_schema::reflection::LoadReflection {
                     load_ms: t0.elapsed().as_secs_f32() * 1e3,
-                    vram_before_mb: 0.0,
-                    vram_after_mb: 0.0,
+                    vram_before_mb: vram_snap_before.map_or(0.0, |s| s.resident_used_mb_f32()),
+                    vram_after_mb: vram_snap_after.map_or(0.0, |s| s.resident_used_mb_f32()),
                     table_mode: if is_mapped { "mapped".into() } else { "resident".into() },
                     resident_table_mb: if is_mapped { 0.0 } else { (config.vocab_size * config.hidden_size * dtype.size_in_bytes()) as f32 / 1e6 },
                     mapped_table_mb: mapped_bytes as f32 / 1e6,

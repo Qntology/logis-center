@@ -25,16 +25,33 @@ pub enum EmbedTable {
     },
 }
 
+/// Host-side token ID bounds validation before device upload or embedding lookup.
+pub fn validate_host_token_ids(ids: &[u32], vocab_size: usize, slot: &str) -> Result<()> {
+    if let Some(&bad) = ids.iter().find(|&&id| (id as usize) >= vocab_size) {
+        return Err(anyhow!(
+            "[{slot}] token ID {bad} out of bounds for vocab size {vocab_size}"
+        ));
+    }
+    Ok(())
+}
+
+/// Deep copy a tensor onto `dev`. Uses `Tensor::copy` when source and destination share the same
+/// device because `Tensor::to_device` performs a shallow clone on same-device transfers.
+fn clone_tensor_to_device(t: &Tensor, dev: &Device) -> Result<Tensor> {
+    let c = t.contiguous()?;
+    if c.device().same_device(dev) {
+        Ok(c.copy()?)
+    } else {
+        Ok(c.to_device(dev)?)
+    }
+}
+
 impl EmbedTable {
     /// Bounds guard ensuring every token ID in `ids` is strictly `< vocab` (Phase 2-2 D3).
     pub fn validate_ids_slice(&self, ids: &[u32]) -> candle_core::Result<()> {
         let v = self.vocab()?;
-        if let Some(&bad) = ids.iter().find(|&&id| (id as usize) >= v) {
-            return Err(candle_core::Error::Msg(format!(
-                "EmbedTable token ID {bad} out of bounds for vocab size {v}"
-            )));
-        }
-        Ok(())
+        validate_host_token_ids(ids, v, "EmbedTable")
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))
     }
 
     /// Tensor-level bounds guard (checks `max_id < vocab`).
@@ -431,7 +448,7 @@ impl Qwen3_5GatedDeltaNet {
         let conv1d = get_conv1d(vb.pp("ssm_conv1d"), conv_dim, conv_dim, conv_kernel_size, 0, 1, 1, conv_dim, false)?;
         let dt_bias = vb.get(num_v_heads, "ssm_dt.bias")?;
         let a_log = vb.get(num_v_heads, "ssm_a")?;
-        let norm = Qwen3_5RMSNormGated::new(vb.pp("ssm_norm"), value_dim, layer_norm_epsilon)?;
+        let norm = Qwen3_5RMSNormGated::new(vb.pp("ssm_norm"), head_v_dim, layer_norm_epsilon)?;
 
         let out_proj = linear_no_bias(value_dim, hidden_size, vb.pp("out_proj"))?;
         let in_proj_qkv = linear_no_bias(hidden_size, conv_dim, vb.pp("in_proj_qkv"))?;
@@ -845,15 +862,7 @@ impl Qwen3_5GatedDeltaNet {
         } else {
             let take_len = self.conv_kernel_size - 1;
             let (bs, dim, seq_len) = mixed_qkv.dims3()?;
-            
-            // 🌟 [GDN-02] narrow 뷰를 그대로 두면 [B,C,T] 프리필 버퍼 전체가 상태로 살아남아(RAM 대피 시 통째로 복사)
-            //    마지막 K-1 열만 연속 복사합니다. 값은 비트 단위로 같습니다.
-            let next_conv_state = if seq_len >= take_len {
-                mixed_qkv.narrow(D::Minus1, seq_len - take_len, take_len)?.contiguous()?
-            } else {
-                mixed_qkv.pad_with_zeros(D::Minus1, take_len - seq_len, 0)?
-            };
-            
+
             let prev_causal = if let Some(prev_state) = &self.conv_state_cache {
                 let prev_len = prev_state.dim(D::Minus1)?;
                 if prev_len >= take_len {
@@ -864,10 +873,18 @@ impl Qwen3_5GatedDeltaNet {
             } else {
                 Tensor::zeros((bs, dim, take_len), mixed_qkv.dtype(), mixed_qkv.device())?
             };
-            
-            mixed_qkv = Tensor::cat(&[&prev_causal, &mixed_qkv], D::Minus1)?;
+
+            let cat_u = Tensor::cat(&[&prev_causal, &mixed_qkv], D::Minus1)?;
+            let cat_len = cat_u.dim(D::Minus1)?;
+            // 🌟 [GDN-02] narrow 뷰를 그대로 두면 [B,C,T] 프리필 버퍼 전체가 상태로 살아남아(RAM 대피 시 통째로 복사)
+            //    마지막 K-1 열만 연속 복사합니다. prev_causal + mixed_qkv 연결 뒤 잘라 suffix seq_len < K-1 이어도 앞 문맥을 유지합니다.
+            let next_conv_state = if cat_len >= take_len {
+                cat_u.narrow(D::Minus1, cat_len - take_len, take_len)?.contiguous()?
+            } else {
+                cat_u.pad_with_zeros(D::Minus1, take_len - cat_len, 0)?
+            };
             self.conv_state_cache = Some(next_conv_state);
-            mixed_qkv = conv1d_depthwise(&mixed_qkv, self.conv1d.weight(), self.conv1d.bias())?;
+            mixed_qkv = conv1d_depthwise(&cat_u, self.conv1d.weight(), self.conv1d.bias())?;
             
             let out_len = mixed_qkv.dim(D::Minus1)?;
             mixed_qkv = if out_len > seq_len {
@@ -1013,6 +1030,36 @@ impl Qwen3_5GatedDeltaNet {
         self.conv_state_cache = conv;
         self.recurrent_state_cache = recurrent;
         self.is_state_dirty = false; 
+    }
+
+    pub fn capture_state(&self, target_dev: &Device) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        let conv = match &self.conv_state_cache {
+            Some(t) => Some(clone_tensor_to_device(t, target_dev)?),
+            None => None,
+        };
+        let rec = match &self.recurrent_state_cache {
+            Some(t) => Some(clone_tensor_to_device(t, target_dev)?),
+            None => None,
+        };
+        Ok((conv, rec))
+    }
+
+    pub fn restore_state_cow(
+        &mut self,
+        conv: Option<&Tensor>,
+        recurrent: Option<&Tensor>,
+        compute_dev: &Device,
+    ) -> Result<()> {
+        self.conv_state_cache = match conv {
+            Some(t) => Some(clone_tensor_to_device(t, compute_dev)?),
+            None => None,
+        };
+        self.recurrent_state_cache = match recurrent {
+            Some(t) => Some(clone_tensor_to_device(t, compute_dev)?),
+            None => None,
+        };
+        self.is_state_dirty = false;
+        Ok(())
     }
 
     pub fn clear_weights(&mut self) {
@@ -1936,6 +1983,81 @@ impl Qwen3_5Attention {
         self.prefetched_block = None;
     }
 
+    pub fn capture_kv_prefix(&self, target_dev: &Device) -> Result<Option<FullAttnKvSnapshot>> {
+        let mut blocks = Vec::with_capacity(self.kv_blocks.len());
+        let mut all_tq = !self.kv_blocks.is_empty();
+        let mut all_fp8 = !self.kv_blocks.is_empty();
+        for block in &self.kv_blocks {
+            let inner = block.inner.read().unwrap();
+            if inner.location != KVLocation::VRAM {
+                return Ok(None);
+            }
+            let (Some(k), Some(v)) = (&inner.k_cache, &inner.v_cache) else {
+                return Ok(None);
+            };
+            if inner.tq.is_none() {
+                all_tq = false;
+            }
+            if inner.tq.is_some() || k.dtype() != DType::F8E4M3 {
+                all_fp8 = false;
+            }
+            blocks.push(SavedKvBlock {
+                index: inner.index,
+                len: inner.len,
+                offset: inner.offset,
+                kv_exact: self.kv_exact,
+                kv_half: self.kv_half,
+                k: clone_tensor_to_device(k, target_dev)?,
+                v: clone_tensor_to_device(v, target_dev)?,
+                tq: inner.tq,
+            });
+        }
+        Ok(Some(if all_tq {
+            FullAttnKvSnapshot::TurboRaw(blocks)
+        } else if all_fp8 {
+            FullAttnKvSnapshot::Fp8Blocks(blocks)
+        } else {
+            FullAttnKvSnapshot::DenseBlocks(blocks)
+        }))
+    }
+
+    pub fn restore_kv_prefix_cow(&mut self, snap: &FullAttnKvSnapshot, compute_dev: &Device) -> Result<usize> {
+        let blocks = match snap {
+            FullAttnKvSnapshot::DenseBlocks(b)
+            | FullAttnKvSnapshot::Fp8Blocks(b)
+            | FullAttnKvSnapshot::TurboRaw(b) => b,
+        };
+        self.kv_blocks.clear();
+        self.prefetched_block = None;
+        let mut restored_tokens = 0usize;
+        for b in blocks {
+            let block = KVBlock::new(KVLocation::VRAM, b.index, b.len, b.offset);
+            {
+                let mut inner = block.inner.write().unwrap();
+                inner.k_cache = Some(clone_tensor_to_device(&b.k, compute_dev)?);
+                inner.v_cache = Some(clone_tensor_to_device(&b.v, compute_dev)?);
+                inner.tq = b.tq;
+            }
+            if let Ok(mut reg) = self.registry.entries.write() {
+                if b.index < reg.len() {
+                    reg[b.index].token_start = b.offset;
+                    reg[b.index].token_len = b.len;
+                    if self.layer_idx < reg[b.index].is_dirty.len() {
+                        reg[b.index].is_dirty[self.layer_idx] = true;
+                    }
+                    if self.layer_idx < reg[b.index].location.len() {
+                        reg[b.index].location[self.layer_idx] = KVLocation::VRAM;
+                    }
+                }
+            }
+            self.kv_exact = b.kv_exact;
+            self.kv_half = b.kv_half;
+            restored_tokens += b.len;
+            self.kv_blocks.push(block);
+        }
+        Ok(restored_tokens)
+    }
+
     
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
         let mut _current_total = 0;
@@ -2057,6 +2179,39 @@ impl AttnKind {
     pub fn set_kv_residency(&mut self, residency: crate::utils::resources::KvResidency) {
         if let AttnKind::SelfAttn(attn) = self {
             attn.kv_residency = residency;
+        }
+    }
+
+    pub fn capture_hybrid_state(&self, target_dev: &Device) -> Result<Option<HybridLayerState>> {
+        match self {
+            AttnKind::LinearAttn(attn) => {
+                let (conv_state, recurrent_state) = attn.capture_state(target_dev)?;
+                Ok(Some(HybridLayerState::Linear {
+                    conv_state,
+                    recurrent_state,
+                }))
+            }
+            AttnKind::SelfAttn(attn) => match attn.capture_kv_prefix(target_dev)? {
+                Some(kv) => Ok(Some(HybridLayerState::Full(kv))),
+                None => Ok(None),
+            },
+        }
+    }
+
+    pub fn restore_hybrid_state_cow(&mut self, state: &HybridLayerState, compute_dev: &Device) -> Result<()> {
+        match (self, state) {
+            (
+                AttnKind::LinearAttn(attn),
+                HybridLayerState::Linear {
+                    conv_state,
+                    recurrent_state,
+                },
+            ) => attn.restore_state_cow(conv_state.as_ref(), recurrent_state.as_ref(), compute_dev),
+            (AttnKind::SelfAttn(attn), HybridLayerState::Full(kv)) => {
+                attn.restore_kv_prefix_cow(kv, compute_dev)?;
+                Ok(())
+            }
+            _ => Err(anyhow!("HybridLayerState variant mismatch during restore")),
         }
     }
 }
@@ -2264,6 +2419,14 @@ impl Qwen3_5DecoderLayer {
         self.attn.set_kv_residency(residency);
     }
 
+    pub fn capture_hybrid_state(&self, target_dev: &Device) -> Result<Option<HybridLayerState>> {
+        self.attn.capture_hybrid_state(target_dev)
+    }
+
+    pub fn restore_hybrid_state_cow(&mut self, state: &HybridLayerState, compute_dev: &Device) -> Result<()> {
+        self.attn.restore_hybrid_state_cow(state, compute_dev)
+    }
+
     pub fn clear_cache(&mut self) {
         match &mut self.attn {
             AttnKind::LinearAttn(attn) => { attn.clear_cache(); }
@@ -2351,12 +2514,12 @@ pub fn weight_resident_margin_bytes() -> u64 {
 
 /// 🌟 [WEIGHT-RESIDENT] `weight_bytes` 는 층 가중치 전체, `missing_bytes` 는 그중 아직 VRAM 에 없는(새로 읽어야 하는) 양입니다.
 /// 이미 올라와 있는 층은 VRAM free 에서 빠져 있으므로 다시 요구하지 않습니다.
-fn decode_resident_gate(on_cuda: bool, weight_bytes: u64, missing_bytes: u64, kv_bytes: u64) -> (bool, Option<u64>) {
-    if !on_cuda {
+fn decode_resident_gate(dev: &Device, weight_bytes: u64, missing_bytes: u64, kv_bytes: u64) -> (bool, Option<u64>) {
+    if !dev.is_cuda_or_rocm() {
         return ((crate::utils::resources::free_ram_bytes() as u64) > 6_000_000_000, None);
     }
-    let free = crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize)
-        .map(|(free, _)| free);
+    let free = crate::utils::device_utils::device_vram_snapshot(dev)
+        .map(|s| s.effective_free_bytes());
     let margin = weight_resident_margin_bytes();
     match free {
         Some(f) => (
@@ -2712,7 +2875,8 @@ impl Qwen3_5TextModel {
                 // 🌟 [SSM-RESIDENT] GDN 상태는 프리필에서 이미 VRAM 에 있습니다. KV 계층과 무관하게 그대로 두고,
                 //    디코딩 순간치조차 못 남길 만큼 VRAM 이 모자랄 때만 CPU 로 내립니다.
                 if !ssm_follows_kv_plan() && xs.device().is_cuda_or_rocm() {
-                    let free = crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize).map(|(f, _)| f);
+                    let free = crate::utils::device_utils::device_vram_snapshot(xs.device())
+                        .map(|s| s.effective_free_bytes());
                     let keep_ssm = free.map_or(true, |f| f >= crate::utils::resources::KV_VRAM_MARGIN_MIN_BYTES);
                     if self.mem.ssm_in_vram != Some(keep_ssm) {
                         println!(
@@ -2738,7 +2902,7 @@ impl Qwen3_5TextModel {
                 let missing_bytes = self.missing_layer_bytes();
                 let res_margin = weight_resident_margin_bytes();
                 let (mut keep, vram_free) =
-                    decode_resident_gate(xs.device().is_cuda_or_rocm(), weight_bytes, missing_bytes, kv_bytes);
+                    decode_resident_gate(xs.device(), weight_bytes, missing_bytes, kv_bytes);
                 let (mut prefix, _prefix_load_bytes) = match vram_free {
                     Some(free) if !keep => self.decode_resident_prefix(
                         free.saturating_sub(kv_bytes + res_margin + self.max_layer_bytes()),
@@ -2974,7 +3138,7 @@ impl Qwen3_5TextModel {
                 layer.set_ssm_dirty(is_dirty_backup); 
             }
             // [DECODE-RESIDENT] 디코딩 시 매 토큰 mmap→heap 가중치 복사(레이어 수 × 토큰 수)를 제거합니다.
-            if !keep_resident && l_idx >= resident_prefix {
+            if self.ct.is_some() && self.mmap.is_some() && !keep_resident && l_idx >= resident_prefix {
                 layer.clear_weights();
             }
 
@@ -3372,7 +3536,7 @@ impl Qwen3_5TextModel {
         // 🌟 [KV-REGISTRY] 이전 문맥의 RAM 사본·SSD 경로가 다음 문맥에 섞이지 않게 장부도 비웁니다.
         self.reset_registry_runtime();
         let keep_warm = was_resident && self.keep_warm_ok();
-        if was_resident && !keep_warm {
+        if self.ct.is_some() && self.mmap.is_some() && was_resident && !keep_warm {
             for layer in self.layers.iter_mut() {
                 layer.clear_weights();
             }
@@ -3490,8 +3654,8 @@ impl Qwen3_5TextModel {
             return None;
         }
         let _ = dev.synchronize();
-        let gpu = crate::utils::resources::primary_gpu_id() as usize;
-        let free = crate::utils::gpu_mem_info(gpu).map(|(f, _)| f)?;
+        let free = crate::utils::device_utils::device_vram_snapshot(dev)
+            .map(|s| s.effective_free_bytes())?;
         let resident = self.resident_layer_bytes();
         if resident > 0 && free < need + RESIDENT_MIN_RESERVE_BYTES {
             let held = self.layers.iter().filter(|l| !l.is_cleared()).count();
@@ -3501,7 +3665,8 @@ impl Qwen3_5TextModel {
             self.keep_weights_resident = false;
             self.resident_prefix = 0;
             let _ = dev.synchronize();
-            let after = crate::utils::gpu_mem_info(gpu).map(|(f, _)| f);
+            let after = crate::utils::device_utils::device_vram_snapshot(dev)
+                .map(|s| s.effective_free_bytes());
             println!(
                 "[WEIGHT-RESIDENT] VRAM free {:.0} MB 가 필요량 {:.0} MB + 여유 {:.0} MB 보다 작아 상주하던 층 {}개 {:.0} MB 를 내려놓습니다 → free {:.0} MB (이번 계산은 층을 읽고 바로 비우는 경로부터 다시 판정합니다)",
                 free as f64 / 1e6,
@@ -3631,8 +3796,11 @@ impl Qwen3_5TextModel {
         if self.dtype == DType::F32 && dev.is_cuda_or_rocm() {
             let half_bytes = exact_bytes / 2;
             let half_fits = || {
-                crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize)
-                    .map(|(f, _)| (f >= half_bytes + margin + reserve, f))
+                crate::utils::device_utils::device_vram_snapshot(dev)
+                    .map(|s| {
+                        let f = s.effective_free_bytes();
+                        (f >= half_bytes + margin + reserve, f)
+                    })
             };
             match kvt::kv_half_mode() {
                 KvHalfMode::Off => {}
@@ -3698,8 +3866,8 @@ impl Qwen3_5TextModel {
         }
         let _ = dev.synchronize();
         let res_margin = weight_resident_margin_bytes();
-        match crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize) {
-            Some((free, _)) => free >= res_margin,
+        match crate::utils::device_utils::device_vram_snapshot(&dev) {
+            Some(s) => s.effective_free_bytes() >= res_margin,
             None => false,
         }
     }
@@ -4097,6 +4265,110 @@ impl Qwen3_5TextModel {
 /// 기본값 false = 기존 동작 (앱 코드는 이 값을 바꾸지 않습니다).
 pub static IGNORE_STOP_SIGNAL_FOR_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Minimum prefix tokens required before capturing a reusable hybrid prompt snapshot.
+pub const MIN_PREFIX_SNAPSHOT_TOKENS: usize = 64;
+/// Minimum free VRAM required to hold the active GPU prefix snapshot without inducing KV offloading.
+pub const HYBRID_SNAPSHOT_VRAM_MIN_FREE_BYTES: u64 = 192 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAccessMode {
+    ReadWrite,
+    ReadOnly,
+}
+
+#[derive(Clone)]
+pub struct SavedKvBlock {
+    pub index: usize,
+    pub len: usize,
+    pub offset: usize,
+    pub kv_exact: bool,
+    pub kv_half: bool,
+    pub k: Tensor,
+    pub v: Tensor,
+    pub tq: Option<crate::models::common::kv_turbo::TqMeta>,
+}
+
+#[derive(Clone)]
+pub enum FullAttnKvSnapshot {
+    DenseBlocks(Vec<SavedKvBlock>),
+    Fp8Blocks(Vec<SavedKvBlock>),
+    TurboRaw(Vec<SavedKvBlock>),
+}
+
+#[derive(Clone)]
+pub enum HybridLayerState {
+    Linear {
+        conv_state: Option<Tensor>,
+        recurrent_state: Option<Tensor>,
+    },
+    Full(FullAttnKvSnapshot),
+}
+
+#[derive(Clone)]
+pub struct HybridPromptSnapshot {
+    pub tokens: Vec<u32>,
+    pub layers: Vec<HybridLayerState>,
+    pub last_hidden: Tensor,
+    pub rope_deltas_cpu: Option<Vec<i64>>,
+    pub kv_exact: bool,
+    pub kv_half: bool,
+    pub on_vram: bool,
+}
+
+#[derive(Default)]
+pub struct HybridSnapshotCache {
+    pub system_host_slot: Option<HybridPromptSnapshot>,
+    pub active_vram_slot: Option<HybridPromptSnapshot>,
+    pub prev_prompt_tokens: Vec<u32>,
+}
+
+impl HybridSnapshotCache {
+    pub fn longest_prefix_match(a: &[u32], b: &[u32]) -> usize {
+        a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+    }
+
+    pub fn lookup_best(&self, tokens: &[u32]) -> Option<(&HybridPromptSnapshot, usize)> {
+        let mut best: Option<(&HybridPromptSnapshot, usize, bool)> = None;
+        for cand in [self.active_vram_slot.as_ref(), self.system_host_slot.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let clen = cand.tokens.len();
+            if clen < MIN_PREFIX_SNAPSHOT_TOKENS || clen > tokens.len() {
+                continue;
+            }
+            if &tokens[..clen] == cand.tokens.as_slice() {
+                let replace = match best {
+                    None => true,
+                    Some((_, best_len, best_vram)) => {
+                        clen > best_len || (clen == best_len && cand.on_vram && !best_vram)
+                    }
+                };
+                if replace {
+                    best = Some((cand, clen, cand.on_vram));
+                }
+            }
+        }
+        best.map(|(snap, len, _)| (snap, len))
+    }
+
+    pub fn store_system_host(&mut self, mut snap: HybridPromptSnapshot) {
+        snap.on_vram = false;
+        self.system_host_slot = Some(snap);
+    }
+
+    pub fn store_active(&mut self, snap: HybridPromptSnapshot) {
+        self.prev_prompt_tokens = snap.tokens.clone();
+        self.active_vram_slot = Some(snap);
+    }
+
+    pub fn clear(&mut self) {
+        self.system_host_slot = None;
+        self.active_vram_slot = None;
+        self.prev_prompt_tokens.clear();
+    }
+}
+
 // ----------------------------------------------------------------------------------
 // [Qwen3_5Model] 최상위 모델 구조 수정 및 인자 전달
 // ----------------------------------------------------------------------------------
@@ -4142,7 +4414,7 @@ impl Qwen3_5Model {
             image_token_id: config.image_token_id,
             video_token_id: config.video_token_id,
             vision_start_token_id: config.vision_start_token_id,
-            vision_end_token_id: config.vision_start_token_id.saturating_add(1),
+            vision_end_token_id: config.vision_end_token_id,
             visual: Some(visual),
             language_model,
             lm_head: ProjKind::LinearProj(lm_head),
@@ -4463,11 +4735,18 @@ impl Qwen3_5Model {
         for b in 0..bs {
             let delta = deltas_cpu[b];
             let real_start = (seqlen_offset as i64 + delta) as f32;
-            
-            // arange 대신 단일 스칼라 텐서를 즉시 생성
-            let p_id = Tensor::new(&[real_start], &Device::Cpu)?
-                .reshape((1, 1, 1))?
-                .broadcast_as((3, 1, 1))?; // seq_len은 항상 1이므로 하드코딩
+            let p_id = if seq_len == 1 {
+                // arange 대신 단일 스칼라 텐서를 즉시 생성
+                Tensor::new(&[real_start], &Device::Cpu)?
+                    .reshape((1, 1, 1))?
+                    .broadcast_as((3, 1, 1))?
+            } else {
+                // Suffix prefill after prefix cache restore (seq_len > 1, seqlen_offset > 0)
+                Tensor::arange(0f32, seq_len as f32, &Device::Cpu)?
+                    .affine(1.0, real_start as f64)?
+                    .reshape((1, 1, seq_len))?
+                    .broadcast_as((3, 1, seq_len))?
+            };
             p_ids_vec.push(p_id);
         }
         
@@ -4696,7 +4975,7 @@ impl Qwen3_5Model {
             let mut processed = 0;
             let mut current_offset = seqlen_offset;
             // 🌟 [KV-PRECISION] 프리필이 청크로 나뉘어도 KV 정밀도는 프롬프트 전체 길이로 판정합니다.
-            if seqlen_offset == 0 {
+            if seqlen_offset == 0 && self.language_model.planned_prompt_len < total_len {
                 self.language_model.planned_prompt_len = total_len;
             }
             
@@ -4943,11 +5222,420 @@ impl Qwen3_5Model {
         }
     }
 
+    pub fn last_rope_deltas(&self) -> Option<Vec<i64>> {
+        self.rope_deltas_cpu.clone()
+    }
+
+    pub fn capture_hybrid_snapshot(
+        &self,
+        tokens: &[u32],
+        last_hidden: &Tensor,
+        target_dev: &Device,
+    ) -> Result<Option<HybridPromptSnapshot>> {
+        if tokens.len() < MIN_PREFIX_SNAPSHOT_TOKENS {
+            return Ok(None);
+        }
+        let mut layers = Vec::with_capacity(self.language_model.layers.len());
+        for layer in &self.language_model.layers {
+            match layer.capture_hybrid_state(target_dev)? {
+                Some(st) => layers.push(st),
+                None => return Ok(None),
+            }
+        }
+        let hidden_clone = clone_tensor_to_device(&last_hidden.to_dtype(DType::F32)?, target_dev)?;
+        Ok(Some(HybridPromptSnapshot {
+            tokens: tokens.to_vec(),
+            layers,
+            last_hidden: hidden_clone,
+            rope_deltas_cpu: self.rope_deltas_cpu.clone(),
+            kv_exact: self.language_model.kv_exact,
+            kv_half: self.language_model.mem.kv_half,
+            on_vram: !target_dev.is_cpu(),
+        }))
+    }
+
+    pub fn restore_hybrid_snapshot(
+        &mut self,
+        snap: &HybridPromptSnapshot,
+        compute_dev: &Device,
+    ) -> Result<Tensor> {
+        if self.language_model.layers.len() != snap.layers.len() {
+            return Err(anyhow!(
+                "HybridPromptSnapshot layer count mismatch: {} vs {}",
+                snap.layers.len(),
+                self.language_model.layers.len()
+            ));
+        }
+        self.language_model.clear_cache();
+        for (layer, state) in self.language_model.layers.iter_mut().zip(snap.layers.iter()) {
+            layer.restore_hybrid_state_cow(state, compute_dev)?;
+        }
+        self.language_model.current_kv_len = snap.tokens.len();
+        self.language_model.kv_exact = snap.kv_exact;
+        self.language_model.mem.kv_half = snap.kv_half;
+        self.language_model.kv_plan = None;
+        self.rope_deltas_cpu = snap.rope_deltas_cpu.clone();
+        self.rope_deltas = snap.rope_deltas_cpu.as_ref().and_then(|deltas| {
+            let bs = deltas.len();
+            Tensor::from_vec(deltas.clone(), (bs, 1), compute_dev).ok()
+        });
+        clone_tensor_to_device(&snap.last_hidden.to_dtype(DType::F32)?, compute_dev)
+    }
+
+    pub async fn forward_tokens_segmented<F>(
+        &mut self,
+        all_tokens: &[u32],
+        start_offset: usize,
+        checkpoints: &[usize],
+        device: &Device,
+        mut on_checkpoint: F,
+    ) -> Result<Tensor>
+    where
+        F: FnMut(&Self, usize, &Tensor),
+    {
+        let total = all_tokens.len();
+        if start_offset >= total {
+            return Err(anyhow!(
+                "forward_tokens_segmented: start_offset ({start_offset}) >= total ({total})"
+            ));
+        }
+        self.validate_input_ids(&all_tokens[start_offset..])?;
+        let mut bounds: Vec<usize> = checkpoints
+            .iter()
+            .copied()
+            .filter(|&cp| cp > start_offset && cp <= total)
+            .collect();
+        bounds.sort_unstable();
+        bounds.dedup();
+        if bounds.last().copied() != Some(total) {
+            bounds.push(total);
+        }
+        self.language_model.planned_prompt_len = total;
+        let mut pos = start_offset;
+        let mut final_hidden: Option<Tensor> = None;
+        for end in bounds {
+            let seg = &all_tokens[pos..end];
+            let seg_ids = Tensor::from_vec(seg.to_vec(), (1, seg.len()), device)?;
+            let hidden = self
+                .forward_last_hidden(&seg_ids, None, None, None, None, None, pos, None, None)
+                .await?;
+            if checkpoints.contains(&end) {
+                on_checkpoint(self, end, &hidden);
+            }
+            final_hidden = Some(hidden);
+            pos = end;
+        }
+        final_hidden.ok_or_else(|| anyhow!("forward_tokens_segmented produced no hidden state"))
+    }
+
     pub fn validate_input_ids(&self, ids: &[u32]) -> Result<()> {
-        Ok(self.language_model.embed_tokens.validate_ids_slice(ids)?)
+        let vocab = self.language_model.embed_tokens.vocab()?;
+        validate_host_token_ids(ids, vocab, "Qwen3_5Model::validate_input_ids")
     }
 
     pub fn clear_cache(&mut self) {
         self.language_model.clear_cache();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::Activation;
+    use crate::models::qwen3_5::config::RopeParameters;
+
+    struct DetBackend;
+
+    impl candle_nn::var_builder::SimpleBackend for DetBackend {
+        fn get(
+            &self,
+            s: candle_core::Shape,
+            name: &str,
+            _h: candle_nn::Init,
+            dtype: DType,
+            dev: &Device,
+        ) -> candle_core::Result<Tensor> {
+            let n = s.elem_count();
+            let mut hash = 0x9e37_79b9_7f4a_7c15u64;
+            for b in name.as_bytes() {
+                hash = hash.wrapping_mul(6364136223846793005).wrapping_add(*b as u64);
+            }
+            let is_norm = s.dims().len() == 1
+                && (name.contains("norm") || name.contains("bias"))
+                && !name.contains("A_log");
+            let vals: Vec<f32> = (0..n)
+                .map(|i| {
+                    if is_norm {
+                        0.92 + ((i % 7) as f32) * 0.02
+                    } else if name.contains("A_log") {
+                        -1.5 + ((i % 5) as f32) * 0.1
+                    } else {
+                        let x = ((hash.wrapping_add(i as u64 * 2654435761) >> 16) % 101) as f32;
+                        (x - 50.0) * 0.0025
+                    }
+                })
+                .collect();
+            Tensor::from_vec(vals, s, dev)?.to_dtype(dtype)
+        }
+
+        fn get_unchecked(&self, _name: &str, _dtype: DType, _dev: &Device) -> candle_core::Result<Tensor> {
+            Err(candle_core::Error::Msg("unused".into()))
+        }
+
+        fn contains_tensor(&self, _name: &str) -> bool {
+            true
+        }
+    }
+
+    fn tiny_test_text_config() -> Qwen3_5TextConfig {
+        Qwen3_5TextConfig {
+            attention_bias: false,
+            attention_dropout: 0.0,
+            attn_output_gate: true,
+            dtype: "float32".to_string(),
+            eos_token_id: 1,
+            full_attention_interval: 2,
+            head_dim: 16,
+            hidden_act: Activation::Silu,
+            hidden_size: 32,
+            initializer_range: 0.02,
+            intermediate_size: 64,
+            layer_types: vec!["linear_attention".to_string(), "full_attention".to_string()],
+            linear_conv_kernel_dim: 4,
+            linear_key_head_dim: 16,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: 2,
+            linear_value_head_dim: 16,
+            max_position_embeddings: 512,
+            mlp_only_layers: Vec::new(),
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            num_attention_heads: 2,
+            num_hidden_layers: 2,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: Some(true),
+            use_cache: true,
+            vocab_size: 64,
+            mamba_ssm_dtype: "float32".to_string(),
+            rope_parameters: RopeParameters {
+                mrope_interleaved: false,
+                mrope_section: vec![2, 1, 1],
+                rope_type: "default".to_string(),
+                rope_theta: 10_000.0,
+                partial_rotary_factor: 0.5,
+            },
+        }
+    }
+
+    fn build_tiny_loaded_model() -> Result<Qwen3_5Model> {
+        let cfg = tiny_test_text_config();
+        let vb = VarBuilder::from_backend(Box::new(DetBackend), DType::F32, Device::Cpu);
+        let embed_tokens = EmbedTable::Dense(embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("embed_tokens"))?);
+        let registry = KVRegistry::new();
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for i in 0..cfg.num_hidden_layers {
+            layers.push(Qwen3_5DecoderLayer::new_from_vb(vb.pp("layers").pp(i), &cfg, i, registry.clone())?);
+        }
+        let norm = Qwen3_5RMSNorm::new(vb.pp("norm"), cfg.hidden_size, cfg.rms_norm_eps)?;
+        let rope_dim = (cfg.head_dim as f32 * cfg.rope_parameters.partial_rotary_factor) as usize;
+        let rotary_emb = Qwen3VLTextRotaryEmbedding::new(rope_dim, cfg.rope_parameters.rope_theta);
+        let language_model = Qwen3_5TextModel {
+            embed_tokens,
+            layers,
+            norm,
+            rotary_emb,
+            mrope_section: cfg.rope_parameters.mrope_section.clone(),
+            dtype: DType::F32,
+            registry,
+            current_kv_len: 0,
+            active_session_id: None,
+            active_kv_name: None,
+            kv_plan: None,
+            keep_weights_resident: false,
+            resident_prefix: 0,
+            release_streamed_pages: false,
+            mmap: None,
+            ct: None,
+            base_name: "test".to_string(),
+            keep_warm: false,
+            kv_exact: true,
+            planned_prompt_len: 0,
+            mem: Qwen35MemState::default(),
+            persist_kv: false,
+        };
+        let lm_head = ProjKind::LinearProj(Linear::new(
+            language_model.embed_tokens.dense().unwrap().clone(),
+            None,
+        ));
+        Ok(Qwen3_5Model {
+            spatial_merge_size: 2,
+            image_token_id: 2,
+            video_token_id: 3,
+            vision_start_token_id: 4,
+            vision_end_token_id: 5,
+            visual: None,
+            language_model,
+            lm_head,
+            trim_head: None,
+            rope_deltas: None,
+            rope_deltas_cpu: None,
+        })
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<f32> {
+        let diff = a
+            .to_dtype(DType::F32)?
+            .sub(&b.to_dtype(DType::F32)?)?
+            .abs()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        Ok(diff.into_iter().fold(0.0f32, f32::max))
+    }
+
+    #[test]
+    fn gdn_suffix_conv_len_lt_kernel_matches_full_pass() -> Result<()> {
+        let cfg = tiny_test_text_config();
+        let vb = VarBuilder::from_backend(Box::new(DetBackend), DType::F32, Device::Cpu);
+        let mut gdn_full = Qwen3_5GatedDeltaNet::new_from_vb(vb.pp("gdn"), &cfg)?;
+        let mut gdn_split = Qwen3_5GatedDeltaNet::new_from_vb(vb.pp("gdn"), &cfg)?;
+
+        let input_data: Vec<f32> = (0..(9 * cfg.hidden_size))
+            .map(|i| ((i * 13 % 37) as f32 - 18.0) * 0.05)
+            .collect();
+        let all_x = Tensor::from_vec(input_data, (1, 9, cfg.hidden_size), &Device::Cpu)?;
+
+        let prefix_x = all_x.narrow(1, 0, 8)?;
+        let step_x = all_x.narrow(1, 8, 1)?;
+        let _ = gdn_full.forward(&prefix_x, None)?;
+        let full_step = gdn_full.forward(&step_x, None)?;
+        let (full_conv, full_rec) = gdn_full.get_states();
+
+        let p0 = all_x.narrow(1, 0, 6)?;
+        let s1 = all_x.narrow(1, 6, 2)?;
+        let _ = gdn_split.forward(&p0, None)?;
+        let _ = gdn_split.forward(&s1, None)?;
+        let split_step = gdn_split.forward(&step_x, None)?;
+        let (split_conv, split_rec) = gdn_split.get_states();
+
+        let conv_err = max_abs_diff(full_conv.as_ref().unwrap(), split_conv.as_ref().unwrap())?;
+        let rec_err = max_abs_diff(full_rec.as_ref().unwrap(), split_rec.as_ref().unwrap())?;
+        let step_err = max_abs_diff(&full_step, &split_step)?;
+        assert!(conv_err < 1e-5, "conv state diverged: {conv_err}");
+        assert!(rec_err < 1e-4, "recurrent state diverged: {rec_err}");
+        assert!(step_err < 1e-4, "step output diverged: {step_err}");
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_snapshot_cache_exact_and_prefix_cow_parity() -> Result<()> {
+        let rt = tokio::runtime::Builder::new_current_thread().build()?;
+        let mut model = build_tiny_loaded_model()?;
+        let tokens_96: Vec<u32> = (0..96u32).map(|i| (i * 7 + 10) % 64).collect();
+        let next_tok = Tensor::from_vec(vec![19u32], (1, 1), &Device::Cpu)?;
+
+        let ref_h96 = rt.block_on(model.forward_tokens_segmented(
+            &tokens_96,
+            0,
+            &[],
+            &Device::Cpu,
+            |_, _, _| {},
+        ))?;
+        let ref_h97 = rt.block_on(model.forward_last_hidden(
+            &next_tok,
+            None,
+            None,
+            None,
+            None,
+            None,
+            96,
+            None,
+            None,
+        ))?;
+
+        model.clear_cache();
+        let mut snap_sys: Option<HybridPromptSnapshot> = None;
+        let cap_h96 = rt.block_on(model.forward_tokens_segmented(
+            &tokens_96,
+            0,
+            &[64],
+            &Device::Cpu,
+            |m, cp, h| {
+                if cp == 64 {
+                    snap_sys = m
+                        .capture_hybrid_snapshot(&tokens_96[..64], h, &Device::Cpu)
+                        .expect("capture sys");
+                }
+            },
+        ))?;
+        assert!(max_abs_diff(&ref_h96, &cap_h96)? < 1e-5);
+        let snap_full = model
+            .capture_hybrid_snapshot(&tokens_96, &cap_h96, &Device::Cpu)?
+            .expect("capture full");
+
+        let mut cache = HybridSnapshotCache::default();
+        cache.store_system_host(snap_sys.expect("sys snap present"));
+        cache.store_active(snap_full);
+
+        let (exact_snap, matched_full) = cache.lookup_best(&tokens_96).expect("exact hit");
+        assert_eq!(matched_full, 96);
+        let exact_snap_clone = exact_snap.clone();
+        let h_restored = model.restore_hybrid_snapshot(&exact_snap_clone, &Device::Cpu)?;
+        assert!(max_abs_diff(&ref_h96, &h_restored)? < 1e-5);
+        let h97_run1 = rt.block_on(model.forward_last_hidden(
+            &next_tok,
+            None,
+            None,
+            None,
+            None,
+            None,
+            96,
+            None,
+            None,
+        ))?;
+        assert!(max_abs_diff(&ref_h97, &h97_run1)? < 1e-5);
+
+        // CoW isolation check
+        let h_restored_2 = model.restore_hybrid_snapshot(&exact_snap_clone, &Device::Cpu)?;
+        assert!(max_abs_diff(&ref_h96, &h_restored_2)? < 1e-5);
+        let h97_run2 = rt.block_on(model.forward_last_hidden(
+            &next_tok,
+            None,
+            None,
+            None,
+            None,
+            None,
+            96,
+            None,
+            None,
+        ))?;
+        assert!(max_abs_diff(&ref_h97, &h97_run2)? < 1e-5);
+
+        // Prefix hit from system_host_slot (64) with tiny suffix length 2 (< conv_kernel-1)
+        let mut alt_tokens = tokens_96[..64].to_vec();
+        alt_tokens.extend_from_slice(&[31u32, 42u32]);
+
+        model.clear_cache();
+        let ref_alt = rt.block_on(model.forward_tokens_segmented(
+            &alt_tokens,
+            0,
+            &[],
+            &Device::Cpu,
+            |_, _, _| {},
+        ))?;
+
+        let (sys_hit, matched_sys) = cache.lookup_best(&alt_tokens).expect("sys hit");
+        assert_eq!(matched_sys, 64);
+        let sys_clone = sys_hit.clone();
+        let _ = model.restore_hybrid_snapshot(&sys_clone, &Device::Cpu)?;
+        let res_alt = rt.block_on(model.forward_tokens_segmented(
+            &alt_tokens,
+            matched_sys,
+            &[],
+            &Device::Cpu,
+            |_, _, _| {},
+        ))?;
+        assert!(max_abs_diff(&ref_alt, &res_alt)? < 1e-4);
+        Ok(())
     }
 }

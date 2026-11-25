@@ -525,8 +525,11 @@ pub fn exact_kv_affordable(device: &Device, exact_bytes: u64, reserve: u64) -> (
     }
     // 메모리 풀이 쥐고 있던 이전 계산의 여분을 돌려준 뒤 잽니다.
     let _ = device.synchronize();
-    match crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize) {
-        Some((free, _)) => (
+    let free_opt = crate::utils::device_utils::device_vram_snapshot(device)
+        .map(|s| s.effective_free_bytes())
+        .or_else(|| crate::utils::device_mem_info_of(device).map(|(f, _)| f));
+    match free_opt {
+        Some(free) => (
             free >= exact_bytes + crate::utils::resources::KV_VRAM_SAFETY_MARGIN_BYTES + reserve,
             Some(free),
         ),
@@ -571,8 +574,11 @@ pub fn exact_kv_affordable_with_margin(device: &Device, exact_bytes: u64, reserv
     if !(device.is_cuda_or_rocm() || device.is_vulkan()) {
         return (true, None);
     }
-    match crate::utils::gpu_mem_info(crate::utils::resources::primary_gpu_id() as usize) {
-        Some((free, _)) => (free >= exact_bytes + margin + reserve, Some(free)),
+    let free_opt = crate::utils::device_utils::device_vram_snapshot(device)
+        .map(|s| s.effective_free_bytes())
+        .or_else(|| crate::utils::device_mem_info_of(device).map(|(f, _)| f));
+    match free_opt {
+        Some(free) => (free >= exact_bytes + margin + reserve, Some(free)),
         None => (false, None),
     }
 }

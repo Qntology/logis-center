@@ -85,7 +85,27 @@ pub fn active_variant() -> EngineVariant {
         .to_ascii_lowercase()
         .as_str()
     {
-        "" | "full" | "default" => EngineVariant::Full,
+        "" => {
+            let manifest = model_dir(LANG_ENGINE).join("trim_manifest.json");
+            if let Ok(raw) = std::fs::read_to_string(&manifest) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    let bundle = val
+                        .get("lang_bundle")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let trimmed_v = val
+                        .get("trimmed_vocab_size")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(u64::MAX);
+                    if bundle == "core12" || bundle == "all12" || trimmed_v <= 70_000 {
+                        return EngineVariant::TrimmedCore12;
+                    }
+                }
+            }
+            EngineVariant::Full
+        }
+        "full" | "default" => EngineVariant::Full,
         "core12" | "trimmed_core12" | "trimmed" => EngineVariant::TrimmedCore12,
         other => EngineVariant::Custom(other.to_string()),
     }
@@ -202,12 +222,25 @@ pub fn resident_estimate_mb(code: &str) -> u64 {
     let runtime = crate::model::lang_gguf::runtime_bytes(&dir);
     let bytes = if runtime > 0 {
         // When `LOGIS_VOCAB_TRIM != off`, `token_embd.weight` (~670 MB for 248k Q8_0) is mmap-only (0 B GPU)
-        // and only active K (~32k–65k, ~130 MB) resides in VRAM. Subtract cold table share so VRAM gating isn't overly conservative.
+        // and only active K (~12k, ~33 MB under Track M) resides in VRAM. Subtract cold table share so VRAM gating isn't overly conservative.
         let trim_on = logis_llm::models::common::vocab_trim::rule_from_env()
             != logis_llm::models::common::vocab_trim::TrimRule::Off;
-        if trim_on && runtime > 2_000_000_000 {
-            let cold_saved = 520.0 * 1024.0 * 1024.0;
-            (runtime as f64 - cold_saved).max(1_800.0 * 1024.0 * 1024.0)
+        if trim_on {
+            if let Some(m) = crate::model::lang_gguf::read_ready_manifest(&dir) {
+                if m.backbone_bytes > 0 && m.embd_row_bytes > 0 {
+                    m.backbone_bytes.saturating_add(12_288u64.saturating_mul(m.embd_row_bytes)) as f64
+                } else if runtime > 2_000_000_000 {
+                    let cold_saved = 520.0 * 1024.0 * 1024.0;
+                    (runtime as f64 - cold_saved).max(1_800.0 * 1024.0 * 1024.0)
+                } else {
+                    runtime as f64
+                }
+            } else if runtime > 2_000_000_000 {
+                let cold_saved = 520.0 * 1024.0 * 1024.0;
+                (runtime as f64 - cold_saved).max(1_800.0 * 1024.0 * 1024.0)
+            } else {
+                runtime as f64
+            }
         } else {
             runtime as f64
         }
@@ -229,6 +262,7 @@ pub fn cleanup_legacy_models() -> Vec<String> {
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let is_legacy = name == "granite-4.0-h-350m"
+            || logis_llm::models::common::reflection_gate::is_retired_or_forbidden_model(&name).is_some()
             || (name.starts_with("Qwen3.5-4B-") && (name.contains("-16384") || name.contains("-32768")));
         if is_legacy && std::fs::remove_dir_all(&path).is_ok() {
             removed.push(name);

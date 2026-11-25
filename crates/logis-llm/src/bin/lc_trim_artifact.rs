@@ -8,17 +8,18 @@
 //!   - zero-requantization repacked `.gguf` OR dtype-preserving repacked `.safetensors`
 //!   - `trim_manifest.json` with full SHA-256 checksums + 64-row E0 byte verification.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
 use premium_discount_quant::artifact_trim::{
-    remap_config_json, trim_tokenizer_json, IdRemap, NumberingMode, TrimManifest,
+    remap_config_json, trim_tokenizer_json, trim_tokenizer_json_prioritized, IdRemap,
+    NumberingMode, TrimManifest,
 };
 use premium_discount_quant::gguf::{repack_gguf_vocab, GgufFile, GgufVocabOverride};
 use premium_discount_quant::safetensors::{repack_safetensors_vocab, SafeTensors};
-use premium_discount_quant::vocab_plan::VocabPlan;
+use premium_discount_quant::vocab_plan::{PlanTier, VocabPlan};
 
 fn parse_arg(args: &[String], flag: &str) -> Option<String> {
     args.windows(2)
@@ -26,23 +27,35 @@ fn parse_arg(args: &[String], flag: &str) -> Option<String> {
         .map(|w| w[1].clone())
 }
 
-fn find_gguf_in_dir(dir: &Path) -> Option<PathBuf> {
-    // Check runtime-q4km/model-q4km.gguf first (Qwen3.5-4B), then top-level *.gguf (excluding mmproj)
-    let rt = dir.join("runtime-q4km").join("model-q4km.gguf");
-    if rt.is_file() {
-        return Some(rt);
-    }
-    let rd = std::fs::read_dir(dir).ok()?;
-    for e in rd.flatten() {
-        let p = e.path();
+fn find_ggufs_in_dir(dir: &Path) -> Vec<PathBuf> {
+    // Check runtime-q4km/model-q4km.gguf and runtime-q8_0/model-q8_0.gguf (Qwen3.5-4B),
+    // then fall back to top-level *.gguf (excluding mmproj).
+    let mut found = Vec::new();
+    for (sub, file) in [
+        ("runtime-q4km", "model-q4km.gguf"),
+        ("runtime-q8_0", "model-q8_0.gguf"),
+    ] {
+        let p = dir.join(sub).join(file);
         if p.is_file() {
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
-            if name.ends_with(".gguf") && !name.contains("mmproj") {
-                return Some(p);
+            found.push(p);
+        }
+    }
+    if !found.is_empty() {
+        return found;
+    }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+                if name.ends_with(".gguf") && !name.contains("mmproj") {
+                    found.push(p);
+                }
             }
         }
     }
-    None
+    found.sort();
+    found
 }
 
 fn extract_gguf_token_arrays(trimmed_tok_json: &str, k: usize) -> Result<(Vec<String>, Vec<i32>, Vec<String>)> {
@@ -113,7 +126,10 @@ fn main() -> Result<()> {
             // Exact baseline mode (e.g. reproducing published alphaedge-ai tokenizer + GGUF apples-to-apples)
             let etok_raw = std::fs::read_to_string(etok_p)?;
             let new_to_old: Vec<u32> = serde_json::from_str(&std::fs::read_to_string(emap_p)?)?;
-            let src_gguf = find_gguf_in_dir(&src_dir).context("exact mode requires source GGUF")?;
+            let src_gguf = find_ggufs_in_dir(&src_dir)
+                .into_iter()
+                .next()
+                .context("exact mode requires source GGUF")?;
             let g_src = GgufFile::open(&src_gguf)?;
             let orig_v = g_src.tensor("token_embd.weight")?.shape[0];
             let mut old_to_new = vec![-1i32; orig_v];
@@ -148,12 +164,30 @@ fn main() -> Result<()> {
         } else {
             let plan_path = PathBuf::from(parse_arg(&args, "--plan").context("missing --plan")?);
             let plan = VocabPlan::load(&plan_path)?;
-            let (tt, rm, st) = trim_tokenizer_json(
-                &tok_raw,
-                plan.orig_vocab_size,
-                &plan.kept_ids,
-                ancestor_max,
-            )?;
+            let no_priority_order = args.iter().any(|a| a == "--no-priority-order");
+            let (tt, rm, st) = if no_priority_order {
+                trim_tokenizer_json(
+                    &tok_raw,
+                    plan.orig_vocab_size,
+                    &plan.kept_ids,
+                    ancestor_max,
+                )?
+            } else {
+                let struct_prio: BTreeSet<u32> = plan
+                    .kept_ids
+                    .iter()
+                    .zip(plan.reasons.iter())
+                    .filter(|(_, &r)| r == PlanTier::MandatoryAsciiStruct)
+                    .map(|(&id, _)| id)
+                    .collect();
+                trim_tokenizer_json_prioritized(
+                    &tok_raw,
+                    plan.orig_vocab_size,
+                    &plan.kept_ids,
+                    ancestor_max,
+                    &struct_prio,
+                )?
+            };
             ensure!(
                 st.orphan_multi == 0,
                 "trimmed tokenizer still has {} orphan multi-char tokens",
@@ -214,16 +248,10 @@ fn main() -> Result<()> {
     }
 
     // 3. Repack weights (GGUF or Safetensors) with E0 bit-exact row verification
-    let orig_bytes: u64;
-    let new_bytes: u64;
-    if let Some(src_gguf) = find_gguf_in_dir(&src_dir) {
-        let is_runtime_4b = src_gguf.parent().and_then(|p| p.file_name()).is_some_and(|n| n == "runtime-q4km");
-        let rel_dst = if is_runtime_4b {
-            "runtime-q4km/model-q4km.gguf".to_string()
-        } else {
-            src_gguf.file_name().unwrap().to_string_lossy().to_string()
-        };
-        let dst_gguf = out_dir.join(&rel_dst);
+    let mut orig_bytes = 0u64;
+    let mut new_bytes = 0u64;
+    let src_ggufs = find_ggufs_in_dir(&src_dir);
+    if !src_ggufs.is_empty() {
         let (tokens, token_types, merges) = extract_gguf_token_arrays(&trimmed_tok_json, remap.trimmed_vocab())?;
         let mut extra_kvs = Vec::new();
         for (tok_str, key) in [
@@ -236,49 +264,80 @@ fn main() -> Result<()> {
                 extra_kvs.push((key.to_string(), premium_discount_quant::gguf::Kv::U32(new_id)));
             }
         }
-        let ov = GgufVocabOverride {
-            tokens: Some(tokens),
-            token_types: Some(token_types),
-            merges: Some(merges),
-            extra_kvs,
-        };
-        repack_gguf_vocab(&src_gguf, &dst_gguf, &remap, &ov)?;
-        orig_bytes = std::fs::metadata(&src_gguf)?.len();
-        new_bytes = std::fs::metadata(&dst_gguf)?.len();
-        manifest_files.push(rel_dst.clone());
-
-        // Verify 64 sampled rows are E0 byte-identical
-        let g_src = GgufFile::open(&src_gguf)?;
-        let g_dst = GgufFile::open(&dst_gguf)?;
-        let step = (remap.trimmed_vocab() / 64).max(1);
-        for new_id in (0..remap.trimmed_vocab()).step_by(step).take(64) {
-            let old_id = remap.new_to_old[new_id] as usize;
-            ensure!(
-                g_src.row_bytes("token_embd.weight", old_id)? == g_dst.row_bytes("token_embd.weight", new_id)?,
-                "E0 row verification failed at new_id={new_id} old_id={old_id}"
-            );
-        }
-
-        // Write READY.json if this is a runtime-q4km artifact
-        if is_runtime_4b {
-            let t_emb = g_dst.tensor("token_embd.weight")?;
-            let (_, cols) = t_emb.rows_cols();
-            let embd_row_bytes = t_emb.ty.row_bytes(cols) as u64;
-            let backbone_bytes = new_bytes.saturating_sub(t_emb.nbytes() as u64);
-            let ready = logis_llm::lang_gguf::ReadyManifest {
-                recipe: "qwen35-q4km/2".into(),
-                engine_fp: format!("q35_4b-{}-v{}k-q4km", plan_bundle, remap.trimmed_vocab() / 1000),
-                source_revision: base_rev.clone(),
-                gguf_sha256: premium_discount_manifest::sha256_file(&dst_gguf, 0)?,
-                gguf_bytes: new_bytes,
-                backbone_bytes,
-                embd_row_bytes,
-                vocab_size: remap.trimmed_vocab(),
-                v_head_order: logis_llm::lang_gguf::v_head_order()?.into(),
-                ascii_intact: true,
+        for src_gguf in &src_ggufs {
+            let parent_name = src_gguf
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str());
+            let runtime_prec = match parent_name {
+                Some("runtime-q4km") => Some((
+                    logis_llm::lang_gguf::Precision::Q4KM,
+                    "runtime-q4km/model-q4km.gguf".to_string(),
+                    "runtime-q4km/READY.json".to_string(),
+                    "qwen35-q4km/2",
+                    "q4km",
+                )),
+                Some("runtime-q8_0") => Some((
+                    logis_llm::lang_gguf::Precision::Q8,
+                    "runtime-q8_0/model-q8_0.gguf".to_string(),
+                    "runtime-q8_0/READY.json".to_string(),
+                    "qwen35-q8_0/1",
+                    "q8_0",
+                )),
+                _ => None,
             };
-            logis_llm::lang_gguf::write_ready_manifest(&out_dir, &ready)?;
-            manifest_files.push("runtime-q4km/READY.json".into());
+            let rel_dst = runtime_prec
+                .as_ref()
+                .map(|(_, rel, _, _, _)| rel.clone())
+                .unwrap_or_else(|| src_gguf.file_name().unwrap().to_string_lossy().to_string());
+            let dst_gguf = out_dir.join(&rel_dst);
+            let ov = GgufVocabOverride {
+                tokens: Some(tokens.clone()),
+                token_types: Some(token_types.clone()),
+                merges: Some(merges.clone()),
+                extra_kvs: extra_kvs.clone(),
+            };
+            repack_gguf_vocab(src_gguf, &dst_gguf, &remap, &ov)?;
+            let src_len = std::fs::metadata(src_gguf)?.len();
+            let dst_len = std::fs::metadata(&dst_gguf)?.len();
+            orig_bytes += src_len;
+            new_bytes += dst_len;
+            manifest_files.push(rel_dst);
+
+            // Verify 64 sampled rows are E0 byte-identical
+            let g_src = GgufFile::open(src_gguf)?;
+            let g_dst = GgufFile::open(&dst_gguf)?;
+            let step = (remap.trimmed_vocab() / 64).max(1);
+            for new_id in (0..remap.trimmed_vocab()).step_by(step).take(64) {
+                let old_id = remap.new_to_old[new_id] as usize;
+                ensure!(
+                    g_src.row_bytes("token_embd.weight", old_id)? == g_dst.row_bytes("token_embd.weight", new_id)?,
+                    "E0 row verification failed at new_id={new_id} old_id={old_id} ({})",
+                    src_gguf.display()
+                );
+            }
+
+            // Write READY.json if this is a runtime-q4km or runtime-q8_0 artifact
+            if let Some((prec, _, ready_rel, recipe_str, prec_tag)) = runtime_prec {
+                let t_emb = g_dst.tensor("token_embd.weight")?;
+                let (_, cols) = t_emb.rows_cols();
+                let embd_row_bytes = t_emb.ty.row_bytes(cols) as u64;
+                let backbone_bytes = dst_len.saturating_sub(t_emb.nbytes() as u64);
+                let ready = logis_llm::lang_gguf::ReadyManifest {
+                    recipe: recipe_str.into(),
+                    engine_fp: format!("q35_4b-{}-v{}k-{prec_tag}", plan_bundle, remap.trimmed_vocab() / 1000),
+                    source_revision: base_rev.clone(),
+                    gguf_sha256: premium_discount_manifest::sha256_file(&dst_gguf, 0)?,
+                    gguf_bytes: dst_len,
+                    backbone_bytes,
+                    embd_row_bytes,
+                    vocab_size: remap.trimmed_vocab(),
+                    v_head_order: logis_llm::lang_gguf::v_head_order()?.into(),
+                    ascii_intact: true,
+                };
+                logis_llm::lang_gguf::write_ready_manifest_for(&out_dir, prec, &ready)?;
+                manifest_files.push(ready_rel);
+            }
         }
     } else if src_dir.join("model.safetensors").is_file() || src_dir.join("model.safetensors.index.json").is_file() {
         let st_open = SafeTensors::open_model_dir(&src_dir, &[])?;

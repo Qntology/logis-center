@@ -3,6 +3,8 @@
 //! (Phase 1 – Part 1 D1, D2, D4)
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+use premium_discount_quant::trim::Langs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LayerStatus {
@@ -58,7 +60,13 @@ pub struct ModelTrimPolicyEntry {
     #[serde(default)]
     pub static_k: Option<usize>,
     #[serde(default)]
+    pub runtime_k_default: Option<usize>,
+    #[serde(default)]
     pub runtime_k_ko: Option<usize>,
+    #[serde(default)]
+    pub runtime_k_cjk: Option<usize>,
+    #[serde(default)]
+    pub runtime_k_all: Option<usize>,
     #[serde(default)]
     pub artifact_tier: Option<EquivalenceTier>,
     #[serde(default)]
@@ -96,10 +104,69 @@ impl NetGainGate {
     }
 }
 
-/// Built-in default policy map matching `apps/core/src/model/model_trim_policy.json`.
+const POLICY_JSON: &str = include_str!("model_trim_policy.json");
+
+/// Cached canonical trim policy owned directly inside `logis-llm`.
+pub fn cached_model_trim_policy() -> &'static BTreeMap<String, ModelTrimPolicyEntry> {
+    static POLICY: OnceLock<BTreeMap<String, ModelTrimPolicyEntry>> = OnceLock::new();
+    POLICY.get_or_init(|| serde_json::from_str(POLICY_JSON).unwrap_or_default())
+}
+
+/// Built-in default policy map (cloned convenience wrapper).
 pub fn default_model_trim_policy() -> BTreeMap<String, ModelTrimPolicyEntry> {
-    let raw = include_str!("../../../../../apps/core/src/model/model_trim_policy.json");
-    serde_json::from_str(raw).unwrap_or_default()
+    cached_model_trim_policy().clone()
+}
+
+/// Canonicalize slot / folder / IPC names to policy JSON keys.
+/// Strict exact matching for `granite-4.0-h-350m` prevents ever blocking `granite-embedding-97m-multilingual-r2`.
+pub fn canonical_policy_key(raw: &str) -> Option<&'static str> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s == "granite-4.0-h-350m" || s == "ibm-granite/granite-4.0-h-350m" {
+        Some("granite-4.0-h-350m")
+    } else if s == "embeddinggemma-300m" || s == "google/embeddinggemma-300m" {
+        Some("embeddinggemma-300m")
+    } else if s.contains("granite-embedding-97m") || s == "granite_embed_97m_r2" {
+        Some("granite-embedding-97m-multilingual-r2")
+    } else if s.contains("siglip2") {
+        Some("siglip2-so400m-patch16-naflex")
+    } else if s.contains("qwen3-0.6b") || s.contains("qwen3_0_6b") {
+        Some("Qwen3-0.6B")
+    } else if s.contains("qwen3.5-2b") || s.contains("qwen3_5_2b") {
+        Some("Qwen3.5-2B")
+    } else if s.contains("qwen3.5-4b") || s.contains("qwen3_5_4b") || s == "model-q4km" || s == "model-q8_0" {
+        Some("Qwen3.5-4B")
+    } else {
+        None
+    }
+}
+
+/// Returns `Some((canonical_key, reason))` if the requested model is retired or forbidden.
+pub fn is_retired_or_forbidden_model(model_name: &str) -> Option<(&'static str, &'static str)> {
+    let key = canonical_policy_key(model_name)?;
+    let entry = cached_model_trim_policy().get(key)?;
+    match entry.policy {
+        TrimModePolicy::Retire => Some((key, entry.reason.as_deref().unwrap_or("retired"))),
+        TrimModePolicy::Forbidden => Some((key, entry.reason.as_deref().unwrap_or("forbidden"))),
+        _ => None,
+    }
+}
+
+/// Resolve Track M runtime active row budget `K` from model hint, vocab size, and document languages.
+pub fn policy_runtime_k(model_hint: Option<&str>, vocab: usize, langs: Langs) -> usize {
+    let key = model_hint
+        .and_then(canonical_policy_key)
+        .or(if vocab <= 160_000 && vocab > 70_000 { Some("Qwen3-0.6B") } else { Some("Qwen3.5-4B") })
+        .unwrap_or("Qwen3.5-4B");
+    let entry = cached_model_trim_policy().get(key);
+    if langs.other || (langs.hangul && langs.kana && langs.arabic && langs.cjk) {
+        entry.and_then(|e| e.runtime_k_all).unwrap_or(24_576)
+    } else if langs.cjk || langs.kana {
+        entry.and_then(|e| e.runtime_k_cjk).unwrap_or(12_288)
+    } else if langs.hangul || langs.arabic {
+        entry.and_then(|e| e.runtime_k_ko).unwrap_or(12_288)
+    } else {
+        entry.and_then(|e| e.runtime_k_default).unwrap_or(10_240)
+    }
 }
 
 pub fn net_gain_gate_enabled() -> bool {
@@ -150,5 +217,16 @@ mod tests {
         };
         assert!(gate.all_pass());
         assert!(gate.format_log("Qwen3.5-4B").contains("[REFLECT-GATE]"));
+
+        // Exact policy key checks: granite-4.0-h-350m blocked, granite-embedding-97m NOT blocked
+        assert!(is_retired_or_forbidden_model("granite-4.0-h-350m").is_some());
+        assert!(is_retired_or_forbidden_model("embeddinggemma-300m").is_some());
+        assert!(is_retired_or_forbidden_model("granite-embedding-97m-multilingual-r2").is_none());
+
+        // Track M policy budgets strictly < 16384 for single-language modes
+        assert_eq!(policy_runtime_k(Some("Qwen3-0.6B"), 151936, Langs::of_doc_lang("en")), 10_240);
+        assert_eq!(policy_runtime_k(Some("Qwen3-0.6B"), 151936, Langs::of_doc_lang("fr")), 10_240);
+        assert_eq!(policy_runtime_k(Some("Qwen3.5-4B"), 248320, Langs::of_doc_lang("ko")), 12_288);
+        assert_eq!(policy_runtime_k(Some("Qwen3.5-4B"), 248320, Langs::of_doc_lang("ja")), 12_288);
     }
 }

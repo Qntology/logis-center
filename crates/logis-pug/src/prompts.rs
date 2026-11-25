@@ -2570,6 +2570,8 @@ Text: "{TEXT}"
 
 
 
+const MAX_PREFIX_REORDER_CHARS: usize = 4_600;
+
 pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc: &str, language: &str, metadata: &str, target_data: &str) -> String {
     let mut dynamic_output_keys = String::new();
     for key in field_name.split(',') {
@@ -2579,7 +2581,33 @@ pub fn extract_single_field_prompt(page_type: &str, field_name: &str, field_desc
 
     // 🌟 기존 7번 SHAPE RULES 전체는 detect_field_format / value_matches_format 의
     //    사전 형식 게이트와 사후 [FORMAT REJECT] 검증이 코드로 강제하므로 프롬프트에서 제거했습니다.
-    let template = r###"[TASK]
+    let template = if target_data.chars().count() <= MAX_PREFIX_REORDER_CHARS {
+        r###"[TASK]
+Copy ONE property set from [TARGET DATA]. You are a copier, not a writer.
+
+[CONTEXT]
+Page Type: {TYPE} / Output Language: {LANGUAGE}
+Column labels (LABELS, never answers): {METADATA}
+
+[TARGET DATA]
+{TARGET_DATA}
+
+[SCHEMA DEFINITIONS]
+{FIELDS}
+
+[RULES]
+1. The answer MUST be an exact literal substring of [TARGET DATA]. Never translate, reformat, round, or re-type it.
+2. Never answer with a column label, a format placeholder ("yyyy-MM-ddThh:mm:ss", "string", "...", "N/A"), or a value listed under [ALREADY CLAIMED VALUES].
+3. NEVER answer with an HTML/PUG tag name.
+4. If [VECTOR MATCH RESULT], [LINK CANDIDATES] or [DATE CANDIDATES] is given, the answer MUST come from it.
+5. If nothing in [TARGET DATA] fits the schema, return null. null is correct data; a wrong value is corrupted data.
+
+[OUTPUT FORMAT]
+{ {DYNAMIC_KEYS} }
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###
+    } else {
+        r###"[TASK]
 Copy ONE property set from [TARGET DATA]. You are a copier, not a writer.
 
 [CONTEXT]
@@ -2602,7 +2630,8 @@ Column labels (LABELS, never answers): {METADATA}
 [OUTPUT FORMAT]
 { {DYNAMIC_KEYS} }
 
-[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###
+    };
 
     template.replace("{TYPE}", page_type)
             .replace("{LANGUAGE}", language)
@@ -2624,7 +2653,34 @@ fn synthesis_field_prompt_with(page_type: &str, field_name: &str, field_desc: &s
     }
     let dynamic_output_keys = dynamic_output_keys.trim_end_matches(",\n");
 
-    let template = r###"[TASK]
+    let template = if source_data.chars().count() <= MAX_PREFIX_REORDER_CHARS {
+        r###"[TASK]
+Write ONE analytic sentence for the requested field. This field is a SUMMARY you compose, not a value you copy.
+
+[CONTEXT]
+Page Type: {TYPE}
+Source Document Language: {DOC_LANG}
+
+[SOURCE DATA]
+{SOURCE_DATA}
+
+[SCHEMA DEFINITIONS]
+{FIELDS}
+
+[WRITING RULES]
+1. Read ALL of [SOURCE DATA] before writing. NEVER answer with a single cell value such as a bare number, a status word, a person name, a branch name, or a column label.
+2. The sentence MUST combine at least two different facts taken from [SOURCE DATA].
+3. Do NOT invent facts. Only restate and connect what is present in [SOURCE DATA].
+4. Keep every proper noun, product name, code, identifier, and number EXACTLY as written in [SOURCE DATA]. Never translate, transliterate, or reformat them, whatever the source language is.
+5. {LANGUAGE_RULE}
+6. If [SOURCE DATA] has no usable content for this field, return null. A null summary is correct; a fabricated one is corrupted data.
+
+[OUTPUT FORMAT]
+{ {DYNAMIC_KEYS} }
+
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###
+    } else {
+        r###"[TASK]
 Write ONE analytic sentence for the requested field. This field is a SUMMARY you compose, not a value you copy.
 
 [CONTEXT]
@@ -2648,7 +2704,8 @@ Source Document Language: {DOC_LANG}
 [OUTPUT FORMAT]
 { {DYNAMIC_KEYS} }
 
-[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###;
+[ACTION] RETURN JSON ONLY. NO EXPLANATION. NO COMMENTS IN JSON. /no_think"###
+    };
 
     template.replace("{LANGUAGE_RULE}", language_rule)
             .replace("{TYPE}", page_type)
