@@ -350,11 +350,11 @@ impl QwenVLProcessor {
         let total_elems = total_patches * patch_dim;
         let pixel_values = match self.dtype {
             DType::F16 => {
-                let mut buf = vec![embed_cpu_kernels::half::f16::ZERO; total_elems];
+                let mut buf = vec![half::f16::ZERO; total_elems];
                 let mut off = 0usize;
                 for (rgb, rw, rh, np) in &prepared {
                     let len = np * patch_dim;
-                    embed_cpu_kernels::image::patchify_norm_qwen_vl_u8_f16(
+                    crate::models::common::qwen_vl_patchify::patchify_norm_qwen_vl_u8_f16(
                         rgb, *rw, *rh, patch_size, merge_size, tp, mean, std,
                         &mut buf[off..off + len],
                     );
@@ -363,11 +363,11 @@ impl QwenVLProcessor {
                 Tensor::from_vec(buf, (total_patches, patch_dim), &self.device)?
             }
             DType::BF16 => {
-                let mut buf = vec![embed_cpu_kernels::half::bf16::ZERO; total_elems];
+                let mut buf = vec![half::bf16::ZERO; total_elems];
                 let mut off = 0usize;
                 for (rgb, rw, rh, np) in &prepared {
                     let len = np * patch_dim;
-                    embed_cpu_kernels::image::patchify_norm_qwen_vl_u8_bf16(
+                    crate::models::common::qwen_vl_patchify::patchify_norm_qwen_vl_u8_bf16(
                         rgb, *rw, *rh, patch_size, merge_size, tp, mean, std,
                         &mut buf[off..off + len],
                     );
@@ -380,7 +380,7 @@ impl QwenVLProcessor {
                 let mut off = 0usize;
                 for (rgb, rw, rh, np) in &prepared {
                     let len = np * patch_dim;
-                    embed_cpu_kernels::image::patchify_norm_qwen_vl_u8_f32(
+                    crate::models::common::qwen_vl_patchify::patchify_norm_qwen_vl_u8_f32(
                         rgb, *rw, *rh, patch_size, merge_size, tp, mean, std,
                         &mut buf[off..off + len],
                     );

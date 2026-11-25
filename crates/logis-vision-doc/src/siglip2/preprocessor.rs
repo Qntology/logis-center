@@ -152,7 +152,7 @@ pub fn preprocess_image_patches_1pass(
     let patch_dim = patch_size * patch_size * 3;
     let num_patches = grid_rows * grid_cols;
     let mut patches = vec![0.0f32; num_patches * patch_dim];
-    embed_cpu_kernels::image::patchify_norm_hwc_u8_f32(
+    lv_kernels::image::patchify_norm_hwc_u8_f32(
         rgb.as_raw(),
         resized_w,
         resized_h,

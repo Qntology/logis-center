@@ -2380,7 +2380,7 @@ impl PatchPhraseDots {
                     bt[k * m + j] = x;
                 }
             }
-            embed_cpu_kernels::dot_rows_cols(&a, n, d, &bt, m, &mut vals);
+            lv_kernels::dot_rows_cols(&a, n, d, &bt, m, &mut vals);
         } else {
             // 길이가 다른 벡터(있어서는 안 됨): 기존 스칼라 내적(zip = 짧은 쪽 길이)을 그대로.
             for (i, p) in patches.iter().enumerate() {

@@ -1003,12 +1003,12 @@ pub fn quantize_rows(t: &Tensor, dtype: GgmlDType, threads: usize) -> Result<Vec
     quantize_rows_with(t, dtype, threads, Quantizer::Candle)
 }
 
-fn kquant_format(dtype: GgmlDType) -> Option<ggml_kquant::Format> {
+fn kquant_format(dtype: GgmlDType) -> Option<premium_discount_quant::kquant::Format> {
     Some(match dtype {
-        GgmlDType::Q8_0 => ggml_kquant::Format::Q8_0,
-        GgmlDType::Q6K => ggml_kquant::Format::Q6K,
-        GgmlDType::Q5K => ggml_kquant::Format::Q5K,
-        GgmlDType::Q4K => ggml_kquant::Format::Q4K,
+        GgmlDType::Q8_0 => premium_discount_quant::kquant::Format::Q8_0,
+        GgmlDType::Q6K => premium_discount_quant::kquant::Format::Q6K,
+        GgmlDType::Q5K => premium_discount_quant::kquant::Format::Q5K,
+        GgmlDType::Q4K => premium_discount_quant::kquant::Format::Q4K,
         _ => return None,
     })
 }
@@ -1017,7 +1017,7 @@ pub fn quantize_rows_with(t: &Tensor, dtype: GgmlDType, threads: usize, quantize
     if let (Quantizer::Wls, Some(fmt)) = (quantizer, kquant_format(dtype)) {
         let cols = t.dim(1)?;
         let data = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        return ggml_kquant::encode(&data, cols, fmt, None).map_err(|e| anyhow!("{e}"));
+        return premium_discount_quant::kquant::encode(&data, cols, fmt, None).map_err(|e| anyhow!("{e}"));
     }
     let rows = t.dim(0)?;
     let per = rows.div_ceil(threads.max(1)).max(1);

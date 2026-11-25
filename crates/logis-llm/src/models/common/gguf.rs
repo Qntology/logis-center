@@ -435,7 +435,7 @@ pub enum ProjKind {
     Exact(ExactQLinear),
     /// 🌟 [CPU-PACKED] Part 2 CPU F32 패킹 선형층 (NR=32 zero-pad, 단일 오름차순 FMA 체인)
     CpuPacked {
-        w: std::sync::Arc<embed_cpu_kernels::PackedW>,
+        w: std::sync::Arc<premium_discount_cpu_kernels::PackedW>,
         bias: Option<std::sync::Arc<[f32]>>,
     },
 }
@@ -516,7 +516,7 @@ impl ProjKind {
             let w_t = l.weight().contiguous()?;
             let (out_dim, in_dim) = w_t.dims2()?;
             let w_vec = w_t.flatten_all()?.to_vec1::<f32>()?;
-            let packed = embed_cpu_kernels::PackedW::pack_padded(&w_vec, out_dim, in_dim);
+            let packed = premium_discount_cpu_kernels::PackedW::pack_padded(&w_vec, out_dim, in_dim);
             let bias = match l.bias() {
                 Some(b) => Some(std::sync::Arc::<[f32]>::from(
                     b.to_dtype(DType::F32)?.contiguous()?.to_vec1::<f32>()?,
@@ -551,14 +551,14 @@ impl Module for ProjKind {
                     .flatten_all()?
                     .to_vec1::<f32>()?;
                 let mut out = vec![0.0f32; m * w.n_valid];
-                embed_cpu_kernels::gemm_bias(
+                premium_discount_cpu_kernels::gemm_bias(
                     &x_vec,
                     m,
                     w,
                     bias.as_deref(),
                     &mut out,
-                    embed_cpu_kernels::Blocking::default(),
-                    embed_cpu_kernels::Epilogue::Store,
+                    premium_discount_cpu_kernels::Blocking::default(),
+                    premium_discount_cpu_kernels::Epilogue::Store,
                     rayon::current_num_threads().max(1),
                 );
                 if let Some(last) = dims.last_mut() {

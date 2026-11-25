@@ -1255,7 +1255,7 @@ fn banks_fingerprint(banks: &[(String, Vec<Vec<f32>>, Vec<f32>)]) -> u64 {
 }
 
 /// 최근 정화 결과. 라벨 뱅크 · 스칼라 뱅크처럼 한 회차에 쓰는 뱅크는 몇 개뿐입니다.
-const PURGE_MEMO_CAP: usize = 4;
+const PURGE_MEMO_CAP: usize = 32;
 static PURGE_MEMO: once_cell::sync::Lazy<std::sync::Mutex<Vec<(u64, std::sync::Arc<PurgeView>)>>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(Vec::new()));
 

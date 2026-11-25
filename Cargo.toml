@@ -1,6 +1,6 @@
 # logis-center 루트 작업 공간.
 #
-#   crates/             logis-* 와 직접 짠 CPU 커널(embed-cpu-kernels · ggml-kquant). Tauri · LanceDB 를 모르는 도메인 · 엔진 라이브러리 (candle · tokio 는 모델 엔진 logis-llm · 문서 비전 logis-vision-doc 만 씀)
+#   crates/             logis-* 도메인 · 엔진 라이브러리 (CPU 커널 · 블록 인코더는 premium-discount-cpu-kernels / premium-discount-quant · lv-kernels / lv-doc / lv-core 사용)
 #   apps/core           헤드리스 코어 logis-app (모델 상주 · LanceDB 저장소 · 스케줄러 · 검색, Tauri 없음)
 #   apps/desktop        데스크톱 앱의 얇은 Tauri 셸 (명령 · 창 · 브라우저 자동화 · TauriSink). 프런트엔드는 web/desktop
 #   apps/mobile         모바일 Tauri 셸 (작업 공간 밖). 외부 코드는 vendor/, 서버(Workers)는 workers/
@@ -57,16 +57,24 @@ logis-vision-doc = { path = "crates/logis-vision-doc" }
 # 헤드리스 코어 (apps/core): 모델 상주 · 저장소 · 스케줄러 · 검색. Tauri 셸(apps/desktop)이 재수출합니다.
 logis-app = { path = "apps/core" }
 
-# premium-discount 공용 라이브러리 (raon-zena 와 같은 리비전).
+# premium-discount 공용 라이브러리 (Tier 0 PD_LIB_PIN_REV 고정).
 # 로컬 ../premium-discount 로 같이 고칠 때는 아래 [patch."https://github.com/Qntology/premium-discount"] 의 주석을 푼다.
-premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38" }
-premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38" }
-premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38" }
-premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38" }
+premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-cpu-kernels = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-eval = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
 # AI 엔진: Stanza (ONNX Runtime, 실행할 때 불러옴) · granite 임베딩 인코더 (candle). logis 쪽은 이 위의 얇은 층입니다.
-premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38", default-features = false }
-# 스팬 NMS (Stanza 역할 · granite 임베딩 위의 의미 NMS). 아직 쓰는 crate 는 없습니다 — 이 앱의 NMS 는 비전 패치(logis-vision-doc nms_arena)뿐.
-premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38" }
+premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675", default-features = false }
+premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+
+# louis-vision Tier 1 통합 비전 · 도메인 · 에이전트 코어 (LV_LIB_PIN_REV 고정, 무통신/무DB/무SAM).
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-core = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-doc = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6", default-features = false }
+lv-domain = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-agent = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
 
 # candle-rocm-vulkan 포크: premium-discount (crates/ · app/) · raon-zena 와 같은 커밋으로 고정한다.
 # 예전에는 branch = "master" 를 따라가고 커밋은 Cargo.lock 이 정했다 (60ec257, ebaf93d 의 조상).
@@ -110,9 +118,11 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.gemm-f64]
 opt-level = 3
-[profile.dev.package.embed-cpu-kernels]
+[profile.dev.package.lv-kernels]
 opt-level = 3
-[profile.dev.package.ggml-kquant]
+[profile.dev.package.lv-core]
+opt-level = 3
+[profile.dev.package.lv-doc]
 opt-level = 3
 [profile.dev.package.half]
 opt-level = 3

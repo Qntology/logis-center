@@ -7,7 +7,7 @@
 
 use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType};
 use candle_core::Device;
-use ggml_kquant::{encode, fit_asymmetric, fit_symmetric, importance, rel, Format};
+use premium_discount_quant::kquant::{encode, fit_asymmetric, fit_symmetric, importance, rel, Format};
 
 type R = anyhow::Result<()>;
 

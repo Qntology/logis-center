@@ -111,7 +111,7 @@ where
     }
     let cols: Vec<&[f32]> = patch_embs.iter().map(|p| p.as_slice()).collect();
     let dots = PatchPhraseDots::compute(&rows, &cols);
-    let patch_norm: Vec<f32> = patch_embs.iter().map(|p| embed_cpu_kernels::l2_norm_seq(p)).collect();
+    let patch_norm: Vec<f32> = patch_embs.iter().map(|p| lv_kernels::l2_norm_seq(p)).collect();
 
     for claim in claims.iter() {
         let v = claim.value.trim();
@@ -139,7 +139,7 @@ where
 
         // 전 패치 코사인 (cosine_similarity 와 같은 식: 내적 / (‖값‖ · ‖패치‖), 노름 0 이면 0)
         let r = row.unwrap();
-        let na = embed_cpu_kernels::l2_norm_seq(rows[r]);
+        let na = lv_kernels::l2_norm_seq(rows[r]);
         let sims: Vec<f32> = (0..n)
             .map(|i| {
                 let nb = patch_norm[i];

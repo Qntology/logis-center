@@ -1655,18 +1655,18 @@ impl RestRescueGuard {
                 let off = self.src.start + (rid as usize) * rb;
                 let raw = &self.src.map[off..off + rb];
                 if let Some(tn) = target_norm_cpu {
-                    embed_cpu_kernels::q8::score_q8_0_prejudice_simd(raw, h_row, tn)
+                    premium_discount_cpu_kernels::q8::score_q8_0_prejudice_simd(raw, h_row, tn)
                 } else {
-                    embed_cpu_kernels::q8::dot_q8_0_f32_simd(raw, h_row)
+                    premium_discount_cpu_kernels::q8::dot_q8_0_f32_simd(raw, h_row)
                 }
             }
             GgmlDType::F16 => {
                 let off = self.src.start + (rid as usize) * rb;
                 let raw = &self.src.map[off..off + rb];
                 if let Some(tn) = target_norm_cpu {
-                    embed_cpu_kernels::q8::score_f16_prejudice_simd(raw, h_row, tn)
+                    premium_discount_cpu_kernels::q8::score_f16_prejudice_simd(raw, h_row, tn)
                 } else {
-                    embed_cpu_kernels::q8::dot_f16_f32_simd(raw, h_row)
+                    premium_discount_cpu_kernels::q8::dot_f16_f32_simd(raw, h_row)
                 }
             }
             _ => {
@@ -1677,7 +1677,7 @@ impl RestRescueGuard {
                 }
                 kquant_scratch.clear();
                 kquant_scratch.extend_from_slice(&vals);
-                let raw = embed_cpu_kernels::dot_f32_simd(h_row, kquant_scratch);
+                let raw = premium_discount_cpu_kernels::dot_f32_simd(h_row, kquant_scratch);
                 if let Some(tn) = target_norm_cpu {
                     raw - crate::models::common::prejudice::scalar_prejudice(kquant_scratch, tn)
                 } else {
@@ -1742,11 +1742,11 @@ impl RestRescueGuard {
             return Ok((best_id, best_val, 1, self.rest_ids.len()));
         };
 
-        let hn = embed_cpu_kernels::dot_f32_simd(h_row, h_row).sqrt();
+        let hn = premium_discount_cpu_kernels::dot_f32_simd(h_row, h_row).sqrt();
         let c = cg.radius.len();
         let mut bounds: Vec<(f32, usize)> = (0..c)
             .map(|j| {
-                let ch = embed_cpu_kernels::dot_f32_simd(&cg.centers[j * cols..(j + 1) * cols], h_row);
+                let ch = premium_discount_cpu_kernels::dot_f32_simd(&cg.centers[j * cols..(j + 1) * cols], h_row);
                 let rh = cg.radius[j] * hn;
                 let ub = ch + rh + 1e-3 * (ch.abs() + rh) + 1e-4;
                 (ub, j)
@@ -1837,7 +1837,7 @@ impl RestRescueGuard {
                 let deq = self.src.gather(chunk, &Device::Cpu)?.dequantize(&Device::Cpu)?;
                 let vals = deq.flatten_all()?.to_vec1::<f32>()?;
                 if let Some((local_idx, local_val)) =
-                    embed_cpu_kernels::dot_argmax_rows_f32(h_row, &vals, chunk.len(), cols)
+                    premium_discount_cpu_kernels::dot_argmax_rows_f32(h_row, &vals, chunk.len(), cols)
                 {
                     if local_idx < chunk.len() {
                         best = better(best, (chunk[local_idx], local_val));
@@ -1884,7 +1884,7 @@ impl RestRescueGuard {
                             continue;
                         }
                         let off = self.src.start + (rid as usize) * rb;
-                        let v = embed_cpu_kernels::q8::dot_q8_0_f32_simd(
+                        let v = premium_discount_cpu_kernels::q8::dot_q8_0_f32_simd(
                             &self.src.map[off..off + rb],
                             h_row,
                         );
@@ -1906,7 +1906,7 @@ impl RestRescueGuard {
                 let deq = self.src.gather(chunk, &Device::Cpu)?.dequantize(&Device::Cpu)?;
                 let vals = deq.flatten_all()?.to_vec1::<f32>()?;
                 for (i, row) in vals.chunks_exact(cols).enumerate() {
-                    let v = embed_cpu_kernels::dot_f32_simd(h_row, row);
+                    let v = premium_discount_cpu_kernels::dot_f32_simd(h_row, row);
                     out.push((chunk[i], v));
                 }
             }
@@ -2688,8 +2688,8 @@ impl TrimmedHead {
                 .flatten_all()?
                 .to_vec1::<f32>()?;
             let mu_host = guard.cs_guard.mu_rest.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
-            let xx = embed_cpu_kernels::dot_f32_simd(&h_host, &h_host);
-            let xm = embed_cpu_kernels::dot_f32_simd(&h_host, &mu_host);
+            let xx = premium_discount_cpu_kernels::dot_f32_simd(&h_host, &h_host);
+            let xm = premium_discount_cpu_kernels::dot_f32_simd(&h_host, &mu_host);
             let upper = xx.sqrt().mul_add(guard.cs_guard.w_rest_bound, xm) + guard.cs_guard.b_rest_max;
             if top[0].1 < upper {
                 rescued = true;
@@ -2795,8 +2795,8 @@ impl TrimmedHead {
                     .flatten_all()?
                     .to_vec1::<f32>()?;
                 let mu_host = guard.cs_guard.mu_rest.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
-                let xx = embed_cpu_kernels::dot_f32_simd(&h_host, &h_host);
-                let xm = embed_cpu_kernels::dot_f32_simd(&h_host, &mu_host);
+                let xx = premium_discount_cpu_kernels::dot_f32_simd(&h_host, &h_host);
+                let xm = premium_discount_cpu_kernels::dot_f32_simd(&h_host, &mu_host);
                 let u_cs = xx.sqrt().mul_add(guard.cs_guard.w_rest_bound, xm) + guard.cs_guard.b_rest_max;
 
                 let needs_rescue = if cfg.temperature <= 0.0 {

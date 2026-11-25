@@ -91,7 +91,7 @@ impl Siglip2Attention {
             let vv = v.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
             let stride = seq_len * hidden;
             let mut out = vec![0.0f32; b * stride];
-            let cfg = embed_cpu_kernels::attn::CpuStreamAttnCfg {
+            let cfg = lv_kernels::attn::CpuStreamAttnCfg {
                 num_heads: self.num_heads,
                 num_kv_heads: self.num_heads,
                 head_dim: self.head_dim,
@@ -100,7 +100,7 @@ impl Siglip2Attention {
                 past_offset: 0,
             };
             for bi in 0..b {
-                embed_cpu_kernels::attn::stream_attention_f32(
+                lv_kernels::attn::stream_attention_f32(
                     &qv[bi * stride..(bi + 1) * stride],
                     &kv[bi * stride..(bi + 1) * stride],
                     &vv[bi * stride..(bi + 1) * stride],

@@ -43,8 +43,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use ggml_kquant::Format;
 use once_cell::sync::Lazy;
+use premium_discount_quant::kquant::{self as ggml_kquant, Format};
 
 use logis_llm::lang_gguf::StFile;
 
@@ -457,7 +457,7 @@ pub enum SLinear {
     /// `cols` 는 저장한 입력 폭(0 으로 채운 폭). 활성이 더 좁으면 0 을 채워 곱합니다.
     Quant { w: candle_core::quantized::QMatMul, b: Option<Tensor>, cols: usize },
     CpuPacked {
-        w: std::sync::Arc<embed_cpu_kernels::PackedW>,
+        w: std::sync::Arc<lv_kernels::PackedW>,
         bias: Option<std::sync::Arc<[f32]>>,
         in_dim: usize,
         out_dim: usize,
@@ -470,7 +470,7 @@ impl SLinear {
         let w_t = l.weight().to_dtype(DType::F32)?.contiguous()?;
         let (out_dim, in_dim) = w_t.dims2()?;
         let w_vec = w_t.flatten_all()?.to_vec1::<f32>()?;
-        let packed = embed_cpu_kernels::PackedW::pack_padded(&w_vec, out_dim, in_dim);
+        let packed = lv_kernels::PackedW::pack_padded(&w_vec, out_dim, in_dim);
         let bias = match l.bias() {
             Some(b) => {
                 let bv = b.to_dtype(DType::F32)?.contiguous()?.to_vec1::<f32>()?;
@@ -489,7 +489,7 @@ impl SLinear {
     fn forward_with_epilogue(
         &self,
         x: &Tensor,
-        epi: embed_cpu_kernels::Epilogue,
+        epi: lv_kernels::Epilogue,
     ) -> candle_core::Result<Tensor> {
         match self {
             SLinear::CpuPacked { w, bias, in_dim, out_dim }
@@ -505,13 +505,13 @@ impl SLinear {
                 let x_vec = x_c.flatten_all()?.to_vec1::<f32>()?;
                 let mut out = vec![0.0f32; m * out_dim];
                 let threads = rayon::current_num_threads().max(1);
-                embed_cpu_kernels::gemm_bias(
+                lv_kernels::gemm_bias(
                     &x_vec,
                     m,
                     w,
                     bias.as_deref(),
                     &mut out,
-                    embed_cpu_kernels::Blocking::default(),
+                    lv_kernels::Blocking::default(),
                     epi,
                     threads,
                 );
@@ -523,7 +523,7 @@ impl SLinear {
             other => {
                 let y = candle_core::Module::forward(other, x)?;
                 match epi {
-                    embed_cpu_kernels::Epilogue::Gelu => y.gelu(),
+                    lv_kernels::Epilogue::Gelu => y.gelu(),
                     _ => Ok(y),
                 }
             }
@@ -532,7 +532,7 @@ impl SLinear {
 
     /// `CpuPacked` 경로에서 `Linear + bias + GELU` 를 1패스 에필로그로 융합 실행합니다.
     pub fn forward_gelu(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        self.forward_with_epilogue(x, embed_cpu_kernels::Epilogue::Gelu)
+        self.forward_with_epilogue(x, lv_kernels::Epilogue::Gelu)
     }
 }
 
@@ -556,7 +556,7 @@ impl candle_core::Module for SLinear {
                 }
             }
             SLinear::CpuPacked { .. } => {
-                self.forward_with_epilogue(x, embed_cpu_kernels::Epilogue::Store)
+                self.forward_with_epilogue(x, lv_kernels::Epilogue::Store)
             }
         }
     }
@@ -581,7 +581,7 @@ pub fn fast_layer_norm(ln: &candle_nn::LayerNorm, x: &Tensor, eps: f32) -> candl
         None => None,
     };
     let mut out = vec![0.0f32; x_vec.len()];
-    embed_cpu_kernels::layer_norm(&x_vec, h, &w_vec, b_vec.as_deref(), eps, &mut out);
+    lv_kernels::layer_norm(&x_vec, h, &w_vec, b_vec.as_deref(), eps, &mut out);
     Tensor::from_vec(out, dims.as_slice(), x.device())
 }
 

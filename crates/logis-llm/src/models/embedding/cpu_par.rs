@@ -27,7 +27,7 @@ fn with_cpu_f32<R>(x: &Tensor, f: impl FnOnce(&[f32]) -> R) -> Option<R> {
 pub fn powf2(x: &Tensor) -> Result<Tensor> {
     let par = with_cpu_f32(x, |s| {
         let mut o = vec![0f32; s.len()];
-        embed_cpu_kernels::powf2(s, &mut o);
+        premium_discount_cpu_kernels::powf2(s, &mut o);
         o
     });
     match par {
@@ -42,7 +42,7 @@ pub fn silu_mul_halves(x: &Tensor) -> Result<Tensor> {
     let i = last / 2;
     let par = with_cpu_f32(x, |s| {
         let mut o = vec![0f32; s.len() / 2];
-        embed_cpu_kernels::silu_mul_halves(s, i, &mut o);
+        premium_discount_cpu_kernels::silu_mul_halves(s, i, &mut o);
         o
     });
     match par {

@@ -4606,7 +4606,8 @@ pub fn currency_code_of(raw: &str) -> Option<&'static str> {
 }
 
 pub fn default_currency_for_lang(doc_lang: &str) -> &'static str {
-    match doc_lang {
+    let canon = crate::scripts::canonical_lang_tag(doc_lang);
+    match canon.as_str() {
         "ko" => "KRW",
         "ja" => "JPY",
         "zh" | "zh-tw" | "zh-hk" | "zh-hans" => "CNY",

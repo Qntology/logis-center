@@ -102,39 +102,57 @@ static LANG_SPECS: &[LangSpec] = &[
     LangSpec { iso1: "te", iso3: "tel", tier: LangTier::Extended, scripts: &[ScriptKind::Other], latin_dominant: false },
 ];
 
+/// Canonicalize BCP-47 / free-form language labels (B16 lowercase trim, B24 `"Traditional Chinese"` -> `"zh-tw"`).
+pub fn canonical_lang_tag(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase().replace('_', "-");
+    if lower.is_empty() {
+        return String::new();
+    }
+    match lower.as_str() {
+        "traditional chinese" | "chinese (traditional)" | "zh-hant" | "zh-tw" | "zh-hk" | "zh-mo" => {
+            "zh-tw".to_string()
+        }
+        "simplified chinese" | "chinese (simplified)" | "zh-hans" | "zh-cn" | "zh-sg" => {
+            "zh-hans".to_string()
+        }
+        "korean" => "ko".to_string(),
+        "english" => "en".to_string(),
+        "japanese" => "ja".to_string(),
+        "chinese" => "zh".to_string(),
+        "french" => "fr".to_string(),
+        "german" => "de".to_string(),
+        "spanish" => "es".to_string(),
+        "italian" => "it".to_string(),
+        "portuguese" => "pt".to_string(),
+        "dutch" => "nl".to_string(),
+        "arabic" => "ar".to_string(),
+        "czech" => "cs".to_string(),
+        "russian" => "ru".to_string(),
+        "ukrainian" => "uk".to_string(),
+        "thai" => "th".to_string(),
+        "hindi" => "hi".to_string(),
+        "bengali" => "bn".to_string(),
+        "greek" => "el".to_string(),
+        "hebrew" | "iw" => "he".to_string(),
+        "persian" | "farsi" => "fa".to_string(),
+        "urdu" => "ur".to_string(),
+        "vietnamese" => "vi".to_string(),
+        "indonesian" => "id".to_string(),
+        "turkish" => "tr".to_string(),
+        "polish" => "pl".to_string(),
+        "nb" | "nn" => "no".to_string(),
+        _ => lower,
+    }
+}
+
 /// Static language specification lookup (replaces bias-derived script detection; fixes `ar` and `ru`/`th`/`hi`).
 pub fn lang_spec(doc_lang: &str) -> Option<&'static LangSpec> {
-    let lower = doc_lang.trim().to_ascii_lowercase();
-    if lower.is_empty() {
+    let canon = canonical_lang_tag(doc_lang);
+    if canon.is_empty() {
         return None;
     }
-    let mapped = match lower.as_str() {
-        "korean" => "ko",
-        "english" => "en",
-        "japanese" => "ja",
-        "chinese" | "zh-cn" | "zh-tw" | "zh-hk" | "zh-hans" | "zh-hant" => "zh",
-        "french" => "fr",
-        "german" => "de",
-        "spanish" => "es",
-        "italian" => "it",
-        "portuguese" => "pt",
-        "dutch" => "nl",
-        "arabic" => "ar",
-        "czech" => "cs",
-        "russian" => "ru",
-        "ukrainian" => "uk",
-        "thai" => "th",
-        "hindi" => "hi",
-        "bengali" => "bn",
-        "greek" => "el",
-        "hebrew" | "iw" => "he",
-        "persian" | "farsi" => "fa",
-        "urdu" => "ur",
-        "vietnamese" => "vi",
-        "indonesian" => "id",
-        "turkish" => "tr",
-        "polish" => "pl",
-        "nb" | "nn" => "no",
+    let mapped = match canon.as_str() {
+        "zh-cn" | "zh-tw" | "zh-hk" | "zh-hans" | "zh-hant" => "zh",
         other => other.split(|c: char| c == '-' || c == '_').next().unwrap_or(other),
     };
     LANG_SPECS

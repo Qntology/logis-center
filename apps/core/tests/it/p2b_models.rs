@@ -385,7 +385,7 @@ fn p2b_lm_head_cost() -> R {
 #[ignore = "GPU (LOGIS_TEST_MODELS=1)"]
 fn p2b_qmatmul_parity() -> R {
     use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul};
-    use ggml_kquant::Format;
+    use premium_discount_quant::kquant::{self as ggml_kquant, Format};
     if !enabled() {
         return Ok(());
     }

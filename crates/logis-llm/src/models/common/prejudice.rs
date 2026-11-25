@@ -34,8 +34,9 @@ pub fn scalar_prejudice(w_row: &[f32], target_norm: &[f32]) -> f32 {
     if w_row.len() != target_norm.len() || w_row.is_empty() {
         return 0.0;
     }
-    let (dot_wt, norm_w_sq) = embed_cpu_kernels::dot_and_norm_sq_f32_simd(w_row, target_norm);
-    embed_cpu_kernels::prejudice_from_stats(dot_wt, norm_w_sq)
+    let (dot_wt, norm_w_sq) =
+        premium_discount_cpu_kernels::dot_and_norm_sq_f32_simd(w_row, target_norm);
+    premium_discount_cpu_kernels::q8::prejudice_from_stats(dot_wt, norm_w_sq)
 }
 
 /// Look up or build a chunked F32 prejudice vector using a row-block provider closure
