@@ -27,6 +27,23 @@ pub struct Task {
     pub status: i32,      
 }
 
+/// [`VectorStore::upsert_chunks_bulk`] 용 단일 청크 행 페이로드.
+#[derive(Debug, Clone)]
+pub struct ChunkUpsertRow {
+    pub chunk_id: String,
+    pub item_id: String,
+    pub item_type: String,
+    pub chunk_text: String,
+    pub property: String,
+    pub property_format: String,
+    pub value_part: String,
+    pub vector: Option<Vec<f32>>,
+    pub cc: Option<String>,
+    pub bcc: Option<String>,
+    pub ref_val: Option<String>,
+    pub mode: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct VectorStore {
     conn: Connection,
@@ -2302,6 +2319,103 @@ impl VectorStore {
             )])),
         ])?;
 
+        table.add(vec![batch]).execute().await?;
+        Ok(())
+    }
+
+    /// 다수의 청크 행을 단일 Arrow `RecordBatch` 와 단일 `table.add` 커밋으로 벌크 업서트합니다.
+    /// 행마다 `open_table` / `delete` / `add` 를 반복하며 발생하던 LanceDB 프래그먼트 폭증을 제거합니다.
+    pub async fn upsert_chunks_bulk(&self, rows: &[ChunkUpsertRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let table = self.conn.open_table("item_chunks").execute().await?;
+        let escaped_ids: Vec<String> = rows
+            .iter()
+            .map(|r| format!("'{}'", r.chunk_id.replace('\'', "''")))
+            .collect();
+        let _ = table
+            .delete(&format!("chunk_id IN ({})", escaped_ids.join(", ")))
+            .await;
+
+        let n = rows.len();
+        let now = chrono::Utc::now().timestamp_millis();
+        let emb_ver = format!(
+            "v3:format-aware(chunk+anchor+leafvalue)/{}",
+            crate::models::embedding::forward_mode().space_tag()
+        );
+
+        let mut chunk_ids = Vec::with_capacity(n);
+        let mut item_ids = Vec::with_capacity(n);
+        let mut item_types = Vec::with_capacity(n);
+        let mut chunk_texts = Vec::with_capacity(n);
+        let mut properties = Vec::with_capacity(n);
+        let mut property_formats = Vec::with_capacity(n);
+        let mut value_parts = Vec::with_capacity(n);
+        let mut flat_vecs = Vec::with_capacity(n * 384);
+        let mut ccs = Vec::with_capacity(n);
+        let mut bccs = Vec::with_capacity(n);
+        let mut refs = Vec::with_capacity(n);
+        let mut modes = Vec::with_capacity(n);
+        let mut ts = Vec::with_capacity(n);
+        let mut vers = Vec::with_capacity(n);
+
+        for row in rows {
+            chunk_ids.push(row.chunk_id.as_str());
+            item_ids.push(row.item_id.as_str());
+            item_types.push(row.item_type.as_str());
+            chunk_texts.push(row.chunk_text.as_str());
+            properties.push(row.property.as_str());
+            property_formats.push(row.property_format.as_str());
+            value_parts.push(row.value_part.as_str());
+            match &row.vector {
+                Some(v) if v.len() == 384 => {
+                    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        flat_vecs.extend(v.iter().map(|x| x / norm));
+                    } else {
+                        flat_vecs.extend_from_slice(v);
+                    }
+                }
+                _ => flat_vecs.extend(std::iter::repeat_n(0.0f32, 384)),
+            }
+            ccs.push(row.cc.as_deref().unwrap_or(""));
+            bccs.push(row.bcc.as_deref().unwrap_or(""));
+            refs.push(row.ref_val.as_deref().unwrap_or(""));
+            modes.push(row.mode.as_deref().unwrap_or("commerce"));
+            ts.push(now);
+            vers.push(emb_ver.as_str());
+        }
+
+        let values_builder = Float32Array::from(flat_vecs);
+        let list_field = Field::new("item", DataType::Float32, true);
+        let list_array = FixedSizeListArray::try_new(
+            Arc::new(list_field),
+            384,
+            Arc::new(values_builder),
+            None,
+        )?;
+        let schema = table.schema().await?;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(chunk_ids)),
+                Arc::new(StringArray::from(item_ids)),
+                Arc::new(StringArray::from(item_types)),
+                Arc::new(StringArray::from(chunk_texts)),
+                Arc::new(StringArray::from(properties)),
+                Arc::new(StringArray::from(property_formats)),
+                Arc::new(StringArray::from(value_parts)),
+                Arc::new(list_array),
+                Arc::new(StringArray::from(ccs)),
+                Arc::new(StringArray::from(bccs)),
+                Arc::new(StringArray::from(refs)),
+                Arc::new(StringArray::from(modes)),
+                Arc::new(Int64Array::from(ts.clone())),
+                Arc::new(Int64Array::from(ts)),
+                Arc::new(StringArray::from(vers)),
+            ],
+        )?;
         table.add(vec![batch]).execute().await?;
         Ok(())
     }

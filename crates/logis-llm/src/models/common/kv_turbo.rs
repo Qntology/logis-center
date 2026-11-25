@@ -22,6 +22,47 @@ pub const TQ_META_MAGIC: u32 = 0x564B_5154;
 /// 형식 버전. 저장 구조가 바뀌면 올립니다.
 pub const TQ_META_VERSION: u32 = 1;
 
+#[cfg(feature = "turbo-quant")]
+pub use candle_nn::kv_offload::SuperSlabBundle;
+#[cfg(feature = "turbo-quant")]
+pub use candle_nn::vision_decode::{
+    DeltaRope, HeteroMultimodalKvCache, VisMicroPageIndex, VisOcrNgramDraft,
+};
+
+/// Attention Sink (앞 4~16 토큰) 및 경계 레이어(`0`, `num_layers - 1`)를 저비트 KV 압축에서
+/// 보호하기 위한 정밀도 가드 정책 (Part 1 / Part 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvLayerProtectionPolicy {
+    /// 항상 비압축(또는 FP8 이상 고정밀)으로 유지할 초기 Attention Sink 토큰 수.
+    pub sink_tokens: usize,
+    /// 첫 번째·마지막 어텐션 레이어(`0`, `num_layers - 1`) 보호 여부.
+    pub protect_edge_layers: bool,
+}
+
+impl Default for KvLayerProtectionPolicy {
+    fn default() -> Self {
+        Self {
+            sink_tokens: 8,
+            protect_edge_layers: true,
+        }
+    }
+}
+
+impl KvLayerProtectionPolicy {
+    /// 주어진 `(layer_idx, num_layers)` 가 저비트(4bit) 압축을 건너뛰고 고정밀(FP8/FP16)을
+    /// 유지해야 하는 경계 레이어인지 판정합니다.
+    #[inline]
+    pub fn is_protected_layer(&self, layer_idx: usize, num_layers: usize) -> bool {
+        self.protect_edge_layers && (layer_idx == 0 || (num_layers > 0 && layer_idx + 1 == num_layers))
+    }
+
+    /// 토큰 위치 `token_pos` 가 Attention Sink 보호 구간에 속하는지 판정합니다.
+    #[inline]
+    pub fn is_sink_token(&self, token_pos: usize) -> bool {
+        token_pos < self.sink_tokens
+    }
+}
+
 #[cfg(not(feature = "turbo-quant"))]
 const NO_FEATURE: &str =
     "turbo-kv: 이 빌드는 turbo-quant feature 없이 컴파일되어 TurboQuant 블록을 만들거나 읽을 수 없습니다";
@@ -1065,4 +1106,21 @@ pub fn flash_history_attention(
     let k = if ks.len() == 1 { ks.remove(0) } else { Tensor::cat(&ks, 2)? }.contiguous()?;
     let v = if vs.len() == 1 { vs.remove(0) } else { Tensor::cat(&vs, 2)? }.contiguous()?;
     Ok(candle_nn::flash_attn::flash_attn_bhsd(&q.contiguous()?, &k, &v, &cfg)?)
+}
+
+#[cfg(test)]
+mod protection_policy_tests {
+    use super::KvLayerProtectionPolicy;
+
+    #[test]
+    fn default_policy_protects_sinks_and_edge_layers() {
+        let p = KvLayerProtectionPolicy::default();
+        assert!(p.is_sink_token(0));
+        assert!(p.is_sink_token(7));
+        assert!(!p.is_sink_token(8));
+        assert!(p.is_protected_layer(0, 28));
+        assert!(p.is_protected_layer(27, 28));
+        assert!(!p.is_protected_layer(1, 28));
+        assert!(!p.is_protected_layer(14, 28));
+    }
 }

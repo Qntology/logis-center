@@ -268,12 +268,11 @@ impl OffloadPrefetcher {
     }
 
     fn alloc_synced_dst(&self, shape: &Shape, dtype: DType) -> Result<Tensor> {
-        let dst = Tensor::zeros(shape, dtype, &self.device)?;
-        // Ensure compute-stream zero-init finishes before copy-stream DMA writes into `dst`.
-        if self.device.is_cuda() || self.device.is_rocm() {
-            self.device.synchronize()?;
-        }
-        Ok(dst)
+        // `CopyStream::upload` in both `cuda_backend::offload` and `rocm_backend::offload`
+        // records a non-blocking event on the compute stream and calls `StreamWaitEvent` on
+        // the copy stream before issuing the DMA write, so the compute-stream allocation /
+        // zero-init is ordered ahead of the DMA without stalling the host CPU.
+        Ok(Tensor::zeros(shape, dtype, &self.device)?)
     }
 
     /// Orders subsequent kernels on the device compute stream after any queued async DMA upload

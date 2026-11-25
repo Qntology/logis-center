@@ -711,15 +711,17 @@ pub fn maybe_run_cli_probe(args: &[String]) -> Option<i32> {
         "rocm" => crate::utils::new_gpu_device(gpu_id)
             .ok_or_else(|| anyhow::anyhow!("failed to open ROCm device {gpu_id}")),
         #[cfg(feature = "vulkan")]
-        "vulkan" => {
-            let d = Device::new_vulkan(gpu_id)?;
-            if let Device::Vulkan(ref vd) = d {
-                if vd.device_type() == "cpu" && std::env::var_os("LOGIS_REQUIRE_GPU").is_some() {
-                    anyhow::bail!("software Vulkan adapter (type=cpu) rejected under LOGIS_REQUIRE_GPU=1");
-                }
+        "vulkan" => match Device::new_vulkan(gpu_id) {
+            Ok(Device::Vulkan(ref vd))
+                if vd.device_type() == "cpu" && std::env::var_os("LOGIS_REQUIRE_GPU").is_some() =>
+            {
+                Err(anyhow::anyhow!(
+                    "software Vulkan adapter (type=cpu) rejected under LOGIS_REQUIRE_GPU=1"
+                ))
             }
-            Ok(d)
-        }
+            Ok(d) => Ok(d),
+            Err(e) => Err(e.into()),
+        },
         #[cfg(feature = "metal")]
         "metal" => Device::new_metal(gpu_id).map_err(Into::into),
         other => Err(anyhow::anyhow!("unsupported backend '{other}' in this build")),

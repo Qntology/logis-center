@@ -437,6 +437,13 @@ impl Module for GateUpDownMLP {
                 return mid_t.apply(&self.down_proj);
             }
         }
+        if matches!(self.act_fn, Activation::Silu) {
+            if let GateUpProj::Split { gate, up } = &self.gate_up {
+                if let Some(mid) = gguf::ProjKind::try_fused_gate_up_silu(gate, up, xs)? {
+                    return mid.apply(&self.down_proj);
+                }
+            }
+        }
         let (gate, up) = match &self.gate_up {
             GateUpProj::Fused { gate_up, inter_dim } => {
                 let gu = gate_up.forward(xs)?;
