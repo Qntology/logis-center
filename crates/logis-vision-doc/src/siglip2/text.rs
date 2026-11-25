@@ -299,7 +299,7 @@ impl TextAttention {
             };
             let stride = seq_len * hidden;
             let mut out = vec![0.0f32; b * stride];
-            let cfg = embed_cpu_kernels::attn::CpuStreamAttnCfg {
+            let cfg = lv_kernels::attn::CpuStreamAttnCfg {
                 num_heads: self.num_heads,
                 num_kv_heads: self.num_heads,
                 head_dim: self.head_dim,
@@ -311,7 +311,7 @@ impl TextAttention {
                 let km = mask_vec
                     .as_deref()
                     .map(|mv| &mv[bi * seq_len..(bi + 1) * seq_len]);
-                embed_cpu_kernels::attn::stream_attention_f32_masked(
+                lv_kernels::attn::stream_attention_f32_masked(
                     &qv[bi * stride..(bi + 1) * stride],
                     &kv[bi * stride..(bi + 1) * stride],
                     &vv[bi * stride..(bi + 1) * stride],

@@ -3,6 +3,22 @@
 version = 4
 
 [[package]]
+name = "ab_glyph"
+version = "0.2.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01c0457472c38ea5bd1c3b5ada5e368271cb550be7a4ca4a0b4634e9913f6cc2"
+dependencies = [
+ "ab_glyph_rasterizer",
+ "owned_ttf_parser",
+]
+
+[[package]]
+name = "ab_glyph_rasterizer"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1118,7 +1134,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "rand 0.9.5",
- "rand_distr",
+ "rand_distr 0.5.1",
  "rayon",
  "safetensors 0.8.0",
  "thiserror 2.0.21",
@@ -3034,14 +3050,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "embed-cpu-kernels"
-version = "0.1.0"
-dependencies = [
- "half",
- "rayon",
-]
-
-[[package]]
 name = "embed-resource"
 version = "3.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3358,7 +3366,7 @@ dependencies = [
  "half",
  "num-traits",
  "rand 0.9.5",
- "rand_distr",
+ "rand_distr 0.5.1",
 ]
 
 [[package]]
@@ -4013,14 +4021,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ggml-kquant"
-version = "0.1.0"
-dependencies = [
- "half",
- "rayon",
-]
-
-[[package]]
 name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4219,7 +4219,7 @@ dependencies = [
  "crunchy",
  "num-traits",
  "rand 0.9.5",
- "rand_distr",
+ "rand_distr 0.5.1",
  "zerocopy",
 ]
 
@@ -4806,6 +4806,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "imageproc"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "602b4e8a4cc3e98372b766cd184ab532999bc0e839b7469e759511ccabc65d77"
+dependencies = [
+ "ab_glyph",
+ "approx",
+ "getrandom 0.2.17",
+ "image",
+ "itertools 0.12.1",
+ "nalgebra 0.32.6",
+ "num",
+ "rand 0.8.8",
+ "rand_distr 0.4.3",
+ "rayon",
+]
+
+[[package]]
 name = "imgref"
 version = "1.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4926,6 +4944,15 @@ checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
 dependencies = [
  "is-docker",
  "once_cell",
+]
+
+[[package]]
+name = "itertools"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+dependencies = [
+ "either",
 ]
 
 [[package]]
@@ -5399,7 +5426,7 @@ dependencies = [
  "half",
  "hex",
  "rand 0.9.5",
- "rand_distr",
+ "rand_distr 0.5.1",
  "rand_xoshiro",
 ]
 
@@ -5532,7 +5559,7 @@ dependencies = [
  "lance-tokenizer",
  "libsais-rs",
  "log",
- "nalgebra",
+ "nalgebra 0.33.3",
  "ndarray 0.16.1",
  "num-traits",
  "object_store 0.14.2",
@@ -5540,7 +5567,7 @@ dependencies = [
  "prost-build",
  "prost-types",
  "rand 0.9.5",
- "rand_distr",
+ "rand_distr 0.5.1",
  "rangemap",
  "rayon",
  "regex-syntax",
@@ -6135,7 +6162,6 @@ dependencies = [
  "dirs 6.0.0",
  "encoding_rs",
  "futures",
- "ggml-kquant",
  "image",
  "io-uring",
  "lancedb",
@@ -6147,12 +6173,17 @@ dependencies = [
  "logis-sds",
  "logis-search",
  "logis-vision-doc",
+ "lv-agent",
+ "lv-core",
+ "lv-doc",
+ "lv-domain",
  "memmap2",
  "mimalloc",
  "num",
  "nvml-wrapper",
  "once_cell",
  "premium-discount-nlp",
+ "premium-discount-quant",
  "rand 0.8.8",
  "rand_chacha 0.3.1",
  "rayon",
@@ -6225,8 +6256,7 @@ dependencies = [
  "candle-transformers",
  "chrono",
  "direct-storage",
- "embed-cpu-kernels",
- "ggml-kquant",
+ "half",
  "image",
  "io-uring",
  "libc",
@@ -6239,6 +6269,7 @@ dependencies = [
  "minijinja",
  "nvml-wrapper",
  "once_cell",
+ "premium-discount-cpu-kernels",
  "premium-discount-manifest",
  "premium-discount-nlp",
  "premium-discount-quant",
@@ -6329,6 +6360,7 @@ dependencies = [
  "logis-schema",
  "memmap2",
  "once_cell",
+ "premium-discount-nms",
  "serde",
  "serde_json",
 ]
@@ -6342,8 +6374,6 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "chrono",
- "embed-cpu-kernels",
- "ggml-kquant",
  "half",
  "image",
  "logis-bias",
@@ -6351,8 +6381,12 @@ dependencies = [
  "logis-pug",
  "logis-schema",
  "logis-sds",
+ "lv-core",
+ "lv-doc",
+ "lv-kernels",
  "memmap2",
  "once_cell",
+ "premium-discount-quant",
  "rayon",
  "serde",
  "serde_json",
@@ -6414,6 +6448,123 @@ name = "lru-slab"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
+
+[[package]]
+name = "lv-agent"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "lv-core",
+ "lv-doc",
+ "lv-domain",
+ "lv-sds",
+ "premium-discount-eval",
+ "premium-discount-sds",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "lv-core"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "candle-rocm",
+ "half",
+ "image",
+ "lv-kernels",
+ "lv-sds",
+ "memmap2",
+ "once_cell",
+ "premium-discount-cpu-kernels",
+ "premium-discount-eval",
+ "premium-discount-quant",
+ "rayon",
+ "safetensors 0.8.0",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smallvec",
+ "thiserror 2.0.21",
+ "tokenizers",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "lv-doc"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "calamine",
+ "cfb",
+ "csv",
+ "flate2",
+ "half",
+ "image",
+ "imageproc",
+ "lv-core",
+ "lv-kernels",
+ "lv-sds",
+ "once_cell",
+ "pdf-extract",
+ "premium-discount-eval",
+ "premium-discount-nms",
+ "premium-discount-quant",
+ "premium-discount-sds",
+ "quick-xml 0.41.0",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "smallvec",
+ "thiserror 2.0.21",
+ "zip 8.6.0",
+]
+
+[[package]]
+name = "lv-domain"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "lv-sds",
+ "premium-discount-eval",
+ "premium-discount-sds",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lv-kernels"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+dependencies = [
+ "premium-discount-cpu-kernels",
+ "rayon",
+]
+
+[[package]]
+name = "lv-sds"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+dependencies = [
+ "premium-discount-sds",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "zeroize",
+]
 
 [[package]]
 name = "lz4"
@@ -6807,6 +6958,21 @@ dependencies = [
 
 [[package]]
 name = "nalgebra"
+version = "0.32.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5c17de023a86f59ed79891b2e5d5a94c705dbe904a5b5c9c952ea6221b03e4"
+dependencies = [
+ "approx",
+ "matrixmultiply",
+ "num-complex",
+ "num-rational",
+ "num-traits",
+ "simba 0.8.1",
+ "typenum",
+]
+
+[[package]]
+name = "nalgebra"
 version = "0.33.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d43ddcacf343185dfd6de2ee786d9e8b1c2301622afab66b6c73baf9882abfd"
@@ -6816,7 +6982,7 @@ dependencies = [
  "num-complex",
  "num-rational",
  "num-traits",
- "simba",
+ "simba 0.9.1",
  "typenum",
 ]
 
@@ -7432,7 +7598,7 @@ dependencies = [
 [[package]]
 name = "onnxruntime"
 version = "0.0.14"
-source = "git+https://github.com/Qntology/premium-discount?rev=b23d38431641319f0f8ae5da324bb76245b2cf38#b23d38431641319f0f8ae5da324bb76245b2cf38"
+source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
 dependencies = [
  "lazy_static",
  "ndarray 0.15.6",
@@ -7444,7 +7610,7 @@ dependencies = [
 [[package]]
 name = "onnxruntime-sys"
 version = "0.0.14"
-source = "git+https://github.com/Qntology/premium-discount?rev=b23d38431641319f0f8ae5da324bb76245b2cf38#b23d38431641319f0f8ae5da324bb76245b2cf38"
+source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
 dependencies = [
  "flate2",
  "libloading 0.8.9",
@@ -7530,6 +7696,15 @@ checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
  "windows-sys 0.45.0",
+]
+
+[[package]]
+name = "owned_ttf_parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
+dependencies = [
+ "ttf-parser",
 ]
 
 [[package]]
@@ -7906,15 +8081,26 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 [[package]]
 name = "premium-discount-cpu-kernels"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=b23d38431641319f0f8ae5da324bb76245b2cf38#b23d38431641319f0f8ae5da324bb76245b2cf38"
+source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
 dependencies = [
+ "half",
  "rayon",
+]
+
+[[package]]
+name = "premium-discount-eval"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "premium-discount-identity"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=b23d38431641319f0f8ae5da324bb76245b2cf38#b23d38431641319f0f8ae5da324bb76245b2cf38"
+source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
 dependencies = [
  "getrandom 0.3.4",
  "hmac 0.12.1",
@@ -7928,7 +8114,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-manifest"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=b23d38431641319f0f8ae5da324bb76245b2cf38#b23d38431641319f0f8ae5da324bb76245b2cf38"
+source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -7936,7 +8122,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-nlp"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=b23d38431641319f0f8ae5da324bb76245b2cf38#b23d38431641319f0f8ae5da324bb76245b2cf38"
+source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -7955,9 +8141,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "premium-discount-nms"
+version = "0.1.0"
+source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+dependencies = [
+ "anyhow",
+ "premium-discount-cpu-kernels",
+ "premium-discount-sds",
+ "serde",
+]
+
+[[package]]
 name = "premium-discount-quant"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=b23d38431641319f0f8ae5da324bb76245b2cf38#b23d38431641319f0f8ae5da324bb76245b2cf38"
+source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
 dependencies = [
  "anyhow",
  "half",
@@ -7975,11 +8172,13 @@ dependencies = [
 [[package]]
 name = "premium-discount-sds"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=b23d38431641319f0f8ae5da324bb76245b2cf38#b23d38431641319f0f8ae5da324bb76245b2cf38"
+source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
 dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "zeroize",
 ]
 
 [[package]]
@@ -8400,6 +8599,16 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_distr"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
+dependencies = [
+ "num-traits",
+ "rand 0.8.8",
+]
 
 [[package]]
 name = "rand_distr"
@@ -9438,6 +9647,19 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest 0.10.7",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "simba"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "061507c94fc6ab4ba1c9a0305018408e312e17c041eb63bef8aa726fa33aceae"
+dependencies = [
+ "approx",
+ "num-complex",
+ "num-traits",
+ "paste",
+ "wide",
 ]
 
 [[package]]
@@ -12241,6 +12463,20 @@ name = "zeroize"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "zerotrie"

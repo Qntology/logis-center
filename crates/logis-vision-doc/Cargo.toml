@@ -10,10 +10,10 @@ repository.workspace = true
 default = []
 # 앱(apps/desktop)의 같은 이름 기능이 이 기능도 켭니다. quant.rs 의 GPU 기본 정밀도(rocm 이면서 cuda 가 아니면 q8)와
 # gguf.rs · vision_encoder.rs 의 장치별 경로가 이 crate 의 기능을 봅니다.
-cuda = ["logis-llm/cuda", "candle-core/cuda", "candle-nn/cuda"]
-rocm = ["logis-llm/rocm", "candle-core/rocm", "candle-nn/rocm"]
-vulkan = ["logis-llm/vulkan", "candle-core/vulkan", "candle-nn/vulkan"]
-metal = ["logis-llm/metal", "candle-core/metal", "candle-nn/metal"]
+cuda = ["logis-llm/cuda", "lv-core/cuda", "lv-doc/cuda", "candle-core/cuda", "candle-nn/cuda"]
+rocm = ["logis-llm/rocm", "lv-core/rocm", "lv-doc/rocm", "candle-core/rocm", "candle-nn/rocm"]
+vulkan = ["logis-llm/vulkan", "lv-core/vulkan", "lv-doc/vulkan", "candle-core/vulkan", "candle-nn/vulkan"]
+metal = ["logis-llm/metal", "lv-core/metal", "lv-doc/metal", "candle-core/metal", "candle-nn/metal"]
 
 [dependencies]
 anyhow.workspace = true
@@ -22,8 +22,6 @@ base64 = "0.22"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
 chrono = { version = "0.4", features = ["serde"] }
-embed-cpu-kernels = { path = "../embed-cpu-kernels" }
-ggml-kquant = { path = "../ggml-kquant" }
 half = "2.4"
 image = { version = "0.25", features = ["jpeg", "png"] }
 logis-bias.workspace = true
@@ -31,8 +29,12 @@ logis-llm.workspace = true
 logis-pug.workspace = true
 logis-schema.workspace = true
 logis-sds.workspace = true
+lv-core.workspace = true
+lv-doc = { workspace = true, default-features = false }
+lv-kernels.workspace = true
 memmap2 = "0.9"
 once_cell.workspace = true
+premium-discount-quant.workspace = true
 rayon = "1.10"
 serde.workspace = true
 serde_json.workspace = true

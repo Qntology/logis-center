@@ -14,5 +14,6 @@ logis-pug.workspace = true
 logis-schema.workspace = true
 memmap2 = "0.9"
 once_cell.workspace = true
+premium-discount-nms.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true

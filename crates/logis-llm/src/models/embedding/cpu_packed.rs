@@ -21,7 +21,7 @@
 //   순전파 전체(패킹 GEMM + 융합 norm/GLU): 단건 L=12 2.0배 · 짧은 구 배치 1.3~1.5배 · 긴 텍스트 1.07~1.24배.
 //   Apple Silicon(NEON) 수치는 macOS 워크플로(tools/cpu-embed-bench)에서 확인 후 기본값을 정합니다.
 // =====================================================================
-pub(crate) use embed_cpu_kernels::*;
+pub(crate) use premium_discount_cpu_kernels::*;
 
 /// 층 하나의 패킹 가중치.
 pub(crate) struct PackedLayer {

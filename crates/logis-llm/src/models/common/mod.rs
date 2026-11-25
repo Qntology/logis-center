@@ -14,6 +14,7 @@ pub mod kv_turbo;
 // 🌟 [ACCEL-CHECK] GPU 가속 커널(FlashAttention / TurboQuant) 자가 검증과 실측 정확도 감시
 pub mod accel_check;
 pub mod prejudice;
+pub mod qwen_vl_patchify;
 pub mod reflection_gate;
 pub mod vision_prune;
 pub mod vocab_trim;
@@ -257,7 +258,7 @@ pub fn fast_cpu_rms_norm(norm: &RmsNorm, x: &Tensor, eps: f32) -> candle_core::R
         .contiguous()?
         .to_vec1::<f32>()?;
     let mut out = vec![0.0f32; xv.len()];
-    embed_cpu_kernels::rms_norm(&xv, h, &wv, eps, &mut out);
+    premium_discount_cpu_kernels::rms_norm(&xv, h, &wv, eps, &mut out);
     Tensor::from_vec(out, dims.as_slice(), x.device())
 }
 
@@ -292,7 +293,7 @@ pub struct GateUpDownMLP {
     down_proj: gguf::ProjKind,
     /// Part 2 (Pack D): CPU F32 + SiLU 무편향 MLP 용 (gate | up) 교차 패킹 패널.
     /// 중간 `[M, 2I]` 텐서 할당 없이 에필로그에서 `silu(gate) * up` 을 직기록합니다.
-    cpu_glu: Option<std::sync::Arc<embed_cpu_kernels::PackedW>>,
+    cpu_glu: Option<std::sync::Arc<premium_discount_cpu_kernels::PackedW>>,
     act_fn: Activation,
 }
 
@@ -332,7 +333,7 @@ impl GateUpDownMLP {
         {
             let gw = gate_lin.weight().contiguous()?.flatten_all()?.to_vec1::<f32>()?;
             let uw = up_lin.weight().contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-            Some(std::sync::Arc::new(embed_cpu_kernels::PackedW::pack_glu_pair(
+            Some(std::sync::Arc::new(premium_discount_cpu_kernels::PackedW::pack_glu_pair(
                 &gw,
                 &uw,
                 intermediate_size,
@@ -421,13 +422,13 @@ impl Module for GateUpDownMLP {
                 let m = xs.elem_count() / k.max(1);
                 let xv = xs.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
                 let mut mid = vec![0.0f32; m * inter];
-                embed_cpu_kernels::gemm(
+                premium_discount_cpu_kernels::gemm(
                     &xv,
                     m,
                     glu_w,
                     &mut mid,
-                    embed_cpu_kernels::Blocking::default(),
-                    embed_cpu_kernels::Epilogue::SiluMul,
+                    premium_discount_cpu_kernels::Blocking::default(),
+                    premium_discount_cpu_kernels::Epilogue::SiluMul,
                     rayon::current_num_threads().max(1),
                 );
                 if let Some(last) = dims.last_mut() {
@@ -1730,7 +1731,7 @@ pub fn eager_attention_forward(
             let q_stride = q_l * q_h * q_d;
             let kv_stride = kv_l * kv_h * q_d;
             let mut out = vec![0.0f32; q_b * q_stride];
-            let cfg = embed_cpu_kernels::attn::CpuStreamAttnCfg {
+            let cfg = premium_discount_cpu_kernels::attn::CpuStreamAttnCfg {
                 num_heads: q_h,
                 num_kv_heads: kv_h,
                 head_dim: q_d,
@@ -1739,7 +1740,7 @@ pub fn eager_attention_forward(
                 past_offset: kv_l.saturating_sub(q_l),
             };
             for bi in 0..q_b {
-                embed_cpu_kernels::attn::stream_attention_f32(
+                premium_discount_cpu_kernels::attn::stream_attention_f32(
                     &qv[bi * q_stride..(bi + 1) * q_stride],
                     &kv[bi * kv_stride..(bi + 1) * kv_stride],
                     &vv[bi * kv_stride..(bi + 1) * kv_stride],

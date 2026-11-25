@@ -264,7 +264,7 @@ fn write_tower(st: &StFile, plan: &WeightPlan, prefix: &str, out: &Path) -> Resu
             let values = source_values(st, it)?;
             let bytes = match it.q {
                 QType::F32 => values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
-                q => ggml_kquant::encode(&values, it.cols_out, q.format(), None).map_err(|e| anyhow!("{}: {e}", it.name))?,
+                q => premium_discount_quant::kquant::encode(&values, it.cols_out, q.format(), None).map_err(|e| anyhow!("{}: {e}", it.name))?,
             };
             if bytes.len() as u64 != it.bytes() {
                 bail!("{} 의 바이트 수 {} 가 예상 {} 와 다릅니다", it.name, bytes.len(), it.bytes());

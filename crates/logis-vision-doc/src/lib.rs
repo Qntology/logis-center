@@ -18,4 +18,10 @@
 //! 이 앱의 비전 게이트 · 크롭 계획 · 값 그라운딩 · 합성 평가 기준선은 지금 출력에 맞춰져 있어, 바꾸려면 출력 변화를 받아들이고 다시
 //! 맞춰야 합니다. 앱은 예전 경로 `crate::models::siglip2` 에서 이 모듈을 재수출합니다.
 
+pub mod facade;
 pub mod siglip2;
+
+pub use facade::{
+    preprocess_logis_doc_v1, retry_bbox_with_margin, reverse_table_grid, verify_trade_ledger_shadow,
+    TradeDocDomainBank, TradeGroundingLexicon,
+};

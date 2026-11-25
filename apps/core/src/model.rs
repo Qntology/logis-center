@@ -18,6 +18,7 @@ pub mod query_shipping;
 pub mod query_commerce;
 pub mod merge;
 pub mod lang_llm;
+pub mod trade_verify;
 // Qwen3.5 언어 엔진 Q4_K_M GGUF 변환 · 적재는 crates/logis-llm 으로 옮겼습니다 (같은 경로로 재수출).
 pub use logis_llm::lang_gguf;
 

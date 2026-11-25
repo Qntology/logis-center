@@ -175,6 +175,44 @@ pub fn fuse(lists: &[(&[String], f32)], k: f32) -> Vec<(String, f32)> {
     out
 }
 
+/// Expands `query_terms` with `premium_discount_nms::normalize::normalize` noun lemmas / stems
+/// so Korean particles & conjugated predicates recall literal & sparse search tracks cleanly.
+pub fn query_terms_with_nms(query: &str) -> Vec<String> {
+    let mut out = query_terms(query);
+    let norm = premium_discount_nms::normalize::normalize(query);
+    for w in norm.words {
+        for cand in [w.surface, w.lemma, w.stem] {
+            let clean = cand.trim().to_lowercase();
+            if clean.chars().count() >= 2 && !out.contains(&clean) {
+                out.push(clean);
+            }
+        }
+    }
+    out
+}
+
+/// Fuses NMS-normalized literal track with caller-provided vector/FTS/sparse/vision tracks via 4+ track RRF.
+pub fn fuse_query_tracks_with_nms(
+    query: &str,
+    docs: &[(String, String)],
+    tracks: FusionTracks<'_>,
+    k: f32,
+) -> Vec<(String, f32)> {
+    let nms_terms = query_terms_with_nms(query);
+    let nms_literal = literal_ranking(&nms_terms, docs);
+    if tracks.literal.is_empty() && !nms_literal.is_empty() {
+        let filled = FusionTracks { literal: &nms_literal, ..tracks };
+        return fuse_query_tracks(&filled, k);
+    }
+    let mut base = fuse_query_tracks(&tracks, k);
+    if nms_literal.is_empty() {
+        return base;
+    }
+    let ranked_base: Vec<String> = base.iter().map(|(id, _)| id.clone()).collect();
+    base = fuse(&[(&ranked_base, 1.0), (&nms_literal, LITERAL_WEIGHT)], k);
+    base
+}
+
 /// 🌟 [CONDITION GROUNDING] 조건 값이 이 행의 칸에 실제로 있는지 봅니다. 프론트엔드의 contains 와 같이 대소문자를 무시합니다.
 pub fn field_contains(row: &Value, field: &str, value: &str) -> bool {
     let want = value.to_lowercase();
@@ -183,5 +221,32 @@ pub fn field_contains(row: &Value, field: &str, value: &str) -> bool {
         Some(Value::Number(n)) => n.to_string().contains(&want),
         Some(Value::Array(a)) => a.iter().any(|x| x.as_str().map_or(false, |s| s.to_lowercase().contains(&want))),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nms_normalized_terms_boost_korean_noun_recall_in_rrf() {
+        let terms = query_terms_with_nms("컨테이너는 선적이 완료된 인보이스");
+        assert!(terms.iter().any(|t| t == "컨테이너"));
+        assert!(terms.iter().any(|t| t == "선적"));
+        let docs = vec![
+            ("doc-1".to_string(), "일반 텍스트".to_string()),
+            ("doc-2".to_string(), "컨테이너 선적 인보이스 bl-901".to_string()),
+        ];
+        let fused = fuse_query_tracks_with_nms(
+            "컨테이너는 선적이",
+            &docs,
+            FusionTracks {
+                sparse: &["doc-2".to_string(), "doc-1".to_string()],
+                fts: &["doc-1".to_string(), "doc-2".to_string()],
+                ..Default::default()
+            },
+            FUSION_K,
+        );
+        assert_eq!(fused.first().map(|(id, _)| id.as_str()), Some("doc-2"));
     }
 }

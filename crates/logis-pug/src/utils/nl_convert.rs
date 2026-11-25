@@ -982,7 +982,8 @@ pub fn format_gate_for_indexing(mut chunks: Vec<ChunkMetadata>) -> Vec<ChunkMeta
 /// [SYNONYM EXPANSION] ISO 언어 코드를 전체 언어 이름으로 변환합니다.
 /// 프롬프트에 언어 코드가 아닌 전체 이름을 전달하여 LLM이 명확히 인식하도록 합니다.
 pub fn lang_code_to_full_name(code: &str) -> String {
-    match code {
+    let canon = crate::scripts::canonical_lang_tag(code);
+    match canon.as_str() {
         "ko" => "korean".to_string(),
         "en" => "english".to_string(),
         "ja" => "japanese".to_string(),

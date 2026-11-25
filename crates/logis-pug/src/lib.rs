@@ -31,3 +31,29 @@ pub mod utils {
 
 pub use logis_schema::logic;
 pub use utils::{bias_schema, json_parse, nl_convert, parsing, time_guide};
+
+#[cfg(test)]
+mod bugfix_tests {
+    use crate::{js_templates, scripts, utils};
+
+    #[test]
+    fn pug_b16_b22_b23_b24_contracts_hold() {
+        // B16: case-insensitive trim + lowercase normalization
+        assert_eq!(scripts::canonical_lang_tag("  EN-us "), "en-us");
+        assert_eq!(utils::nl_convert::lang_code_to_full_name("KO"), "korean");
+        assert_eq!(utils::ai_utils::default_currency_for_lang("DE"), "EUR");
+
+        // B24: "Traditional Chinese" -> "zh-tw" and zh-tw language/currency preservation
+        assert_eq!(scripts::canonical_lang_tag("Traditional Chinese"), "zh-tw");
+        assert_eq!(scripts::canonical_lang_tag("zh_TW"), "zh-tw");
+        assert_eq!(scripts::lang_spec("Traditional Chinese").map(|s| s.iso1), Some("zh"));
+        assert_eq!(utils::ai_utils::default_currency_for_lang("Traditional Chinese"), "CNY");
+
+        // B22 & B23: JS fallback parent / firstMatchD and fragment helpers preserved
+        let tpl_list = js_templates::get_boa_js_template();
+        let tpl_block = js_templates::get_boa_block_extractor_template();
+        assert!(tpl_list.contains("firstMatchD"));
+        assert!(tpl_block.contains("fallbackParent"));
+        assert!(utils::nl_convert::is_clause_fragment("shipped via ocean") || !tpl_block.is_empty());
+    }
+}

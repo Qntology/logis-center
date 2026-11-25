@@ -29,10 +29,7 @@ candle-nn = "0.11.0"
 candle-rocm = { workspace = true, optional = true }
 candle-transformers = "0.11.0"
 chrono = { version = "0.4", features = ["serde"] }
-# 🌟 [EMBED-CPU-PACKED] CPU 임베딩 패킹 GEMM (opt-in: LOGIS_EMBED_CPU_KERNEL=packed, models/embedding/cpu_packed.rs)
-embed-cpu-kernels = { path = "../embed-cpu-kernels" }
-# 🌟 [PYRAMID-QUANT] 원본 가중치를 한 번 양자화하는 GGML 블록 인코더 (lang_gguf.rs)
-ggml-kquant = { path = "../ggml-kquant" }
+half = "2.4"
 image = { version = "0.25", features = ["jpeg", "png"] }
 libc = "0.2"
 logis-bias.workspace = true
@@ -45,6 +42,7 @@ minijinja = "2.12.0"
 nvml-wrapper = "0.9.0"
 once_cell.workspace = true
 # granite 임베딩의 ModernBERT 인코더(예전 ForwardMode::Exact 순전파, 연산 그대로)는 premium-discount-nlp 에 있습니다 (models/embedding.rs).
+premium-discount-cpu-kernels.workspace = true
 premium-discount-manifest.workspace = true
 premium-discount-nlp = { workspace = true, features = ["granite"] }
 premium-discount-quant = { workspace = true, features = ["mine"] }
