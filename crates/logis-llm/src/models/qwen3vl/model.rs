@@ -79,10 +79,28 @@ fn ct_qlinear<R: Read + Seek>(
 
 pub struct Qwen3VLVisionPatchEmbed {
     conv3d_weight: Tensor,
+    /// FP64-folded static-image projection weight `[C * P * P, D]` (`T_p` summed once).
+    /// Halves Stem FLOPs and weight bandwidth for static images (`grid_t == 1`) with
+    /// bit-faithful numerical accuracy while keeping `conv3d_weight` for multi-frame video.
+    conv3d_weight_static: Option<Tensor>,
     conv3d_bias: Tensor,
+    in_channels: usize,
+    temporal_patch_size: usize,
 }
 
 impl Qwen3VLVisionPatchEmbed {
+    fn fold_static_from_5d(w5: &Tensor, temporal_patch_size: usize) -> Result<Option<Tensor>> {
+        if temporal_patch_size <= 1 {
+            return Ok(None);
+        }
+        // w5: [D_out, C_in, T_p, P_h, P_w] -> FP64 sum over T_p -> [D_out, C_in, P_h, P_w]
+        let folded = candle_nn::fold_conv3d_temporal_weight(w5)?
+            .flatten(1, 3)?
+            .t()?
+            .contiguous()?;
+        Ok(Some(folded))
+    }
+
     pub fn new(cfg: &Qwen3VLVisionConfig, vb: VarBuilder) -> Result<Self> {
         let patch_size = cfg.patch_size;
         let temporal_patch_size = cfg.temporal_patch_size;
@@ -90,53 +108,95 @@ impl Qwen3VLVisionPatchEmbed {
         let embed_dim = cfg.hidden_size;
         // conv3d weight key: visual.patch_embed.proj.weight, value: Tensor[dims 1024, 3, 2, 16, 16; bf16, cuda:0]
         // (1024, 3, 2, 16, 16) -> (1024, 1536) -> (1536, 1024)
-        let conv3d_weight = vb
-            .get_with_hints(
-                (
-                    embed_dim,
-                    in_channels,
-                    temporal_patch_size,
-                    patch_size,
-                    patch_size,
-                ),
-                "proj.weight",
-                Init::Const(1.),
-            )?
-            .flatten(1, 4)?
-            .t()?;
+        let w5 = vb.get_with_hints(
+            (
+                embed_dim,
+                in_channels,
+                temporal_patch_size,
+                patch_size,
+                patch_size,
+            ),
+            "proj.weight",
+            Init::Const(1.),
+        )?;
+        let conv3d_weight_static = Self::fold_static_from_5d(&w5, temporal_patch_size)?;
+        let conv3d_weight = w5.flatten(1, 4)?.t()?;
         // (1024) -> (1, 1024)
         let conv3d_bias = vb
             .get_with_hints((embed_dim,), "proj.bias", Init::Const(0.))?
             .unsqueeze(0)?;
         Ok(Self {
             conv3d_weight,
+            conv3d_weight_static,
             conv3d_bias,
+            in_channels,
+            temporal_patch_size,
         })
     }
 
     pub fn new_from_gguf<R: Read + Seek>(gguf: &mut Gguf<R>) -> Result<Self> {
-        
         let conv3d_weight_0 = gguf.get_dequantized_f16("v.patch_embd.weight")?.to_dtype(candle_core::DType::F16)?.unsqueeze(2)?;
         let conv3d_weight_1 = gguf.get_dequantized_f16("v.patch_embd.weight.1")?.to_dtype(candle_core::DType::F16)?.unsqueeze(2)?;
-        let conv3d_weight = Tensor::cat(&[conv3d_weight_0, conv3d_weight_1], 2)?.flatten(1, 4)?.t()?;
+        let w5 = Tensor::cat(&[conv3d_weight_0, conv3d_weight_1], 2)?;
+        let in_channels = w5.dim(1)?;
+        let temporal_patch_size = w5.dim(2)?;
+        let conv3d_weight_static = Self::fold_static_from_5d(&w5, temporal_patch_size)?;
+        let conv3d_weight = w5.flatten(1, 4)?.t()?;
         let conv3d_bias = gguf.get_dequantized_f16("v.patch_embd.bias")?.to_dtype(candle_core::DType::F16)?;
         Ok(Self {
             conv3d_weight,
+            conv3d_weight_static,
             conv3d_bias,
+            in_channels,
+            temporal_patch_size,
         })
     }
 
     pub fn forward(&self, hidden_states: &Tensor) -> Result<Tensor> {
-        // hidden_states shape:  (grid_t*grid_h*grid_w, c*temporal_patch_size*patch_size*patch_size)
-        // ((), 1536) matmul (1536, 1024) -> ((), 1024)
+        self.forward_for_grid(hidden_states, false)
+    }
+
+    /// Projects patches into vision hidden space. When `is_static_image` is true (all frames have
+    /// `grid_t == 1`, so duplicated temporal slices are identical), uses the FP64-folded static
+    /// weight (`[C*P*P, D]`) to halve Stem FLOPs and weight reads.
+    pub fn forward_for_grid(&self, hidden_states: &Tensor, is_static_image: bool) -> Result<Tensor> {
         let dtype = hidden_states.dtype();
-        let hidden_states = hidden_states.matmul(&self.conv3d_weight.to_dtype(dtype)?)?;
-        let hidden_states = hidden_states.broadcast_add(&self.conv3d_bias.to_dtype(dtype)?)?;
+        let proj = if is_static_image && self.temporal_patch_size > 1 {
+            if let Some(w_static) = &self.conv3d_weight_static {
+                let (n, cols) = hidden_states.dims2()?;
+                let static_cols = w_static.dim(0)?;
+                if cols == static_cols {
+                    hidden_states.matmul(&w_static.to_dtype(dtype)?)?
+                } else if cols == static_cols * self.temporal_patch_size
+                    && self.in_channels > 0
+                    && static_cols % self.in_channels == 0
+                {
+                    let pp = static_cols / self.in_channels;
+                    let t0 = hidden_states
+                        .reshape((n, self.in_channels, self.temporal_patch_size, pp))?
+                        .narrow(2, 0, 1)?
+                        .contiguous()?
+                        .reshape((n, static_cols))?;
+                    t0.matmul(&w_static.to_dtype(dtype)?)?
+                } else {
+                    hidden_states.matmul(&self.conv3d_weight.to_dtype(dtype)?)?
+                }
+            } else {
+                hidden_states.matmul(&self.conv3d_weight.to_dtype(dtype)?)?
+            }
+        } else {
+            // hidden_states shape: (grid_t*grid_h*grid_w, c*temporal_patch_size*patch_size*patch_size)
+            hidden_states.matmul(&self.conv3d_weight.to_dtype(dtype)?)?
+        };
+        let hidden_states = proj.broadcast_add(&self.conv3d_bias.to_dtype(dtype)?)?;
         Ok(hidden_states)
     }
 
     pub fn to_device(&mut self, device: &Device) -> Result<()> {
         self.conv3d_weight = self.conv3d_weight.to_device(device)?;
+        if let Some(ws) = &self.conv3d_weight_static {
+            self.conv3d_weight_static = Some(ws.to_device(device)?);
+        }
         self.conv3d_bias = self.conv3d_bias.to_device(device)?;
         Ok(())
     }
@@ -145,6 +205,7 @@ impl Qwen3VLVisionPatchEmbed {
     pub fn clear_weights(&mut self) {
         let dummy = Tensor::zeros((1, 1), DType::F16, &Device::Cpu).unwrap();
         self.conv3d_weight = dummy.clone();
+        self.conv3d_weight_static = None;
         self.conv3d_bias = dummy;
     }
 
@@ -158,7 +219,11 @@ impl Qwen3VLVisionPatchEmbed {
             .get_dequantized_f16("v.patch_embd.weight.1")?
             .to_dtype(candle_core::DType::F16)?
             .unsqueeze(2)?;
-        self.conv3d_weight = Tensor::cat(&[w0, w1], 2)?.flatten(1, 4)?.t()?;
+        let w5 = Tensor::cat(&[w0, w1], 2)?;
+        self.in_channels = w5.dim(1)?;
+        self.temporal_patch_size = w5.dim(2)?;
+        self.conv3d_weight_static = Self::fold_static_from_5d(&w5, self.temporal_patch_size)?;
+        self.conv3d_weight = w5.flatten(1, 4)?.t()?;
         self.conv3d_bias = gguf
             .get_dequantized_f16("v.patch_embd.bias")?
             .to_dtype(candle_core::DType::F16)?;
@@ -855,7 +920,10 @@ impl Qwen3VLVisionModel {
         let dummy_f16 = Tensor::zeros((1, 1), DType::F16, &Device::Cpu)?;
         let patch_embed = Qwen3VLVisionPatchEmbed {
             conv3d_weight: dummy_f16.clone(),
+            conv3d_weight_static: None,
             conv3d_bias: dummy_f16,
+            in_channels: 3,
+            temporal_patch_size: 2,
         };
         let pos_embed = Embedding::new(Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?, 1);
         let rotary_pos_emb = Qwen2_5VisionRotaryEmbedding::new(head_dim / 2, None);
@@ -1007,6 +1075,28 @@ impl Qwen3VLVisionModel {
         Ok(())
     }
 
+    /// 🌟 [VISION-STREAM] deepstack merger `k` 하나만 mmap 에서 필요 시점에 적재합니다.
+    fn load_deepstack_merger(&mut self, k: usize) -> Result<()> {
+        let (ct, mmap) = match (self.mmproj_ct.clone(), self.mmproj_mmap.clone()) {
+            (Some(c), Some(m)) => (c, m),
+            _ => return Ok(()),
+        };
+        let Some(&i) = self.deepstack_visual_indexes.get(k) else {
+            return Ok(());
+        };
+        let mut reader = std::io::Cursor::new(&mmap[..]);
+        let dev = self.device.clone();
+        let eps = self.rms_norm_eps;
+        let prefix = format!("v.deepstack.{i}");
+        self.deepstack_merger_list[k].norm =
+            ct_layer_norm(&ct, &mut reader, &dev, &format!("{prefix}.norm"), eps)?;
+        self.deepstack_merger_list[k].linear_fc1 =
+            ProjKind::QuantizedProj(ct_qlinear(&ct, &mut reader, &dev, &format!("{prefix}.fc1"), true)?);
+        self.deepstack_merger_list[k].linear_fc2 =
+            ProjKind::QuantizedProj(ct_qlinear(&ct, &mut reader, &dev, &format!("{prefix}.fc2"), true)?);
+        Ok(())
+    }
+
     /// 🌟 [VISION-JIT] 블록을 제외한 공용 파트(patch_embed / pos_embed / merger 계열)만 붙입니다.
     fn load_shared_weights(&mut self) -> Result<()> {
         let (ct, mmap) = match (self.mmproj_ct.clone(), self.mmproj_mmap.clone()) {
@@ -1023,7 +1113,12 @@ impl Qwen3VLVisionModel {
         let w1 = ct_dequant_f16(&ct, &mut reader, &dev, "v.patch_embd.weight.1")?
             .to_dtype(DType::F16)?
             .unsqueeze(2)?;
-        self.patch_embed.conv3d_weight = Tensor::cat(&[w0, w1], 2)?.flatten(1, 4)?.t()?;
+        let w5 = Tensor::cat(&[w0, w1], 2)?;
+        self.patch_embed.in_channels = w5.dim(1)?;
+        self.patch_embed.temporal_patch_size = w5.dim(2)?;
+        self.patch_embed.conv3d_weight_static =
+            Qwen3VLVisionPatchEmbed::fold_static_from_5d(&w5, self.patch_embed.temporal_patch_size)?;
+        self.patch_embed.conv3d_weight = w5.flatten(1, 4)?.t()?;
         self.patch_embed.conv3d_bias =
             ct_dequant_f16(&ct, &mut reader, &dev, "v.patch_embd.bias")?.to_dtype(DType::F16)?;
 
@@ -1037,15 +1132,18 @@ impl Qwen3VLVisionModel {
         self.merger.linear_fc2 =
             ProjKind::QuantizedProj(ct_qlinear(&ct, &mut reader, &dev, "mm.2", true)?);
 
-        let ds_indexes = self.deepstack_visual_indexes.clone();
-        for (k, i) in ds_indexes.iter().enumerate() {
-            let prefix = format!("v.deepstack.{i}");
-            self.deepstack_merger_list[k].norm =
-                ct_layer_norm(&ct, &mut reader, &dev, &format!("{prefix}.norm"), eps)?;
-            self.deepstack_merger_list[k].linear_fc1 =
-                ProjKind::QuantizedProj(ct_qlinear(&ct, &mut reader, &dev, &format!("{prefix}.fc1"), true)?);
-            self.deepstack_merger_list[k].linear_fc2 =
-                ProjKind::QuantizedProj(ct_qlinear(&ct, &mut reader, &dev, &format!("{prefix}.fc2"), true)?);
+        // stream_blocks 모드에서는 deepstack merger 도 해당 층 직전에 적재하고 직후 해제합니다.
+        if !self.stream_blocks {
+            let ds_indexes = self.deepstack_visual_indexes.clone();
+            for (k, i) in ds_indexes.iter().enumerate() {
+                let prefix = format!("v.deepstack.{i}");
+                self.deepstack_merger_list[k].norm =
+                    ct_layer_norm(&ct, &mut reader, &dev, &format!("{prefix}.norm"), eps)?;
+                self.deepstack_merger_list[k].linear_fc1 =
+                    ProjKind::QuantizedProj(ct_qlinear(&ct, &mut reader, &dev, &format!("{prefix}.fc1"), true)?);
+                self.deepstack_merger_list[k].linear_fc2 =
+                    ProjKind::QuantizedProj(ct_qlinear(&ct, &mut reader, &dev, &format!("{prefix}.fc2"), true)?);
+            }
         }
         Ok(())
     }
@@ -1285,9 +1383,11 @@ impl Qwen3VLVisionModel {
         let mut sin = emb.sin()?.to_dtype(self.dtype)?;
 
         // 2) 1-Hop Halo 프루닝 적용 시 살아남은 패치만 patch_embed + 원본 (pos_embed, cos, sin) 결합
+        //    정적 이미지(모든 프레임 grid_t == 1)는 FP64-접힘 Conv3d 가중치로 Stem 연산량/대역폭 50% 절감.
+        let all_static_images = !grid_thw_cpu.is_empty() && grid_thw_cpu.iter().all(|thw| thw[0] == 1);
         let (hidden_states, chunks) = if let Some(ref plan) = prune_plan {
             let kept_idx = &plan.kept_rotary_idx;
-            let pe = self.patch_embed.forward(&plan.kept_pixels)?;
+            let pe = self.patch_embed.forward_for_grid(&plan.kept_pixels, all_static_images)?;
             pos_embeds = pos_embeds
                 .index_select(kept_idx, 0)?
                 .to_dtype(pe.dtype())?;
@@ -1303,7 +1403,7 @@ impl Qwen3VLVisionModel {
             );
             (hs.reshape((kept_seq, ()))?, vec![kept_seq])
         } else {
-            let pe = self.patch_embed.forward(pixel_values)?;
+            let pe = self.patch_embed.forward_for_grid(pixel_values, all_static_images)?;
             pos_embeds = pos_embeds.to_dtype(pe.dtype())?;
             let hs = pe.broadcast_add(&pos_embeds)?;
             let seq_len = hs.dim(0)?;
@@ -1333,6 +1433,9 @@ impl Qwen3VLVisionModel {
             hidden_states = self.blocks[layer_num].forward(&hidden_states, &chunks, &cos, &sin)?;
 
             if let Some(index) = ds_indexes.iter().position(|&x| x == layer_num) {
+                if streaming {
+                    self.load_deepstack_merger(index)?;
+                }
                 let mut deepstack_feature = self.deepstack_merger_list[index].forward(&hidden_states)?;
                 if prune_mode == PruneMode::Halo1HopScatter {
                     if let Some(ref plan) = prune_plan {
@@ -1340,6 +1443,9 @@ impl Qwen3VLVisionModel {
                     }
                 }
                 deepstack_feature_lists.push(deepstack_feature);
+                if streaming {
+                    self.deepstack_merger_list[index].clear_weights();
+                }
             }
 
             if streaming {

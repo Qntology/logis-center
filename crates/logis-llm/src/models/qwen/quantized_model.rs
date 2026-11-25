@@ -1802,10 +1802,46 @@ impl QuantizedQwenVLTextDecoderLayer {
             let residual = xs.clone();
             let xs = post_norm.forward(&xs)?;
             let xs = {
-                let gate = gate_proj.forward(&xs)?;
-                let up = up_proj.forward(&xs)?;
-                let gate = candle_nn::ops::silu(&gate)?;
-                let hidden = gate.mul(&up)?;
+                let k_dim = *xs.dims().last().unwrap_or(&0);
+                let m_rows = if k_dim > 0 { xs.elem_count() / k_dim } else { 0 };
+                let fused_mid = if m_rows > 0
+                    && m_rows <= 8
+                    && (xs.device().is_cuda() || xs.device().is_rocm())
+                    && gate_proj.bias.is_none()
+                    && up_proj.bias.is_none()
+                {
+                    match (&gate_proj.inner, &up_proj.inner) {
+                        (QMatMul::QTensor(gw), QMatMul::QTensor(uw))
+                            if gw.dtype() == candle_core::quantized::GgmlDType::Q8_0
+                                && uw.dtype() == candle_core::quantized::GgmlDType::Q8_0
+                                && gw.device().same_device(xs.device())
+                                && uw.device().same_device(xs.device()) =>
+                        {
+                            Some(gw.fused_gate_up_silu(uw, &xs)?)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let hidden = if let Some(mid) = fused_mid {
+                    mid
+                } else {
+                    let gate = gate_proj.forward(&xs)?;
+                    let up = up_proj.forward(&xs)?;
+                    let inter = *gate.dims().last().unwrap_or(&0);
+                    if crate::models::common::accel_check::fused_op_ok(
+                        gate.device(),
+                        crate::models::common::accel_check::FusedOpKind::SiluMul,
+                        gate.dtype(),
+                        inter,
+                    ) {
+                        candle_core::decoder_ops::silu_mul(&gate, &up)?
+                    } else {
+                        let gate = candle_nn::ops::silu(&gate)?;
+                        gate.mul(&up)?
+                    }
+                };
                 down_proj.forward(&hidden)?
             };
             Ok(residual.add(&xs)?)
@@ -1886,6 +1922,8 @@ pub struct QuantizedQwenVLTextModel {
     // 🌟 [DECODE-RESIDENT] 가중치 상주 여부도 같은 시점에 1회만 판정하여
     //    레이어마다(= 토큰당 28회) 반복되던 sysinfo 호출을 제거합니다.
     pub keep_weights_resident: bool,
+    /// 🌟 [KV-PLAN v2] 호출부가 알린 최대 생성 토큰 수 (`0`이면 기본값 `QWEN06B_DECODE_HEADROOM_TOKENS` 사용).
+    pub planned_decode_tokens: usize,
     // [NEW] 재로딩을 위한 메타데이터
     pub config: QwenVLTextConfig,
     pub ct: Option<Arc<gguf_file::Content>>,
@@ -1997,6 +2035,7 @@ impl QuantizedQwenVLTextModel {
             current_kv_len: 0,
             kv_plan: None,
             keep_weights_resident: false,
+            planned_decode_tokens: 0,
             config: config.clone(),
             ct: Some(ct),
             base_name: base_name.to_string(),
@@ -2085,6 +2124,7 @@ impl QuantizedQwenVLTextModel {
             current_kv_len: 0,
             kv_plan: None,
             keep_weights_resident: false,
+            planned_decode_tokens: 0,
             config: config.clone(),
             ct: Some(ct),
             base_name: base_name.to_string(),
@@ -2861,7 +2901,7 @@ impl QuantizedQwenVLTextModel {
         if is_decoding {
             if self.kv_plan.is_none() {
                 let (kv_layers, kv_heads, kv_head_dim) = self.kv_plan_geometry();
-                let planned = seqlen_offset + seq_len + QWEN06B_DECODE_HEADROOM_TOKENS;
+                let planned = seqlen_offset + seq_len + self.decode_headroom_tokens();
                 // 🌟 [P4-F05] 프리필 중 RAM/SSD 로 대피된 블록은 아직 VRAM 에 없으므로
                 //    `seqlen_offset` 전체가 아니라 실제로 VRAM 에 상주 중인 토큰만 `already_tokens` 로 셉니다.
                 let vram_already_tokens: usize = self
@@ -3021,6 +3061,18 @@ impl QuantizedQwenVLTextModel {
         (layers, heads, dim)
     }
 
+    /// 🌟 [KV-PLAN v2] 호출부가 알린 최대 생성 토큰 수를 저장합니다 (`0`이면 기본 상한 사용).
+    pub fn set_planned_decode_tokens(&mut self, max_new_tokens: usize) {
+        self.planned_decode_tokens = max_new_tokens;
+    }
+
+    pub fn decode_headroom_tokens(&self) -> usize {
+        match self.planned_decode_tokens {
+            0 => QWEN06B_DECODE_HEADROOM_TOKENS,
+            n => n.clamp(64, QWEN06B_DECODE_HEADROOM_TOKENS),
+        }
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
@@ -3029,6 +3081,7 @@ impl QuantizedQwenVLTextModel {
         // 🌟 [KV RESIDENCY] 세션이 바뀌면 배치 계획도 폐기하여 다음 디코딩에서 재판정합니다.
         self.kv_plan = None;
         self.keep_weights_resident = false;
+        self.planned_decode_tokens = 0;
     }
 
     pub fn evacuate_vram_to_cache(&mut self) -> Result<()> {

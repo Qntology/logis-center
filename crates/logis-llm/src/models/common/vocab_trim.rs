@@ -1847,6 +1847,89 @@ impl RestRescueGuard {
             Ok(best)
         }
     }
+
+    /// 희귀 구출(샘플링 모드): 문법 마스크가 허용하는 REST 행의 `(vocab_id, logit)` 을
+    /// 호스트 mmap 에서 SIMD 로 직접 평가해 반환합니다 (GPU 추가 상주 0 바이트).
+    pub fn eval_rest_filtered(
+        &self,
+        h_row: &[f32],
+        grammar_bitmask: Option<&[u32]>,
+    ) -> Result<Vec<(u32, f32)>> {
+        let cols = self.src.cols;
+        anyhow::ensure!(
+            h_row.len() == cols,
+            "RestRescueGuard: hidden len {} != cols {}",
+            h_row.len(),
+            cols
+        );
+        let allowed = |vid: u32| -> bool {
+            match grammar_bitmask {
+                None => true,
+                Some(bits) => {
+                    let w = (vid as usize) >> 5;
+                    let b = vid & 31;
+                    w < bits.len() && ((bits[w] >> b) & 1) != 0
+                }
+            }
+        };
+        let rb = self.src.row_bytes();
+        if self.src.dtype == GgmlDType::Q8_0 {
+            let chunks: Vec<Vec<(u32, f32)>> = self
+                .rest_ids
+                .par_chunks(512)
+                .map(|chunk| {
+                    let mut out = Vec::new();
+                    for &rid in chunk {
+                        if !allowed(rid) {
+                            continue;
+                        }
+                        let off = self.src.start + (rid as usize) * rb;
+                        let v = embed_cpu_kernels::q8::dot_q8_0_f32_simd(
+                            &self.src.map[off..off + rb],
+                            h_row,
+                        );
+                        out.push((rid, v));
+                    }
+                    out
+                })
+                .collect();
+            let total: usize = chunks.iter().map(Vec::len).sum();
+            let mut merged = Vec::with_capacity(total);
+            for mut c in chunks {
+                merged.append(&mut c);
+            }
+            Ok(merged)
+        } else {
+            let mut out = Vec::new();
+            let filtered: Vec<u32> = self.rest_ids.iter().copied().filter(|&id| allowed(id)).collect();
+            for chunk in filtered.chunks(512) {
+                let deq = self.src.gather(chunk, &Device::Cpu)?.dequantize(&Device::Cpu)?;
+                let vals = deq.flatten_all()?.to_vec1::<f32>()?;
+                for (i, row) in vals.chunks_exact(cols).enumerate() {
+                    let v = embed_cpu_kernels::dot_f32_simd(h_row, row);
+                    out.push((chunk[i], v));
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// BPE 토큰 조각과 문서 앵커를 비교할 때 경계/내부 단일 ASCII 공백 차이
+/// (예: `"31 MPa"` vs `"31MPa"`, `" 100"` vs `"100"`) 를 흡수하는 무할당 일치 판정기.
+pub fn match_piece_with_optional_space(cand: &[u8], anchor: &[u8]) -> bool {
+    if cand == anchor {
+        return true;
+    }
+    let mut a_it = cand.iter().copied().filter(|&b| b != b' ');
+    let mut b_it = anchor.iter().copied().filter(|&b| b != b' ');
+    loop {
+        match (a_it.next(), b_it.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if x == y => continue,
+            _ => return false,
+        }
+    }
 }
 
 /// Gate 1-C: Greedy 디코드 스텝의 그림자 Top-3 후보.
@@ -1924,7 +2007,7 @@ pub fn match_shadow_anchor_candidate(
     };
     let top1_bytes = decode_small(step.token_id);
     let top1_trimmed = top1_bytes.as_slice();
-    if top1_trimmed == anchor_bytes {
+    if match_piece_with_optional_space(top1_trimmed, anchor_bytes) {
         return None;
     }
     let top1_dist = bounded_edit_distance(top1_trimmed, anchor_bytes, 2);
@@ -1933,6 +2016,9 @@ pub fn match_shadow_anchor_candidate(
             continue;
         }
         let cand_bytes = decode_small(cand.token_id);
+        if match_piece_with_optional_space(cand_bytes.as_slice(), anchor_bytes) {
+            return Some(cand.token_id);
+        }
         let dist = bounded_edit_distance(cand_bytes.as_slice(), anchor_bytes, 2);
         if dist < top1_dist && (dist == 0 || dist <= 2) {
             return Some(cand.token_id);
@@ -2650,6 +2736,123 @@ impl TrimmedHead {
             rescued,
         })
     }
+
+    /// Part 3: 100% 무손실 Top-K / Min-P / Grammar Bitmask 가드 샘플링 (`TrimmedHead` 위에서 직접 수행).
+    ///
+    /// - `top_k` 번째 허용 CORE 로짓이 `U_CS(x)` 이상이거나, `best_core + T * ln(min_p) > U_CS(x)` 이거나,
+    ///   문법 마스크가 모든 REST 토큰을 배제하면 REST 가중치를 0바이트만 읽고 종료합니다.
+    /// - 가드가 열릴 때만 호스트 mmap 의 REST 행을 SIMD 로 구출해 병합하고, 전역 `vocab_id` 키의
+    ///   `philox4x32_uniform` Gumbel-Max 로 전체 어휘 샘플링과 100% 동일한 토큰을 반환합니다.
+    pub fn guarded_sample_next_token(
+        &self,
+        last_hidden: &Tensor,
+        cfg: &candle_nn::trimmed_head::SamplingGuardConfig,
+    ) -> Result<(u32, bool)> {
+        if cfg.temperature <= 0.0 && cfg.grammar_bitmask.is_none() {
+            let (ids, rescued) = self.greedy_next_token_with_stats(last_hidden)?;
+            return Ok((ids.first().copied().unwrap_or(0), rescued > 0));
+        }
+
+        let k_dim = *last_hidden.dims().last().unwrap_or(&0);
+        let h_2d = last_hidden.reshape((1, k_dim))?.contiguous()?;
+        let sub_logits = self.project_rows_f32(&h_2d)?;
+        let sub_vec = sub_logits.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+        let bitmask = cfg.grammar_bitmask.as_deref();
+        let grammar_allows = |vid: u32| -> bool {
+            match bitmask {
+                None => true,
+                Some(bits) => {
+                    let w = (vid as usize) >> 5;
+                    let b = vid & 31;
+                    w < bits.len() && ((bits[w] >> b) & 1) != 0
+                }
+            }
+        };
+
+        let mut cands: Vec<(u32, f32)> = self
+            .kept
+            .iter()
+            .zip(sub_vec.iter())
+            .filter(|(&gid, _)| grammar_allows(gid))
+            .map(|(&gid, &v)| (gid, v))
+            .collect();
+        cands.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let min_p_offset = match cfg.min_p {
+            Some(mp) if mp > 0.0 && mp < 1.0 && cfg.temperature > 0.0 => {
+                Some(cfg.temperature * mp.ln())
+            }
+            _ => None,
+        };
+
+        let mut rescued = false;
+        if let Some(guard) = self.active_rescue() {
+            let rest_allowed = guard.rest_ids.iter().any(|&rid| grammar_allows(rid));
+            if rest_allowed {
+                let h_host = h_2d
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(candle_core::DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let mu_host = guard.cs_guard.mu_rest.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+                let xx = embed_cpu_kernels::dot_f32_simd(&h_host, &h_host);
+                let xm = embed_cpu_kernels::dot_f32_simd(&h_host, &mu_host);
+                let u_cs = xx.sqrt().mul_add(guard.cs_guard.w_rest_bound, xm) + guard.cs_guard.b_rest_max;
+
+                let needs_rescue = if cfg.temperature <= 0.0 {
+                    cands.first().map_or(true, |&(_, best)| best < u_cs)
+                } else {
+                    let topk_safe = match cfg.top_k {
+                        Some(tk) if tk > 0 && cands.len() >= tk => cands[tk - 1].1 >= u_cs,
+                        _ => false,
+                    };
+                    let minp_safe = match (min_p_offset, cands.first()) {
+                        (Some(off), Some(&(_, best))) => (best + off) > u_cs,
+                        _ => false,
+                    };
+                    !(topk_safe || minp_safe)
+                };
+
+                if needs_rescue {
+                    rescued = true;
+                    let mut rest_cands = guard.eval_rest_filtered(&h_host, bitmask)?;
+                    cands.append(&mut rest_cands);
+                    cands.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                }
+            }
+        }
+
+        if cands.is_empty() {
+            return Ok((0, rescued));
+        }
+        if cfg.temperature <= 0.0 {
+            return Ok((cands[0].0, rescued));
+        }
+
+        if let Some(tk) = cfg.top_k {
+            if tk > 0 && cands.len() > tk {
+                cands.truncate(tk);
+            }
+        }
+        if let Some(off) = min_p_offset {
+            let thresh = cands[0].1 + off;
+            cands.retain(|&(_, v)| v >= thresh);
+        }
+
+        let inv_t = 1.0f64 / (cfg.temperature as f64);
+        let mut best_id = cands[0].0;
+        let mut best_score = f64::NEG_INFINITY;
+        for &(gid, z) in &cands {
+            let u = candle_nn::trimmed_head::philox4x32_uniform(cfg.seed, cfg.step, gid) as f64;
+            let gumbel = -(-u.ln()).ln();
+            let score = (z as f64) * inv_t + gumbel;
+            if score > best_score || (score == best_score && gid < best_id) {
+                best_score = score;
+                best_id = gid;
+            }
+        }
+        Ok((best_id, rescued))
+    }
 }
 
 /// 잘라 내기를 켤 수 있으면(규칙이 `off` 가 아니고 매핑 · Q8_0 류 블록 표 — GPU 3종 + CPU + Metal 전체 지원, Phase 3-1 D4)
@@ -3246,5 +3449,44 @@ mod tests {
         assert!(!u.contains("العربية"));
         let langs = Langs::present(&u);
         assert!(!langs.hangul && !langs.arabic, "system scripts must not leak: {langs:?}");
+    }
+
+    #[test]
+    fn optional_space_piece_matching_and_guarded_sampling_parity() -> Result<()> {
+        assert!(match_piece_with_optional_space(b"31 MPa", b"31MPa"));
+        assert!(match_piece_with_optional_space(b" 100", b"100"));
+        assert!(!match_piece_with_optional_space(b"31 kPa", b"31 MPa"));
+
+        // 8-row vocab x 32 cols Q8_0: verify guarded_sample_next_token matches full-vocab sampling
+        // (both when CS guard skips REST and when REST rescue fires).
+        let dev = Device::Cpu;
+        let w: Vec<f32> = (0..8 * 32).map(|i| ((i as f32) * 0.29).cos()).collect();
+        let q = candle_core::quantized::QTensor::quantize(&Tensor::from_vec(w, (8, 32), &dev)?, GgmlDType::Q8_0)?;
+        let bytes = q.data()?.to_vec();
+        let dir = std::env::temp_dir().join(format!("logis-vt-gs-{}", std::process::id()));
+        std::fs::write(&dir, &bytes)?;
+        let map = Arc::new(unsafe { memmap2::Mmap::map(&std::fs::File::open(&dir)?)? });
+        let src = TableSource { map, start: 0, rows: 8, cols: 32, dtype: GgmlDType::Q8_0 };
+        let cs_policy = GuardPolicyConfig::from_raw_vars(Some("single"), None, Some("off"));
+        let trimmed = TrimmedHead::build_with_policy(&src, Arc::new(vec![0, 2, 4, 6]), "t".into(), &dev, cs_policy)?;
+        let full = TrimmedHead::build_with_policy(&src, Arc::new((0..8).collect()), "all".into(), &dev, cs_policy)?;
+        let h = Tensor::from_vec((0..32).map(|i| ((i as f32) * 0.13).sin()).collect::<Vec<f32>>(), (1, 32), &dev)?;
+
+        let cfg = candle_nn::trimmed_head::SamplingGuardConfig {
+            temperature: 0.7,
+            top_k: Some(3),
+            min_p: Some(0.05),
+            seed: 42,
+            step: 7,
+            grammar_bitmask: None,
+        };
+        let (tok_trim, _rescued) = trimmed.guarded_sample_next_token(&h, &cfg)?;
+        let (tok_full, _) = full.guarded_sample_next_token(&h, &cfg)?;
+        assert_eq!(tok_trim, tok_full, "guarded sampling must match full-vocab sampling exactly");
+
+        drop(trimmed);
+        drop(full);
+        let _ = std::fs::remove_file(&dir);
+        Ok(())
     }
 }

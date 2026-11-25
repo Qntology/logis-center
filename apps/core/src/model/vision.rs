@@ -825,47 +825,71 @@ impl crate::model::LogisModel {
                         );
                         // 🌟 [PART 1 / CROP DIET & PREFETCH / SPD-10] 타일 크롭을 2차 Qwen3.5-VL 진입 직전
                         //    (고DPI 다운스케일 + 노이즈 제거 잉크 BBox + 32px 종이색 Pad 스냅) 으로 정규화합니다.
+                        //    멀티 타일(tiles.len() > 1)은 Rayon 병렬로 전처리하되 로그는 타일 순서를 100% 결정적으로 출력합니다.
                         let diet_cfg = crate::models::siglip2::vision_crop::CropDietConfig::for_qwen3_5();
-                        let prepared_tiles: Vec<(&crate::models::siglip2::vision_crop::TilePlan, image::DynamicImage)> =
-                            tiles
-                                .iter()
-                                .map(|tile| {
-                                    // 🌟 [PRC-06] crop_tile 의 실제 업스케일 배율을 전달해 tighten_and_snap_crop_for_vlm 의
-                                    //    이중 업스케일(소형 행 타일 4x 팽창)을 방지합니다.
-                                    let (raw, applied_scale) = crate::models::siglip2::vision_crop::crop_tile_with_scale(
-                                        &dynamic_image, plan, tile, 512,
-                                    );
-                                    let master_bounds = if tile.header_band.is_none() {
-                                        layout_hit.as_ref().and_then(|h| {
-                                            h.trusted_dilated_crop_bounds(
-                                                tile.bbox,
-                                                grid.orig_width,
-                                                grid.orig_height,
-                                                3,
-                                            )
-                                        })
-                                    } else {
-                                        None
-                                    };
-                                    let est_h = if tile.text_h > 0.5 {
-                                        Some(tile.text_h * applied_scale)
-                                    } else {
-                                        None
-                                    };
-                                    let tile_baseline = height_baseline
-                                        .map(|(lo, hi)| (lo * applied_scale, hi * applied_scale));
-                                    let slim = crate::models::siglip2::vision_crop::tighten_and_snap_crop_for_vlm(
-                                        raw,
-                                        &plan.category,
-                                        est_h,
-                                        tile_baseline,
-                                        master_bounds,
-                                        &diet_cfg,
-                                        &emit_term,
-                                    );
-                                    (tile, slim)
+                        let prepare_one = |tile: &crate::models::siglip2::vision_crop::TilePlan, emit: &dyn Fn(&str)| {
+                            // 🌟 [PRC-06] crop_tile 의 실제 업스케일 배율을 전달해 tighten_and_snap_crop_for_vlm 의
+                            //    이중 업스케일(소형 행 타일 4x 팽창)을 방지합니다.
+                            let (raw, applied_scale) = crate::models::siglip2::vision_crop::crop_tile_with_scale(
+                                &dynamic_image, plan, tile, 512,
+                            );
+                            let master_bounds = if tile.header_band.is_none() {
+                                layout_hit.as_ref().and_then(|h| {
+                                    h.trusted_dilated_crop_bounds(
+                                        tile.bbox,
+                                        grid.orig_width,
+                                        grid.orig_height,
+                                        3,
+                                    )
                                 })
-                                .collect();
+                            } else {
+                                None
+                            };
+                            let est_h = if tile.text_h > 0.5 {
+                                Some(tile.text_h * applied_scale)
+                            } else {
+                                None
+                            };
+                            let tile_baseline = height_baseline
+                                .map(|(lo, hi)| (lo * applied_scale, hi * applied_scale));
+                            crate::models::siglip2::vision_crop::tighten_and_snap_crop_for_vlm(
+                                raw,
+                                &plan.category,
+                                est_h,
+                                tile_baseline,
+                                master_bounds,
+                                &diet_cfg,
+                                emit,
+                            )
+                        };
+                        let prepared_tiles: Vec<(&crate::models::siglip2::vision_crop::TilePlan, image::DynamicImage)> =
+                            if tiles.len() > 1 {
+                                use rayon::prelude::*;
+                                let results: Vec<(&crate::models::siglip2::vision_crop::TilePlan, image::DynamicImage, Vec<String>)> =
+                                    tiles
+                                        .par_iter()
+                                        .map(|tile| {
+                                            let tile_logs = std::cell::RefCell::new(Vec::<String>::new());
+                                            let emit_buf = |msg: &str| tile_logs.borrow_mut().push(msg.to_string());
+                                            let slim = prepare_one(tile, &emit_buf);
+                                            (tile, slim, tile_logs.into_inner())
+                                        })
+                                        .collect();
+                                results
+                                    .into_iter()
+                                    .map(|(tile, slim, logs)| {
+                                        for line in logs {
+                                            emit_term(&line);
+                                        }
+                                        (tile, slim)
+                                    })
+                                    .collect()
+                            } else {
+                                tiles
+                                    .iter()
+                                    .map(|tile| (tile, prepare_one(tile, &emit_term)))
+                                    .collect()
+                            };
                         for (tile, crop) in prepared_tiles {
 
                             let tile_tag = if tile.total > 1 {

@@ -374,6 +374,61 @@ pub fn encode_image_pooled(
     Ok(pooled)
 }
 
+/// 2차 소형 크롭 다건을 CPU 병렬 전처리(Rayon) + 순차 인코딩으로 처리하는 헬퍼.
+/// 1차 전체 페이지 스캔(`encode_image`) 의 비트 동일 계약을 일절 건드리지 않으면서
+/// 2차 크롭 전처리 레이턴시를 병렬로 숨깁니다.
+pub fn encode_crops_pooled_batched(
+    model: &Siglip2Model,
+    images: &[DynamicImage],
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    if images.len() == 1 {
+        return Ok(vec![encode_image_pooled(model, &images[0])?]);
+    }
+    let vision = model.vision.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "SigLIP2 vision encoder is not loaded. Call ensure_siglip2 with needs_vision=true."
+        )
+    })?;
+    let use_packed = super::quant::cpu_packed_active(&model.device);
+    let cfg = &model.config;
+    use rayon::prelude::*;
+    let preprocessed: Vec<candle_core::Result<PreprocessedImage>> = images
+        .par_iter()
+        .map(|img| {
+            if use_packed {
+                super::preprocessor::preprocess_image_patches_1pass(img, cfg, &Device::Cpu)
+            } else {
+                preprocess_image(img, cfg, &Device::Cpu)
+            }
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(images.len());
+    for pre in preprocessed {
+        let pre = pre?;
+        let px = pre
+            .pixel_values
+            .to_device(&model.device)?
+            .to_dtype(model.dtype)?;
+        let pooled_t = if use_packed {
+            vision
+                .forward_pooled_patches(&px, pre.grid_rows, pre.grid_cols)?
+                .to_dtype(DType::F32)?
+        } else {
+            vision
+                .forward_pooled(&px, pre.grid_rows, pre.grid_cols)?
+                .to_dtype(DType::F32)?
+        };
+        let mut pooled: Vec<f32> = pooled_t.squeeze(0)?.to_vec1::<f32>()?;
+        l2_normalize(&mut pooled);
+        out.push(pooled);
+    }
+    Ok(out)
+}
+
 pub fn encode_image_and_release(
     model: &mut Siglip2Model,
     image: &DynamicImage,
@@ -474,18 +529,10 @@ fn score_patches(
 
         total_scored += 1;
 
-        let patch_idx_for_log = {
-            let mut cnt = 0usize;
-            for pp in grid.patches.iter() {
-                if std::ptr::eq(pp, p) { break; }
-                cnt += 1;
-            }
-            cnt
-        };
-        let log_this_patch = patch_idx_for_log < 12;
+        let log_this_patch = patch_idx < 12;
 
         if log_this_patch && !scores.is_empty() {
-            let (r, c) = grid.rc(patch_idx_for_log);
+            let (r, c) = grid.rc(patch_idx);
             let top3: Vec<String> = scores.iter().take(3)
                 .map(|s| format!("{}(cos:{:.4} sur:{:+.4} N:{})", s.key, s.max_cos, s.surprisal, s.n))
                 .collect();
@@ -498,7 +545,7 @@ fn score_patches(
             dropped += 1;
             // 🌟 [LOG] 편견 우세로 탈락한 패치의 상세 (샘플)
             if log_this_patch {
-                let (r, c) = grid.rc(patch_idx_for_log);
+                let (r, c) = grid.rc(patch_idx);
                 println!(
                     "    🚫 [PREJUDICE r{}c{}] top: {} cos:{:.4} sur:{:+.4} ≤ 0 → 편견 우세 탈락",
                     r, c, scores[0].key, scores[0].max_cos, scores[0].surprisal
@@ -517,7 +564,7 @@ fn score_patches(
             if s.surprisal > *e {
                 // 🌟 [LOG] 키별 최고점 갱신 시 원시 코사인 기록 (샘플)
                 if log_this_patch {
-                    let (r, c) = grid.rc(patch_idx_for_log);
+                    let (r, c) = grid.rc(patch_idx);
                     println!(
                         "    ⬆️ [KEY-UPDATE r{}c{}] '{}' cos:{:.4} sur:{:+.4} (이전 {:+.4})",
                         r, c, s.key, s.max_cos, s.surprisal, *e

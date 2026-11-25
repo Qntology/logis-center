@@ -456,6 +456,58 @@ impl std::fmt::Debug for ProjKind {
 }
 
 impl ProjKind {
+    /// Returns the underlying Q8_0 `QTensor` when this projection has no bias and is eligible
+    /// for single-rounding fused W8A16 dual-projection SwiGLU (`w8a16_gate_up_silu_mv`).
+    pub fn q8_exact_no_bias_tensor(&self) -> Option<&QTensor> {
+        match self {
+            ProjKind::Exact(e) if e.w.dtype() == candle_core::quantized::GgmlDType::Q8_0 => {
+                Some(e.w.as_ref())
+            }
+            ProjKind::QuantizedProj(q)
+                if q.bias.is_none()
+                    && q8_exact_enabled() =>
+            {
+                match &q.inner {
+                    QMatMul::QTensor(t)
+                        if t.dtype() == candle_core::quantized::GgmlDType::Q8_0 =>
+                    {
+                        Some(t.as_ref())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Single-rounding fused dual-projection SwiGLU for W8A16 decode (`M <= 8`) on CUDA/ROCm:
+    /// reads `xs` once and computes `silu(xs @ gate^T) * (xs @ up^T)` in FP32 without
+    /// materializing intermediate `[M, I]` `gate` / `up` tensors in HBM.
+    pub fn try_fused_gate_up_silu(
+        gate: &Self,
+        up: &Self,
+        xs: &Tensor,
+    ) -> candle_core::Result<Option<Tensor>> {
+        if !(xs.device().is_cuda() || xs.device().is_rocm()) {
+            return Ok(None);
+        }
+        if !matches!(xs.dtype(), DType::F16 | DType::BF16 | DType::F32) {
+            return Ok(None);
+        }
+        let k = *xs.dims().last().unwrap_or(&0);
+        let m = if k > 0 { xs.elem_count() / k } else { 0 };
+        if m == 0 || m > 8 {
+            return Ok(None);
+        }
+        let (Some(gw), Some(uw)) = (gate.q8_exact_no_bias_tensor(), up.q8_exact_no_bias_tensor()) else {
+            return Ok(None);
+        };
+        if !gw.device().same_device(xs.device()) || !uw.device().same_device(xs.device()) {
+            return Ok(None);
+        }
+        Ok(Some(gw.fused_gate_up_silu(uw, xs)?))
+    }
+
     /// `LOGIS_LLM_CPU_PACKED=1` (또는 CPU F32 `Linear`) 일 때 `Linear` 를 `CpuPacked` 로 패킹합니다.
     pub fn from_linear_maybe_cpu_packed(l: Linear) -> candle_core::Result<Self> {
         if crate::models::common::llm_cpu_packed_enabled(l.weight().device())
@@ -632,6 +684,11 @@ impl GateUpDownMLPGguf {
 
 impl Module for GateUpDownMLPGguf {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        if matches!(self.act, Activation::Silu) {
+            if let Some(mid) = ProjKind::try_fused_gate_up_silu(&self.gate_proj, &self.up_proj, xs)? {
+                return self.down_proj.forward(&mid);
+            }
+        }
         let gate = self.gate_proj.forward(xs)?;
         let up = self.up_proj.forward(xs)?;
         if matches!(self.act, Activation::Silu) {

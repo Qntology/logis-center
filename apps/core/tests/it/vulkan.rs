@@ -367,7 +367,6 @@ fn layer_norm_zero_mean_matches_two_pass_reference() -> R {
 }
 
 #[test]
-#[ignore = "BUG(LN-1): candle-nn layer_norm uses one-pass E[x^2]-E[x]^2 variance; rows with a large mean (e.g. SigLIP2 / Qwen3-VL activations) lose precision on CPU and Vulkan"]
 fn layer_norm_large_mean_matches_two_pass_reference() -> R {
     // 평균이 큰 행 (x = 1000 + N(0,1)) — 정상적인 두 단계 분산이면 오차가 작아야 한다
     let x = (randn(&[4, 16, 1152])? + 1000.0)?;

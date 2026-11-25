@@ -24,8 +24,8 @@ use super::layers::{apply_rope, linear_b, linear_no_bias, sigmoid, RmsNorm1p, Ro
 /// 프리필 어텐션을 쿼리 행 단위로 나눠 `[B, H, rows, KV]` 순간 메모리를 묶어 둡니다.
 const PREFILL_ROW_TILE: usize = 256;
 const KV_GROW: usize = 512;
-/// 인덱서 점수 타일의 원소 수 상한 (`rows · nI · NB`, F32 기준 약 128 MB).
-const SCORE_TILE_ELEMS: usize = 32 * 1024 * 1024;
+/// 인덱서 점수 타일의 원소 수 상한 (`rows · nI · NB`, F32 기준 약 32 MB — 8GB VRAM 피크 압박 방지).
+const SCORE_TILE_ELEMS: usize = 8 * 1024 * 1024;
 
 /// 쿼리 행 하나의 선택 결과.
 #[derive(Debug, Clone, PartialEq)]
@@ -157,7 +157,15 @@ impl QsaIndexer {
                     continue;
                 }
                 let mut order: Vec<usize> = (0..nb).collect();
-                order.sort_by(|&x, &y| row[y].partial_cmp(&row[x]).unwrap_or(std::cmp::Ordering::Equal).then(x.cmp(&y)));
+                let cmp = |&x: &usize, &y: &usize| {
+                    row[y]
+                        .partial_cmp(&row[x])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(x.cmp(&y))
+                };
+                if self.topk_blocks > 0 && self.topk_blocks < nb {
+                    order.select_nth_unstable_by(self.topk_blocks - 1, cmp);
+                }
                 let mut blocks: Vec<usize> = order[..self.topk_blocks].to_vec();
                 blocks.sort_unstable();
                 let mut toks = Vec::with_capacity(self.topk_blocks * self.ratio + self.ratio);
