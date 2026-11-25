@@ -277,19 +277,53 @@ static ACTIVE: Lazy<RwLock<Option<WeightPlan>>> = Lazy::new(|| {
     RwLock::new(plan)
 });
 
-/// GPU 의 기본 계획: ROCm 은 q8 (모듈 설명의 실측), 그 밖(CUDA · Metal)은 재지 않아 예전 그대로 bf16.
-fn gpu_default(rocm: bool) -> WeightPlan {
-    if rocm {
-        WeightPlan::q8()
-    } else {
-        WeightPlan::bf16()
+const CUDA_Q8_AUTO_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024 + (512 << 20);
+
+fn default_siglip2_dir() -> Option<std::path::PathBuf> {
+    let p = logis_schema::paths::get_app_dir()
+        .join("models")
+        .join("siglip2-so400m-patch16-naflex");
+    p.is_dir().then_some(p)
+}
+
+/// Check whether Q8 quantized SigLIP2 tower artifacts or source safetensors exist on disk.
+pub fn can_serve_q8_from(model_dir: Option<&Path>) -> bool {
+    let Some(dir) = model_dir else { return true };
+    let q8_plan = WeightPlan::q8();
+    super::gguf::quant_vision_path(dir, &q8_plan).is_file() || dir.join("model.safetensors").is_file()
+}
+
+/// Shared auto-selection rule for both context-free `active()` and device-bound `plan_for()`.
+pub fn select_auto_plan(
+    backend: logis_llm::utils::resources::RuntimeBackendKind,
+    total_vram_bytes: Option<u64>,
+    q8_available: bool,
+) -> WeightPlan {
+    use logis_llm::utils::resources::RuntimeBackendKind;
+    match backend {
+        RuntimeBackendKind::Cpu | RuntimeBackendKind::Vulkan => WeightPlan::f32(),
+        RuntimeBackendKind::Rocm => {
+            if q8_available { WeightPlan::q8() } else { WeightPlan::bf16() }
+        }
+        RuntimeBackendKind::Cuda => {
+            if q8_available && total_vram_bytes.is_some_and(|t| t <= CUDA_Q8_AUTO_MAX_BYTES) {
+                WeightPlan::q8()
+            } else {
+                WeightPlan::bf16()
+            }
+        }
+        RuntimeBackendKind::Metal => WeightPlan::bf16(),
     }
 }
 
-/// 이 빌드의 GPU 에 적용될 계획 (장치를 모를 때: ROCm 빌드면 ROCm 으로 봅니다)
+/// 이 빌드의 GPU 에 적용될 계획 (GPU 컨텍스트를 열지 않는 요약으로 `plan_for` 와 일치시킴)
 pub fn active() -> WeightPlan {
-    let chosen = ACTIVE.read().unwrap_or_else(|e| e.into_inner()).clone();
-    chosen.unwrap_or_else(|| gpu_default(cfg!(feature = "rocm") && !cfg!(feature = "cuda")))
+    if let Some(chosen) = ACTIVE.read().unwrap_or_else(|e| e.into_inner()).clone() {
+        return chosen;
+    }
+    let summary = logis_llm::utils::resources::probe_runtime_device_summary();
+    let q8_ok = can_serve_q8_from(default_siglip2_dir().as_deref());
+    select_auto_plan(summary.backend_kind, summary.total_vram_bytes, q8_ok)
 }
 
 /// 계획을 바꿉니다 (시험용). `None` 이면 장치 기본으로 돌아갑니다. 이미 올라간 타워는 바뀌지 않습니다.
@@ -297,13 +331,29 @@ pub fn set_active(plan: Option<WeightPlan>) {
     *ACTIVE.write().unwrap_or_else(|e| e.into_inner()) = plan;
 }
 
-/// 이 장치에서 실제로 쓰는 계획. CPU · Vulkan 은 언제나 원본 F32 입니다(앱의 기존 규칙).
-pub fn plan_for(device: &Device) -> WeightPlan {
+/// 이 장치에서 실제로 쓰는 계획 (선택된 모델 디렉터리 기준 가용 Q8 확인 포함).
+pub fn plan_for_with_dir(device: &Device, model_dir: Option<&Path>) -> WeightPlan {
     if device.is_cpu() || device.is_vulkan() {
+        if let Some(chosen) = ACTIVE.read().unwrap_or_else(|e| e.into_inner()).clone() {
+            if chosen.tag == "f32" {
+                return chosen;
+            }
+        }
         return WeightPlan::f32();
     }
-    let chosen = ACTIVE.read().unwrap_or_else(|e| e.into_inner()).clone();
-    chosen.unwrap_or_else(|| gpu_default(device.is_rocm()))
+    if let Some(chosen) = ACTIVE.read().unwrap_or_else(|e| e.into_inner()).clone() {
+        return chosen;
+    }
+    let backend = logis_llm::utils::resources::RuntimeBackendKind::from_device(device);
+    let total = logis_llm::utils::device_utils::device_vram_snapshot(device).map(|s| s.total_bytes);
+    let default_dir = default_siglip2_dir();
+    let q8_ok = can_serve_q8_from(model_dir.or(default_dir.as_deref()));
+    select_auto_plan(backend, total, q8_ok)
+}
+
+/// 이 장치에서 실제로 쓰는 계획. CPU · Vulkan 은 언제나 원본 F32 입니다(앱의 기존 규칙).
+pub fn plan_for(device: &Device) -> WeightPlan {
+    plan_for_with_dir(device, None)
 }
 
 /// 이 장치에서 SigLIP2 를 올리는 dtype

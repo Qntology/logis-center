@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub use half;
 pub mod attn;
 pub mod image;
+pub mod q8;
+pub use q8::*;
 
 static FORCE_SCALAR: AtomicBool = AtomicBool::new(false);
 

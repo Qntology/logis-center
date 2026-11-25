@@ -10,10 +10,13 @@ use crate::models::qwen3_5::generate::Qwen3_5GenerateModel;
 
 pub const RUNTIME_DIR: &str = "runtime-q4km";
 pub const RUNTIME_FILE: &str = "model-q4km.gguf";
+pub const RUNTIME_DIR_Q8: &str = "runtime-q8_0";
+pub const RUNTIME_FILE_Q8: &str = "model-q8_0.gguf";
 const READY_FILE: &str = "READY";
 pub const READY_JSON_FILE: &str = "READY.json";
 const RECIPE: &str = "qwen35-q4km/2";
 const LEGACY_RECIPE: &str = "qwen35-q4km/1";
+const RECIPE_Q8: &str = "qwen35-q8_0/1";
 pub const ALIGN: u64 = 32;
 const ROUND_ELEMS: usize = 16 * 1024 * 1024;
 
@@ -258,16 +261,36 @@ pub enum Meta {
     ArrI32(Vec<i32>),
 }
 
+pub fn runtime_dir_for(model_dir: &Path, precision: Precision) -> PathBuf {
+    match precision {
+        Precision::Q8 => model_dir.join(RUNTIME_DIR_Q8),
+        Precision::Q4KM | Precision::Exact => model_dir.join(RUNTIME_DIR),
+    }
+}
+
+pub fn runtime_gguf_for(model_dir: &Path, precision: Precision) -> PathBuf {
+    match precision {
+        Precision::Q8 => runtime_dir_for(model_dir, precision).join(RUNTIME_FILE_Q8),
+        Precision::Q4KM | Precision::Exact => runtime_dir_for(model_dir, precision).join(RUNTIME_FILE),
+    }
+}
+
+pub fn runtime_bytes_for(model_dir: &Path, precision: Precision) -> u64 {
+    std::fs::metadata(runtime_gguf_for(model_dir, precision))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
 pub fn runtime_dir(model_dir: &Path) -> PathBuf {
-    model_dir.join(RUNTIME_DIR)
+    runtime_dir_for(model_dir, Precision::Q4KM)
 }
 
 pub fn runtime_gguf(model_dir: &Path) -> PathBuf {
-    runtime_dir(model_dir).join(RUNTIME_FILE)
+    runtime_gguf_for(model_dir, Precision::Q4KM)
 }
 
 pub fn runtime_bytes(model_dir: &Path) -> u64 {
-    std::fs::metadata(runtime_gguf(model_dir)).map(|m| m.len()).unwrap_or(0)
+    runtime_bytes_for(model_dir, Precision::Q4KM)
 }
 
 pub fn v_head_order() -> Result<&'static str> {
@@ -302,20 +325,20 @@ pub fn sha256_bytes(data: &[u8]) -> String {
     premium_discount_quant::vocab_plan::sha256_hex(data)
 }
 
-pub fn read_ready_manifest(model_dir: &Path) -> Option<ReadyManifest> {
-    let raw = std::fs::read_to_string(runtime_dir(model_dir).join(READY_JSON_FILE)).ok()?;
+pub fn read_ready_manifest_for(model_dir: &Path, precision: Precision) -> Option<ReadyManifest> {
+    let raw = std::fs::read_to_string(runtime_dir_for(model_dir, precision).join(READY_JSON_FILE)).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-pub fn write_ready_manifest(model_dir: &Path, manifest: &ReadyManifest) -> Result<()> {
-    let dir = runtime_dir(model_dir);
+pub fn write_ready_manifest_for(model_dir: &Path, precision: Precision, manifest: &ReadyManifest) -> Result<()> {
+    let dir = runtime_dir_for(model_dir, precision);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(READY_JSON_FILE), serde_json::to_string_pretty(manifest)?)?;
     Ok(())
 }
 
-pub fn runtime_ready(model_dir: &Path) -> bool {
-    let gguf_len = runtime_bytes(model_dir);
+pub fn runtime_ready_for(model_dir: &Path, precision: Precision) -> bool {
+    let gguf_len = runtime_bytes_for(model_dir, precision);
     if gguf_len == 0 {
         return false;
     }
@@ -323,19 +346,26 @@ pub fn runtime_ready(model_dir: &Path) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
+    let recipe_ok = |recipe: &str| match precision {
+        Precision::Q8 => recipe == RECIPE_Q8,
+        Precision::Q4KM | Precision::Exact => recipe == RECIPE || recipe == LEGACY_RECIPE,
+    };
     // 1. Prefer READY.json (survives original .safetensors shard deletion)
-    if let Some(m) = read_ready_manifest(model_dir) {
+    if let Some(m) = read_ready_manifest_for(model_dir, precision) {
         return m.gguf_bytes == gguf_len
             && m.v_head_order == expected_vhead
-            && (m.recipe == RECIPE || m.recipe == LEGACY_RECIPE);
+            && recipe_ok(&m.recipe);
+    }
+    if precision != Precision::Q4KM {
+        return false;
     }
     // 2. Fallback to legacy READY text file when shards are still present
-    let ready = std::fs::read_to_string(runtime_dir(model_dir).join(READY_FILE)).unwrap_or_default();
+    let ready = std::fs::read_to_string(runtime_dir_for(model_dir, precision).join(READY_FILE)).unwrap_or_default();
     let trimmed = ready.trim();
     if trimmed.is_empty() {
         return false;
     }
-    if let Ok(key) = recipe_key(model_dir, Precision::Q4KM) {
+    if let Ok(key) = recipe_key(model_dir, precision) {
         if trimmed == key {
             return true;
         }
@@ -345,6 +375,47 @@ pub fn runtime_ready(model_dir: &Path) -> bool {
         }
     }
     false
+}
+
+pub fn resolve_active_precision(model_dir: &Path, device: &Device) -> Precision {
+    let raw = std::env::var("LOGIS_LANG_PRECISION")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "q8" | "q8_0" => {
+            if runtime_ready_for(model_dir, Precision::Q8) {
+                Precision::Q8
+            } else {
+                Precision::Q4KM
+            }
+        }
+        "q4" | "q4km" | "q4_k_m" => Precision::Q4KM,
+        _ => {
+            if runtime_ready_for(model_dir, Precision::Q8) {
+                let q8_bytes = runtime_bytes_for(model_dir, Precision::Q8);
+                let free_bytes = crate::utils::device_utils::device_vram_snapshot(device)
+                    .map(|s| s.effective_free_bytes())
+                    .unwrap_or(0);
+                if free_bytes >= q8_bytes.saturating_add(1_500_000_000) {
+                    return Precision::Q8;
+                }
+            }
+            Precision::Q4KM
+        }
+    }
+}
+
+pub fn read_ready_manifest(model_dir: &Path) -> Option<ReadyManifest> {
+    read_ready_manifest_for(model_dir, Precision::Q4KM)
+}
+
+pub fn write_ready_manifest(model_dir: &Path, manifest: &ReadyManifest) -> Result<()> {
+    write_ready_manifest_for(model_dir, Precision::Q4KM, manifest)
+}
+
+pub fn runtime_ready(model_dir: &Path) -> bool {
+    runtime_ready_for(model_dir, Precision::Q4KM)
 }
 
 static CONVERT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -403,7 +474,10 @@ fn path_str(p: &Path) -> Result<&str> {
 }
 
 pub fn load_runtime(model_dir: &Path, device: &Device) -> Result<Qwen3_5GenerateModel> {
-    let gguf = prepare(model_dir, &|_, _| {})?;
+    let gguf = match resolve_active_precision(model_dir, device) {
+        Precision::Q8 => runtime_gguf_for(model_dir, Precision::Q8),
+        _ => prepare(model_dir, &|_, _| {})?,
+    };
     load_from(model_dir, &gguf, device)
 }
 
@@ -1094,6 +1168,8 @@ pub fn convert_variant(model_dir: &Path, out: &Path, precision: Precision, quant
     }
     if out.starts_with(runtime_dir(model_dir)) {
         let _ = std::fs::remove_file(runtime_dir(model_dir).join(READY_FILE));
+    } else if out.starts_with(runtime_dir_for(model_dir, Precision::Q8)) {
+        let _ = std::fs::remove_file(runtime_dir_for(model_dir, Precision::Q8).join(READY_FILE));
     }
     let part = out.with_extension("gguf.part");
     let file = std::fs::File::create(&part).with_context(|| format!("{:?} 를 만들 수 없습니다", part))?;

@@ -677,45 +677,98 @@ pub fn save_probe_cache(cache: &AccelProbeCache) {
     }
 }
 
+fn write_probe_inflight(backend: &str, gpu_id: usize, op: &str) {
+    let path = logis_schema::paths::get_app_dir()
+        .join("cache")
+        .join(format!("probe_inflight_{backend}_{gpu_id}.json"));
+    if let Some(p) = path.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    let _ = std::fs::write(path, format!("{{\"backend\":\"{backend}\",\"gpu_id\":{gpu_id},\"op\":\"{op}\"}}"));
+}
+
+fn clear_probe_inflight(backend: &str, gpu_id: usize) {
+    let path = logis_schema::paths::get_app_dir()
+        .join("cache")
+        .join(format!("probe_inflight_{backend}_{gpu_id}.json"));
+    let _ = std::fs::remove_file(path);
+}
+
 /// Subprocess probe entrypoint (`--logis-accel-probe <backend> <gpu_id>`).
 /// Returns `Some(exit_code)` if the current process was launched as an isolated accel probe.
 pub fn maybe_run_cli_probe(args: &[String]) -> Option<i32> {
     let pos = args.iter().position(|a| a == "--logis-accel-probe")?;
     let backend = args.get(pos + 1).map(String::as_str).unwrap_or("cpu");
-    let dev = match backend {
-        "cpu" => Device::Cpu,
+    let gpu_id: usize = args
+        .get(pos + 2)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let dev_res: anyhow::Result<Device> = match backend {
+        "cpu" => Ok(Device::Cpu),
         #[cfg(feature = "cuda")]
-        "cuda" => Device::new_cuda(0).unwrap_or(Device::Cpu),
+        "cuda" => Device::new_cuda(gpu_id).map_err(Into::into),
         #[cfg(feature = "rocm")]
-        "rocm" => crate::utils::new_gpu_device(0).unwrap_or(Device::Cpu),
+        "rocm" => crate::utils::new_gpu_device(gpu_id)
+            .ok_or_else(|| anyhow::anyhow!("failed to open ROCm device {gpu_id}")),
         #[cfg(feature = "vulkan")]
-        "vulkan" => Device::new_vulkan(0).unwrap_or(Device::Cpu),
-        _ => Device::Cpu,
+        "vulkan" => {
+            let d = Device::new_vulkan(gpu_id)?;
+            if let Device::Vulkan(ref vd) = d {
+                if vd.device_type() == "cpu" && std::env::var_os("LOGIS_REQUIRE_GPU").is_some() {
+                    anyhow::bail!("software Vulkan adapter (type=cpu) rejected under LOGIS_REQUIRE_GPU=1");
+                }
+            }
+            Ok(d)
+        }
+        #[cfg(feature = "metal")]
+        "metal" => Device::new_metal(gpu_id).map_err(Into::into),
+        other => Err(anyhow::anyhow!("unsupported backend '{other}' in this build")),
+    };
+    let dev = match dev_res {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[ACCEL-PROBE] ERROR opening {backend}:{gpu_id}: {e}");
+            return Some(3);
+        }
     };
     let dt = model_dtype(&dev);
     let mut passed_ops = Vec::new();
     let mut failed_ops = Vec::new();
     for kind in FusedOpKind::ALL {
-        let d = match kind {
-            FusedOpKind::RopeKvWrite | FusedOpKind::GatedDeltaRule => 128,
-            _ => 128,
-        };
+        let token = format!("fused:{}", kind.token());
+        write_probe_inflight(backend, gpu_id, &token);
         let tol = fused_op_tol(kind, dt);
-        match check_fused_op(&dev, kind, dt, d) {
-            Ok(err) if err <= tol => passed_ops.push(kind.token().to_string()),
-            _ => failed_ops.push(kind.token().to_string()),
+        match check_fused_op(&dev, kind, dt, 128) {
+            Ok(err) if err <= tol => passed_ops.push(token),
+            _ => failed_ops.push(token),
         }
     }
+    for &hd in &[64usize, 72, 128, 256] {
+        let token = format!("flash_attn:{dt:?}:d{hd}");
+        write_probe_inflight(backend, gpu_id, &token);
+        if flash_attn_ok(&dev, dt, hd) {
+            passed_ops.push(token);
+        } else {
+            failed_ops.push(token);
+        }
+    }
+    clear_probe_inflight(backend, gpu_id);
     let cache = AccelProbeCache {
         binary_key: binary_fingerprint(),
-        backend: backend_name(&dev).to_string(),
+        backend: format!("{}:{gpu_id}", backend_name(&dev)),
         arch: arch(&dev),
         passed_ops,
         failed_ops: failed_ops.clone(),
     };
     save_probe_cache(&cache);
     println!("[ACCEL-PROBE] backend={} passed={} failed={:?}", cache.backend, cache.passed_ops.len(), failed_ops);
-    Some(0)
+    let exit_code = if !failed_ops.is_empty() && std::env::var_os("LOGIS_STRICT_ACCEL").is_some() {
+        1
+    } else {
+        0
+    };
+    crate::utils::rocm_exit_now_if_used(exit_code as u32);
+    Some(exit_code)
 }
 
 /// 이 장치에서 TurboQuant 를 끈 이유 (켜져 있으면 None)

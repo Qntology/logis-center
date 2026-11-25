@@ -813,7 +813,8 @@ impl Qwen3Model {
     }
 
     pub fn validate_input_ids(&self, ids: &[u32]) -> Result<()> {
-        Ok(self.embed_tokens.validate_ids_slice(ids)?)
+        let vocab = self.embed_tokens.vocab()?;
+        crate::models::qwen3_5::model::validate_host_token_ids(ids, vocab, "Qwen3Model::validate_input_ids")
     }
 
     /// Estimate resident GPU weight bytes (backbone + active trim_head / embedding table).

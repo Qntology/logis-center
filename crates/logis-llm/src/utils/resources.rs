@@ -122,6 +122,141 @@ pub struct KvPlanInput<'a> {
     pub label: &'a str,
 }
 
+/// Context-free backend classification for runtime resource planning and reflection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeBackendKind {
+    Cuda,
+    Rocm,
+    Vulkan,
+    Metal,
+    Cpu,
+}
+
+impl RuntimeBackendKind {
+    pub fn from_device(dev: &candle_core::Device) -> Self {
+        match dev {
+            candle_core::Device::Cuda(_) => Self::Cuda,
+            candle_core::Device::Rocm(_) => Self::Rocm,
+            candle_core::Device::Vulkan(_) => Self::Vulkan,
+            candle_core::Device::Metal(_) => Self::Metal,
+            _ => Self::Cpu,
+        }
+    }
+}
+
+/// Primary GPU / runtime summary probed once without creating unused secondary CUDA contexts.
+#[derive(Clone, Debug)]
+pub struct RuntimeDeviceSummary {
+    pub backend_kind: RuntimeBackendKind,
+    pub runtime_ordinal: usize,
+    pub nvml_index: Option<u32>,
+    pub total_vram_bytes: Option<u64>,
+    pub is_unified_memory: bool,
+    pub is_software_adapter: bool,
+}
+
+/// Probe the runtime primary device summary once without opening extra GPU driver contexts.
+pub fn probe_runtime_device_summary() -> &'static RuntimeDeviceSummary {
+    static SUMMARY: std::sync::OnceLock<RuntimeDeviceSummary> = std::sync::OnceLock::new();
+    SUMMARY.get_or_init(|| {
+        #[cfg(feature = "rocm")]
+        {
+            let probe = crate::utils::GpuMemProbe::new();
+            let count = probe.device_count();
+            let mut best_ord = 0usize;
+            let mut best_free = 0u64;
+            let mut best_total = None;
+            for i in 0..count {
+                if let Some((free, total)) = probe.mem_info(i) {
+                    if free >= best_free {
+                        best_free = free;
+                        best_ord = i;
+                        best_total = Some(total);
+                    }
+                }
+            }
+            if count > 0 {
+                return RuntimeDeviceSummary {
+                    backend_kind: RuntimeBackendKind::Rocm,
+                    runtime_ordinal: best_ord,
+                    nvml_index: None,
+                    total_vram_bytes: best_total,
+                    is_unified_memory: false,
+                    is_software_adapter: false,
+                };
+            }
+        }
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(nvml) = crate::utils::device_utils::nvml_handle() {
+                if let Ok(cnt) = nvml.device_count() {
+                    let mut best_ord = 0usize;
+                    let mut best_free = 0u64;
+                    let mut best_total = None;
+                    for i in 0..cnt {
+                        if let Ok(d) = nvml.device_by_index(i) {
+                            if let Ok(mem) = d.memory_info() {
+                                if mem.free >= best_free {
+                                    best_free = mem.free;
+                                    best_ord = i as usize;
+                                    best_total = Some(mem.total);
+                                }
+                            }
+                        }
+                    }
+                    if cnt > 0 {
+                        return RuntimeDeviceSummary {
+                            backend_kind: RuntimeBackendKind::Cuda,
+                            runtime_ordinal: best_ord,
+                            nvml_index: Some(best_ord as u32),
+                            total_vram_bytes: best_total,
+                            is_unified_memory: false,
+                            is_software_adapter: false,
+                        };
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "vulkan")]
+        {
+            let probe = crate::utils::GpuMemProbe::new();
+            let count = probe.device_count();
+            if count > 0 {
+                let total = probe.mem_info(0).map(|(_, t)| t);
+                return RuntimeDeviceSummary {
+                    backend_kind: RuntimeBackendKind::Vulkan,
+                    runtime_ordinal: 0,
+                    nvml_index: None,
+                    total_vram_bytes: total,
+                    is_unified_memory: false,
+                    is_software_adapter: false,
+                };
+            }
+        }
+        #[cfg(feature = "metal")]
+        {
+            let mut sys = sysinfo::System::new();
+            sys.refresh_memory();
+            return RuntimeDeviceSummary {
+                backend_kind: RuntimeBackendKind::Metal,
+                runtime_ordinal: 0,
+                nvml_index: None,
+                total_vram_bytes: Some(sys.total_memory()),
+                is_unified_memory: true,
+                is_software_adapter: false,
+            };
+        }
+        RuntimeDeviceSummary {
+            backend_kind: RuntimeBackendKind::Cpu,
+            runtime_ordinal: 0,
+            nvml_index: None,
+            total_vram_bytes: None,
+            is_unified_memory: true,
+            is_software_adapter: false,
+        }
+    })
+}
+
 /// NVML 장치 목록을 1회만 훑어 여유 VRAM 이 가장 큰 GPU 인덱스를 캐싱합니다.
 /// device_utils::get_best_device_info 와 동일한 정책이지만 Device 객체를 생성하지 않아
 /// 디코딩 경로에서 호출해도 CUDA 컨텍스트를 건드리지 않습니다.

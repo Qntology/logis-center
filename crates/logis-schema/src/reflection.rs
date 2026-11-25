@@ -2,18 +2,20 @@
 //!
 //! Records every model load and inference execution across the four reflection layers
 //! (artifact, load, runtime, effect) to `{app_dir}/tmp/logs/reflection.jsonl` (or
-//! `LOGIS_REFLECTION_OUT`), flushing with `File::sync_all()` so fast ROCm process exit
-//! (`TerminateProcess`) never drops audit entries.
+//! `LOGIS_REFLECTION_OUT`), using a persistent 64 KiB `BufWriter<File>` in `Batch` mode
+//! with RAII (`ReflectionFlushGuard`) + `OsFlush` for fast-exit / eval paths.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
-const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const BUF_CAPACITY: usize = 64 * 1024;
+const BATCH_FLUSH_RECORDS: u32 = 16;
 const MAX_ROTATED_FILES: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,7 +140,162 @@ impl ReflectionLogMode {
     }
 }
 
-static WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static WRITE_LOCK: Lazy<Mutex<Option<ReflectionWriter>>> = Lazy::new(|| Mutex::new(None));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReflectionSyncPolicy {
+    /// Default runtime mode: 64 KiB `BufWriter`, flushes on `load` / 16 records / RAII `ReflectionFlushGuard`.
+    Batch,
+    /// Benchmark / fast-exit mode: flushes to OS page cache on every record (~3 us, survives `TerminateProcess`).
+    OsFlush,
+    /// Crash-trace debug (`LOGIS_REFLECTION_SYNC=always|sync|fsync|crash`): `File::sync_all()` on every record.
+    SyncAll,
+}
+
+/// Cached reflection sync policy (avoids repeated `env::var` syscalls on hot path).
+pub fn cached_sync_policy() -> ReflectionSyncPolicy {
+    static POLICY: OnceLock<ReflectionSyncPolicy> = OnceLock::new();
+    *POLICY.get_or_init(|| {
+        match std::env::var("LOGIS_REFLECTION_SYNC")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "always" | "sync" | "fsync" | "crash" => ReflectionSyncPolicy::SyncAll,
+            "os" | "line" => ReflectionSyncPolicy::OsFlush,
+            _ => {
+                if std::env::var_os("LOGIS_REFLECTION_OUT").is_some()
+                    || std::env::var_os("LOGIS_REFLECT_OUT").is_some()
+                    || std::env::var_os("LOGIS_TEST_FAST_EXIT").is_some()
+                {
+                    ReflectionSyncPolicy::OsFlush
+                } else {
+                    ReflectionSyncPolicy::Batch
+                }
+            }
+        }
+    })
+}
+
+/// Persistent buffered writer with handle-releasing forced rotation on Windows.
+pub struct ReflectionWriter {
+    path: PathBuf,
+    writer: Option<BufWriter<File>>,
+    written_bytes: u64,
+    unflushed_records: u32,
+    max_log_bytes: u64,
+}
+
+impl ReflectionWriter {
+    pub fn open(path: PathBuf, max_log_bytes: u64) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            path,
+            writer: Some(BufWriter::with_capacity(BUF_CAPACITY, file)),
+            written_bytes: len,
+            unflushed_records: 0,
+            max_log_bytes: max_log_bytes.max(1024),
+        })
+    }
+
+    pub fn append_line(
+        &mut self,
+        bytes: &[u8],
+        is_load: bool,
+        policy: ReflectionSyncPolicy,
+    ) -> std::io::Result<()> {
+        let next_total = self.written_bytes.saturating_add(bytes.len() as u64);
+        let prev_bucket = self.written_bytes / self.max_log_bytes;
+        let next_bucket = next_total / self.max_log_bytes;
+        if self.written_bytes > 0 && next_bucket > prev_bucket {
+            if let Some(mut old_w) = self.writer.take() {
+                old_w.flush()?;
+                let _ = old_w.get_ref().sync_all();
+            }
+            force_rotate_files(&self.path);
+            let reopened = OpenOptions::new().create(true).append(true).open(&self.path)?;
+            self.written_bytes = reopened.metadata().map(|m| m.len()).unwrap_or(0);
+            self.writer = Some(BufWriter::with_capacity(BUF_CAPACITY, reopened));
+            self.unflushed_records = 0;
+        }
+        if self.writer.is_none() {
+            let reopened = OpenOptions::new().create(true).append(true).open(&self.path)?;
+            self.written_bytes = reopened.metadata().map(|m| m.len()).unwrap_or(0);
+            self.writer = Some(BufWriter::with_capacity(BUF_CAPACITY, reopened));
+        }
+        let w = self.writer.as_mut().expect("writer initialized");
+        w.write_all(bytes)?;
+        self.written_bytes = self.written_bytes.saturating_add(bytes.len() as u64);
+        self.unflushed_records += 1;
+        match policy {
+            ReflectionSyncPolicy::SyncAll => {
+                w.flush()?;
+                w.get_ref().sync_all()?;
+                self.unflushed_records = 0;
+            }
+            ReflectionSyncPolicy::OsFlush => {
+                w.flush()?;
+                self.unflushed_records = 0;
+            }
+            ReflectionSyncPolicy::Batch => {
+                if is_load || self.unflushed_records >= BATCH_FLUSH_RECORDS {
+                    w.flush()?;
+                    self.unflushed_records = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(w) = self.writer.as_mut() {
+            w.flush()?;
+            self.unflushed_records = 0;
+        }
+        Ok(())
+    }
+
+    pub fn flush_and_sync(&mut self) -> std::io::Result<()> {
+        if let Some(w) = self.writer.as_mut() {
+            w.flush()?;
+            w.get_ref().sync_all()?;
+            self.unflushed_records = 0;
+        }
+        Ok(())
+    }
+}
+
+/// RAII scope guard flushing buffered reflection records on task/command exit or early `?` error.
+pub struct ReflectionFlushGuard;
+
+impl Drop for ReflectionFlushGuard {
+    fn drop(&mut self) {
+        flush();
+    }
+}
+
+/// Flush any buffered records in the active global writer to OS page cache.
+pub fn flush() {
+    if let Ok(mut g) = WRITE_LOCK.lock() {
+        if let Some(w) = g.as_mut() {
+            let _ = w.flush();
+        }
+    }
+}
+
+/// Flush and `sync_all()` any buffered records in the active global writer to disk.
+pub fn flush_and_sync() {
+    if let Ok(mut g) = WRITE_LOCK.lock() {
+        if let Some(w) = g.as_mut() {
+            let _ = w.flush_and_sync();
+        }
+    }
+}
 
 pub fn default_reflection_path() -> PathBuf {
     if let Ok(p) = std::env::var("LOGIS_REFLECTION_OUT") {
@@ -186,11 +343,7 @@ pub fn current_run_id() -> String {
     std::env::var("LOGIS_RUN_ID").unwrap_or_else(|_| format!("pid-{}", std::process::id()))
 }
 
-fn rotate_if_needed(path: &Path) {
-    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if len < MAX_LOG_BYTES {
-        return;
-    }
+fn force_rotate_files(path: &Path) {
     for idx in (1..=MAX_ROTATED_FILES).rev() {
         let dst = path.with_extension(format!("jsonl.{idx}"));
         if idx == MAX_ROTATED_FILES {
@@ -205,14 +358,13 @@ fn rotate_if_needed(path: &Path) {
     let _ = std::fs::rename(path, first);
 }
 
-/// Append a `ReflectionRecord` as one JSONL line and `sync_all()` to disk.
+/// Append a `ReflectionRecord` as one JSONL line using `cached_sync_policy()`.
 pub fn record(rec: &ReflectionRecord) {
     let mode = ReflectionLogMode::from_env();
     if mode == ReflectionLogMode::Off {
         return;
     }
     if mode == ReflectionLogMode::Summary && rec.load.is_none() && rec.exec.is_some() {
-        // Summary mode skips per-step exec lines unless explicitly outputting to LOGIS_REFLECTION_OUT
         if std::env::var("LOGIS_REFLECTION_OUT").is_err()
             && std::env::var("LOGIS_REFLECT_OUT").is_err()
         {
@@ -220,21 +372,33 @@ pub fn record(rec: &ReflectionRecord) {
         }
     }
     let path = default_reflection_path();
-    let _ = record_to_path(&path, rec);
+    let policy = cached_sync_policy();
+    let Ok(mut line) = serde_json::to_string(rec) else { return };
+    line.push('\n');
+    let mut guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let need_reopen = guard.as_ref().is_none_or(|w| w.path != path);
+    if need_reopen {
+        if let Some(prev) = guard.as_mut() {
+            let _ = prev.flush();
+        }
+        if let Ok(w) = ReflectionWriter::open(path, DEFAULT_MAX_LOG_BYTES) {
+            *guard = Some(w);
+        } else {
+            return;
+        }
+    }
+    if let Some(w) = guard.as_mut() {
+        let _ = w.append_line(line.as_bytes(), rec.load.is_some(), policy);
+    }
 }
 
 pub fn record_to_path(path: &Path, rec: &ReflectionRecord) -> std::io::Result<()> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    rotate_if_needed(path);
-    let line = serde_json::to_string(rec)
+    let mut w = ReflectionWriter::open(path.to_path_buf(), DEFAULT_MAX_LOG_BYTES)?;
+    let mut line = serde_json::to_string(rec)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let mut file: File = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
+    line.push('\n');
+    w.append_line(line.as_bytes(), true, ReflectionSyncPolicy::SyncAll)?;
     Ok(())
 }
 
@@ -265,8 +429,8 @@ mod tests {
             },
             load: Some(LoadReflection {
                 load_ms: 820.0,
-                vram_before_mb: 7800.0,
-                vram_after_mb: 5500.0,
+                vram_before_mb: 240.0,
+                vram_after_mb: 2401.0,
                 table_mode: "mapped".into(),
                 resident_table_mb: 33.4,
                 mapped_table_mb: 178.3,
@@ -276,18 +440,18 @@ mod tests {
             }),
             exec: Some(ExecReflection {
                 step: "commerce.detail_synthesis".into(),
-                langs: ["ko".into(), "ko".into(), "ko+en".into()],
+                langs: ["ko".into(), "ko".into(), "hangul".into()],
                 scope_label: "compact:hangul".into(),
                 vocab_k: [65536, 12288],
                 head_path: "quant_mode_a".into(),
-                guard_kind: "clustered_64".into(),
+                guard_kind: "off".into(),
                 tokens: [256, 64],
-                timing_ms: [42.0, 1280.0, 1.4],
-                steps: [62, 1, 1, 2, 0],
+                timing_ms: [42.0, 1280.0, 0.0],
+                steps: [64, 0, 0, 0, 0],
                 sampling: false,
                 trim_mode: "compact".into(),
-                clusters_checked: 2,
-                rows_scored: 320,
+                clusters_checked: 0,
+                rows_scored: 0,
                 sparse_mode: None,
                 sparse_vocab_k: None,
                 sparse_query_nnz: None,
@@ -301,7 +465,24 @@ mod tests {
         let content = std::fs::read_to_string(&p).unwrap();
         let parsed: ReflectionRecord = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(parsed.artifact.artifact_k, 65536);
+        assert!(parsed.load.unwrap().vram_after_mb > 240.0);
         assert_eq!(parsed.exec.as_ref().unwrap().vocab_k, [65536, 12288]);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn reflection_writer_batches_and_rotates() {
+        let dir = std::env::temp_dir().join(format!("logis_reflect_rot_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("reflection.jsonl");
+        let mut w = ReflectionWriter::open(p.clone(), 1024).unwrap();
+        let line = format!("{{\"msg\":\"{}\"}}\n", "x".repeat(280));
+        for _ in 0..8 {
+            w.append_line(line.as_bytes(), false, ReflectionSyncPolicy::Batch).unwrap();
+        }
+        w.flush_and_sync().unwrap();
+        assert!(p.exists());
+        assert!(p.with_extension("jsonl.1").exists(), "forced rotation must create .jsonl.1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

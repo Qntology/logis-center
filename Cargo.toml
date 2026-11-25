@@ -59,14 +59,14 @@ logis-app = { path = "apps/core" }
 
 # premium-discount 공용 라이브러리 (raon-zena 와 같은 리비전).
 # 로컬 ../premium-discount 로 같이 고칠 때는 아래 [patch."https://github.com/Qntology/premium-discount"] 의 주석을 푼다.
-premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "af95f0651bb25585d1cc6bbdd61e49e23bff3eeb" }
-premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "af95f0651bb25585d1cc6bbdd61e49e23bff3eeb" }
-premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "af95f0651bb25585d1cc6bbdd61e49e23bff3eeb" }
-premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "af95f0651bb25585d1cc6bbdd61e49e23bff3eeb" }
+premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38" }
+premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38" }
+premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38" }
+premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38" }
 # AI 엔진: Stanza (ONNX Runtime, 실행할 때 불러옴) · granite 임베딩 인코더 (candle). logis 쪽은 이 위의 얇은 층입니다.
-premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "af95f0651bb25585d1cc6bbdd61e49e23bff3eeb", default-features = false }
+premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38", default-features = false }
 # 스팬 NMS (Stanza 역할 · granite 임베딩 위의 의미 NMS). 아직 쓰는 crate 는 없습니다 — 이 앱의 NMS 는 비전 패치(logis-vision-doc nms_arena)뿐.
-premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "af95f0651bb25585d1cc6bbdd61e49e23bff3eeb" }
+premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "b23d38431641319f0f8ae5da324bb76245b2cf38" }
 
 # candle-rocm-vulkan 포크: premium-discount (crates/ · app/) · raon-zena 와 같은 커밋으로 고정한다.
 # 예전에는 branch = "master" 를 따라가고 커밋은 Cargo.lock 이 정했다 (60ec257, ebaf93d 의 조상).
@@ -135,6 +135,18 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.tiny-keccak]
 opt-level = 3
+[profile.dev.package.logis-llm]
+opt-level = 2
+[profile.dev.package.logis-vision-doc]
+opt-level = 2
+[profile.dev.package.tokenizers]
+opt-level = 3
+[profile.dev.package.premium-discount-quant]
+opt-level = 3
+[profile.dev.package.premium-discount-cpu-kernels]
+opt-level = 3
+[profile.dev.package.premium-discount-nlp]
+opt-level = 2
 
 [profile.release]
 opt-level = 3   # 실행 속도 최대

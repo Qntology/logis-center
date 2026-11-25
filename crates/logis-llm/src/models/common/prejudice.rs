@@ -27,25 +27,15 @@ pub struct CachedPrejudice {
 static CACHE: Lazy<Mutex<VecDeque<CachedPrejudice>>> =
     Lazy::new(|| Mutex::new(VecDeque::with_capacity(LRU_CAP)));
 
-/// Compute exact scalar prejudice penalty for a single decoded weight row `w_row` (CPU F32).
-/// Guaranteed `>= 0.0`.
+/// Compute exact scalar prejudice penalty for a single decoded weight row `w_row` (CPU F32)
+/// in a single pass over `w_row` and `target_norm`. Guaranteed `>= 0.0`.
 #[inline]
 pub fn scalar_prejudice(w_row: &[f32], target_norm: &[f32]) -> f32 {
     if w_row.len() != target_norm.len() || w_row.is_empty() {
         return 0.0;
     }
-    let dot = embed_cpu_kernels::dot_f32_simd(w_row, target_norm);
-    let norm = embed_cpu_kernels::dot_f32_simd(w_row, w_row).sqrt();
-    if norm <= 1e-12 {
-        return 0.0;
-    }
-    let cos = dot / norm;
-    let relu = (cos - 0.65).max(0.0);
-    if relu == 0.0 {
-        0.0
-    } else {
-        (15.0 * relu).exp() - 1.0
-    }
+    let (dot_wt, norm_w_sq) = embed_cpu_kernels::dot_and_norm_sq_f32_simd(w_row, target_norm);
+    embed_cpu_kernels::prejudice_from_stats(dot_wt, norm_w_sq)
 }
 
 /// Look up or build a chunked F32 prejudice vector using a row-block provider closure

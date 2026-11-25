@@ -322,7 +322,7 @@ async fn run_synthesis_pass(
                 top_p: Some(0.95),
                 ..Default::default()
             };
-            let r = tokio::task::spawn_blocking(move || {
+            let r = crate::utils::spawn_blocking_with_lang(move || {
                 let mut guard = q3_gen.blocking_lock();
                 match guard.as_mut() {
                     Some(gen) => gen
@@ -5902,7 +5902,7 @@ pub async fn process_task(
                             let task_q = task_question.clone();
                             let ignore_list_clone = ignore_list.clone();
                             let literal_copy_field = !field_is_analytic[f_idx];
-                            let res = tokio::task::spawn_blocking(move || {
+                            let res = crate::utils::spawn_blocking_with_lang(move || {
                                 let mut gen_guard = q3_gen.blocking_lock();
                                 if let Some(gen) = gen_guard.as_mut() {
                                     let params = ChatCompletionParameters {
@@ -8848,7 +8848,7 @@ pub async fn process_task(
                         let task_q = task_question.clone();
                         let ignore_list_clone = ignore_list.clone();
                         let literal_copy_field = !field_is_analytic[idx];
-                        let res = tokio::task::spawn_blocking(move || {
+                        let res = crate::utils::spawn_blocking_with_lang(move || {
                             let mut gen_guard = q3_gen.blocking_lock();
                             if let Some(gen) = gen_guard.as_mut() {
                                 let params = ChatCompletionParameters {

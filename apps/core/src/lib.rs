@@ -76,3 +76,8 @@ pub fn init_headless() {
     crate::model::lang_llm::register_loader(crate::models::qwen4_exp::registry::load_lang_runtime);
     crate::models::qwen::generate::init_bake_worker();
 }
+
+/// Flush and fsync buffered JSONL reflection telemetry before exit / task completion.
+pub fn flush_reflection_logs() {
+    logis_schema::reflection::flush_and_sync();
+}

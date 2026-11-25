@@ -3543,7 +3543,7 @@ impl QuantizedQwenVLModel {
         Ok((position_ids, deltas, mrope_position_deltas))
     }
 
-    pub async fn forward(
+    pub async fn forward_last_hidden(
         &mut self,
         input_ids_in: &Tensor,
         pixel_values: Option<&Tensor>,
@@ -3561,7 +3561,7 @@ impl QuantizedQwenVLModel {
         }
 
         let input_ids = if !input_ids_in.device().same_device(&self.text_device) { input_ids_in.to_device(&self.text_device)? } else { input_ids_in.clone() };
-        let (b_sz, seq_len) = input_ids.dims2()?;
+        let (b_sz, _seq_len) = input_ids.dims2()?;
 
         // 🌟 [VISION-JIT] 텍스트 경로에서 떼어낸 상태로 이미지가 들어오면 ViT 가 없어 패닉합니다.
         //    실제 비전 텐서가 도착한 이 순간에만 mmap 에서 되살립니다.
@@ -3621,6 +3621,18 @@ impl QuantizedQwenVLModel {
         ).await?;
         
         let hidden_state = outputs.narrow(1, outputs.dim(1)? - 1, 1)?;
+        Ok(hidden_state)
+    }
+
+    pub fn trim_head(&self) -> Option<&crate::models::common::vocab_trim::TrimmedHead> {
+        self.trim_head.as_ref()
+    }
+
+    pub fn head_src_ref(&self) -> Option<&crate::models::common::vocab_trim::TableSource> {
+        self.head_src.as_ref()
+    }
+
+    pub fn logits_from_hidden(&self, hidden_state: &Tensor) -> Result<Tensor> {
         // 🌟 [VOCAB TRIM] 남긴 행만 곱하고 전체 어휘 길이로 펼쳐(잘린 행 −∞) 원래 출력 투영의 장치로 돌려줍니다
         //    (선입견 벡터 등 아래 단계가 그 장치에 있습니다).
         if let Some(head) = &self.trim_head {
@@ -3637,13 +3649,41 @@ impl QuantizedQwenVLModel {
         let head_dev = self.lm_head.device();
         let head_dtype = if head_dev.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         
-        let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
+        let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state.clone() };
         let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
         
-        
         let logits = self.lm_head.forward(&hidden_state)?;
-        
         Ok(logits)
+    }
+
+    pub async fn forward(
+        &mut self,
+        input_ids_in: &Tensor,
+        pixel_values: Option<&Tensor>,
+        image_grid_thw: Option<&Tensor>,
+        pixel_values_video: Option<&Tensor>,
+        video_grid_thw: Option<&Tensor>,
+        cache_position_in: Option<&Tensor>,
+        seqlen_offset: usize,
+        total_len: usize,
+        session_id: Option<String>,
+        kv_name: Option<String>,
+    ) -> Result<Tensor> {
+        let hidden_state = self
+            .forward_last_hidden(
+                input_ids_in,
+                pixel_values,
+                image_grid_thw,
+                pixel_values_video,
+                video_grid_thw,
+                cache_position_in,
+                seqlen_offset,
+                total_len,
+                session_id,
+                kv_name,
+            )
+            .await?;
+        self.logits_from_hidden(&hidden_state)
     }
 
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
@@ -3744,7 +3784,7 @@ impl QuantizedQwenTextModel {
         Ok(Self { language_model, lm_head, trim_head: None, head_src: None, text_device: text_device.clone(), mmap: None })
     }
 
-    pub async fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
+    pub async fn forward_last_hidden(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
         if seqlen_offset == 0 {
             let _ = self.rebalance_layers(self.language_model.device_id, seqlen_offset, total_len);
         }
@@ -3840,7 +3880,18 @@ impl QuantizedQwenTextModel {
             final_hidden_state = Some(outputs.narrow(1, s_len - 1, 1)?.contiguous()?);
         }
         
-        let hidden_state = final_hidden_state.unwrap();
+        Ok(final_hidden_state.unwrap())
+    }
+
+    pub fn trim_head(&self) -> Option<&crate::models::common::vocab_trim::TrimmedHead> {
+        self.trim_head.as_ref()
+    }
+
+    pub fn head_src_ref(&self) -> Option<&crate::models::common::vocab_trim::TableSource> {
+        self.head_src.as_ref()
+    }
+
+    pub fn logits_from_hidden(&self, hidden_state: &Tensor) -> Result<Tensor> {
         // 🌟 [VOCAB TRIM] [`QuantizedQwenVLModel::forward`] 와 같음
         if let Some(head) = &self.trim_head {
             // 원래 출력 투영(`QLinear`)과 같은 수치: 은닉을 출력 dtype(GPU BF16)으로 맞춘 뒤 F32 로 곱하고, 로짓을 다시 그 dtype 으로
@@ -3856,7 +3907,7 @@ impl QuantizedQwenTextModel {
         let head_dev = self.lm_head.as_ref().map(|h| h.device()).unwrap_or(&self.text_device);
         let head_dtype = if head_dev.is_cuda_or_rocm() { DType::BF16 } else { DType::F32 };
         
-        let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state };
+        let hidden_state = if hidden_state.dtype() != head_dtype { hidden_state.to_dtype(head_dtype)? } else { hidden_state.clone() };
         let hidden_state = if !hidden_state.device().same_device(head_dev) { hidden_state.to_device(head_dev)? } else { hidden_state };
         
         let logits = if let Some(head) = &self.lm_head {
@@ -3864,6 +3915,11 @@ impl QuantizedQwenTextModel {
         } else { hidden_state };
         
         Ok(logits)
+    }
+
+    pub async fn forward(&mut self, input_ids_in: &Tensor, cache_position_in: Option<&Tensor>, seqlen_offset: usize, total_len: usize, session_id: Option<String>, kv_name: Option<String>) -> Result<Tensor> {
+        let hidden_state = self.forward_last_hidden(input_ids_in, cache_position_in, seqlen_offset, total_len, session_id, kv_name).await?;
+        self.logits_from_hidden(&hidden_state)
     }
 
     pub fn clear_kv_cache(&mut self) { self.language_model.clear_kv_cache(); }
