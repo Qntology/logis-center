@@ -31,7 +31,9 @@ logis-schema.workspace = true
 logis-sds.workspace = true
 lv-core.workspace = true
 lv-doc = { workspace = true, default-features = false }
+lv-domain.workspace = true
 lv-kernels.workspace = true
+lv-sds.workspace = true
 memmap2 = "0.9"
 once_cell.workspace = true
 premium-discount-quant.workspace = true

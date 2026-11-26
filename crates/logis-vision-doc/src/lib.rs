@@ -22,6 +22,8 @@ pub mod facade;
 pub mod siglip2;
 
 pub use facade::{
-    preprocess_logis_doc_v1, retry_bbox_with_margin, reverse_table_grid, verify_trade_ledger_shadow,
-    TradeDocDomainBank, TradeGroundingLexicon,
+    check_trade_outbound_clean, device_pref_from_env, heavy4b_q8_profile, preprocess_logis_doc_v1,
+    repair_and_verify_container, retry_bbox_with_margin, reverse_table_grid,
+    rocm_fast_exit_if_used, verify_trade_ledger_shadow, zh_tw_scope_labels, TradeDocDomainBank,
+    TradeGroundingLexicon,
 };

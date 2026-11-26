@@ -1,7 +1,14 @@
-//! Thin trade facade bridging `logis-vision-doc` onto `louis-vision` Tier 1 (`lv-doc` + `lv-core`).
+//! Thin trade facade bridging `logis-vision-doc` onto `louis-vision` Tier 1 (`lv-doc`, `lv-core`, `lv-domain`, `lv-sds`).
 
+use anyhow::bail;
 use image::GrayImage;
+use lv_core::device::{
+    rocm_exit_now_if_used, DevicePref, RuntimeBackendKind, RuntimeDeviceSummary,
+};
+use lv_core::qwen35::{select_heavy4b_precision, Qwen35Config, QwenPrecision};
+use lv_core::residency::QwenTier;
 use lv_core::siglip2::{preprocess_for, PatchGrid, SiglipCompatProfile, DEFAULT_MAX_PATCHES};
+use lv_core::vocab_trim::{normalize_lang_tag, DocLangScope};
 use lv_doc::vision::grounding::{
     padded_retry_bbox, DocDomainBank, GroundingLexicon, PADDED_RETRY_FRAC,
 };
@@ -10,6 +17,8 @@ use lv_doc::vision::lattice_verify::{
 };
 use lv_doc::vision::legibility::LegibilityMap;
 use lv_doc::vision::table_grid_reverse::{inject_virtual_gridlines, VIRTUAL_GRIDLINE_LUMA};
+use lv_domain::{repair_code, verify_iso6346_check_digit, CodeScheme};
+use lv_sds::CITIZEN_FORBIDDEN_TERMS;
 
 /// Trade document taxonomy bank injected into `lv-doc` (`DocDomainBank`).
 #[derive(Debug, Default)]
@@ -141,6 +150,78 @@ pub fn verify_trade_ledger_shadow(
 pub const TRADE_RETRY_PAD_FRAC: f32 = PADDED_RETRY_FRAC;
 pub const TRADE_VIRTUAL_GRIDLINE_LUMA: u8 = VIRTUAL_GRIDLINE_LUMA;
 
+/// Selects Heavy4B `Q8_0` vs `Q4_K_M` precision via Tier 1 `lv_core::qwen35`.
+pub fn heavy4b_q8_profile(
+    total_vram_bytes: u64,
+    free_vram_bytes: u64,
+    is_unified_memory: bool,
+    has_runtime_q8_0: bool,
+) -> (Qwen35Config, QwenPrecision) {
+    let summary = RuntimeDeviceSummary {
+        backend_kind: if is_unified_memory {
+            RuntimeBackendKind::Metal
+        } else {
+            RuntimeBackendKind::Rocm
+        },
+        runtime_ordinal: 0,
+        pci_bus_id: None,
+        device_uuid: None,
+        total_vram_bytes: Some(total_vram_bytes),
+        is_unified_memory,
+        is_software_adapter: false,
+    };
+    let cfg = Qwen35Config::for_tier(QwenTier::Heavy4B);
+    let prec = select_heavy4b_precision(&summary, free_vram_bytes, has_runtime_q8_0);
+    (cfg, prec)
+}
+
+/// Parses `LV_DEVICE` into a Tier 1 `DevicePref`.
+pub fn device_pref_from_env() -> anyhow::Result<DevicePref> {
+    DevicePref::from_env()
+}
+
+/// Exits immediately without triggering broken HIP teardown when ROCm was used.
+pub fn rocm_fast_exit_if_used(code: i32) {
+    rocm_exit_now_if_used(code);
+}
+
+/// Normalizes `zh_TW` and returns `[doc_lang, ui_lang, resolved_scope_lang]` via `DocLangScope`.
+pub fn zh_tw_scope_labels(sample_text: &str) -> [String; 3] {
+    let tag = normalize_lang_tag("zh_TW").unwrap_or_else(|| "zh-tw".to_string());
+    let scope = DocLangScope::text(&tag, sample_text);
+    scope.labels()
+}
+
+/// Guards outward trade text against beacon URLs, Layer-0 forbidden terms, and altered locked facts.
+pub fn check_trade_outbound_clean(text: &str, locked_facts: &[&str]) -> anyhow::Result<()> {
+    if text.contains("http://") || text.contains("https://") {
+        bail!("trade outbound guard blocked: external beacon URL present");
+    }
+    let leak_count = CITIZEN_FORBIDDEN_TERMS
+        .iter()
+        .filter(|&&term| text.contains(term))
+        .count();
+    if leak_count > 0 {
+        // Never quote the leaked strings in error messages.
+        bail!("trade outbound guard blocked: {leak_count} forbidden term(s) present");
+    }
+    let missing = locked_facts
+        .iter()
+        .filter(|fact| !fact.is_empty() && !text.contains(**fact))
+        .count();
+    if missing > 0 {
+        bail!("trade outbound guard blocked: {missing} locked fact(s) missing or altered");
+    }
+    Ok(())
+}
+
+/// Repairs OCR confusion in an ISO 6346 container ID and verifies its Mod-11 check digit.
+pub fn repair_and_verify_container(raw: &str) -> (String, bool) {
+    let repaired = repair_code(raw, CodeScheme::Iso6346Container);
+    let ok = verify_iso6346_check_digit(&repaired);
+    (repaired, ok)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +272,43 @@ mod tests {
         }
         let (_out_img, vx, _vy) = reverse_table_grid(&tbl, 2).unwrap();
         assert!(vx.len() >= 3);
+    }
+
+    #[test]
+    fn trade_facade_exposes_tier1_qwen35_zhtw_guard_and_iso6346() {
+        let (cfg, prec_q8) = heavy4b_q8_profile(8 << 30, 5 << 30, false, true);
+        assert_eq!(cfg.vocab_size, 248_320);
+        assert_eq!(cfg.static_artifact_k, Some(65_536));
+        assert_eq!(prec_q8, QwenPrecision::Q8_0);
+        assert_eq!(heavy4b_q8_profile(4 << 30, 3 << 30, false, true).1, QwenPrecision::Q4Km);
+
+        assert!(device_pref_from_env().is_ok());
+        rocm_fast_exit_if_used(0);
+
+        let labels = zh_tw_scope_labels("繁體臺灣");
+        assert_eq!(labels[0], "zh-tw");
+
+        assert_eq!(CITIZEN_FORBIDDEN_TERMS.len(), 16);
+        assert!(check_trade_outbound_clean("상업송장 합계 2000 PCS", &["2000 PCS"]).is_ok());
+        for &term in CITIZEN_FORBIDDEN_TERMS {
+            let sample = format!("초안 본문 {term} 포함");
+            let err = check_trade_outbound_clean(&sample, &[]).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                !msg.contains(term),
+                "error string leaked forbidden term {term}: {msg}"
+            );
+        }
+        assert!(check_trade_outbound_clean("https://beacon.invalid/ping", &[]).is_err());
+        assert!(check_trade_outbound_clean("상업송장 합계", &["2000 PCS"]).is_err());
+
+        assert_eq!(
+            repair_and_verify_container("MSCU1Z34S66"),
+            ("MSCU1234566".to_string(), true)
+        );
+        assert_eq!(
+            repair_and_verify_container("MSCU1Z34S6?"),
+            ("MSCU1234566".to_string(), true)
+        );
     }
 }
