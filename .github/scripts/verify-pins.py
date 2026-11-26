@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_CANDLE_REV = "f73415d4d149d7949e8a6a94911af670e4e10f7f"
 EXPECTED_PD_REV = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
-EXPECTED_LV_REV = "341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+EXPECTED_LV_REV = "afa2f8afce076ee418b669e701e3c1668463da56"
 
 
 def extract_revs(cargo_toml: str, needle: str) -> set[str]:

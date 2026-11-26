@@ -70,11 +70,12 @@ premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", r
 premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
 
 # louis-vision Tier 1 통합 비전 · 도메인 · 에이전트 코어 (LV_LIB_PIN_REV 고정, 무통신/무DB/무SAM).
-lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
-lv-core = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
-lv-doc = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6", default-features = false }
-lv-domain = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
-lv-agent = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-sds = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-core = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-doc = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56", default-features = false }
+lv-domain = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-agent = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
 
 # candle-rocm-vulkan 포크: premium-discount (crates/ · app/) · raon-zena 와 같은 커밋으로 고정한다.
 # 예전에는 branch = "master" 를 따라가고 커밋은 Cargo.lock 이 정했다 (60ec257, ebaf93d 의 조상).
@@ -97,6 +98,14 @@ candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", re
 # premium-discount-quant = { path = "../premium-discount/crates/premium-discount-quant" }
 # premium-discount-nlp = { path = "../premium-discount/crates/premium-discount-nlp" }
 # premium-discount-nms = { path = "../premium-discount/crates/premium-discount-nms" }
+
+# [patch."https://github.com/Qntology/louis-vision"]
+# lv-kernels = { path = "../louis-vision/crates/lv-kernels" }
+# lv-sds = { path = "../louis-vision/crates/lv-sds" }
+# lv-core = { path = "../louis-vision/crates/lv-core" }
+# lv-doc = { path = "../louis-vision/crates/lv-doc" }
+# lv-domain = { path = "../louis-vision/crates/lv-domain" }
+# lv-agent = { path = "../louis-vision/crates/lv-agent" }
 
 [profile.dev]
 opt-level = 0      # 기본값 0(최적화 없음). 무거운 crate 만 아래에서 3 으로 올린다.

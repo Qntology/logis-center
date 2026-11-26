@@ -6383,7 +6383,9 @@ dependencies = [
  "logis-sds",
  "lv-core",
  "lv-doc",
+ "lv-domain",
  "lv-kernels",
+ "lv-sds",
  "memmap2",
  "once_cell",
  "premium-discount-quant",
@@ -6452,7 +6454,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lv-agent"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6471,7 +6473,7 @@ dependencies = [
 [[package]]
 name = "lv-core"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -6501,7 +6503,7 @@ dependencies = [
 [[package]]
 name = "lv-doc"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6534,7 +6536,7 @@ dependencies = [
 [[package]]
 name = "lv-domain"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6548,7 +6550,7 @@ dependencies = [
 [[package]]
 name = "lv-kernels"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
 dependencies = [
  "premium-discount-cpu-kernels",
  "rayon",
@@ -6557,7 +6559,7 @@ dependencies = [
 [[package]]
 name = "lv-sds"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
 dependencies = [
  "premium-discount-sds",
  "serde",
