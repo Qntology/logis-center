@@ -70,12 +70,12 @@ premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", r
 premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
 
 # louis-vision Tier 1 통합 비전 · 도메인 · 에이전트 코어 (LV_LIB_PIN_REV 고정, 무통신/무DB/무SAM).
-lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-sds = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-core = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-doc = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132", default-features = false }
-lv-domain = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
-lv-agent = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-sds = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-core = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-doc = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611", default-features = false }
+lv-domain = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
+lv-agent = { git = "https://github.com/Qntology/louis-vision", rev = "54b161b3f182ccef867ff9fafa1c684946be2611" }
 
 # candle-rocm-vulkan 포크: premium-discount (crates/ · app/) · raon-zena 와 같은 커밋으로 고정한다.
 # 예전에는 branch = "master" 를 따라가고 커밋은 Cargo.lock 이 정했다 (60ec257, ebaf93d 의 조상).
