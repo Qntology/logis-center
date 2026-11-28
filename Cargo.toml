@@ -59,23 +59,23 @@ logis-app = { path = "apps/core" }
 
 # premium-discount 공용 라이브러리 (Tier 0 PD_LIB_PIN_REV 고정).
 # 로컬 ../premium-discount 로 같이 고칠 때는 아래 [patch."https://github.com/Qntology/premium-discount"] 의 주석을 푼다.
-premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
-premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
-premium-discount-cpu-kernels = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
-premium-discount-eval = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
-premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
-premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-identity = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-manifest = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-cpu-kernels = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-eval = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-sds = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-quant = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
 # AI 엔진: Stanza (ONNX Runtime, 실행할 때 불러옴) · granite 임베딩 인코더 (candle). logis 쪽은 이 위의 얇은 층입니다.
-premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675", default-features = false }
-premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-nlp = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5", default-features = false }
+premium-discount-nms = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
 
 # louis-vision Tier 1 통합 비전 · 도메인 · 에이전트 코어 (LV_LIB_PIN_REV 고정, 무통신/무DB/무SAM).
-lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
-lv-sds = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
-lv-core = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
-lv-doc = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56", default-features = false }
-lv-domain = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
-lv-agent = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
+lv-sds = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
+lv-core = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
+lv-doc = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132", default-features = false }
+lv-domain = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
+lv-agent = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
 
 # candle-rocm-vulkan 포크: premium-discount (crates/ · app/) · raon-zena 와 같은 커밋으로 고정한다.
 # 예전에는 branch = "master" 를 따라가고 커밋은 Cargo.lock 이 정했다 (60ec257, ebaf93d 의 조상).

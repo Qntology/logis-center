@@ -6454,7 +6454,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lv-agent"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
+source = "git+https://github.com/Qntology/louis-vision?rev=5ea66a0f8727d8560bd16991cccff7f1e6a00132#5ea66a0f8727d8560bd16991cccff7f1e6a00132"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6473,7 +6473,7 @@ dependencies = [
 [[package]]
 name = "lv-core"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
+source = "git+https://github.com/Qntology/louis-vision?rev=5ea66a0f8727d8560bd16991cccff7f1e6a00132#5ea66a0f8727d8560bd16991cccff7f1e6a00132"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -6503,7 +6503,7 @@ dependencies = [
 [[package]]
 name = "lv-doc"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
+source = "git+https://github.com/Qntology/louis-vision?rev=5ea66a0f8727d8560bd16991cccff7f1e6a00132#5ea66a0f8727d8560bd16991cccff7f1e6a00132"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6536,7 +6536,7 @@ dependencies = [
 [[package]]
 name = "lv-domain"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
+source = "git+https://github.com/Qntology/louis-vision?rev=5ea66a0f8727d8560bd16991cccff7f1e6a00132#5ea66a0f8727d8560bd16991cccff7f1e6a00132"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6550,7 +6550,7 @@ dependencies = [
 [[package]]
 name = "lv-kernels"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
+source = "git+https://github.com/Qntology/louis-vision?rev=5ea66a0f8727d8560bd16991cccff7f1e6a00132#5ea66a0f8727d8560bd16991cccff7f1e6a00132"
 dependencies = [
  "premium-discount-cpu-kernels",
  "rayon",
@@ -6559,7 +6559,7 @@ dependencies = [
 [[package]]
 name = "lv-sds"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
+source = "git+https://github.com/Qntology/louis-vision?rev=5ea66a0f8727d8560bd16991cccff7f1e6a00132#5ea66a0f8727d8560bd16991cccff7f1e6a00132"
 dependencies = [
  "premium-discount-sds",
  "serde",
@@ -7600,7 +7600,7 @@ dependencies = [
 [[package]]
 name = "onnxruntime"
 version = "0.0.14"
-source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+source = "git+https://github.com/Qntology/premium-discount?rev=b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5#b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
 dependencies = [
  "lazy_static",
  "ndarray 0.15.6",
@@ -7612,7 +7612,7 @@ dependencies = [
 [[package]]
 name = "onnxruntime-sys"
 version = "0.0.14"
-source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+source = "git+https://github.com/Qntology/premium-discount?rev=b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5#b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
 dependencies = [
  "flate2",
  "libloading 0.8.9",
@@ -8083,7 +8083,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 [[package]]
 name = "premium-discount-cpu-kernels"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+source = "git+https://github.com/Qntology/premium-discount?rev=b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5#b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
 dependencies = [
  "half",
  "rayon",
@@ -8092,7 +8092,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-eval"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+source = "git+https://github.com/Qntology/premium-discount?rev=b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5#b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
 dependencies = [
  "anyhow",
  "serde",
@@ -8102,7 +8102,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-identity"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+source = "git+https://github.com/Qntology/premium-discount?rev=b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5#b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
 dependencies = [
  "getrandom 0.3.4",
  "hmac 0.12.1",
@@ -8116,7 +8116,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-manifest"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+source = "git+https://github.com/Qntology/premium-discount?rev=b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5#b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -8124,7 +8124,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-nlp"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+source = "git+https://github.com/Qntology/premium-discount?rev=b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5#b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -8145,7 +8145,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-nms"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+source = "git+https://github.com/Qntology/premium-discount?rev=b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5#b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
 dependencies = [
  "anyhow",
  "premium-discount-cpu-kernels",
@@ -8156,7 +8156,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-quant"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+source = "git+https://github.com/Qntology/premium-discount?rev=b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5#b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
 dependencies = [
  "anyhow",
  "half",
@@ -8174,7 +8174,7 @@ dependencies = [
 [[package]]
 name = "premium-discount-sds"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/premium-discount?rev=dae2667e498b65e6eb92ca0bd3ebf7e10c75c675#dae2667e498b65e6eb92ca0bd3ebf7e10c75c675"
+source = "git+https://github.com/Qntology/premium-discount?rev=b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5#b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
 dependencies = [
  "anyhow",
  "serde",
